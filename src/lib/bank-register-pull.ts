@@ -233,6 +233,17 @@ export interface PullWindowState {
      * never drain. This is the resume point that makes progress monotonic.
      */
     continueAfter?: { postedDate: string; qbTxnId: string } | null;
+    /**
+     * Where a TRUNCATED mint stopped, when one did.
+     *
+     * Diagnostic rather than a resume point in the strict sense: minting
+     * re-plans from the unlinked observations every batch, so a line already
+     * minted is linked and no longer a candidate, and the next run continues by
+     * construction. What this buys is the ability to SEE a backlog that is not
+     * draining — a cursor that never moves across runs is a stuck mint, and
+     * without it that looks exactly like a quiet week.
+     */
+    mintRemainingCursor?: string | null;
 }
 
 export interface PullWindow {
@@ -390,7 +401,14 @@ export interface BankRegisterPullDependencies {
      * reconcile, so anything the statement already covers is linked and no
      * longer a mint candidate.
      */
-    mintFromQbo?(account: string, deadlineAt?: number): Promise<{ minted: number; skipped: Record<string, number> } | null>;
+    mintFromQbo?(account: string, deadlineAt?: number): Promise<{
+        minted: number;
+        skipped: Record<string, number>;
+        /** False when the mint stopped on its batch cap or the deadline. */
+        complete?: boolean;
+        /** Where it stopped, when it stopped early. */
+        remainingCursor?: string | null;
+    } | null>;
     now?(): number;
     /** Wall clock, injectable so the absolute deadline is testable. Defaults to Date.now. */
     clock?(): number;
@@ -469,7 +487,12 @@ export interface BankRegisterPullSummary {
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
     mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window";
-    minted?: { minted: number; skipped: Record<string, number> } | null;
+    minted?: {
+        minted: number;
+        skipped: Record<string, number>;
+        complete?: boolean;
+        remainingCursor?: string | null;
+    } | null;
 }
 
 /**
@@ -654,6 +677,14 @@ export async function runBankRegisterPull(
     if (dependencies.mintFromQbo && mintIsSafe) {
         try {
             summary.minted = await dependencies.mintFromQbo(account, workDeadline());
+            // A TRUNCATED MINT IS NOT A COMPLETE RUN. It is not a failure
+            // either — the batch cap and the deadline are the system working —
+            // but a backlog of unminted observations is exactly the state the
+            // freshness stamp must not certify as current.
+            if (summary.minted && summary.minted.complete === false) {
+                summary.complete = false;
+                summary.error = summary.error ?? "mint-incomplete";
+            }
         } catch (error) {
             summary.minted = null;
             summary.ok = false;
@@ -689,6 +720,7 @@ export async function runBankRegisterPull(
         summary.highWater = highWater;
         try {
             await dependencies.saveWindowState({
+                mintRemainingCursor: summary.minted?.remainingCursor ?? null,
                 highWater,
                 lastFullSweep: windowFullyIngested && planned.fullSweep
                     ? endDate

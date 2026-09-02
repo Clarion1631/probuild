@@ -495,6 +495,26 @@ async function componentIssueRows(lineIds: string[]): Promise<Array<{ updatedAt:
     });
 }
 
+/**
+ * The lines that could compete inside this window, for the version stamp.
+ *
+ * BY AMOUNT AND SPAN, NOT BY ID. A line ARRIVING mid-plan — the nightly pull
+ * minting one, a statement import landing — is a new competitor for the same
+ * evidence, and an id list drawn from the plan itself is exactly the thing that
+ * cannot see it. The descriptor is hashed too, because a refreshed one changes
+ * the payee and therefore what matches.
+ */
+async function componentLineRows(
+    amounts: number[],
+    postedDate: { gte: Date; lt: Date },
+): Promise<Array<{ id: string; updatedAt: Date; rawDescriptor: string }>> {
+    if (amounts.length === 0) return [];
+    return prisma.bankLine.findMany({
+        where: { amountCents: { in: [...new Set(amounts)] }, postedDate },
+        select: { id: true, updatedAt: true, rawDescriptor: true },
+    });
+}
+
 function emptySummary(): ReceiptRequestApplySummary {
     return { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] };
 }
@@ -646,11 +666,18 @@ async function processBatch(
             },
         }),
     ]);
-    // THE VERSION OF THE WORLD THIS PLAN IS ABOUT TO BE MADE FROM.
+    // THE VERSION OF THE WORLD THIS PLAN IS ABOUT TO BE MADE FROM — all four
+    // inputs, because a verdict is a function of all four.
     const lineIds = lines.map(row => row.id);
+    const componentAmounts = lines.map(row => row.amountCents);
     const planVersion = componentVersionOf({
         issues: await componentIssueRows(lineIds),
         intakes: intakeRows,
+        lines: await componentLineRows(componentAmounts, range.calendar),
+        expenses: expenseRows.map(row => ({
+            id: row.id,
+            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+        })),
     });
 
     // 3. DECIDE.
@@ -721,6 +748,17 @@ async function processBatch(
             where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
             select: { updatedAt: true },
         }),
+        lines: await componentLineRows(componentAmounts, range.calendar),
+        // Re-read with the SAME predicate the planner used, so an expense that
+        // gained a receipt mid-plan changes the hash rather than slipping in
+        // under an unchanged count.
+        expenses: (await prisma.expense.findMany({
+            where: { date: range.timestamp },
+            select: { id: true, receiptUrl: true, receiptIntake: { select: { id: true } } },
+        })).map(row => ({
+            id: row.id,
+            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+        })),
     });
     if (!componentVersionsMatch(planVersion, currentVersion)) {
         return { summary: emptySummary(), undecided: plan.open.length + plan.close.length, replan: true };

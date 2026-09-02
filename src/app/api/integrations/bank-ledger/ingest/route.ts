@@ -656,6 +656,24 @@ const handlers = createBankLedgerIngestHandlers({
             // minted has to move with it. Half of this landing is the bug it
             // fixes, one layer down.
             touched += await prisma.$transaction(async tx => {
+                /**
+                 * THE IDENTITY LOCK, FIRST.
+                 *
+                 * `rawDescriptor` and `normalizedPayee` are what minting and
+                 * statement adoption plan against, and both take this lock
+                 * precisely so no two writers can be looking at different
+                 * versions of an identity at once. This refresh rewrites those
+                 * two columns, so without the lock it is a third writer working
+                 * outside the agreement: an adoption planned from the OLD payee
+                 * commits against the NEW one, sees no match, and mints a
+                 * second canonical line for a transaction that already had one.
+                 * `amountCents` is immutable by trigger, so only a human can
+                 * unpick that.
+                 *
+                 * $executeRaw, not $queryRaw: pg_advisory_xact_lock returns
+                 * void, and the query form trips the raw-SQL guard.
+                 */
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
                 const result = await tx.bankLineObservation.updateMany({
                     where: {
                         source: "QBO_REGISTER",

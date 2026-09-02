@@ -622,7 +622,7 @@ test("a duplicate target must be a real original, and cycles are refused", () =>
 
 // ── A signed memo needs a durable artifact (round-11 item 6) ────────────────
 
-test("signed:true with no durable artifact is a 400 that writes nothing", async () => {
+test("signed:true with no verifiable artifact is a 422 that writes nothing", async () => {
     // `signed:true` on its own used to close the chase, so a truncated or
     // malformed forwarder row silenced a genuinely missing receipt and left
     // nothing behind a human could open. These requests are refused BEFORE any
@@ -645,15 +645,23 @@ test("signed:true with no durable artifact is a 400 that writes nothing", async 
         },
     ));
 
+    // A signed memo must carry a Drive FILE ID. None of these is one, and none
+    // of them reaches Drive or the database: 422, because re-sending the same
+    // body would fail the same way (see receipt-answers-drive.test.ts for the
+    // three Drive outcomes).
     for (const [label, body] of [
         ["no artifact at all", { fingerprint: "pb-bl-1", signed: true }],
-        ["an off-host URL", { fingerprint: "pb-bl-1", signed: true, pdf_url: "https://example.com/memo.pdf" }],
-        ["a non-https URL", { fingerprint: "pb-bl-1", signed: true, pdf_url: "http://drive.google.com/file/d/1/view" }],
-        ["an empty signature id", { fingerprint: "pb-bl-1", signed: true, signature_id: "   " }],
+        ["the gate's own example", { fingerprint: "pb-bl-1", signed: true, pdf_id: "x" }],
+        ["a URL where the id goes", { fingerprint: "pb-bl-1", signed: true, pdf_id: "https://drive.google.com/file/d/1abc/view" }],
+        ["a URL and no id", { fingerprint: "pb-bl-1", signed: true, pdf_url: "https://drive.google.com/file/d/1abc/view" }],
+        ["a signature id, which is no longer accepted", { fingerprint: "pb-bl-1", signed: true, signature_id: "sig-123" }],
     ] as const) {
         const res = await post(body);
-        assert.equal(res.status, 400, label);
-        assert.deepEqual(await res.json(), { ok: false, reason: "missing-artifact", targetKey: "bl-1" }, label);
+        assert.equal(res.status, 422, label);
+        const payload = await res.json() as { ok: boolean; reason: string; targetKey: string };
+        assert.equal(payload.ok, false, label);
+        assert.equal(payload.reason, "missing-artifact", label);
+        assert.equal(payload.targetKey, "bl-1", label);
     }
 
     // Unauthenticated is still 401, and a row that is not a signature is still
@@ -732,4 +740,53 @@ test("and the refreshed descriptor is what gives the chaser the card tail", () =
         computeQboLineContentHash({ postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: stale, checkNumber: null }),
         computeQboLineContentHash({ postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: refreshed, checkNumber: null }),
     );
+});
+
+
+// -- The refresh takes the identity lock (round-17 item 2) -----------------
+
+test("the descriptor refresh takes the identity lock before touching identity", () => {
+    // Minting and statement adoption both plan under BANK_LINE_IDENTITY_LOCK
+    // precisely so no two writers see different versions of an identity. This
+    // refresh rewrites rawDescriptor AND normalizedPayee, so without the lock
+    // it is a third writer outside that agreement: an adoption planned from the
+    // OLD payee commits against the NEW one, matches nothing, and mints a
+    // SECOND canonical line for a transaction that already had one - and
+    // amountCents is immutable by trigger, so only a human can unpick it.
+    const source = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    const fn = source.slice(source.indexOf("refreshQboDescriptors: async (account, rows) =>"));
+    const body = fn.slice(0, fn.indexOf("createQboObservations:"));
+    const lockAt = body.indexOf("pg_advisory_xact_lock");
+    const readAt = body.indexOf("tx.bankLineObservation.updateMany(");
+    const lineAt = body.indexOf("tx.bankLine.updateMany(");
+    assert.ok(lockAt > 0, "the refresh must take the lock");
+    assert.ok(readAt > lockAt, "before it reads or writes the observation");
+    assert.ok(lineAt > lockAt, "and before it rewrites the canonical identity");
+    // $executeRaw, not $queryRaw: the lock function returns void.
+    assert.match(body, /await tx\.\$executeRaw`SELECT pg_advisory_xact_lock\(hashtext\(\$\{BANK_LINE_IDENTITY_LOCK\}\)\)`;/);
+    // The SAME lock the mint and adoption paths take - a different key would
+    // exclude nobody.
+    const pull = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(pull, /pg_advisory_xact_lock\(hashtext\(\$\{BANK_LINE_IDENTITY_LOCK\}\)\)/);
+});
+
+// -- A truncated mint is not a complete run (item 4) -----------------------
+
+test("mintFromQbo reports truncation, and a truncated run stamps nothing", () => {
+    const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    // Three exits, and only one of them is "finished".
+    assert.match(route, /return \{ minted, skipped, complete: true, remainingCursor: null \};/);
+    assert.match(route, /return \{ minted, skipped, complete: false, remainingCursor: "deadline" \};/);
+    assert.match(route, /return \{ minted, skipped, complete: false, remainingCursor \};/);
+    // The batch cap is a truncation too - falling out of the loop is not done.
+    assert.match(route, /const MINT_MAX_BATCHES = 10;/);
+    assert.match(route, /remainingCursor = result\.nextId;/);
+    // The freshness clock needs a run that was BOTH clean and whole.
+    assert.match(route, /if \(summary\.ok && summary\.complete\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    // And the cursor is persisted, so a backlog that is not draining is visible.
+    assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
+
+    const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
+    assert.match(lib, /if \(summary\.minted && summary\.minted\.complete === false\) \{[\s\S]{0,200}summary\.complete = false;/);
+    assert.match(lib, /mintRemainingCursor: summary\.minted\?\.remainingCursor \?\? null,/);
 });

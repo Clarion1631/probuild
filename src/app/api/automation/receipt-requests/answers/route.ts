@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
 import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, isDurableArtifactUrl } from "@/lib/receipt-requests";
+import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
 export const dynamic = "force-dynamic";
@@ -24,10 +25,11 @@ export const dynamic = "force-dynamic";
  * `{ok:true, ignored:true}` — not an error. The forwarder ships one file for
  * both systems and must not retry forever on rows that were never ours.
  *
- * NEVER emails anything, and never touches the PDF: it records the link
- * Beverly's app already produced. A `signed:true` carrying NO durable artifact
- * — no Drive/Storage `pdf_url`, no `signature_id` — is a 400 and writes
- * nothing.
+ * NEVER emails anything, and never downloads the PDF: it reads the file's
+ * METADATA to prove it exists, then records the id and a link. A `signed:true`
+ * with no `pdf_id`, or one naming a file Drive says is not there, writes
+ * nothing (422); a Drive we cannot reach is a 503 with `retry`, never a
+ * recorded resolution.
  *
  * AUTH: the Phase 1 machine secret, fail-closed. Exact-match proxy bypass, so
  * the caller gets a clean 401 rather than a redirect. No session branch exists.
@@ -36,16 +38,18 @@ export const dynamic = "force-dynamic";
 interface AnswerBody {
     fingerprint?: unknown;
     signed?: unknown;
+    /** The affidavit app's Drive file id. REQUIRED for a signature. */
+    pdf_id?: unknown;
+    /** Optional convenience link. Never the proof — see the artifact block. */
     pdf_url?: unknown;
-    signature_id?: unknown;
     job?: unknown;
     at?: unknown;
     message?: unknown;
     thread?: unknown;
 }
 
-/** Signature ids are opaque; cap them so a stray blob cannot bloat the row. */
-const MAX_SIGNATURE_ID_LEN = 128;
+/** A stored URL is display data; cap it so a stray blob cannot bloat the row. */
+const MAX_URL_LEN = 2_000;
 
 export async function POST(request: Request) {
     // RECEIPT_BRIDGE_SECRET, not the intake key — see the threads route.
@@ -77,23 +81,53 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, ignored: true, reason: "not-a-signature" });
     }
 
-    // A SIGNATURE WITHOUT AN ARTIFACT IS NOT EVIDENCE.
-    //
-    // `signed:true` on its own used to close the chase, so a truncated or
-    // malformed forwarder row silenced a genuinely missing receipt and left
-    // nothing behind that a human could open. The memo has to be backed by the
-    // affidavit app's own durable copy — a Drive/Storage PDF link, or the
-    // signature id that identifies the stored record. Neither present is a 400
-    // and NOTHING is written: no resolution, no clear.
-    const artifactUrl = isDurableArtifactUrl(body.pdf_url) ? body.pdf_url : null;
-    const rawSignatureId = typeof body.signature_id === "string" ? body.signature_id.trim() : "";
-    const signatureId = rawSignatureId ? rawSignatureId.slice(0, MAX_SIGNATURE_ID_LEN) : null;
-    if (!artifactUrl && !signatureId) {
+    /**
+     * A SIGNATURE WITHOUT A VERIFIED ARTIFACT IS NOT EVIDENCE.
+     *
+     * `signed:true` alone used to close the chase, so a truncated forwarder row
+     * silenced a genuinely missing receipt and left nothing a human could open.
+     * A URL was the next attempt and it is still not proof: a well-formed link
+     * to a file that was never created, or was created and deleted, passes
+     * every syntactic check there is.
+     *
+     * So the bridge sends the affidavit app's Drive FILE ID, and this reads its
+     * metadata before recording anything. Three outcomes, three different
+     * answers, and the difference is the point:
+     *
+     *   found       — record the resolution and clear the chase.
+     *   missing     — 422. Google answered and there is no such file (or it is
+     *                 in the bin). Retrying will not change that; the memo has
+     *                 to be re-generated. The chase stays open.
+     *   unreachable — 503. We could not ASK. Nothing is written, and the
+     *                 forwarder is told to come back: "we could not check" must
+     *                 never be recorded as "it checked out".
+     */
+    if (!isDriveFileId(body.pdf_id)) {
         return NextResponse.json(
-            { ok: false, reason: "missing-artifact", targetKey: bankLineId },
-            { status: 400 },
+            { ok: false, reason: "missing-artifact", detail: "a signed memo must carry its Drive pdf_id", targetKey: bankLineId },
+            { status: 422 },
         );
     }
+    const pdfId = (body.pdf_id as string).trim();
+    const probe = await probeDriveFile(pdfId);
+    if (probe.kind === "unreachable") {
+        console.error("[automation/receipt-requests/answers] Drive unreachable", pdfId, probe.reason);
+        return NextResponse.json(
+            { ok: false, reason: "artifact-unverifiable", retry: true, detail: probe.reason, targetKey: bankLineId },
+            { status: 503 },
+        );
+    }
+    if (probe.kind === "missing") {
+        return NextResponse.json(
+            { ok: false, reason: "artifact-missing", detail: probe.reason, targetKey: bankLineId },
+            { status: 422 },
+        );
+    }
+    // The caller's link if it is a durable one, else Drive's own — both are
+    // display data hanging off the id, which is the identity that was verified.
+    const artifactUrl = isDurableArtifactUrl(body.pdf_url)
+        ? (body.pdf_url as string).slice(0, MAX_URL_LEN)
+        : (probe.webViewLink ?? null);
 
     // RECORD FIRST, CLEAR ONLY IF IT COMMITTED.
     //
@@ -118,8 +152,9 @@ export async function POST(request: Request) {
         // corrected amount written since must survive.
         const details = parseMissingReceiptDetails(issue.displayDetails);
         details.resolution = "memo-signed";
+        // The ID is the durable identity; the URL is how a human opens it.
+        details.pdfId = pdfId;
         if (artifactUrl) details.pdfUrl = artifactUrl;
-        if (signatureId) details.signatureId = signatureId;
         if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
         if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
 

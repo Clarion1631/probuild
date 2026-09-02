@@ -276,12 +276,20 @@ Planner output for the executor: build exactly this; do not guess.
   Memos". ASSUMPTION / companion change: Beverly's Python runner (not in any repo here —
   it runs on Justin's PC) needs the small "post sign card on request" trigger; flag it in
   the PR description as a required companion, never silently assume it.
-- **Close the loop**: `POST /api/automation/receipt-requests/answers` (same machine
-  secret) accepting `{fingerprint, signed?, pdf_url?, job?, at, message, thread}` — a
+- **Close the loop**: `POST /api/automation/receipt-requests/answers`
+  (`RECEIPT_BRIDGE_SECRET`) accepting
+  `{fingerprint, signed?, pdf_id, pdf_url?, job?, at, message, thread}` — a
   qbo-clasp forwarder posts each NEW `chat-job-answers.json` record. For
-  `fingerprint = "pb-<bankLineId>"` with `signed:true`: record
-  `{resolution:"memo-signed", pdfUrl}` into the issue's `displayDetails`, then
-  `evaluateReviewIssue("bank-line", key, [], details)` to clear it. Photo answers need no
+  `fingerprint = "pb-<bankLineId>"` with `signed:true` the artifact is
+  **VERIFIED, not trusted**: `pdf_id` is required and its Drive metadata is read
+  (bounded, no download) before anything is written. Found ⇒ record
+  `{resolution:"memo-signed", pdfId, pdfUrl}` into the issue's `displayDetails`
+  and `evaluateReviewIssue("bank-line", key, [], details)` to clear it. Drive
+  says no such file (or it is trashed) ⇒ **422**, nothing written, the chase
+  stays open. Drive unreachable ⇒ **503** with `retry:true` — "we could not
+  check" must never be recorded as "it checked out". `pdf_url` alone is not
+  proof (a well-formed link to a file that was never created passes every
+  syntactic test), and `signature_id` is no longer accepted at all. Photo answers need no
   handling here — the resulting Expense/ReceiptIntake closes the issue via the nightly
   matcher. Unknown fingerprints (Beverly's own) → `{ok:true, ignored:true}`.
 

@@ -24,9 +24,12 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 // ── "Mark delivered" needs the thread identity (round-14 item 2) ────────────
 
 test("a delivered card must carry BOTH Chat names, from the same space", () => {
+    // The space is now checked against configuration too — see
+    // receipt-artifact-verification.test.ts for that half.
+    const env = { RECEIPTS_CHAT_WEBHOOK: "https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=k" };
     const thread = "spaces/AAQAKhvMYtg/threads/xyz-123";
     const message = "spaces/AAQAKhvMYtg/messages/xyz-123.abc-456";
-    assert.deepEqual(parseChatDelivery(thread, message), { threadName: thread, messageName: message });
+    assert.deepEqual(parseChatDelivery(thread, message, env), { threadName: thread, messageName: message });
 
     for (const [label, t, m] of [
         ["no thread", "", message],
@@ -39,10 +42,10 @@ test("a delivered card must carry BOTH Chat names, from the same space", () => {
         ["two DIFFERENT spaces", thread, "spaces/AAQAOther/messages/xyz-123"],
         ["not strings", null, undefined],
     ] as const) {
-        assert.equal(parseChatDelivery(t, m), null, label);
+        assert.equal(parseChatDelivery(t, m, env), null, label);
     }
     // Surrounding whitespace is a paste artefact, not a mistake.
-    assert.deepEqual(parseChatDelivery(`  ${thread} `, ` ${message}  `), { threadName: thread, messageName: message });
+    assert.deepEqual(parseChatDelivery(`  ${thread} `, ` ${message}  `, env), { threadName: thread, messageName: message });
 });
 
 test("the two Chat name shapes are not interchangeable", () => {

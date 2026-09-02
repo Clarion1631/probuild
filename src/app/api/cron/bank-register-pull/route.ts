@@ -78,6 +78,7 @@ async function readWindowState(): Promise<PullWindowState> {
             continueAfter: resume && typeof resume.postedDate === "string" && typeof resume.qbTxnId === "string"
                 ? { postedDate: resume.postedDate, qbTxnId: resume.qbTxnId }
                 : null,
+            mintRemainingCursor: typeof parsed.mintRemainingCursor === "string" ? parsed.mintRemainingCursor : null,
         };
     } catch {
         // A corrupt or unreadable state is "we know nothing", which plans the
@@ -144,12 +145,16 @@ const MINT_MAX_BATCHES = 10;
  * `bankLineId: null`, so a concurrent reconcile that just claimed the same
  * observation wins and this mint rolls back rather than forking the identity.
  */
-async function mintFromQbo(account: string, deadlineAt?: number): Promise<{ minted: number; skipped: Record<string, number> }> {
+async function mintFromQbo(
+    account: string,
+    deadlineAt?: number,
+): Promise<{ minted: number; skipped: Record<string, number>; complete: boolean; remainingCursor: string | null }> {
     // The START of the oldest allowed day, not an instant 60 days ago:
     // `postedDate` is a `@db.Date` at UTC midnight, so an instant boundary
     // silently drops the whole of its own oldest day and moves every run.
     const since = registerWindowStart(new Date(), MINT_LOOKBACK_DAYS);
     let minted = 0;
+    let remainingCursor: string | null = null;
     const skipped: Record<string, number> = {};
 
     // BOUNDED BATCHES, each its own transaction. One transaction for the whole
@@ -167,7 +172,8 @@ async function mintFromQbo(account: string, deadlineAt?: number): Promise<{ mint
         // deadline handed in already holds back CHECKPOINT_RESERVE_MS.
         if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
             skipped["deadline"] = (skipped["deadline"] ?? 0) + 1;
-            break;
+            // TRUNCATED, and it says so. See the return below.
+            return { minted, skipped, complete: false, remainingCursor: "deadline" };
         }
         const result = await prisma.$transaction(async tx => {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
@@ -233,15 +239,33 @@ async function mintFromQbo(account: string, deadlineAt?: number): Promise<{ mint
                 if (linked.count === 0) throw new ObservationClaimedError();
                 mintedHere++;
             }
-            return { mintedHere, skipped: plan.skipped, more: plan.mint.length > slice.length };
+            return {
+                mintedHere,
+                skipped: plan.skipped,
+                more: plan.mint.length > slice.length,
+                // The oldest observation still waiting, so a truncated run can
+                // say WHERE it stopped rather than merely that it did.
+                nextId: plan.mint[slice.length]?.id ?? null,
+            };
         }, { timeout: MINT_TX_TIMEOUT_MS });
 
         minted += result.mintedHere;
         for (const [key, value] of Object.entries(result.skipped)) skipped[key] = value;
-        if (!result.more) break;
+        if (!result.more) return { minted, skipped, complete: true, remainingCursor: null };
+        remainingCursor = result.nextId;
     }
 
-    return { minted, skipped };
+    /**
+     * THE BATCH CAP BIT, and it is not a detail.
+     *
+     * Falling out of this loop means there is more to mint and this invocation
+     * chose to stop. Reporting that as a finished mint let the caller stamp the
+     * freshness clock, which tells the health check the register is current
+     * while a backlog of unminted observations sits behind it — and every
+     * following run re-derives the same first ten batches, so the backlog never
+     * drains and nothing ever says so.
+     */
+    return { minted, skipped, complete: false, remainingCursor };
 }
 
 class ObservationClaimedError extends Error {}

@@ -524,18 +524,53 @@ export interface ChatDelivery {
 }
 
 /**
+ * THE space these cards live in, from configuration.
+ *
+ * `RECEIPTS_CHAT_SPACE` if set; otherwise derived from the webhook URL, whose
+ * path is `/v1/spaces/<id>/messages`. One source of truth: the space we post
+ * to is by definition the space a reply can be in.
+ */
+export function configuredReceiptsSpace(
+    env: Record<string, string | undefined> = process.env,
+): string | null {
+    const explicit = env.RECEIPTS_CHAT_SPACE?.trim();
+    if (explicit) return explicit.replace(/^spaces\//, "");
+    const webhook = env.RECEIPTS_CHAT_WEBHOOK?.trim();
+    if (!webhook) return null;
+    try {
+        const match = /\/v1\/spaces\/([A-Za-z0-9_-]+)\//.exec(new URL(webhook).pathname);
+        return match ? match[1] : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * The pair an operator must supply to close an uncertain card by hand, or null
  * when what they pasted cannot be that pair.
  *
- * BOTH names are required and both must name the SAME space — a pair copied
- * from two different cards is the mistake this catches, and it is a plausible
- * one when somebody is working through a list of them.
+ * BOTH names are required, both must name the same space, and that space must
+ * be OUR space. A well-formed pair from somewhere else is the dangerous shape:
+ * it satisfies every syntactic check, marks the card delivered, and points the
+ * bridge at a thread in a room the crew cannot see — so the card reads as
+ * answered and the replies that would answer it can never arrive. A pair copied
+ * from two different cards is the same class of mistake, and plausible when
+ * somebody is working through a list of them.
  */
-export function parseChatDelivery(threadName: unknown, messageName: unknown): ChatDelivery | null {
+export function parseChatDelivery(
+    threadName: unknown,
+    messageName: unknown,
+    env: Record<string, string | undefined> = process.env,
+): ChatDelivery | null {
     if (!isChatThreadName(threadName) || !isChatMessageName(messageName)) return null;
     const thread = threadName.trim();
     const message = messageName.trim();
     const space = chatSpaceOf(thread);
     if (space === null || space !== chatSpaceOf(message)) return null;
+    // Unconfigured is REFUSED, not waved through: with no known space there is
+    // nothing to check against, and "we could not check" must never read as
+    // "it checked out".
+    const ours = configuredReceiptsSpace(env);
+    if (ours === null || ours !== space) return null;
     return { threadName: thread, messageName: message };
 }

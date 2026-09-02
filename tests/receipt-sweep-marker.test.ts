@@ -91,7 +91,9 @@ test("a memo signed mid-sweep changes the component version", () => {
         issues: [{ updatedAt: new Date("2026-09-02T10:00:00Z") }, { updatedAt: new Date("2026-09-02T09:00:00Z") }],
         intakes: [{ updatedAt: new Date("2026-09-02T08:00:00Z") }],
     });
-    assert.deepEqual(planned, { newest: "2026-09-02T10:00:00.000Z", issues: 2, intakes: 1 });
+    assert.equal(planned.newest, "2026-09-02T10:00:00.000Z");
+    assert.equal(planned.issues, 2);
+    assert.equal(planned.intakes, 1);
     assert.equal(componentVersionsMatch(planned, { ...planned }), true, "an untouched component replans nothing");
 
     // The SIBLING was answered while we were planning.
@@ -132,4 +134,78 @@ test("a changed component is replanned, and never committed from a stale plan", 
     const wrapped = source.match(/await processBatchWithReplan\(/g) ?? [];
     assert.equal(wrapped.length, 2, "the open-issue pass and the line pass");
     assert.match(source, /replans,\s*\n\s*bankLines: linesSeen,/, "and it is reported");
+});
+
+
+// -- The stamp covers EVERY planner input (round-17 item 3) ----------------
+
+test("a receipt attached to an existing Expense mid-plan forces a replan", () => {
+    // THE RACE: a bookkeeper attaches a receipt to an expense that already
+    // existed. `hasReceipt` flips false to true, every line in the component
+    // gets a new answer - and Expense HAS NO updatedAt column (only createdAt
+    // and qbSyncedAt), so no timestamp anywhere on that row moves. Hashing the
+    // flag is the only fingerprint that sees it.
+    const issues = [{ updatedAt: new Date("2026-09-02T10:00:00Z") }];
+    const intakes: Array<{ updatedAt: Date }> = [];
+    const lines = [{ id: "bl-1", updatedAt: new Date("2026-09-02T09:00:00Z"), rawDescriptor: "LOWES #02516" }];
+
+    const before = componentVersionOf({
+        issues, intakes, lines,
+        expenses: [{ id: "exp-1", hasReceipt: false }, { id: "exp-2", hasReceipt: true }],
+    });
+    const after = componentVersionOf({
+        issues, intakes, lines,
+        expenses: [{ id: "exp-1", hasReceipt: true }, { id: "exp-2", hasReceipt: true }],
+    });
+    assert.equal(before.expenses, after.expenses, "the COUNT is identical - that is the trap");
+    assert.equal(before.newest, after.newest, "and so is every timestamp");
+    assert.notEqual(before.expenseHash, after.expenseHash);
+    assert.equal(componentVersionsMatch(before, after), false, "so the plan must be redone");
+});
+
+test("a BankLine inserted mid-plan forces a replan", () => {
+    // The nightly pull minting a line, or a statement import landing, adds a
+    // competitor for the same evidence. The plan was made without it.
+    const issues = [{ updatedAt: new Date("2026-09-02T10:00:00Z") }];
+    const intakes: Array<{ updatedAt: Date }> = [];
+    const expenses = [{ id: "exp-1", hasReceipt: true }];
+
+    const before = componentVersionOf({
+        issues, intakes, expenses,
+        lines: [{ id: "bl-1", updatedAt: new Date("2026-09-02T09:00:00Z"), rawDescriptor: "LOWES #02516" }],
+    });
+    const after = componentVersionOf({
+        issues, intakes, expenses,
+        lines: [
+            { id: "bl-1", updatedAt: new Date("2026-09-02T09:00:00Z"), rawDescriptor: "LOWES #02516" },
+            { id: "bl-2", updatedAt: new Date("2026-09-02T09:30:00Z"), rawDescriptor: "LOWES #02516" },
+        ],
+    });
+    assert.equal(componentVersionsMatch(before, after), false);
+    assert.equal(after.lines, 2);
+
+    // And a REFRESHED descriptor on the same line, which changes the payee and
+    // therefore what matches, even though the id set is unchanged.
+    const refreshed = componentVersionOf({
+        issues, intakes, expenses,
+        lines: [{ id: "bl-1", updatedAt: new Date("2026-09-02T09:00:00Z"), rawDescriptor: "LOWES #02516 POS DEB C#8516" }],
+    });
+    assert.equal(refreshed.lines, before.lines);
+    assert.notEqual(refreshed.lineHash, before.lineHash);
+    assert.equal(componentVersionsMatch(before, refreshed), false);
+});
+
+test("the cron stamps all four inputs, at plan time and again before writing", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    // Both stamps read the same four things.
+    const stamps = source.match(/componentVersionOf\(\{/g) ?? [];
+    assert.equal(stamps.length, 2, "plan time and check time");
+    for (const input of [/issues: await componentIssueRows\(lineIds\)/, /intakes:/, /lines: await componentLineRows\(componentAmounts, range\.calendar\)/, /expenses:/]) {
+        const matches = source.match(new RegExp(input.source, "g")) ?? [];
+        assert.ok(matches.length >= 2, `both stamps must cover ${input.source}`);
+    }
+    // Lines are re-read BY AMOUNT AND SPAN, not by the plan's own id list - an
+    // id list drawn from the plan cannot see a line that just arrived.
+    assert.match(source, /where: \{ amountCents: \{ in: \[\.\.\.new Set\(amounts\)\] \}, postedDate \}/);
+    assert.doesNotMatch(source, /componentLineRows\(lineIds\)/);
 });

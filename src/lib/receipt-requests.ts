@@ -1107,23 +1107,87 @@ export function componentTouchesBoundary(
  * see a row being DELETED, and a deleted intake un-answers a charge).
  */
 export interface ComponentVersion {
+    /** Newest updatedAt across the issues, intakes and bank lines. */
     newest: string;
     issues: number;
     intakes: number;
+    /** The component's own lines: a count and a hash of their identities. */
+    lines: number;
+    lineHash: string;
+    /**
+     * The receipt-bearing expenses in the window: a count, and a hash of
+     * (id, hasReceipt).
+     *
+     * `Expense` HAS NO `updatedAt` COLUMN — only `createdAt` and `qbSyncedAt` —
+     * so a timestamp cannot see the race that matters here: a bookkeeper
+     * attaching a receipt to an EXISTING expense flips `hasReceipt` false→true
+     * and changes the answer for every line in the component, while every
+     * timestamp on the row stays exactly where it was. Hashing the flag itself
+     * is the only fingerprint that catches it.
+     */
+    expenses: number;
+    expenseHash: string;
 }
 
+/** A short, order-independent digest. Not cryptographic — a change detector. */
+function fingerprint(parts: readonly string[]): string {
+    let hash = 0x811c9dc5;
+    for (const part of [...parts].sort()) {
+        for (let i = 0; i < part.length; i++) {
+            hash ^= part.charCodeAt(i);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        hash ^= 0x2c; // a separator, so ["ab","c"] and ["a","bc"] differ
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Stamp EVERY input the planner read, not just the ones that are easy to watch.
+ *
+ * A verdict is a function of four things: the issues, the intakes, the bank
+ * lines in the component, and the receipt-bearing expenses in the window.
+ * Versioning only the first two left two real races open — a bookkeeper
+ * attaching a receipt to an existing Expense, and a bank line arriving mid-plan
+ * — and BOTH change the allocation for every line in the component without
+ * touching anything the stamp watched. A fingerprint that covers only part of
+ * its input is an assurance about nothing.
+ */
 export function componentVersionOf(input: {
     issues: ReadonlyArray<{ updatedAt: Date | string | null }>;
     intakes: ReadonlyArray<{ updatedAt: Date | string | null }>;
+    lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null }>;
+    expenses?: ReadonlyArray<{ id: string; hasReceipt: boolean }>;
 }): ComponentVersion {
+    const iso = (value: Date | string | null | undefined): string =>
+        value instanceof Date ? value.toISOString() : (value ?? "");
     let newest = "";
-    for (const row of [...input.issues, ...input.intakes]) {
-        const at = row.updatedAt instanceof Date ? row.updatedAt.toISOString() : (row.updatedAt ?? "");
+    for (const row of [...input.issues, ...input.intakes, ...(input.lines ?? [])]) {
+        const at = iso((row as { updatedAt?: Date | string | null }).updatedAt);
         if (at > newest) newest = at;
     }
-    return { newest, issues: input.issues.length, intakes: input.intakes.length };
+    const lines = input.lines ?? [];
+    const expenses = input.expenses ?? [];
+    return {
+        newest,
+        issues: input.issues.length,
+        intakes: input.intakes.length,
+        lines: lines.length,
+        // The DESCRIPTOR is hashed, not just the id: a refreshed descriptor
+        // changes the payee, which changes what matches.
+        lineHash: fingerprint(lines.map(line => `${line.id}:${line.rawDescriptor ?? ""}`)),
+        expenses: expenses.length,
+        expenseHash: fingerprint(expenses.map(expense => `${expense.id}:${expense.hasReceipt ? 1 : 0}`)),
+    };
 }
 
 export function componentVersionsMatch(a: ComponentVersion, b: ComponentVersion): boolean {
-    return a.newest === b.newest && a.issues === b.issues && a.intakes === b.intakes;
+    return a.newest === b.newest
+        && a.issues === b.issues
+        && a.intakes === b.intakes
+        && a.lines === b.lines
+        && a.lineHash === b.lineHash
+        && a.expenses === b.expenses
+        && a.expenseHash === b.expenseHash;
 }
