@@ -36,6 +36,8 @@ import {
     createRouteDeadline,
     QBBudgetExhaustedError,
     qboHttpStatus,
+    isTransientQboStatus,
+    qboResponseError,
     type RouteDeadline,
     QboRetryableError,
     isRetryableQboError,
@@ -116,6 +118,9 @@ export async function ensureQBVendor(
         body: JSON.stringify({ DisplayName: trimmed }),
     });
     if (!res.ok) {
+        // 408/429/5xx is QuickBooks being unavailable, not a verdict on this
+        // vendor — classify it before any body sniffing.
+        if (isTransientQboStatus(res.status)) throw await qboResponseError(res, "QB vendor create");
         const err = await res.text();
         if (err.includes("6240")) {
             // A concurrent create can win the race between our lookup and our
@@ -304,6 +309,8 @@ async function defaultQbCreatePurchase(
         qbDeadline: deadline,
     });
     if (!res.ok) {
+        // Transient first: a 503 here is an outage, not a business rule.
+        if (isTransientQboStatus(res.status)) throw await qboResponseError(res, "QB purchase create");
         const text = await res.text();
         // A business-rule rejection (bad account ref, closed period, ...) is
         // terminal and distinct from a transient/network failure — thread the
@@ -414,7 +421,9 @@ export async function defaultUploadAttachment(
     if (!res.ok) {
         // Busy, timed out, or still unauthorized: QBO is not refusing this
         // file, so raise and let the push be retried rather than banking a
-        // terminal "failed:503" next to ok:true.
+        // terminal "failed:503" next to ok:true. (401 is attachment-specific —
+        // it survived the forced refresh above — so this set is wider than the
+        // shared transient one.)
         if (isTransientAttachmentStatus(res.status)) {
             throw new QboRetryableError(`QB attachment upload failed with status ${res.status}`, res.status);
         }

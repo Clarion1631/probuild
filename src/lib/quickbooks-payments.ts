@@ -838,7 +838,54 @@ export interface SyncQuickBooksPaymentsOptions {
     qboClient?: PaymentsSyncQboClient;
     /** Whole-run time budget; defaults to PAYMENTS_SYNC_BUDGET_MS. */
     deadline?: RouteDeadline;
+    /** Where the resume cursors live; defaults to the AutomationSetting table. */
+    cursorStore?: PaymentsSyncCursorStore;
 }
+
+/**
+ * Where the last run stopped, per collection, so the next one CONTINUES rather
+ * than restarting.
+ *
+ * Ordering by id made each run deterministic, but every run still began at the
+ * same end: with more pending rows than one run's budget, the rows past the cap
+ * were re-skipped forever and never verified. Persisting the cursor turns the
+ * cap into a rolling window over the whole set. Wrapping to the start on
+ * exhaustion keeps it a cycle rather than a dead end.
+ */
+export const PAYMENTS_CURSOR_KEYS = {
+    milestones: "qbo-payments-sync.cursor.milestones",
+    billings: "qbo-payments-sync.cursor.billings",
+} as const;
+/** Which collection goes first; flipped each run so neither can starve the other. */
+export const PAYMENTS_ORDER_KEY = "qbo-payments-sync.order";
+
+export interface PaymentsSyncCursorStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+
+/** AutomationSetting-backed cursor store. Never throws: a cursor is an optimisation. */
+export const automationSettingCursorStore: PaymentsSyncCursorStore = {
+    async get(key) {
+        try {
+            const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+            return row?.value ?? null;
+        } catch {
+            return null;
+        }
+    },
+    async set(key, value) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key },
+                create: { key, value },
+                update: { value },
+            });
+        } catch {
+            // A lost cursor costs one restart from the top, never correctness.
+        }
+    },
+};
 
 /** One database page. Small enough to stay responsive, big enough to be cheap. */
 const PAYMENTS_SYNC_PAGE_SIZE = 100;
@@ -854,31 +901,66 @@ const PAYMENTS_SYNC_MAX_ROWS = 500;
  * Ordering by id makes the walk deterministic, and anything we do not reach is
  * counted as skipped so the run is honestly reported as partial.
  */
-async function forEachPendingPage<T extends { id: string }>(
+export async function forEachPendingPage<T extends { id: string }>(
     result: QBPaymentSyncResult,
     deadline: RouteDeadline,
     fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
     countRemaining: (cursorId: string | null) => Promise<number>,
     handlePage: (rows: T[]) => Promise<void>,
+    cursor?: { store: PaymentsSyncCursorStore; key: string },
+    maxRows: number = PAYMENTS_SYNC_MAX_ROWS,
 ): Promise<void> {
-    let cursorId: string | null = null;
+    // Resume where the last run stopped. A run that finishes the tail wraps
+    // back to the start, so the window rolls over the whole collection instead
+    // of stalling at whichever rows happen to sort last.
+    const storedCursor = cursor ? await cursor.store.get(cursor.key) : null;
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursorId: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
     let processed = 0;
+    let wrapped = false;
+
+    const saveCursor = async (value: string | null) => {
+        if (cursor) await cursor.store.set(cursor.key, value ?? "");
+    };
 
     while (true) {
         if (result.abortedOnQboOutage) break;
-        if (processed >= PAYMENTS_SYNC_MAX_ROWS) break;
+        if (processed >= maxRows) break;
         if (isBudgetExhausted(deadline)) break;
 
-        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, PAYMENTS_SYNC_MAX_ROWS - processed);
+        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, maxRows - processed);
         const page = await fetchPage(cursorId, take);
-        if (page.length === 0) return; // exhausted — nothing was missed
+
+        if (page.length === 0) {
+            // End of the collection. If we started mid-way, wrap once and keep
+            // going with whatever budget is left; the rows before the old
+            // cursor are exactly the ones a fixed start would never reach.
+            if (cursorId !== null && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null); // fully drained: next run starts at the top
+            return;
+        }
 
         await handlePage(page);
         processed += page.length;
         cursorId = page[page.length - 1].id;
+        await saveCursor(cursorId);
 
         // A short page means we reached the end of the collection.
-        if (page.length < take) return;
+        if (page.length < take) {
+            if (cursorId !== null && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null);
+            return;
+        }
     }
 
     // Stopped early. Count what is genuinely left AFTER the cursor rather than
@@ -1030,12 +1112,14 @@ async function runPaymentsSync(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
+    const cursorStore = options?.cursorStore ?? automationSettingCursorStore;
+
     const milestoneSelect = {
         id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
         invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
     } as const;
 
-    await forEachPendingPage(
+    const runMilestonePass = () => forEachPendingPage(
         result,
         routeDeadline,
         (cursorId, take) => prisma.paymentSchedule.findMany({
@@ -1133,6 +1217,7 @@ async function runPaymentsSync(
     }, (schedule, e) => {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
         }, "milestones", routeDeadline),
+        { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones },
     );
 
     // ── Progress billings ───────────────────────────────────────────────────
@@ -1148,7 +1233,7 @@ async function runPaymentsSync(
         invoice: { select: { code: true, estimateId: true } },
     } as const;
 
-    await forEachPendingPage(
+    const runBillingPass = () => forEachPendingPage(
         result,
         routeDeadline,
         (cursorId, take) => prisma.progressBilling.findMany({
@@ -1191,7 +1276,24 @@ async function runPaymentsSync(
     }, (billing, e) => {
             result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
         }, "progress billings", routeDeadline),
-    )
+        { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings },
+    );
+
+    // Alternate which collection goes first. Whichever runs second only gets
+    // the budget the first one left, so a fixed order lets a busy milestone
+    // queue starve progress billings indefinitely (and vice versa). Flipping
+    // each run guarantees both sides get to go first half the time.
+    const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
+    const billingsFirst = lastOrder !== "billings-first";
+    await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+
+    if (billingsFirst) {
+        await runBillingPass();
+        await runMilestonePass();
+    } else {
+        await runMilestonePass();
+        await runBillingPass();
+    }
 
     if (newlyFlagged.length > 0) {
         const { notifyQBSyncIssues } = await import("./payment-notifications");

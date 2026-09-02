@@ -1697,3 +1697,71 @@ test("a SHORT-budget push starting the verification does not poison it for other
     );
     assert.equal(accountQueries, 3, "one shared verification, not one per push");
 });
+
+
+// --- One transient classification, shared by every create path ---
+
+test("a 503 on the REAL vendor/customer/purchase create reaches the route as a 503 retry", async () => {
+    // Codex gate: each create classified for itself and none knew about
+    // transient statuses, so a 503 came back as a bare Error and the route
+    // reported an unknown failure (500) instead of the outage it plainly was.
+    // This drives the real helpers through the real route handler; only the
+    // network underneath returns 503.
+    const events: AutomationEventInput[] = [];
+    const serviceUnavailable = (async () =>
+        new Response(JSON.stringify({ Fault: { Error: [{ code: "5000" }] } }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => TOKENS,
+        createPurchase: (tokens, input, deadline) =>
+            withFetch(serviceUnavailable, async () => {
+                const mod = await import("../src/lib/qbo-receipt-push");
+                // Real ensures, real queries, real create — nothing stubbed but
+                // the project list, which is a database read.
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT] }, deadline);
+            }),
+        logEvent: event => { events.push(event); },
+    });
+
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({
+            fileId: "file-503",
+            projectName: PROJECT.name,
+            vendor: "Home Depot",
+            date: "2026-07-15",
+            totalAmount: 100,
+            groups: [{ category: "03 Plumbing", amount: 100 }],
+        }),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
+    assert.equal(events[0].reason, "qbo-unavailable");
+});
+
+test("408/429/5xx share one transient classification at the boundary", async () => {
+    const { isTransientQboStatus } = await import("../src/lib/quickbooks");
+    for (const status of [408, 429, 500, 502, 503, 504]) {
+        assert.equal(isTransientQboStatus(status), true, String(status));
+    }
+    for (const status of [400, 401, 403, 404, 409, 422]) {
+        assert.equal(isTransientQboStatus(status), false, String(status));
+    }
+});
+
+test("qboResponseError picks the class from the status", async () => {
+    const { qboResponseError, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+
+    const transient = await qboResponseError(new Response("busy", { status: 503 }), "QB vendor create");
+    assert.equal(isRetryableQboError(transient), true);
+    assert.equal(qboHttpStatus(transient), null, "a retryable error is not a plain HTTP error");
+
+    const terminal = await qboResponseError(new Response("nope", { status: 400 }), "QB vendor create");
+    assert.equal(terminal.name, "QboHttpError");
+    assert.equal(qboHttpStatus(terminal), 400);
+});

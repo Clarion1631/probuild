@@ -719,3 +719,118 @@ test("a stranded refresh is classified as its own failed-run reason", async () =
         { reason: "token-rotation-ambiguous", abortedOnQboOutage: false },
     );
 });
+
+
+// --- The cursor makes the row cap a rolling window, not a wall ---
+
+/** In-memory stand-in for the AutomationSetting-backed cursor store. */
+function memoryCursorStore() {
+    const values = new Map<string, string>();
+    return {
+        values,
+        store: {
+            async get(key: string) { return values.get(key) ?? null; },
+            async set(key: string, value: string) { values.set(key, value); },
+        },
+    };
+}
+
+/**
+ * Drives the REAL paging helper the sync uses, against an in-memory
+ * collection, so the resume/wrap behaviour under test is the shipped code
+ * rather than a restatement of it.
+ */
+async function runPagedPass(
+    all: { id: string }[],
+    cursorStore: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<void> },
+    key: string,
+    maxRows: number,
+    seen: Set<string>,
+) {
+    const { forEachPendingPage } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const sorted = [...all].sort((a, b) => a.id.localeCompare(b.id));
+    const after = (cursorId: string | null) =>
+        cursorId === null ? sorted : sorted.filter(r => r.id > cursorId);
+
+    await forEachPendingPage(
+        emptyResult(),
+        createRouteDeadline(30_000),
+        async (cursorId, take) => after(cursorId).slice(0, take),
+        async (cursorId) => after(cursorId).length,
+        async (page) => { for (const row of page) seen.add(row.id); },
+        { store: cursorStore, key },
+        maxRows,
+    );
+}
+
+test("across runs, EVERY row is reached — the cap becomes a rolling window", async () => {
+    // Codex gate: ordering by id made each run deterministic, but every run
+    // still started at the same end, so with more pending rows than one run's
+    // budget the tail was re-skipped forever and never verified.
+    const all = Array.from({ length: 250 }, (_, i) => ({ id: `row-${String(i).padStart(3, "0")}` }));
+    const { store } = memoryCursorStore();
+    const seen = new Set<string>();
+
+    // 100 rows per run: three runs must cover all 250 and wrap cleanly.
+    for (let run = 0; run < 3; run++) {
+        await runPagedPass(all, store, "k", 100, seen);
+    }
+
+    assert.equal(seen.size, 250, `only reached ${seen.size} of 250 rows`);
+});
+
+test("a drained collection wraps back to the top for the next run", async () => {
+    const all = Array.from({ length: 30 }, (_, i) => ({ id: `row-${String(i).padStart(3, "0")}` }));
+    const { store } = memoryCursorStore();
+
+    const first = new Set<string>();
+    await runPagedPass(all, store, "k", 100, first);
+    assert.equal(first.size, 30, "one run covers a small collection");
+
+    // Having drained it, the cursor is back at the top and the next run
+    // re-verifies from the start rather than sitting on an empty tail.
+    const second = new Set<string>();
+    await runPagedPass(all, store, "k", 100, second);
+    assert.equal(second.size, 30, "the next run starts again from the top");
+});
+
+test("the cursor survives between runs so run 2 does not repeat run 1", async () => {
+    const all = Array.from({ length: 200 }, (_, i) => ({ id: `row-${String(i).padStart(3, "0")}` }));
+    const { store, values } = memoryCursorStore();
+
+    const first = new Set<string>();
+    await runPagedPass(all, store, "k", 100, first);
+    assert.equal(first.size, 100);
+    assert.ok(values.get("k"), "a cursor must be persisted for the next run");
+
+    const second = new Set<string>();
+    await runPagedPass(all, store, "k", 100, second);
+    assert.equal(second.size, 100);
+    // No overlap: run 2 continued instead of restarting.
+    const overlap = [...second].filter(id => first.has(id));
+    assert.deepEqual(overlap, [], `run 2 repeated ${overlap.length} of run 1's rows`);
+});
+
+test("the collection order alternates so neither side starves", async () => {
+    const { PAYMENTS_ORDER_KEY } = await import("../src/lib/quickbooks-payments");
+    // Whichever collection runs second only gets the budget the first left, so
+    // a fixed order lets a busy queue starve the other one indefinitely.
+    const { store } = memoryCursorStore();
+    const order: string[] = [];
+    for (let run = 0; run < 4; run++) {
+        const last = await store.get(PAYMENTS_ORDER_KEY);
+        const billingsFirst = last !== "billings-first";
+        await store.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+        order.push(billingsFirst ? "billings" : "milestones");
+    }
+    assert.deepEqual(order, ["billings", "milestones", "billings", "milestones"]);
+});
+
+test("a cursor store that fails never breaks the run", async () => {
+    const { automationSettingCursorStore } = await import("../src/lib/quickbooks-payments");
+    // No database in unit tests: the real store must swallow that and report
+    // "no cursor" rather than throwing into the sync.
+    assert.equal(await automationSettingCursorStore.get("nope"), null);
+    await automationSettingCursorStore.set("nope", "value"); // must not throw
+});

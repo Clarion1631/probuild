@@ -2,6 +2,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import {
+    createRouteDeadline,
+    isBudgetExhausted,
+    isQBBudgetExhaustedError,
+    isQboConnectionFailure,
+    isQBTimeoutError,
+} from "@/lib/quickbooks";
+import {
     getQBInvoicePaymentOptions, setQBInvoicePaymentOptions,
     createQBPaymentForInvoice, deleteQBPayment, deleteQBInvoice,
 } from "@/lib/quickbooks";
@@ -90,12 +97,19 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "unknown-action" }, { status: 400 });
     }
 
+    // 100s under the 120s ceiling, leaving room to return the partial result
+    // rather than being killed with nothing to show for the work already done.
+    const deadline = createRouteDeadline(100_000);
+
     let tokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(deadline);
     } catch (e) {
         if (e instanceof QBNotConnectedError) {
             return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
+        }
+        if (isQBBudgetExhaustedError(e)) {
+            return NextResponse.json({ ok: false, reason: "qbo-budget-exhausted", retry: true }, { status: 503 });
         }
         throw e;
     }
@@ -107,10 +121,24 @@ export async function POST(req: Request) {
     });
 
     const results: { qbInvoiceId: string; code: string; result: string }[] = [];
-    for (const s of schedules) {
+    // Same rule as the payments loop: a shared connection failure means every
+    // remaining row fails identically at full cost, so stop and report what was
+    // done instead of burning the ceiling proving it 200 times over.
+    let skipped = 0;
+    let abortedReason: string | null = null;
+    for (const [index, s] of schedules.entries()) {
+        if (abortedReason) {
+            skipped = schedules.length - index;
+            break;
+        }
+        if (isBudgetExhausted(deadline)) {
+            abortedReason = "budget-exhausted";
+            skipped = schedules.length - index;
+            break;
+        }
         const qbId = s.qbInvoiceId!;
         try {
-            const current = await getQBInvoicePaymentOptions(tokens, qbId);
+            const current = await getQBInvoicePaymentOptions(tokens, qbId, deadline);
             if (!current) {
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "not-found-in-qbo" });
                 continue;
@@ -119,12 +147,30 @@ export async function POST(req: Request) {
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "already-correct" });
                 continue;
             }
-            const updated = await setQBInvoicePaymentOptions(tokens, qbId, current.syncToken, { card: true, ach: true });
+            const updated = await setQBInvoicePaymentOptions(tokens, qbId, current.syncToken, { card: true, ach: true }, deadline);
             results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: updated ? "updated" : "update-failed" });
         } catch (e) {
+            if (isQBBudgetExhaustedError(e)) {
+                abortedReason = "budget-exhausted";
+                skipped = schedules.length - index;
+                break;
+            }
+            if (isQboConnectionFailure(e)) {
+                abortedReason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
+                skipped = schedules.length - index - 1;
+                break;
+            }
             results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `error: ${e instanceof Error ? e.message.slice(0, 120) : "?"}` });
         }
     }
 
-    return NextResponse.json({ ok: true, checked: results.length, results });
+    // `ok` reflects whether the sweep actually finished: a run that stopped
+    // early has left work undone and must not read as a clean pass.
+    return NextResponse.json({
+        ok: abortedReason === null,
+        checked: results.length,
+        skipped,
+        ...(abortedReason ? { reason: abortedReason, retry: true } : {}),
+        results,
+    });
 }

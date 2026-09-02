@@ -141,6 +141,35 @@ export function isRetryableQboStatus(status: number): boolean {
 }
 
 /**
+ * The statuses that mean "QuickBooks could not serve this right now" —
+ * 408 (its edge timed out), 429 (rate limited), 5xx (broken).
+ */
+export function isTransientQboStatus(status: number): boolean {
+    return status === 408 || isRetryableQboStatus(status);
+}
+
+/**
+ * Turn a non-2xx QuickBooks response into the right error class, once, at the
+ * boundary every caller shares.
+ *
+ * Each create path used to classify for itself, and none of them knew about
+ * transient statuses: a 503 on a vendor, customer or purchase create came back
+ * as a bare `Error`, which the receipt route read as an unknown failure (500)
+ * instead of the retryable outage it plainly was. Same wall, three different
+ * verdicts depending on which call hit it. Now they all get QboRetryableError
+ * for 408/429/5xx and a typed QboHttpError (status preserved) for everything
+ * else, so downstream classification is identical wherever it happens.
+ */
+export async function qboResponseError(res: Response, label: string): Promise<Error> {
+    const body = await res.text().catch(() => "");
+    const detail = `${label} failed (${res.status}): ${body}`.slice(0, 500);
+    if (isTransientQboStatus(res.status)) {
+        return new QboRetryableError(detail, res.status);
+    }
+    return new QboHttpError(detail, res.status, body);
+}
+
+/**
  * A status that will repeat identically on the NEXT record.
  *
  * 429/5xx: QBO cannot serve requests. 401/403: the credential is bad, and it is
@@ -623,10 +652,7 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline
             Accept: "application/json",
         },
     });
-    if (!res.ok) {
-        const err = await res.text().catch(() => "");
-        throw new QboHttpError(`QB query failed (${res.status}): ${err}`.slice(0, 500), res.status, err);
-    }
+    if (!res.ok) throw await qboResponseError(res, "QB query");
     const data = await res.json();
     const response = data.QueryResponse || {};
     const key = Object.keys(response).find(k => Array.isArray(response[k]));
@@ -737,10 +763,7 @@ export async function ensureQBCustomer(
             ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
         }),
     });
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB customer create failed: ${err}`);
-    }
+    if (!res.ok) throw await qboResponseError(res, "QB customer create");
     const data = await res.json();
     return data.Customer.Id;
 }
@@ -1157,8 +1180,8 @@ export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pr
 }
 
 /** Read an invoice's online-payment toggles + sync token (for sparse updates). */
-export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string) {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!res.ok) return null;
     const inv = (await res.json()).Invoice;
     if (!inv) return null;
@@ -1175,9 +1198,11 @@ export async function setQBInvoicePaymentOptions(
     tokens: QBTokens,
     qbInvoiceId: string,
     syncToken: string,
-    opts: { card: boolean; ach: boolean }
+    opts: { card: boolean; ach: boolean },
+    deadline?: RouteDeadline,
 ): Promise<boolean> {
     const res = await qbFetch("/invoice", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Id: qbInvoiceId,
@@ -1217,9 +1242,9 @@ export async function appendQBInvoiceCustomerMemo(
 }
 
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
-export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
+export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number, deadline?: RouteDeadline) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`));
+    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`), undefined, deadline);
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
@@ -1237,7 +1262,12 @@ export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: numbe
  * Pagination matters for the initial historical backfill; a single QBO query
  * page would silently stop after its MAXRESULTS boundary.
  */
-export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?: Date): Promise<any[]> {
+export async function getQBPurchasesSince(
+    tokens: QBTokens,
+    since: Date,
+    until?: Date,
+    deadline?: RouteDeadline,
+): Promise<any[]> {
     if (!Number.isFinite(since.getTime())) {
         throw new Error("QBO purchase query requires a valid since date");
     }
@@ -1256,6 +1286,7 @@ export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?:
         const page = await qbQuery<any>(
             tokens,
             `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}'${untilClause} ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+            deadline,
         );
         purchases.push(...page);
         if (page.length < pageSize) break;
@@ -1331,9 +1362,9 @@ export async function getQBPurchaseChangesSince(
 }
 
 /** Posted customer payments (money in) from the books. */
-export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number) {
+export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number, deadline?: RouteDeadline) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await qbQuery<any>(tokens, `SELECT * FROM Payment WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    const rows = await qbQuery<any>(tokens, `SELECT * FROM Payment WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`, deadline);
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
