@@ -95,6 +95,15 @@ export interface PipelineHealth {
         stuck: CountProbe;
         /** NEEDS_REVIEW backlog. Reported always; a reason only when rows are STUCK. */
         needsReview: CountProbe;
+        /**
+         * NEEDS_JOB rows older than INTAKE_STUCK_HOURS — a receipt nobody has
+         * matched to a job. Terminal for the worker, so it can pile up
+         * indefinitely while every other probe reads green: the exact
+         * silent-failure mode this whole check exists to eliminate. Only the
+         * OVERDUE ones count, so a receipt uploaded ten minutes ago is not an
+         * alert.
+         */
+        unassigned: CountProbe;
     };
 }
 
@@ -206,6 +215,7 @@ export function evaluatePipelineHealth(input: {
     stuck: CountProbe;
     intakeStuck: CountProbe;
     intakeNeedsReview: CountProbe;
+    intakeUnassigned: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -219,6 +229,7 @@ export function evaluatePipelineHealth(input: {
         ["stuck", input.stuck],
         ["intakeStuck", input.intakeStuck],
         ["intakeNeedsReview", input.intakeNeedsReview],
+        ["intakeUnassigned", input.intakeUnassigned],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -267,6 +278,14 @@ export function evaluatePipelineHealth(input: {
         const backlog =
             input.intakeNeedsReview.status === "ok" ? `,needs-review:${input.intakeNeedsReview.count}` : "";
         reasons.push(`intake-stuck:${input.intakeStuck.count}${backlog}`);
+    }
+
+    // A receipt that has been waiting hours for someone to say which job it
+    // belongs to is not "working as designed" — it is an expense that will
+    // never reach job cost. It is its own reason, separate from intake-stuck,
+    // because the fix is different: assign a project, not restart a worker.
+    if (input.intakeUnassigned.status === "ok" && input.intakeUnassigned.count > 0) {
+        reasons.push(`intake-unassigned:${input.intakeUnassigned.count}`);
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -336,6 +355,10 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck] = await Promise.all([
     const [intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck, intakeStuck, intakeNeedsReview] =
         await Promise.all([
+    const [
+        intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck,
+        intakeStuck, intakeNeedsReview, intakeUnassigned,
+    ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -470,6 +493,17 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             () => prisma.receiptIntake.count({ where: { state: "NEEDS_REVIEW" } }),
             0,
         ),
+        probe<number>(
+            "intakeUnassigned",
+            () =>
+                prisma.receiptIntake.count({
+                    where: {
+                        state: "NEEDS_JOB",
+                        createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                    },
+                }),
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -506,6 +540,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: intakeNeedsReview.reason,
             count: intakeNeedsReview.value,
         },
+        intakeUnassigned: {
+            status: intakeUnassigned.status,
+            reason: intakeUnassigned.reason,
+            count: intakeUnassigned.value,
+        },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -522,7 +561,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
         stuck: snapshot.stuck,
-        intake: { stuck: snapshot.intakeStuck, needsReview: snapshot.intakeNeedsReview },
+        intake: {
+            stuck: snapshot.intakeStuck,
+            needsReview: snapshot.intakeNeedsReview,
+            unassigned: snapshot.intakeUnassigned,
+        },
     };
 }
 
@@ -581,6 +624,9 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Receipt intake awaiting review: ${
             health.intake?.needsReview?.status === "error" ? "unavailable (probe failed)" : health.intake?.needsReview?.count ?? "unavailable"
+        }`,
+        `Receipt intake awaiting a job (>${INTAKE_STUCK_HOURS}h): ${
+            health.intake?.unassigned?.status === "error" ? "unavailable (probe failed)" : health.intake?.unassigned?.count ?? "unavailable"
         }`,
     ];
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);

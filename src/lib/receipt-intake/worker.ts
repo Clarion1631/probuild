@@ -15,7 +15,7 @@
  */
 import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
-import { startOfDateInTimeZone } from "@/lib/tz-date";
+import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
 import { backoffMs, MAX_BOOK_ATTEMPTS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
 import {
     appliedTaxCents,
@@ -59,6 +59,8 @@ export const RUN_SOFT_DEADLINE_MS = 40_000;
  * outage, and neither resolves itself.
  */
 export const STAGING_SWEEP_MINUTES = 15;
+/** Storage round trips per sweep. Small: the sweep runs before any real work. */
+export const STAGING_SWEEP_BATCH = 10;
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
  * from v3.4: an outage that never ends still has to end somewhere, and 20
@@ -93,15 +95,16 @@ export interface WorkerDependencies {
      * backlog and both un-park it, and the second one's UPDATE would race the
      * first one's claim.
      */
-    claim: (opts: { requeueDryRunParked: boolean }) => Promise<{ rows: WorkerRow[]; requeued: number } | null>;
+    claim: (opts: { retireShadowBacklog: boolean }) => Promise<{ rows: WorkerRow[]; shadowRetired: number } | null>;
     /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the cutover is testable. */
     isDryRunEnabled: () => boolean;
     /**
      * Move STAGING rows older than STAGING_SWEEP_MINUTES to NEEDS_REVIEW
-     * `file-missing`. A row whose upload never landed is invisible to the claim
-     * predicate by design, so nothing else would ever notice it.
+     * `file-missing`, or PUBLISH them when the object is actually there.
+     * `shouldStop` bounds the pass: the sweep downloads objects, so it must not
+     * be able to eat the invocation before any real work starts.
      */
-    sweepStaleStaging: () => Promise<number>;
+    sweepStaleStaging: (shouldStop: () => boolean) => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
     /** Tagged: a confirmed 404 and a transient storage fault are NOT the same answer. */
     downloadBytes: (storagePath: string) => Promise<DocBytesResult>;
@@ -169,8 +172,8 @@ export interface WorkerRunSummary {
     skipped?: "already-running";
     /** Rows left unprocessed because the soft deadline hit. They keep their lease. */
     deferredToNextRun?: number;
-    /** Rows un-parked by the first live pass after the shadow week. */
-    requeued?: number;
+    /** Shadow-week rows retired as SHADOW_DONE by the first live pass. */
+    shadowRetired?: number;
     /** STAGING rows whose upload never landed, parked for a human. */
     staleStagingSwept?: number;
 }
@@ -257,22 +260,31 @@ export function toDateStr(date: Date): string {
 
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
-    // Cutover: the FIRST live pass hands the shadow week's parked backlog back
-    // to the queue. Rows parked under dryRun are excluded from the claim (see
-    // the cron route's claim predicate) precisely so they cannot starve the
-    // batch — which also means nothing else would ever wake them. It runs
-    // INSIDE the claim transaction, under the same lock.
-    const claimed = await deps.claim({ requeueDryRunParked: !deps.isDryRunEnabled() });
+    // THE DEADLINE STARTS HERE, at invocation entry — not after the claim and
+    // the sweep. The sweep downloads objects, so timing it out of the budget
+    // meant it could consume the whole platform timeout and the worker would
+    // STILL go on to start a 25s Gemini read and a QBO round trip.
+    const startedAt = deps.monotonicMs();
+    const outOfTime = () => deps.monotonicMs() - startedAt >= RUN_SOFT_DEADLINE_MS;
+
+    // CUTOVER. Rows received while dry-run was on were booked by v1, so v2 must
+    // never book them: they are RETIRED as SHADOW_DONE, not requeued.
+    //
+    // Requeuing them was a double-booking hazard. v2's QBO identity for an
+    // email/chat/mobile/web row is the intake UUID, which v1 never saw, so
+    // QuickBooks' DocNumber idempotency could not recognise a Purchase v1 had
+    // already created for the same document — and the whole shadow backlog
+    // would have been booked a second time, on real books, in one pass.
+    const claimed = await deps.claim({ retireShadowBacklog: !deps.isDryRunEnabled() });
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, requeued } = claimed;
+    const { rows, shadowRetired } = claimed;
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
-    const staged = await deps.sweepStaleStaging().catch(() => 0);
+    const staged = await deps.sweepStaleStaging(outOfTime).catch(() => 0);
 
-    const startedAt = deps.monotonicMs();
     const byState: Record<string, number> = {};
     const bump = (state: string) => { byState[state] = (byState[state] ?? 0) + 1; };
 
@@ -284,7 +296,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         // ceiling — the invocation dies mid-book and the row's state is
         // whatever it happened to be. Stop TAKING rows instead; the claim
         // lease already keeps them ours, and the next run picks them up.
-        if (deps.monotonicMs() - startedAt >= RUN_SOFT_DEADLINE_MS) {
+        if (outOfTime()) {
             deferredToNextRun = rows.length - processed;
             break;
         }
@@ -325,7 +337,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         processed,
         byState,
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
-        ...(requeued ? { requeued } : {}),
+        ...(shadowRetired ? { shadowRetired } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
     };
 }
@@ -425,6 +437,9 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     }
 
     const read = outcome.read;
+    // Resolved BEFORE the keys: the fallback date is part of the dedup key, so
+    // it has to be the company's calendar day from the start.
+    const timeZone = await deps.companyTimeZone();
     const keys = dedupKeys({
         docType: read.docType,
         vendor: read.vendor,
@@ -432,7 +447,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         invoice: read.invoice,
         checkNumber: read.checkNumber,
         totalAmount: read.totalAmount,
-        fallbackDateStr: toDateStr(row.createdAt),
+        // The company's calendar day, not UTC's. `toISOString().slice(0,10)`
+        // rolls over at 16:00/17:00 local, so a receipt uploaded on a Pacific
+        // evening got TOMORROW's date as its fallback — changing its dedup key
+        // and its reporting period.
+        fallbackDateStr: dayKeyInTimeZone(row.createdAt, timeZone),
     });
 
     const totalCents = centsOf(keys.amount);
@@ -456,7 +475,6 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         : 0;
     const taxCents = accepted > 0 ? accepted : null;
     const taxImplausible = tax.implausible || (tax.taxCents !== null && taxCents === null);
-    const timeZone = await deps.companyTimeZone();
 
     const base = {
         vendor: read.vendor || null,
@@ -561,9 +579,17 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const weak = await deps.findWeakHit(row.id, keys.weak);
     if (weak) {
         const third = routeState(routeInput, { strong: null, weak }, !!row.projectId);
-        // The strong key stays claimed: this row is still the live owner of
-        // that date|ref, and releasing it would let a third copy book.
-        await deps.applyState(row.id, third.state, note(third.stateReason));
+        // RELEASE the strong key. Nothing was sent to QuickBooks, so this row
+        // is parked pre-send and the documented rule applies to it like any
+        // other. Holding the key made a CORRECTED resend of the same receipt
+        // collide with a row that was never booked — the review queue then had
+        // two rows and neither could proceed. The weak pair is still visible to
+        // a human through duplicateOfId and the reason.
+        await deps.applyState(row.id, third.state, note(third.stateReason), {
+            ...base,
+            dedupStrongKey: null,
+            duplicateOfId: third.duplicateOfId,
+        });
         return third.state;
     }
 

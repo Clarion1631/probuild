@@ -238,7 +238,9 @@ export async function POST(req: Request) {
         });
     } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-            return respondToSourceRefConflict(auth, source, sourceRef, fileSha256);
+            return respondToSourceRefConflict(auth, source, sourceRef, fileSha256, {
+                bytes: parsed.bytes, mimeType, storagePath,
+            });
         }
         // A projectId/costCodeId that doesn't exist is the CALLER's mistake, so
         // it must be a deterministic 400 — a 500 would make a forwarder retry a
@@ -287,6 +289,22 @@ export async function POST(req: Request) {
  * retry finds the STAGING row, confirms the object really is there, and
  * finishes the job.
  */
+/** Upload bytes to the private bucket. Returns false on any failure. */
+async function storeObject(storagePath: string, bytes: Buffer, mimeType: string): Promise<boolean> {
+    const supabase = getSupabase();
+    if (!supabase) return false;
+    try {
+        const { error } = await supabase.storage
+            .from(SECURE_BUCKET)
+            .upload(storagePath, bytes, { contentType: mimeType, upsert: true });
+        if (error) console.error("[receipts/intake] heal upload failed", error.message);
+        return !error;
+    } catch (error) {
+        console.error("[receipts/intake] heal upload threw", error instanceof Error ? error.name : "error");
+        return false;
+    }
+}
+
 async function publishStagedRow(id: string): Promise<NextResponse> {
     try {
         const published = await prisma.receiptIntake.update({
@@ -322,6 +340,8 @@ async function respondToSourceRefConflict(
     source: string,
     sourceRef: string,
     fileSha256: string,
+    /** The bytes this replay carried — used to HEAL a row whose object is gone. */
+    payload: { bytes: Buffer; mimeType: string; storagePath: string },
 ): Promise<NextResponse> {
     const existing = await prisma.receiptIntake.findUnique({
         where: { sourceRef },
@@ -362,36 +382,50 @@ async function respondToSourceRefConflict(
         );
     }
 
-    // Same bytes, and the first attempt is still STAGING. Two very different
-    // reasons for that, and only storage can tell them apart:
+    // SAME BYTES. Before promising anything, confirm the document is actually
+    // in the bucket — for EVERY state, not just STAGING.
     //
-    //  - the object IS there, so the previous request uploaded successfully and
-    //    only its publish UPDATE failed. Finish it. This is what makes the
-    //    publish resumable rather than a permanent half-state.
-    //  - the object is NOT there yet — a concurrent request is mid-upload, or
-    //    the last one died before storing anything. 202 "accepted, not yet
-    //    published" tells the caller to re-poll rather than assume a queued
-    //    document; the 15-minute sweeper handles the case where it never lands.
-    if (existing.state === "STAGING") {
-        if (await secureObjectExists(existing.storagePath)) {
-            return publishStagedRow(existing.id);
+    // Checking only STAGING left a hole: once the stale-row sweep flipped an
+    // orphan to NEEDS_REVIEW/file-missing, this replay returned a cheerful 200
+    // and the forwarder could delete its only copy of a receipt we did not
+    // have. The state a row happens to be parked in says nothing about whether
+    // its bytes exist.
+    if (!(await secureObjectExists(existing.storagePath))) {
+        // The caller just handed us the bytes again, so the orphan is fixable:
+        // store them and republish. This is the retry HEALING the row rather
+        // than merely reporting on it.
+        const healable = existing.state === "STAGING" || existing.state === "NEEDS_REVIEW";
+        if (healable) {
+            const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
+            if (!healed) {
+                return NextResponse.json({ ok: false, error: "storage-failed" }, { status: 503 });
+            }
+            await prisma.receiptIntake.update({
+                where: { id: existing.id },
+                data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
+            });
+            return NextResponse.json({
+                ok: true, recovered: true, id: existing.id, state: "RECEIVED",
+                sourceRef: existing.sourceRef, projectId: existing.projectId, dryRun: existing.dryRun,
+            });
         }
-        // 409, NOT 202. The forwarders retry only non-2xx: a 202 told the
-        // caller "accepted", so a Drive script would move its source file out
-        // of the pickup folder and the ORIGINAL document would be gone while
-        // nothing durable existed on our side. Any 2xx here is a promise we
-        // cannot keep until the object is confirmed.
+        // A booked/archived row with no object is not something a replay may
+        // rewrite. Retryable failure, never a 2xx.
         return NextResponse.json(
             {
                 ok: false,
-                error: "staging-incomplete",
-                reason: "the previous upload for this sourceRef never landed; retry",
+                error: "object-missing",
+                reason: "this sourceRef exists but its stored document is gone; escalate",
                 id: existing.id,
-                sourceRef: existing.sourceRef,
+                state: existing.state,
             },
             { status: 409 },
         );
     }
+
+    // The object is there. A STAGING row means the previous request uploaded
+    // successfully and only its publish UPDATE failed — finish it.
+    if (existing.state === "STAGING") return publishStagedRow(existing.id);
 
     return NextResponse.json({
         ok: true,

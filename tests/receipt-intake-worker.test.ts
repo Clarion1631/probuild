@@ -24,7 +24,7 @@ import {
     type WorkerDependencies,
     type WorkerRow,
 } from "../src/lib/receipt-intake/worker";
-import type { ReadOutcome } from "../src/lib/receipt-intake/read";
+import { normalizeDocType, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import { QBTimeoutError } from "../src/lib/quickbooks";
 import { QboAccountConfigError, QboPurchaseFaultError } from "../src/lib/qbo-receipt-push";
@@ -86,12 +86,12 @@ interface Harness {
     reads: number;
     books: number;
     applied: ReadPatch[];
-    states: { id: string; state: string; reason: string | null }[];
+    states: { id: string; state: string; reason: string | null; patch?: Partial<ReadPatch> }[];
     promoted: string[];
     finished: { id: string; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
-    claimOpts: { requeueDryRunParked: boolean }[];
+    claimOpts: { retireShadowBacklog: boolean }[];
     sweepCalls: number;
     clock: number;
 }
@@ -103,7 +103,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
-        claim: async opts => { h.claimOpts.push(opts); return { rows, requeued: 0 }; },
+        claim: async opts => { h.claimOpts.push(opts); return { rows, shadowRetired: 0 }; },
         isDryRunEnabled: () => true,
         sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
@@ -111,7 +111,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
         findWeakHit: async () => null,
-        applyState: async (id, state, reason) => { h.states.push({ id, state, reason }); },
+        applyState: async (id, state, reason, patch) => { h.states.push({ id, state, reason, patch }); },
         finishRouting: async (id, stateReason) => { h.finished.push({ id, stateReason }); },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
@@ -285,35 +285,36 @@ test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", 
 
 // ── Dry-run starvation (Codex blocker 1) ─────────────────────────────────────
 
-test("the shadow week does NOT ask the claim to requeue", async () => {
+test("the shadow week does NOT retire anything", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
     const summary = await runIntakeWorker(h.deps);
-    assert.deepEqual(h.claimOpts, [{ requeueDryRunParked: false }]);
-    assert.equal(summary.requeued, undefined);
+    assert.deepEqual(h.claimOpts, [{ retireShadowBacklog: false }]);
+    assert.equal(summary.shadowRetired, undefined);
 });
 
-test("the FIRST live pass asks the claim to un-park the backlog, INSIDE the lock", async () => {
-    // Parked rows are excluded from the claim (see the cron route's
-    // NOT_DRY_RUN_PARKED) precisely so they cannot starve the ten-row batch —
-    // which also means nothing else would ever wake them. The requeue rides in
-    // the claim transaction so two overlapping invocations cannot both un-park
-    // the same backlog and race each other's claim.
+test("CUTOVER: the shadow backlog is RETIRED, never requeued", async () => {
+    // The double-booking hazard this closes: v2's QBO identity for an
+    // email/chat/mobile/web row is the intake UUID, which v1 never saw, so
+    // QuickBooks' DocNumber idempotency could not recognise the Purchase v1
+    // already made — and requeuing would have booked the entire shadow backlog
+    // a second time, on real books, in one pass.
     const h = harness([], {
         isDryRunEnabled: () => false,
-        claim: async opts => { h.claimOpts.push(opts); return { rows: [], requeued: 7 }; },
+        claim: async opts => { h.claimOpts.push(opts); return { rows: [], shadowRetired: 7 }; },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.deepEqual(h.claimOpts, [{ requeueDryRunParked: true }]);
-    assert.equal(summary.requeued, 7);
+    assert.deepEqual(h.claimOpts, [{ retireShadowBacklog: true }]);
+    assert.equal(summary.shadowRetired, 7);
+    assert.equal(h.books, 0, "nothing from the shadow week is ever booked by v2");
 
-    // Idempotent by construction: nothing is left matching the predicate.
+    // Idempotent by construction: SHADOW_DONE no longer matches the predicate.
     const second = harness([], { isDryRunEnabled: () => false });
-    assert.equal((await runIntakeWorker(second.deps)).requeued, undefined, "a no-op requeue is not reported");
+    assert.equal((await runIntakeWorker(second.deps)).shadowRetired, undefined, "a no-op retire is not reported");
 });
 
-test("a run that loses the lock does nothing at all — including the requeue", async () => {
-    // The requeue is now part of the claim transaction, so losing the lock
-    // means losing it too. That is correct: the run that HOLDS the lock does it.
+test("a run that loses the lock does nothing at all — including the retire", async () => {
+    // The retire is part of the claim transaction, so losing the lock means
+    // losing it too. That is correct: the run that HOLDS the lock does it.
     const h = harness([], { isDryRunEnabled: () => false, claim: async () => null });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary, { processed: 0, byState: {}, skipped: "already-running" });
@@ -581,8 +582,11 @@ test("a weak-only hit still asks a human, and KEEPS the strong key", async () =>
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
     assert.equal(h.states[0].reason, "weak-dup:row-twin");
     assert.equal(h.states[0].state, "NEEDS_REVIEW");
-    // applyState was called WITHOUT a patch clearing dedupStrongKey.
-    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766");
+    // ...and it RELEASES the strong key: nothing was sent to QuickBooks, so the
+    // documented pre-send rule applies here like anywhere else. Holding it made
+    // a CORRECTED resend collide with a row that was never booked, leaving two
+    // rows in review and neither able to proceed.
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
 });
 
 test("a document-level gate short-circuits BOTH nets and claims no key", async () => {
@@ -709,4 +713,76 @@ test("a tax equal to the total is refused end to end", async () => {
     assert.equal(h.applied[0].taxCents, null);
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
     assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+});
+
+// ── Fail-closed classifier (round-5 item 4) ────────────────────────────────
+
+test("a missing or unknown doc_type is NEVER treated as a receipt", async () => {
+    // The old default was "receipt", and any unrecognised string also slipped
+    // past the exact multi/non_receipt checks. A truncated response, a schema
+    // change, or a prompt-injected document that suppressed the field while
+    // supplying plausible amounts went straight at QuickBooks.
+    for (const docType of ["", "unknown", "invoice", "RECEIPT_PLEASE_BOOK", "non-receipt"]) {
+        const h = harness([workerRow()], {
+            read: async () => ({
+                ok: true,
+                read: { ...goodRead.read, docType: normalizeDocType(docType) },
+            } as ReadOutcome),
+        });
+        const summary = await runIntakeWorker(h.deps);
+        assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 }, JSON.stringify(docType));
+        assert.equal(h.applied[0].stateReason, "unknown-doc-type", JSON.stringify(docType));
+        assert.equal(h.applied[0].dedupStrongKey, null, "and it claims no key");
+    }
+});
+
+test("normalizeDocType accepts exactly the four the prompt may return", () => {
+    for (const ok of ["receipt", "check", "multi", "non_receipt"]) {
+        assert.equal(normalizeDocType(ok), ok);
+        assert.equal(normalizeDocType(ok.toUpperCase()), ok, "case is normalised");
+    }
+    for (const bad of [undefined, null, "", "  ", "invoice", "reciept", 42, {}, ["receipt"]]) {
+        assert.equal(normalizeDocType(bad), "unknown", JSON.stringify(bad));
+    }
+    // Surrounding whitespace is a formatting artefact, not a different answer.
+    assert.equal(normalizeDocType("  receipt  "), "receipt");
+});
+
+// ── Fallback date in the company zone (round-5 item 5) ─────────────────────
+
+test("an unreadable date falls back to the COMPANY's calendar day, not UTC's", async () => {
+    // 2026-08-04T02:00Z is still the EVENING OF THE 3RD in Pacific. The old
+    // toISOString().slice(0,10) gave "2026-08-04", which changed the receipt's
+    // date, its dedup key, and its reporting period.
+    const h = harness([workerRow({ createdAt: new Date("2026-08-04T02:00:00.000Z") })], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "" } } as ReadOutcome),
+        companyTimeZone: async () => "America/Los_Angeles",
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].dedupWeakKey, "lowes|2026-08-03|364.98|amt", "the KEY uses the local day");
+    assert.equal(h.applied[0].txnDate!.toISOString(), "2026-08-03T07:00:00.000Z");
+    // Still no strong key: a fallback date is our guess, not the document's.
+    assert.equal(h.applied[0].dedupStrongKey, null);
+});
+
+// ── The sweep lives inside the run's budget (round-5 item 7) ───────────────
+
+test("the deadline starts at invocation entry, so a slow sweep cannot overrun it", async () => {
+    // The sweep downloads objects. Timing it OUT of the budget meant it could
+    // eat the platform timeout and the worker would still go on to start a 25s
+    // Gemini read and a QBO round trip.
+    const h = harness([workerRow(), workerRow({ id: "row-2" })], {
+        sweepStaleStaging: async shouldStop => {
+            h.sweepCalls++;
+            assert.equal(typeof shouldStop, "function", "the sweep is given the deadline");
+            assert.equal(shouldStop(), false, "not yet out of time");
+            h.clock += RUN_SOFT_DEADLINE_MS + 1_000; // a slow sweep
+            assert.equal(shouldStop(), true, "the sweep can see it is out of time");
+            return 1;
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.reads, 0, "no Gemini call after the budget is gone");
+    assert.equal(summary.processed, 0);
+    assert.equal(summary.deferredToNextRun, 2, "both rows keep their lease for the next run");
 });

@@ -217,15 +217,17 @@ test.describe("intake POST", () => {
             data: { state: "STAGING", storagePath: `receipts/intake/${created.body.id}-never-uploaded.png` },
         });
 
-        // 409, NEVER a 2xx. The forwarders retry only non-2xx: a 202 read as
-        // "accepted" would make a Drive script move its source file out of the
-        // pickup folder while nothing durable existed on our side.
+        // The replay carries the bytes again, so the orphan is HEALED rather
+        // than merely reported: stored and republished. Never a 202 — the
+        // forwarders retry only non-2xx, so "accepted" for a document we do not
+        // have would let a Drive script delete its only copy.
         const retry = await postIntake(request, intakeBody({ sourceRef: ref }));
-        expect(retry.res.status()).toBe(409);
-        expect(retry.body.ok).toBe(false);
-        expect(retry.body.error).toBe("staging-incomplete");
+        expect(retry.res.status()).toBe(200);
+        expect(retry.body.recovered).toBe(true);
+        expect(retry.body.state).toBe("RECEIVED");
         expect(retry.body.id).toBe(created.body.id);
-        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.state).toBe("STAGING");
+        const healed = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(healed?.state).toBe("RECEIVED");
     });
 
     test("a machine caller MUST supply its own sourceRef", async ({ request }) => {
@@ -611,5 +613,52 @@ test.describe("archive callback", () => {
         });
         expect(res.status()).toBe(404);
         await machine.dispose();
+    });
+});
+
+test.describe("orphan recovery", () => {
+    test("replaying a row the sweeper already parked file-missing HEALS it", async ({ request }) => {
+        // The hole this closes: storage existence was checked only while the row
+        // was STAGING. Once the sweep flipped an orphan to
+        // NEEDS_REVIEW/file-missing, an identical replay got a cheerful 200 and
+        // the forwarder could delete its only copy of a receipt we did not have.
+        const ref = `${REF_PREFIX}swept-orphan`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+
+        // Exactly what the sweeper leaves behind.
+        await prisma.receiptIntake.update({
+            where: { id: created.body.id },
+            data: {
+                state: "NEEDS_REVIEW",
+                stateReason: "file-missing",
+                storagePath: `receipts/intake/${created.body.id}-gone.png`,
+            },
+        });
+
+        const replay = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(replay.res.status()).toBe(200);
+        expect(replay.body.recovered).toBe(true);
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(row?.state).toBe("RECEIVED");
+        expect(row?.stateReason).toBeNull();
+    });
+
+    test("a BOOKED row whose object vanished is never rewritten by a replay", async ({ request }) => {
+        // A replay may heal an orphan, but it must not be able to reach into a
+        // row that already has a Purchase behind it.
+        const ref = `${REF_PREFIX}booked-orphan`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        await prisma.receiptIntake.update({
+            where: { id: created.body.id },
+            data: { state: "BOOKED", storagePath: `receipts/intake/${created.body.id}-gone.png` },
+        });
+
+        const replay = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(replay.res.status()).toBe(409);
+        expect(replay.body.error).toBe("object-missing");
+        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.state).toBe("BOOKED");
     });
 });

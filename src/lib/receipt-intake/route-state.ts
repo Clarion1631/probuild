@@ -10,9 +10,18 @@ export const RECEIPT_INTAKE_STATES = [
     "STAGING",
     "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
+    /**
+     * Terminal. The row arrived while RECEIPT_INTAKE_DRYRUN was on, so v1 (the
+     * Apps Script) booked it and v2 never will. See the cutover sequence in
+     * docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §7.
+     */
+    "SHADOW_DONE",
 ] as const;
 
 export type ReceiptIntakeState = (typeof RECEIPT_INTAKE_STATES)[number];
+
+/** Mirrors DOC_TYPES in read.ts — the closed set STEP 1 of the prompt may return. */
+const KNOWN_DOC_TYPES = new Set(["receipt", "check", "multi", "non_receipt"]);
 
 export interface RouteInput {
     docType: string;
@@ -74,6 +83,14 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
     }
     if (docType === "non_receipt") {
         return { state: "NON_RECEIPT", stateReason: null, duplicateOfId: null };
+    }
+    // Fail CLOSED on the classifier. A missing or unrecognised doc_type means
+    // we do not know whether this is a purchase at all — a truncated response, a
+    // schema change, or a prompt-injected document that suppressed the field
+    // while supplying plausible amounts. Booking on that is unacceptable; a
+    // human looks instead.
+    if (!KNOWN_DOC_TYPES.has(docType)) {
+        return { state: "NEEDS_REVIEW", stateReason: "unknown-doc-type", duplicateOfId: null };
     }
     if (read.totalCents === null || read.totalCents <= 0 || read.amount === "0.00") {
         return { state: "NEEDS_REVIEW", stateReason: "refund-or-zero", duplicateOfId: null };

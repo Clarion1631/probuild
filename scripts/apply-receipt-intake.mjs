@@ -72,6 +72,8 @@ export function targetMatches(actual, expectDb, expectHost) {
 export const RECEIPT_INTAKE_STATES = [
     "STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
+    // Received during the shadow week, therefore booked by v1 and NEVER by v2.
+    "SHADOW_DONE",
 ];
 
 export const statements = [
@@ -161,7 +163,8 @@ export const statements = [
                          AND conrelid = '"ReceiptIntake"'::regclass) THEN
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
-                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));
+                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
+                              'SHADOW_DONE'));
        END IF;
      END $$`,
 

@@ -180,3 +180,27 @@ test("RLS is enabled on ReceiptIntake, in both files, and WITHOUT force", () => 
     assert.ok(entry, "ReceiptIntake missing from prisma-blind-spots.json rlsTables");
     assert.equal(entry.forced, false);
 });
+
+test("SHADOW_DONE is a real state everywhere, so the cutover write cannot fail", () => {
+    // The cutover UPDATE writes this value on every shadow-week row in one
+    // statement. If the CHECK constraint did not know it, the entire cutover
+    // would abort — inside the claim transaction, on the first live run.
+    assert.ok(RECEIPT_INTAKE_STATES.includes("SHADOW_DONE"));
+    const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
+    assert.match(check!, /'SHADOW_DONE'/);
+    assert.match(migrationSql, /'SHADOW_DONE'/);
+    const snapshot = JSON.parse(
+        readFileSync(path.join(__dirname, "..", "prisma", "prisma-blind-spots.json"), "utf8"),
+    );
+    const entry = snapshot.checkConstraints.find((r: { name: string }) => r.name === "ReceiptIntake_state_check");
+    assert.match(entry.def, /'SHADOW_DONE'::text/);
+});
+
+test("SHADOW_DONE stays in the strong-key active set", () => {
+    // A shadow-week row WAS booked (by v1), so its dedup key must keep
+    // quarantining a post-cutover resend of the same receipt. Only DUPLICATE and
+    // VOID — rows that represent nothing — drop out of the index.
+    const index = statements.find((s: string) => s.includes("ReceiptIntake_dedupStrongKey_active_key"));
+    assert.match(index!, /NOT IN \('DUPLICATE', 'VOID'\)/);
+    assert.ok(!/SHADOW_DONE/.test(index!), "SHADOW_DONE must NOT be excluded");
+});

@@ -156,6 +156,30 @@ export function buildReadPrompt(projectPhases: ProjectPhase[]): string {
     );
 }
 
+/**
+ * The ONLY four answers STEP 1 of the prompt is allowed to give.
+ *
+ * `doc_type` used to default to "receipt" when the field was missing, and any
+ * unrecognised string fell through the exact `multi` / `non_receipt` checks in
+ * routeState and was treated as a bookable receipt too. So a truncated
+ * response, a schema change, or a prompt-injected document that suppressed the
+ * field while supplying plausible vendor/date/amount values would be routed
+ * straight at QuickBooks. Failing OPEN on a classifier that decides whether
+ * something is a purchase at all is exactly backwards.
+ */
+export const DOC_TYPES = ["receipt", "check", "multi", "non_receipt"] as const;
+/** Not in DOC_TYPES: routeState sends it to a human. */
+export const UNKNOWN_DOC_TYPE = "unknown";
+
+export function normalizeDocType(value: unknown): string {
+    // typeof, not coerce(): String(["receipt"]) is "receipt", so an array would
+    // otherwise be accepted as a valid classification. A doc_type that is not a
+    // string is not an answer.
+    if (typeof value !== "string") return UNKNOWN_DOC_TYPE;
+    const raw = value.trim().toLowerCase();
+    return (DOC_TYPES as readonly string[]).includes(raw) ? raw : UNKNOWN_DOC_TYPE;
+}
+
 function coerce(value: unknown): string {
     if (value === null || value === undefined) return "";
     return String(value).trim();
@@ -175,7 +199,7 @@ export function parseReadJson(text: string, projectPhases: ProjectPhase[]): Read
     const suggested = coerce(json.suggested_phase);
 
     return {
-        docType: (coerce(json.doc_type) || "receipt").toLowerCase(),
+        docType: normalizeDocType(json.doc_type),
         vendor: coerce(json.vendor),
         date: coerce(json.date),
         invoice: coerce(json.invoice),

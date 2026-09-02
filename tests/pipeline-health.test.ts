@@ -39,6 +39,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         stuck: { status: "ok" as const, count: 0 },
         intakeStuck: { status: "ok" as const, count: 0 },
         intakeNeedsReview: { status: "ok" as const, count: 0 },
+        intakeUnassigned: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
     };
@@ -186,6 +187,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         intake: {
             stuck: { status: "ok", count: 0 },
             needsReview: { status: "ok", count: 0 },
+            unassigned: { status: "ok", count: 0 },
         },
         ...overrides,
     };
@@ -577,7 +579,7 @@ test("a NEEDS_REVIEW backlog alone is NOT a failure", () => {
 });
 
 test("an intake probe that FAILED is not an intake probe that found nothing", () => {
-    for (const name of ["intakeStuck", "intakeNeedsReview"] as const) {
+    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned"] as const) {
         const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
         assert.equal(v.ok, false, name);
         assert.ok(v.reasons.includes(`probe-failed:${name}`), name);
@@ -595,10 +597,15 @@ test("the stuck reason survives a failed backlog probe rather than lying about i
 
 test("the digest prints both intake numbers", () => {
     const { text } = formatPipelineDigest(sampleHealth({
-        intake: { stuck: { status: "ok", count: 3 }, needsReview: { status: "ok", count: 7 } },
+        intake: {
+            stuck: { status: "ok", count: 3 },
+            needsReview: { status: "ok", count: 7 },
+            unassigned: { status: "ok", count: 2 },
+        },
     }));
     assert.match(text, /Receipt intake stuck >6h: 3/);
     assert.match(text, /Receipt intake awaiting review: 7/);
+    assert.match(text, /Receipt intake awaiting a job \(>6h\): 2/);
 });
 
 test("the digest says a failed intake probe is unavailable, never zero", () => {
@@ -606,6 +613,7 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
         intake: {
             stuck: { status: "error", reason: "timeout", count: 0 },
             needsReview: { status: "error", reason: "timeout", count: 0 },
+            unassigned: { status: "error", reason: "timeout", count: 0 },
         },
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
@@ -642,4 +650,29 @@ test("the intake stuck probe covers the three shapes of 'the worker stopped'", a
     // dryRun rows legitimately REST in READ for the whole shadow week — counting
     // them would make the check red by design and train everyone to ignore it.
     assert.equal(branches[2].dryRun, false);
+});
+
+test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
+    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
+    // while every other probe reads green — the exact silent failure this whole
+    // check exists to eliminate. Its own reason, because the fix is different:
+    // assign a project, not restart a worker.
+    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
+});
+
+test("a freshly uploaded unassigned receipt is not an alert", () => {
+    // Only rows OLDER than the stuck threshold are counted by the probe, so a
+    // receipt uploaded ten minutes ago never reaches this reason.
+    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+});
+
+test("unassigned and stuck are reported separately", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeUnassigned: { status: "ok", count: 3 },
+    }));
+    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
+    assert.ok(v.reasons.includes("intake-unassigned:3"));
 });

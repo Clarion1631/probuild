@@ -15,6 +15,7 @@ import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
+    STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
     isUniqueViolation,
     runIntakeWorker,
@@ -71,8 +72,8 @@ const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
 };
 
 async function claim(
-    opts: { requeueDryRunParked: boolean },
-): Promise<{ rows: WorkerRow[]; requeued: number } | null> {
+    opts: { retireShadowBacklog: boolean },
+): Promise<{ rows: WorkerRow[]; shadowRetired: number } | null> {
     const now = new Date();
     return prisma.$transaction(async tx => {
         const [lock] = await tx.$queryRaw<{ locked: boolean }[]>(
@@ -80,20 +81,30 @@ async function claim(
         );
         if (!lock?.locked) return null;
 
-        // Cutover, INSIDE the lock and the same transaction as the claim. Run
-        // outside it, two overlapping invocations could both see the parked
-        // backlog and both un-park it, and the second UPDATE would race the
-        // first one's claim. `dryRun` flips WITH the requeue: a row that
-        // reappeared still carrying dryRun=true would be skipped and re-parked
-        // forever.
-        let requeued = 0;
-        if (opts.requeueDryRunParked) {
+        // CUTOVER, inside the lock and the same transaction as the claim.
+        //
+        // Everything received during the shadow week was booked by v1, so v2
+        // RETIRES it — SHADOW_DONE, terminal, never booked here. It is not
+        // requeued, because v2's QBO identity for an email/chat/mobile/web row
+        // is the intake UUID, which v1 never saw: QuickBooks' DocNumber
+        // idempotency could not have recognised the Purchase v1 already made,
+        // and the entire backlog would have booked a second time on real books
+        // in a single pass. (Drive rows book under the Drive file id — v1's own
+        // identity — so those alone would have been safe. That is not enough to
+        // requeue the rest.)
+        //
+        // The rows keep their read results and dedup keys, so a post-cutover
+        // resend of the same receipt still collides with them and is caught.
+        let shadowRetired = 0;
+        if (opts.retireShadowBacklog) {
             const result = await tx.receiptIntake.updateMany({
                 where: { dryRun: true, state: { in: ["READ", "BOOKING"] } },
-                data: { dryRun: false, nextRetryAt: null },
+                data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
             });
-            requeued = result.count;
-            if (requeued > 0) console.log("[cron/receipt-intake-worker] cutover requeue", requeued);
+            shadowRetired = result.count;
+            if (shadowRetired > 0) {
+                console.log("[cron/receipt-intake-worker] shadow backlog retired", shadowRetired);
+            }
         }
 
         const due = await tx.receiptIntake.findMany({
@@ -109,7 +120,7 @@ async function claim(
             take: BATCH_SIZE,
             select: WORKER_ROW_SELECT,
         });
-        if (due.length === 0) return { rows: [], requeued };
+        if (due.length === 0) return { rows: [], shadowRetired };
 
         // THE claim. Anything this run took is invisible to the next one for
         // the lease, whether or not the advisory lock held.
@@ -117,7 +128,7 @@ async function claim(
             where: { id: { in: due.map(r => r.id) } },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS) },
         });
-        return { rows: due as WorkerRow[], requeued };
+        return { rows: due as WorkerRow[], shadowRetired };
     });
 }
 
@@ -127,7 +138,7 @@ function buildDeps(): WorkerDependencies {
 
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
 
-        sweepStaleStaging: async () => {
+        sweepStaleStaging: async shouldStop => {
             // NEVER a blanket "old therefore missing". A STAGING row that is old
             // because its publish UPDATE failed HAS its object in the bucket,
             // and declaring that receipt file-missing would hand a human a
@@ -138,12 +149,17 @@ function buildDeps(): WorkerDependencies {
             const stale = await prisma.receiptIntake.findMany({
                 where: { state: "STAGING", createdAt: { lt: cutoff } },
                 select: { id: true, storagePath: true },
-                take: 50,
+                // Small on purpose: each row costs a storage round trip, and the
+                // sweep runs BEFORE any receipt is processed. A big batch here
+                // spends the invocation on housekeeping.
+                take: STAGING_SWEEP_BATCH,
             });
 
             let published = 0;
             let parked = 0;
             for (const row of stale) {
+                // The sweep is inside the run's deadline, not outside it.
+                if (shouldStop()) break;
                 const probe = await downloadDocBytesResult(toSecureRef(row.storagePath));
                 if (probe.ok) {
                     // The upload landed; only the publish was lost. Finish it.

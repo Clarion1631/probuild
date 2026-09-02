@@ -3027,7 +3027,7 @@ model ReceiptIntake {
   /// yet, so the worker's claim predicate excludes it. The intake route flips
   /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets
   /// there is swept to NEEDS_REVIEW after 15 minutes.
-  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT
+  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT SHADOW_DONE
   dryRun      Boolean @default(true)
   /// no-estimate | multi-doc | zero-total | weak-dup:<id> |
   /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |

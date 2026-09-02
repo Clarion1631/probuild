@@ -435,6 +435,41 @@ here); multipart buffering before the size check (the platform body limit applie
 PDFs carrying embedded JavaScript (never opened server-side — the bytes go to Gemini and to
 QBO as an attachment).
 
+### CUTOVER SEQUENCE — do these in this order (2026-09-02)
+
+The hazard this order exists to prevent: v2's QuickBooks identity for an
+email/chat/mobile/web row is the intake UUID, which v1 never saw. QBO's DocNumber
+idempotency therefore CANNOT recognise a Purchase v1 already created for the same
+document. Run both pipelines live at once, or replay the shadow backlog through v2, and
+those receipts book twice on real books.
+
+Drive rows are the exception: v2 books them under the Drive file id, which IS v1's
+identity, so an overlap on a Drive-sourced file is idempotent. That is not enough to make
+an overlap safe in general.
+
+1. **Flip the Apps Script to forwarder mode** (`V2_FORWARD=true`). It now COPIES bytes to
+   `/api/receipts/intake` and still books everything itself. ProBuild is in dry-run:
+   it reads, dedups and routes, and books nothing.
+2. **Run the shadow week.** Gate on §8: 5 consecutive days where every archived v1 file has
+   a v2 row agreeing on vendor/date/total, and no v2 row stuck in RECEIVED over an hour.
+3. **Flip the Apps Script to `V2_LIVE=true`.** It now MOVES files to `_Forwarded` instead of
+   booking them. v1 stops writing to QuickBooks. ProBuild is still in dry-run, so for this
+   window NOTHING books — that is intended and it is why the window is short.
+4. **Confirm zero v1 bookings for 24 hours.** Watch the Automation register and QBO. This
+   is the step that makes the next one safe: it proves v1 is out of the books before v2
+   enters them, so the two can never both create a Purchase for one document.
+5. **Only then set `RECEIPT_INTAKE_DRYRUN=false`.** On its first pass the worker RETIRES the
+   entire shadow backlog to `SHADOW_DONE` / `booked-by-v1` — terminal, never booked by v2,
+   because v1 already booked all of it. Nothing is requeued. Only rows received AFTER this
+   point are booked by v2.
+
+Retired rows keep their read results and dedup keys, so a post-cutover resend of a
+shadow-week receipt still collides with them and is caught as a duplicate.
+
+**Rolling back** after step 5 means turning `V2_LIVE` off again and `RECEIPT_INTAKE_DRYRUN`
+back on. Rows received while v2 was live are already booked and stay `BOOKED`; v1 will not
+re-book them, because its own `_Forwarded` move already took those files out of its path.
+
 Two things a human must do before this can leave shadow mode:
 
 - Set `RECEIPT_INTAKE_SECRET` (new, independent of `RECEIPT_INGEST_SECRET`) in Vercel, and

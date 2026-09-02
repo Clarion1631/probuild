@@ -336,20 +336,54 @@ test("an attachment upload that FAILED is retried, never reported as booked", as
     assert.equal(r.expenses.length, 0, "no Expense until the receipt is actually on the Purchase");
 });
 
-test("the retry after an attachment failure asks a human instead of silently succeeding", async () => {
-    // The retry hits QBO's idempotency and comes back alreadyExists:true, which
-    // carries NO attachment status — so booking it would declare success for a
-    // Purchase we KNOW has no receipt on it.
+test("an EXISTING purchase is held to the SAME attachment standard", async () => {
+    // This is the path that matters: it is reached by every retry after a lost
+    // response — exactly when a Purchase is most likely to be sitting in the
+    // books without its image. It was the one path exempt from the check.
+    const failing = recorder({
+        createPurchase: async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+        }) as any,
+    });
+    const failed = await bookReceipt(row(), failing.deps);
+    assert.equal(failed.outcome, "retry", "an upload fault on an existing Purchase is recoverable");
+    assert.equal(failing.expenses.length, 0, "and it is NOT booked meanwhile");
+
+    const skipped = recorder({
+        createPurchase: async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped",
+        }) as any,
+    });
+    const skippedResult = await bookReceipt(row(), skipped.deps);
+    assert.equal(skippedResult.outcome, "needs-review");
+    assert.equal((skippedResult as any).reason, "unsupported-attachment:skipped");
+    assert.equal(skipped.expenses.length, 0);
+});
+
+test("a previous attachment failure does NOT block the recovery attempt", async () => {
+    // The QBO core re-checks and re-uploads the file for an existing Purchase
+    // (ensureAttachmentOnExistingPurchase), so the retry IS the recovery.
+    // Short-circuiting on lastError made the stranded-receipt case permanent —
+    // the opposite of what the guard was for.
     const r = recorder({
-        createPurchase: async () => ({ ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true }) as any,
+        createPurchase: async (_t, input) => {
+            r.purchaseCalls.push(input);
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+        },
     });
     const result = await bookReceipt(row({ lastError: "attachment-failed:failed:500" }), r.deps);
-    assert.deepEqual(result, {
-        outcome: "needs-review",
-        reason: "attachment-unconfirmed",
-        releaseStrongKey: false,
+    assert.equal(result.outcome, "booked", "the recovery succeeded and the row books");
+    assert.equal(r.purchaseCalls.length, 1, "the recovery attempt actually happened");
+    assert.equal(r.expenses.length, 1);
+});
+
+test("already-attached counts as attached on the fresh-create path too", async () => {
+    const r = recorder({
+        createPurchase: async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "already-attached",
+        }) as any,
     });
-    assert.equal(r.purchaseCalls.length, 0, "not even re-queried — the answer is already known");
+    assert.equal((await bookReceipt(row(), r.deps)).outcome, "booked");
 });
 
 test("a QBTimeoutError retries on the backoff schedule", async () => {
@@ -387,7 +421,8 @@ test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTA
 test("alreadyExists books identically — the lost-response retry", async () => {
     const r = recorder({
         createPurchase: async (_t, input) => ({
-            ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21), alreadyExists: true,
+            ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
+            alreadyExists: true, attachment: "already-attached",
         }) as any,
     });
     const result = await bookReceipt(row(), r.deps);

@@ -315,13 +315,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     const blocker = attachmentBlocker(row.mimeType, bytes.length);
     if (blocker) return parkedBeforeSend(`unsupported-attachment:${blocker}`);
 
-    // A previous attempt created the Purchase but could not attach the file.
-    // The retry below returns alreadyExists:true, which carries NO attachment
-    // status — so booking it now would silently declare success for a Purchase
-    // we know has no receipt on it. Hand it to a human instead.
-    if (row.lastError?.startsWith(ATTACHMENT_FAILED_PREFIX)) {
-        return { outcome: "needs-review", reason: "attachment-unconfirmed", releaseStrongKey: false };
-    }
+    // NOTE: a previous attachment failure deliberately does NOT short-circuit
+    // here. createQBReceiptPurchase re-checks and re-uploads the file for an
+    // EXISTING Purchase (ensureAttachmentOnExistingPurchase), so the retry is
+    // the recovery — parking early would have made the stranded-receipt case
+    // permanent, which is the opposite of the intent.
 
     const input: CreateQBReceiptPurchaseInput = {
         projectName: project.name,
@@ -368,11 +366,20 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: true };
     }
 
-    // The Purchase exists. If the receipt did NOT make it on, that is not a
-    // success: `failed:*` is an HTTP/transport fault on the upload leg and is
-    // worth another pass; `skipped` after a passing preflight means the two
-    // ceilings have drifted apart and a human must look.
-    if (!result.alreadyExists && result.attachment !== "attached") {
+    // The Purchase exists. If the receipt is not ON it, that is not a success —
+    // and this is checked on BOTH paths.
+    //
+    // The alreadyExists path was previously exempt, which is the path that
+    // MATTERS: it is reached by every retry after a lost response, i.e. exactly
+    // when a Purchase is most likely to be sitting there without its image. So
+    // the one case the check existed for was the one case it skipped.
+    //
+    // "already-attached" is a success: the file was put on by an earlier
+    // attempt. "failed:*" is an HTTP fault on the upload leg and is worth
+    // another pass (the QBO core re-uploads for an existing Purchase, so the
+    // retry genuinely recovers). "skipped" after a passing preflight means our
+    // mirrored ceilings have drifted from QBO's and a human must look.
+    if (result.attachment !== "attached" && result.attachment !== "already-attached") {
         if (result.attachment === "skipped") {
             return { outcome: "needs-review", reason: "unsupported-attachment:skipped", releaseStrongKey: false };
         }
