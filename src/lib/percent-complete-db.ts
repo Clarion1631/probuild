@@ -52,6 +52,17 @@ export function activeJobWhere() {
  * ONLY where the name is unambiguous on BOTH sides. Anything ambiguous stays
  * null and goes on being honestly unattributed rather than guessed.
  *
+ * Both sides are also narrowed to exactly what generation produces, because a
+ * name match against anything else is a false positive by construction:
+ *   - `ci."total" >= 0` — applyChangeOrderToSchedule builds children from
+ *     `items.filter(i => i.total >= 0)`. A negative DEDUCTION line never
+ *     produces a task, so letting it into the join can only mis-stamp a
+ *     same-named row or spuriously trip the ambiguity guard.
+ *   - `st."parentId" IS NOT NULL` — the CO PARENT row ("CO-001 · Title") is
+ *     also `type = 'task'` with a null `estimateItemId`, so a name collision
+ *     could stamp the structural parent and add a phantom task to the phase's
+ *     completion ratio. Only children are ever generated from an item.
+ *
  * Kept byte-identical to BACKFILL_CO_TASK_COST_CODES in
  * scripts/apply-percent-complete.mjs; tests/percent-complete-backfill.test.ts
  * fails if the two ever drift.
@@ -65,12 +76,16 @@ export const BACKFILL_CO_TASK_COST_CODES = `
       AND st."costCodeId" IS NULL
       AND st."estimateItemId" IS NULL
       AND st."type" = 'task'
+      AND st."parentId" IS NOT NULL
       AND ci."costCodeId" IS NOT NULL
+      AND ci."total" >= 0
       AND (SELECT COUNT(*) FROM "ChangeOrderItem" c2
-           WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name") = 1
+           WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name"
+             AND c2."total" >= 0) = 1
       AND (SELECT COUNT(*) FROM "ScheduleTask" s2
            WHERE s2."generatedFromChangeOrderId" = st."generatedFromChangeOrderId"
-             AND s2."name" = st."name" AND s2."type" = 'task') = 1`;
+             AND s2."name" = st."name" AND s2."type" = 'task'
+             AND s2."parentId" IS NOT NULL) = 1`;
 
 /**
  * Run the CO-task cost-code repair. Returns how many rows it fixed — zero on

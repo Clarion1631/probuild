@@ -53,7 +53,16 @@ function resetFixture() {
                 payments: [
                     { status: "Paid", amount: D(4_000), dueDate: null },
                     { status: "Pending", amount: D(6_000), dueDate: FUTURE },
-                    // Canceled milestones are not receivables — pre-existing rule.
+                    // PRE-EXISTING RULE, NOT INTRODUCED BY THIS PR. Canceled
+                    // milestones are skipped by `computeProjectFinancials`, which
+                    // is code that already lives on main:
+                    //   git show origin/main:src/lib/project-financials.ts | grep -n Canceled
+                    //   -> line 87, `if (payment.status === "Canceled") continue;`
+                    // introduced in bf65af41 (already merged). This PR's diff of
+                    // that file deletes exactly ONE line — the Promise.all
+                    // destructuring — and touches none of scheduledIncoming,
+                    // overdueIncoming or clientOwes. The row is here so the
+                    // fixture exercises the existing rule, not to assert a change.
                     { status: "Canceled", amount: D(2_500), dueDate: FUTURE },
                 ],
             },

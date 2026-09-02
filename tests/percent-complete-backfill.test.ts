@@ -18,13 +18,14 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
 
 import { BACKFILL_CO_TASK_COST_CODES as SCRIPT_SQL } from "../scripts/apply-percent-complete.mjs";
 
 // ── in-memory stand-in for the UPDATE ───────────────────────────────────────
 
-interface Task { id: string; coId: string | null; name: string; type: string; costCodeId: string | null; estimateItemId: string | null }
-interface CoItem { coId: string; name: string; costCodeId: string | null }
+interface Task { id: string; coId: string | null; name: string; type: string; costCodeId: string | null; estimateItemId: string | null; parentId: string | null }
+interface CoItem { coId: string; name: string; costCodeId: string | null; total: number }
 
 let tasks: Task[];
 let coItems: CoItem[];
@@ -32,10 +33,12 @@ let statementsRun: string[];
 
 function resetFixture() {
     tasks = [
-        { id: "t1", coId: "co1", name: "Recessed lighting", type: "task", costCodeId: null, estimateItemId: null },
-        { id: "t2", coId: "co1", name: "CO-001 · Extra electrical", type: "task", costCodeId: null, estimateItemId: null },
+        // The CO PARENT row: type 'task', no estimate item, and parentId null.
+        { id: "t2", coId: "co1", name: "CO-001 · Extra electrical", type: "task", costCodeId: null, estimateItemId: null, parentId: null },
+        // A generated CHILD, built from the CO item of the same name.
+        { id: "t1", coId: "co1", name: "Recessed lighting", type: "task", costCodeId: null, estimateItemId: null, parentId: "t2" },
     ];
-    coItems = [{ coId: "co1", name: "Recessed lighting", costCodeId: "cc-elec" }];
+    coItems = [{ coId: "co1", name: "Recessed lighting", costCodeId: "cc-elec", total: 1200 }];
     statementsRun = [];
 }
 
@@ -46,11 +49,16 @@ function applyBackfill(): number {
         if (t.costCodeId !== null) continue;          // st."costCodeId" IS NULL
         if (t.estimateItemId !== null) continue;      // st."estimateItemId" IS NULL
         if (t.type !== "task") continue;              // st."type" = 'task'
+        if (t.parentId === null) continue;            // st."parentId" IS NOT NULL
         if (!t.coId) continue;
-        const matches = coItems.filter((c) => c.coId === t.coId && c.name === t.name && c.costCodeId !== null);
-        if (matches.length !== 1) continue;           // unambiguous CO item
-        const twins = tasks.filter((s) => s.coId === t.coId && s.name === t.name && s.type === "task");
-        if (twins.length !== 1) continue;             // unambiguous task
+        const matches = coItems.filter(
+            (c) => c.coId === t.coId && c.name === t.name && c.costCodeId !== null && c.total >= 0
+        );
+        if (matches.length !== 1) continue;           // unambiguous task-producing CO item
+        const twins = tasks.filter(
+            (s) => s.coId === t.coId && s.name === t.name && s.type === "task" && s.parentId !== null
+        );
+        if (twins.length !== 1) continue;             // unambiguous child task
         t.costCodeId = matches[0].costCodeId;
         n++;
     }
@@ -98,9 +106,24 @@ beforeEach(() => {
 
 // ── the two copies must not drift ───────────────────────────────────────────
 
+const normalize = (sql: string) => sql.replace(/\s+/g, " ").trim();
+
 test("the apply script and the nightly repair run the SAME statement", () => {
-    const normalize = (sql: string) => sql.replace(/\s+/g, " ").trim();
     assert.equal(normalize(SCRIPT_SQL), normalize(APP_SQL));
+});
+
+test("the checked-in migration carries that same statement", () => {
+    // Three copies exist by necessity (the .mjs writes prod, the migration
+    // builds CI's database, the app repairs nightly). Only a test can stop them
+    // drifting.
+    const migration = readFileSync(
+        new URL("../prisma/migrations/20260901000000_percent_complete/migration.sql", import.meta.url),
+        "utf8",
+    );
+    assert.ok(
+        normalize(migration).includes(normalize(APP_SQL)),
+        "migration.sql has drifted from BACKFILL_CO_TASK_COST_CODES",
+    );
 });
 
 test("importing the apply script has no side effects (main-module guard intact)", () => {
@@ -114,6 +137,8 @@ test("the statement carries the guards that make it safe to repeat", () => {
     assert.match(APP_SQL, /st\."costCodeId" IS NULL/, "without this, a re-run would overwrite corrected codes");
     assert.match(APP_SQL, /st\."estimateItemId" IS NULL/, "estimate tasks resolve through their live item, not this");
     assert.match(APP_SQL, /st\."type" = 'task'/, "milestones are markers, not work");
+    assert.match(APP_SQL, /st\."parentId" IS NOT NULL/, "the CO parent row is structural, never generated from an item");
+    assert.match(APP_SQL, /ci\."total" >= 0/, "negative deduction lines never produce a task");
     assert.match(APP_SQL, /COUNT\(\*\) FROM "ChangeOrderItem"/, "ambiguous CO item names must not be guessed");
     assert.match(APP_SQL, /COUNT\(\*\) FROM "ScheduleTask"/, "ambiguous task names must not be guessed");
 });
@@ -136,10 +161,11 @@ test("the repair fixes what it can on the first run and nothing on the second", 
 });
 
 test("a task fixed by hand is never overwritten by a later repair", async () => {
-    tasks[0].costCodeId = "cc-manual";
+    const child = tasks.find((t) => t.id === "t1")!;
+    child.costCodeId = "cc-manual";
     const n = await repairChangeOrderTaskCostCodes();
     assert.equal(n, 0);
-    assert.equal(tasks[0].costCodeId, "cc-manual");
+    assert.equal(child.costCodeId, "cc-manual");
 });
 
 test("a CO task created AFTER the first repair is picked up by the next one", async () => {
@@ -147,8 +173,8 @@ test("a CO task created AFTER the first repair is picked up by the next one", as
     // this task between the apply script running and the deploy landing.
     await repairChangeOrderTaskCostCodes();
 
-    tasks.push({ id: "t3", coId: "co1", name: "Panel upgrade", type: "task", costCodeId: null, estimateItemId: null });
-    coItems.push({ coId: "co1", name: "Panel upgrade", costCodeId: "cc-elec" });
+    tasks.push({ id: "t3", coId: "co1", name: "Panel upgrade", type: "task", costCodeId: null, estimateItemId: null, parentId: "t2" });
+    coItems.push({ coId: "co1", name: "Panel upgrade", costCodeId: "cc-elec", total: 900 });
 
     const n = await repairChangeOrderTaskCostCodes();
     assert.equal(n, 1);
@@ -158,20 +184,59 @@ test("a CO task created AFTER the first repair is picked up by the next one", as
 // ── the ambiguity guards ────────────────────────────────────────────────────
 
 test("two CO items sharing a name are left alone rather than guessed", async () => {
-    coItems.push({ coId: "co1", name: "Recessed lighting", costCodeId: "cc-other" });
+    coItems.push({ coId: "co1", name: "Recessed lighting", costCodeId: "cc-other", total: 800 });
     const n = await repairChangeOrderTaskCostCodes();
     assert.equal(n, 0);
-    assert.equal(tasks[0].costCodeId, null);
+    assert.equal(tasks.find((t) => t.id === "t1")?.costCodeId, null);
 });
 
 test("two CO tasks sharing a name are left alone rather than guessed", async () => {
-    tasks.push({ id: "t4", coId: "co1", name: "Recessed lighting", type: "task", costCodeId: null, estimateItemId: null });
+    tasks.push({ id: "t4", coId: "co1", name: "Recessed lighting", type: "task", costCodeId: null, estimateItemId: null, parentId: "t2" });
     const n = await repairChangeOrderTaskCostCodes();
     assert.equal(n, 0);
-    assert.equal(tasks[0].costCodeId, null);
+    assert.equal(tasks.find((t) => t.id === "t1")?.costCodeId, null);
 });
 
 test("the CO parent row matches no item name and stays unattributed", async () => {
     await repairChangeOrderTaskCostCodes();
     assert.equal(tasks.find((t) => t.id === "t2")?.costCodeId, null);
+});
+
+// -- narrowing to exactly what generation produces ---------------------------
+
+test("the structural CO PARENT is never stamped, even on an exact name collision", async () => {
+    // The parent row is type 'task' with a null estimateItemId, so only the
+    // parentId guard keeps it out. Stamping it would add a phantom task to the
+    // phase's completion ratio -- a parent is a container, not work.
+    coItems.push({ coId: "co1", name: "CO-001 · Extra electrical", costCodeId: "cc-elec", total: 500 });
+
+    const n = await repairChangeOrderTaskCostCodes();
+
+    assert.equal(tasks.find((t) => t.id === "t2")?.costCodeId, null, "the parent must stay unattributed");
+    assert.equal(n, 1, "the real child is still fixed");
+    assert.equal(tasks.find((t) => t.id === "t1")?.costCodeId, "cc-elec");
+});
+
+test("a negative DEDUCTION line never stamps anything -- it produces no task", async () => {
+    // applyChangeOrderToSchedule builds children from items with total >= 0.
+    // A deduction generates no task at all, so any name match against one is a
+    // false positive by construction.
+    tasks.push({ id: "t5", coId: "co1", name: "Remove tile allowance", type: "task", costCodeId: null, estimateItemId: null, parentId: "t2" });
+    coItems.push({ coId: "co1", name: "Remove tile allowance", costCodeId: "cc-tile", total: -1500 });
+
+    await repairChangeOrderTaskCostCodes();
+
+    assert.equal(tasks.find((t) => t.id === "t5")?.costCodeId, null);
+});
+
+test("a deduction sharing a name with a real item does not trip the ambiguity guard", async () => {
+    // Before the total >= 0 narrowing, a same-named deduction made the CO-item
+    // count 2 and silently blocked a match that is not actually ambiguous:
+    // only one of the two ever produced a task.
+    coItems.push({ coId: "co1", name: "Recessed lighting", costCodeId: "cc-tile", total: -300 });
+
+    const n = await repairChangeOrderTaskCostCodes();
+
+    assert.equal(n, 1);
+    assert.equal(tasks.find((t) => t.id === "t1")?.costCodeId, "cc-elec");
 });

@@ -60,9 +60,13 @@ WHERE st."generatedFromChangeOrderId" = ci."changeOrderId"
   AND st."costCodeId" IS NULL
   AND st."estimateItemId" IS NULL
   AND st."type" = 'task'
+  AND st."parentId" IS NOT NULL
   AND ci."costCodeId" IS NOT NULL
+  AND ci."total" >= 0
   AND (SELECT COUNT(*) FROM "ChangeOrderItem" c2
-       WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name") = 1
+       WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name"
+         AND c2."total" >= 0) = 1
   AND (SELECT COUNT(*) FROM "ScheduleTask" s2
        WHERE s2."generatedFromChangeOrderId" = st."generatedFromChangeOrderId"
-         AND s2."name" = st."name" AND s2."type" = 'task') = 1;
+         AND s2."name" = st."name" AND s2."type" = 'task'
+         AND s2."parentId" IS NOT NULL) = 1;
