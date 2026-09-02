@@ -51,8 +51,11 @@ test("--dry-run executes NO statement — it is safe to point at production", { 
         await db.$executeRawUnsafe(`DROP INDEX IF EXISTS "PayrollPeriod_discardedAt_idx"`);
 
         const out = runScript(["--dry-run"]);
-        assert.match(out, /1 of \d+ object\(s\) would be created or converted/, out);
-        assert.match(out, /index PayrollPeriod_discardedAt_idx/);
+        // Round 20 replaced the presence-only check with a definition-level one,
+        // so the wording is "missing or drifted" and each line is prefixed with
+        // the table. This assertion was left describing the old output.
+        assert.match(out, /1 of \d+ object\(s\) are missing or drifted/, out);
+        assert.match(out, /index PayrollPeriod\.PayrollPeriod_discardedAt_idx: missing/, out);
 
         const after = (await db.$queryRawUnsafe(
             `SELECT 1 FROM pg_indexes WHERE indexname = 'PayrollPeriod_discardedAt_idx'`
