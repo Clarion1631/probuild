@@ -51,6 +51,7 @@ const WORKER_ROW_SELECT = {
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true,
+    createdAt: true,
 } as const;
 
 async function claim(): Promise<WorkerRow[] | null> {

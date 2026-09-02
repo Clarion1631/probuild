@@ -46,6 +46,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         memo: null,
         attempts: 0,
         readAt: null,
+        createdAt: new Date("2026-08-20T09:00:00.000Z"),
         ...overrides,
     };
 }

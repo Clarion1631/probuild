@@ -29,6 +29,13 @@ export interface WorkerRow extends BookableRow {
     state: string;
     fileSize: number;
     readAt: Date | null;
+    /**
+     * The fallback transaction date when the document's own date is
+     * unreadable. v1 used the Drive UPLOAD date (:1509); the intake row is
+     * created when the file arrives, so this is the same semantic — and,
+     * unlike "now", it does not drift when a read is delayed by an outage.
+     */
+    createdAt: Date;
 }
 
 export interface WorkerDependencies {
@@ -174,7 +181,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         invoice: read.invoice,
         checkNumber: read.checkNumber,
         totalAmount: read.totalAmount,
-        fallbackDateStr: toDateStr(row.readAt ?? deps.now()),
+        fallbackDateStr: toDateStr(row.createdAt),
     });
 
     const totalCents = centsOf(keys.amount);

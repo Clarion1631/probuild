@@ -198,6 +198,13 @@ jobs:
       # against the throwaway DB — so unlike the provider secrets above it's a
       # literal here rather than a repo secret (there's nothing to rotate).
       DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+      # Shared secret for the Receipt Pipeline v2 intake endpoint
+      # (src/app/api/receipts/intake/route.ts). Same reasoning as
+      # DEPOSIT_INGEST_SECRET above: nothing external depends on this value, it
+      # only gates e2e/receipt-intake.spec.ts against the throwaway DB, so it is
+      # a literal rather than a repo secret. The spec's "env var unset" case is
+      # a unit test (tests/receipt-intake-auth.test.ts), not this job.
+      RECEIPT_INTAKE_SECRET: "e2e-ci-receipt-intake-secret"
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.

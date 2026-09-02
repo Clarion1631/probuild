@@ -341,6 +341,51 @@ All gated on Script Property `V2_FORWARD === "true"`; all send `x-receipt-intake
   original for v1 to process as usual. The move-to-`_Forwarded` branch (which hides the
   file from v1) activates only under a second property `V2_LIVE === "true"` at cutover.
 
+### As-built notes (2026-09-01) — where the implementation differs from the plan above
+
+The Apps Script side is a separate PR in `qbo-clasp`. The endpoint contract it must code
+against is the one above, with these six clarifications from the build:
+
+1. **`GET /api/receipts/intake` accepts the shared secret as well as a staff session.**
+   §3 said staff-only, but §6's nightly mirror polls `?state=BOOKED` with
+   `x-receipt-intake-secret` — it has no session to present. A SESSION caller still needs
+   ADMIN | MANAGER | FINANCE (403 otherwise); the secret caller is the mirror.
+2. **`POST /api/receipts/intake/<id>/archived` is also on the proxy's public bypass**,
+   spelled out as its own exact pattern (`/api/receipts/intake/[^/]+/archived`). It is a
+   DESCENDANT of the intake path, and the intake bypass is exact-match on purpose, so
+   without its own entry the proxy would answer the mirror with a 307 to /login. The
+   route is secret-only: a session, however privileged, is refused, because only the
+   mirror can know that a file now exists in Drive. It is also state-conditional
+   (`updateMany WHERE state = 'BOOKED'`), so two mirror runs racing one row cannot both
+   claim the transition — the loser gets 409.
+3. **`threadName` is accepted and NOT persisted.** The chat forwarder should keep sending
+   it, but `memo` belongs to the read step (it holds a check's handwritten memo line) and
+   there is no other column for it yet. Phase 2 adds one when the queue page needs to link
+   back to the thread.
+4. **The phase suggestion is resolved to `suggestedCostCodeId` at READ time**, not at
+   booking, using the same `matchCostCode` the v1 ingest uses. Booking then takes
+   `costCodeId ?? suggestedCostCodeId`. Same outcome as §4 step 5, but the suggestion is
+   visible in the queue before anything books.
+5. **A non-Drive row's intake id is a UUIDv4**, so its QBO DocNumber is the first 21
+   characters of that UUID (risk 5 above, unchanged in substance — the PrivateNote marker
+   check in `createQBReceiptPurchase` still turns any truncation collision into a
+   `docnumber-conflict` rather than a mis-attached Purchase).
+6. **Tests live in `tests/receipt-intake-*.test.ts`, run by `tsx --test`**, not
+   `test/receipt-intake/*.test.mjs`. That is the repo's existing convention (every other
+   suite is there and wired into `npm run test:unit`); the rule that mattered — no
+   `mock.module`, function injection only, because CI pins Node 20 — is followed.
+
+Two things a human must do before this can leave shadow mode:
+
+- Set `RECEIPT_INTAKE_SECRET` (new, independent of `RECEIPT_INGEST_SECRET`) in Vercel, and
+  give the same value to the Apps Script as a Script Property.
+- Re-run `node scripts/snapshot-prisma-blind-spots.mjs --write` against production AFTER
+  `scripts/apply-receipt-intake.mjs` has run there. The new partial index and CHECK
+  constraint were added to `prisma/prisma-blind-spots.json` by hand (the snapshotter needs
+  a live production connection, which this branch never had), so their rendered
+  definitions are asserted, not observed. CI's `migrations` job is what will catch a
+  mismatch.
+
 ## 8. Shadow-week gate
 
 - `RECEIPT_INTAKE_DRYRUN` unset/true: every row gets `dryRun=true` — reader, dedup, and
