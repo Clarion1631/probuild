@@ -237,7 +237,9 @@ test("card history is written only AFTER a validated post", () => {
     // Chat, deprioritising work nobody had actually been asked about.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
-    const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now);");
+    // It rides INSIDE the completion transaction now — same ordering, and the
+    // pair commits together (tests/receipt-request-cards.test.ts).
+    const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now, tx);");
     assert.ok(postAt > 0 && recordAt > postAt, "history must follow the post");
     assert.doesNotMatch(source, /recordCardOnIssues\(card, null, null, now\)/, "no pre-post history write");
 });

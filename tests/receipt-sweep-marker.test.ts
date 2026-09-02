@@ -1,0 +1,135 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import {
+    SWEEP_MARKER_KEY,
+    chaserCompletedFor,
+    formatSweepMarker,
+    parseSweepMarker,
+} from "../src/lib/receipt-sweep-marker";
+import {
+    componentVersionOf,
+    componentVersionsMatch,
+} from "../src/lib/receipt-requests";
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// ── The cards cron waits for tonight's chase (round-16 item 3) ─────────────
+
+test("a card is only selected after the chase COMPLETED today", () => {
+    // Mid-cycle, the open set is a half-reconciled world: answered items are
+    // not closed yet and items that should have opened have not. A card built
+    // from it asks for receipts already sent AND misses the ones not sent, on
+    // the same morning — and selection claims the owner's whole day.
+    const today = "2026-09-02";
+    const done = parseSweepMarker(formatSweepMarker({
+        phase: "done",
+        chaserCompletedAt: "2026-09-02T13:20:00Z", // 6:20am Pacific
+    }));
+    assert.equal(chaserCompletedFor(done, today), true);
+
+    for (const [label, marker] of [
+        ["never completed", { phase: "done" as const, chaserCompletedAt: null }],
+        ["completed yesterday", { phase: "done" as const, chaserCompletedAt: "2026-09-01T13:20:00Z" }],
+        ["still mid-cycle", { phase: "lines" as const, chaserCompletedAt: null }],
+        ["a garbage timestamp", { phase: "done" as const, chaserCompletedAt: "whenever" }],
+    ] as const) {
+        assert.equal(chaserCompletedFor(marker, today), false, label);
+    }
+
+    // The crew's day, not UTC's: 11pm Pacific on the 2nd is the 3rd in UTC.
+    const lateNight = { phase: "done" as const, chaserCompletedAt: "2026-09-03T06:00:00Z" };
+    assert.equal(chaserCompletedFor(lateNight, "2026-09-02"), true, "still the 2nd in Pacific");
+});
+
+test("the marker row still reads correctly when an older build wrote it", () => {
+    // It used to hold a bare phase string. That must parse as "no completion
+    // recorded" — the reading that BLOCKS selection — rather than throwing or
+    // being taken as done.
+    assert.deepEqual(parseSweepMarker("lines"), { phase: "lines", chaserCompletedAt: null });
+    assert.deepEqual(parseSweepMarker("done"), { phase: "done", chaserCompletedAt: null });
+    assert.equal(chaserCompletedFor(parseSweepMarker("done"), "2026-09-02"), false);
+    // Junk is not a licence to assume anything either.
+    for (const junk of ["", "  ", "{not json", "[]", "null", undefined, null]) {
+        assert.equal(chaserCompletedFor(parseSweepMarker(junk as string), "2026-09-02"), false, String(junk));
+    }
+    // Round-trips.
+    const marker = { phase: "lines" as const, chaserCompletedAt: "2026-09-02T13:20:00Z" };
+    assert.deepEqual(parseSweepMarker(formatSweepMarker(marker)), marker);
+});
+
+test("the sweep stamps only a clean cycle, and the cards cron refuses without one", () => {
+    const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    // "done" stamps; anything else carries the previous stamp forward.
+    assert.match(sweep, /await writePhase\(phase, phase === "done" \? new Date\(\)\.toISOString\(\) : undefined\);/);
+    assert.match(sweep, /chaserCompletedAt: completedAt \?\? previous\.chaserCompletedAt,/);
+
+    const cards = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(cards, /if \(!chaserCompletedFor\(marker, date\)\) \{/);
+    assert.match(cards, /skipped: "chaser-incomplete"/);
+    // ok:false so it is visible, 200 because retrying THIS invocation would not
+    // help — and nothing is claimed, so the slot is still free later.
+    assert.match(cards, /ok: false,\s*\n\s*skipped: "chaser-incomplete"/);
+    assert.match(cards, /return NextResponse\.json\(summary, \{ status: 200 \}\);/);
+    const gateAt = cards.indexOf("skipped: \"chaser-incomplete\"");
+    const selectAt = cards.indexOf("const { items, overflow } = selectOwnerItems(");
+    assert.ok(gateAt > 0 && selectAt > gateAt, "the gate comes BEFORE selection");
+    // The retry pass is exempt: it never selects.
+    assert.match(cards, /if \(!retryOnly\) \{[\s\S]{0,1400}chaser-incomplete/);
+    assert.equal(SWEEP_MARKER_KEY, "receiptRequestsPhase", "one row, not a new table");
+});
+
+// ── A sibling moving mid-sweep replans the component (item 2) ──────────────
+
+test("a memo signed mid-sweep changes the component version", () => {
+    // Assignment is a property of the SET, so a memo signed on the charge NEXT
+    // to this one changes this line's verdict without touching this line. A
+    // per-row freshness check cannot see that.
+    const planned = componentVersionOf({
+        issues: [{ updatedAt: new Date("2026-09-02T10:00:00Z") }, { updatedAt: new Date("2026-09-02T09:00:00Z") }],
+        intakes: [{ updatedAt: new Date("2026-09-02T08:00:00Z") }],
+    });
+    assert.deepEqual(planned, { newest: "2026-09-02T10:00:00.000Z", issues: 2, intakes: 1 });
+    assert.equal(componentVersionsMatch(planned, { ...planned }), true, "an untouched component replans nothing");
+
+    // The SIBLING was answered while we were planning.
+    const sibling = componentVersionOf({
+        issues: [{ updatedAt: new Date("2026-09-02T10:00:00Z") }, { updatedAt: new Date("2026-09-02T10:05:00Z") }],
+        intakes: [{ updatedAt: new Date("2026-09-02T08:00:00Z") }],
+    });
+    assert.equal(componentVersionsMatch(planned, sibling), false);
+
+    // A new intake arriving, and an intake being DELETED — the second is why
+    // the stamp carries counts and not just the newest timestamp.
+    const added = componentVersionOf({
+        issues: [{ updatedAt: new Date("2026-09-02T10:00:00Z") }, { updatedAt: new Date("2026-09-02T09:00:00Z") }],
+        intakes: [{ updatedAt: new Date("2026-09-02T08:00:00Z") }, { updatedAt: new Date("2026-09-02T07:00:00Z") }],
+    });
+    assert.equal(componentVersionsMatch(planned, added), false, "an added row");
+    const removed = componentVersionOf({
+        issues: [{ updatedAt: new Date("2026-09-02T10:00:00Z") }, { updatedAt: new Date("2026-09-02T09:00:00Z") }],
+        intakes: [],
+    });
+    assert.equal(componentVersionsMatch(planned, removed), false, "a deleted row is invisible to a max()");
+});
+
+test("a changed component is replanned, and never committed from a stale plan", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    // The check sits between the plan and the first write.
+    const planAt = source.indexOf("const fullPlan = planReceiptRequests({");
+    const checkAt = source.indexOf("if (!componentVersionsMatch(planVersion, currentVersion))");
+    const applyAt = source.indexOf("const summary = await applyReceiptRequestPlan(");
+    assert.ok(planAt > 0 && checkAt > planAt && applyAt > checkAt, "plan, verify, THEN write");
+    // A mismatch commits nothing and asks for a replan.
+    assert.match(source, /return \{ summary: emptySummary\(\), undecided: plan\.open\.length \+ plan\.close\.length, replan: true \};/);
+    // Bounded, and the give-up is an OPEN chase, not a close.
+    assert.match(source, /const MAX_COMPONENT_REPLANS = 3;/);
+    assert.match(source, /for \(let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt\+\+\)/);
+    assert.match(source, /return \{ summary: emptySummary\(\), undecided: batch\.length, replans \};/);
+    // Both passes go through the replanning wrapper.
+    const wrapped = source.match(/await processBatchWithReplan\(/g) ?? [];
+    assert.equal(wrapped.length, 2, "the open-issue pass and the line pass");
+    assert.match(source, /replans,\s*\n\s*bankLines: linesSeen,/, "and it is reported");
+});

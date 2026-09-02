@@ -5,6 +5,12 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { appendCardRecord, effectiveOwner } from "../src/lib/receipt-requests";
 import {
+    CardHistoryRaceError,
+    itemsMissingCardRecord,
+    recordCardOnIssues,
+    type CardHistoryClient,
+} from "../src/lib/receipt-card-history";
+import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
     buildCardFromItems,
@@ -462,6 +468,90 @@ test("marking delivered writes the thread record in the SAME transaction", () =>
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
         "utf8",
     );
-    assert.match(cron, /import \{ recordCardOnIssues \} from "@\/lib\/receipt-card-history";/);
+    assert.match(cron, /import \{ itemsMissingCardRecord, recordCardOnIssues \} from "@\/lib\/receipt-card-history";/);
     assert.doesNotMatch(cron, /async function recordCardOnIssues\(/, "no second copy");
+});
+
+
+// -- Delivery and history commit together (round-16 item 4) ----------------
+
+test("a lost history CAS takes the POSTED write back with it", async () => {
+    // A row marked POSTED whose items carry no thread record is a card nobody
+    // can answer: a reply in that thread has nothing to resolve against, and
+    // the items still read as never-carded so tomorrow asks again. Committing
+    // one without the other is the failure.
+    const items = [cardItem("a", 1), cardItem("b", 2)];
+    const client = {
+        reviewIssue: {
+            findUnique: async ({ where }: { where: { id: string } }) => ({
+                id: where.id, version: 1, displayDetails: "{}", clearedAt: null,
+            }),
+            // The second item loses its CAS.
+            updateMany: async ({ where }: { where: { id: string } }) => ({ count: where.id === "b" ? 0 : 1 }),
+            findMany: async () => [],
+        },
+    } as unknown as CardHistoryClient;
+
+    await assert.rejects(
+        () => recordCardOnIssues({ items, date: "2026-08-20", requestId: "req-1" }, "spaces/A/threads/t", "spaces/A/messages/m", new Date(), client),
+        (error: unknown) => {
+            assert.ok(error instanceof CardHistoryRaceError);
+            assert.deepEqual(error.issueIds, ["b"]);
+            return true;
+        },
+    );
+
+    // "report" is for callers with nothing to roll back — the repair pass.
+    const reported = await recordCardOnIssues(
+        { items, date: "2026-08-20", requestId: "req-1" },
+        "spaces/A/threads/t", "spaces/A/messages/m", new Date(), client, "report",
+    );
+    assert.deepEqual(reported, { recorded: 1, skipped: 0, lostRaces: 1 });
+});
+
+test("itemsMissingCardRecord finds exactly the items with no record", async () => {
+    const withRecord = JSON.stringify({ cards: [{ requestId: "req-1", date: "2026-08-20", n: 1 }] });
+    const withOther = JSON.stringify({ cards: [{ requestId: "req-OTHER", date: "2026-08-19", n: 1 }] });
+    const legacySlot = JSON.stringify({ card: { requestId: "req-1", date: "2026-08-20", n: 1 } });
+    const rows: Record<string, { displayDetails: string; clearedAt: Date | null }> = {
+        "has-it": { displayDetails: withRecord, clearedAt: null },
+        "legacy": { displayDetails: legacySlot, clearedAt: null },
+        "other-card": { displayDetails: withOther, clearedAt: null },
+        "empty": { displayDetails: "{}", clearedAt: null },
+        // A cleared issue is never touched: its answer outranks its history.
+        "answered": { displayDetails: "{}", clearedAt: new Date() },
+    };
+    const client = {
+        reviewIssue: {
+            findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+                where.id.in.map(id => ({ id, ...rows[id] })),
+            findUnique: async () => null,
+            updateMany: async () => ({ count: 1 }),
+        },
+    } as unknown as CardHistoryClient;
+
+    assert.deepEqual(
+        await itemsMissingCardRecord(Object.keys(rows), "req-1", client),
+        ["other-card", "empty"],
+    );
+    assert.deepEqual(await itemsMissingCardRecord([], "req-1", client), []);
+});
+
+test("the cron commits delivery+history together and repairs old gaps", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
+        "utf8",
+    );
+    // ONE transaction: the POSTED write and the history write.
+    assert.match(source, /const completed = await prisma\.\$transaction\(async tx => \{[\s\S]{0,900}await recordCardOnIssues\(card, result\.threadName, result\.messageName, now, tx\);/);
+    // And no second, un-transacted call after it.
+    assert.doesNotMatch(source, /await recordCardOnIssues\(card, result\.threadName, result\.messageName, now\);/);
+    // THE REPAIR PASS: bounded, idempotent, and it never fails the run.
+    assert.match(source, /const HISTORY_REPAIR_DAYS = 3;/);
+    assert.match(source, /const HISTORY_REPAIR_MAX_CARDS = 20;/);
+    assert.match(source, /await itemsMissingCardRecord\(items\.map\(item => item\.issueId\), requestId\)/);
+    assert.match(source, /if \(missing\.length === 0\) continue;/);
+    assert.match(source, /"report",/, "the repair reports a lost race rather than throwing");
+    assert.match(source, /history repair failed/, "and never fails the run");
+    assert.match(source, /repairedHistory: repaired,/);
 });

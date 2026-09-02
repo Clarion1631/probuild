@@ -1060,3 +1060,70 @@ export async function loadComponentToClosure<T extends { id: string; postedDate:
     }
     throw new ComponentTooLargeError(loaded.length, options.maxNodes);
 }
+
+/**
+ * Does this component sit close enough to the loaded window's edge that its
+ * chain might continue OUTSIDE it?
+ *
+ * The line pass groups components over the 60-day window, which makes them
+ * whole WITHIN that window and says nothing about what lies just past either
+ * end. A charge on day 61 that links to one on day 59 is a real competitor the
+ * window never loaded, so the component the pass thinks it has is a fragment —
+ * and a fragment allocates evidence differently from the whole. Anything within
+ * one link of an edge therefore gets the full closure walk; everything in the
+ * interior is provably complete already and keeps the cheap query.
+ */
+export function componentTouchesBoundary(
+    dates: readonly string[],
+    windowStart: string,
+    windowEnd: string,
+    linkDays: number = COMPETING_LINE_ADJACENCY_DAYS,
+): boolean {
+    const days = dates
+        .map(date => dayNumber(date))
+        .filter((value): value is number => value !== null);
+    if (days.length === 0) return true; // undateable: assume the worst
+    const start = dayNumber(windowStart);
+    const end = dayNumber(windowEnd);
+    if (start === null || end === null) return true;
+    return Math.min(...days) - start <= linkDays || end - Math.max(...days) <= linkDays;
+}
+
+// ── Component versions ─────────────────────────────────────────────────────
+
+/**
+ * A stamp for "nothing about this component has changed since I planned it".
+ *
+ * WHY A WHOLE-COMPONENT STAMP AND NOT A PER-ROW CHECK. Evidence assignment is a
+ * property of the SET: one receipt answering two identical charges is decided
+ * by looking at both. So a sibling changing mid-sweep — a memo signed on the
+ * charge next to this one, an intake booked, an issue cleared by a human — can
+ * change THIS line's verdict without touching this line at all. A per-row
+ * freshness check cannot see that; it only stops the row itself being
+ * overwritten, which is the smaller half of the problem.
+ *
+ * The stamp is the newest `updatedAt` across the component's issues and the
+ * intakes that could answer them, plus their counts (an updatedAt alone cannot
+ * see a row being DELETED, and a deleted intake un-answers a charge).
+ */
+export interface ComponentVersion {
+    newest: string;
+    issues: number;
+    intakes: number;
+}
+
+export function componentVersionOf(input: {
+    issues: ReadonlyArray<{ updatedAt: Date | string | null }>;
+    intakes: ReadonlyArray<{ updatedAt: Date | string | null }>;
+}): ComponentVersion {
+    let newest = "";
+    for (const row of [...input.issues, ...input.intakes]) {
+        const at = row.updatedAt instanceof Date ? row.updatedAt.toISOString() : (row.updatedAt ?? "");
+        if (at > newest) newest = at;
+    }
+    return { newest, issues: input.issues.length, intakes: input.intakes.length };
+}
+
+export function componentVersionsMatch(a: ComponentVersion, b: ComponentVersion): boolean {
+    return a.newest === b.newest && a.issues === b.issues && a.intakes === b.intakes;
+}

@@ -12,6 +12,7 @@ import {
     isPacificWeekday,
     pacificDate,
     postOwnerCard,
+    requestIdFor,
     rebuildCardItems,
     selectOwnerItems,
     type CardCandidateIssue,
@@ -19,8 +20,9 @@ import {
     type CardItemTruth,
     type OwnerCard,
 } from "@/lib/receipt-request-cards";
+import { SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepMarker } from "@/lib/receipt-sweep-marker";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
-import { recordCardOnIssues } from "@/lib/receipt-card-history";
+import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -57,6 +59,13 @@ export const maxDuration = 60;
 const CLAIM_LOCK_KEY = "receipt-request-cards";
 
 /** Page size for the candidate scan. See scanCandidates for why it pages. */
+/**
+ * How far back the history repair looks, and how many cards it fixes per run.
+ * Small on purpose: it is catch-up work riding a cron that has a card to send.
+ */
+const HISTORY_REPAIR_DAYS = 3;
+const HISTORY_REPAIR_MAX_CARDS = 20;
+
 const SCAN_PAGE_SIZE = 500;
 /**
  * Absolute stop, so a pathological backlog cannot run the request out of time.
@@ -240,6 +249,43 @@ export async function GET(request: Request) {
     // re-posts rows an earlier run claimed and failed to deliver, so a webhook
     // outage at 7:30 does not cost the crew their whole day.
     const retryOnly = new URL(request.url).searchParams.get("retry") === "1";
+
+    /**
+     * NO SELECTION UNTIL TONIGHT'S CHASE HAS FINISHED.
+     *
+     * The card is built from open ReviewIssues, and those are whatever the
+     * nightly sweep last left behind. Mid-cycle — budget-truncated, or stopped
+     * on an error — that open set is a half-reconciled world: items already
+     * answered are not closed yet, and items that should have opened have not.
+     * A card built from it asks people for receipts they already sent AND
+     * misses the ones they did not, on the same morning.
+     *
+     * And getting it wrong costs the whole day: selection claims the owner's
+     * (owner, pacificDate) slot, so the bad card is the only card that owner
+     * gets. So this refuses to select, says so, and consumes NOTHING — the
+     * later `?retry=1` pass (or tomorrow) will find the slot free.
+     *
+     * The retry pass is exempt: it never selects, it only re-posts a snapshot
+     * an earlier run already claimed while the chase WAS complete.
+     */
+    if (!retryOnly) {
+        const marker = parseSweepMarker(
+            (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,
+        );
+        if (!chaserCompletedFor(marker, date)) {
+            const summary = {
+                ok: false,
+                skipped: "chaser-incomplete",
+                date,
+                phase: marker.phase,
+                chaserCompletedAt: marker.chaserCompletedAt,
+            };
+            console.error("[cron/receipt-request-cards] refusing to select — tonight's chase has not completed", JSON.stringify(summary));
+            // 200: nothing failed here, and a retry of THIS invocation would
+            // not help. The ok:false is what makes it visible.
+            return NextResponse.json(summary, { status: 200 });
+        }
+    }
     const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
     // The retry pass posts from the claimed snapshot, so it needs no scan.
     const scan = retryOnly
@@ -458,16 +504,30 @@ export async function GET(request: Request) {
         // superseded run cannot mark a row posted that it did not post. If this
         // write does not land the card IS out and we have no record of it, so a
         // zero count is uncertain — never a silent success, never a repost.
-        const completed = await prisma.receiptRequestCard.updateMany({
-            where: { id: rowId, claimToken: token, status: "POSTING" },
-            data: {
-                status: "POSTED",
-                postedAt: new Date(),
-                threadName: result.threadName,
-                messageName: result.messageName,
-                attempts: { increment: 1 },
-                lastError: null,
-            },
+        //
+        // THE HISTORY RIDES WITH IT. A row marked POSTED whose items carry no
+        // thread record is a card nobody can answer: a reply in that thread has
+        // nothing to resolve against, and the items still read as never-carded
+        // so tomorrow asks again. Committing one without the other is the
+        // failure, so they commit together or not at all — a lost CAS throws
+        // (`CardHistoryRaceError`) and takes the POSTED write back with it,
+        // leaving the row in POSTING for the next run to reconcile.
+        const completed = await prisma.$transaction(async tx => {
+            const written = await tx.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, status: "POSTING" },
+                data: {
+                    status: "POSTED",
+                    postedAt: new Date(),
+                    threadName: result.threadName,
+                    messageName: result.messageName,
+                    attempts: { increment: 1 },
+                    lastError: null,
+                },
+            });
+            if (written.count === 1) {
+                await recordCardOnIssues(card, result.threadName, result.messageName, now, tx);
+            }
+            return written;
         });
         if (completed.count === 0) {
             await prisma.receiptRequestCard.updateMany({
@@ -478,8 +538,60 @@ export async function GET(request: Request) {
             uncertainTransitions.push(card.owner);
             continue;
         }
-        await recordCardOnIssues(card, result.threadName, result.messageName, now);
         posted.push({ owner: card.owner, items: card.items.length, threadName: result.threadName, resumed });
+    }
+
+    /**
+     * THE REPAIR PASS. Cards that went out but whose items never got their
+     * thread record.
+     *
+     * Everything above makes that pair atomic from here on, but rows written
+     * before it — or by a run that died between the two writes — are already on
+     * the books, and nothing else would ever fix them: the card is POSTED, so
+     * no run will repost it, and the items read as never-carded forever, so
+     * every following morning asks about them again.
+     *
+     * Bounded and cheap: the last few days only, a handful of cards, and it
+     * writes NOTHING when the record is already there.
+     */
+    const repaired: Array<{ owner: string; date: string; items: number }> = [];
+    const repairSince = new Date(now.getTime() - HISTORY_REPAIR_DAYS * 86_400_000)
+        .toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+    try {
+        const postedRows = await prisma.receiptRequestCard.findMany({
+            where: {
+                status: "POSTED",
+                pacificDate: { gte: repairSince },
+                threadName: { not: null },
+                messageName: { not: null },
+            },
+            orderBy: [{ pacificDate: "desc" }, { owner: "asc" }],
+            take: HISTORY_REPAIR_MAX_CARDS,
+            select: { owner: true, pacificDate: true, itemsJson: true, threadName: true, messageName: true },
+        });
+        for (const row of postedRows) {
+            const items = parseItems(row.itemsJson);
+            if (items.length === 0) continue;
+            const requestId = requestIdFor(row.owner, row.pacificDate);
+            const missing = await itemsMissingCardRecord(items.map(item => item.issueId), requestId);
+            if (missing.length === 0) continue;
+            const gaps = items.filter(item => missing.includes(item.issueId));
+            // "report", not "throw": there is no delivery to roll back here, and
+            // one contended issue must not abandon the rest of the repair.
+            await recordCardOnIssues(
+                { items: gaps, date: row.pacificDate, requestId },
+                row.threadName as string,
+                row.messageName as string,
+                now,
+                prisma,
+                "report",
+            );
+            repaired.push({ owner: row.owner, date: row.pacificDate, items: gaps.length });
+        }
+    } catch (error) {
+        // Never fails the run: the repair is catch-up work, and the cards this
+        // invocation actually sent are already committed.
+        console.error("[cron/receipt-request-cards] history repair failed", error instanceof Error ? error.message : "UnknownError");
     }
 
     const summary = {
@@ -506,6 +618,7 @@ export async function GET(request: Request) {
         // send. Not a failure — the opposite — but worth seeing.
         cancelledOwners: cancelled,
         droppedItems: dropped,
+        repairedHistory: repaired,
         posted,
     };
     if (failures.length > 0) {

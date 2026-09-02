@@ -7,6 +7,7 @@ import {
     COMPETING_LINE_ADJACENCY_DAYS,
     ComponentTooLargeError,
     competingLineFilter,
+    componentTouchesBoundary,
     groupCompetingLines,
     loadComponentToClosure,
 } from "../src/lib/receipt-requests";
@@ -137,4 +138,55 @@ test("the open-issue pass asks for closure; the line pass keeps the window", () 
     assert.match(source, /undecided: plan\.undecided\.length \+ unresolved\.length/);
     // The line pass still uses the cheap query: its pages ARE components.
     assert.match(source, /const cohortFilters = batch\.map\(row => competingLineFilter\(/);
+});
+
+// ── Components at the window edge (round-16 item 1) ────────────────────────
+
+test("a chain that crosses the 60-day boundary is loaded to closure", () => {
+    // The line pass groups components over the loaded window, which makes them
+    // whole WITHIN it and says nothing about what sits just past the edge. A
+    // charge on day 61 linking to one on day 59 is a real competitor the window
+    // never loaded — so what the pass holds is a FRAGMENT, and a fragment
+    // allocates evidence differently from the whole.
+    const start = ymd(0);
+    const end = ymd(59);
+
+    // Sitting ON the old edge: its chain may continue behind the window.
+    assert.equal(componentTouchesBoundary([ymd(1), ymd(3)], start, end), true);
+    // Sitting on the recent edge: a line posted while the sweep ran can join it.
+    assert.equal(componentTouchesBoundary([ymd(57)], start, end), true);
+    // Exactly one link from either edge still counts.
+    assert.equal(componentTouchesBoundary([ymd(4)], start, end), true, "4 days is the link rule");
+    assert.equal(componentTouchesBoundary([ymd(55)], start, end), true);
+    // The interior is provably complete and keeps the cheap query.
+    assert.equal(componentTouchesBoundary([ymd(5), ymd(9)], start, end), false);
+    assert.equal(componentTouchesBoundary([ymd(30)], start, end), false);
+    // An undateable component is treated as a boundary case, not as interior.
+    assert.equal(componentTouchesBoundary(["not-a-date"], start, end), true);
+    assert.equal(componentTouchesBoundary([], start, end), true);
+});
+
+test("the crossing chain's far half is only found by the walk", async () => {
+    // Day 59 and day 61 are one link apart, and day 61 is outside the window.
+    // The window query cannot see it; the walk can.
+    const { load } = loaderOver([-2, 2, 6]); // -2 is "before the window start"
+    const walked = await loadComponentToClosure(ymd(2), load, { maxNodes: 200 });
+    assert.deepEqual(walked.map(r => r.id), ["bl--2", "bl-2", "bl-6"]);
+    // Grouped over the window ALONE, the out-of-window line is simply absent —
+    // which is the fragment the boundary rule exists to avoid judging.
+    const inWindowOnly = groupCompetingLines(
+        [2, 6].map(offset => ({ id: `bl-${offset}`, postedDate: ymd(offset), amountCents: -4_600 })),
+    );
+    assert.equal(inWindowOnly[0].lineIds.length, 2, "the window sees two; the truth is three");
+});
+
+test("the line pass sends only its edge components through the walk", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const boundaryLineIds = new Set\(/);
+    assert.match(source, /componentTouchesBoundary\(/);
+    // Two calls per page: the interior on the cheap query, the edge on the walk.
+    assert.match(source, /\[interiorBatch, "window"\],\s*\n\s*\[boundaryBatch, "closure"\],/);
+    // And a failure in EITHER still stops the cursor.
+    assert.match(source, /pageErrors \+= outcome\.summary\.errors;/);
+    assert.match(source, /if \(pageErrors > 0\) break;/);
 });

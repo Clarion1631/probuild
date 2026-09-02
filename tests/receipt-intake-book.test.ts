@@ -160,10 +160,6 @@ function recorder(
         }) as any,
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         logEvent: async (event) => { events.push(event); },
-        // The pre-send re-read (Codex blocker 5). The default says "still
-        // BOOKING", i.e. nobody touched the row; a test that wants the abort
-        // path overrides it.
-        readState: async () => "BOOKING",
         now: () => NOW,
         companyTimeZone: async () => "America/Los_Angeles",
         isCostCodeAllowed: async () => true,
@@ -633,8 +629,8 @@ test("the send fence is checked at the LAST instant, not merely before the downl
     assert.equal(purchaseCalls.length, 1);
 });
 
-test("the normal path is unaffected: still BOOKING means send", async () => {
-    const { deps, purchaseCalls } = recorder({ readState: async () => "BOOKING" });
+test("the normal path is unaffected: an unmoved row is sent", async () => {
+    const { deps, purchaseCalls } = recorder();
     const result = await bookReceipt(row(), deps);
     assert.equal(result.outcome, "booked");
     assert.equal(purchaseCalls.length, 1);

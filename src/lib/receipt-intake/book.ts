@@ -239,17 +239,6 @@ export interface BookDependencies {
      */
     downloadBytes: (storagePath: string, expectedSha256: string) => Promise<VerifiedBytes>;
     logEvent: (event: AutomationEventInput) => Promise<void>;
-    /**
-     * Re-reads the row's CURRENT state, immediately before the QBO send.
-     *
-     * Everything above this point can take seconds (a project lookup, a file
-     * download out of the bucket), and a human on the Receipts tab can VOID or
-     * re-classify the row in that window. Booking it anyway creates a real
-     * QuickBooks Purchase for a receipt somebody just cancelled, and QBO is
-     * read-only from here — nothing can take it back. So the last thing before
-     * the send is a fresh read, and anything other than BOOKING aborts.
-     */
-    readState: (rowId: string) => Promise<string | null>;
     now: () => Date;
 }
 

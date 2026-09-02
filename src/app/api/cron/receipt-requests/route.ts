@@ -13,6 +13,9 @@ import {
     decimalStringToCents,
     ComponentTooLargeError,
     competingLineFilter,
+    componentTouchesBoundary,
+    componentVersionOf,
+    componentVersionsMatch,
     loadComponentToClosure,
     groupCompetingLines,
     isComponentKey,
@@ -23,6 +26,13 @@ import {
     type ReceiptRequestPlan,
 } from "@/lib/receipt-requests";
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
+import {
+    SWEEP_MARKER_KEY,
+    formatSweepMarker,
+    parseSweepMarker,
+    type SweepMarker,
+    type SweepPhase,
+} from "@/lib/receipt-sweep-marker";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
 export const dynamic = "force-dynamic";
@@ -94,7 +104,7 @@ const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";
 const OPEN_ISSUE_BATCH_SIZE = 100;
 
 /** Which half of the sweep is in progress. Persisted, so a resume knows. */
-const PHASE_KEY = "receiptRequestsPhase";
+const PHASE_KEY = SWEEP_MARKER_KEY;
 
 /**
  * The sweep's two passes, in order, plus "done".
@@ -105,11 +115,7 @@ const PHASE_KEY = "receiptRequestsPhase";
  * pass exited, and the line half of the sweep waited for tomorrow. The phase is
  * what says a cycle is unfinished when neither cursor is parked.
  */
-export type SweepPhase = "open-issues" | "lines" | "done";
-
-export function isSweepPhase(value: unknown): value is SweepPhase {
-    return value === "open-issues" || value === "lines" || value === "done";
-}
+export type { SweepPhase };
 
 /**
  * Where the cycle stands once a run ends. ONE place, so the marker can never
@@ -144,22 +150,40 @@ export function shouldResumeSweep(
     return phase !== "done" || !!lineCursor || !!openCursor;
 }
 
-async function readPhase(): Promise<SweepPhase> {
+async function readMarker(): Promise<SweepMarker> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: PHASE_KEY } });
-        const value = row?.value;
-        return isSweepPhase(value) ? value : "done";
+        return parseSweepMarker(row?.value);
     } catch {
-        return "done";
+        return { phase: "done", chaserCompletedAt: null };
     }
 }
 
-async function writePhase(phase: SweepPhase): Promise<void> {
+async function readPhase(): Promise<SweepPhase> {
+    return (await readMarker()).phase;
+}
+
+/**
+ * Write the phase, and STAMP A COMPLETION when the cycle actually finished.
+ *
+ * That stamp is what the morning cards cron waits for: a card built from a
+ * half-reconciled open set asks people for receipts they already sent and
+ * misses the ones they did not, and selection costs the owner their whole day
+ * (the claim is per owner per Pacific day). A previous stamp is CARRIED
+ * FORWARD on every other write — losing it would block tomorrow's cards on a
+ * technicality.
+ */
+async function writePhase(phase: SweepPhase, completedAt?: string): Promise<void> {
     try {
+        const previous = await readMarker();
+        const value = formatSweepMarker({
+            phase,
+            chaserCompletedAt: completedAt ?? previous.chaserCompletedAt,
+        });
         await prisma.automationSetting.upsert({
             where: { key: PHASE_KEY },
-            update: { value: phase },
-            create: { key: PHASE_KEY, value: phase },
+            update: { value },
+            create: { key: PHASE_KEY, value },
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "UnknownError";
@@ -319,6 +343,9 @@ export async function applyReceiptRequestPlan(
  */
 const MAX_COMPONENT_LINES = 200;
 
+/** How many times one component may be replanned before the run leaves it alone. */
+const MAX_COMPONENT_REPLANS = 3;
+
 /**
  * Load the TRUE competing component around one line, by iterating the link rule
  * to closure — the walk itself is `loadComponentToClosure`, which is pure and
@@ -459,6 +486,48 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
 }
 
 
+/** The issues that belong to a component, with just enough to version them. */
+async function componentIssueRows(lineIds: string[]): Promise<Array<{ updatedAt: Date }>> {
+    if (lineIds.length === 0) return [];
+    return prisma.reviewIssue.findMany({
+        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lineIds } },
+        select: { updatedAt: true },
+    });
+}
+
+function emptySummary(): ReceiptRequestApplySummary {
+    return { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] };
+}
+
+/**
+ * Plan and apply, replanning when the component moved underneath us.
+ *
+ * THREE ATTEMPTS, then silence. A component that keeps changing is one a human
+ * is actively working on, and the honest answer there is to leave it alone for
+ * this run: the next sweep decides it. Looping until it settles would hold the
+ * budget hostage to somebody's editing session.
+ */
+async function processBatchWithReplan(
+    batch: BatchLine[],
+    openIssues: Array<{ targetKey: string }>,
+    resolvedIssueKeys: string[],
+    detailsByKey: Map<string, Record<string, unknown>>,
+    now: Date,
+    cohortMode: "window" | "closure" = "window",
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replans: number }> {
+    let replans = 0;
+    for (let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt++) {
+        const outcome = await processBatch(batch, openIssues, resolvedIssueKeys, detailsByKey, now, cohortMode);
+        if (!outcome.replan) return { ...outcome, replans };
+        replans++;
+        console.log("[cron/receipt-requests] component changed mid-plan; replanning", batch.length, "line(s)", attempt);
+    }
+    // Deliberately no verdict, and it is REPORTED as undecided rather than
+    // hidden: a chase left open is a question a human can answer; a chase
+    // closed from a stale plan is a receipt nobody ever asks for again.
+    return { summary: emptySummary(), undecided: batch.length, replans };
+}
+
 interface BatchLine {
     id: string;
     postedDate: Date;
@@ -499,7 +568,7 @@ async function processBatch(
      *   the line pass reaches for the same rows.
      */
     cohortMode: "window" | "closure" = "window",
-): Promise<{ summary: ReceiptRequestApplySummary; undecided: number }> {
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replan: boolean }> {
     // THE LINES THIS BATCH IS ANSWERABLE FOR. The cohort query below drags in
     // neighbours so they can consume the evidence they are entitled to, but a
     // neighbour's OWN verdict belongs to the page that owns it — judging it here,
@@ -551,7 +620,7 @@ async function processBatch(
         [...batch, ...cohortRows].map(row => [row.id, row]),
     ).values()];
     if (lines.length === 0) {
-        return { summary: { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] }, undecided: 0 };
+        return { summary: emptySummary(), undecided: 0, replan: false };
     }
 
     // 2. EVIDENCE FOR THE COHORT'S FULL SPAN, widened by the match window.
@@ -571,9 +640,18 @@ async function processBatch(
         }),
         prisma.receiptIntake.findMany({
             where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
-            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, stateReason: true, expenseId: true, qbPurchaseId: true },
+            select: {
+                id: true, totalCents: true, txnDate: true, vendor: true, state: true,
+                stateReason: true, expenseId: true, qbPurchaseId: true, updatedAt: true,
+            },
         }),
     ]);
+    // THE VERSION OF THE WORLD THIS PLAN IS ABOUT TO BE MADE FROM.
+    const lineIds = lines.map(row => row.id);
+    const planVersion = componentVersionOf({
+        issues: await componentIssueRows(lineIds),
+        intakes: intakeRows,
+    });
 
     // 3. DECIDE.
     const fullPlan = planReceiptRequests({
@@ -623,6 +701,31 @@ async function processBatch(
         undecided: fullPlan.undecided.filter(id => judgeOnly.has(id)),
     };
 
+    /**
+     * NOTHING MOVED WHILE WE WERE THINKING.
+     *
+     * Assignment is a property of the SET: one receipt answering two identical
+     * charges is decided by looking at both. So a SIBLING changing mid-sweep —
+     * a memo signed on the charge next to this one, an intake booked, an issue
+     * a human cleared — can change THIS line's verdict without touching this
+     * line at all, and the per-write fresh read cannot see that. It only stops
+     * the row itself being overwritten, which is the smaller half.
+     *
+     * So the plan is checked against the component's version immediately before
+     * anything is applied, and a change replans the WHOLE component rather than
+     * committing a verdict derived from a world that no longer exists.
+     */
+    const currentVersion = componentVersionOf({
+        issues: await componentIssueRows(lineIds),
+        intakes: await prisma.receiptIntake.findMany({
+            where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            select: { updatedAt: true },
+        }),
+    });
+    if (!componentVersionsMatch(planVersion, currentVersion)) {
+        return { summary: emptySummary(), undecided: plan.open.length + plan.close.length, replan: true };
+    }
+
     const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
         // FRESH READ before each write. The sweep can run for minutes; a memo
         // signed in that window would otherwise be un-answered by a merge from
@@ -657,7 +760,7 @@ async function processBatch(
 
     // A line whose component would not load is undecided too — the caller
     // reports it, and the cursor does not step past it silently.
-    return { summary, undecided: plan.undecided.length + unresolved.length };
+    return { summary, undecided: plan.undecided.length + unresolved.length, replan: false };
 }
 
 
@@ -816,6 +919,9 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     let openExhausted = startPhase === "lines";
     let openBatches = 0;
     let targetMissing = 0;
+    // How many components had to be replanned because a sibling moved while the
+    // plan was being made. Reported: a run full of them is a run racing a human.
+    let replans = 0;
 
     while (startPhase !== "lines" && Date.now() - startedAt < RUN_BUDGET_MS) {
         const page = await prisma.reviewIssue.findMany({
@@ -861,7 +967,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         }
 
         if (lines.length > 0) {
-            const outcome = await processBatch(
+            const outcome = await processBatchWithReplan(
                 lines,
                 page.map(issue => ({ targetKey: issue.targetKey })),
                 resolvedIssueKeys,
@@ -871,6 +977,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
                 // one's chain to closure or judge a fragment.
                 "closure",
             );
+            replans += outcome.replans;
             openPass.opened += outcome.summary.opened;
             openPass.closed += outcome.summary.closed;
             openPass.touched += outcome.summary.touched;
@@ -918,11 +1025,31 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
         select: { id: true, postedDate: true, amountCents: true },
     });
+    const windowDates = new Map(windowLines.map(row => [row.id, row.postedDate.toISOString().slice(0, 10)]));
     const components = groupCompetingLines(windowLines.map(row => ({
         id: row.id,
-        postedDate: row.postedDate.toISOString().slice(0, 10),
+        postedDate: windowDates.get(row.id) as string,
         amountCents: row.amountCents,
     })));
+    /**
+     * Components whose chain might continue OUTSIDE the loaded window.
+     *
+     * Grouping over a 60-day window makes a component whole WITHIN it and says
+     * nothing about what sits just past either end: a charge on day 61 linking
+     * to one on day 59 is a real competitor this pass never loaded, so what it
+     * has is a FRAGMENT — and a fragment allocates evidence differently from
+     * the whole. These get the full closure walk; the interior is provably
+     * complete already and keeps the cheap query.
+     */
+    const boundaryLineIds = new Set(
+        components
+            .filter(component => componentTouchesBoundary(
+                component.lineIds.map(id => windowDates.get(id) ?? ""),
+                windowStart,
+                windowEnd,
+            ))
+            .flatMap(component => component.lineIds),
+    );
     // The cursor is a COMPONENT KEY now. A cursor left by an older build is a
     // bare BankLine id; it cannot be placed in this ordering, so the cycle
     // restarts once — idempotent, and it self-corrects on the first checkpoint.
@@ -951,23 +1078,38 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             continue;
         }
 
-        const outcome = await processBatch(batch, openIssues, resolvedIssueKeys, detailsByKey, now);
+        // Split the page by where its components sit. Distinct components share
+        // no candidate evidence by construction, so judging them in two calls
+        // cannot change any allocation — it only changes how each one's
+        // competitors were found.
+        const boundaryBatch = batch.filter(row => boundaryLineIds.has(row.id));
+        const interiorBatch = batch.filter(row => !boundaryLineIds.has(row.id));
+        let pageErrors = 0;
+        for (const [rows, mode] of [
+            [interiorBatch, "window"],
+            [boundaryBatch, "closure"],
+        ] as const) {
+            if (rows.length === 0) continue;
+            const outcome = await processBatchWithReplan(rows, openIssues, resolvedIssueKeys, detailsByKey, now, mode);
+            replans += outcome.replans;
+            undecided += outcome.undecided;
+            totals.opened += outcome.summary.opened;
+            totals.closed += outcome.summary.closed;
+            totals.touched += outcome.summary.touched;
+            totals.skipped += outcome.summary.skipped;
+            totals.errors += outcome.summary.errors;
+            totals.failedTargets.push(...outcome.summary.failedTargets);
+            pageErrors += outcome.summary.errors;
+        }
         batches++;
         linesSeen += batch.length;
-        undecided += outcome.undecided;
-        totals.opened += outcome.summary.opened;
-        totals.closed += outcome.summary.closed;
-        totals.touched += outcome.summary.touched;
-        totals.skipped += outcome.summary.skipped;
-        totals.errors += outcome.summary.errors;
-        totals.failedTargets.push(...outcome.summary.failedTargets);
 
         // THE CURSOR STOPS AT THE FIRST FAILURE. Advancing past a target whose
         // write threw is how a row that fails every night is never chased: the
         // sweep would step over it forever and report a clean run. A failed
         // batch keeps its cursor so the next invocation retries the same
         // ground; the lifecycle writes are idempotent, so re-running is free.
-        if (outcome.summary.errors > 0) break;
+        if (pageErrors > 0) break;
 
         // The checkpoint is the last COMPONENT this page finished, so a resume
         // can never land in the middle of a competition set.
@@ -991,7 +1133,10 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         lineExhausted: exhausted,
         lineErrors: totals.errors - openPass.errors,
     });
-    await writePhase(phase);
+    // A CLEAN, COMPLETE cycle stamps the clock the cards cron reads. Anything
+    // else leaves the previous stamp alone: yesterday's completion is still a
+    // true statement about yesterday, and the cards cron compares it to TODAY.
+    await writePhase(phase, phase === "done" ? new Date().toISOString() : undefined);
 
     const result = {
         ok: totals.errors === 0,
@@ -1002,6 +1147,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         openIssueCursor: openCursor,
         openIssuesExhausted: openExhausted,
         targetMissing,
+        replans,
         bankLines: linesSeen,
         undecided,
         exhausted,

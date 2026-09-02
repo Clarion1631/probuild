@@ -927,6 +927,9 @@ test("book.ts and the chaser share ONE list of no-evidence reasons", () => {
     assert.match(worker, /parkTerminal\(row, deps, NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
     // And the cron actually SELECTS the column the predicate needs.
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    const selects = cron.match(/state: true, stateReason: true/g) ?? [];
+    // BOTH evidence loads select it — the recompute pass and the batch pass.
+    // (The batch pass's select is wrapped across lines; match the pair, not the
+    // formatting.)
+    const selects = cron.match(/state: true,\s+stateReason: true/g) ?? [];
     assert.equal(selects.length, 2, "the batch pass and the recompute pass");
 });

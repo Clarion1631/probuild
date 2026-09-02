@@ -27,16 +27,37 @@ export interface RecordableCard {
 /** The two Prisma calls this needs — so a transaction client can be passed in. */
 export type CardHistoryClient = Pick<typeof prisma, "reviewIssue">;
 
+/**
+ * Thrown when a history write lost its CAS. The caller decides, and inside a
+ * transaction the only honest decision is to roll the whole thing back: a card
+ * marked POSTED whose items carry no thread record is one nobody can answer.
+ */
+export class CardHistoryRaceError extends Error {
+    constructor(readonly issueIds: string[]) {
+        super(`card history lost a CAS for ${issueIds.length} item(s)`);
+        this.name = "CardHistoryRaceError";
+    }
+}
+
 export async function recordCardOnIssues(
     card: RecordableCard,
     threadName: string,
     messageName: string,
     now: Date,
     client: CardHistoryClient = prisma,
+    /**
+     * `"throw"` — a lost CAS raises `CardHistoryRaceError`, so a caller writing
+     * inside a transaction rolls the delivery back with it. A card marked
+     * POSTED whose items carry no thread record is one nobody can answer, and
+     * committing half of that pair is worse than committing neither.
+     * `"report"` — count it and carry on. For callers with nothing to roll back.
+     */
+    onLostRace: "throw" | "report" = "throw",
 ): Promise<{ recorded: number; skipped: number; lostRaces: number }> {
     let recorded = 0;
     let skipped = 0;
     let lostRaces = 0;
+    const lost: string[] = [];
 
     for (const item of card.items) {
         // FRESH READ INSIDE THE CAS. Replaying the codes and details captured
@@ -67,10 +88,53 @@ export async function recordCardOnIssues(
         });
         if (written.count === 0) {
             lostRaces++;
+            lost.push(item.issueId);
             console.warn("[receipt-card-history] card history lost a race", item.issueId);
             continue;
         }
         recorded++;
     }
+    if (lostRaces > 0 && onLostRace === "throw") throw new CardHistoryRaceError(lost);
     return { recorded, skipped, lostRaces };
+}
+
+/** True when this issue already carries the record for a given card. */
+export function issueHasCardRecord(details: Record<string, unknown> | null | undefined, requestId: string): boolean {
+    const cards = details?.cards;
+    if (Array.isArray(cards)) {
+        if (cards.some(entry => (entry as { requestId?: unknown })?.requestId === requestId)) return true;
+    }
+    const latest = details?.card as { requestId?: unknown } | undefined;
+    return latest?.requestId === requestId;
+}
+
+/**
+ * Which of a card's items are MISSING their thread record.
+ *
+ * The repair path's question. History is written after a confirmed post, and
+ * anything that interrupts that write — a lost CAS, a crash between the two —
+ * leaves a card that went out with items that do not know where they were
+ * asked. A reply in that thread then has nothing to resolve against, and the
+ * items still read as never-carded, so tomorrow's card asks again.
+ */
+export async function itemsMissingCardRecord(
+    itemIds: readonly string[],
+    requestId: string,
+    client: CardHistoryClient = prisma,
+): Promise<string[]> {
+    if (itemIds.length === 0) return [];
+    const issues = await client.reviewIssue.findMany({
+        where: { id: { in: [...itemIds] } },
+        select: { id: true, displayDetails: true, clearedAt: true },
+    });
+    const missing: string[] = [];
+    for (const issue of issues) {
+        // A cleared issue is deliberately never touched — its answer outranks
+        // its history.
+        if (issue.clearedAt !== null) continue;
+        if (!issueHasCardRecord(parseMissingReceiptDetails(issue.displayDetails), requestId)) {
+            missing.push(issue.id);
+        }
+    }
+    return missing;
 }
