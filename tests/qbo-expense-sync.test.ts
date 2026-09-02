@@ -6,12 +6,14 @@ import {
     normalizeQboPurchase,
     syncQboExpenses,
     upsertQboExpense,
+    applyQboExpenseCostCodeSuggestion,
     type QboExpenseProjectCandidate,
     type QboExpenseSyncDependencies,
     type QboExpenseWrite,
     type QboPurchaseNormalizationSkipReason,
     type QboPurchaseForImport,
 } from "../src/lib/qbo-expense-sync";
+import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
 
 const TOKENS = {
     accessToken: "test-access",
@@ -562,6 +564,10 @@ type StoredExpense = Omit<QboExpenseWrite, "status"> & {
     id: string;
     receiptUrl: string | null;
     status: "Pending" | "Reviewed";
+    // Phase 3 attribution columns, so a test can seed a human-coded row.
+    costCodeId?: string | null;
+    costCodeSource?: string | null;
+    costCodeConfidence?: number | null;
 };
 
 function createFakePrisma(initial: StoredExpense[] = []) {
@@ -625,6 +631,7 @@ const WRITE: QboExpenseWrite = {
     qbSyncToken: "0",
     qbSyncedAt: new Date("2026-07-29T12:00:00.000Z"),
     estimateId: "estimate-1",
+    projectId: "project-1",
     amount: 125.5,
     vendor: "Contractor Supply",
     date: new Date("2026-07-15T00:00:00.000Z"),
@@ -1072,4 +1079,221 @@ test("backfill fixture imports only the active unambiguous job and stays idempot
         skipped: first.skipped,
     });
     assert.equal(fake.rows.size, 1);
+});
+
+// ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §3.1, §8) ──
+
+test("an imported expense is born knowing its job", async () => {
+    const fake = createFakePrisma();
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
+    assert.equal(fake.rows.get("purchase-1")?.projectId, "project-1");
+});
+
+test("a re-sync fills a NULL projectId but never overwrites one", async () => {
+    // The sync has always KNOWN the project; before Phase 3 it dropped it. A
+    // row imported back then has projectId NULL and should be caught up.
+    const legacy = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: null, receiptUrl: null },
+    ]);
+    assert.equal(await upsertQboExpense(legacy.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    assert.equal(legacy.rows.get("purchase-1")?.projectId, "project-1");
+
+    // ...but a bookkeeper's re-attribution is a HUMAN decision, and the QBO
+    // customer ref is not a newer fact about it.
+    const reattributed = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: "moved-by-hand", receiptUrl: null },
+    ]);
+    assert.equal(
+        await upsertQboExpense(reattributed.client, { ...WRITE, qbSyncToken: "1", amount: 200 }),
+        "updated",
+    );
+    assert.equal(reattributed.rows.get("purchase-1")?.projectId, "moved-by-hand");
+    assert.equal(reattributed.rows.get("purchase-1")?.amount, 200, "the rest of the write still lands");
+});
+
+test("a re-attributed row settles to unchanged instead of updating forever", async () => {
+    // If projectId were compared unconditionally, every re-attributed row would
+    // read as drifted on every sync and re-issue an update that deliberately
+    // changes nothing — a permanent phantom write, and a permanently wrong
+    // "updated" count in the sync report.
+    const fake = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: "moved-by-hand", receiptUrl: null },
+    ]);
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    assert.equal(fake.rows.get("purchase-1")?.projectId, "moved-by-hand");
+});
+
+test("deactivation never touches the attribution columns", async () => {
+    const fake = createFakePrisma([
+        {
+            ...WRITE,
+            id: "expense-1",
+            projectId: "project-1",
+            costCodeId: "cc-plumb",
+            costCodeSource: "manual",
+            receiptUrl: null,
+        },
+    ]);
+    assert.equal(
+        await deactivateQboExpense(fake.client, {
+            qbPurchaseId: "purchase-1",
+            qbSyncToken: "1",
+            qbSyncedAt: new Date("2026-07-29T14:00:00.000Z"),
+            reason: "deleted",
+        }),
+        "removed",
+    );
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.amount, 0);
+    assert.equal(row?.projectId, "project-1", "the job survives the deactivation");
+    assert.equal(row?.costCodeId, "cc-plumb");
+    assert.equal(row?.costCodeSource, "manual");
+});
+
+// ── the cost-code suggester ────────────────────────────────────────────────
+
+const COST_CODE_IDS = new Map([
+    ["03-PLUMB", "cc-plumb"],
+    ["02-FRAME", "cc-frame"],
+]);
+
+function fakeSuggestionClient() {
+    const calls: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
+    let count = 1;
+    return {
+        calls,
+        setCount(next: number) { count = next; },
+        client: {
+            expense: {
+                async updateMany(args: {
+                    where: Record<string, unknown>;
+                    data: { costCodeId: string; costCodeSource: string; costCodeConfidence: number };
+                }) {
+                    calls.push(args);
+                    return { count };
+                },
+            },
+        },
+    };
+}
+
+test("a NULL cost code is filled with source ai and the rule's tier confidence", async () => {
+    const fake = fakeSuggestionClient();
+    const result = await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        {
+            qbPurchaseId: "purchase-1",
+            vendor: "Summit Plumbing",
+            description: "[QuickBooks import] rough-in",
+            projectId: "project-1",
+        },
+        COST_CODE_IDS,
+    );
+    assert.equal(result, "written");
+    assert.equal(fake.calls.length, 1);
+    assert.deepEqual(fake.calls[0].data, {
+        costCodeId: "cc-plumb",
+        costCodeSource: "ai",
+        costCodeConfidence: 0.9,
+    });
+});
+
+test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", async () => {
+    // This is the whole of the "never overwrite a human" rule, and it lives in
+    // the predicate rather than in a caller's discipline. The NULL branch is
+    // load-bearing: SQL NOT IN drops NULL rows, which is every legacy row.
+    const fake = fakeSuggestionClient();
+    await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x", projectId: "project-1" },
+        COST_CODE_IDS,
+    );
+    const where = fake.calls[0].where;
+    assert.equal(where.qbPurchaseId, "purchase-1");
+    assert.equal(where.costCodeId, null);
+    assert.deepEqual(where.OR, [
+        { costCodeSource: null },
+        { costCodeSource: { notIn: ["capture", "manual"] } },
+    ]);
+});
+
+test("a row a human already coded is reported not-written, not silently written", async () => {
+    const fake = fakeSuggestionClient();
+    fake.setCount(0); // the guard matched nothing
+    const result = await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x", projectId: "project-1" },
+        COST_CODE_IDS,
+    );
+    assert.equal(result, "not-written");
+});
+
+test("the overhead bucket is never given a job phase, and never even queried", async () => {
+    const fake = fakeSuggestionClient();
+    const result = await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        {
+            qbPurchaseId: "purchase-1",
+            vendor: "Summit Plumbing",
+            description: "x",
+            projectId: OVERHEAD_PROJECT_ID,
+        },
+        COST_CODE_IDS,
+    );
+    assert.equal(result, "skipped-overhead");
+    assert.equal(fake.calls.length, 0);
+});
+
+test("no rule match and an unknown code both write nothing", async () => {
+    const fake = fakeSuggestionClient();
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "p", vendor: "General Hardware", description: "misc", projectId: "project-1" },
+            COST_CODE_IDS,
+        ),
+        "no-match",
+    );
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "p", vendor: "Summit Plumbing", description: "x", projectId: "project-1" },
+            new Map(),
+        ),
+        "unknown-code",
+    );
+    assert.equal(fake.calls.length, 0);
+});
+
+test("a failing suggester never fails the import it rides alongside", async () => {
+    const fake = createFakePrisma();
+    const dependencies = createSyncDependencies(
+        [PURCHASE],
+        ACTIVE_PROJECTS,
+        write => upsertQboExpense(fake.client, write),
+    );
+    dependencies.suggestCostCode = async () => { throw new Error("cost code table unavailable"); };
+
+    const result = await syncQboExpenses(
+        { since: new Date("2026-07-01T00:00:00.000Z") },
+        dependencies,
+    );
+    assert.equal(result.imported, 1, "the money is recorded even when the phase guess blows up");
+});
+
+test("the sync asks for a phase on a matched job, carrying the job it matched", async () => {
+    const fake = createFakePrisma();
+    const suggested: { qbPurchaseId: string; projectId: string | null }[] = [];
+    const dependencies = createSyncDependencies(
+        [PURCHASE],
+        ACTIVE_PROJECTS,
+        write => upsertQboExpense(fake.client, write),
+    );
+    dependencies.suggestCostCode = async input => {
+        suggested.push({ qbPurchaseId: input.qbPurchaseId, projectId: input.projectId });
+    };
+
+    await syncQboExpenses({ since: new Date("2026-07-01T00:00:00.000Z") }, dependencies);
+    assert.deepEqual(suggested, [{ qbPurchaseId: "purchase-1", projectId: "project-1" }]);
 });

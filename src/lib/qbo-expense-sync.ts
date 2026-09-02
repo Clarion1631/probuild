@@ -4,6 +4,9 @@ import { findBestProjectNameMatches } from "./project-match";
 import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
 import { after } from "next/server";
+import { suggestCode } from "./expense-cost-suggest";
+import { notHumanCodedExpenseWhere } from "./expense-attribution";
+import { isOverheadProject } from "./overhead-project";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
 // never drift from the values that module READS.
@@ -492,6 +495,16 @@ export interface QboExpenseWrite {
     qbSyncToken: string;
     qbSyncedAt: Date;
     estimateId: string;
+    /**
+     * Phase 3: the job this purchase belongs to — the match's project, or the
+     * overhead bucket. The sync always KNEW this (it is how `estimateId` was
+     * chosen); it just used to drop it on the floor.
+     *
+     * On UPDATE it is only ever written when the existing row's is NULL. A
+     * bookkeeper who re-attributed an imported expense by hand must survive the
+     * next re-sync — same posture as the deliberate `receiptUrl` omission.
+     */
+    projectId: string | null;
     amount: number;
     vendor: string | null;
     date: Date | null;
@@ -509,6 +522,7 @@ type ExpenseTransaction = {
             id: string;
             qbSyncToken: string | null;
             estimateId: string;
+            projectId?: string | null;
             amount: unknown;
             vendor: string | null;
             date: Date | null;
@@ -546,12 +560,36 @@ function datesEqual(left: Date | null, right: Date | null): boolean {
     return left?.getTime() === right?.getTime();
 }
 
+/**
+ * The subset of `write` an UPDATE is allowed to apply to an existing row.
+ *
+ * `projectId` is dropped once the row already has one: re-attribution by a
+ * bookkeeper is a human decision, and the QBO Purchase's customer ref is not a
+ * newer fact about it. Filling a NULL is still correct — that is the backfill
+ * catching up.
+ */
+function qboExpenseUpdateData(
+    existing: NonNullable<Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>>,
+    write: QboExpenseWrite,
+): Partial<QboExpenseWrite> {
+    if ((existing.projectId ?? null) === null) return write;
+    const { projectId: _ignored, ...rest } = write;
+    return rest;
+}
+
 function expenseMatchesQboWrite(
     existing: Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>,
     write: QboExpenseWrite,
 ): boolean {
     if (!existing) return false;
+    // Compare projectId ONLY on the rows an update would actually write it to.
+    // Comparing it unconditionally would mark every hand-re-attributed row as
+    // drifted and re-issue an update forever that deliberately never changes it.
+    const projectIdMatches =
+        (existing.projectId ?? null) !== null ||
+        (existing.projectId ?? null) === (write.projectId ?? null);
     return (
+        projectIdMatches &&
         existing.qbSyncToken === write.qbSyncToken &&
         existing.estimateId === write.estimateId &&
         Number(existing.amount) === write.amount &&
@@ -591,6 +629,7 @@ export async function upsertQboExpense(
                 id: true,
                 qbSyncToken: true,
                 estimateId: true,
+                projectId: true,
                 amount: true,
                 vendor: true,
                 date: true,
@@ -611,7 +650,7 @@ export async function upsertQboExpense(
         }
         await transaction.expense.update({
             where: { id: existing.id },
-            data: write,
+            data: qboExpenseUpdateData(existing, write),
         });
         return "updated";
     });
@@ -675,6 +714,81 @@ export async function deactivateQboExpense(
         });
         return "removed";
     });
+}
+
+// ── Cost-code suggestion (Phase 3 attribution, spec §3.1) ──────────────────
+//
+// A QBO import has never carried a cost code — the sync only ever project-
+// matched, so every imported expense landed on the job with no phase and fell
+// into the variance report's "unattributed" bucket. The rules in
+// expense-cost-suggest.ts answer the unambiguous ones; the rest stay NULL for
+// a human, which is the same deliberate refusal the backfill makes.
+//
+// TWO THINGS THIS MUST NEVER DO, both encoded in the `where` below rather than
+// in a caller's discipline:
+//   * overwrite a code (the `costCodeId: null` predicate), and
+//   * overwrite a HUMAN's code (`notHumanCodedExpenseWhere()` — capture and
+//     manual are off limits, and its explicit NULL branch is what keeps legacy
+//     rows eligible; see that function's comment).
+// It also never runs on the deactivate path: a Purchase deleted in QBO is not
+// an occasion to guess its phase.
+
+export interface QboCostCodeSuggestionInput {
+    qbPurchaseId: string;
+    vendor: string | null;
+    description: string;
+    /** The job the row was just imported against; the overhead bucket opts out. */
+    projectId: string | null;
+}
+
+export interface QboCostCodeSuggestionClient {
+    expense: {
+        updateMany(args: {
+            where: Record<string, unknown>;
+            data: { costCodeId: string; costCodeSource: string; costCodeConfidence: number };
+        }): Promise<{ count: number }>;
+    };
+}
+
+export type QboCostCodeSuggestionResult =
+    /** The overhead bucket is not a job and does not get a job phase. */
+    | "skipped-overhead"
+    /** The rules refused — the honest majority case. */
+    | "no-match"
+    /** The rules named a code this company does not have active. */
+    | "unknown-code"
+    /** Already coded, or coded by a human: the guard held. */
+    | "not-written"
+    | "written";
+
+export async function applyQboExpenseCostCodeSuggestion(
+    client: QboCostCodeSuggestionClient,
+    input: QboCostCodeSuggestionInput,
+    costCodeIdByCode: ReadonlyMap<string, string>,
+): Promise<QboCostCodeSuggestionResult> {
+    if (input.projectId && isOverheadProject(input.projectId)) return "skipped-overhead";
+
+    const suggestion = suggestCode({ vendor: input.vendor, description: input.description });
+    if (!suggestion) return "no-match";
+
+    const costCodeId = costCodeIdByCode.get(suggestion.code);
+    if (!costCodeId) return "unknown-code";
+
+    const written = await client.expense.updateMany({
+        where: {
+            qbPurchaseId: input.qbPurchaseId,
+            costCodeId: null,
+            ...notHumanCodedExpenseWhere(),
+        },
+        data: {
+            costCodeId,
+            // "ai" is the spec's value for "a machine chose this". The rules are
+            // regexes; the label is about provenance, not about technique.
+            costCodeSource: "ai",
+            costCodeConfidence: suggestion.confidence,
+        },
+    });
+    return written.count > 0 ? "written" : "not-written";
 }
 
 // ── Purchase classification (Unified Money Register plan §5 step 3) ─────────
@@ -762,6 +876,12 @@ export interface QboExpenseSyncDependencies {
     /** Optional: copy the QBO receipt attachment into ProBuild storage for this purchase. */
     attachReceipt?(tokens: QBTokens, qbPurchaseId: string): Promise<void>;
     upsertPurchaseClassification(write: QboPurchaseClassificationWrite): Promise<void>;
+    /**
+     * Optional: rule-based phase suggestion for a job-costed import that has no
+     * cost code yet (spec §3.1). Optional so a caller can turn it off outright,
+     * and so existing tests that build dependencies by hand keep compiling.
+     */
+    suggestCostCode?(input: QboCostCodeSuggestionInput): Promise<void>;
     now(): Date;
 }
 
@@ -819,6 +939,23 @@ async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
 }
 
 function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
+    // Loaded once per sync, on first use: a sync that matches nothing (or one
+    // where every row is already coded) should not pay for the lookup, and a
+    // sync of 400 purchases should not pay for it 400 times. Scoped to this
+    // closure rather than to the module so a long-lived process picks up a
+    // newly added cost code on the next run.
+    let costCodeIdByCode: ReadonlyMap<string, string> | null = null;
+    const loadCostCodes = async (): Promise<ReadonlyMap<string, string>> => {
+        if (!costCodeIdByCode) {
+            const codes = await prisma.costCode.findMany({
+                where: { isActive: true },
+                select: { id: true, code: true },
+            });
+            costCodeIdByCode = new Map(codes.map(code => [code.code, code.id]));
+        }
+        return costCodeIdByCode;
+    };
+
     return {
         getTokens: getFreshQBTokens,
         readPurchases: (tokens, since, mode, until) =>
@@ -845,6 +982,13 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
                 prisma as unknown as QboPurchaseClassificationPersistenceClient,
                 write,
             ),
+        suggestCostCode: async input => {
+            await applyQboExpenseCostCodeSuggestion(
+                prisma as unknown as QboCostCodeSuggestionClient,
+                input,
+                await loadCostCodes(),
+            );
+        },
         now: () => new Date(),
     };
 }
@@ -1034,6 +1178,11 @@ export async function syncQboExpenses(
                     qbSyncToken: purchase.syncToken,
                     qbSyncedAt: dependencies.now(),
                     estimateId: overheadEstimateId,
+                    // The overhead bucket IS this row's project — the sync has
+                    // always known it, it just never wrote it down.
+                    // Non-null on this branch by construction: overheadEstimateId
+                    // is derived from overheadProject and gates the branch.
+                    projectId: overheadProject?.id ?? null,
                     amount: purchase.total,
                     vendor: purchase.vendor,
                     date: qboTransactionDate(purchase.txnDate),
@@ -1042,6 +1191,9 @@ export async function syncQboExpenses(
                 });
                 if (outcome === "imported") result.imported += 1;
                 if (outcome === "updated") result.updated += 1;
+                // NO cost-code suggestion here. Overhead is not a job and does
+                // not get a job phase (same scope rule as
+                // scripts/suggest-expense-cost-codes.mjs).
                 await attachReceipt(purchase.qbPurchaseId);
                 continue;
             }
@@ -1075,19 +1227,48 @@ export async function syncQboExpenses(
             continue;
         }
 
+        const description = qboExpenseDescription(purchase);
         const outcome = await dependencies.upsertExpense({
             qbPurchaseId: purchase.qbPurchaseId,
             qbSyncToken: purchase.syncToken,
             qbSyncedAt: dependencies.now(),
             estimateId: match.estimateId,
+            // The matched job. `match.projectId` was computed to pick the
+            // estimate and then thrown away; now it is persisted.
+            projectId: match.projectId,
             amount: purchase.total,
             vendor: purchase.vendor,
             date: qboTransactionDate(purchase.txnDate),
-            description: qboExpenseDescription(purchase),
+            description,
             status: "Reviewed",
         });
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
+
+        // Runs on "unchanged" too: a row imported before Phase 3 is unchanged
+        // by definition and is exactly the row that still has no phase. The
+        // write is guarded (uncoded, and not human-coded), so a re-run over an
+        // already-coded row is a no-op.
+        //
+        // Failure here must never fail the import — the money is already
+        // recorded, and a missing phase is a reportable gap, not a lost cost.
+        // Same resilience posture as persistClassification/attachReceipt.
+        if (dependencies.suggestCostCode) {
+            try {
+                await dependencies.suggestCostCode({
+                    qbPurchaseId: purchase.qbPurchaseId,
+                    vendor: purchase.vendor,
+                    description,
+                    projectId: match.projectId,
+                });
+            } catch (error) {
+                console.error(
+                    "QBO cost-code suggestion failed",
+                    purchase.qbPurchaseId,
+                    error instanceof Error ? error.name : "UnknownError",
+                );
+            }
+        }
         await attachReceipt(purchase.qbPurchaseId);
     }
 

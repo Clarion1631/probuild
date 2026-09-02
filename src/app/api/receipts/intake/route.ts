@@ -23,6 +23,7 @@ import {
     serializeReceiptIntake,
     withArchiveDownloadUrls,
 } from "@/lib/receipt-intake/queries";
+import { isOverheadProject } from "@/lib/overhead-project";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -73,6 +74,13 @@ interface ParsedBody {
     uploadId: string | null;
     projectId: string | null;
     costCodeId: string | null;
+    /**
+     * Phase 3: did this material get installed at a customer job? Tri-state on
+     * purpose — `null` means the caller did not say, which is NOT the same as
+     * "no" and must not be recorded as one. `resolveInstalledAtCustomer` fills
+     * a default only when the caller stayed silent.
+     */
+    installedAtCustomer: boolean | null;
     threadName: string | null;
     /** The forwarder reporting that v1 already booked and archived this file. */
     archivedByV1: boolean;
@@ -122,6 +130,34 @@ function tooLargeForInline(limit: number, encoding: "json" | "multipart") {
         },
         { status: 413 },
     );
+
+ * Accept a boolean from either a JSON body (real boolean) or a multipart form
+ * (everything is a string). Anything else is "the caller did not say".
+ */
+function optionalBool(value: unknown): boolean | null {
+    if (typeof value === "boolean") return value;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return null;
+}
+
+/**
+ * The default the mobile app relies on (spec §5c): a receipt filed against a
+ * real job was installed at the customer's; one filed against the Shop overhead
+ * bucket was consumed by the business and is NOT deductible on the excise
+ * return. An explicit answer from the caller always wins — the crew member
+ * standing in front of the material knows better than this rule does.
+ *
+ * With no project at all the answer stays NULL. Guessing "yes" would quietly
+ * inflate a tax deduction, which is the one direction this must never fail in.
+ */
+export function resolveInstalledAtCustomer(
+    declared: boolean | null,
+    projectId: string | null,
+): boolean | null {
+    if (declared !== null) return declared;
+    if (!projectId) return null;
+    return !isOverheadProject(projectId);
 }
 
 async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
@@ -150,6 +186,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
             uploadId: str(form.get("uploadId")),
             projectId: str(form.get("projectId")),
             costCodeId: str(form.get("costCodeId")),
+            installedAtCustomer: optionalBool(form.get("installedAtCustomer")),
             threadName: str(form.get("threadName")),
             archivedByV1: form.get("archivedByV1") === "true",
         };
@@ -182,6 +219,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         uploadId: str(json.uploadId),
         projectId: str(json.projectId),
         costCodeId: str(json.costCodeId),
+        installedAtCustomer: optionalBool(json.installedAtCustomer),
         threadName: str(json.threadName),
         // Strict === true: only an explicit boolean may mark a row as already
         // booked by v1, because that flag is what excuses v2 from booking it.
@@ -294,6 +332,10 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId: parsed.projectId,
                 costCodeId: parsed.costCodeId,
+                installedAtCustomer: resolveInstalledAtCustomer(
+                    parsed.installedAtCustomer,
+                    parsed.projectId,
+                ),
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Only a shared-secret forwarder may assert this: it is the
                 // claim that v1 already put this document in the books, and it

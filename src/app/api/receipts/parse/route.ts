@@ -290,6 +290,12 @@ export async function POST(req: NextRequest) {
                 const expense = await prisma.expense.create({
                     data: {
                         estimateId: estimate.id,
+                        // Phase 3: the caller named the project and access was
+                        // checked three lines up — stamp it rather than making
+                        // every reader re-derive it through the estimate.
+                        // Cost code stays null: this parse reads vendor/total/
+                        // date, never a phase.
+                        projectId,
                         description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
                         amount: parsed.total as number,
                         date: parsed.date ? new Date(parsed.date as string) : new Date(),

@@ -82,6 +82,8 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         costCodeId: null,
         suggestedCostCodeId: "cc-plumb",
         suggestedConfidence: 0.82,
+        taxAtSource: true,
+        installedAtCustomer: true,
         storagePath: "receipts/intake/intake-1.jpg",
         fileName: "receipt.jpg",
         mimeType: "image/jpeg",

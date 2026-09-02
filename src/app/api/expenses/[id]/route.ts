@@ -54,6 +54,28 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
+        // Phase 3 (spec §3.7): an edit here is a HUMAN re-coding the expense,
+        // so it takes the highest precedence and no automated pass may touch it
+        // again. `costCodeSource` is never read off the body — a client cannot
+        // assert its own provenance — it is derived from the fact that a person
+        // used this endpoint. The key is only acted on when it is present, so
+        // existing callers that send {amount, vendor, date, ...} are unchanged.
+        const editsCostCode = Object.prototype.hasOwnProperty.call(body, "costCodeId");
+        const nextCostCodeId: string | null =
+            typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
+        if (editsCostCode && nextCostCodeId) {
+            const costCode = await prisma.costCode.findUnique({
+                where: { id: nextCostCodeId },
+                select: { id: true, isActive: true },
+            });
+            if (!costCode) {
+                return NextResponse.json({ error: "Cost code not found." }, { status: 400 });
+            }
+            if (!costCode.isActive) {
+                return NextResponse.json({ error: "That cost code is inactive." }, { status: 400 });
+            }
+        }
+
         const updatedExpense = await prisma.expense.update({
             where: { id },
             data: {
@@ -62,6 +84,16 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 date: body.date ? new Date(body.date) : null,
                 description: body.description || null,
                 itemId: body.itemId || null,
+                ...(editsCostCode
+                    ? {
+                        costCodeId: nextCostCodeId,
+                        // Clearing the code clears the provenance with it —
+                        // leaving "manual" on a null code would guard a row
+                        // that has nothing to guard.
+                        costCodeSource: nextCostCodeId ? "manual" : null,
+                        costCodeConfidence: null,
+                    }
+                    : {}),
             },
         });
 

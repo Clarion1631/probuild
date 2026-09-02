@@ -108,7 +108,15 @@ export async function POST(req: Request) {
         await prisma.expense.create({
             data: {
                 estimateId,
+                projectId: project.id,
                 costCodeId: costCode?.id ?? null,
+                // The category came from the Apps Script's Gemini read, not
+                // from a person — "ai", never "capture", so nothing downstream
+                // treats it as a human's answer. No confidence: matchCostCode
+                // is a string match and has no score to report, and inventing
+                // one would be a guess presented as a measurement.
+                costCodeSource: costCode ? "ai" : null,
+                costCodeConfidence: null,
                 amount,
                 vendor: body.vendor || "Unknown",
                 date,

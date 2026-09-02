@@ -71,8 +71,11 @@ const LEASE_MS = CLAIM_LEASE_MINUTES * 60_000;
 const WORKER_ROW_SELECT = {
     id: true, source: true, sourceRef: true, state: true, dryRun: true,
     projectId: true, costCodeId: true, suggestedCostCodeId: true,
+    suggestedConfidence: true,
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
+    // Phase 3 attribution — booking copies these straight onto the Expense.
+    taxAtSource: true, installedAtCustomer: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true,

@@ -184,9 +184,16 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
     return prisma.expense.create({
         data: {
             estimateId,
+            // Phase 3: the estimate's project, already resolved and validated
+            // above (including the change-order cross-check).
+            projectId: estimate.projectId,
             itemId: data.itemId || null,
             costCodeId: data.costCodeId || null,
             costTypeId: data.costTypeId || null,
+            // Every caller of this core is a human picking a code in a web form
+            // or a CO flow, so a code here is "manual" and is off limits to the
+            // sync and the backfill.
+            costCodeSource: data.costCodeId ? "manual" : null,
             amount: dollars(data.amount),
             vendor: data.vendor?.trim() || null,
             date: expenseDate,

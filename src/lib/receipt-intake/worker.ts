@@ -286,6 +286,8 @@ export interface ReadPatch {
     txnDate: Date | null;
     totalCents: number | null;
     taxCents: number | null;
+    /** Phase 3: `taxCents > 0` — a positive read, never a present-but-zero one. */
+    taxAtSource: boolean;
     docType: string | null;
     refNumber: string | null;
     memo: string | null;
@@ -680,6 +682,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         txnDate: dateOnly(keys.dateStr, timeZone),
         totalCents,
         taxCents,
+        // Phase 3: the receipt carried sales tax GTR paid at the register. An
+        // ABSENT tax read and a ZERO one are the same answer here — neither is
+        // evidence that tax was paid — so this is derived from `taxCents` being
+        // a positive number, never from the field merely existing.
+        taxAtSource: taxCents !== null && taxCents > 0,
         docType: read.docType || null,
         refNumber: keys.ref,
         memo: read.memo || null,

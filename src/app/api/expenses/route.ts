@@ -2,6 +2,10 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { resolveCostCode } from "@/lib/cost-coding";
+import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -15,6 +19,14 @@ export async function POST(req: NextRequest) {
         const body = await req.json();
         const { itemId, amount, vendor, date, description, receiptUrl } = body;
         let { estimateId, projectId } = body;
+        // Phase 3 (spec §3.4): the crew app may now send a phase. Optional on
+        // purpose — this route also serves legacy mobile builds and the
+        // no-photo path, and rejecting an uncoded expense here would just stop
+        // the spend being recorded at all. `costCodeSource` is NEVER read off
+        // the body: provenance is something the server observes, not something
+        // a client asserts.
+        const requestedCostCodeId: string | null =
+            typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
 
         if (!estimateId && !projectId) {
             return NextResponse.json(
@@ -95,10 +107,52 @@ export async function POST(req: NextRequest) {
             parsedDate = d;
         }
 
+        // BOTH checks, per the SCOPE note on resolveCostCode: "the cost code
+        // exists and is active" is attribution, "this code belongs to this job"
+        // is permission, and neither implies the other.
+        let costCodeId: string | null = null;
+        let costTypeId: string | null = null;
+        if (requestedCostCodeId) {
+            const resolved = await resolveCostCode(prismaCostCodingDataSource, {
+                costCodeId: requestedCostCodeId,
+            });
+            if (!resolved.ok) {
+                return NextResponse.json(
+                    { error: resolved.error, code: resolved.code },
+                    { status: resolved.status },
+                );
+            }
+            const allowed = await isCostCodeAllowedForProject(
+                prismaPhaseDataSource,
+                projectId,
+                resolved.costCodeId,
+            );
+            if (!allowed) {
+                return NextResponse.json(
+                    {
+                        error: "That cost code isn't one of this project's phases.",
+                        code: "PHASE_NOT_ON_PROJECT",
+                    },
+                    { status: 400 },
+                );
+            }
+            costCodeId = resolved.costCodeId;
+            costTypeId = resolved.costTypeId;
+        }
+
         const newExpense = await prisma.expense.create({
             data: {
                 estimateId,
+                // Phase 3: born with its job. Resolved above in both branches
+                // (derived from the estimate on the web path, checked against
+                // the caller's access on the mobile path).
+                projectId,
                 itemId: itemId || null,
+                costCodeId,
+                costTypeId,
+                // A person picked this on a phone or in a form, so it is
+                // "capture" and no automated pass may ever overwrite it.
+                costCodeSource: costCodeId ? "capture" : null,
                 amount: numericAmount,
                 vendor: vendor || null,
                 date: parsedDate,

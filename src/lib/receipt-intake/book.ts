@@ -50,6 +50,11 @@ export interface BookableRow {
     suggestedCostCodeId: string | null;
     /** The model's confidence in that phase suggestion, 0..1. */
     suggestedConfidence: number | null;
+    suggestedConfidence: number | null;
+    /** Phase 3: the read found sales tax paid at the register. */
+    taxAtSource: boolean;
+    /** Phase 3: installed at a customer job (deductible) — null = unknown. */
+    installedAtCustomer: boolean | null;
     storagePath: string;
     fileName: string | null;
     mimeType: string;
@@ -613,6 +618,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             );
         }
         const costCodeId = phaseCheck.costCodeId;
+        // Phase 3 provenance, derived from WHICH source survived the
+        // re-validation above — not from which one was merely present. A
+        // captured code that the final project does not carry is dropped by
+        // resolvePhase, and calling the survivor "capture" would then be a
+        // claim about a decision that did not stick.
+        const costCodeSource = costCodeId
+            ? (costCodeId === row.costCodeId ? "capture" : "ai")
+            : null;
+        const costCodeConfidence = costCodeSource === "ai" ? row.suggestedConfidence : null;
         const driveFileId = driveFileIdOf(row);
         const receiptUrl = driveFileId
             ? `https://drive.google.com/file/d/${driveFileId}/view`
@@ -635,7 +649,23 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             const expense = existing ?? await tx.expense.create({
                 data: {
                     estimateId,
+                    // Phase 3: the job the capturer (or the Drive folder) named.
+                    // `estimateId` above is DERIVED from it — the project is the
+                    // fact, the estimate is the lookup.
+                    projectId: row.projectId,
                     costCodeId,
+                    costCodeSource,
+                    costCodeConfidence,
+                    // The tax the VENDOR charged, from the read — deliberately
+                    // not `taxApplied`. `taxApplied` is what the QBO Purchase
+                    // split onto the reclaimable account, and buildGroups zeroes
+                    // it for a check or a nonsense read. The WA deduction is
+                    // based on tax actually paid at the register, so the receipt's
+                    // own figure is the right one here, and the two are allowed
+                    // to disagree.
+                    taxAmount: row.taxCents !== null ? row.taxCents / 100 : null,
+                    taxAtSource: row.taxAtSource,
+                    installedAtCustomer: row.installedAtCustomer,
                     amount: amountCents / 100,
                     vendor: row.vendor || "Unknown",
                     // RE-ANCHORED at write time. `txnDate` is a @db.Date column
