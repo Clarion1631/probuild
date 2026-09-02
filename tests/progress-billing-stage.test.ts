@@ -19,7 +19,12 @@ import {
     progressBillingPrivateNote,
     type ProgressBillingStageQbo,
 } from "../src/lib/progress-billing";
-import { QBAmbiguousCreateError } from "../src/lib/quickbooks-payments";
+import { QBAmbiguousCreateError, compensateAndUnlink } from "../src/lib/quickbooks-payments";
+import {
+    markerKind,
+    parseCreateMarker,
+    AMBIGUOUS_CREATE_MARKER,
+} from "../src/lib/qbo-create-markers";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 
@@ -222,7 +227,13 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
         () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
         (e: unknown) => e instanceof QBAmbiguousCreateError,
     );
-    assert.equal(row.qbSyncError, "ambiguous-create");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER);
+    // The marker carries what a recovery has to ask QuickBooks for, captured
+    // before the POST — not recomputed later from a row that may have moved.
+    assert.deepEqual(parseCreateMarker(row.qbSyncError)?.identity, {
+        docNumber: "INV-00171-P1",
+        privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
+    });
     assert.equal(row.qbInvoiceId, null, "we never learned an id to record");
     assert.equal(events.at(-1)?.reason, "ambiguous-create");
     assert.equal(events.at(-1)?.source, "progress-billing-stage");
@@ -258,4 +269,112 @@ test("an AUTH failure on the pay link surfaces; it is not filed as pending", asy
     assert.equal(row.qbInvoiceId, "qb-1");
     assert.equal(row.status, "Staged");
     assert.equal(calls.deleted.length, 0, "a linked row must never have its invoice deleted");
+});
+
+// --- Compensation releases the provisional link ---------------------------
+
+test("a compensated invoice takes the provisional link with it", async () => {
+    // The race: the link write COMMITS (the row now points at the new QBO
+    // invoice) and then the response is lost, so the stage compensates.
+    // Deleting without clearing would leave the row pointing at a document that
+    // no longer exists — the poller would keep probing it, the portal would
+    // offer a dead pay link, and the next stage would refuse because the
+    // billing "already has" an invoice.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo();
+
+    let updates = 0;
+    const lossyDb = {
+        findUnique: db.findUnique,
+        async updateMany(args: any) {
+            updates++;
+            const result = await db.updateMany(args);
+            // 1 = the in-flight claim, 2 = the provisional link. The write
+            // LANDS and then the connection dies on the way back.
+            if (updates === 2) throw new Error("connection lost after linking");
+            return result;
+        },
+    };
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db: lossyDb, qbo, logEvent }),
+        /connection lost after linking/,
+    );
+
+    assert.deepEqual(calls.deleted, ["qb-1"], "the invoice we could not keep is deleted");
+    assert.equal(row.qbInvoiceId, null, "and the row does not point at it any more");
+    assert.equal(row.qbInvoiceLink, null);
+    assert.equal(row.qbSyncError, null, "including the paylink-pending marker");
+    assert.equal(row.status, "Draft", "re-stageable");
+});
+
+test("a FAILED compensation keeps the link, so a human can find the invoice", async () => {
+    // The opposite rule, deliberately: the invoice is still out there and
+    // collectible, and a row pointing at it is how anyone finds it.
+    const { row, db } = makeDb(draftRow());
+    const { qbo } = makeQbo({ deleteResult: false });
+    let updates = 0;
+    const lossyDb = {
+        findUnique: db.findUnique,
+        async updateMany(args: any) {
+            updates++;
+            const result = await db.updateMany(args);
+            if (updates === 2) throw new Error("connection lost after linking");
+            return result;
+        },
+    };
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db: lossyDb, qbo, logEvent }),
+        /could not be deleted/,
+    );
+    assert.equal(row.qbInvoiceId, "qb-1", "the link survives a failed delete");
+});
+
+test("compensateAndUnlink clears only a row still pointing at the deleted invoice", async () => {
+    // The shared step both rails use, driven directly — this is what the
+    // milestone push runs when its final link claim misses after the
+    // provisional link has already landed.
+    const linked: any = { id: "r1", qbInvoiceId: "qb-1", qbInvoiceLink: "https://pay/1", qbSyncedAt: new Date(), qbSyncError: "paylink-pending", status: "Staged" };
+    const delegate = {
+        async updateMany(args: any) {
+            const matches = Object.entries(args.where).every(([k, v]) => linked[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(linked, args.data);
+            return { count: 1 };
+        },
+    };
+
+    const ok = await compensateAndUnlink(delegate, "r1", "qb-1", async () => true, { status: "Draft" });
+    assert.deepEqual(ok, { deleted: true, unlinked: true });
+    assert.equal(linked.qbInvoiceId, null);
+    assert.equal(linked.qbSyncError, null);
+    assert.equal(linked.status, "Draft");
+
+    // A row that moved on (a concurrent settle re-linked it) is NOT trampled.
+    const moved: any = { id: "r2", qbInvoiceId: "qb-OTHER", qbSyncError: null };
+    const movedDelegate = {
+        async updateMany(args: any) {
+            const matches = Object.entries(args.where).every(([k, v]) => moved[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(moved, args.data);
+            return { count: 1 };
+        },
+    };
+    const missed = await compensateAndUnlink(movedDelegate, "r2", "qb-1", async () => true);
+    assert.deepEqual(missed, { deleted: true, unlinked: false });
+    assert.equal(moved.qbInvoiceId, "qb-OTHER", "the winner keeps its link");
+
+    // A failed delete never clears: the invoice still exists.
+    const keep: any = { id: "r3", qbInvoiceId: "qb-1", qbSyncError: "paylink-pending" };
+    const keepDelegate = {
+        async updateMany() {
+            throw new Error("must not clear a link whose invoice still exists");
+        },
+    };
+    assert.deepEqual(await compensateAndUnlink(keepDelegate, "r3", "qb-1", async () => false), {
+        deleted: false,
+        unlinked: false,
+    });
+    assert.equal(keep.qbInvoiceId, "qb-1");
 });

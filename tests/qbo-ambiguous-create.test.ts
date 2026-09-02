@@ -18,19 +18,33 @@ import {
     ambiguousCreateFingerprint,
 } from "../src/lib/qbo-ambiguous-create";
 import { QBTimeoutError, type QBInvoiceMatch, type QBTokens } from "../src/lib/quickbooks";
-import { milestonePrivateNote } from "../src/lib/quickbooks-payments";
+import { milestonePrivateNote, milestoneDocNumber } from "../src/lib/quickbooks-payments";
 import { progressBillingPrivateNote, deleteProgressBillingCore } from "../src/lib/progress-billing";
-import { QBResolveRequiredError } from "../src/lib/qbo-create-markers";
+import {
+    QBResolveRequiredError,
+    composeCreateMarker,
+    parseCreateMarker,
+    markerKind,
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+} from "../src/lib/qbo-create-markers";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
 
-function milestoneRow(overrides: Record<string, any> = {}) {
+/** The milestone's real DocNumber and PrivateNote, from the shared helpers. */
+const MILESTONE_DOC = milestoneDocNumber("INV-00171", 2);
+const MILESTONE_NOTE = milestonePrivateNote("INV-00171", "Rough-in", "Mesplay Kitchen");
+const BILLING_NOTE = progressBillingPrivateNote("INV-00171", "INV-00171-P1");
+const MILESTONE_IDENTITY = { docNumber: MILESTONE_DOC, privateNote: MILESTONE_NOTE };
+
+function milestoneRow(overrides: Record<string, any> = {}): any {
     return {
         id: "ps-1",
         name: "Rough-in",
         qbInvoiceId: null,
-        qbSyncError: "ambiguous-create",
+        // The marker as the create path writes it: kind + the identity it used.
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY),
         invoiceId: "inv-1",
         invoice: {
             code: "INV-00171",
@@ -47,17 +61,15 @@ function billingRow(overrides: Record<string, any> = {}): any {
         id: "pb-1",
         code: "INV-00171-P1",
         qbInvoiceId: null,
-        qbSyncError: "ambiguous-create",
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, {
+            docNumber: "INV-00171-P1",
+            privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
+        }),
         invoiceId: "inv-1",
         invoice: { code: "INV-00171", projectId: "proj-1" },
         ...overrides,
     };
 }
-
-/** The milestone's real DocNumber and PrivateNote, from the shared helpers. */
-const MILESTONE_DOC = "INV-00171-2";
-const MILESTONE_NOTE = milestonePrivateNote("INV-00171", "Rough-in", "Mesplay Kitchen");
-const BILLING_NOTE = progressBillingPrivateNote("INV-00171", "INV-00171-P1");
 
 function makeDb(milestone: any | null, billing: any | null) {
     const delegate = (row: any) => ({
@@ -138,7 +150,7 @@ test("an invoice sharing the DocNumber but not our PrivateNote is NOT ours", asy
     assert.equal(res.ok, false);
     assert.equal(!res.ok && res.refusal, "none-found");
     assert.equal(row.qbInvoiceId, null, "nothing written");
-    assert.equal(row.qbSyncError, "ambiguous-create", "still parked");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
 });
 
 test("zero matches refuses until the operator confirms none exists", async () => {
@@ -149,7 +161,7 @@ test("zero matches refuses until the operator confirms none exists", async () =>
         deps([], db),
     );
     assert.equal(!refused.ok && refused.refusal, "none-found");
-    assert.equal(row.qbSyncError, "ambiguous-create");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER);
 
     const confirmed = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
@@ -171,7 +183,7 @@ test("more than one match refuses and writes NOTHING", async () => {
 
     assert.equal(!res.ok && res.refusal, "multiple-matches");
     assert.deepEqual(!res.ok && res.candidates?.map((c) => c.qbInvoiceId), ["qb-1", "qb-2"]);
-    assert.equal(row.qbSyncError, "ambiguous-create", "parked is the only state that stops a third invoice");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "parked is the only state that stops a third invoice");
     assert.equal(row.qbInvoiceId, null);
 });
 
@@ -186,7 +198,7 @@ test("an unreachable QuickBooks refuses — 'I could not ask' is not 'there is n
     );
 
     assert.equal(!res.ok && res.refusal, "quickbooks-unreachable");
-    assert.equal(row.qbSyncError, "ambiguous-create");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER);
     assert.equal(row.qbInvoiceId, null);
 });
 
@@ -212,8 +224,8 @@ test("a row that moved since the page was rendered is refused as stale", async (
     const row = milestoneRow();
     const db = makeDb(row, null);
     // Someone else resolved it first: the state the operator was shown is gone.
-    const staleToken = ambiguousCreateFingerprint({ qbSyncError: "ambiguous-create", qbInvoiceId: null });
-    row.qbSyncError = "create-in-flight";
+    const staleToken = ambiguousCreateFingerprint(row);
+    row.qbSyncError = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY);
 
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: staleToken },
@@ -255,7 +267,7 @@ test("a progress billing resolves the same way, and comes back Staged", async ()
 });
 
 test("an in-flight marker is resolvable too — a crash leaves exactly that", async () => {
-    const row = milestoneRow({ qbSyncError: "create-in-flight" });
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY) });
     const db = makeDb(row, null);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: ambiguousCreateFingerprint(row) },
@@ -271,7 +283,10 @@ test("deleting a parked progress-billing draft is refused with a typed error", a
     //
     // src/lib/prisma.ts reads globalThis.prisma before building a client, which
     // is the seam this uses: no database, and the REAL core runs.
-    const parked = { id: "pb-1", code: "INV-00171-P1", status: "Draft", qbInvoiceId: null, qbSyncError: "ambiguous-create" };
+    const parked = {
+        id: "pb-1", code: "INV-00171-P1", status: "Draft", qbInvoiceId: null,
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, { docNumber: "INV-00171-P1", privateNote: BILLING_NOTE }),
+    };
     let deleted = false;
     const tx = {
         progressBilling: {
@@ -297,5 +312,95 @@ test("deleting a parked progress-billing draft is refused with a typed error", a
         assert.equal(deleted, false, "the draft must survive until it is resolved");
     } finally {
         (globalThis as any).prisma = previous;
+    }
+});
+
+// ─── The recovery identity rides in the marker ─────────────────────────────
+
+test("compose/parse round-trips, and a legacy or corrupt marker yields NO identity", () => {
+    const identity = { docNumber: "INV-00171-2", privateNote: "ProBuild INV-00171 · Rough-in · Mesplay Kitchen" };
+    const marker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
+    assert.equal(marker, "create-in-flight:INV-00171-2|ProBuild INV-00171 · Rough-in · Mesplay Kitchen");
+    assert.deepEqual(parseCreateMarker(marker), { kind: CREATE_IN_FLIGHT_MARKER, identity });
+
+    // A note containing the field separator survives: the FIRST one splits.
+    const piped = { docNumber: "INV-9-1", privateNote: "ProBuild INV-9 · A|B · Job" };
+    assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, piped)), {
+        kind: AMBIGUOUS_CREATE_MARKER,
+        identity: piped,
+    });
+
+    // Legacy bare markers: recognised as parked, but with nothing to look up.
+    for (const bare of [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER]) {
+        assert.deepEqual(parseCreateMarker(bare), { kind: bare, identity: null });
+    }
+    // Corrupt payloads are treated the same way — never guessed at.
+    for (const corrupt of ["ambiguous-create:", "ambiguous-create:|note", "ambiguous-create:doc|", "ambiguous-create:doconly"]) {
+        assert.equal(parseCreateMarker(corrupt)?.identity, null, corrupt);
+    }
+    // And unrelated values are not markers at all.
+    for (const other of [null, undefined, "", "voided", "notFound", "paylink-pending"]) {
+        assert.equal(parseCreateMarker(other as any), null, String(other));
+        assert.equal(markerKind(other as any), null, String(other));
+    }
+});
+
+test("the queried identity does not move when a sibling is deleted or the project renamed", async () => {
+    // The regression this exists for: docNumber is the milestone's POSITION and
+    // the note carries the project name. Recomputing either at recovery time
+    // would look for a document we never created — find nothing — and offer to
+    // release a row whose invoice is sitting in QuickBooks, collectible.
+    const row = milestoneRow();
+    const markerAtCreate = row.qbSyncError;
+
+    // An earlier milestone is deleted (this one is now position 1, not 2) and
+    // the project is renamed. The marker is untouched by both.
+    row.invoice.payments = [{ id: "ps-1" }];
+    row.invoice.project.name = "Mesplay Kitchen (Phase 2)";
+    row.name = "Rough-in plumbing";
+
+    const asked: string[] = [];
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        {
+            db,
+            logEvent,
+            getTokens: async () => TOKENS,
+            findInvoices: async (_t, docNumber) => {
+                asked.push(docNumber);
+                return [invoice("qb-9", MILESTONE_NOTE)];
+            },
+        },
+    );
+
+    assert.deepEqual(asked, [MILESTONE_DOC], "asked for the ORIGINAL doc number");
+    assert.equal(res.ok, true, "and matched the ORIGINAL private note");
+    assert.equal(row.qbInvoiceId, "qb-9");
+    assert.equal(markerAtCreate, composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY));
+});
+
+test("a marker with no identity refuses, and confirmed-none cannot clear it", async () => {
+    // Parked by an older release. We cannot know which document to ask about,
+    // so the one thing we must never do is conclude "there is none".
+    for (const bare of [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER, "ambiguous-create:doconly"]) {
+        const row = milestoneRow({ qbSyncError: bare });
+        const db = makeDb(row, null);
+        let asked = 0;
+        for (const decision of ["link-existing", "confirmed-none"] as const) {
+            const res = await resolveAmbiguousInvoiceCreateCore(
+                { ...base, decision, expectedState: ambiguousCreateFingerprint(row) },
+                {
+                    db, logEvent,
+                    getTokens: async () => TOKENS,
+                    findInvoices: async () => { asked++; return []; },
+                },
+            );
+            assert.equal(res.ok, false, `${bare} / ${decision}`);
+            assert.equal(!res.ok && res.refusal, "identity-unknown", `${bare} / ${decision}`);
+        }
+        assert.equal(asked, 0, "never guesses at a document to query");
+        assert.equal(row.qbSyncError, bare, "still parked, whatever the operator confirmed");
+        assert.equal(row.qbInvoiceId, null);
     }
 });

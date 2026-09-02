@@ -17,7 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import {
     isBlockedByAmbiguousCreate,
     isQboInvoiceLinkedOrPending,
-    PENDING_CREATE_MARKERS,
+    pendingCreateMarkerWhere,
     QBResolveRequiredError,
 } from "./qbo-create-markers";
 import {
@@ -2733,8 +2733,9 @@ export async function splitInvoiceMilestonesCore(
                     { qbInvoiceId: { not: null } },
                     // A create whose outcome is unknown counts as in flight: the
                     // id is null but a collectible invoice may exist, and the
-                    // re-split below drops the row that would settle it.
-                    { qbSyncError: { in: [...PENDING_CREATE_MARKERS] } },
+                    // re-split below drops the row that would settle it. Prefix
+                    // matched, because a marker carries a per-issuance identity.
+                    ...pendingCreateMarkerWhere(),
                 ],
             },
             select: { name: true },

@@ -50,6 +50,7 @@ import {
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
+    composeCreateMarker,
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
@@ -255,11 +256,16 @@ export {
     CREATE_IN_FLIGHT_STALE_MS,
     PAYLINK_PENDING_MARKER,
     PENDING_CREATE_MARKERS,
+    composeCreateMarker,
+    parseCreateMarker,
+    markerKind,
+    pendingCreateMarkerWhere,
     isBlockedByAmbiguousCreate,
     isStaleInFlight,
     isQboInvoiceLinkedOrPending,
     ambiguousCreateFingerprint,
     QBResolveRequiredError,
+    QBIdentityUnknownError,
 } from "./qbo-create-markers";
 
 /**
@@ -278,6 +284,51 @@ export function milestoneDocNumber(invoiceCode: string, position: number): strin
 /** The PrivateNote every milestone invoice carries — what proves it is ours. */
 export function milestonePrivateNote(invoiceCode: string, scheduleName: string, projectName: string): string {
     return `ProBuild ${invoiceCode} · ${scheduleName} · ${projectName}`;
+}
+
+/** The one write the compensation step needs; either rail's delegate satisfies it. */
+export interface CompensatableDelegate {
+    updateMany(args: any): Promise<{ count: number }>;
+}
+
+/**
+ * Delete a QuickBooks invoice we created but could not keep, then release the
+ * provisional link we wrote for it.
+ *
+ * Both rails now record `qbInvoiceId` BEFORE the pay-link fetch, so by the time
+ * compensation runs the row may already point at the invoice being deleted.
+ * Deleting without clearing left the row linked to a document that no longer
+ * exists: the payments poller would keep probing it, the portal would offer a
+ * dead pay link, and the next send would refuse because the row "already has"
+ * an invoice. The clear is CAS-pinned to the exact id we wrote, so a concurrent
+ * settle or re-stage that moved the row on wins instead of being trampled.
+ *
+ * A FAILED delete deliberately keeps the link: the invoice is still out there
+ * and collectible, and a row pointing at it is how a human finds it.
+ */
+export async function compensateAndUnlink(
+    delegate: CompensatableDelegate,
+    rowId: string,
+    qbInvoiceId: string,
+    deleteInvoice: () => Promise<boolean>,
+    /** Extra columns to restore alongside the link (e.g. a progress billing's status). */
+    extraClearData: Record<string, unknown> = {},
+): Promise<{ deleted: boolean; unlinked: boolean }> {
+    const deleted = await deleteInvoice().catch(() => false);
+    if (!deleted) return { deleted: false, unlinked: false };
+    const cleared = await delegate.updateMany({
+        where: { id: rowId, qbInvoiceId },
+        data: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            qbSyncedAt: null,
+            // The paylink-pending marker goes with it: there is no invoice left
+            // for the sweep to fetch a link for.
+            qbSyncError: null,
+            ...extraClearData,
+        },
+    }).catch(() => ({ count: 0 }));
+    return { deleted: true, unlinked: cleared.count === 1 };
 }
 
 /** One row waiting for its pay link, from either rail. */
@@ -305,6 +356,11 @@ export interface PayLinkSweepResult {
     noLink: number;
     /** Left for the next run — the sweep stopped, or the CAS lost. */
     skipped: number;
+    /**
+     * A rail filled its page, so more pending rows may exist than this run
+     * looked at. The caller must not report a clean sweep on it.
+     */
+    truncated?: boolean;
     reason?: string;
 }
 
@@ -359,6 +415,11 @@ export async function sweepPendingPayLinks(
             row: { id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code },
         })),
     ];
+
+    // A full page on either rail means there may be more behind it.
+    if (milestones.length >= PAYLINK_SWEEP_LIMIT || billings.length >= PAYLINK_SWEEP_LIMIT) {
+        result.truncated = true;
+    }
 
     for (const [index, entry] of rows.entries()) {
         if (isBudgetExhausted(deadline)) {
@@ -594,9 +655,18 @@ export async function pushMilestoneToQuickBooks(
     // sender got there first — refuse rather than race them into two invoices.
     // A failure to WRITE the marker must abort: without it a crash mid-create
     // is invisible, which is the whole failure this guards.
+    //
+    // The marker CARRIES the recovery identity (docNumber + PrivateNote),
+    // written in this same CAS. Both are derived from mutable state — the
+    // docNumber from this milestone's POSITION in the schedule, the note from
+    // the project and milestone names — so a recovery that recomputed them
+    // after an earlier milestone was deleted or the project renamed would look
+    // for a document we never created, find nothing, and offer to release a row
+    // whose real invoice is sitting in QuickBooks collectible.
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, { docNumber, privateNote });
     const claimedSend = await prisma.paymentSchedule.updateMany({
         where: { id: schedule.id, qbInvoiceId: null, qbSyncError: null },
-        data: { qbSyncError: CREATE_IN_FLIGHT_MARKER },
+        data: { qbSyncError: inFlightMarker },
     });
     if (claimedSend.count !== 1) {
         throw new QBAmbiguousCreateError(schedule.invoice.code);
@@ -618,20 +688,25 @@ export async function pushMilestoneToQuickBooks(
     } catch (error) {
         if (!isAmbiguousCreateFailure(error)) {
             // QuickBooks answered "no" and created nothing, so this row is
-            // freely re-sendable: release the in-flight claim.
+            // freely re-sendable: release the in-flight claim. Pinned to the
+            // exact marker we wrote — releasing someone else's claim would
+            // unblock a row whose outcome is genuinely unknown.
             await prisma.paymentSchedule.updateMany({
-                where: { id: schedule.id, qbSyncError: CREATE_IN_FLIGHT_MARKER },
+                where: { id: schedule.id, qbSyncError: inFlightMarker },
                 data: { qbSyncError: null },
             }).catch(() => {});
             throw error;
         }
         {
             // The request went out and we never learned the outcome. Promote
-            // the in-flight claim to the durable ambiguous marker so the next
-            // send refuses rather than risking a duplicate bill.
+            // the in-flight claim to the durable ambiguous marker, carrying the
+            // SAME identity, so the next send refuses rather than risking a
+            // duplicate bill and the recovery knows what to look for. Pinned to
+            // our own claim; if it no longer matches, the row is still blocked
+            // by whatever marker replaced it.
             await prisma.paymentSchedule.updateMany({
-                where: { id: schedule.id, qbInvoiceId: null },
-                data: { qbSyncError: AMBIGUOUS_CREATE_MARKER },
+                where: { id: schedule.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+                data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, { docNumber, privateNote }) },
             });
             await logAutomationEvent({
                 kind: "qbo-payments-sync",
@@ -667,6 +742,8 @@ export async function pushMilestoneToQuickBooks(
             status: "Pending",
             qbPaymentId: null,
             qbInvoiceId: null,
+            // Our own in-flight claim, still ours.
+            qbSyncError: inFlightMarker,
             amount: schedule.amount,
             name: schedule.name,
             dueDate: schedule.dueDate,
@@ -741,7 +818,23 @@ export async function pushMilestoneToQuickBooks(
         // is also capped by what the ROUTE has left, so cleanup cannot itself
         // overrun the platform ceiling: reserve whichever is smaller.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
-        const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
+        // Deleting is only half of it: this row may already carry the
+        // provisional link written before the pay-link fetch, and leaving it
+        // pointing at a deleted invoice would block the next send behind an
+        // invoice that no longer exists.
+        const { deleted: compensated, unlinked } = await compensateAndUnlink(
+            prisma.paymentSchedule,
+            schedule.id,
+            qbId,
+            () => deleteQBInvoice(tokens, qbId, cleanupDeadline),
+        );
+        if (compensated && claimedLink.count === 1 && !unlinked) {
+            // The invoice is gone but the row still points at it. Say so rather
+            // than reporting a tidy "changed while staging" — the next send
+            // would otherwise refuse against a dead link.
+            console.error(`[quickbooks-payments] milestone ${schedule.id}: deleted QBO invoice ${qbId} but could not clear the local link`);
+            throw new Error(`This milestone changed while staging its QuickBooks invoice. The abandoned QuickBooks invoice ${docNumber} was deleted, but the link in ProBuild could not be cleared — use "Break QB Link" before re-sending.`);
+        }
         if (!compensated) {
             // Even the reserved budget is gone (or the delete was refused).
             // Record the orphan durably so the maintenance sweep can resolve

@@ -904,10 +904,13 @@ export async function createQBMilestoneInvoice(
  * Fetch the customer-facing payment link for a QBO invoice (requires QB
  * Payments enabled).
  *
- * `null` means one thing only: QuickBooks answered, and this invoice has no
- * payment link. Every FAILURE is typed and thrown — 401/403 as a QboHttpError
- * (the credential is bad; a human has to reconnect), 408/429/5xx and our own
- * deadline as retryable (come back later).
+ * `null` means one thing only: QuickBooks answered with an Invoice, and that
+ * Invoice has no payment link. Every FAILURE is typed and thrown — 401/403 as a
+ * QboHttpError (the credential is bad; a human has to reconnect), 408/429/5xx
+ * and our own deadline as retryable (come back later), and a body that is not
+ * parseable JSON or carries no Invoice as retryable too: a truncated or
+ * proxy-mangled response says nothing about whether a link exists, and the
+ * paylink-pending sweep would clear the marker on it.
  *
  * It used to return null for all of those too, which quietly cost real money in
  * two ways. The create paths could not tell "no link exists" from "we never
@@ -927,7 +930,14 @@ export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: str
     });
     if (!res.ok) throw await qboResponseError(res, "QB invoice payment link");
     const data = await parseJsonOrNull(res);
-    return data?.Invoice?.InvoiceLink || null;
+    // parseJsonOrNull returns null for a genuine parse failure (it rethrows a
+    // timeout). Either that or a 200 with no Invoice in it is an answer we
+    // cannot read — retryable, never "there is no link".
+    if (!data || typeof data !== "object" || !data.Invoice || typeof data.Invoice !== "object") {
+        throw new QboRetryableError("QB invoice payment link returned no usable Invoice");
+    }
+    const link = (data.Invoice as { InvoiceLink?: unknown }).InvoiceLink;
+    return typeof link === "string" && link ? link : null;
 }
 
 /** One QuickBooks invoice as the ambiguous-create resolver needs to see it. */

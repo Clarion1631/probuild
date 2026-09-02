@@ -34,15 +34,10 @@ import {
     type RouteDeadline,
 } from "./quickbooks";
 import {
-    AMBIGUOUS_CREATE_MARKER,
-    CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
-    isBlockedByAmbiguousCreate,
-    milestoneDocNumber,
-    milestonePrivateNote,
+    parseCreateMarker,
     getFreshQBTokens,
 } from "./quickbooks-payments";
-import { progressBillingPrivateNote } from "./progress-billing";
 
 /** Whole-operation budget: a token refresh plus one query, and room to answer. */
 export const RESOLVE_AMBIGUOUS_BUDGET_MS = 25_000;
@@ -63,6 +58,7 @@ export type AmbiguousCreateRefusal =
     | "forbidden"
     | "not-found"
     | "not-ambiguous"
+    | "identity-unknown"
     | "stale"
     | "none-found"
     | "multiple-matches"
@@ -122,8 +118,17 @@ export interface ResolveAmbiguousCreateDeps {
 interface ParkedRow {
     id: string;
     code: string;
-    docNumber: string;
-    privateNote: string;
+    /**
+     * READ BACK FROM THE MARKER, never recomputed.
+     *
+     * The docNumber is the milestone's POSITION in its invoice's schedule and
+     * the privateNote embeds the project and milestone names, so both move when
+     * an earlier milestone is deleted or something is renamed. Recomputing them
+     * here would query QuickBooks for a document we never created, find
+     * nothing, and offer to release a row whose real invoice is collectible.
+     * `null` means the marker predates the identity (or is corrupt): refuse.
+     */
+    identity: { docNumber: string; privateNote: string } | null;
     marker: string;
     fingerprint: string;
     projectId: string | null;
@@ -160,6 +165,19 @@ export async function resolveAmbiguousInvoiceCreateCore(
             message: "This one is not waiting on a QuickBooks answer — nothing to resolve.",
         };
     }
+    if (!parked.identity) {
+        // A marker from before the identity was carried, or a corrupt one. We
+        // cannot know which document to ask about, and the one thing we must
+        // never do is conclude "there is none" and release the row.
+        // Deliberately not clearable, whatever the operator confirms.
+        return {
+            ok: false,
+            refusal: "identity-unknown",
+            message:
+                `${parked.code} was parked by an older release that did not record which QuickBooks document to look for, ` +
+                `so this cannot be resolved automatically. Find the invoice in QuickBooks by hand — if it exists, keep it and record the payment there.`,
+        };
+    }
     if (parked.fingerprint !== input.expectedState) {
         return {
             ok: false,
@@ -174,11 +192,11 @@ export async function resolveAmbiguousInvoiceCreateCore(
     let matches: QBInvoiceMatch[];
     try {
         const tokens = await getTokens(deadline);
-        const found = await findInvoices(tokens, parked.docNumber, deadline);
+        const found = await findInvoices(tokens, parked.identity.docNumber, deadline);
         // DocNumber is not unique in QuickBooks (duplicates can be enabled, and
         // the number is only 21 characters), so the PrivateNote is what says an
-        // invoice is OURS.
-        matches = found.filter((inv) => (inv.privateNote || "").trim() === parked.privateNote);
+        // invoice is OURS. Both come from the marker written before the POST.
+        matches = found.filter((inv) => (inv.privateNote || "").trim() === parked.identity!.privateNote);
     } catch (error) {
         // Every failure refuses. A timeout, a 5xx and a plain refusal all leave
         // the same question unanswered — whether an invoice is sitting there —
@@ -199,7 +217,7 @@ export async function resolveAmbiguousInvoiceCreateCore(
         return {
             ok: false,
             refusal: "multiple-matches",
-            message: `QuickBooks holds ${matches.length} invoices for ${parked.docNumber}. Delete the extras in QuickBooks first — nothing was changed here.`,
+            message: `QuickBooks holds ${matches.length} invoices for ${parked.identity.docNumber}. Delete the extras in QuickBooks first — nothing was changed here.`,
             candidates: matches.map((m) => ({ qbInvoiceId: m.id, total: m.total })),
         };
     }
@@ -228,7 +246,7 @@ export async function resolveAmbiguousInvoiceCreateCore(
             ok: true,
             outcome: "linked",
             qbInvoiceId,
-            message: `Linked to the QuickBooks invoice that was already there (${parked.docNumber}).`,
+            message: `Linked to the QuickBooks invoice that was already there (${parked.identity.docNumber}).`,
         };
     }
 
@@ -238,7 +256,7 @@ export async function resolveAmbiguousInvoiceCreateCore(
         return {
             ok: false,
             refusal: "none-found",
-            message: `No QuickBooks invoice matches ${parked.docNumber}. If you have checked QuickBooks yourself, confirm none exists to clear this and send again.`,
+            message: `No QuickBooks invoice matches ${parked.identity.docNumber}. If you have checked QuickBooks yourself, confirm none exists to clear this and send again.`,
         };
     }
     const cleared = await delegate.updateMany({
@@ -253,30 +271,22 @@ export async function resolveAmbiguousInvoiceCreateCore(
 }
 
 async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Promise<ParkedRow | null> {
+    // NOTE what is NOT selected: the sibling milestone order and the project
+    // name. Neither is used any more — the identity comes off the marker, and
+    // reading them here at all would invite recomputing it.
     if (kind === "milestone") {
         const row = await db.paymentSchedule.findUnique({
             where: { id },
             select: {
                 id: true, name: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
-                invoice: {
-                    select: {
-                        code: true, projectId: true,
-                        project: { select: { name: true } },
-                        payments: { select: { id: true }, orderBy: { createdAt: "asc" } },
-                    },
-                },
+                invoice: { select: { code: true, projectId: true } },
             },
         });
         if (!row) return null;
-        const invoiceCode: string = row.invoice?.code ?? "";
-        const projectName: string = row.invoice?.project?.name || "Project";
-        const position = (row.invoice?.payments ?? []).findIndex((p: { id: string }) => p.id === row.id) + 1 || 1;
         return {
             id: row.id,
-            code: invoiceCode,
-            docNumber: milestoneDocNumber(invoiceCode, position),
-            privateNote: milestonePrivateNote(invoiceCode, row.name, projectName),
-            marker: blockingMarker(row),
+            code: row.name || row.invoice?.code || row.id,
+            ...parkedIdentity(row),
             fingerprint: ambiguousCreateFingerprint(row),
             projectId: row.invoice?.projectId ?? null,
             invoiceId: row.invoiceId ?? null,
@@ -293,20 +303,27 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
     return {
         id: row.id,
         code: row.code,
-        docNumber: row.code,
-        privateNote: progressBillingPrivateNote(row.invoice?.code ?? "", row.code),
-        marker: blockingMarker(row),
+        ...parkedIdentity(row),
         fingerprint: ambiguousCreateFingerprint(row),
         projectId: row.invoice?.projectId ?? null,
         invoiceId: row.invoiceId ?? null,
     };
 }
 
-/** "" when the row is not parked at all. */
-function blockingMarker(row: { qbSyncError: string | null; qbInvoiceId: string | null }): string {
-    if (row.qbInvoiceId) return "";
-    if (!isBlockedByAmbiguousCreate(row)) return "";
-    return row.qbSyncError === CREATE_IN_FLIGHT_MARKER ? CREATE_IN_FLIGHT_MARKER : AMBIGUOUS_CREATE_MARKER;
+/**
+ * The marker this row is parked by, and the identity it carries.
+ *
+ * `marker: ""` when the row is not parked at all (including a row that already
+ * has a qbInvoiceId — there is nothing ambiguous about a linked row).
+ */
+function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string | null }): {
+    marker: string;
+    identity: { docNumber: string; privateNote: string } | null;
+} {
+    if (row.qbInvoiceId) return { marker: "", identity: null };
+    const parsed = parseCreateMarker(row.qbSyncError);
+    if (!parsed) return { marker: "", identity: null };
+    return { marker: row.qbSyncError as string, identity: parsed.identity };
 }
 
 async function audit(
@@ -322,7 +339,7 @@ async function audit(
         status: "ok",
         reason: `ambiguous-create-${outcome}`,
         source: "ambiguous-create-resolve",
-        docNumber: parked.docNumber,
+        docNumber: parked.identity?.docNumber ?? parked.code,
         detail: {
             kind: input.kind,
             rowId: parked.id,

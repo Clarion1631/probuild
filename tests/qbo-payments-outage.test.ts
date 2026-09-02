@@ -1689,3 +1689,68 @@ test("a transient pay-link failure on an ALREADY-linked milestone parks it for t
     assert.equal(isAmbiguousCreateFailure(new QboHttpError("401", 401)), false);
     assert.equal(PAYLINK_PENDING_MARKER, "paylink-pending");
 });
+
+// --- A body we cannot read is not "there is no link" ---
+
+test("a malformed or Invoice-less pay-link body is retryable, not null", async () => {
+    const { getQBInvoicePaymentLink, isRetryableQboError } = await import("../src/lib/quickbooks");
+
+    // Truncated / proxy-mangled JSON.
+    const malformed = await withFetch(
+        async () => new Response("<html>502 Bad Gateway</html>", { status: 200, headers: { "content-type": "application/json" } }),
+        () => getQBInvoicePaymentLink(TOKENS, "1"),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isRetryableQboError(malformed), true, "a body we cannot parse says nothing about the link");
+
+    // Valid JSON, but not the shape we asked for.
+    const unshaped = await withFetch(
+        async () => json(200, { QueryResponse: {} }),
+        () => getQBInvoicePaymentLink(TOKENS, "1"),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isRetryableQboError(unshaped), true, "a 200 with no Invoice is not an answer");
+
+    // A real Invoice with no link IS an answer, and stays null.
+    const answered = await withFetch(
+        async () => json(200, { Invoice: { Id: "1", TotalAmt: 100 } }),
+        () => getQBInvoicePaymentLink(TOKENS, "1"),
+    );
+    assert.equal(answered, null);
+});
+
+test("the sweep KEEPS the marker when the pay-link body is malformed", async () => {
+    // The 2026-09-01 shape one level down: a body that cannot be read must not
+    // clear a pending marker, or the row loses its only claim on a retry.
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const db = makeSweepDb(milestones, []);
+
+    // No readPayLink override: this drives the REAL getQBInvoicePaymentLink.
+    const result = await withFetch(
+        async () => new Response("not json at all", { status: 200, headers: { "content-type": "application/json" } }),
+        () => sweepPendingPayLinks(TOKENS, undefined, { db }),
+    );
+
+    assert.equal(result.repaired, 0);
+    assert.equal(result.noLink, 0, "we never learned that there is no link");
+    assert.equal(result.reason, "qbo-unavailable");
+    assert.equal(milestones[0].qbSyncError, PAYLINK_PENDING_MARKER, "still queued for the next run");
+    assert.equal(milestones[0].qbInvoiceLink, null);
+});
+
+// --- The in-flight marker carries the recovery identity ---
+
+test("the milestone claim writes an identity-carrying marker, and compensation unlinks", async () => {
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
+
+    // The claim CAS writes the composed marker, not the bare kind: recomputing
+    // the docNumber later (it is a POSITION) or the note (it carries names)
+    // would ask QuickBooks about a document we never created.
+    assert.match(push, /composeCreateMarker\(CREATE_IN_FLIGHT_MARKER, \{ docNumber, privateNote \}\)/);
+    assert.match(push, /data: \{ qbSyncError: inFlightMarker \}/);
+    // Release and promote are pinned to OUR marker, not to any in-flight row.
+    assert.match(push, /where: \{ id: schedule\.id, qbSyncError: inFlightMarker \}/);
+    assert.match(push, /qbSyncError: composeCreateMarker\(AMBIGUOUS_CREATE_MARKER/);
+    // And compensation goes through the shared delete+unlink step.
+    assert.match(push, /compensateAndUnlink\(\s*prisma\.paymentSchedule/);
+});

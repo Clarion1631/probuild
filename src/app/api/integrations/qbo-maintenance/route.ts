@@ -137,55 +137,84 @@ export async function POST(req: Request) {
         throw e;
     }
 
-    const schedules = await prisma.paymentSchedule.findMany({
-        where: { qbInvoiceId: { not: null }, status: { not: "Paid" } },
-        select: { id: true, qbInvoiceId: true, name: true, invoice: { select: { code: true } } },
-        take: 200,
-    });
+    // Paged by id with a cursor rather than one `take: 200` slice. A fixed take
+    // silently ignored everything past the 200th row: the response said
+    // "checked 200, ok" and the 201st unpaid invoice was never looked at, run
+    // after run. Now the sweep walks the whole set, and when it cannot finish
+    // it SAYS so (`truncated`) and reports how many are left.
+    const SWEEP_PAGE_SIZE = 100;
+    const scheduleWhere = { qbInvoiceId: { not: null }, status: { not: "Paid" } } as const;
 
     const results: { qbInvoiceId: string; code: string; result: string }[] = [];
     // Same rule as the payments loop: a shared connection failure means every
     // remaining row fails identically at full cost, so stop and report what was
     // done instead of burning the ceiling proving it 200 times over.
-    let skipped = 0;
     let abortedReason: string | null = null;
-    for (const [index, s] of schedules.entries()) {
-        if (abortedReason) {
-            skipped = schedules.length - index;
-            break;
-        }
-        if (isBudgetExhausted(deadline)) {
-            abortedReason = "budget-exhausted";
-            skipped = schedules.length - index;
-            break;
-        }
-        const qbId = s.qbInvoiceId!;
-        try {
-            const current = await getQBInvoicePaymentOptions(tokens, qbId, deadline);
-            if (!current) {
-                results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "not-found-in-qbo" });
-                continue;
-            }
-            if (current.card && current.ach) {
-                results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "already-correct" });
-                continue;
-            }
-            const updated = await setQBInvoicePaymentOptions(tokens, qbId, current.syncToken, { card: true, ach: true }, deadline);
-            results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: updated ? "updated" : "update-failed" });
-        } catch (e) {
-            if (isQBBudgetExhaustedError(e)) {
+    let cursor: string | null = null;
+    let lastCompletedId: string | null = null;
+
+    pager: while (!abortedReason) {
+        const page: Array<{ id: string; qbInvoiceId: string | null; name: string; invoice: { code: string } }> =
+            await prisma.paymentSchedule.findMany({
+                where: scheduleWhere,
+                select: { id: true, qbInvoiceId: true, name: true, invoice: { select: { code: true } } },
+                orderBy: { id: "asc" },
+                take: SWEEP_PAGE_SIZE,
+                ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+            });
+        if (page.length === 0) break;
+        cursor = page[page.length - 1].id;
+
+        for (const s of page) {
+            if (isBudgetExhausted(deadline)) {
                 abortedReason = "budget-exhausted";
-                skipped = schedules.length - index;
-                break;
+                break pager;
             }
-            if (isQboConnectionFailure(e)) {
-                abortedReason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
-                skipped = schedules.length - index - 1;
-                break;
+            const qbId = s.qbInvoiceId!;
+            try {
+                const current = await getQBInvoicePaymentOptions(tokens, qbId, deadline);
+                if (!current) {
+                    results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "not-found-in-qbo" });
+                    lastCompletedId = s.id;
+                    continue;
+                }
+                if (current.card && current.ach) {
+                    results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: "already-correct" });
+                    lastCompletedId = s.id;
+                    continue;
+                }
+                const updated = await setQBInvoicePaymentOptions(tokens, qbId, current.syncToken, { card: true, ach: true }, deadline);
+                results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: updated ? "updated" : "update-failed" });
+                lastCompletedId = s.id;
+            } catch (e) {
+                if (isQBBudgetExhaustedError(e)) {
+                    abortedReason = "budget-exhausted";
+                    break pager;
+                }
+                if (isQboConnectionFailure(e)) {
+                    abortedReason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
+                    break pager;
+                }
+                results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `error: ${e instanceof Error ? e.message.slice(0, 120) : "?"}` });
+                // A per-row business failure is finished as far as the cursor is
+                // concerned — the next run must not retry the same bad row forever.
+                lastCompletedId = s.id;
             }
-            results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `error: ${e instanceof Error ? e.message.slice(0, 120) : "?"}` });
         }
+        if (page.length < SWEEP_PAGE_SIZE) break;
     }
+
+    // How many rows this run never reached. Counted from the database rather
+    // than inferred from the page, so it includes everything past the cursor.
+    let remaining = 0;
+    if (abortedReason) {
+        remaining = await prisma.paymentSchedule.count({
+            where: lastCompletedId ? { ...scheduleWhere, id: { gt: lastCompletedId } } : scheduleWhere,
+        }).catch(() => -1);
+    }
+    // Any row that actually failed, as opposed to being already correct or
+    // simply absent from QuickBooks.
+    const failedRows = results.filter((r) => r.result.startsWith("error:") || r.result === "update-failed").length;
 
     // Same pass, second repair: rows whose invoice IS linked but whose pay-link
     // fetch timed out (marked `paylink-pending` by the milestone push / progress
@@ -197,13 +226,22 @@ export async function POST(req: Request) {
         if (payLinks.reason) abortedReason = payLinks.reason;
     }
 
-    // `ok` reflects whether the sweep actually finished: a run that stopped
-    // early has left work undone and must not read as a clean pass.
+    // Work left undone, by any route: the options loop stopped early, the
+    // pay-link sweep hit its per-rail cap, or rows were skipped inside it.
+    const truncated = abortedReason !== null || !!payLinks?.truncated || (payLinks?.skipped ?? 0) > 0;
+
+    // `ok` reflects the RUN, not the fact that the handler returned. A run that
+    // stopped early, left rows unvisited, or failed on a row has work
+    // outstanding and must not read as a clean pass — that reading is what let
+    // a 200-row cap look like a complete sweep for as long as it did.
+    const ok = !truncated && failedRows === 0;
     return NextResponse.json({
-        ok: abortedReason === null,
+        ok,
         checked: results.length,
-        skipped,
-        ...(abortedReason ? { reason: abortedReason, retry: true } : {}),
+        failed: failedRows,
+        ...(truncated ? { truncated: true, retry: true } : {}),
+        ...(abortedReason ? { reason: abortedReason, remaining } : {}),
+        ...(!abortedReason && failedRows > 0 ? { reason: "row-errors" } : {}),
         ...(payLinks ? { payLinks } : {}),
         results,
     });

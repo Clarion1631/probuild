@@ -35,18 +35,19 @@ import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline, type QBTokens } from "./quickbooks";
 import {
+    compensateAndUnlink,
     compensationWindowMs,
     isAmbiguousCreateFailure,
     QBAmbiguousCreateError,
     MILESTONE_PUSH_BUDGET_MS,
 } from "./quickbooks-payments";
 import {
+    composeCreateMarker,
     isBlockedByAmbiguousCreate,
     isQboInvoiceLinkedOrPending,
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
     PAYLINK_PENDING_MARKER,
-    PENDING_CREATE_MARKERS,
     QBResolveRequiredError,
 } from "./qbo-create-markers";
 import { logAutomationEvent } from "./automation-events";
@@ -353,9 +354,11 @@ export async function createProgressBillingCore(
                     // The id being null is not enough: a create that started
                     // between validation and here leaves the id null and the
                     // marker set, and that row may already be billed in QBO.
-                    // Written as an explicit OR because SQL's NOT IN is false for
-                    // a NULL column, which would exclude every healthy row.
-                    OR: [{ qbSyncError: null }, { qbSyncError: { notIn: [...PENDING_CREATE_MARKERS] } }],
+                    // Pinning the EXACT value read under the lock covers that
+                    // without a NULL-unsafe NOT IN, and now that markers carry a
+                    // per-issuance identity suffix there is no fixed list to
+                    // match against anyway.
+                    qbSyncError: schedule.qbSyncError,
                     stripeSessionId: null,
                     stripePaymentIntentId: null,
                     amount: schedule.amount,
@@ -765,9 +768,16 @@ export async function stageProgressBillingToQuickBooksCore(
     // The write is deliberately NOT swallowed: without the marker a crash
     // between the POST and the link write is invisible, and the next stage
     // creates a second collectible invoice.
+    //
+    // The marker CARRIES the recovery identity (docNumber + PrivateNote) in the
+    // same CAS, so a recovery never has to recompute it from state that may
+    // have moved since — see composeCreateMarker.
+    const privateNote = progressBillingPrivateNote(invoice.code, billing.code);
+    const identity = { docNumber: billing.code, privateNote };
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
     const claimedSend = await db.updateMany({
         where: { id: billing.id, status: "Draft", qbInvoiceId: null, qbSyncError: null },
-        data: { qbSyncError: CREATE_IN_FLIGHT_MARKER },
+        data: { qbSyncError: inFlightMarker },
     });
     if (claimedSend.count !== 1) {
         throw new QBAmbiguousCreateError(billing.code);
@@ -783,14 +793,16 @@ export async function stageProgressBillingToQuickBooksCore(
             amount: total,
             tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
             billEmail: invoice.client?.email || null,
-            privateNote: progressBillingPrivateNote(invoice.code, billing.code),
+            privateNote,
         }, stageDeadline);
     } catch (error) {
         if (!isAmbiguousCreateFailure(error)) {
             // QuickBooks answered "no" and created nothing, so this billing is
-            // freely re-stageable: release the in-flight claim.
+            // freely re-stageable: release the in-flight claim. Pinned to the
+            // exact marker we wrote — releasing someone else's claim would
+            // unblock a row whose outcome is genuinely unknown.
             await db.updateMany({
-                where: { id: billing.id, qbSyncError: CREATE_IN_FLIGHT_MARKER },
+                where: { id: billing.id, qbSyncError: inFlightMarker },
                 data: { qbSyncError: null },
             }).catch(() => {});
             throw error;
@@ -799,8 +811,8 @@ export async function stageProgressBillingToQuickBooksCore(
         // the in-flight claim to the durable marker so the next stage refuses
         // rather than double-billing.
         await db.updateMany({
-            where: { id: billing.id, qbInvoiceId: null },
-            data: { qbSyncError: AMBIGUOUS_CREATE_MARKER },
+            where: { id: billing.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity) },
         });
         await logEvent({
             kind: "qbo-payments-sync",
@@ -819,9 +831,24 @@ export async function stageProgressBillingToQuickBooksCore(
     // Bounded exactly like the milestone push's compensation — measured when
     // compensation begins, capped by the route's real headroom. Only ever called
     // while the row is still UNLINKED.
+    // Delete the invoice AND release any provisional link that landed for it.
+    // The link write below can fail after committing (a dead response), so
+    // "we never linked it" is not something this path can assume — the CAS
+    // inside compensateAndUnlink is pinned to the exact id, so it clears the
+    // row only when the row really does point at the invoice being deleted.
+    // A progress billing also has to come back to Draft to be re-stageable.
+    let compensationUnlinkFailed = false;
     const compensate = async (): Promise<boolean> => {
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(stageDeadline)));
-        return qbo.deleteInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
+        const { deleted, unlinked } = await compensateAndUnlink(
+            db,
+            billing.id,
+            qbId,
+            () => qbo.deleteInvoice(tokens, qbId, cleanupDeadline),
+            { status: "Draft" },
+        );
+        compensationUnlinkFailed = deleted && !unlinked;
+        return deleted;
     };
     const orphanError = (reason: string) =>
         new Error(
@@ -853,6 +880,14 @@ export async function stageProgressBillingToQuickBooksCore(
         throw err instanceof Error ? err : new Error(String(err));
     }
 
+    // A lost claim after a successful compensation still needs saying when the
+    // row DID carry our link: the invoice is gone, but the row would keep
+    // pointing at it and refuse the next stage.
+    const compensationNote = () =>
+        compensationUnlinkFailed
+            ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
+            : "";
+
     if (claimedLink.count !== 1) {
         // A lost claim is most often a CONCURRENT stage that linked this very
         // invoice first (both share one issuance key, so Intuit returned the
@@ -866,7 +901,7 @@ export async function stageProgressBillingToQuickBooksCore(
             return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: current.qbInvoiceLink ?? null };
         }
         if (!(await compensate())) throw orphanError("this billing changed while staging");
-        throw new Error("This billing changed while staging its QuickBooks invoice — refresh and try again.");
+        throw new Error(`This billing changed while staging its QuickBooks invoice — refresh and try again.${compensationNote()}`);
     }
 
     // From here the row IS linked. Never compensate past this point: deleting

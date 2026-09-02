@@ -51,23 +51,111 @@ export const PAYLINK_PENDING_MARKER = "paylink-pending";
 
 /**
  * The two markers that mean "an invoice may exist in QuickBooks for this row
- * even though qbInvoiceId is null". Exported as an array so a Prisma `where`
- * can filter on the same list the predicates use.
+ * even though qbInvoiceId is null". Both appear as a bare marker (legacy rows)
+ * or with a recovery identity appended (see composeCreateMarker), so a Prisma
+ * `where` must match them by PREFIX -- `pendingCreateMarkerWhere()` builds it.
  */
 export const PENDING_CREATE_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER];
+
+/**
+ * The identity a recovery needs to find the invoice a create may have made.
+ *
+ * It is captured in the MARKER, written before the POST, because both halves
+ * are derived from mutable state: `docNumber` is the milestone's POSITION in
+ * its invoice's schedule (delete an earlier milestone and every later one
+ * renumbers), and `privateNote` embeds the project name and the milestone name
+ * (rename either and it no longer matches). Recomputing at recovery time would
+ * query QuickBooks for a document we never created, find nothing, and offer to
+ * clear a row whose real invoice is sitting there collectible.
+ */
+export interface CreateIdentity {
+    /** The QuickBooks DocNumber the create used. */
+    docNumber: string;
+    /** The exact PrivateNote the create wrote -- what proves an invoice is ours. */
+    privateNote: string;
+}
+
+/** Separates the marker kind from its identity payload. */
+const MARKER_KIND_SEP = ":";
+/** Separates docNumber from privateNote. First occurrence wins -- a note may contain more. */
+const MARKER_FIELD_SEP = "|";
+
+/**
+ * `create-in-flight:INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
+ *
+ * The identity rides in the qbSyncError column because this PR ships no schema
+ * change and there is nowhere else durable to put it that is written in the
+ * SAME CAS as the claim. It has to be one write: a marker without its identity
+ * is a row we can block but never resolve.
+ */
+export function composeCreateMarker(
+    kind: typeof CREATE_IN_FLIGHT_MARKER | typeof AMBIGUOUS_CREATE_MARKER,
+    identity: CreateIdentity,
+): string {
+    // A docNumber containing the field separator would make the split
+    // ambiguous. QuickBooks DocNumbers are ours to generate and never contain
+    // one, so this is an invariant, not input validation.
+    if (identity.docNumber.includes(MARKER_FIELD_SEP)) {
+        throw new Error(`DocNumber must not contain "${MARKER_FIELD_SEP}": ${identity.docNumber}`);
+    }
+    return `${kind}${MARKER_KIND_SEP}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+}
+
+/** Which pending-create marker is this, identity or not? `null` when it is neither. */
+export function markerKind(qbSyncError: string | null | undefined): string | null {
+    if (!qbSyncError) return null;
+    for (const kind of PENDING_CREATE_MARKERS) {
+        if (qbSyncError === kind || qbSyncError.startsWith(kind + MARKER_KIND_SEP)) return kind;
+    }
+    return null;
+}
+
+/**
+ * The identity carried by a marker, or `null` for the legacy bare shape.
+ *
+ * `null` is NOT "no identity needed" -- it means we cannot know what to look
+ * for, and the caller must refuse rather than guess (see the identity-unknown
+ * refusal in qbo-ambiguous-create.ts).
+ */
+export function parseCreateMarker(
+    qbSyncError: string | null | undefined,
+): { kind: string; identity: CreateIdentity | null } | null {
+    const kind = markerKind(qbSyncError);
+    if (!kind) return null;
+    const marker = qbSyncError as string;
+    if (marker === kind) return { kind, identity: null };
+    const payload = marker.slice(kind.length + MARKER_KIND_SEP.length);
+    const sep = payload.indexOf(MARKER_FIELD_SEP);
+    // A payload with no separator, an empty docNumber or an empty note is a
+    // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
+    if (sep <= 0) return { kind, identity: null };
+    const docNumber = payload.slice(0, sep);
+    const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
+    if (!docNumber || !privateNote) return { kind, identity: null };
+    return { kind, identity: { docNumber, privateNote } };
+}
+
+/**
+ * Prisma `where` fragments matching any pending-create marker, identity or not.
+ * Returns an array for use inside an `OR`.
+ */
+export function pendingCreateMarkerWhere(): Array<{ qbSyncError: string | { startsWith: string } }> {
+    return PENDING_CREATE_MARKERS.flatMap((kind) => [
+        { qbSyncError: kind },
+        { qbSyncError: { startsWith: kind + MARKER_KIND_SEP } },
+    ]);
+}
 
 /** Is this row blocked from sending because a previous attempt's outcome is unknown? */
 export function isBlockedByAmbiguousCreate(
     row: { qbSyncError: string | null; updatedAt?: Date | null },
     now: number = Date.now(),
 ): boolean {
-    if (row.qbSyncError === AMBIGUOUS_CREATE_MARKER) return true;
-    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
     // Both a fresh and a stale in-flight marker refuse the send: fresh means a
     // peer is mid-flight, stale means nobody is coming back and the outcome is
     // unknown. The age only decides what the operator is told.
     void now;
-    return true;
+    return markerKind(row.qbSyncError) !== null;
 }
 
 /**
@@ -84,7 +172,7 @@ export function isStaleInFlight(
     row: { qbSyncError: string | null; updatedAt?: Date | null },
     now: number = Date.now(),
 ): boolean {
-    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
+    if (markerKind(row.qbSyncError) !== CREATE_IN_FLIGHT_MARKER) return false;
     const at = row.updatedAt ? row.updatedAt.getTime() : 0;
     return now - at > CREATE_IN_FLIGHT_STALE_MS;
 }
@@ -122,6 +210,25 @@ export function ambiguousCreateFingerprint(row: { qbSyncError: string | null; qb
  * ambiguous QuickBooks create. Typed so a caller can offer the resolver instead
  * of string-matching a message.
  */
+/**
+ * The row is parked, but its marker does not say WHAT to look for -- a legacy
+ * bare marker written before the identity was carried, or a corrupt one.
+ *
+ * Deliberately terminal for the automated path: the recovery cannot query
+ * QuickBooks for the right document, so it must not be allowed to conclude
+ * "there is none" and release the row. A human resolves these in QuickBooks
+ * directly.
+ */
+export class QBIdentityUnknownError extends Error {
+    name = "QBIdentityUnknownError";
+    constructor(subject: string) {
+        super(
+            `"${subject}" is parked from an older release that did not record which QuickBooks document to look for. ` +
+            `It cannot be resolved automatically -- find the invoice in QuickBooks by hand before doing anything else with this row.`,
+        );
+    }
+}
+
 export class QBResolveRequiredError extends Error {
     name = "QBResolveRequiredError";
     constructor(subject: string) {
