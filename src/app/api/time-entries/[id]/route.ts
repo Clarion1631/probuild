@@ -189,7 +189,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // a forgotten punch, and closing it at a $0 rate books a free shift. Only a
     // genuine OPEN -> CLOSED transition is gated; re-editing an already-closed
     // entry is left alone so an old punch never becomes uneditable.
-    if (closingOpenEntry && zeroRateBlocks({ role: owner.role, hourlyRate: toNum(owner.hourlyRate) })) {
+    if (closingOpenEntry && zeroRateBlocks({ role: owner.role, email: owner.email, hourlyRate: toNum(owner.hourlyRate) })) {
         return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
     }
 
@@ -323,6 +323,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             estimateItemId: existing.estimateItemId,
         });
     }
+
+    // Re-check immediately before the write — the first check happened before
+    // several awaited round trips (day load, meal settlement, task re-binding),
+    // and a period can be locked inside that window.
+    const lockedNow = await assertPeriodUnlocked([existing.startTime, newStart]);
+    if (lockedNow) return lockedNow;
 
     const updated = await prisma.timeEntry.update({ where: { id }, data });
 

@@ -15,6 +15,7 @@ import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timez
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
+import { assertPeriodUnlockedOrThrow } from "@/lib/payroll-period";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -69,9 +70,13 @@ export async function updateTimeEntry(
     const timeZone = await resolveCompanyTimeZone();
     const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
     if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
-    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true, estimateItemId: true } });
+    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, startTime: true, invoiceId: true, invoicedAt: true, estimateItemId: true } });
     if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
     if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+    // Locked payroll (src/lib/payroll-period.ts). BOTH dates: this action writes
+    // startTime AND durationHours, so it can edit hours already paid or move
+    // hours into a period that was already exported.
+    await assertPeriodUnlockedOrThrow([current.startTime, startTime]);
 
     // Re-bind against the STORED row: this action never writes projectId, so a
     // client-supplied one could attach another project's task, and dropping the
@@ -108,6 +113,8 @@ export async function deleteTimeEntry(id: string) {
     if (!entry) throw new Error("Not found");
     if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
     if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
+    // Deleting a punch out of an exported period changes hours that were paid.
+    await assertPeriodUnlockedOrThrow([entry.startTime]);
 
     const deleted = await prisma.timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
@@ -126,13 +133,17 @@ export async function deleteTimeEntries(
 
     const entries = await prisma.timeEntry.findMany({
         where: { id: { in: ids } },
-        select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
+        select: { id: true, projectId: true, startTime: true, invoiceId: true, invoicedAt: true },
     });
 
     const allowed = entries.filter(
         e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
     );
     if (!allowed.length) return { deleted: 0 };
+    // EVERY row, not a sample: a bulk delete that silently skipped the locked
+    // ones would be worse than refusing outright, because the caller would be
+    // told it succeeded.
+    await assertPeriodUnlockedOrThrow(allowed.map(e => e.startTime));
 
     const allowedIds = allowed.map(e => e.id);
     const projectIds = new Set(allowed.map(e => e.projectId));

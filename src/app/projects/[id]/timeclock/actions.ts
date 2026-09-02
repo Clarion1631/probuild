@@ -7,6 +7,7 @@ import { revalidatePath } from "next/cache";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { dayKeyFromDateOnly } from "@/lib/company-day";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import { assertPeriodUnlockedOrThrow } from "@/lib/payroll-period";
 
 // A bare session check let any signed-in account write hours against any
 // project. These rows are now direct field evidence on the schedule board, so
@@ -34,6 +35,9 @@ export async function createTimeEntry(data: {
 
     // Start time at midnight of the selected date (simplified for this context)
     const startTime = new Date(data.date);
+    // Creating hours AT a date is moving hours INTO that period, so a create is
+    // as much a payroll change as an edit (src/lib/payroll-period.ts).
+    await assertPeriodUnlockedOrThrow([startTime]);
     // Day comes from the date STRING: new Date("2026-07-27") is UTC midnight,
     // which is the 26th in company time.
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
@@ -77,10 +81,12 @@ export async function updateTimeEntry(id: string, data: {
     // would drop a good mobile binding on an ordinary hours edit.
     const existing = await prisma.timeEntry.findUnique({
         where: { id },
-        select: { projectId: true, estimateItemId: true },
+        select: { projectId: true, startTime: true, estimateItemId: true },
     });
     if (!existing) throw new Error("Not found");
     await assertTimeclockProjectAccess(existing.projectId);
+    // Both dates — editing inside a locked period, and moving a punch into one.
+    await assertPeriodUnlockedOrThrow([existing.startTime, startTime]);
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: data.userId,
         projectId: existing.projectId,
@@ -110,6 +116,7 @@ export async function deleteTimeEntry(id: string) {
 
     const entry = await prisma.timeEntry.findUnique({ where: { id }});
     if (!entry) throw new Error("Not found");
+    await assertPeriodUnlockedOrThrow([entry.startTime]);
 
     await prisma.timeEntry.delete({ where: { id } });
 

@@ -2,20 +2,43 @@
 //
 // Once payroll has been exported for a period and a human has locked it, the
 // hours behind that export must stop moving — otherwise ProBuild and Gusto
-// silently disagree about a period that was already paid. Every write path
-// that can change WHICH period an entry belongs to, or how many hours it
-// carries, goes through assertPeriodUnlocked():
+// silently disagree about a period that was already paid.
 //
-//   PUT    /api/time-entries          (clock-out: existing.startTime)
-//   PATCH  /api/time-entries/[id]     (edit: BOTH the old and the new startTime —
-//                                      an edit that MOVES a punch into a locked
-//                                      period is just as much a violation as one
-//                                      that edits a punch already inside it)
-//   DELETE /api/time-entries/[id]     (existing.startTime)
+// EVERY writer that can change how many payroll hours a period holds is gated.
+// The canonical list lives in tests/payroll-period-lock.test.ts (the writer
+// tripwire) — keep the two in step. Route handlers use assertPeriodUnlocked()
+// and answer 423; server actions use assertPeriodUnlockedOrThrow() because an
+// action has no response object to shape:
+//
+//   PUT    /api/time-entries              (clock-out: existing.startTime)
+//   POST   /api/time-entries              (clock-in: the client may supply startTime)
+//   PATCH  /api/time-entries/[id]         (edit: BOTH the old and the new startTime —
+//                                          an edit that MOVES a punch into a locked
+//                                          period is as much a violation as one that
+//                                          edits a punch already inside it)
+//   DELETE /api/time-entries/[id]         (existing.startTime)
+//   lib/time-expense-core createTimeEntryCore        (creating hours AT a date is
+//                                          moving hours INTO that period)
+//   lib/time-expense-actions update/delete/deleteMany
+//   app/projects/[id]/timeclock/actions create/update/delete
+//
+// Deliberately NOT gated, because they cannot change a period's hours: writers
+// that only touch flags, notes, cost coding, change-order tags or billing
+// stamps (markTimeEntryReviewed, meal-skip decisions, logistics routing and
+// re-coding, the invoice claim in billing-core). settleDay() is not gated
+// directly either — it is only reachable through the gated routes above and
+// through the export preamble, which refuses to settle any day that falls in a
+// locked period.
 //
 // A blocked write answers 423 Locked with code PERIOD_LOCKED. 423 rather than
 // 409/403 because the row is fine and the caller is authorized — the resource
 // is simply frozen, which is exactly what 423 means.
+//
+// TIME OF CHECK vs TIME OF USE: the check is not a transaction. A period can be
+// locked between the check and the write, so the hot routes check AGAIN
+// immediately before the write call. That narrows the window; it does not close
+// it, and the lock action's own transaction (lockPayrollPeriod) is what
+// actually detects a period that moved underneath it.
 //
 // The range is HALF-OPEN, [periodStart, periodEnd): an instant exactly equal
 // to periodEnd belongs to the NEXT period. Two adjacent periods can therefore
@@ -85,7 +108,7 @@ export function periodLockedResponse(period: LockedPeriodRow): NextResponse {
 }
 
 /** Default loader — every locked period. The table holds one row per reviewed period, so this stays tiny. */
-async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
+export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
     const { prisma } = await import("./prisma");
     return prisma.payrollPeriod.findMany({
         where: { lockedAt: { not: null } },
@@ -114,4 +137,27 @@ export async function assertPeriodUnlocked(
         if (period) return periodLockedResponse(period);
     }
     return null;
+}
+
+/**
+ * Server-action variant. Actions have no response object to shape, and a
+ * thrown Error is how every other guard in actions.ts / time-expense-actions.ts
+ * refuses — returning a value would be silently ignored by the callers, which
+ * is exactly how a guard becomes decorative.
+ *
+ * Same rule, same loader, same message as assertPeriodUnlocked; only the
+ * failure shape differs.
+ */
+export async function assertPeriodUnlockedOrThrow(
+    instants: Array<Date | null | undefined>,
+    loader: LockedPeriodLoader = loadLockedPeriods
+): Promise<void> {
+    const candidates = instants.filter((value): value is Date => value instanceof Date && !Number.isNaN(value.getTime()));
+    if (candidates.length === 0) return;
+    const periods = await loader();
+    if (periods.length === 0) return;
+    for (const instant of candidates) {
+        const period = lockedPeriodFor(periods, instant);
+        if (period) throw new Error(periodLockedMessage(period));
+    }
 }

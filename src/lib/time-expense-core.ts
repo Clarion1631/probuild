@@ -3,6 +3,7 @@ import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
+import { assertPeriodUnlockedOrThrow } from "./payroll-period";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -72,6 +73,11 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
         ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
         : new Date(data.date);
     if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
+    // The canonical manual-create. Creating hours AT a date puts them in that
+    // period, so a locked period refuses the create outright — gating here
+    // covers every caller instead of each server action separately
+    // (src/lib/payroll-period.ts).
+    await assertPeriodUnlockedOrThrow([startTime]);
 
     const changeOrder = data.changeOrderId ? await resolveChangeOrder(data.changeOrderId, data.projectId) : null;
     const projectId = changeOrder?.projectId ?? data.projectId;

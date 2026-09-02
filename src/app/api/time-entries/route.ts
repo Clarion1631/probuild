@@ -237,6 +237,13 @@ export async function POST(req: Request) {
     const validSources = ["daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
+    // startTime is CLIENT-supplied here, so a clock-in can land in a locked
+    // period. The close would be refused later anyway, but that leaves an
+    // unclosable open punch — refuse at the door instead
+    // (src/lib/payroll-period.ts).
+    const clockInLocked = await assertPeriodUnlocked([entryStartTime]);
+    if (clockInLocked) return clockInLocked;
+
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
@@ -282,7 +289,7 @@ export async function POST(req: Request) {
 // edit-flow clock-out check is defense in depth for a different call site,
 // not the primary one).
 
-type ClockOutAuthedUser = { id: string; role: string; hourlyRate: number; burdenRate: number };
+type ClockOutAuthedUser = { id: string; role: string; email: string; hourlyRate: number; burdenRate: number };
 type ClockOutAuthResult =
     | { ok: true; user: ClockOutAuthedUser }
     | { ok: false; status: number; error: string };
@@ -314,7 +321,7 @@ export interface ClockOutDependencies {
      */
     findOwnerRates(
         userId: string
-    ): Promise<{ hourlyRate: number; burdenRate: number; role: string; name: string | null } | null>;
+    ): Promise<{ hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string } | null>;
     /** Locked pay periods — a closed period freezes every punch that started inside it (src/lib/payroll-period.ts). */
     loadLockedPeriods: LockedPeriodLoader;
     /**
@@ -543,6 +550,12 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 }
             }
 
+            // Re-check immediately before the write: everything between the
+            // first check and here is awaited work, and a period can be locked
+            // in that window (see the TOCTOU note in payroll-period.ts).
+            const lockedNow = await assertPeriodUnlocked([existing.startTime], dependencies.loadLockedPeriods);
+            if (lockedNow) return lockedNow;
+
             const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData);
             if (!closeResult.ok) {
                 // Lost the race to a concurrent PUT that closed the entry
@@ -582,6 +595,7 @@ const clockOutHandler = createClockOutHandler({
             user: {
                 id: result.user.id,
                 role: result.user.role,
+                email: result.user.email,
                 hourlyRate: toNum(result.user.hourlyRate),
                 burdenRate: toNum(result.user.burdenRate),
             },
@@ -599,7 +613,7 @@ const clockOutHandler = createClockOutHandler({
     findOwnerRates: async (userId) => {
         const owner = await prisma.user.findUnique({
             where: { id: userId },
-            select: { hourlyRate: true, burdenRate: true, role: true, name: true },
+            select: { hourlyRate: true, burdenRate: true, role: true, name: true, email: true },
         });
         if (!owner) return null;
         return {
@@ -607,6 +621,7 @@ const clockOutHandler = createClockOutHandler({
             burdenRate: toNum(owner.burdenRate),
             role: owner.role,
             name: owner.name,
+            email: owner.email,
         };
     },
     loadLockedPeriods: async () =>
