@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
+    BANK_LINE_IDENTITY_LOCK,
     QBO_MINT_MIN_AGE_DAYS,
     bankLineIdentityKey,
     planQboMint,
@@ -18,6 +22,7 @@ import {
 
 const NOW = new Date("2026-08-20T09:00:00Z");
 const ACCOUNT = "WTB-0723";
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const obs = (over: Partial<MintCandidateObservation> = {}): MintCandidateObservation => ({
     id: "obs-1",
@@ -110,11 +115,45 @@ test("re-running mints nothing: the QBO line it made last night is itself a matc
     assert.equal(second.mint.length, 0, "a re-run must create nothing");
 });
 
-test("two observations sharing one identity mint ONCE, not a twin", () => {
+test("CARDINALITY: two same-identity QBO transactions mint TWO lines", () => {
+    // This business genuinely buys the same thing from the same merchant twice
+    // on the same day. Testing "does a line with this key exist" made the
+    // second charge disappear from the ledger entirely.
     const plan = planQboMint([obs({ id: "a" }), obs({ id: "b" })], [], NOW);
-    assert.equal(plan.mint.length, 1);
-    assert.equal(plan.mint[0].id, "a");
+    assert.equal(plan.mint.length, 2);
+    assert.deepEqual(plan.mint.map(o => o.id), ["a", "b"]);
+    assert.equal(plan.skipped.statementLineExists, 0);
+});
+
+test("CARDINALITY: one existing line covers one observation, not both", () => {
+    const plan = planQboMint([obs({ id: "a" }), obs({ id: "b" })], [existing()], NOW);
+    assert.equal(plan.mint.length, 1, "the second has nothing to link to and mints");
     assert.equal(plan.skipped.statementLineExists, 1);
+});
+
+test("CARDINALITY: a line already claimed by a linked observation does not cover a new one", () => {
+    // The statement minted one line; an earlier observation already linked to
+    // it. A second QBO observation for the same identity is a SECOND charge.
+    const plan = planQboMint(
+        [obs({ id: "linked", bankLineId: "bl-1" }), obs({ id: "new" })],
+        [existing({ id: "bl-1" })],
+        NOW,
+    );
+    assert.equal(plan.mint.length, 1);
+    assert.equal(plan.mint[0].id, "new");
+    assert.equal(plan.skipped.alreadyLinked, 1);
+});
+
+test("duplicateWithinBatch actually increments — telemetry that never fires is worse than none", () => {
+    const none = planQboMint([obs({ id: "a" }), obs({ id: "b", amountCents: -1 })], [], NOW);
+    assert.equal(none.skipped.duplicateWithinBatch, 0, "different identities are not duplicates");
+
+    const two = planQboMint([obs({ id: "a" }), obs({ id: "b" })], [], NOW);
+    assert.equal(two.skipped.duplicateWithinBatch, 1);
+
+    const three = planQboMint([obs({ id: "a" }), obs({ id: "b" }), obs({ id: "c" })], [], NOW);
+    assert.equal(three.skipped.duplicateWithinBatch, 2);
+    assert.equal(three.mint.length, 3, "counting them does not stop them minting");
 });
 
 test("the identity key is JSON-encoded, so a payee containing a delimiter can't collide", () => {
@@ -160,26 +199,65 @@ test("adoption needs an EXACT match on every field of the identity", async t => 
     }
 });
 
-test("ambiguity mints and is reported — never an arbitrary pairing", async t => {
-    await t.test("two statement lines, one adoptable", () => {
+test("N:N adopts deterministically instead of minting a third line", async t => {
+    await t.test("two statement lines, two adoptable — both adopt, nothing mints", () => {
         const plan = planStatementAdoption(
             [stmt({ sequence: 0 }), stmt({ sequence: 1 })],
-            [existing({ id: "bl-qbo", sourceOfRecord: "QBO" })],
+            [
+                existing({ id: "bl-y", qbTxnId: "2000", sourceOfRecord: "QBO" }),
+                existing({ id: "bl-x", qbTxnId: "1000", sourceOfRecord: "QBO" }),
+            ],
             ACCOUNT,
         );
-        assert.equal(plan.adopt.size, 0);
-        assert.deepEqual(plan.mint, [0, 1]);
-        assert.equal(plan.ambiguous.length, 1);
+        assert.deepEqual(plan.mint, [], "minting a third line was the duplicate this feature prevents");
+        // Sorted by qbTxnId, paired against sorted statement sequence.
+        assert.deepEqual([...plan.adopt.entries()], [[0, "bl-x"], [1, "bl-y"]]);
+        assert.deepEqual(plan.ambiguous, []);
     });
-    await t.test("one statement line, two adoptable", () => {
+
+    await t.test("the pairing is the SAME on a replay, whatever order the rows arrive in", () => {
+        const lines = [stmt({ sequence: 0 }), stmt({ sequence: 1 })];
+        const a = existing({ id: "bl-y", qbTxnId: "2000", sourceOfRecord: "QBO" });
+        const b = existing({ id: "bl-x", qbTxnId: "1000", sourceOfRecord: "QBO" });
+        const first = planStatementAdoption(lines, [a, b], ACCOUNT);
+        const second = planStatementAdoption([...lines].reverse(), [b, a], ACCOUNT);
+        assert.deepEqual([...first.adopt.entries()], [...second.adopt.entries()]);
+    });
+
+    await t.test("two statement lines, ONE adoptable — one adopts, one mints, reported", () => {
+        const plan = planStatementAdoption(
+            [stmt({ sequence: 0 }), stmt({ sequence: 1 })],
+            [existing({ id: "bl-qbo", qbTxnId: "1000", sourceOfRecord: "QBO" })],
+            ACCOUNT,
+        );
+        assert.deepEqual([...plan.adopt.entries()], [[0, "bl-qbo"]]);
+        assert.deepEqual(plan.mint, [1], "the statement says there were two");
+        assert.equal(plan.ambiguous.length, 1, "QBO under-reported — surfaced for a human");
+    });
+
+    await t.test("one statement line, two adoptable — one adopts, the stale QBO line stays visible", () => {
         const plan = planStatementAdoption(
             [stmt()],
-            [existing({ id: "a", sourceOfRecord: "QBO" }), existing({ id: "b", sourceOfRecord: "QBO" })],
+            [
+                existing({ id: "bl-b", qbTxnId: "2000", sourceOfRecord: "QBO" }),
+                existing({ id: "bl-a", qbTxnId: "1000", sourceOfRecord: "QBO" }),
+            ],
             ACCOUNT,
         );
-        assert.equal(plan.adopt.size, 0);
-        assert.deepEqual(plan.mint, [0]);
-        assert.equal(plan.ambiguous.length, 1);
+        assert.deepEqual([...plan.adopt.entries()], [[0, "bl-a"]]);
+        assert.deepEqual(plan.mint, []);
+    });
+
+    await t.test("a candidate with no qbTxnId still orders stably, by line id", () => {
+        const plan = planStatementAdoption(
+            [stmt({ sequence: 0 }), stmt({ sequence: 1 })],
+            [
+                existing({ id: "bl-b", qbTxnId: null, sourceOfRecord: "QBO" }),
+                existing({ id: "bl-a", qbTxnId: null, sourceOfRecord: "QBO" }),
+            ],
+            ACCOUNT,
+        );
+        assert.deepEqual([...plan.adopt.entries()], [[0, "bl-a"], [1, "bl-b"]]);
     });
 });
 
@@ -220,4 +298,98 @@ test("RE-RUN after convergence still changes nothing, in either order", () => {
     // so it would mint rather than silently re-attach.
     const replay = planStatementAdoption([stmt()], [adopted], ACCOUNT);
     assert.equal(replay.adopt.size, 0);
+});
+
+// ── Concurrency (Codex round-2 blocker 2b) ──────────────────────────────────
+
+/**
+ * A ledger whose write path is serialized by the identity lock, so the two
+ * interleavings can be driven explicitly. Planning happens INSIDE the critical
+ * section, which is the whole point — planning outside it is the bug.
+ */
+function lockedLedger() {
+    const lines: ExistingBankLine[] = [];
+    const linked = new Map<string, string>();
+    let queue: Promise<unknown> = Promise.resolve();
+    let seq = 0;
+
+    /** Serializes like pg_advisory_xact_lock on one key would. */
+    function withIdentityLock<T>(work: () => Promise<T>): Promise<T> {
+        const run = queue.then(work);
+        queue = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
+    return {
+        lines,
+        linked,
+        mint(observations: MintCandidateObservation[], now: Date) {
+            return withIdentityLock(async () => {
+                // Read → plan → write, all inside the lock.
+                const withLinks = observations.map(o => ({ ...o, bankLineId: linked.get(o.id) ?? null }));
+                const plan = planQboMint(withLinks, lines, now);
+                for (const o of plan.mint) {
+                    const id = `bl-minted-${++seq}`;
+                    lines.push({
+                        id,
+                        account: o.account,
+                        postedDate: o.postedDate,
+                        amountCents: o.amountCents,
+                        normalizedPayee: o.normalizedPayee,
+                        checkNumber: o.checkNumber,
+                        sourceOfRecord: "QBO",
+                    });
+                    linked.set(o.id, id);
+                }
+                return plan.mint.length;
+            });
+        },
+    };
+}
+
+test("two concurrent mint runs over the same observation create ONE line", async () => {
+    const ledger = lockedLedger();
+    const observations = [obs()];
+    const [a, b] = await Promise.all([
+        ledger.mint(observations, NOW),
+        ledger.mint(observations, NOW),
+    ]);
+    assert.equal(a + b, 1, "planning inside the lock is what makes the loser see the winner's line");
+    assert.equal(ledger.lines.length, 1);
+});
+
+test("two concurrent runs over TWO same-identity observations still create exactly two", async () => {
+    const ledger = lockedLedger();
+    const observations = [obs({ id: "a" }), obs({ id: "b" })];
+    const [x, y] = await Promise.all([
+        ledger.mint(observations, NOW),
+        ledger.mint(observations, NOW),
+    ]);
+    assert.equal(x + y, 2, "cardinality survives concurrency — two charges, two lines, no third");
+    assert.equal(ledger.lines.length, 2);
+});
+
+test("a third run after both mints is a no-op", async () => {
+    const ledger = lockedLedger();
+    const observations = [obs({ id: "a" }), obs({ id: "b" })];
+    await Promise.all([ledger.mint(observations, NOW), ledger.mint(observations, NOW)]);
+    assert.equal(await ledger.mint(observations, NOW), 0);
+    assert.equal(ledger.lines.length, 2);
+});
+
+test("both write paths take the SAME lock key, and plan inside it", () => {
+    // Two paths locking on two spellings of one intent is the same as not
+    // locking at all, and a lock taken AFTER the planning read protects nothing.
+    assert.equal(BANK_LINE_IDENTITY_LOCK, "bank-line-identity");
+    const cron = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    const ingest = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    for (const [label, source, planner] of [
+        ["cron mint", cron, "planQboMint("],
+        ["statement ingest", ingest, "planStatementAdoption("],
+    ] as const) {
+        const lockAt = source.indexOf("pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))");
+        assert.ok(lockAt > 0, `${label} must take the shared identity lock`);
+        const planAt = source.indexOf(planner);
+        assert.ok(planAt > lockAt, `${label} must PLAN inside the lock, not before it`);
+    }
 });

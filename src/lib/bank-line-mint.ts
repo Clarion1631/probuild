@@ -20,6 +20,37 @@
  * Both functions here are PURE. The caller supplies rows and `now`; the caller
  * does the writes.
  *
+ * CARDINALITY, NOT PRESENCE. An identity key is not unique: this business
+ * genuinely buys the same thing from the same merchant twice on the same day.
+ * So "does a line with this key exist?" is the wrong question and produced the
+ * wrong answer — two same-key QBO transactions minted ONE line and the second
+ * charge silently vanished from the ledger. The question is "are there more
+ * UNLINKED canonical lines with this key than observations already claiming
+ * them?", and the planners below count rather than test membership.
+ *
+ * CONCURRENCY. Planning reads the world and then writes to it, so two runs can
+ * both plan against the same gap and both mint. Both write paths — the nightly
+ * mint and the statement ingest — take
+ * `pg_advisory_xact_lock(hashtext('bank-line-identity'))` and PLAN INSIDE that
+ * transaction, so identity decisions are serialized against each other. The
+ * lock is transaction-scoped (pgbouncer forbids session locks) and is held only
+ * across the planning read plus its writes.
+ *
+ * WHAT IS STILL NOT HANDLED, stated plainly rather than left to be discovered:
+ *   - A QuickBooks RESTATEMENT after minting. If QBO edits the amount or date
+ *     of a row we already minted a line from, the observation conflicts (409)
+ *     but the minted BankLine keeps the old figures, and `amountCents` is
+ *     immutable by trigger. A human resolves it; nothing here rewrites a
+ *     canonical line.
+ *   - A QBO row that is later DELETED in QuickBooks leaves its minted line
+ *     behind. It stays visible as sourceOfRecord="QBO" with no statement
+ *     backing, which is the honest state, but nothing reaps it.
+ *   - SPLIT postings that QBO reports as one row and the bank as two (or the
+ *     reverse) will not adopt — the identities differ — so the statement mints
+ *     its own line and the QBO one lingers.
+ * All three are why BANK_LINE_MINT_FROM_QBO defaults OFF and why the statement
+ * remains the source that gets to say how many transactions there were.
+ *
  * MATCH IDENTITY is deliberately the SAME key `reconcileObservations` uses —
  * account + postedDate + amountCents + normalizedPayee, plus checkNumber
  * agreement — so a line that adoption considers "the same transaction" is the
@@ -39,6 +70,13 @@
  */
 export const QBO_MINT_MIN_AGE_DAYS = 2;
 
+/**
+ * The advisory-lock key both write paths take. ONE string, exported, because
+ * two paths locking on two spellings of the same intent is the same as not
+ * locking at all.
+ */
+export const BANK_LINE_IDENTITY_LOCK = "bank-line-identity";
+
 export interface MintCandidateObservation {
     id: string;
     account: string;
@@ -54,6 +92,8 @@ export interface MintCandidateObservation {
 
 export interface ExistingBankLine {
     id: string;
+    /** Used ONLY to order same-identity candidates deterministically. */
+    qbTxnId?: string | null;
     account: string;
     postedDate: string;
     amountCents: number;
@@ -125,10 +165,24 @@ export function planQboMint(
         skipped: { alreadyLinked: 0, tooRecent: 0, emptyPayee: 0, statementLineExists: 0, duplicateWithinBatch: 0 },
     };
     const todayDay = dayNumber(now.toISOString().slice(0, 10));
-    const taken = new Set<string>();
+
+    // COUNTS, not membership. Two identical charges on one day are two real
+    // transactions; testing "does a line with this key exist" made the second
+    // one disappear. `available` is how many canonical lines with this identity
+    // are still unclaimed by an observation.
+    const available = new Map<string, number>();
     for (const line of existingLines) {
         if (line.normalizedPayee === "") continue;
-        taken.add(bankLineIdentityKey(line));
+        const key = bankLineIdentityKey(line);
+        available.set(key, (available.get(key) ?? 0) + 1);
+    }
+    // An observation that is ALREADY linked has consumed one of those lines.
+    for (const obs of observations) {
+        if (obs.bankLineId === null) continue;
+        if (obs.normalizedPayee === "") continue;
+        const key = bankLineIdentityKey(obs);
+        const left = available.get(key);
+        if (left !== undefined && left > 0) available.set(key, left - 1);
     }
 
     for (const obs of observations) {
@@ -142,15 +196,29 @@ export function planQboMint(
         }
 
         const key = bankLineIdentityKey(obs);
-        if (taken.has(key)) {
-            // Either a statement already minted it, or an earlier run did, or
-            // an earlier observation in THIS batch did. All three mean "a
-            // canonical line for this transaction already exists".
+        const left = available.get(key) ?? 0;
+        if (left > 0) {
+            // A canonical line for this transaction already exists and is free.
+            // Reconcile links it; minting here would be the twin.
+            available.set(key, left - 1);
             plan.skipped.statementLineExists++;
             continue;
         }
-        taken.add(key);
+        // No unclaimed line left for this identity — this observation is a
+        // transaction nothing in the ledger accounts for yet. Two same-key QBO
+        // observations therefore mint TWO lines, which is the point.
         plan.mint.push(obs);
+    }
+
+    // Telemetry only, and it must be TRUE: how many of the minted rows share an
+    // identity with another minted row in the same batch. Previously this
+    // counter existed and never incremented, which is worse than not having it.
+    const mintedByKey = new Map<string, number>();
+    for (const obs of plan.mint) {
+        const key = bankLineIdentityKey(obs);
+        const seen = mintedByKey.get(key) ?? 0;
+        if (seen > 0) plan.skipped.duplicateWithinBatch++;
+        mintedByKey.set(key, seen + 1);
     }
 
     return plan;
@@ -173,11 +241,9 @@ export interface AdoptionPlan {
     /** Sequences that mint a fresh canonical line, as they always did. */
     mint: number[];
     /**
-     * Identities where the pairing could not be inferred — more than one
-     * statement line and/or more than one adoptable line share a key. Every
-     * member mints instead, exactly as it would have before this feature
-     * existed. Reported, never silently guessed (the same rule
-     * reconcileObservations follows for its ambiguous groups).
+     * Identities where the statement reported MORE lines than QBO did, so some
+     * of them had no line to adopt and minted. Reported for visibility, not as
+     * a failure — see the pairing rule in planStatementAdoption.
      */
     ambiguous: string[];
 }
@@ -205,6 +271,14 @@ export function planStatementAdoption(
 ): AdoptionPlan {
     const plan: AdoptionPlan = { adopt: new Map(), mint: [], ambiguous: [] };
 
+    // Candidates per identity, in a DETERMINISTIC order. Previously an N:N
+    // group refused to pair at all and minted a third line — which left the
+    // QBO line orphaned AND created the duplicate the whole feature exists to
+    // prevent. Two same-key statement lines against two same-key QBO lines are
+    // two transactions matched by two records; the only real question is which
+    // pairs with which, and for identical rows that question has no observable
+    // answer. So pair by sorted qbTxnId (falling back to the line id, which is
+    // equally stable) — the SAME pairing every time, on every replay.
     const candidatesByKey = new Map<string, string[]>();
     for (const line of adoptableLines) {
         if (line.sourceOfRecord !== "QBO") continue;
@@ -213,6 +287,14 @@ export function planStatementAdoption(
         const ids = candidatesByKey.get(key);
         if (ids) ids.push(line.id);
         else candidatesByKey.set(key, [line.id]);
+    }
+    for (const [key, ids] of candidatesByKey) {
+        const order = new Map(adoptableLines.map(line => [line.id, line.qbTxnId ?? line.id]));
+        candidatesByKey.set(key, [...ids].sort((a, b) => {
+            const oa = order.get(a) ?? a;
+            const ob = order.get(b) ?? b;
+            return oa < ob ? -1 : oa > ob ? 1 : a < b ? -1 : a > b ? 1 : 0;
+        }));
     }
 
     const linesByKey = new Map<string, number[]>();
@@ -225,17 +307,17 @@ export function planStatementAdoption(
     }
 
     for (const [key, sequences] of linesByKey) {
-        const candidates = candidatesByKey.get(key);
-        if (!candidates || candidates.length === 0) {
-            plan.mint.push(...sequences);
-            continue;
+        const candidates = candidatesByKey.get(key) ?? [];
+        // Statement order is the statement's own sequence — already stable.
+        const ordered = [...sequences].sort((a, b) => a - b);
+        for (let i = 0; i < ordered.length; i++) {
+            if (i < candidates.length) plan.adopt.set(ordered[i], candidates[i]);
+            else plan.mint.push(ordered[i]);
         }
-        if (sequences.length === 1 && candidates.length === 1) {
-            plan.adopt.set(sequences[0], candidates[0]);
-            continue;
-        }
-        plan.ambiguous.push(key);
-        plan.mint.push(...sequences);
+        // The statement saw more of this transaction than QBO did. The extras
+        // mint (the statement is the source that says how many there were);
+        // surfaced so a human can see QBO under-reported.
+        if (ordered.length > candidates.length && candidates.length > 0) plan.ambiguous.push(key);
     }
 
     plan.mint.sort((a, b) => a - b);

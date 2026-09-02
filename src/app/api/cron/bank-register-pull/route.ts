@@ -12,7 +12,7 @@ import {
     type BankRegisterIngestResult,
 } from "@/lib/bank-register-pull";
 import { normalizePayee } from "@/lib/bank-ledger";
-import { planQboMint } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, planQboMint } from "@/lib/bank-line-mint";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
 import { bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
 
@@ -61,73 +61,80 @@ const MINT_LOOKBACK_DAYS = 45;
 async function mintFromQbo(account: string): Promise<{ minted: number; skipped: Record<string, number> }> {
     const since = new Date(Date.now() - MINT_LOOKBACK_DAYS * 86_400_000);
 
-    const [observations, existingLines] = await Promise.all([
-        prisma.bankLineObservation.findMany({
-            where: { source: "QBO_REGISTER", account, bankLineId: null, postedDate: { gte: since } },
-            select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
-        }),
-        prisma.bankLine.findMany({
-            where: { account, postedDate: { gte: since } },
-            select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true },
-        }),
-    ]);
+    // ONE transaction: take the identity lock, THEN read, THEN plan, THEN
+    // write. Planning outside the lock is the bug this shape exists to prevent
+    // — two runs would both read the same gap and both mint into it. The lock
+    // is transaction-scoped because pgbouncer forbids session locks
+    // (review-alert-rollout.ts), and the statement ingest takes the SAME key.
+    return prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
 
-    const plan = planQboMint(
-        observations.map(row => ({
-            id: row.id,
-            account: row.account,
-            postedDate: row.postedDate.toISOString().slice(0, 10),
-            amountCents: row.amountCents,
-            rawDescriptor: row.rawDescriptor,
-            normalizedPayee: normalizePayee(row.rawDescriptor),
-            checkNumber: row.checkNumber,
-            bankLineId: row.bankLineId,
-        })),
-        existingLines.map(row => ({
-            id: row.id,
-            account: row.account,
-            postedDate: row.postedDate.toISOString().slice(0, 10),
-            amountCents: row.amountCents,
-            normalizedPayee: row.normalizedPayee,
-            checkNumber: row.checkNumber,
-            sourceOfRecord: row.sourceOfRecord,
-        })),
-        new Date(),
-    );
+        const [observations, existingLines] = await Promise.all([
+            tx.bankLineObservation.findMany({
+                where: { source: "QBO_REGISTER", account, postedDate: { gte: since } },
+                select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
+            }),
+            tx.bankLine.findMany({
+                where: { account, postedDate: { gte: since } },
+                select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
+            }),
+        ]);
 
-    let minted = 0;
-    for (const observation of plan.mint) {
-        try {
-            await prisma.$transaction(async tx => {
-                const line = await tx.bankLine.create({
-                    data: {
-                        account: observation.account,
-                        postedDate: new Date(`${observation.postedDate}T00:00:00Z`),
-                        amountCents: observation.amountCents,
-                        rawDescriptor: observation.rawDescriptor,
-                        normalizedPayee: observation.normalizedPayee,
-                        checkNumber: observation.checkNumber,
-                        state: "POSTED",
-                        sourceOfRecord: "QBO",
-                    },
-                });
-                // Guarded: a reconcile run that claimed this observation between
-                // the read above and here must win. Throwing rolls the new line
-                // back with it — no orphan.
-                const linked = await tx.bankLineObservation.updateMany({
-                    where: { id: observation.id, bankLineId: null },
-                    data: { bankLineId: line.id },
-                });
-                if (linked.count === 0) throw new ObservationClaimedError();
+        const plan = planQboMint(
+            observations.map(row => ({
+                id: row.id,
+                account: row.account,
+                postedDate: row.postedDate.toISOString().slice(0, 10),
+                amountCents: row.amountCents,
+                rawDescriptor: row.rawDescriptor,
+                normalizedPayee: normalizePayee(row.rawDescriptor),
+                checkNumber: row.checkNumber,
+                bankLineId: row.bankLineId,
+            })),
+            existingLines.map(row => ({
+                id: row.id,
+                qbTxnId: row.qbTxnId,
+                account: row.account,
+                postedDate: row.postedDate.toISOString().slice(0, 10),
+                amountCents: row.amountCents,
+                normalizedPayee: row.normalizedPayee,
+                checkNumber: row.checkNumber,
+                sourceOfRecord: row.sourceOfRecord,
+            })),
+            new Date(),
+        );
+
+        // LINKED observations are loaded too (not filtered out in SQL as
+        // before), because the cardinality count needs to know which existing
+        // lines are already spoken for.
+        let minted = 0;
+        for (const observation of plan.mint) {
+            const line = await tx.bankLine.create({
+                data: {
+                    account: observation.account,
+                    postedDate: new Date(`${observation.postedDate}T00:00:00Z`),
+                    amountCents: observation.amountCents,
+                    rawDescriptor: observation.rawDescriptor,
+                    normalizedPayee: observation.normalizedPayee,
+                    checkNumber: observation.checkNumber,
+                    state: "POSTED",
+                    sourceOfRecord: "QBO",
+                },
             });
+            // Guarded even under the lock: reconcile does NOT take this lock
+            // (it only links, never mints), so it can still claim the
+            // observation. Losing that race must roll the new line back with
+            // it rather than leave an orphan.
+            const linked = await tx.bankLineObservation.updateMany({
+                where: { id: observation.id, bankLineId: null },
+                data: { bankLineId: line.id },
+            });
+            if (linked.count === 0) throw new ObservationClaimedError();
             minted++;
-        } catch (error) {
-            if (error instanceof ObservationClaimedError) continue;
-            throw error;
         }
-    }
 
-    return { minted, skipped: { ...plan.skipped } };
+        return { minted, skipped: { ...plan.skipped } };
+    });
 }
 
 class ObservationClaimedError extends Error {}

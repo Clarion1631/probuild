@@ -10,7 +10,7 @@ import {
     isValidCalendarDate,
     isSafeCents,
 } from "@/lib/bank-ledger";
-import { planStatementAdoption } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, planStatementAdoption } from "@/lib/bank-line-mint";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -457,6 +457,12 @@ const handlers = createBankLedgerIngestHandlers({
     createStatementImport: async input => {
         try {
             return await prisma.$transaction(async tx => {
+                // The SAME identity lock the nightly mint takes, held across
+                // the adoption read and every write below. Without it a mint
+                // committing between this read and these inserts would leave a
+                // QBO line the statement never adopted, plus the twin.
+                await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+
                 // ADOPTION (Justin, decision 3). The nightly QBO pull may have
                 // already minted a canonical line for some of these
                 // transactions. Minting a second one would be the dual-identity
@@ -473,7 +479,7 @@ const handlers = createBankLedgerIngestHandlers({
                         sourceOfRecord: "QBO",
                         postedDate: { gte: new Date(input.periodStart), lte: new Date(input.periodEnd) },
                     },
-                    select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
                 });
                 const adoptionPlan = planStatementAdoption(
                     input.lines.map(line => ({
@@ -485,6 +491,7 @@ const handlers = createBankLedgerIngestHandlers({
                     })),
                     adoptable.map(row => ({
                         id: row.id,
+                        qbTxnId: row.qbTxnId,
                         account: row.account,
                         postedDate: row.postedDate.toISOString().slice(0, 10),
                         amountCents: row.amountCents,
