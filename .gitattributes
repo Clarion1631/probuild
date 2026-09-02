@@ -1,0 +1,5 @@
+# Golden-file CSVs are byte-compared by tests/gusto-export.test.ts. Git's
+# autocrlf would rewrite their line endings on a Windows checkout and either
+# hide a real regression or fail a correct build, so they are checked out
+# verbatim.
+tests/fixtures/*.csv -text

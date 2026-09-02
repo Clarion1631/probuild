@@ -191,7 +191,6 @@ export function buildGustoExport(input: {
     const employeeMappings = input.employeeMappings ?? {};
     const isSalaried = input.isSalaried ?? (() => false);
 
-    const byId = new Map(users.map((user) => [user.id, user]));
     const closed = entries.filter(
         (entry) => entry.endTime != null && Number.isFinite(entry.durationHours) && entry.durationHours > 0
     );
