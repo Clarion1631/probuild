@@ -10,6 +10,7 @@ import {
     assertManualEntryWrite,
     assertNotClockGeneratedEntry,
     assertNotLegacyUnitEntry,
+    reassertManualEntryInTx,
     assertUsableDuration,
 } from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
@@ -178,6 +179,10 @@ export async function updateTimeEntry(id: string, data: {
     // PATCH /api/time-entries/[id]) are where settlement belongs.
     // Both dates — editing inside a locked period, and moving a punch into one.
     const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
+        // The row is FOR UPDATE now. Everything above was authorized from a read
+        // taken before that lock existed, so it is re-checked here against what
+        // the row actually is.
+        await reassertManualEntryInTx(tx as never, id, existing);
         const priced = await priceManualEntry(tx, data.userId, durationHours, acknowledgeZeroRate);
         // updateMany with the billing columns in the WHERE is the compare-and-set:
         // the pre-transaction read above is stale the moment a concurrent invoice
@@ -212,9 +217,12 @@ export async function deleteTimeEntry(id: string) {
     // has none — so a settle call would take locks and re-plan a day this write
     // cannot have changed. The clocked paths (PUT /api/time-entries and
     // PATCH /api/time-entries/[id]) are where settlement belongs.
-    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
-    );
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, async (tx) => {
+        await reassertManualEntryInTx(tx as never, id, entry);
+        return (tx as unknown as typeof prisma).timeEntry.deleteMany({
+            where: { id, invoiceId: null, invoicedAt: null },
+        });
+    });
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/timeclock`);

@@ -206,6 +206,65 @@ export type LockedOwnerRates = {
  * otherwise be ignored, and the entry would be stamped at a rate that is no
  * longer true — including a $0 one the guard would have refused.
  */
+/**
+ * The same rates, taken with a SHARED row lock.
+ *
+ * Settlement REPRICES rows, so it has to see one consistent answer for "what is
+ * this person paid" for the whole transaction. A plain SELECT does not: a rate
+ * import committing halfway through a multi-entry day would price the first
+ * shift at the old rate and the second at the new one, and the day would not add
+ * up to anything anybody could reconcile.
+ *
+ * FOR SHARE rather than FOR UPDATE because settlement does not change the rate —
+ * two settlements for different days may run at once, and only a rate WRITER
+ * (which takes FOR UPDATE) needs to be excluded. Every rate writer goes through
+ * readOwnerRatesForUpdate or lockOwnerRowForUpdate, so the two serialize.
+ */
+export async function readOwnerRatesForShare(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string,
+    toNumber: (value: unknown) => number
+): Promise<LockedOwnerRates | null> {
+    const [row] = (await tx.$queryRawUnsafe(
+        `SELECT "name", "email", "role", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR SHARE`,
+        userId
+    )) as Array<{
+        name: string | null;
+        email: string;
+        role: string;
+        payType: string | null;
+        hourlyRate: unknown;
+        burdenRate: unknown;
+    }>;
+    if (!row) return null;
+    return {
+        name: row.name,
+        email: row.email,
+        role: row.role,
+        payType: row.payType,
+        hourlyRate: toNumber(row.hourlyRate),
+        burdenRate: toNumber(row.burdenRate),
+    };
+}
+
+/**
+ * Take the EXCLUSIVE row lock before writing a rate.
+ *
+ * Pairs with readOwnerRatesForShare: a settlement holding the shared lock blocks
+ * here until it commits, so a rate can never change underneath a day that is
+ * mid-reprice.
+ */
+export async function lockOwnerRowForUpdate(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string
+): Promise<boolean> {
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "id" FROM "User" WHERE "id" = $1 FOR UPDATE`,
+        userId
+    )) as Array<{ id: string }>;
+    return rows.length === 1;
+}
+
 export async function readOwnerRatesForUpdate(
     tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
     userId: string,

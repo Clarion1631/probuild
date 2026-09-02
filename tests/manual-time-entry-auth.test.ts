@@ -22,7 +22,10 @@ import {
     isLegacyUnitEntry,
     isOfficeTimeRole,
     isClockGeneratedEntry,
+    reassertManualEntryInTx,
+    BILLED_ENTRY_CODE,
     CLOCK_GENERATED_ENTRY_CODE,
+    ENTRY_CHANGED_CODE,
     LEGACY_UNIT_ENTRY_CODE,
 } from "../src/lib/manual-time-entry-auth";
 import { settleDayPlan } from "../src/lib/wa-breaks";
@@ -225,4 +228,88 @@ test("deleting one of two shifts drops the meal deduction the day no longer earn
     const deductedAlone = remaining.reduce((sum, row) => sum + row.mealDeductionHours, 0);
     assert.equal(deductedAlone, 0, "4 hours alone earn none");
     assert.equal(remaining[0].paidHours, 4, "and the paid hours go back up");
+});
+
+// ── Re-authorization under the row lock (review round 18, item 1) ───────────
+
+const AUTHORIZED = {
+    userId: "u-crew",
+    projectId: "p1",
+    endTime: null as Date | null,
+    invoiceId: null as string | null,
+    invoicedAt: null as Date | null,
+};
+
+/** Stands in for the session-backed check, which needs a request scope. */
+const noopAuth = async () => ({ id: "u-admin", role: "ADMIN" });
+
+function txReturning(row: unknown) {
+    return { timeEntry: { findUnique: async () => row } } as never;
+}
+
+test("an entry REASSIGNED between the read and the lock is refused", async () => {
+    // The pre-transaction read said this row belonged to u-crew on p1, and the
+    // authorization, the pricing target and the schedule-task binding were all
+    // computed from that. If it now belongs to somebody else, hours priced from
+    // the OLD owner's rates would land on the NEW owner.
+    let error: (Error & { code?: string }) | null = null;
+    try {
+        await reassertManualEntryInTx(txReturning({ ...AUTHORIZED, userId: "u-someone-else" }), "e1", AUTHORIZED, noopAuth);
+    } catch (thrown) {
+        error = thrown as Error & { code?: string };
+    }
+    assert.equal(error?.code, ENTRY_CHANGED_CODE);
+    assert.match(error!.message, /different person or job/);
+});
+
+test("an entry MOVED to another project between the read and the lock is refused", async () => {
+    await assert.rejects(
+        () => reassertManualEntryInTx(txReturning({ ...AUTHORIZED, projectId: "p-other" }), "e1", AUTHORIZED, noopAuth),
+        (error: Error & { code?: string }) => error.code === ENTRY_CHANGED_CODE
+    );
+});
+
+test("an entry CLOSED into a clock punch between the read and the lock is refused", async () => {
+    await assert.rejects(
+        () =>
+            reassertManualEntryInTx(
+                txReturning({ ...AUTHORIZED, endTime: new Date("2026-09-01T23:00:00Z") }),
+                "e1",
+                AUTHORIZED
+            ),
+        (error: Error & { code?: string }) => error.code === CLOCK_GENERATED_ENTRY_CODE
+    );
+});
+
+test("an entry BILLED between the read and the lock is refused", async () => {
+    await assert.rejects(
+        () => reassertManualEntryInTx(txReturning({ ...AUTHORIZED, invoicedAt: new Date() }), "e1", AUTHORIZED, noopAuth),
+        (error: Error & { code?: string }) => error.code === BILLED_ENTRY_CODE
+    );
+});
+
+test("an entry DELETED between the read and the lock is refused", async () => {
+    await assert.rejects(
+        () => reassertManualEntryInTx(txReturning(null), "e1", AUTHORIZED, noopAuth),
+        (error: Error & { code?: string }) => error.code === ENTRY_CHANGED_CODE
+    );
+});
+
+test("an unchanged entry passes", async () => {
+    await reassertManualEntryInTx(txReturning({ ...AUTHORIZED }), "e1", AUTHORIZED, noopAuth);
+});
+
+test("BOTH editors re-authorize inside the transaction, on update AND delete", () => {
+    for (const file of MANUAL_ACTION_FILES) {
+        const source = actionSource(file);
+        // Twice per file: once in the update path, once in the delete path.
+        assert.equal(
+            (source.match(/reassertManualEntryInTx\(/g) ?? []).length,
+            2,
+            `${file}: update and delete both need it`
+        );
+        // INSIDE withPayrollWriteTx — the point is that the row is FOR UPDATE by
+        // the time the check runs.
+        assert.match(source, /withPayrollWriteTx\([\s\S]{0,300}?reassertManualEntryInTx\(/, file);
+    }
 });

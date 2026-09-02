@@ -157,14 +157,17 @@ async function settleDayInTx(
             // laborCost = paidHours * 0 here was the one path that could book a
             // free shift without anybody choosing to — the clock-out guard
             // refuses it, and then a later re-plan quietly did it anyway.
-            const owner = await tx.user.findUnique({
-                where: { id: userId },
-                select: { email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
-            });
+            // SHARED row lock, not a plain read. Settlement reprices every row
+            // it touches, so it needs ONE answer to "what is this person paid"
+            // for the whole transaction: a rate import committing halfway through
+            // a multi-entry day would otherwise price the first shift at the old
+            // rate and the second at the new one. Every rate WRITER takes the
+            // exclusive lock on the same row, so the two serialize.
+            const { appendZeroRateReview, readOwnerRatesForShare, zeroRateBlocks } = await import("./pay-rate-guard");
+            const owner = await readOwnerRatesForShare(tx as never, userId, toNum);
             if (!owner) return 0;
-            const hourlyRate = toNum(owner.hourlyRate);
-            const burdenRate = toNum(owner.burdenRate);
-            const { appendZeroRateReview, zeroRateBlocks } = await import("./pay-rate-guard");
+            const hourlyRate = owner.hourlyRate;
+            const burdenRate = owner.burdenRate;
             const zeroRate = zeroRateBlocks({
                 role: owner.role,
                 email: owner.email,

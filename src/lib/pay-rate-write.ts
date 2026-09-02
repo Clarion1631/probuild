@@ -14,7 +14,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { hasPermission } from "./access-rules";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
-import { isKnownPayType } from "./pay-rate-guard";
+import { isKnownPayType, lockOwnerRowForUpdate } from "./pay-rate-guard";
 
 export type RateActor = { role: string; permissions?: unknown } | null | undefined;
 
@@ -61,11 +61,25 @@ export function canWriteRates(actor: RateActor): boolean {
  * carried no rate fields at all, so callers can keep updating other columns
  * without needing payroll permission.
  */
+/**
+ * The database handle. A transaction is REQUIRED: the rate write has to take the
+ * exclusive row lock and write in one atomic step, or settlement's FOR SHARE
+ * cannot serialize against it.
+ */
+export type RateWriteClient = {
+    $transaction<T>(fn: (tx: RateWriteTx) => Promise<T>): Promise<T>;
+};
+
+export type RateWriteTx = {
+    user: { update(args: unknown): Promise<unknown> };
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+};
+
 export async function applyRateChange(
     actor: RateActor,
     userId: string,
     change: RateChange,
-    client: { user: { update(args: unknown): Promise<unknown> } } = prisma
+    client: RateWriteClient = prisma as never
 ): Promise<RateWriteResult> {
     const touchesRates = change.hourlyRate !== undefined || change.burdenRate !== undefined;
     const touchesPayType = change.payType !== undefined;
@@ -107,6 +121,13 @@ export async function applyRateChange(
     // point of the staleness marker is that no rate write can skip it.
     if (touchesRates) data.lastRateSyncAt = new Date();
 
-    await client.user.update({ where: { id: userId }, data });
+    // EXCLUSIVE row lock, then the write, in ONE transaction. Settlement reads
+    // the same row FOR SHARE while it reprices a day, so this waits rather than
+    // moving the rate underneath a day that is mid-reprice — which would leave
+    // one day's shifts priced at two different rates.
+    await client.$transaction(async (tx) => {
+        await lockOwnerRowForUpdate(tx, userId);
+        await tx.user.update({ where: { id: userId }, data });
+    });
     return { ok: true, changed: true };
 }

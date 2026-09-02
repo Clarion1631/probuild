@@ -214,13 +214,33 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                         <p className="text-sm text-red-800 mb-3">
                             {unknownPayTypeCount} {unknownPayTypeCount === 1 ? "person has" : "people have"} no pay type
                             set. Gusto pays salaried staff a salary and hourly staff by the hour — guessing either way
-                            is a wrong paycheque, so set it on Team Members before exporting.
+                            is a wrong paycheque, so set it on{" "}
+                            <Link
+                                href={`/company/team-members?periodStart=${startKey}&periodEnd=${endKeyExclusive}`}
+                                className="underline font-medium"
+                            >
+                                Team Members
+                            </Link>{" "}
+                            before exporting.
                         </p>
                     )}
                     <ul className="text-sm divide-y divide-hui-border">
                         {result.blocking.slice(0, 25).map((row) => (
                             <li key={row.id} className="py-1.5 flex justify-between gap-4">
-                                <span className="font-medium text-hui-textMain">{row.userLabel}</span>
+                                {row.reason === "unknownPayType" ? (
+                                    // Straight to THIS person's pay-type field, with the
+                                    // period carried across — the page has to load the
+                                    // former employees who have hours in it, and a
+                                    // disabled account is not in the default list.
+                                    <Link
+                                        href={`/company/team-members?periodStart=${startKey}&periodEnd=${endKeyExclusive}#pay-type-${row.userId}`}
+                                        className="font-medium text-hui-textMain underline"
+                                    >
+                                        {row.userLabel}
+                                    </Link>
+                                ) : (
+                                    <span className="font-medium text-hui-textMain">{row.userLabel}</span>
+                                )}
                                 <span className="text-hui-textMuted">
                                     {new Date(row.startTime).toLocaleString()} ·{" "}
                                     {row.reason === "open"

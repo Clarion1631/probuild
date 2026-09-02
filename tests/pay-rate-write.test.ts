@@ -9,6 +9,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { applyRateChange, canWriteRates } from "../src/lib/pay-rate-write";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-pay-rate-write-tests";
@@ -16,9 +18,19 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 function fakeClient() {
     const writes: Array<{ where: unknown; data: Record<string, unknown> }> = [];
+    const locks: string[] = [];
     return {
         writes,
-        client: { user: { update: async (args: any) => { writes.push(args); return {}; } } },
+        // A transaction, because the real write takes the exclusive row lock and
+        // updates in one atomic step. `locks` records that it did.
+        locks,
+        client: {
+            $transaction: async (fn: any) =>
+                fn({
+                    user: { update: async (args: any) => { writes.push(args); return {}; } },
+                    $queryRawUnsafe: async (_q: string, id: string) => { locks.push(id); return [{ id }]; },
+                }),
+        },
     };
 }
 
@@ -85,4 +97,65 @@ test("pay type rides the same path, and only accepts the two real values", async
     // A pay-type-only change is not a rate confirmation, so it does not stamp.
     assert.equal(writes[0].data.lastRateSyncAt, undefined);
     assert.equal((await applyRateChange(ADMIN, "u1", { payType: "GUESS" }, client)).ok, false);
+});
+
+// ── Rate writes serialize against settlement (review round 18, item 2) ──────
+
+test("a rate write takes the EXCLUSIVE row lock before updating, in one transaction", async () => {
+    const { writes, locks, client } = fakeClient();
+    const result = await applyRateChange(ADMIN, "u1", { hourlyRate: "31.00" }, client);
+    assert.deepEqual(result, { ok: true, changed: true });
+    assert.deepEqual(locks, ["u1"], "settlement holds FOR SHARE on this row while it reprices a day");
+    assert.equal(writes.length, 1);
+});
+
+test("the lock is taken BEFORE the write, not after it", async () => {
+    const order: string[] = [];
+    const client = {
+        $transaction: async (fn: any) =>
+            fn({
+                user: { update: async () => { order.push("write"); return {}; } },
+                $queryRawUnsafe: async (q: string, id: string) => {
+                    order.push(q.includes("FOR UPDATE") ? "lock" : "read");
+                    return [{ id }];
+                },
+            }),
+    };
+    await applyRateChange(ADMIN, "u1", { hourlyRate: "31.00" }, client as never);
+    assert.deepEqual(order, ["lock", "write"], "a lock taken after the write serializes nothing");
+});
+
+test("a refused write never reaches the transaction at all", async () => {
+    let opened = false;
+    const client = { $transaction: async (fn: any) => { opened = true; return fn({} as never); } };
+    const result = await applyRateChange(CREW, "u1", { hourlyRate: "31.00" }, client as never);
+    assert.equal(result.ok, false);
+    assert.equal(opened, false);
+});
+
+test("settlement reads the owner's rates FOR SHARE, from the same helper family", () => {
+    const guard = readFileSync(path.join(process.cwd(), "src/lib/pay-rate-guard.ts"), "utf8");
+    // FOR SHARE, not FOR UPDATE: two settlements for different days may run at
+    // once. Only a rate WRITER has to be excluded.
+    assert.match(guard, /FROM "User" WHERE "id" = \$1 FOR SHARE/);
+    assert.match(guard, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
+
+    const settle = readFileSync(path.join(process.cwd(), "src/lib/wa-breaks-db.ts"), "utf8");
+    const fn = settle.slice(settle.indexOf("async function settleDayInTx"));
+    assert.match(fn, /readOwnerRatesForShare\(tx as never, userId, toNum\)/);
+    // The plain unlocked read is gone — that is what let a rate import commit
+    // halfway through a multi-entry day.
+    assert.doesNotMatch(fn.slice(0, fn.indexOf("const rows =")), /tx\.user\.findUnique/);
+});
+
+test("the rate import locks every affected row, in a stable order", () => {
+    const actions = readFileSync(path.join(process.cwd(), "src/lib/actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function applyGustoRateImport"));
+    const body = fn.slice(0, fn.indexOf("\nexport "));
+    assert.match(body, /lockOwnerRowForUpdate\(tx as never, row\.userId\)/);
+    // Sorted, or two concurrent imports touching the same two people in
+    // different orders deadlock on each other.
+    assert.match(body, /\[\.\.\.clean\]\.sort\(\(a, b\) => a\.userId\.localeCompare\(b\.userId\)\)/);
+    // Locks first, then the compare-and-set writes.
+    assert.ok(body.indexOf("lockOwnerRowForUpdate") < body.indexOf("tx.user.updateMany"));
 });

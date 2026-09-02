@@ -15476,6 +15476,15 @@ export async function applyGustoRateImport(
     const syncedAt = new Date();
     try {
         await prisma.$transaction(async (tx) => {
+            const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
+            // EXCLUSIVE row locks first, in a stable id order so two concurrent
+            // imports cannot deadlock on each other. This is the other half of
+            // settlement's FOR SHARE: a day mid-reprice holds the shared lock, so
+            // this import waits rather than changing the rate underneath it and
+            // leaving one day priced at two different rates.
+            for (const row of [...clean].sort((a, b) => a.userId.localeCompare(b.userId))) {
+                await lockOwnerRowForUpdate(tx as never, row.userId);
+            }
             for (const row of clean) {
                 const live = byId.get(row.userId)!;
                 // Compare-and-set on BOTH values we showed the human. Rate

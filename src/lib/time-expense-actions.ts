@@ -18,6 +18,7 @@ import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import {
     assertBulkDeletable,
     assertManualEntryDelete,
+    reassertManualEntryInTx,
     assertManualEntryWrite,
     assertNotClockGeneratedEntry,
     assertNotLegacyUnitEntry,
@@ -172,6 +173,10 @@ export async function updateTimeEntry(
     // cannot have changed. The clocked paths (PUT /api/time-entries and
     // PATCH /api/time-entries/[id]) are where settlement belongs.
     const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
+        // The row is FOR UPDATE now. Everything above was authorized from a read
+        // taken before that lock existed, so it is re-checked here against what
+        // the row actually is.
+        await reassertManualEntryInTx(tx as never, id, current);
         const result = await (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id, invoiceId: null, invoicedAt: null },
             data: {
@@ -215,9 +220,12 @@ export async function deleteTimeEntry(id: string) {
     // has none — so a settle call would take locks and re-plan a day this write
     // cannot have changed. The clocked paths (PUT /api/time-entries and
     // PATCH /api/time-entries/[id]) are where settlement belongs.
-    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
-    );
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, async (tx) => {
+        await reassertManualEntryInTx(tx as never, id, entry);
+        return (tx as unknown as typeof prisma).timeEntry.deleteMany({
+            where: { id, invoiceId: null, invoicedAt: null },
+        });
+    });
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/time-expenses`);

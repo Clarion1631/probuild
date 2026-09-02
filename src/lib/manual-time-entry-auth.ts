@@ -215,3 +215,69 @@ export function assertUsableDuration(durationHours: unknown): number {
     }
     return hours;
 }
+
+/** Coded refusal for "the row changed between authorizing it and locking it". */
+export const ENTRY_CHANGED_CODE = "manual-entry-changed";
+
+export type ManualEntryIdentity = {
+    userId: string;
+    projectId: string;
+    endTime: Date | null;
+    invoiceId: string | null;
+    invoicedAt: Date | null;
+};
+
+/**
+ * Re-authorize a manual write against the row as it stands under FOR UPDATE.
+ *
+ * Everything above this point was decided from a read taken OUTSIDE the
+ * transaction. In between, another writer can reassign the entry to a different
+ * owner or project, close it into a clocked punch, or an invoice run can claim
+ * it — and the authorization, the pricing target and the schedule-task binding
+ * were all computed from values that no longer describe this row.
+ *
+ * Two checks, and both are needed. Re-running the guards catches a row that is
+ * now unauthorized; comparing against what was authorized catches a row that is
+ * still authorized but is no longer the row the caller was shown. The second is
+ * the one that matters for pricing: hours priced from the OLD owner's rates
+ * would land on the NEW owner.
+ */
+export async function reassertManualEntryInTx(
+    tx: { timeEntry: { findUnique: (args: unknown) => Promise<ManualEntryIdentity | null> } },
+    entryId: string,
+    authorized: ManualEntryIdentity,
+    /**
+     * The session-backed authorization. Injected so the identity rules can be
+     * tested without a request scope — assertManualEntryWrite reads the NextAuth
+     * session, which does not exist outside one.
+     */
+    reauthorize: (projectId: string, targetUserId: string) => Promise<unknown> = assertManualEntryWrite
+): Promise<void> {
+    const fresh = await tx.timeEntry.findUnique({
+        where: { id: entryId },
+        select: { userId: true, projectId: true, endTime: true, invoiceId: true, invoicedAt: true },
+    });
+    if (!fresh) {
+        const error = new Error("That time entry no longer exists — refresh and try again.");
+        (error as Error & { code?: string }).code = ENTRY_CHANGED_CODE;
+        throw error;
+    }
+
+    // The guards, re-run against the CURRENT row.
+    assertNotClockGeneratedEntry(fresh);
+    assertNotBilledEntry(fresh);
+
+    // The identity the authorization was actually granted for. Checked BEFORE
+    // the session call: a row that moved is refused on that ground alone, and
+    // the answer must not depend on whether the actor happens to also be
+    // authorized for wherever it moved to.
+    if (fresh.userId !== authorized.userId || fresh.projectId !== authorized.projectId) {
+        const error = new Error(
+            "Someone moved that time entry to a different person or job while you were editing it. Nothing was changed — refresh and try again."
+        );
+        (error as Error & { code?: string }).code = ENTRY_CHANGED_CODE;
+        throw error;
+    }
+
+    await reauthorize(fresh.projectId, fresh.userId);
+}

@@ -389,7 +389,15 @@ test("the zero-rate policy reads the whole owner, not just the number", () => {
     const body = fn.slice(fn.indexOf("async function settleDayInTx"));
     // role / email / payType are what exempt a salaried owner. Selecting only
     // the rates would make every salaried $0 look like a blocked hourly one.
-    assert.match(body, /select: \{ email: true, role: true, payType: true, hourlyRate: true, burdenRate: true \}/);
+    // Round 18 moved this behind readOwnerRatesForShare, which takes the shared
+    // row lock — the columns are the same, and the helper is shared with the
+    // clock-out pricing path so the two cannot disagree about the policy input.
+    assert.match(body, /readOwnerRatesForShare\(tx as never, userId, toNum\)/);
+    const guard = readFileSync(path.join(process.cwd(), "src/lib/pay-rate-guard.ts"), "utf8");
+    const reader = guard.slice(guard.indexOf("export async function readOwnerRatesForShare"));
+    const readerBody = reader.slice(0, reader.indexOf("export async function lockOwnerRowForUpdate"));
+    assert.match(readerBody, /"name", "email", "role", "payType", "hourlyRate", "burdenRate"/);
+    assert.match(readerBody, /FOR SHARE/);
 });
 
 test("the skip decision is one pure predicate, not inlined per branch", () => {

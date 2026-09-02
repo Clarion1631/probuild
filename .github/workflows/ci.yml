@@ -66,6 +66,15 @@ jobs:
       # The focused integration regression deliberately drifts the disposable
       # database's function and trigger after proving the checker recognizes
       # the production snapshot. It therefore runs last in this job.
+      # Two REAL connections contending on a User row. Every other concurrency
+      # proof in the suite is an injected sequence, which shows the branch exists
+      # but not that PostgreSQL serializes the way the code assumes. Runs BEFORE
+      # the drift test below, which deliberately mutates this database.
+      - name: Prove settlement's FOR SHARE blocks a concurrent rate write
+        run: npx tsx --test tests/payroll-rate-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

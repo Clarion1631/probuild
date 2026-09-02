@@ -7,6 +7,8 @@ import Link from "next/link";
 import { toast } from "sonner";
 import RatesImport from "./RatesImport";
 import { setUserPayType } from "@/lib/actions";
+import { Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 
 /**
  * The Payroll rates panel's own row shape, from GET /api/payroll/roster — a
@@ -51,7 +53,28 @@ function rateSyncLabel(lastRateSyncAt: string | null): { text: string; stale: bo
     return { text, stale: days > RATE_STALE_DAYS };
 }
 
+/**
+ * useSearchParams needs a Suspense boundary — the payroll export links here with
+ * its period in the query string, which opts this page out of prerendering.
+ */
 export default function TeamPage() {
+    return (
+        <Suspense fallback={<div className="p-6 text-sm text-hui-textMuted">Loading team…</div>}>
+            <TeamPageInner />
+        </Suspense>
+    );
+}
+
+function TeamPageInner() {
+    // The export sends people here with its own period in the URL.
+    const searchParams = useSearchParams();
+    const periodStartParam = searchParams.get("periodStart");
+    const periodEndParam = searchParams.get("periodEnd");
+    const historicalWindowLabel =
+        periodStartParam && periodEndParam
+            ? `this pay period (${periodStartParam} to ${periodEndParam})`
+            : "the last 90 days";
+
     const [users, setUsers] = useState<User[]>([]);
     const [roster, setRoster] = useState<PayrollRosterRow[]>([]);
     const rosterById = new Map(roster.map(row => [row.id, row]));
@@ -64,20 +87,39 @@ export default function TeamPage() {
     useEffect(() => {
         fetchUsers();
         fetchRoster();
-    }, []);
+        // Re-fetch when the export hands us a different period.
+    }, [searchParams]);
 
     // Payroll data comes from the payroll-scoped endpoint. A viewer without
     // payroll access simply gets no panel rather than a broken one.
     async function fetchRoster() {
-        // The historical window asks for former employees with hours in it. It
-        // defaults to the last 90 days: wide enough to cover any period still
-        // open, narrow enough not to resurrect the whole payroll history.
-        const to = new Date();
-        const from = new Date(to.getTime() - 90 * 86_400_000);
+        // The historical window asks for former employees with hours in it.
+        //
+        // When the payroll export sends somebody here it carries its OWN period
+        // in the URL, and that is the window we ask for. A rolling 90 days is
+        // not the same question: an export of a period older than 90 days
+        // listed a former employee as blocking and then did not show them on
+        // this page at all, which is a dead end with no way out of it.
+        //
+        // Absent a period, the rolling window is still a reasonable default for
+        // somebody who navigated here directly.
         const day = (d: Date) => d.toISOString().slice(0, 10);
-        const res = await fetch(
-            `/api/payroll/roster?historicalFrom=${day(from)}&historicalTo=${day(to)}`
-        );
+        const periodStart = searchParams.get("periodStart");
+        const periodEnd = searchParams.get("periodEnd");
+        const isDay = (value: string | null): value is string => !!value && /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+        let from: string;
+        let to: string;
+        if (isDay(periodStart) && isDay(periodEnd)) {
+            from = periodStart;
+            to = periodEnd;
+        } else {
+            const now = new Date();
+            from = day(new Date(now.getTime() - 90 * 86_400_000));
+            to = day(now);
+        }
+
+        const res = await fetch(`/api/payroll/roster?historicalFrom=${from}&historicalTo=${to}`);
         if (res.ok) setRoster(await res.json());
     }
 
@@ -342,6 +384,7 @@ export default function TeamPage() {
                                                 refuses to run until somebody answers, because guessing
                                                 either way is a wrong paycheque. */}
                                             <select
+                                                id={`pay-type-${user.id}`}
                                                 value={user.payType ?? ""}
                                                 onChange={async (e) => {
                                                     const value = e.target.value;
@@ -394,9 +437,9 @@ export default function TeamPage() {
                         <div className="px-6 py-4 border-b border-hui-border">
                             <h2 className="font-semibold text-hui-textMain">Historical payroll</h2>
                             <p className="text-xs text-hui-textMuted mt-0.5">
-                                Former team members with hours in the last 90 days. Setting a pay type here does
-                                not re-activate the account — it only answers how those hours should be paid, so
-                                the payroll export can run.
+                                Former team members with hours in {historicalWindowLabel}. Setting a pay type
+                                here does not re-activate the account — it only answers how those hours should be
+                                paid, so the payroll export can run.
                             </p>
                         </div>
                         <table className="w-full text-left border-collapse text-sm">
@@ -418,6 +461,7 @@ export default function TeamPage() {
                                         </td>
                                         <td className="px-6 py-3">
                                             <select
+                                                id={`pay-type-${user.id}`}
                                                 value={user.payType ?? ""}
                                                 onChange={async (e) => {
                                                     const value = e.target.value;

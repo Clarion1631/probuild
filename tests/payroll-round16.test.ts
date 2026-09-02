@@ -227,7 +227,10 @@ test("the timeclock editor rejects billed hours, and CASes on the billing column
 
     const del = source.slice(source.indexOf("export async function deleteTimeEntry"));
     assert.match(del, /Billed time entries cannot be deleted/);
-    assert.match(del, /deleteMany\(\{ where: \{ id, invoiceId: null, invoicedAt: null \} \}\)/);
+    // Round 18 put the in-transaction re-authorization ahead of it, so the call
+    // is now multi-line. The CAS itself is what matters.
+    assert.match(del, /deleteMany\(\{\s+where: \{ id, invoiceId: null, invoicedAt: null \},/);
+    assert.match(del, /reassertManualEntryInTx\(tx as never, id, entry\)/);
     assert.match(del, /deleted\.count !== 1/);
 });
 
@@ -413,4 +416,60 @@ test("both help routes fence their completion on the lease token", () => {
         // No unfenced UPDATE of the provider columns left behind.
         assert.doesNotMatch(source, /SET "status" = [\s\S]{0,200}"providerState"/, file);
     }
+});
+
+// ── Reaching the person who is blocking the export (round 18, item 3) ───────
+
+test("Team Members loads the historical window from the SELECTED period, not a rolling 90 days", () => {
+    const page = read("src/app/company/team-members/page.tsx");
+    // An export of a period older than 90 days listed a former employee as
+    // blocking and then did not show them on this page at all — a dead end.
+    assert.match(page, /searchParams\.get\("periodStart"\)/);
+    assert.match(page, /searchParams\.get\("periodEnd"\)/);
+    assert.match(page, /historicalFrom=\$\{from\}&historicalTo=\$\{to\}/);
+    // The rolling window survives only as the fallback for direct navigation.
+    assert.match(page, /90 \* 86_400_000/);
+    assert.ok(
+        page.indexOf('searchParams.get("periodStart")') < page.indexOf("90 * 86_400_000"),
+        "the period must be preferred over the rolling default"
+    );
+    // Re-fetches when the period changes, or a second link from the export
+    // would render the first period's roster.
+    assert.match(page, /\}, \[searchParams\]\);/);
+});
+
+test("the panel's description states the window it is actually showing", () => {
+    const page = read("src/app/company/team-members/page.tsx");
+    // It used to say "the last 90 days" unconditionally, which was a lie the
+    // moment the export sent somebody here for an older period.
+    assert.match(page, /hours in \{historicalWindowLabel\}/);
+    assert.match(page, /this pay period \(\$\{periodStartParam\} to \$\{periodEndParam\}\)/);
+    assert.match(page, /"the last 90 days"/);
+});
+
+test("every pay-type field is addressable, and the export links straight to it", () => {
+    const page = read("src/app/company/team-members/page.tsx");
+    // BOTH tables — the active roster and the historical one. A blocking former
+    // employee is only ever in the second.
+    assert.equal((page.match(/id=\{`pay-type-\$\{user\.id\}`\}/g) ?? []).length, 2);
+
+    const exportPage = read("src/app/manager/payroll-export/page.tsx");
+    assert.match(
+        exportPage,
+        /href=\{`\/company\/team-members\?periodStart=\$\{startKey\}&periodEnd=\$\{endKeyExclusive\}#pay-type-\$\{row\.userId\}`\}/
+    );
+    // Only the pay-type blockers link — the others are fixed on the time-entry
+    // screens, not here.
+    assert.match(exportPage, /row\.reason === "unknownPayType" \? \(/);
+});
+
+test("the pay-type summary line links to the period-scoped page too", () => {
+    const exportPage = read("src/app/manager/payroll-export/page.tsx");
+    assert.match(exportPage, /href=\{`\/company\/team-members\?periodStart=\$\{startKey\}&periodEnd=\$\{endKeyExclusive\}`\}/);
+});
+
+test("the page is Suspense-wrapped, because useSearchParams opts it out of prerendering", () => {
+    const page = read("src/app/company/team-members/page.tsx");
+    assert.match(page, /<Suspense fallback=/);
+    assert.match(page, /function TeamPageInner\(\)/);
 });
