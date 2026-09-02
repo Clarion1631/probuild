@@ -1342,113 +1342,7 @@ test("an unresolvable orphan is recorded durably, not just logged", async () => 
     assert.equal(PAYMENTS_SYNC_EVENT_KIND, "qbo-payments-sync");
 });
 
-// --- Per-issuance identity: retry vs re-issue ---
-
-/** In-memory stand-in for the PaymentSchedule/ProgressBilling rows the helper CASes on. */
-function fakeIssuanceModel(initial: string | null = null, initialHash: string | null = null) {
-    const row: { qbIssuanceKey: string | null; qbIssuancePayloadHash: string | null } =
-        { qbIssuanceKey: initial, qbIssuancePayloadHash: initialHash };
-    return {
-        row,
-        model: {
-            async findUnique() { return { ...row }; },
-            async updateMany({ where, data }: { where: { qbIssuanceKey: null | string }; data: { qbIssuanceKey: string; qbIssuancePayloadHash: string } }) {
-                // Mirrors the CAS: only claims when the column is still null.
-                if (where.qbIssuanceKey === null && row.qbIssuanceKey !== null) return { count: 0 };
-                row.qbIssuanceKey = data.qbIssuanceKey;
-                row.qbIssuancePayloadHash = data.qbIssuancePayloadHash;
-                return { count: 1 };
-            },
-        },
-    };
-}
-
-const HASH_A = "hash-a";
-const HASH_B = "hash-b";
-
-test("an ambiguous retry REUSES the key, so Intuit returns the original invoice", async () => {
-    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
-    const { model, row } = fakeIssuanceModel();
-
-    const { key: first } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
-    assert.ok(first, "a key is minted before the first QBO call");
-    assert.equal(row.qbIssuanceKey, first, "and persisted, so it survives the process");
-
-    // The retry reads the stored key and passes it back in.
-    const { key: retry } = await ensureIssuanceKey(model as never, "sched-1", row.qbIssuanceKey, HASH_A, row.qbIssuancePayloadHash);
-    assert.equal(retry, first, "same key -> no duplicate invoice");
-});
-
-test("a RE-ISSUE after unlink mints a NEW key, so a new invoice is created", async () => {
-    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
-    const { model, row } = fakeIssuanceModel();
-
-    const { key: first } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
-    // breakQBInvoiceLink clears it (qbIssuanceKey: null in the unlink write).
-    row.qbIssuanceKey = null;
-    row.qbIssuancePayloadHash = null;
-
-    const { key: reissued } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
-    // Codex gate: keying on the row id could not express this - the re-send
-    // reused the same key and Intuit handed back the invoice just unlinked.
-    assert.notEqual(reissued, first, "a new issuance must not reuse the old key");
-    assert.equal(row.qbIssuanceKey, reissued);
-});
-
-test("two racing pushes share ONE key, so they cannot create two invoices", async () => {
-    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
-    const { model } = fakeIssuanceModel();
-    const [a, b] = await Promise.all([
-        ensureIssuanceKey(model as never, "sched-1", null, HASH_A),
-        ensureIssuanceKey(model as never, "sched-1", null, HASH_A),
-    ]);
-    assert.equal(a.key, b.key, "the CAS loser adopts the winner's key");
-});
-
 // --- Reconciliation: every expected field must be present AND equal ---
-
-test("a reordered retry (same content) reconciles clean", async () => {
-    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
-    const drift = reconcileIssuedInvoice(
-        { total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
-        { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
-    );
-    assert.deepEqual(drift, [], "reordering does not change what is billed");
-});
-
-test("an EDITED retry parks as invoice-drift on any changed field", async () => {
-    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
-    const expected = { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" };
-
-    assert.ok(reconcileIssuedInvoice({ total: 1600, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" }, expected).length > 0, "amount");
-    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c2", dueDate: "2026-10-01", docNumber: "INV-1-DEP" }, expected).length > 0, "customer");
-    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c1", dueDate: "2026-11-01", docNumber: "INV-1-DEP" }, expected).length > 0, "due date");
-    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-2-DEP" }, expected).length > 0, "docNumber");
-});
-
-test("a MISSING expected field is a mismatch, not a pass", async () => {
-    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
-    const expected = { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" };
-    // "We could not check" is not "it matches" — QBO omitting the field must
-    // never be read as agreement.
-    for (const returned of [
-        { total: 1500, customerId: null, dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
-        { total: 1500, customerId: "c1", dueDate: null, docNumber: "INV-1-DEP" },
-        { total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: null },
-        { total: Number.NaN, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
-    ]) {
-        assert.ok(reconcileIssuedInvoice(returned, expected).length > 0, JSON.stringify(returned));
-    }
-});
-
-test("no expected due date means QBO's due date is not checked", async () => {
-    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
-    const drift = reconcileIssuedInvoice(
-        { total: 100, customerId: "c1", dueDate: null, docNumber: "PB-1" },
-        { amount: 100, customerId: "c1", dueDate: null, docNumber: "PB-1" },
-    );
-    assert.deepEqual(drift, [], "progress billings carry no due date");
-});
 
 // --- The compensation clock starts when compensation begins ---
 
@@ -1493,8 +1387,6 @@ test("the cleanup window is the SMALLER of its own budget and route headroom", a
     }
 });
 
-// --- A lost claim may be a concurrent WINNER ---
-
 test("losing the claim to a concurrent push that linked the SAME invoice is a success", async () => {
     // Both pushes share one issuance key, so Intuit returns the same invoice to
     // both. Compensating here would delete the winner's invoice and leave the
@@ -1511,57 +1403,6 @@ test("losing the claim to a concurrent push that linked the SAME invoice is a su
 });
 
 // --- Payload hash: same key only when it is the same bill ---
-
-test("a retry whose PAYLOAD changed refuses to reuse the issuance", async () => {
-    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
-    const { model, row } = fakeIssuanceModel();
-    const { key } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
-
-    // Same key, same bill: reuse.
-    const again = await ensureIssuanceKey(model as never, "sched-1", key, HASH_A, row.qbIssuancePayloadHash);
-    assert.equal(again.key, key);
-
-    // Same key, DIFFERENT bill: the invoice Intuit would hand back describes
-    // the old one, so this must not be treated as an ambiguous retry.
-    await assert.rejects(
-        () => ensureIssuanceKey(model as never, "sched-1", key, HASH_B, row.qbIssuancePayloadHash),
-        (e: unknown) => (e as Error).name === "IssuancePayloadChangedError",
-    );
-});
-
-test("a legacy row with no stored hash is still reusable", async () => {
-    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
-    const { model } = fakeIssuanceModel("old-key", null);
-    // Rows minted before the column existed must not be stranded.
-    const { key } = await ensureIssuanceKey(model as never, "sched-1", "old-key", HASH_A, null);
-    assert.equal(key, "old-key");
-});
-
-test("the hash catches changes QBO does not echo back", async () => {
-    const { issuancePayloadHash } = await import("../src/lib/quickbooks-payments");
-    const base = {
-        customerId: "c1", docNumber: "INV-1-1", dueDate: "2026-10-01",
-        lineDescriptions: ["Project — Deposit"], preTaxAmount: 1000, taxAmount: 80,
-        taxCode: "TAX", privateNote: "note",
-    };
-    const h = issuancePayloadHash(base);
-    assert.equal(issuancePayloadHash({ ...base }), h, "same payload, same hash");
-
-    // A cleared due date.
-    assert.notEqual(issuancePayloadHash({ ...base, dueDate: null }), h, "cleared due date");
-    // A description-only edit: same total, QBO echoes nothing useful.
-    assert.notEqual(
-        issuancePayloadHash({ ...base, lineDescriptions: ["Project — Deposit (revised)"] }),
-        h,
-        "description-only change",
-    );
-    // A tax-only change with the SAME grand total (1080 either way).
-    assert.notEqual(
-        issuancePayloadHash({ ...base, preTaxAmount: 1080, taxAmount: 0, taxCode: null }),
-        h,
-        "tax-only change with an identical total",
-    );
-});
 
 // --- A shared 401/403 aborts a sweep ---
 
@@ -1601,92 +1442,7 @@ test("the maintenance sync response reports the RUN, not just the request", asyn
 
 // --- Releasing the issuance after a CONFIRMED delete ---
 
-test("a confirmed compensating delete releases the issuance, CAS-guarded", async () => {
-    const { clearIssuanceIfUnlinked } = await import("../src/lib/quickbooks-payments");
-
-    // The happy path: still unlinked, still our key -> released, so the next
-    // send mints fresh instead of asking Intuit for a deleted invoice.
-    const rows: Record<string, { qbInvoiceId: string | null; qbIssuanceKey: string | null; qbIssuancePayloadHash: string | null }> = {
-        a: { qbInvoiceId: null, qbIssuanceKey: "key-1", qbIssuancePayloadHash: "h" },
-    };
-    const model = {
-        async updateMany({ where, data }: { where: { id: string; qbInvoiceId: null; qbIssuanceKey: string }; data: { qbIssuanceKey: null; qbIssuancePayloadHash: null } }) {
-            const row = rows[where.id];
-            if (!row || row.qbInvoiceId !== null || row.qbIssuanceKey !== where.qbIssuanceKey) return { count: 0 };
-            row.qbIssuanceKey = data.qbIssuanceKey;
-            row.qbIssuancePayloadHash = data.qbIssuancePayloadHash;
-            return { count: 1 };
-        },
-    };
-    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), true);
-    assert.equal(rows.a.qbIssuanceKey, null);
-    assert.equal(rows.a.qbIssuancePayloadHash, null);
-
-    // A concurrent push that already minted a NEW key keeps it — wiping it
-    // would make the next retry create a third invoice.
-    rows.a = { qbInvoiceId: null, qbIssuanceKey: "key-2", qbIssuancePayloadHash: "h2" };
-    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), false);
-    assert.equal(rows.a.qbIssuanceKey, "key-2");
-
-    // A row that got linked in the meantime is left alone.
-    rows.a = { qbInvoiceId: "inv-9", qbIssuanceKey: "key-1", qbIssuancePayloadHash: "h" };
-    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), false);
-    assert.equal(rows.a.qbIssuanceKey, "key-1");
-});
-
 // --- An ambiguous create followed by an edit ---
-
-test("a stranded issuance asks QuickBooks instead of guessing", async () => {
-    const { reconcileStrandedIssuance, QBRemoteStateUnknownError } = await import("../src/lib/quickbooks-payments");
-    const TOKENS_ = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
-    const marker = "ProBuild INV-1 · Deposit";
-
-    const queryReturning = (body: unknown, status = 200) =>
-        (async () => new Response(JSON.stringify(body), {
-            status, headers: { "content-type": "application/json" },
-        })) as unknown as typeof fetch;
-
-    // FOUND: the invoice exists, so it must be linked and parked - never
-    // re-created, which would double-bill.
-    const found = await withFetch(
-        queryReturning({ QueryResponse: { Invoice: [{ Id: "77", PrivateNote: `${marker} · Project` }] } }),
-        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
-    );
-    assert.deepEqual(found, { state: "found", qbInvoiceId: "77" });
-
-    // NOT FOUND: the create never landed, so the issuance is proven unsent and
-    // can be released for a fresh mint.
-    const missing = await withFetch(
-        queryReturning({ QueryResponse: {} }),
-        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
-    );
-    assert.deepEqual(missing, { state: "not-found" });
-
-    // UNREACHABLE is not "not found": guessing either way risks a duplicate
-    // bill or a stranded invoice, so it must refuse and change nothing.
-    const unreachable = await withFetch(
-        queryReturning("busy", 503),
-        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
-    ).then(() => null, (e: unknown) => e as Error);
-    assert.ok(unreachable instanceof QBRemoteStateUnknownError, `got ${unreachable?.name}`);
-});
-
-test("the marker, not the DocNumber alone, identifies our invoice", async () => {
-    const { reconcileStrandedIssuance } = await import("../src/lib/quickbooks-payments");
-    const TOKENS_ = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
-    // Two invoices share the DocNumber (a re-issue); the marker disambiguates.
-    const impl = (async () => new Response(JSON.stringify({
-        QueryResponse: { Invoice: [
-            { Id: "10", PrivateNote: "ProBuild INV-1 · Retainage · Project" },
-            { Id: "11", PrivateNote: "ProBuild INV-1 · Deposit · Project" },
-        ] },
-    }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
-
-    const found = await withFetch(impl, () =>
-        reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker: "ProBuild INV-1 · Deposit" }),
-    );
-    assert.deepEqual(found, { state: "found", qbInvoiceId: "11" });
-});
 
 // --- Cumulative budget across a refresh plus serial calls ---
 
@@ -1704,4 +1460,57 @@ test("a refresh plus N serial calls cannot exceed the route deadline", async () 
     }
     assert.ok(calls < 50, "the sequence stopped itself");
     assert.ok(remainingBudgetMs(deadline) <= 1_000, "never more budget than was granted");
+});
+
+// --- Fail closed on an ambiguous invoice create ---
+
+test("only an UNKNOWN outcome parks the row; a business refusal does not", async () => {
+    const { isAmbiguousCreateFailure } = await import("../src/lib/quickbooks-payments");
+    const { QBTimeoutError, QboRetryableError, QboHttpError } = await import("../src/lib/quickbooks");
+
+    // The request went out and we never learned the result, so an invoice may
+    // exist. Re-sending blindly would bill the client twice.
+    assert.equal(isAmbiguousCreateFailure(new QBTimeoutError("timed out")), true);
+    assert.equal(isAmbiguousCreateFailure(new QboRetryableError("reset", 503)), true);
+
+    // QuickBooks answered "no" and created nothing — not ambiguous, and
+    // parking it would strand a milestone that is perfectly re-sendable.
+    assert.equal(isAmbiguousCreateFailure(new QboHttpError("bad ref", 400)), false);
+    assert.equal(isAmbiguousCreateFailure(new QboHttpError("forbidden", 403)), false);
+    assert.equal(isAmbiguousCreateFailure(new Error("something else")), false);
+});
+
+test("a parked row refuses the next send, and unlinking releases it", async () => {
+    const { AMBIGUOUS_CREATE_MARKER, QBAmbiguousCreateError } = await import("../src/lib/quickbooks-payments");
+    assert.equal(AMBIGUOUS_CREATE_MARKER, "ambiguous-create");
+
+    // Mirrors the guard at the top of the push / stage paths.
+    const refuseIfParked = (qbSyncError: string | null, code: string) => {
+        if (qbSyncError === AMBIGUOUS_CREATE_MARKER) throw new QBAmbiguousCreateError(code);
+        return "proceeds";
+    };
+
+    // Timeout -> parked -> the SECOND send is refused rather than duplicating.
+    assert.throws(
+        () => refuseIfParked(AMBIGUOUS_CREATE_MARKER, "INV-1"),
+        (e: unknown) => (e as Error).name === "QBAmbiguousCreateError",
+    );
+    // The message has to tell the operator what to actually do.
+    const error = new QBAmbiguousCreateError("INV-1");
+    assert.match(error.message, /Check QuickBooks/);
+    assert.match(error.message, /clear the QuickBooks link/);
+
+    // claimQBInvoiceUnlink nulls qbSyncError, so a cleared row proceeds again.
+    assert.equal(refuseIfParked(null, "INV-1"), "proceeds");
+    // An unrelated sync error must not block a send.
+    assert.equal(refuseIfParked("voided", "INV-1"), "proceeds");
+});
+
+test("the unlink write clears the marker", async () => {
+    // The documented release path: unlink already nulls qbSyncError, so no new
+    // column or UI is needed to un-park a milestone.
+    const src = await import("node:fs").then(fs =>
+        fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const unlinkWrite = src.slice(src.indexOf("export async function claimQBInvoiceUnlink"));
+    assert.match(unlinkWrite.slice(0, 1600), /qbSyncError: null/);
 });

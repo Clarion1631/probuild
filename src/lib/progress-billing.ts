@@ -35,11 +35,10 @@ import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "./quickbooks";
 import {
-    ensureIssuanceKey,
-    clearIssuanceIfUnlinked,
-    issuancePayloadHash,
-    reconcileIssuedInvoice,
     compensationWindowMs,
+    isAmbiguousCreateFailure,
+    AMBIGUOUS_CREATE_MARKER,
+    QBAmbiguousCreateError,
     MILESTONE_PUSH_BUDGET_MS,
 } from "./quickbooks-payments";
 
@@ -643,57 +642,43 @@ export async function stageProgressBillingToQuickBooksCore(
     const stageDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS);
     const tokens = await getFreshQBTokens(stageDeadline);
     const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, stageDeadline);
-    const billingPayloadHash = issuancePayloadHash({
-        customerId,
-        docNumber: billing.code,
-        dueDate: null,
-        lineDescriptions: [billing.description],
-        preTaxAmount: toNum(billing.subtotal),
-        taxAmount: toNum(billing.taxAmount),
-        taxCode: toNum(billing.taxAmount) > 0 ? "TAX" : null,
-        privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
-    });
-    const { key: issuanceKey } = await ensureIssuanceKey(
-        prisma.progressBilling as never,
-        billing.id,
-        billing.qbIssuanceKey ?? null,
-        billingPayloadHash,
-        billing.qbIssuancePayloadHash ?? null,
-    );
 
     const subtotal = toNum(billing.subtotal);
     const taxAmount = toNum(billing.taxAmount);
     const total = toNum(billing.total);
 
-    const created = await createQBMilestoneInvoice(tokens, {
-        docNumber: billing.code,
-        // Per-ISSUANCE, so a re-stage after an unlink gets a new invoice.
-        idempotencyKey: issuanceKey,
-        customerId,
-        itemId,
-        description: billing.description,
-        amount: total,
-        tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
-        billEmail: invoice.client?.email || null,
-        privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
-    }, stageDeadline);
+    // Fail closed, same rule as the milestone push: a previous attempt may
+    // already have created this invoice in QuickBooks.
+    if (billing.qbSyncError === AMBIGUOUS_CREATE_MARKER) {
+        throw new QBAmbiguousCreateError(billing.code);
+    }
+
+    let created: Awaited<ReturnType<typeof createQBMilestoneInvoice>>;
+    try {
+        created = await createQBMilestoneInvoice(tokens, {
+            docNumber: billing.code,
+            customerId,
+            itemId,
+            description: billing.description,
+            amount: total,
+            tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
+            billEmail: invoice.client?.email || null,
+            privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
+        }, stageDeadline);
+    } catch (error) {
+        if (isAmbiguousCreateFailure(error)) {
+            // Outcome unknown: the request may have created a real invoice.
+            // Park it so the next stage refuses rather than double-billing.
+            await prisma.progressBilling.updateMany({
+                where: { id: billing.id, qbInvoiceId: null },
+                data: { qbSyncError: AMBIGUOUS_CREATE_MARKER },
+            }).catch(() => {});
+            throw new QBAmbiguousCreateError(billing.code);
+        }
+        throw error;
+    }
 
     const qbId = created.qbId;
-    // Same reconciliation as the milestone push: on an ambiguous retry Intuit
-    // returns the invoice it created FIRST, which may predate an edit.
-    const drift = reconcileIssuedInvoice(created, {
-        amount: total,
-        customerId,
-        dueDate: null,
-        docNumber: billing.code,
-    });
-    if (drift.length > 0) {
-        console.error(`[progress-billing] invoice drift on ${billing.code} (QBO id ${qbId}): ${drift.join("; ")}`);
-        throw new Error(
-            `QuickBooks returned an invoice that no longer matches this billing (${drift.join("; ")}). ` +
-            `Review QuickBooks invoice ${billing.code} (id ${qbId}) before retrying.`,
-        );
-    }
 
     try {
         const payLink = await getQBInvoicePaymentLink(tokens, qbId, stageDeadline);
@@ -739,12 +724,6 @@ export async function stageProgressBillingToQuickBooksCore(
         // when compensation begins, capped by the route's real headroom.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(stageDeadline)));
         const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
-        if (compensated) {
-            // Provably gone: release the identity so the next stage mints a
-            // fresh key instead of asking Intuit for a deleted invoice.
-            // CAS-guarded so a concurrent stage keeps its own key.
-            await clearIssuanceIfUnlinked(prisma.progressBilling as never, billing.id, issuanceKey);
-        }
         if (!compensated) {
             throw new Error(
                 `Staging this billing's QuickBooks invoice failed (${err instanceof Error ? err.message : String(err)}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`

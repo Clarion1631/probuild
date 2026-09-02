@@ -25,12 +25,12 @@ import {
     isQBBudgetExhaustedError,
     createRouteDeadline,
     remainingBudgetMs,
-    qboRequestId,
     isBudgetExhausted,
     type RouteDeadline,
     qbQuery,
     escapeQBString,
     isQboConnectionFailure,
+    isRetryableQboError,
     isQboMalformedResponseError,
     qboHttpStatus,
     QBTokenStrandedError,
@@ -193,13 +193,10 @@ export async function claimQBInvoiceUnlink(
             // payment request was emailed (the portal's "due" marker), which stays
             // true even when the QBO invoice behind it is voided and re-staged.
             qbSyncedAt: null,
+            // Also clears the ambiguous-create marker: unlinking is the
+            // documented way to release a milestone parked by an unknown-outcome
+            // create, once a human has checked QuickBooks.
             qbSyncError: null,
-            // Cleared so the NEXT send mints a fresh issuance key and gets a
-            // genuinely new invoice. Keeping it would make the re-send an
-            // "ambiguous retry" of a link that no longer exists, and Intuit
-            // would hand back the invoice we just unlinked.
-            qbIssuanceKey: null,
-            qbIssuancePayloadHash: null,
         },
     });
     return cleared.count === 1;
@@ -242,6 +239,36 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
+/**
+ * Parked on a milestone whose QuickBooks invoice create ended with an UNKNOWN
+ * outcome — a timeout, or a transport failure after the request went out.
+ *
+ * The request may well have created a real, collectible invoice. Re-sending
+ * blindly would bill the client twice, so the row is marked and the send path
+ * refuses until a human has looked in QuickBooks. Clearing it is the existing
+ * unlink flow, which already nulls qbSyncError.
+ */
+export const AMBIGUOUS_CREATE_MARKER = "ambiguous-create";
+
+/** Raised when a send is refused because a previous attempt's outcome is unknown. */
+export class QBAmbiguousCreateError extends Error {
+    name = "QBAmbiguousCreateError";
+    constructor(docNumberOrCode: string) {
+        super(
+            `A previous QuickBooks send for ${docNumberOrCode} ended without a confirmed result, so it may already exist there. ` +
+            `Check QuickBooks: if an invoice was created, keep it; if not, clear the QuickBooks link in ProBuild and send again.`,
+        );
+    }
+}
+
+/** Did this failure leave the create's outcome genuinely unknown? */
+export function isAmbiguousCreateFailure(error: unknown): boolean {
+    // A timeout or a dead connection means the request may have landed. A
+    // business refusal (4xx) means QuickBooks answered "no" and created
+    // nothing, so that is NOT ambiguous and must not park the row.
+    return isQBTimeoutError(error) || isRetryableQboError(error);
+}
+
 /** Reserved for the compensating delete, independent of the push's own budget. */
 export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
 /**
@@ -284,191 +311,6 @@ export function compensationWindowMs(routeRemainingMs: number): number {
  * The CAS write is what makes it safe under concurrency: two pushes racing the
  * same milestone cannot mint two keys, so they cannot create two invoices.
  */
-/**
- * Canonical hash of what we are asking QuickBooks to bill.
- *
- * Field equality on the RETURNED invoice catches drift QBO echoes back, but
- * QBO does not echo everything: a line description edit, or a tax split that
- * keeps the same grand total, come back looking identical. Hashing the payload
- * we SENT closes that: same key + same hash is genuinely the same bill; same
- * key + different hash means the milestone changed under an ambiguous retry.
- *
- * Ordering is fixed and nulls are explicit, so "no due date" hashes
- * differently from "due date removed since" only when it actually differs.
- */
-export function issuancePayloadHash(payload: {
-    customerId: string;
-    docNumber: string;
-    dueDate: string | null;
-    lineDescriptions: string[];
-    preTaxAmount: number;
-    taxAmount: number;
-    taxCode: string | null;
-    privateNote: string | null;
-}): string {
-    const canonical = JSON.stringify([
-        ["customerId", payload.customerId],
-        ["docNumber", payload.docNumber],
-        ["dueDate", payload.dueDate],
-        ["lineDescriptions", payload.lineDescriptions],
-        ["preTaxAmount", Number(payload.preTaxAmount).toFixed(2)],
-        ["taxAmount", Number(payload.taxAmount).toFixed(2)],
-        ["taxCode", payload.taxCode],
-        ["privateNote", payload.privateNote],
-    ]);
-    return createHash("sha256").update(canonical).digest("hex");
-}
-
-/**
- * True when a stored issuance can be reused for this payload. A stored hash
- * that differs means the bill changed; a MISSING stored hash (a row minted
- * before this column existed) is treated as reusable — refusing every legacy
- * row would strand them.
- */
-export function issuanceMatchesPayload(storedHash: string | null, currentHash: string): boolean {
-    if (!storedHash) return true;
-    return storedHash === currentHash;
-}
-
-export async function ensureIssuanceKey(
-    model: { findUnique: Function; updateMany: Function },
-    id: string,
-    existing: string | null,
-    payloadHash: string,
-    storedHash: string | null = null,
-): Promise<{ key: string; reused: boolean }> {
-    if (existing) {
-        // An ambiguous retry. Reuse ONLY if it is still the same bill — a
-        // stored hash that differs means the milestone changed under us, and
-        // the invoice Intuit would hand back describes the old one.
-        if (!issuanceMatchesPayload(storedHash, payloadHash)) {
-            throw new IssuancePayloadChangedError(id);
-        }
-        return { key: existing, reused: true };
-    }
-    const minted = qboRequestId(`${id}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
-    const claimed = await model.updateMany({
-        where: { id, qbIssuanceKey: null },
-        data: { qbIssuanceKey: minted, qbIssuancePayloadHash: payloadHash },
-    });
-    if (claimed.count === 1) return { key: minted, reused: false };
-    // Someone else minted first; use theirs so both attempts share one key —
-    // but only if they were billing the same thing.
-    const row = await model.findUnique({
-        where: { id },
-        select: { qbIssuanceKey: true, qbIssuancePayloadHash: true },
-    });
-    if (!row?.qbIssuanceKey) return { key: minted, reused: false };
-    if (!issuanceMatchesPayload(row.qbIssuancePayloadHash ?? null, payloadHash)) {
-        throw new IssuancePayloadChangedError(id);
-    }
-    return { key: row.qbIssuanceKey, reused: true };
-}
-
-/** QuickBooks could not be reached, so remote state is unknown and nothing was changed. */
-export class QBRemoteStateUnknownError extends Error {
-    name = "QBRemoteStateUnknownError";
-    constructor(detail: string) {
-        super(`QuickBooks could not be reached to confirm the invoice state (${detail}); nothing was changed. Try again once QuickBooks responds.`);
-    }
-}
-
-/**
- * Clear the issuance identity, but only if the row is still the one we staged.
- *
- * Called after a CONFIRMED delete/void. The CAS matters: without it, a
- * concurrent push that had already minted a fresh key and created a new
- * invoice would have its identity wiped by this cleanup, and the next retry
- * would create a THIRD invoice.
- */
-export async function clearIssuanceIfUnlinked(
-    model: { updateMany: Function },
-    id: string,
-    expectedKey: string | null,
-): Promise<boolean> {
-    if (!expectedKey) return false;
-    const cleared = await model.updateMany({
-        where: { id, qbInvoiceId: null, qbIssuanceKey: expectedKey },
-        data: { qbIssuanceKey: null, qbIssuancePayloadHash: null },
-    });
-    return cleared.count === 1;
-}
-
-/**
- * An issuance whose payload changed while its invoice state is unknown.
- *
- * The dangerous shape: an ambiguous create (request landed, response lost)
- * followed by an edit. The stored key says "an invoice may exist"; the changed
- * hash says "but not for this bill". Minting blindly could double-bill;
- * reusing blindly could link an invoice describing the old amount. So ASK
- * QuickBooks whether the invoice exists.
- *
- *  - found     -> link it and let the normal drift check park it for a human
- *  - not found -> the issuance is proven unsent; clear it and mint fresh
- *  - unknown   -> refuse, change nothing
- */
-export async function reconcileStrandedIssuance(
-    tokens: QBTokens,
-    args: { docNumber: string; marker: string },
-    deadline?: RouteDeadline,
-): Promise<{ state: "found"; qbInvoiceId: string } | { state: "not-found" }> {
-    let rows: Array<{ Id?: string; PrivateNote?: string }>;
-    try {
-        rows = await qbQuery<{ Id?: string; PrivateNote?: string }>(
-            tokens,
-            `SELECT Id, PrivateNote FROM Invoice WHERE DocNumber = '${escapeQBString(args.docNumber)}'`,
-            deadline,
-        );
-    } catch (error) {
-        // Unknown is NOT "not found". Guessing either way risks a duplicate
-        // bill or a stranded invoice, so change nothing and say so.
-        throw new QBRemoteStateUnknownError(error instanceof Error ? error.name : "query failed");
-    }
-    // DocNumber alone can collide across re-issues; the private-note marker is
-    // what proves this invoice is the one this issuance created.
-    const mine = rows.find(row => (row.PrivateNote ?? "").includes(args.marker)) ?? rows[0];
-    if (mine?.Id) return { state: "found", qbInvoiceId: String(mine.Id) };
-    return { state: "not-found" };
-}
-
-/** The stored issuance describes a different bill than the one being sent now. */
-export class IssuancePayloadChangedError extends Error {
-    name = "IssuancePayloadChangedError";
-    constructor(id: string) {
-        super(`The billing details changed since this QuickBooks invoice was first staged (${id}); re-issue instead of retrying.`);
-    }
-}
-
-/**
- * Does what QuickBooks returned still describe the thing we meant to bill?
- *
- * On an ambiguous retry Intuit hands back the invoice it created the FIRST
- * time, which may predate an edit or a reorder. Every expected field must be
- * present AND equal — a MISSING field is a mismatch, not a pass, because "we
- * could not check" is not "it matches".
- */
-export function reconcileIssuedInvoice(
-    returned: { total: number; customerId: string | null; dueDate: string | null; docNumber: string | null },
-    expected: { amount: number; customerId: string; dueDate: string | null; docNumber: string },
-): string[] {
-    const drift: string[] = [];
-    if (!Number.isFinite(returned.total) || Math.abs(returned.total - expected.amount) > 0.05) {
-        drift.push(`amount ProBuild ${expected.amount} vs QBO ${returned.total}`);
-    }
-    if (!returned.customerId || returned.customerId !== expected.customerId) {
-        drift.push(`customer ProBuild ${expected.customerId} vs QBO ${returned.customerId ?? "missing"}`);
-    }
-    if (!returned.docNumber || returned.docNumber !== expected.docNumber) {
-        drift.push(`docNumber ProBuild ${expected.docNumber} vs QBO ${returned.docNumber ?? "missing"}`);
-    }
-    if (expected.dueDate) {
-        if (!returned.dueDate || returned.dueDate !== expected.dueDate) {
-            drift.push(`due date ProBuild ${expected.dueDate} vs QBO ${returned.dueDate ?? "missing"}`);
-        }
-    }
-    return drift;
-}
-
 export async function pushMilestoneToQuickBooks(
     paymentScheduleId: string,
     passedTokens?: QBTokens,
@@ -536,6 +378,11 @@ export async function pushMilestoneToQuickBooks(
         return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
     }
 
+    // Fail closed: a previous attempt may already have created the invoice.
+    if (schedule.qbSyncError === AMBIGUOUS_CREATE_MARKER) {
+        throw new QBAmbiguousCreateError(schedule.invoice.code);
+    }
+
     const invoice = schedule.invoice;
     const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, pushDeadline);
 
@@ -565,124 +412,48 @@ export async function pushMilestoneToQuickBooks(
 
     const description = `${projectName} — ${schedule.name}`;
     const privateNote = `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`;
-    // Hashed BEFORE the create, from what we are about to send — a retry that
-    // hashes differently is billing something else and must not reuse the key.
-    const payloadHash = issuancePayloadHash({
-        customerId,
-        docNumber,
-        dueDate: schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null,
-        lineDescriptions: [description],
-        preTaxAmount: tax ? tax.preTaxAmount : amount,
-        taxAmount: tax ? tax.taxAmount : 0,
-        taxCode: tax ? "TAX" : null,
-        privateNote,
-    });
-    const privateNoteMarker = `ProBuild ${invoice.code} · ${schedule.name}`;
-    let issuanceKey: string;
+    let created: Awaited<ReturnType<typeof createQBMilestoneInvoice>>;
     try {
-        ({ key: issuanceKey } = await ensureIssuanceKey(
-            prisma.paymentSchedule as never,
-            schedule.id,
-            schedule.qbIssuanceKey ?? null,
-            payloadHash,
-            schedule.qbIssuancePayloadHash ?? null,
-        ));
+        created = await createQBMilestoneInvoice(tokens, {
+            docNumber,
+            customerId,
+            itemId,
+            description,
+            amount,
+            tax,
+            dueDate: schedule.dueDate,
+            billEmail: invoice.client?.email || null,
+            privateNote,
+        }, pushDeadline);
     } catch (error) {
-        if (!(error instanceof IssuancePayloadChangedError)) throw error;
-        // An ambiguous create followed by an edit: the stored key says an
-        // invoice MAY exist, the changed hash says it is not for this bill.
-        // Minting blindly could double-bill; reusing blindly could link an
-        // invoice describing the old amount. Ask QuickBooks which it is.
-        const remote = await reconcileStrandedIssuance(
-            tokens,
-            { docNumber, marker: privateNoteMarker },
-            pushDeadline,
-        );
-        if (remote.state === "found") {
-            // It exists. Link it so it is never orphaned, then let the normal
-            // drift check park it for a human — it bills the OLD amount.
+        if (isAmbiguousCreateFailure(error)) {
+            // The request went out and we never learned the outcome. Mark the
+            // row so the next send refuses rather than risking a duplicate
+            // bill, and tell the operator where to look.
             await prisma.paymentSchedule.updateMany({
                 where: { id: schedule.id, qbInvoiceId: null },
-                data: { qbInvoiceId: remote.qbInvoiceId, qbSyncError: "invoice-drift" },
-            });
+                data: { qbSyncError: AMBIGUOUS_CREATE_MARKER },
+            }).catch(() => {});
             await logAutomationEvent({
                 kind: "qbo-payments-sync",
                 status: "error",
-                reason: "invoice-drift",
+                reason: AMBIGUOUS_CREATE_MARKER,
                 source: "milestone-push",
                 docNumber,
-                detail: { paymentScheduleId: schedule.id, qbInvoiceId: remote.qbInvoiceId, cause: "stranded-issuance" },
+                detail: { paymentScheduleId: schedule.id, error: error instanceof Error ? error.name : "unknown" },
             });
-            throw new Error(
-                `QuickBooks already holds invoice ${docNumber} (id ${remote.qbInvoiceId}) from an earlier attempt, and this milestone has changed since. ` +
-                `Review it in QuickBooks before re-sending.`,
-            );
+            throw new QBAmbiguousCreateError(docNumber);
         }
-        // Proven unsent: clear the stale identity and mint fresh.
-        await clearIssuanceIfUnlinked(
-            prisma.paymentSchedule as never,
-            schedule.id,
-            schedule.qbIssuanceKey ?? null,
-        );
-        ({ key: issuanceKey } = await ensureIssuanceKey(
-            prisma.paymentSchedule as never,
-            schedule.id,
-            null,
-            payloadHash,
-            null,
-        ));
+        throw error;
     }
-
-    const created = await createQBMilestoneInvoice(tokens, {
-        docNumber,
-        // Per-ISSUANCE, not per-row: an unlink clears it so the next send mints
-        // a new one and gets a genuinely new invoice.
-        idempotencyKey: issuanceKey,
-        customerId,
-        itemId,
-        description,
-        amount,
-        tax,
-        dueDate: schedule.dueDate,
-        billEmail: invoice.client?.email || null,
-        privateNote,
-    }, pushDeadline);
 
     const { qbId, total } = created;
 
-    // The requestid makes a retry safe from DUPLICATION, not from DRIFT: on an
-    // ambiguous retry Intuit returns the invoice it created the FIRST time, and
-    // the milestone may have been edited or reordered since. Linking that
-    // silently would bill the client the old amount, or attach an invoice made
-    // for a different customer. Reconcile before linking; park on a mismatch.
-    const driftReasons = reconcileIssuedInvoice(created, {
-        amount,
-        customerId,
-        dueDate: schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null,
-        docNumber,
-    });
-    if (driftReasons.length > 0) {
-        // Deliberately NOT deleted: it may be a real invoice a client has
-        // already seen. Flag the milestone so a human reconciles it.
-        console.error(
-            `[quickbooks-payments] invoice drift on ${docNumber} (QBO id ${qbId}): ${driftReasons.join("; ")}`,
-        );
-        await prisma.paymentSchedule.updateMany({
-            where: { id: schedule.id, qbInvoiceId: null },
-            data: { qbSyncError: "invoice-drift" },
-        }).catch(() => {});
-        await logAutomationEvent({
-            kind: "qbo-payments-sync",
-            status: "error",
-            reason: "invoice-drift",
-            source: "milestone-push",
-            docNumber,
-            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, drift: driftReasons },
-        });
-        throw new Error(
-            `QuickBooks returned an invoice that no longer matches this milestone (${driftReasons.join("; ")}). ` +
-            `Review QuickBooks invoice ${docNumber} (id ${qbId}) before retrying.`,
-        );
+    // QBO Automated Sales Tax can recalculate on top of what we send — verify
+    // the grand total still equals the milestone. A drift means the client
+    // would be asked for a different amount than ProBuild expects.
+    if (Math.abs(total - amount) > 0.05) {
+        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
     }
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
@@ -727,19 +498,6 @@ export async function pushMilestoneToQuickBooks(
         });
     }));
     if (linked.count !== 1) {
-        // Losing the claim does not prove the milestone changed. The commonest
-        // cause is a CONCURRENT push that linked this very invoice first —
-        // both attempts share one issuance key, so Intuit returned the same
-        // invoice to both. Deleting it here would tear down the winner's work
-        // and leave the milestone pointing at a QBO invoice that no longer
-        // exists. Re-read before compensating.
-        const current = await prisma.paymentSchedule.findUnique({
-            where: { id: schedule.id },
-            select: { qbInvoiceId: true, qbInvoiceLink: true },
-        });
-        if (current?.qbInvoiceId === qbId) {
-            return { qbInvoiceId: qbId, payLink: current.qbInvoiceLink ?? payLink, qbTotal: total };
-        }
         // The compensation clock starts HERE, when compensation begins — not at
         // entry, where it would have been ticking down through every call that
         // preceded it and could already be spent by the time it is needed. It
@@ -747,13 +505,6 @@ export async function pushMilestoneToQuickBooks(
         // overrun the platform ceiling: reserve whichever is smaller.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
         const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
-        if (compensated) {
-            // The invoice is provably gone, so the identity that produced it
-            // must be released or the next send would reuse the key and ask
-            // Intuit for an invoice that no longer exists. CAS-guarded: a
-            // concurrent push that already minted a fresh key keeps it.
-            await clearIssuanceIfUnlinked(prisma.paymentSchedule as never, schedule.id, issuanceKey);
-        }
         if (!compensated) {
             // Even the reserved budget is gone (or the delete was refused).
             // Record the orphan durably so the maintenance sweep can resolve

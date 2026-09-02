@@ -542,55 +542,6 @@ test("an ordinary error body is still read into the message", async () => {
 });
 
 
-// --- The milestone invoice create is idempotent ---
-
-test("createQBMilestoneInvoice sends a stable requestid so a retry cannot double-bill", async () => {
-    const { createQBMilestoneInvoice, qboRequestId } = await import("../src/lib/quickbooks");
-    const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
-    // Codex gate: without a requestid, an ambiguous timeout (the request landed,
-    // the response did not) left the caller to retry and create a SECOND
-    // invoice for the same milestone - a duplicate bill to a client.
-    const urls: string[] = [];
-    const impl = (async (url: string) => {
-        urls.push(String(url));
-        return new Response(JSON.stringify({ Invoice: { Id: "inv-1", TotalAmt: 500, CustomerRef: { value: "c1" } } }), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-        });
-    }) as unknown as typeof fetch;
-
-    const args = {
-        docNumber: "INV-00123-DEP",
-        idempotencyKey: "sched-abc123",
-        customerId: "c1",
-        itemId: "i1",
-        description: "Deposit",
-        amount: 500,
-        dueDate: null,
-        billEmail: null,
-        privateNote: "note",
-    };
-
-    const original = globalThis.fetch;
-    globalThis.fetch = impl;
-    try {
-        await createQBMilestoneInvoice(TOKENS, args);
-        await createQBMilestoneInvoice(TOKENS, args); // the retry
-    } finally {
-        globalThis.fetch = original;
-    }
-
-    const expected = qboRequestId(`milestone-invoice:${args.idempotencyKey}`);
-    assert.equal(urls.length, 2);
-    for (const url of urls) {
-        assert.match(url, /requestid=/, `no requestid on ${url}`);
-        assert.ok(url.includes(expected), "the SAME key both times, so Intuit returns the original");
-    }
-    // Keyed on the IMMUTABLE schedule id: renaming the milestone (which
-    // changes DocNumber) must not mint a new key and create a second invoice.
-    assert.equal(qboRequestId(`milestone-invoice:${args.idempotencyKey}`), expected);
-    assert.notEqual(qboRequestId("milestone-invoice:sched-different"), expected);
-});
 
 
 
@@ -621,24 +572,3 @@ test("a 200 with no usable Invoice is ambiguous and retryable, never a silent li
     }
 });
 
-test("a well-formed invoice returns what QBO actually holds, for reconciliation", async () => {
-    const { createQBMilestoneInvoice } = await import("../src/lib/quickbooks");
-    const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
-    const original = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-        Invoice: { Id: "42", TotalAmt: 1500.5, CustomerRef: { value: "cust-9" }, DueDate: "2026-10-01", DocNumber: "INV-9" },
-    }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
-    try {
-        const created = await createQBMilestoneInvoice(TOKENS, {
-            docNumber: "INV-9", idempotencyKey: "sched-9", customerId: "cust-9", itemId: "i1",
-            description: "d", amount: 1500.5, dueDate: null, billEmail: null, privateNote: "n",
-        });
-        // The caller compares these against the milestone before linking.
-        assert.equal(created.qbId, "42");
-        assert.equal(created.total, 1500.5);
-        assert.equal(created.customerId, "cust-9");
-        assert.equal(created.dueDate, "2026-10-01");
-    } finally {
-        globalThis.fetch = original;
-    }
-});

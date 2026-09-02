@@ -9,7 +9,6 @@ import {
     getMockQboInvoice,
     mockSendQBPaymentCreate,
 } from "./quickbooks-mock";
-import { createHash } from "node:crypto";
 import { isEstimateSectionRow } from "./estimate-item-payload";
 
 export const QB_API_BASE = process.env.QB_SANDBOX === "true"
@@ -830,28 +829,10 @@ export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDead
  * Create a QBO invoice for ONE payment milestone, with QuickBooks Payments
  * (card + ACH) enabled so the customer gets Intuit's hosted "Review & Pay" page.
  */
-/**
- * QBO's create-request idempotency key: a stable hash of the caller's own
- * identifier, capped at QBO's 50-char requestid limit. Same pattern the receipt
- * push uses. Sending the SAME requestid twice makes Intuit return the original
- * object instead of creating a second one.
- */
-export function qboRequestId(seed: string): string {
-    return createHash("sha256").update(seed).digest("hex").slice(0, 50);
-}
-
 export async function createQBMilestoneInvoice(
     tokens: QBTokens,
     input: {
         docNumber: string; // ≤ 21 chars
-        /**
-         * IMMUTABLE identity for the idempotency key — the PaymentSchedule id.
-         * DocNumber is derived from editable content (invoice code, milestone
-         * name), so keying on it meant a rename produced a NEW key and the
-         * retry created a second invoice: exactly the duplicate this exists to
-         * prevent.
-         */
-        idempotencyKey: string;
         customerId: string;
         itemId: string;
         description: string;
@@ -865,14 +846,7 @@ export async function createQBMilestoneInvoice(
         privateNote?: string;
     },
     deadline?: RouteDeadline,
-): Promise<{
-    qbId: string;
-    qbUrl: string;
-    total: number;
-    customerId: string | null;
-    dueDate: string | null;
-    docNumber: string | null;
-}> {
+): Promise<{ qbId: string; qbUrl: string; total: number }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
@@ -905,12 +879,7 @@ export async function createQBMilestoneInvoice(
         ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
     };
 
-    // A stable requestid, keyed on the milestone's DocNumber. Without it an
-    // ambiguous timeout — the request landed, the response did not — left the
-    // caller to retry and create a SECOND invoice for the same milestone, which
-    // is a duplicate bill to a client. With it, Intuit returns the original.
-    const requestId = qboRequestId(`milestone-invoice:${input.idempotencyKey}`);
-    const res = await qbFetch(`/invoice?requestid=${encodeURIComponent(requestId)}`, tokens, {
+    const res = await qbFetch("/invoice", tokens, {
         method: "POST",
         body: JSON.stringify(payload),
         qbDeadline: deadline,
@@ -928,16 +897,7 @@ export async function createQBMilestoneInvoice(
     if (!qbId || !Number.isFinite(total)) {
         throw new QboRetryableError("QB milestone invoice create returned no usable Invoice");
     }
-    return {
-        qbId,
-        qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`,
-        total,
-        // What QBO actually holds, so an ambiguous-retry hit can be reconciled
-        // against the milestone before anything is linked.
-        customerId: invoice?.CustomerRef?.value ? String(invoice.CustomerRef.value) : null,
-        dueDate: typeof invoice?.DueDate === "string" ? invoice.DueDate : null,
-        docNumber: typeof invoice?.DocNumber === "string" ? invoice.DocNumber : null,
-    };
+    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
 }
 
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
