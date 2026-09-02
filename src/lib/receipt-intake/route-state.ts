@@ -161,3 +161,50 @@ export function backoffMs(attempts: number): number {
     if (attempts === 3) return 60 * 60_000;
     return 6 * 60 * 60_000;
 }
+
+/**
+ * Which parked rows the Receipts tab's "Retry now" may resend, and where each
+ * goes back to. PURE, so the rule is one testable statement rather than a
+ * condition duplicated between the button and the action.
+ *
+ * The list is deliberately CLOSED. Most NEEDS_REVIEW reasons are verdicts about
+ * the DOCUMENT — `multi-doc`, `no-estimate`, `weak-dup:<id>`,
+ * `strong-dup-amount-mismatch:<id>`, `refund-or-zero` — and retrying one of
+ * those just parks it again with the same reason while spending an attempt and
+ * a QuickBooks round trip. Only reasons that describe a TRANSIENT FAILURE of
+ * something other than the document are retryable.
+ *
+ * Where a row resumes matters as much as whether it may:
+ *   - `ai-unavailable` and `file-missing` failed BEFORE the read, so they go
+ *     back to RECEIVED and get read again. Sending them to BOOKING would book a
+ *     row whose vendor/total were never extracted.
+ *   - `qbo-timeout` / `qbo-5xx` / `max-retries` failed at the SEND, with the
+ *     read already done, so they resume at BOOKING.
+ */
+export type RetryTarget = "RECEIVED" | "BOOKING";
+
+const RETRYABLE_REASONS: Array<{ test: RegExp; target: RetryTarget }> = [
+    // Gemini was down. The document was never read, so re-read it.
+    { test: /^ai-unavailable$/, target: "RECEIVED" },
+    // The upload never landed in the bucket; a human has since re-uploaded it.
+    { test: /^file-missing$/, target: "RECEIVED" },
+    // Transport-class QuickBooks failures, and the row that exhausted its
+    // budget of them. The read is done; resume at the send.
+    { test: /^qbo-timeout$/, target: "BOOKING" },
+    { test: /^qbo-5xx$/, target: "BOOKING" },
+    { test: /^qbo-fault:(?:429|5\d\d|timeout)$/i, target: "BOOKING" },
+    { test: /^max-retries$/, target: "BOOKING" },
+];
+
+/**
+ * Where a manual retry should send this row, or null when it may not be
+ * retried at all. A BOOKING row is always retryable — it is mid-flight, not
+ * parked on a verdict.
+ */
+export function retryTargetFor(state: string, stateReason: string | null): RetryTarget | null {
+    if (state === "BOOKING") return "BOOKING";
+    if (state !== "NEEDS_REVIEW") return null;
+    const reason = (stateReason ?? "").trim();
+    if (!reason) return null;
+    return RETRYABLE_REASONS.find(rule => rule.test.test(reason))?.target ?? null;
+}

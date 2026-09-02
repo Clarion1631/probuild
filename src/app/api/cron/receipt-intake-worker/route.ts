@@ -703,6 +703,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),
             downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
             logEvent: logAutomationEvent,
+            // The last read before money moves — see BookDependencies.readState.
+            readState: async rowId => {
+                const current = await prisma.receiptIntake.findUnique({ where: { id: rowId }, select: { state: true } });
+                return current?.state ?? null;
+            },
             now: () => new Date(),
         }),
 

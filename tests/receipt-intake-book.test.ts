@@ -147,6 +147,10 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         }) as any,
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         logEvent: async (event) => { events.push(event); },
+        // The pre-send re-read (Codex blocker 5). The default says "still
+        // BOOKING", i.e. nobody touched the row; a test that wants the abort
+        // path overrides it.
+        readState: async () => "BOOKING",
         now: () => NOW,
         companyTimeZone: async () => "America/Los_Angeles",
         isCostCodeAllowed: async () => true,
@@ -583,6 +587,32 @@ test("the receipt bytes always ride along with the Purchase", async () => {
     await bookReceipt(row(), r.deps);
     assert.equal(r.purchaseCalls[0].fileBase64, Buffer.from("bytes").toString("base64"));
     assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
+test("a void between the claim and the send ABORTS — QBO is never called", async () => {
+    // Everything before the send takes real time (a project lookup, a file
+    // download), and a human on the Receipts tab can void the row in that
+    // window. QBO is read-only from here: a Purchase created for a cancelled
+    // receipt cannot be taken back.
+    const { deps, purchaseCalls, intakeUpdates } = recorder({ readState: async () => "VOID" });
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "aborted");
+    assert.match((result as { reason: string }).reason, /state-changed:VOID/);
+    assert.deepEqual(purchaseCalls, [], "nothing was sent");
+    assert.deepEqual(intakeUpdates, [], "and nothing overwrote the human's decision");
+});
+
+test("a row that vanished mid-flight also aborts rather than booking", async () => {
+    const { deps, purchaseCalls } = recorder({ readState: async () => null });
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "aborted");
+    assert.match((result as { reason: string }).reason, /state-changed:missing/);
+    assert.deepEqual(purchaseCalls, []);
+});
+
+test("the normal path is unaffected: still BOOKING means send", async () => {
+    const { deps, purchaseCalls } = recorder({ readState: async () => "BOOKING" });
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(purchaseCalls.length, 1);
 });
 
 // ── Expense.date is a business calendar day (round-6 item 3) ────────────────

@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { retryTargetFor } from "@/lib/receipt-intake/route-state";
 import { StatCard } from "../shared/stat-card";
 import MarkReviewedButton from "../register/mark-reviewed-button";
 import {
@@ -194,7 +195,12 @@ export function ReceiptsTab({
                                     <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} />
                                     <ReceiptLink storagePath={row.storagePath} />
                                     <MarkDuplicateControl intakeId={row.id} />
-                                    <RetryButton intakeId={row.id} />
+                                    {/* Only offered when a retry can actually
+                                        do something. A document VERDICT
+                                        (multi-doc, a duplicate, no estimate)
+                                        needs a decision, not another attempt —
+                                        the button would just park it again. */}
+                                    {retryTargetFor(row.state, row.stateReason) && <RetryButton intakeId={row.id} />}
                                     <VoidButton intakeId={row.id} />
                                 </div>
                             </RowShell>

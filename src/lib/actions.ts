@@ -20,6 +20,7 @@ import { isHttpUrl } from "./url-safety";
 import { parsePaymentDateInput } from "./payment-date";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
+import { retryTargetFor } from "./receipt-intake/route-state";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
 import { normalizePercentCompleteInput } from "./percent-complete";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
@@ -15195,11 +15196,52 @@ async function assertReceiptQueueAccess() {
 }
 
 class StaleReceiptIntakeError extends Error {
-    constructor() {
-        super("This receipt changed underneath you — refresh and try again.");
+    constructor(message = "This receipt changed underneath you — refresh and try again.") {
+        super(message);
         this.name = "StaleReceiptIntakeError";
     }
 }
+
+/**
+ * The worker's lease, expressed as a where-clause.
+ *
+ * The 5-minute worker CLAIMS a row by pushing `nextRetryAt` into the future
+ * (CLAIM_LEASE_MINUTES, receipt-intake/worker.ts). A row inside that window is
+ * being processed RIGHT NOW — possibly already downloading the file for a
+ * QuickBooks send — and a human write against it is a race we lose silently.
+ * `nextRetryAt` null or in the past means nobody holds it.
+ *
+ * This fails CLOSED: a row in retry backoff also carries a future
+ * `nextRetryAt`, so an action against it is refused too. That is the right
+ * trade — the user gets a "try again in a minute" they can act on instead of an
+ * edit that may or may not have survived. The worker's own state CAS is the
+ * second line of defence, not a substitute for this one.
+ */
+function notClaimedByWorker(now: Date): Prisma.ReceiptIntakeWhereInput {
+    return { OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }] };
+}
+
+const WORKER_BUSY_MESSAGE = "The pipeline is working on this receipt right now — try again in a minute.";
+
+/**
+ * Distinguish "you were looking at stale state" from "the worker holds it".
+ * A guarded update returning 0 cannot tell them apart, and the two need
+ * different words: one says refresh, the other says wait.
+ */
+async function receiptIntakeWriteFailure(id: string, allowedStates: readonly string[], now: Date): Promise<never> {
+    const current = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { state: true, nextRetryAt: true },
+    });
+    if (!current) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+    if (allowedStates.includes(current.state) && current.nextRetryAt && current.nextRetryAt > now) {
+        throw new StaleReceiptIntakeError(WORKER_BUSY_MESSAGE);
+    }
+    throw new StaleReceiptIntakeError();
+}
+
+/** Every state a manual write may legally act on (never BOOKED/ARCHIVED). */
+const HUMAN_WRITABLE_STATES = ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING", "DUPLICATE", "VOID", "NON_RECEIPT"];
 
 function revalidateReceiptQueue() {
     revalidatePath("/automation");
@@ -15224,8 +15266,10 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
         if (!costCode) throw new Error("That cost code no longer exists");
     }
 
+    const now = new Date();
+    const allowed = ["NEEDS_JOB", "NEEDS_REVIEW"];
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: { in: ["NEEDS_JOB", "NEEDS_REVIEW"] } },
+        where: { id, state: { in: allowed }, ...notClaimedByWorker(now) },
         data: {
             projectId,
             ...(costCodeId ? { costCodeId } : {}),
@@ -15235,7 +15279,7 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
             nextRetryAt: null,
         },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (result.count === 0) await receiptIntakeWriteFailure(id, allowed, now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15250,9 +15294,12 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
     const original = await prisma.receiptIntake.findUnique({ where: { id: duplicateOfId }, select: { id: true } });
     if (!original) throw new Error("That original receipt no longer exists");
 
+    const now = new Date();
     const result = await prisma.receiptIntake.updateMany({
         // A BOOKED row is money history — it is never reclassified from here.
-        where: { id, state: { notIn: ["BOOKED", "ARCHIVED", "VOID"] } },
+        // The lease fence matters most on exactly this path: BOOKING is a legal
+        // source state, and BOOKING is where the worker is mid-send.
+        where: { id, state: { notIn: ["BOOKED", "ARCHIVED", "VOID"] }, ...notClaimedByWorker(now) },
         data: {
             state: "DUPLICATE",
             duplicateOfId,
@@ -15264,7 +15311,7 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
             dedupStrongKey: null,
         },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (result.count === 0) await receiptIntakeWriteFailure(id, HUMAN_WRITABLE_STATES, now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15274,11 +15321,12 @@ export async function unmarkReceiptIntakeDuplicate(id: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
+    const now = new Date();
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: "DUPLICATE" },
+        where: { id, state: "DUPLICATE", ...notClaimedByWorker(now) },
         data: { state: "READ", duplicateOfId: null, stateReason: null, lastError: null, nextRetryAt: null },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (result.count === 0) await receiptIntakeWriteFailure(id, ["DUPLICATE"], now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15288,11 +15336,12 @@ export async function voidReceiptIntake(id: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
+    const now = new Date();
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: { notIn: ["BOOKED", "ARCHIVED"] } },
+        where: { id, state: { notIn: ["BOOKED", "ARCHIVED"] }, ...notClaimedByWorker(now) },
         data: { state: "VOID", stateReason: "voided-by-user", nextRetryAt: null, dedupStrongKey: null },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (result.count === 0) await receiptIntakeWriteFailure(id, HUMAN_WRITABLE_STATES, now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15310,11 +15359,36 @@ export async function retryReceiptIntake(id: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
-    const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: { in: ["BOOKING", "NEEDS_REVIEW"] } },
-        data: { lastError: null, nextRetryAt: new Date() },
+    const now = new Date();
+    const current = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { state: true, stateReason: true, nextRetryAt: true },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (!current) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+
+    // A CLOSED list of retryable reasons, and each one resumes where it failed.
+    // Retrying a document VERDICT (multi-doc, no-estimate, a dup) just parks it
+    // again with the same reason, having spent an attempt and a QBO round trip.
+    const target = retryTargetFor(current.state, current.stateReason);
+    if (!target) {
+        throw new StaleReceiptIntakeError(
+            "This one can't be retried — it needs a decision, not another attempt.",
+        );
+    }
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: current.state, stateReason: current.stateReason, ...notClaimedByWorker(now) },
+        data: {
+            // RECEIVED re-reads the document; BOOKING resumes at the send.
+            state: target,
+            // The reason described a failure that is now being retried; leaving
+            // it would make the row look parked while it is actually in flight.
+            stateReason: null,
+            lastError: null,
+            nextRetryAt: now,
+        },
+    });
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [current.state], now);
     revalidateReceiptQueue();
     return { success: true };
 }
