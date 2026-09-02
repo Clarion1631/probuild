@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import { getAnthropicText } from "@/lib/anthropic";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -27,7 +28,12 @@ export async function POST(req: NextRequest) {
             select: { durationHours: true, laborCost: true, burdenCost: true },
         }),
         prisma.expense.findMany({
-            where: { estimate: { is: { projectId } } },
+            // DEVIATION from spec §4's "display-only, no change" list: this one
+            // is not display-only. It is a real per-project spend filter feeding
+            // a forecast, so it has to see the same rows the variance report
+            // does — otherwise a re-attributed expense would show up in one and
+            // not the other.
+            where: expenseForProjectWhere(projectId),
             select: { amount: true, vendor: true, status: true },
         }),
         prisma.purchaseOrder.findMany({
