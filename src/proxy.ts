@@ -123,13 +123,20 @@ const TEST_ONLY_DISPATCHER_PATHS = new Set([
 ]);
 
 /**
- * True for a machine endpoint that must never dispatch a Server Action.
+ * True for a path that skips the proxy AND may never dispatch a Server Action.
+ *
+ * Expressed against the ALLOWLIST above rather than a list of its own. It used
+ * to be a denylist of machine endpoints, which is the wrong shape for a global
+ * action namespace — every bypassed path nobody thought to list was a live
+ * anonymous dispatcher — and keeping a second list here would reintroduce
+ * exactly that: two rules, drifting, with the safe-looking one out of date.
  *
  * A named export rather than an inline `.test()` so the rule can be asserted
  * directly — a guard nobody can call is a guard nobody can prove.
  */
 export function isMachineOnlyBypass(pathname: string) {
-    return MACHINE_ENDPOINT_PATTERN.test(pathname);
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname)
+        && !ANONYMOUS_SERVER_ACTION_PATHS.test(pathname);
 }
 
 export function isPublicProxyBypass(pathname: string) {

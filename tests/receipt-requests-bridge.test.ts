@@ -82,23 +82,33 @@ test("every machine bypass refuses a Server Action dispatch", async () => {
     }
 });
 
-test("machine paths NOT on the bypass are still refused an action dispatch", async () => {
-    // Belt and braces. `/api/mcp/mcp` is not matched by the public bypass (the
-    // bypass's own `mcp` alternative only reaches `/api/mcp/`), and the plural
-    // `/api/webhooks/...` form likewise — but both are unambiguously machine
-    // surfaces, so the guard covers them regardless of how the bypass evolves.
-    const { isMachineOnlyBypass } = await loadProxy();
+test("machine paths NOT on the bypass are refused by the proxy itself", async () => {
+    // These two are not matched by the public bypass at all (`/api/mcp/mcp`
+    // goes past the bypass's own `mcp` alternative, and the plural
+    // `/api/webhooks/...` form likewise), so they take the ORDINARY path: the
+    // proxy's session check. `isMachineOnlyBypass` is about the bypassed set,
+    // so it is false for them — and that is not a hole, it is a stricter route.
+    const { isMachineOnlyBypass, isPublicProxyBypass } = await loadProxy();
     for (const path of ["/api/mcp/mcp", "/api/webhooks/stripe"]) {
-        assert.equal(isMachineOnlyBypass(path), true, path);
+        assert.equal(isPublicProxyBypass(path), false, `${path} is not bypassed`);
+        assert.equal(isMachineOnlyBypass(path), false, `${path} never skips the proxy`);
     }
 });
 
-test("surfaces with genuinely anonymous Server Actions keep working", async () => {
-    const { isMachineOnlyBypass } = await loadProxy();
+test("only the portal surfaces may dispatch a Server Action anonymously", async () => {
+    // INVERTED with Phase 1's allowlist. It used to be "everything except a
+    // listed set of machine endpoints", which is the wrong shape for a global
+    // action namespace: every bypassed path nobody thought to list — /share,
+    // /api/pdf/*, /api/auth — was a live anonymous dispatcher. Now only the two
+    // surfaces that genuinely define anonymous actions are open.
+    const { isMachineOnlyBypass, isPublicProxyBypass } = await loadProxy();
+    for (const path of ["/portal/projects/abc", "/sub-portal/projects/abc"]) {
+        assert.equal(isPublicProxyBypass(path), true, path);
+        assert.equal(isMachineOnlyBypass(path), false, `${path} accepts the tradeoff on purpose`);
+    }
+    // Everything else that skips the proxy is refused one, INCLUDING the paths
+    // the old denylist quietly left open.
     for (const path of [
-        // The portal accepts the anonymous-action tradeoff on purpose.
-        "/portal/projects/abc",
-        "/sub-portal/projects/abc",
         "/share/room/tok",
         "/api/portal/verify",
         "/api/sub-portal/login",
@@ -106,16 +116,15 @@ test("surfaces with genuinely anonymous Server Actions keep working", async () =
         "/api/pdf/invoices/abc",
         "/api/mobile/login",
         "/api/auth/session",
-        // Ordinary app routes are untouched.
-        "/projects/abc",
-        "/automation",
-        "/api/automation/review-issues/mark-reviewed",
-        // Near-misses on the exact forms.
-        "/api/receipts/parse",
-        "/api/receipts/intake/abc123",
-        "/api/office-tasks",
-        "/api/automation/receipt-requests",
+        "/login",
     ]) {
+        assert.equal(isPublicProxyBypass(path), true, `${path} is bypassed`);
+        assert.equal(isMachineOnlyBypass(path), true, `${path} defines no anonymous action`);
+    }
+    // Ordinary app routes never reach the bypass at all — the session check is
+    // what refuses them.
+    for (const path of ["/projects/abc", "/automation", "/api/automation/review-issues/mark-reviewed"]) {
+        assert.equal(isPublicProxyBypass(path), false, path);
         assert.equal(isMachineOnlyBypass(path), false, path);
     }
 });

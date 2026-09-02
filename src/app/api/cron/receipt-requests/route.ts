@@ -4,7 +4,11 @@ import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { resolveCompanyTimeZone, startOfDateInTimeZone } from "@/lib/company-timezone";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
-import { evaluateReviewIssue, type EvaluateReviewIssueResult } from "@/lib/review-alert-lifecycle";
+import {
+    evaluateReviewIssue,
+    type EvaluateReviewIssueResult,
+    type ReviewIssueLifecycleClient,
+} from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
 import {
     DEAD_INTAKE_STATES,
@@ -487,33 +491,28 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
 
 
 /** The issues that belong to a component, with just enough to version them. */
-async function componentIssueRows(lineIds: string[]): Promise<Array<{ updatedAt: Date }>> {
+async function componentIssueRows(lineIds: string[]): Promise<Array<{ targetKey: string; updatedAt: Date }>> {
     if (lineIds.length === 0) return [];
     return prisma.reviewIssue.findMany({
         where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lineIds } },
-        select: { updatedAt: true },
+        select: { targetKey: true, updatedAt: true },
     });
 }
 
-/**
- * The lines that could compete inside this window, for the version stamp.
- *
- * BY AMOUNT AND SPAN, NOT BY ID. A line ARRIVING mid-plan — the nightly pull
- * minting one, a statement import landing — is a new competitor for the same
- * evidence, and an id list drawn from the plan itself is exactly the thing that
- * cannot see it. The descriptor is hashed too, because a refreshed one changes
- * the payee and therefore what matches.
- */
-async function componentLineRows(
-    amounts: number[],
-    postedDate: { gte: Date; lt: Date },
-): Promise<Array<{ id: string; updatedAt: Date; rawDescriptor: string }>> {
-    if (amounts.length === 0) return [];
-    return prisma.bankLine.findMany({
-        where: { amountCents: { in: [...new Set(amounts)] }, postedDate },
-        select: { id: true, updatedAt: true, rawDescriptor: true },
-    });
+/** Raised inside a component transaction when its inputs moved. Aborts it. */
+class ComponentMovedError extends Error {
+    constructor() {
+        super("component moved between plan and commit");
+        this.name = "ComponentMovedError";
+    }
 }
+
+/**
+ * One component's transaction holds row locks while it re-reads and writes.
+ * Prisma's interactive default is 5s; a component is a handful of rows, but the
+ * re-read is four queries and the writes are one per verdict.
+ */
+const COMPONENT_TX_TIMEOUT_MS = 15_000;
 
 function emptySummary(): ReceiptRequestApplySummary {
     return { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] };
@@ -666,19 +665,7 @@ async function processBatch(
             },
         }),
     ]);
-    // THE VERSION OF THE WORLD THIS PLAN IS ABOUT TO BE MADE FROM — all four
-    // inputs, because a verdict is a function of all four.
     const lineIds = lines.map(row => row.id);
-    const componentAmounts = lines.map(row => row.amountCents);
-    const planVersion = componentVersionOf({
-        issues: await componentIssueRows(lineIds),
-        intakes: intakeRows,
-        lines: await componentLineRows(componentAmounts, range.calendar),
-        expenses: expenseRows.map(row => ({
-            id: row.id,
-            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
-        })),
-    });
 
     // 3. DECIDE.
     const fullPlan = planReceiptRequests({
@@ -729,72 +716,190 @@ async function processBatch(
     };
 
     /**
-     * NOTHING MOVED WHILE WE WERE THINKING.
+     * APPLY EACH COMPONENT ATOMICALLY, UNDER ITS OWN LOCKS.
      *
      * Assignment is a property of the SET: one receipt answering two identical
      * charges is decided by looking at both. So a SIBLING changing mid-sweep —
      * a memo signed on the charge next to this one, an intake booked, an issue
-     * a human cleared — can change THIS line's verdict without touching this
-     * line at all, and the per-write fresh read cannot see that. It only stops
-     * the row itself being overwritten, which is the smaller half.
+     * a human cleared — changes THIS line's verdict without touching this line
+     * at all. A fresh read per write cannot see that, and a fingerprint checked
+     * outside a transaction only narrows the window: the sibling can still move
+     * between the check and the writes.
      *
-     * So the plan is checked against the component's version immediately before
-     * anything is applied, and a change replans the WHOLE component rather than
-     * committing a verdict derived from a world that no longer exists.
+     * So each component gets ONE transaction that:
+     *   1. takes `FOR UPDATE` on its ReviewIssue rows and the candidate
+     *      ReceiptIntake rows, in id order (the same discipline mark-duplicate
+     *      uses — two transactions wanting the same rows ask in the same
+     *      sequence, so one waits instead of deadlocking);
+     *   2. recomputes the fingerprint from those LOCKED rows plus the bank
+     *      lines and expenses re-read inside the same transaction;
+     *   3. aborts the whole component if it moved — no partial verdicts — and
+     *      the caller replans;
+     *   4. otherwise writes every verdict for that component in that
+     *      transaction, so the set commits together or not at all.
      */
-    const currentVersion = componentVersionOf({
-        issues: await componentIssueRows(lineIds),
-        intakes: await prisma.receiptIntake.findMany({
-            where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
-            select: { updatedAt: true },
-        }),
-        lines: await componentLineRows(componentAmounts, range.calendar),
-        // Re-read with the SAME predicate the planner used, so an expense that
-        // gained a receipt mid-plan changes the hash rather than slipping in
-        // under an unchanged count.
-        expenses: (await prisma.expense.findMany({
-            where: { date: range.timestamp },
-            select: { id: true, receiptUrl: true, receiptIntake: { select: { id: true } } },
-        })).map(row => ({
-            id: row.id,
-            hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
-        })),
-    });
-    if (!componentVersionsMatch(planVersion, currentVersion)) {
-        return { summary: emptySummary(), undecided: plan.open.length + plan.close.length, replan: true };
-    }
+    const componentsInBatch = groupCompetingLines(lines.map(row => ({
+        id: row.id,
+        postedDate: row.postedDate.toISOString().slice(0, 10),
+        amountCents: row.amountCents,
+    })));
+    const planIssueRows = await componentIssueRows(lineIds);
+    const summary = emptySummary();
 
-    const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
-        // FRESH READ before each write. The sweep can run for minutes; a memo
-        // signed in that window would otherwise be un-answered by a merge from
-        // the run-start snapshot.
-        const fresh = await prisma.reviewIssue.findUnique({
-            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
-            select: { displayDetails: true, clearedAt: true },
+    for (const component of componentsInBatch) {
+        const ids = new Set(component.lineIds);
+        const componentOpen = plan.open.filter(item => ids.has(item.targetKey));
+        const componentClose = plan.close.filter(targetKey => ids.has(targetKey));
+        if (componentOpen.length === 0 && componentClose.length === 0) continue;
+
+        // The component's own span, and the evidence window around it.
+        const componentLines = lines.filter(row => ids.has(row.id));
+        const days = componentLines.map(row => row.postedDate.getTime());
+        const fromDay = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const toDay = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const componentRange = await evidenceRange(fromDay, toDay);
+        const amounts = [...new Set(componentLines.map(row => row.amountCents))];
+        const intakeInWindow = (value: Date | null) =>
+            value !== null && value >= componentRange.calendar.gte && value < componentRange.calendar.lt;
+        const expenseInWindow = (value: Date | null) =>
+            value !== null && value >= componentRange.timestamp.gte && value < componentRange.timestamp.lt;
+
+        // The fingerprint of what THIS component was planned from, taken from
+        // rows already in hand — no extra queries.
+        const planned = componentVersionOf({
+            issues: planIssueRows.filter(issue => ids.has(issue.targetKey)),
+            intakes: intakeRows.filter(row => intakeInWindow(row.txnDate)),
+            lines: componentLines.map(row => ({ id: row.id, rawDescriptor: row.rawDescriptor })),
+            expenses: expenseRows
+                .filter(row => expenseInWindow(row.date))
+                .map(row => ({ id: row.id, hasReceipt: !!row.receiptUrl || row.receiptIntake !== null })),
         });
-        const freshDetails = fresh
-            ? parseMissingReceiptDetails(fresh.displayDetails)
-            : detailsByKey.get(targetKey) ?? {};
 
-        // A resolution that appeared since the snapshot: do not reopen.
-        if (codes.length > 0 && hasResolution(freshDetails)) {
-            return { decision: { step: 1, action: "noop", canonicalCodes: [], reasonHash: "" }, applied: false };
+        try {
+            await prisma.$transaction(async tx => {
+                // 1. LOCKS, in id order, one statement each.
+                const issueKeys = [...component.lineIds].sort();
+                await tx.$queryRaw`
+                    SELECT "id" FROM "ReviewIssue"
+                    WHERE "targetType" = ${RECEIPT_REQUEST_TARGET_TYPE}
+                      AND "targetKey" = ANY(${issueKeys})
+                    ORDER BY "id"
+                    FOR UPDATE`;
+                const candidateIntakeIds = intakeRows
+                    .filter(row => intakeInWindow(row.txnDate))
+                    .map(row => row.id)
+                    .sort();
+                if (candidateIntakeIds.length > 0) {
+                    await tx.$queryRaw`
+                        SELECT "id" FROM "ReceiptIntake"
+                        WHERE "id" = ANY(${candidateIntakeIds})
+                        ORDER BY "id"
+                        FOR UPDATE`;
+                }
+
+                // 2. THE FINGERPRINT, FROM THE LOCKED ROWS.
+                const current = componentVersionOf({
+                    issues: await tx.reviewIssue.findMany({
+                        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: component.lineIds } },
+                        select: { targetKey: true, updatedAt: true },
+                    }),
+                    intakes: await tx.receiptIntake.findMany({
+                        where: { txnDate: componentRange.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
+                        select: { updatedAt: true },
+                    }),
+                    lines: await tx.bankLine.findMany({
+                        where: { amountCents: { in: amounts }, postedDate: componentRange.calendar },
+                        select: { id: true, updatedAt: true, rawDescriptor: true },
+                    }),
+                    expenses: (await tx.expense.findMany({
+                        where: { date: componentRange.timestamp },
+                        select: { id: true, receiptUrl: true, receiptIntake: { select: { id: true } } },
+                    })).map(row => ({ id: row.id, hasReceipt: !!row.receiptUrl || row.receiptIntake !== null })),
+                });
+                if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
+
+                // 3. EVERY VERDICT FOR THIS COMPONENT, IN THIS TRANSACTION.
+                //
+                // The lifecycle opens its own transaction; handed this one it
+                // would nest, which Prisma's interactive client cannot do. The
+                // shim flattens it so the callback runs against the SAME tx and
+                // one component's writes share one atomic unit.
+                const flattened: {
+                    reviewIssue: typeof tx.reviewIssue;
+                    reviewAlertEpisode: typeof tx.reviewAlertEpisode;
+                    $transaction: <T>(fn: (inner: unknown) => Promise<T>) => Promise<T>;
+                } = {
+                    reviewIssue: tx.reviewIssue,
+                    reviewAlertEpisode: tx.reviewAlertEpisode,
+                    // The flattening: the lifecycle asks for a transaction and
+                    // gets THIS one, so its writes join the component's unit
+                    // instead of opening a nested one Prisma cannot give it.
+                    $transaction: async fn => fn(flattened),
+                };
+
+                const applied = await applyReceiptRequestPlan(
+                    { open: componentOpen, close: componentClose, undecided: [] },
+                    async (targetKey, codes, displayDetails) => {
+                        const fresh = await tx.reviewIssue.findUnique({
+                            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
+                            select: { displayDetails: true, clearedAt: true },
+                        });
+                        const freshDetails = fresh
+                            ? parseMissingReceiptDetails(fresh.displayDetails)
+                            : detailsByKey.get(targetKey) ?? {};
+
+                        // A resolution that appeared since the snapshot: do not
+                        // reopen. Belt and braces now that the rows are locked.
+                        if (codes.length > 0 && hasResolution(freshDetails)) {
+                            return { decision: { step: 1, action: "noop", canonicalCodes: [], reasonHash: "" }, applied: false };
+                        }
+
+                        return evaluateReviewIssue(
+                            RECEIPT_REQUEST_TARGET_TYPE,
+                            targetKey,
+                            codes,
+                            displayDetails ? mergeReceiptRequestDetails(freshDetails, displayDetails) : null,
+                            {
+                                client: flattened as unknown as ReviewIssueLifecycleClient,
+                                // Delivery is the per-owner digest, never the
+                                // per-issue drainer.
+                                episodeStatus: "SUPPRESSED",
+                                // Under these locks a version conflict cannot
+                                // happen, so this hook is unreachable today.
+                                // It stays wired because it is the correct
+                                // answer if the locking is ever relaxed, and an
+                                // unreachable-but-right retry costs nothing.
+                                recomputeCodes: () => recomputeCodesFor(targetKey),
+                            },
+                        );
+                    },
+                );
+                summary.opened += applied.opened;
+                summary.closed += applied.closed;
+                summary.touched += applied.touched;
+                summary.skipped += applied.skipped;
+                summary.errors += applied.errors;
+                summary.failedTargets.push(...applied.failedTargets);
+            }, { timeout: COMPONENT_TX_TIMEOUT_MS });
+        } catch (error) {
+            if (error instanceof ComponentMovedError) {
+                // NOTHING COMMITTED for this component. The caller replans the
+                // batch rather than half-applying a plan drawn from a world
+                // that moved.
+                return {
+                    summary: emptySummary(),
+                    undecided: componentOpen.length + componentClose.length,
+                    replan: true,
+                };
+            }
+            // Any other failure also wrote nothing: counted, reported, and the
+            // cursor will not step past it.
+            summary.errors++;
+            summary.failedTargets.push(...component.lineIds);
+            console.error("[cron/receipt-requests] component transaction failed", component.key,
+                error instanceof Error ? error.message : "UnknownError");
         }
-
-        return evaluateReviewIssue(
-            RECEIPT_REQUEST_TARGET_TYPE,
-            targetKey,
-            codes,
-            displayDetails ? mergeReceiptRequestDetails(freshDetails, displayDetails) : null,
-            {
-                // Delivery is the per-owner digest, never the per-issue drainer.
-                episodeStatus: "SUPPRESSED",
-                // On an OCC retry, re-derive from the COMPLETE competing set
-                // rather than replaying a stale verdict.
-                recomputeCodes: () => recomputeCodesFor(targetKey),
-            },
-        );
-    });
+    }
 
     // A line whose component would not load is undecided too — the caller
     // reports it, and the cursor does not step past it silently.

@@ -111,9 +111,26 @@ export async function POST(request: Request) {
     const pdfId = (body.pdf_id as string).trim();
     const probe = await probeDriveFile(pdfId);
     if (probe.kind === "unreachable") {
-        console.error("[automation/receipt-requests/answers] Drive unreachable", pdfId, probe.reason);
+        // NO CREDENTIAL is its own answer, and a different problem from a bad
+        // minute at Google: it means this deployment cannot verify ANY memo
+        // until somebody connects Drive, and it will not fix itself. Naming it
+        // is what stops the retries reading as a transient Google outage —
+        // pipeline-health reports the same condition as `drive-not-configured`.
+        const unconfigured = probe.reason === "no-drive-token";
+        console.error(
+            unconfigured
+                ? "[automation/receipt-requests/answers] Drive is NOT CONFIGURED — no memo can be verified"
+                : "[automation/receipt-requests/answers] Drive unreachable",
+            pdfId, probe.reason,
+        );
         return NextResponse.json(
-            { ok: false, reason: "artifact-unverifiable", retry: true, detail: probe.reason, targetKey: bankLineId },
+            {
+                ok: false,
+                reason: unconfigured ? "drive-not-configured" : "artifact-unverifiable",
+                retry: true,
+                detail: probe.reason,
+                targetKey: bankLineId,
+            },
             { status: 503 },
         );
     }

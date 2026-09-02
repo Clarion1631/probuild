@@ -164,7 +164,8 @@ test("a TRASHED file is missing too — it disappears on its own", async () => {
 
 test("an UNREACHABLE Drive is 503 with retry — never a recorded resolution", async () => {
     reset();
-    probeResult = { kind: "unreachable", reason: "no-drive-token" };
+    // A bad minute at Google.
+    probeResult = { kind: "unreachable", reason: "backend error" };
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 503);
     const payload = await res.json() as { ok: boolean; reason: string; retry: boolean };
@@ -172,6 +173,21 @@ test("an UNREACHABLE Drive is 503 with retry — never a recorded resolution", a
     assert.equal(payload.reason, "artifact-unverifiable");
     assert.equal(payload.retry, true, "the forwarder must come back");
     assert.deepEqual(writes, [], "we could not check, so nothing is claimed");
+    assert.deepEqual(cleared, []);
+});
+
+test("NO CREDENTIAL is named as such — it will not fix itself", async () => {
+    // Distinct from a transient outage on purpose: it means this deployment
+    // cannot verify ANY memo until somebody connects Drive, and the retries
+    // would otherwise read as a bad minute at Google forever.
+    reset();
+    probeResult = { kind: "unreachable", reason: "no-drive-token" };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 503);
+    const payload = await res.json() as { ok: boolean; reason: string; retry: boolean };
+    assert.equal(payload.reason, "drive-not-configured");
+    assert.equal(payload.retry, true);
+    assert.deepEqual(writes, []);
     assert.deepEqual(cleared, []);
 });
 

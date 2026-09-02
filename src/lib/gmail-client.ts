@@ -66,3 +66,43 @@ export function saveToken(token: any) {
 loadToken();
 
 export const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+/**
+ * Where the Drive/Gmail credential actually comes from, in each environment.
+ *
+ * `loadToken()` is synchronous (it runs at import time) and can therefore only
+ * see the local token FILE or `GMAIL_REFRESH_TOKEN`. On Vercel neither exists
+ * by default: the filesystem is ephemeral and the env var has to be set by
+ * hand. But the admin "connect Google" flow
+ * (`/api/gmail/callback`) persists its refresh token to
+ * `CompanySettings.googleDriveRefreshToken` — so the connection a human already
+ * made was invisible to every Drive call, and connecting again changed nothing.
+ * That gap is why a signed-memo probe could never succeed in production no
+ * matter how many times somebody clicked connect.
+ *
+ * This is the async form that closes it: file / env first (cheap, no database),
+ * then the stored company credential.
+ */
+export type DriveAuthSource = "token-file-or-env" | "company-settings" | "none";
+
+export async function ensureDriveAuth(): Promise<{ ok: boolean; source: DriveAuthSource }> {
+    if (loadToken()) return { ok: true, source: "token-file-or-env" };
+    try {
+        const { prisma } = await import("./prisma");
+        const settings = await prisma.companySettings.findUnique({
+            where: { id: "singleton" },
+            select: { googleDriveRefreshToken: true },
+        });
+        const refreshToken = settings?.googleDriveRefreshToken;
+        if (!refreshToken) return { ok: false, source: "none" };
+        oauth2Client.setCredentials({ refresh_token: refreshToken });
+        return { ok: true, source: "company-settings" };
+    } catch (error) {
+        // A database we cannot read is not "no credential" — but for the
+        // caller's purposes it is the same refusal: we cannot prove we can
+        // reach Drive, so nothing may be recorded as verified.
+        console.error("[gmail-client] could not read the stored Drive credential",
+            error instanceof Error ? error.message : "UnknownError");
+        return { ok: false, source: "none" };
+    }
+}

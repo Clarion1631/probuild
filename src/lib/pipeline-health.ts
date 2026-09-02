@@ -208,6 +208,12 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
  *    chaser reads BankLine, so a dead pull silently starves it: every check
  *    stays green while the queue quietly stops finding anything. Only reported
  *    when the feature is actually on — an unset flag is not a failure.
+ *  - `drive-not-configured` — no Google Drive credential is loadable, so the
+ *    signed-memo path cannot verify a single artifact. Every `signed:true` the
+ *    bridge sends is refused with a 503 while this holds, which is correct
+ *    (never record "verified" for something nobody could check) and completely
+ *    silent from the crew's side: they sign memos and nothing closes. It is
+ *    reported here because the failure has no other symptom.
  *  - `cards-uncertain:<n>` — the morning Chat digest asked Google Chat to post
  *    a card and never got a confirmed answer. Those rows are deliberately NEVER
  *    auto-retried (a duplicate chase card teaches people the list is noise), so
@@ -244,6 +250,8 @@ export function evaluatePipelineHealth(input: {
     bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
+    /** Can we authenticate to Drive at all? Gates the signed-memo path. */
+    driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -260,6 +268,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeUnassigned", input.intakeUnassigned],
         ["uncertainCards", input.uncertainCards],
         ["bankPull", input.bankPull],
+        ["driveCredentials", input.driveCredentials],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -337,6 +346,13 @@ export function evaluatePipelineHealth(input: {
         // elsewhere.
         const stale = at === null || Number.isNaN(at) || input.now - at > BANK_PULL_STALE_HOURS * HOUR_MS;
         if (stale) reasons.push("bank-pull-stale");
+    }
+
+    // NO DRIVE CREDENTIAL = the signed-memo path is dead, silently. Only
+    // reported when the probe actually ANSWERED: a failed probe is already
+    // `probe-failed:driveCredentials`.
+    if (input.driveCredentials.status === "ok" && !input.driveCredentials.configured) {
+        reasons.push("drive-not-configured");
     }
 
     // An uncertain card is an ASK THAT MAY NEVER HAVE HAPPENED. It cannot be
@@ -440,7 +456,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull, driveCredentials,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -600,6 +616,19 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             readBankPullState,
             { enabled: false, lastSuccessAt: null },
         ),
+        // Can we authenticate to Drive? Asked here rather than at the moment a
+        // memo arrives, because the answer "no" produces no symptom anywhere
+        // else: memos are signed, the bridge is refused, and the queue simply
+        // never empties.
+        probe<{ ok: boolean; source: string }>(
+            "driveCredentials",
+            async () => {
+                const { ensureDriveAuth } = await import("./gmail-client");
+                const verdict = await ensureDriveAuth();
+                return { ok: verdict.ok, source: verdict.source };
+            },
+            { ok: false, source: "none" },
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -645,6 +674,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: uncertainCards.status,
             reason: uncertainCards.reason,
             count: uncertainCards.value,
+        },
+        driveCredentials: {
+            status: driveCredentials.status,
+            reason: driveCredentials.reason,
+            configured: driveCredentials.value.ok,
+            source: driveCredentials.value.source,
         },
         bankPull: {
             status: bankPull.status,

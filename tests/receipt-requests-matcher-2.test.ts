@@ -11,6 +11,8 @@ import {
     isComponentKey,
     isDurableArtifactUrl,
     pageComponents,
+    componentVersionOf,
+    componentVersionsMatch,
     payeeSignificantTokens,
     payeeTokens,
     GENERIC_PAYEE_TOKENS,
@@ -932,4 +934,82 @@ test("book.ts and the chaser share ONE list of no-evidence reasons", () => {
     // formatting.)
     const selects = cron.match(/state: true,\s+stateReason: true/g) ?? [];
     assert.equal(selects.length, 2, "the batch pass and the recompute pass");
+});
+
+
+// -- The sibling-resolution race, end to end (round-18 item 1) -------------
+
+test("a memo signed on A mid-plan frees A's receipt for B — B is never opened", () => {
+    // THE RACE, in the order it happens:
+    //   1. Two identical charges, ONE receipt. The matcher gives it to A
+    //      (oldest first, id breaking the tie) and plans to OPEN a chase on B.
+    //   2. Between that plan and the write, somebody signs a memo on A.
+    //   3. A no longer needs the receipt at all — so B's chase is wrong, and
+    //      committing it asks a person for a receipt that is sitting right
+    //      there.
+    // The component's fingerprint moves (A's issue was updated), the whole
+    // component aborts and replans, and the replan gives the receipt to B.
+    const now = new Date("2026-08-20T12:00:00Z");
+    const base = {
+        bankLines: [
+            { id: "bl-a", postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null },
+            { id: "bl-b", postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null },
+        ],
+        expenses: [{
+            id: "exp-1", qbPurchaseId: null, hasReceipt: true,
+            amountCents: 12_345, date: "2026-08-16", vendor: "Lowes",
+        }],
+        intakes: [],
+        openIssueKeys: ["bl-a", "bl-b"],
+        now,
+    };
+
+    // 1. The plan as it stood: A takes the receipt, B gets chased.
+    const before = planReceiptRequests(base);
+    assert.deepEqual(before.close, ["bl-a"], "A is answered by the receipt");
+    assert.deepEqual(before.open.map(o => o.targetKey), ["bl-b"], "and B would be opened");
+
+    // 2 + 3. The memo lands on A, and the replan gives B the freed receipt.
+    const after = planReceiptRequests({ ...base, resolvedIssueKeys: ["bl-a"] });
+    assert.deepEqual(after.open, [], "B IS NOT OPENED");
+    assert.deepEqual(after.close.sort(), ["bl-a", "bl-b"], "both are answered");
+
+    // And the fingerprint really does move, which is what triggers the replan:
+    // A's issue was written, so its updatedAt is newer than the plan's.
+    const planned = componentVersionOf({
+        issues: [
+            { targetKey: "bl-a", updatedAt: new Date("2026-08-20T11:00:00Z") },
+            { targetKey: "bl-b", updatedAt: new Date("2026-08-20T11:00:00Z") },
+        ],
+        intakes: [],
+        lines: [{ id: "bl-a", rawDescriptor: "x" }, { id: "bl-b", rawDescriptor: "x" }],
+        expenses: [{ id: "exp-1", hasReceipt: true }],
+    });
+    const locked = componentVersionOf({
+        issues: [
+            // The memo write.
+            { targetKey: "bl-a", updatedAt: new Date("2026-08-20T11:59:00Z") },
+            { targetKey: "bl-b", updatedAt: new Date("2026-08-20T11:00:00Z") },
+        ],
+        intakes: [],
+        lines: [{ id: "bl-a", rawDescriptor: "x" }, { id: "bl-b", rawDescriptor: "x" }],
+        expenses: [{ id: "exp-1", hasReceipt: true }],
+    });
+    assert.equal(componentVersionsMatch(planned, locked), false, "so the component aborts and replans");
+});
+
+test("the whole component aborts together — never half its verdicts", () => {
+    // Two verdicts fall out of one plan (close A, open B). Committing one
+    // without the other is the state that reads as "answered AND chased", and
+    // it is exactly what a per-issue write produced when the set moved
+    // underneath it.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    // One transaction per component, holding its verdicts.
+    assert.match(source, /await prisma\.\$transaction\(async tx => \{[\s\S]{0,600}FOR UPDATE/);
+    assert.match(source, /\{ open: componentOpen, close: componentClose, undecided: \[\] \}/);
+    // The abort is a throw, so the transaction rolls back rather than the loop
+    // continuing with some writes already committed.
+    assert.match(source, /throw new ComponentMovedError\(\);/);
+    // And the caller replans instead of reporting a partial success.
+    assert.match(source, /replan: true,/);
 });

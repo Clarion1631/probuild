@@ -44,6 +44,8 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intakeNeedsReview: { status: "ok" as const, count: 0 },
         intakeUnassigned: { status: "ok" as const, count: 0 },
         uncertainCards: { status: "ok" as const, count: 0 },
+        // A connected Drive is the normal state; the memo path needs it.
+        driveCredentials: { status: "ok" as const, configured: true, source: "company-settings" },
         // The nightly QBO pull is OFF by default, so it contributes no reason.
         bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null },
         now: NOW,
@@ -810,4 +812,52 @@ test("the bank-pull read runs inside the Promise.all, as a probe", () => {
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));
     assert.doesNotMatch(fn.slice(0, fn.indexOf("\n}")), /catch/);
+});
+
+test("no Drive credential is a reported failure, not a silent one", () => {
+    // The symptom is invisible otherwise: memos get signed, the bridge is
+    // refused with a 503, and the queue simply never empties. Nobody watching
+    // the queue can tell that from "nobody has signed anything".
+    const missing = evaluatePipelineHealth(snapshot({
+        driveCredentials: { status: "ok", configured: false, source: "none" },
+    }));
+    assert.equal(missing.ok, false);
+    assert.ok(missing.reasons.includes("drive-not-configured"), missing.reasons.join(","));
+
+    // Connected either way is silent.
+    for (const source of ["token-file-or-env", "company-settings"]) {
+        const ok = evaluatePipelineHealth(snapshot({
+            driveCredentials: { status: "ok", configured: true, source },
+        }));
+        assert.deepEqual(ok.reasons, [], source);
+    }
+
+    // A probe that could not answer is probe-failed, and must NOT also claim
+    // the credential is missing — one failure, one reason.
+    const broken = evaluatePipelineHealth(snapshot({
+        driveCredentials: { status: "error", reason: "timeout", configured: false, source: "none" },
+    }));
+    assert.ok(broken.reasons.includes("probe-failed:driveCredentials"));
+    assert.ok(!broken.reasons.includes("drive-not-configured"));
+});
+
+test("the Drive credential is probed, and the stored one counts", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /"driveCredentials",\s*\n\s*async \(\) => \{[\s\S]{0,200}ensureDriveAuth\(\)/);
+    assert.match(source, /\{ ok: false, source: "none" \}/, "the fallback assumes NOT configured");
+    // And the operator docs say exactly what prod needs.
+    const env = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".env.example"), "utf8");
+    for (const name of ["GOOGLE_DRIVE_CLIENT_ID", "GOOGLE_DRIVE_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]) {
+        assert.match(env, new RegExp(`^${name}=`, "m"), name);
+    }
+    assert.match(env, /auth\/drive/, "the scope is named");
+    const spec = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "docs/plans/PHASE-2-QUEUE-AND-MEMOS-SPEC.md"),
+        "utf8",
+    );
+    assert.match(spec, /Connect Google Drive, or the signed-memo path is dead on arrival/);
+    assert.match(spec, /CompanySettings\.googleDriveRefreshToken/);
 });

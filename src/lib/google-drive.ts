@@ -1,5 +1,5 @@
 import { google } from 'googleapis';
-import { oauth2Client, loadToken } from './gmail-client';
+import { oauth2Client, loadToken, ensureDriveAuth } from './gmail-client';
 
 /**
  * Service to manage Google Drive provisioning and integration for ProBuild.
@@ -335,7 +335,10 @@ export function isDriveFileId(value: unknown): value is string {
 
 export async function probeDriveFile(fileId: string, timeoutMs = 5_000): Promise<DriveFileProbe> {
     if (!isDriveFileId(fileId)) return { kind: "missing", reason: "invalid-id" };
-    if (!loadToken()) return { kind: "unreachable", reason: "no-drive-token" };
+    // The stored company credential counts, not just the env var — see
+    // ensureDriveAuth. Without this, an admin who completed the connect flow
+    // still had every Drive call answer "no token".
+    if (!(await ensureDriveAuth()).ok) return { kind: "unreachable", reason: "no-drive-token" };
     try {
         const drive = google.drive({ version: "v3", auth: oauth2Client });
         const response = await drive.files.get(

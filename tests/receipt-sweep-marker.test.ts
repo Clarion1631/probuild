@@ -119,13 +119,24 @@ test("a memo signed mid-sweep changes the component version", () => {
 
 test("a changed component is replanned, and never committed from a stale plan", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    // The check sits between the plan and the first write.
+    // Plan, LOCK, verify against the locked rows, THEN write — all inside one
+    // transaction per component, so nothing can move between the check and the
+    // writes and no component commits half its verdicts.
     const planAt = source.indexOf("const fullPlan = planReceiptRequests({");
-    const checkAt = source.indexOf("if (!componentVersionsMatch(planVersion, currentVersion))");
-    const applyAt = source.indexOf("const summary = await applyReceiptRequestPlan(");
-    assert.ok(planAt > 0 && checkAt > planAt && applyAt > checkAt, "plan, verify, THEN write");
-    // A mismatch commits nothing and asks for a replan.
-    assert.match(source, /return \{ summary: emptySummary\(\), undecided: plan\.open\.length \+ plan\.close\.length, replan: true \};/);
+    const lockAt = source.indexOf("FOR UPDATE`;", planAt);
+    const checkAt = source.indexOf("if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();");
+    const applyAt = source.indexOf("const applied = await applyReceiptRequestPlan(");
+    assert.ok(planAt > 0 && lockAt > planAt, "the locks come first");
+    assert.ok(checkAt > lockAt, "the fingerprint is recomputed from the LOCKED rows");
+    assert.ok(applyAt > checkAt, "and the writes come last");
+    // Both lock statements, in id order.
+    assert.match(source, /SELECT "id" FROM "ReviewIssue"[\s\S]{0,220}ORDER BY "id"\s*\n\s*FOR UPDATE/);
+    assert.match(source, /SELECT "id" FROM "ReceiptIntake"[\s\S]{0,160}ORDER BY "id"\s*\n\s*FOR UPDATE/);
+    // A mismatch aborts the transaction: nothing committed, and a replan.
+    assert.match(source, /class ComponentMovedError extends Error/);
+    assert.match(source, /undecided: componentOpen\.length \+ componentClose\.length,\s*\n\s*replan: true,/);
+    // The lifecycle writes join THIS transaction rather than opening their own.
+    assert.match(source, /client: flattened as unknown as ReviewIssueLifecycleClient,/);
     // Bounded, and the give-up is an OPEN chase, not a close.
     assert.match(source, /const MAX_COMPONENT_REPLANS = 3;/);
     assert.match(source, /for \(let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt\+\+\)/);
@@ -195,17 +206,21 @@ test("a BankLine inserted mid-plan forces a replan", () => {
     assert.equal(componentVersionsMatch(before, refreshed), false);
 });
 
-test("the cron stamps all four inputs, at plan time and again before writing", () => {
+test("the cron stamps all four inputs, at plan time and again under the lock", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    // Both stamps read the same four things.
+    // Two stamps per component: what it was planned from, and what the locked
+    // rows say now.
     const stamps = source.match(/componentVersionOf\(\{/g) ?? [];
     assert.equal(stamps.length, 2, "plan time and check time");
-    for (const input of [/issues: await componentIssueRows\(lineIds\)/, /intakes:/, /lines: await componentLineRows\(componentAmounts, range\.calendar\)/, /expenses:/]) {
-        const matches = source.match(new RegExp(input.source, "g")) ?? [];
-        assert.ok(matches.length >= 2, `both stamps must cover ${input.source}`);
+    for (const input of ["issues:", "intakes:", "lines:", "expenses:"]) {
+        const matches = source.match(new RegExp(input, "g")) ?? [];
+        assert.ok(matches.length >= 2, `both stamps must cover ${input}`);
     }
-    // Lines are re-read BY AMOUNT AND SPAN, not by the plan's own id list - an
-    // id list drawn from the plan cannot see a line that just arrived.
-    assert.match(source, /where: \{ amountCents: \{ in: \[\.\.\.new Set\(amounts\)\] \}, postedDate \}/);
-    assert.doesNotMatch(source, /componentLineRows\(lineIds\)/);
+    // The re-read happens on the TRANSACTION, so it sees the locked rows.
+    for (const model of ["tx.reviewIssue.findMany", "tx.receiptIntake.findMany", "tx.bankLine.findMany", "tx.expense.findMany"]) {
+        assert.ok(source.includes(model), model);
+    }
+    // Lines are re-read BY AMOUNT AND SPAN, not by an id list drawn from the
+    // plan — that list is exactly what cannot see a line that just arrived.
+    assert.match(source, /where: \{ amountCents: \{ in: amounts \}, postedDate: componentRange\.calendar \}/);
 });

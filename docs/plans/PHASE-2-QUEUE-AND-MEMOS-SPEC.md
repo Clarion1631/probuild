@@ -448,11 +448,29 @@ Every one of these is a human step. None of it happens by merging.
    both sides are updated the bridge gets a clean 401/403 and signed memos stop being
    recorded — so change Vercel and Apps Script together, and re-run one thread export
    to confirm.
-4. **Collect the Chat user ids** for `RECEIPT_OWNER_CHAT_USERS` (CJ, Richard). A wrong
+4. **Connect Google Drive, or the signed-memo path is dead on arrival.** The
+   answers endpoint verifies each affidavit PDF by reading its Drive metadata,
+   so with no loadable credential it refuses every memo with a 503
+   `drive-not-configured` and `/api/health/pipeline` reports the same reason.
+   It never accepts one unverified. What prod needs:
+   - `GOOGLE_DRIVE_CLIENT_ID` / `GOOGLE_DRIVE_CLIENT_SECRET` (already set;
+     `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` are the fallback), with
+     `https://probuild.goldentouchremodeling.com/api/gmail/callback` among the
+     OAuth client's authorized redirect URIs.
+   - A refresh token carrying the `https://www.googleapis.com/auth/drive`
+     scope. Either an ADMIN visits `/api/gmail/callback` and completes the
+     consent screen — that stores it in `CompanySettings.googleDriveRefreshToken`
+     and survives deploys, which is the preferred route — or the same token is
+     pasted into `GMAIL_REFRESH_TOKEN` in Vercel. **Prod currently has the
+     client id/secret and NEITHER credential**, so this step is not optional.
+     (The local `.gmail-token.json` is a development convenience only: Vercel's
+     filesystem is ephemeral.)
+   - Confirm with `/api/health/pipeline`: `drive-not-configured` must be gone.
+5. **Collect the Chat user ids** for `RECEIPT_OWNER_CHAT_USERS` (CJ, Richard). A wrong
    id locks that owner out of signing their own memo.
-5. **Create the incoming webhook** in `spaces/AAQAKhvMYtg` and set
+6. **Create the incoming webhook** in `spaces/AAQAKhvMYtg` and set
    `RECEIPTS_CHAT_WEBHOOK`. Unset ⇒ the cron answers `{skipped:"no-webhook"}`.
-6. **Only then** set `RECEIPT_REQUEST_CARDS_ENABLED=true`, and turn Beverly's own
+7. **Only then** set `RECEIPT_REQUEST_CARDS_ENABLED=true`, and turn Beverly's own
    missing-receipt asks OFF in the same step (risk 5).
-7. `BANK_LINE_MINT_FROM_QBO` stays unset until somebody is watching the first run:
+8. `BANK_LINE_MINT_FROM_QBO` stays unset until somebody is watching the first run:
    minting creates canonical ledger rows and `amountCents` is immutable by trigger.

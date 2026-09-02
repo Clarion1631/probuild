@@ -269,8 +269,10 @@ test("a memo signed DURING the sweep is not un-answered by it", async () => {
 
 test("the sweep's real apply path reads fresh, not from the run-start snapshot", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    const applyAt = source.indexOf("applyReceiptRequestPlan(plan,");
-    const freshReadAt = source.indexOf("const fresh = await prisma.reviewIssue.findUnique(");
+    // The apply path is per COMPONENT and inside its transaction now, so the
+    // fresh read is on `tx` — same rule, one scope tighter.
+    const applyAt = source.indexOf("const applied = await applyReceiptRequestPlan(");
+    const freshReadAt = source.indexOf("const fresh = await tx.reviewIssue.findUnique(");
     assert.ok(applyAt > 0 && freshReadAt > applyAt, "the read must be INSIDE the per-issue callback");
     assert.match(source, /if \(codes\.length > 0 && hasResolution\(freshDetails\)\)/);
     assert.match(source, /mergeReceiptRequestDetails\(freshDetails, displayDetails\)/);

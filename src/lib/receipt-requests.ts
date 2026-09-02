@@ -1155,7 +1155,8 @@ function fingerprint(parts: readonly string[]): string {
  * its input is an assurance about nothing.
  */
 export function componentVersionOf(input: {
-    issues: ReadonlyArray<{ updatedAt: Date | string | null }>;
+    /** `targetKey` is carried so a caller can filter to one component. */
+    issues: ReadonlyArray<{ targetKey?: string; updatedAt: Date | string | null }>;
     intakes: ReadonlyArray<{ updatedAt: Date | string | null }>;
     lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null }>;
     expenses?: ReadonlyArray<{ id: string; hasReceipt: boolean }>;

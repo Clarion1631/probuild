@@ -42,8 +42,11 @@ test("the three Drive outcomes map to three different answers", () => {
     assert.match(route, /if \(!isDriveFileId\(body\.pdf_id\)\) \{[\s\S]{0,400}status: 422/);
     // Google answered "not there": 422 as well — retrying will not change it.
     assert.match(route, /if \(probe\.kind === "missing"\) \{[\s\S]{0,300}status: 422/);
-    // We could not ASK: 503 with retry. Never a recorded resolution.
-    assert.match(route, /if \(probe\.kind === "unreachable"\) \{[\s\S]{0,400}retry: true[\s\S]{0,120}status: 503/);
+    // We could not ASK: 503 with retry. Never a recorded resolution — and a
+    // MISSING CREDENTIAL is named separately, because it will not fix itself.
+    assert.match(route, /if \(probe\.kind === "unreachable"\) \{[\s\S]{0,1200}retry: true[\s\S]{0,200}status: 503/);
+    assert.match(route, /const unconfigured = probe\.reason === "no-drive-token";/);
+    assert.match(route, /reason: unconfigured \? "drive-not-configured" : "artifact-unverifiable",/);
     // The probe runs BEFORE the write loop, and the id is persisted.
     const probeAt = route.indexOf("const probe = await probeDriveFile(pdfId);");
     const writeAt = route.indexOf("details.resolution = \"memo-signed\";");
@@ -61,7 +64,11 @@ test("the probe never falls back to mock data, and reads metadata only", () => {
     const drive = readFileSync(join(repoRoot, "src/lib/google-drive.ts"), "utf8");
     const fn = drive.slice(drive.indexOf("export async function probeDriveFile("));
     const body = fn.slice(0, fn.indexOf("\n}"));
-    assert.match(body, /if \(!loadToken\(\)\) return \{ kind: "unreachable", reason: "no-drive-token" \};/);
+    // The STORED company credential counts too — an admin who completed the
+    // connect flow was otherwise still told "no token" on every call.
+    assert.match(body, /if \(!\(await ensureDriveAuth\(\)\)\.ok\) return \{ kind: "unreachable", reason: "no-drive-token" \};/);
+    const client = readFileSync(join(repoRoot, "src/lib/gmail-client.ts"), "utf8");
+    assert.match(client, /googleDriveRefreshToken: true/, "ensureDriveAuth reads the stored credential");
     assert.doesNotMatch(body, /getMock/, "no mock fallback on the verification path");
     // Metadata, bounded — never a download.
     assert.match(body, /fields: "id, name, trashed, webViewLink"/);
