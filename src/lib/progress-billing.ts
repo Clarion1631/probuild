@@ -799,7 +799,11 @@ export async function stageProgressBillingToQuickBooksCore(
             total: billing.total,
         }),
     };
-    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
+    // Captured once and reused for the promotion below — the ambiguous-create
+    // marker must carry this SAME claim time, not a fresh one taken after the
+    // request ends. See composeCreateMarker's `at` param.
+    const claimedAt = new Date();
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
     const claimedSend = await db.updateMany({
         where: { id: billing.id, status: "Draft", qbInvoiceId: null, qbSyncError: null },
         data: { qbSyncError: inFlightMarker },
@@ -837,7 +841,7 @@ export async function stageProgressBillingToQuickBooksCore(
         // rather than double-billing.
         await db.updateMany({
             where: { id: billing.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
-            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity) },
+            data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity, claimedAt) },
         });
         await logEvent({
             kind: "qbo-payments-sync",

@@ -98,16 +98,25 @@ const MARKER_FIELD_SEP = "|";
  * Prefixes the epoch-ms a `create-in-flight` claim was written, e.g.
  * `create-in-flight:@1730000000000|INV-00171-2|ProBuild ...`.
  *
- * Only CREATE_IN_FLIGHT_MARKER carries one. Neither PaymentSchedule nor
- * ProgressBilling has an `updatedAt` column, so this is the only durable place
- * to record when the claim was taken -- and it is needed exactly once, by
+ * Both CREATE_IN_FLIGHT_MARKER and AMBIGUOUS_CREATE_MARKER carry one. Neither
+ * PaymentSchedule nor ProgressBilling has an `updatedAt` column, so this is the
+ * only durable place to record when the claim was taken -- and it is needed by
  * `resolveAmbiguousInvoiceCreateCore`'s liveness check: a `confirmed-none`
  * clear on a marker with no readable age, or one younger than
- * `CREATE_IN_FLIGHT_STALE_MS`, must refuse rather than assume the peer that
- * wrote it is gone. AMBIGUOUS_CREATE_MARKER never needs this: by the time a
- * marker is promoted to it, the create request has already ended (a timeout or
- * a definite unknown-outcome failure), so there is no "still running" case left
- * to protect against.
+ * `CREATE_IN_FLIGHT_STALE_MS`, must refuse rather than assume the request it
+ * describes has definitely finished landing in QuickBooks.
+ *
+ * A create-in-flight marker's timestamp is when the claim was taken; a
+ * promotion to ambiguous-create MUST carry that SAME original timestamp
+ * forward (composeCreateMarker takes an explicit `at`, callers must reuse the
+ * one from the in-flight marker they are promoting), not a fresh one taken at
+ * promotion time. Our own deadline firing only means WE gave up waiting -- the
+ * request can still be landing at QuickBooks' end for a while after that. If
+ * the promoted marker restarted the clock, the resolver's cooldown would judge
+ * "is the original request still plausibly in flight?" against the wrong
+ * origin and let an operator clear it (via `confirmed-none`) before that
+ * original request has had time to become visible, opening the exact
+ * double-create window this whole marker exists to close.
  */
 const MARKER_TIME_PREFIX = "@";
 /**
@@ -131,6 +140,14 @@ const MARKER_HASH_PREFIX = "#";
 export function composeCreateMarker(
     kind: typeof CREATE_IN_FLIGHT_MARKER | typeof AMBIGUOUS_CREATE_MARKER,
     identity: CreateIdentity,
+    /**
+     * When the ORIGINAL create-in-flight claim was taken. Defaults to now,
+     * which is correct when composing a fresh `create-in-flight` marker. A
+     * caller promoting an existing in-flight marker to `ambiguous-create` MUST
+     * pass the in-flight marker's own `at` through unchanged -- see the doc
+     * comment on MARKER_TIME_PREFIX for why a fresh timestamp there would be
+     * wrong.
+     */
     at: Date = new Date(),
 ): string {
     // A docNumber containing the field separator would make the split
@@ -152,7 +169,10 @@ export function composeCreateMarker(
     if (identity.issuanceHash != null && !/^[0-9a-f]+$/.test(identity.issuanceHash)) {
         throw new Error(`Issuance hash must be lowercase hex: ${identity.issuanceHash}`);
     }
-    const timePart = kind === CREATE_IN_FLIGHT_MARKER ? `${MARKER_TIME_PREFIX}${at.getTime()}${MARKER_FIELD_SEP}` : "";
+    // Both marker kinds carry the timestamp now -- a promotion to
+    // ambiguous-create must preserve the in-flight claim's original time, not
+    // reset it. See the doc comment on MARKER_TIME_PREFIX.
+    const timePart = `${MARKER_TIME_PREFIX}${at.getTime()}${MARKER_FIELD_SEP}`;
     const hashPart = identity.issuanceHash
         ? `${MARKER_HASH_PREFIX}${identity.issuanceHash}${MARKER_FIELD_SEP}`
         : "";
@@ -175,10 +195,10 @@ export function markerKind(qbSyncError: string | null | undefined): string | nul
  * for, and the caller must refuse rather than guess (see the identity-unknown
  * refusal in qbo-ambiguous-create.ts).
  *
- * `atMs` is the embedded claim time for a `create-in-flight` marker (see
- * `MARKER_TIME_PREFIX`), or `null` when the marker carries none -- either it is
- * not that kind, or it predates this field (legacy row: treat as unknown age,
- * never as fresh).
+ * `atMs` is the embedded claim time (see `MARKER_TIME_PREFIX`) -- the ORIGINAL
+ * in-flight claim's time, preserved through a promotion to ambiguous-create --
+ * or `null` when the marker carries none, i.e. it predates this field (legacy
+ * row: treat as unknown age, never as fresh).
  */
 export function parseCreateMarker(
     qbSyncError: string | null | undefined,

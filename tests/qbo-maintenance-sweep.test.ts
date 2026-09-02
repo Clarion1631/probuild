@@ -40,10 +40,16 @@ function rows(count: number, prefix = "ps"): FakeRow[] {
 }
 
 /** Paging semantics Prisma gives us: orderBy id asc, cursor + skip:1, take. */
-function makePrisma(all: FakeRow[], opts: { onPage?: () => void } = {}) {
+function makePrisma(all: FakeRow[], opts: { onPage?: () => void; settings?: Map<string, string> } = {}) {
     const seen: string[] = [];
+    // Backs automationSettingCursorStore (src/lib/quickbooks-payments.ts) —
+    // the same key/value table the sweep's resume cursor now persists to.
+    // Pre-seed via `opts.settings`, or read it back afterward, to assert on
+    // what a run stored for the NEXT invocation to pick up.
+    const settingsStore = opts.settings ?? new Map<string, string>();
     return {
         seen,
+        settingsStore,
         client: {
             integration: {
                 async findUnique() {
@@ -61,6 +67,16 @@ function makePrisma(all: FakeRow[], opts: { onPage?: () => void } = {}) {
                 },
                 async upsert() {
                     return {};
+                },
+            },
+            automationSetting: {
+                async findUnique(args: any) {
+                    const value = settingsStore.get(args.where.key);
+                    return value === undefined ? null : { value };
+                },
+                async upsert(args: any) {
+                    settingsStore.set(args.where.key, args.create?.value ?? args.update?.value);
+                    return { key: args.where.key, value: settingsStore.get(args.where.key) };
                 },
             },
             automationEvent: { async create() { return {}; } },
@@ -212,6 +228,66 @@ test("stopping early reports truncated + how many are left", async () => {
     // Counted from the database after the last row it actually finished, so it
     // includes everything the cursor never reached.
     assert.equal(body.remaining, 37, `remaining was ${body.remaining}`);
+});
+
+// --- Codex gate (round 30): the cursor used to be re-seeded to null every ---
+// --- invocation, so a stopped run re-walked the SAME leading rows on retry ---
+// --- and anything past the cap was never reached — a starved tail, forever.
+
+test("an outage persists the resume cursor for the NEXT invocation", async () => {
+    const all = rows(40);
+    const settings = new Map<string, string>();
+
+    const { client: client1 } = makePrisma(all, { settings });
+    await withEnvAndFakes(client1, makeFetch({ "qb-3": 401 }), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        await POST(request());
+    });
+    assert.equal(
+        settings.get("qbo-maintenance.sync-payment-options.cursor"),
+        "ps-0002",
+        "resumes after the last row it actually finished, not from the top",
+    );
+
+    // A second, independent invocation — same persisted store, no more
+    // failures — must resume straight into the tail rather than re-checking
+    // rows 0-2 again.
+    const { client: client2, seen } = makePrisma(all, { settings });
+    const body = await withEnvAndFakes(client2, makeFetch(), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        return (await POST(request())).json();
+    });
+    assert.deepEqual(seen, all.slice(3).map((r) => r.id), "resumed into the tail, never re-checked the already-finished head");
+    assert.equal(body.checked, 37);
+    assert.equal(body.ok, true);
+});
+
+test("a run that walks the WHOLE collection resets the cursor to the top", async () => {
+    // Otherwise the window would keep resuming from the tail end forever and
+    // never come back around to re-verify the rows near the top.
+    const all = rows(5);
+    const settings = new Map<string, string>();
+    const { client } = makePrisma(all, { settings });
+    const body = await withEnvAndFakes(client, makeFetch(), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        return (await POST(request())).json();
+    });
+    assert.equal(body.ok, true);
+    assert.equal(settings.get("qbo-maintenance.sync-payment-options.cursor"), "", "reset to the top for a fresh rolling window");
+});
+
+test("a run that starts with no stored cursor at all behaves exactly as before", async () => {
+    // The fake Prisma's automationSetting table starts empty (get() -> null),
+    // matching automationSettingCursorStore's own "never throws" contract —
+    // this is the very first invocation ever, or a lost/expired setting.
+    const all = rows(5);
+    const { client, seen } = makePrisma(all);
+    const body = await withEnvAndFakes(client, makeFetch(), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        return (await POST(request())).json();
+    });
+    assert.equal(body.checked, 5);
+    assert.deepEqual(seen, all.map((r) => r.id));
 });
 
 test("a 404 row is a finding, not a failure", async () => {

@@ -399,6 +399,34 @@ test("createQBReceiptPurchase treats a TERMINAL attachment failure as non-fatal"
     }
 });
 
+// ─── Purchase create: an unreadable 2xx is retryable, not a terminal 500 ───
+
+test("createQBReceiptPurchase treats a malformed/empty 2xx purchase-create response as retryable", async () => {
+    // Codex gate: parseJsonOrNull degrades a genuine parse failure to `null`,
+    // and the old code turned that (and any 2xx body with neither Purchase nor
+    // Fault) into a bare Error — reaching the route as a terminal push-failed
+    // 500 instead of the retryable 503 an unknown create outcome actually is.
+    // The `requestid` this create is sent under makes a QuickBooks retry safe
+    // either way this one actually resolved. Drives the REAL
+    // defaultQbCreatePurchase (qbCreateFn left unset) through real fetch; the
+    // account/vendor/customer/query seams stay faked so only the create call
+    // itself is real.
+    const { deps } = createDeps();
+    delete deps.qbCreateFn;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+        new Response("not json at all", { status: 200, headers: { "content-type": "application/json" } })
+    ) as typeof fetch;
+    try {
+        await assert.rejects(
+            () => createQBReceiptPurchase(TOKENS, baseInput(), deps),
+            (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        );
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 // ─── Vendor 6240 duplicate-name recovery ───────────────────────────────────
 
 test("createQBReceiptPurchase maps a QboVendorDuplicateError to a terminal duplicate-name result", async () => {

@@ -1356,10 +1356,23 @@ export async function createQBPaymentForInvoiceWithDetails(
     return { ok: true, paymentId: sent.paymentId, amount: sent.amount, requestBody: built.requestBody };
 }
 
-/** Hard-delete a payment (test cleanup). */
+/**
+ * Hard-delete a payment (test cleanup, and the rebalance loop's invoice
+ * replacement in billing-core.ts).
+ *
+ * 404 is authoritative — the payment is already gone — and stays `false`, same
+ * as `readQBInvoice`'s rule. Every OTHER failure (401/403/429/5xx) is the
+ * SAME wall the next call in a loop would hit identically; collapsing it into
+ * `false` read as an ordinary per-row "couldn't delete" refusal, so a caller
+ * looping over rows (see isSharedQboWall) never saw the outage and kept
+ * spending its deadline proving the same wall on every remaining row. Thrown
+ * instead, via the shared classifier, so it propagates like any other QBO
+ * failure.
+ */
 export async function deleteQBPayment(tokens: QBTokens, paymentId: string, deadline?: RouteDeadline): Promise<boolean> {
     const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET", qbDeadline: deadline });
-    if (!get.ok) return false;
+    if (get.status === 404) return false;
+    if (!get.ok) throw await qboResponseError(get, `QB payment ${paymentId} read`);
     const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
     const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
@@ -1370,10 +1383,20 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string, deadl
             body: JSON.stringify({ Id: paymentId, SyncToken: syncToken }),
         }
     );
-    return res.ok;
+    if (res.status === 404) return false;
+    if (!res.ok) throw await qboResponseError(res, `QB payment ${paymentId} delete`);
+    return true;
 }
 
-/** Hard-delete an invoice (test cleanup). Fails in QBO if payments are still linked. */
+/**
+ * Hard-delete an invoice (test cleanup, and the rebalance loop's invoice
+ * replacement in billing-core.ts). Fails in QBO if payments are still linked.
+ *
+ * Same authoritative-vs-shared split as `deleteQBPayment`: `readQBInvoice`
+ * already throws for a non-404 read failure, so only the delete POST needed
+ * the same treatment here. See its doc comment for why a shared failure must
+ * be thrown rather than collapsed into `false`.
+ */
 export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<boolean> {
     const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv) return false;
@@ -1386,7 +1409,9 @@ export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string, dea
             body: JSON.stringify({ Id: qbInvoiceId, SyncToken: inv.syncToken }),
         }
     );
-    return res.ok;
+    if (res.status === 404) return false;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} delete`);
+    return true;
 }
 
 /** Read an invoice's online-payment toggles + sync token (for sparse updates). */

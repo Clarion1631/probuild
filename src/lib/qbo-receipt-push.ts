@@ -365,7 +365,17 @@ async function defaultQbCreatePurchase(
         if (data?.Fault) {
             throw new QboPurchaseFaultError(res.status, `QB purchase create returned a Fault: ${JSON.stringify(data.Fault).slice(0, 500)}`, faultCode);
         }
-        throw new Error("QB purchase create returned no Purchase body");
+        // QuickBooks answered 2xx but the body was unusable — empty or
+        // malformed JSON (parseJsonOrNull degrades a genuine parse failure to
+        // `null`), or valid JSON with neither a Purchase nor a Fault. Whether
+        // the Purchase actually landed is genuinely UNKNOWN from here, same as
+        // a timeout — a generic Error used to reach the route as a terminal
+        // push-failed/500, which then either gave up or got retried without
+        // ever surfacing the ambiguity as retryable. QboRetryableError instead:
+        // the route maps it to a retryable 503, and the `requestid` this create
+        // was sent under makes QuickBooks itself dedupe the replay, so
+        // retrying is safe either way this actually resolved.
+        throw new QboRetryableError("QB purchase create returned an unreadable 2xx response (no Purchase, no Fault)");
     }
     return { id: data.Purchase.Id };
 }

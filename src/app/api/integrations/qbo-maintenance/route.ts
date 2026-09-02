@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, automationSettingCursorStore } from "@/lib/quickbooks-payments";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -98,13 +98,25 @@ export async function POST(req: Request) {
         }
         if (body.action === "delete-qbo-payment") {
             if (!body.qbPaymentId) return NextResponse.json({ ok: false, reason: "qbPaymentId required" }, { status: 400 });
-            const deleted = await deleteQBPayment(qbTokens, body.qbPaymentId, deadline);
-            return NextResponse.json({ ok: deleted });
+            // deleteQBPayment now throws (rather than returning false) on a
+            // shared QBO failure (401/403/429/5xx) so a caller looping over
+            // rows can tell it apart from a per-document refusal — this single
+            // caller has no loop to protect, so it just reports the failure.
+            try {
+                const deleted = await deleteQBPayment(qbTokens, body.qbPaymentId, deadline);
+                return NextResponse.json({ ok: deleted });
+            } catch (e) {
+                return NextResponse.json({ ok: false, reason: e instanceof Error ? e.message.slice(0, 300) : "delete failed" }, { status: 500 });
+            }
         }
         if (body.action === "delete-qbo-invoice") {
             if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
-            const deleted = await deleteQBInvoice(qbTokens, body.qbInvoiceId, deadline);
-            return NextResponse.json({ ok: deleted });
+            try {
+                const deleted = await deleteQBInvoice(qbTokens, body.qbInvoiceId, deadline);
+                return NextResponse.json({ ok: deleted });
+            } catch (e) {
+                return NextResponse.json({ ok: false, reason: e instanceof Error ? e.message.slice(0, 300) : "delete failed" }, { status: 500 });
+            }
         }
     }
 
@@ -147,12 +159,21 @@ export async function POST(req: Request) {
     const SWEEP_PAGE_SIZE = 100;
     const scheduleWhere = { qbInvoiceId: { not: null }, status: { not: "Paid" } } as const;
 
+    // Where this sweep resumes from, run to run. Same idea and store as the
+    // payments/pay-link sweeps' resume cursors (quickbooks-payments.ts): the
+    // cursor used to be re-seeded to `null` on every invocation, so a budget
+    // cutoff or an outage always re-walked the SAME leading rows on retry and
+    // anything past the cap was never reached — a starved tail, forever.
+    const SWEEP_CURSOR_KEY = "qbo-maintenance.sync-payment-options.cursor";
+
     const results: { qbInvoiceId: string; code: string; result: string }[] = [];
     // Same rule as the payments loop: a shared connection failure means every
     // remaining row fails identically at full cost, so stop and report what was
     // done instead of burning the ceiling proving it 200 times over.
     let abortedReason: string | null = null;
-    let cursor: string | null = null;
+    // "" is how "start from the top" is stored; it is never a real id.
+    const storedCursor = await automationSettingCursorStore.get(SWEEP_CURSOR_KEY);
+    let cursor: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
     let lastCompletedId: string | null = null;
 
     pager: while (!abortedReason) {
@@ -210,6 +231,15 @@ export async function POST(req: Request) {
         }
         if (page.length < SWEEP_PAGE_SIZE) break;
     }
+
+    // Persist where to resume. A run that stopped early (budget or a shared
+    // outage) resumes from the last row it actually finished, so the NEXT
+    // invocation continues into the tail instead of re-checking the same
+    // leading rows again. A run that walked the whole collection resets to the
+    // top ("") so the window rolls over the whole set rather than resuming
+    // from the end forever. Never throws — a lost cursor costs one restart
+    // from the top, never correctness (see automationSettingCursorStore).
+    await automationSettingCursorStore.set(SWEEP_CURSOR_KEY, abortedReason ? (lastCompletedId ?? "") : "");
 
     // How many rows this run never reached. Counted from the database rather
     // than inferred from the page, so it includes everything past the cursor.

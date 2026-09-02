@@ -37,6 +37,7 @@ import {
 import {
     PAYLINK_PENDING_MARKER,
     CREATE_IN_FLIGHT_MARKER,
+    AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_STALE_MS,
     parseCreateMarker,
     getFreshQBTokens,
@@ -329,14 +330,20 @@ export async function resolveAmbiguousInvoiceCreateCore(
             message: `No QuickBooks invoice matches ${parked.identity.docNumber}. If you have checked QuickBooks yourself, confirm none exists to clear this and send again.`,
         };
     }
-    // A `create-in-flight` marker means the POST may STILL be running — the row
-    // is only promoted to `ambiguous-create` once that request has definitely
-    // ended. Clearing it here would let a second operator start another create
-    // while the first is still landing, so a marker without a readable claim
-    // time, or one younger than CREATE_IN_FLIGHT_STALE_MS, refuses outright.
-    // Neither table carries `updatedAt`, so an unreadable age is the common
-    // case today, not the exception — that is deliberately fail-closed.
-    if (parked.kind === CREATE_IN_FLIGHT_MARKER) {
+    // A `create-in-flight` marker means the POST may STILL be running. A row
+    // promoted to `ambiguous-create` means OUR wait for that same request ended
+    // (a timeout, or a definite unknown-outcome failure) — but our deadline
+    // firing only means WE gave up; the original request can still be landing
+    // at QuickBooks' end for a while afterward, and may not be visible to the
+    // lookup above yet. Both kinds carry the ORIGINAL claim's timestamp (see
+    // composeCreateMarker), so both get the same cooldown here: clearing either
+    // one too early would let a second create go out — or let the operator
+    // conclude "none exists" — while the first request is still landing. A
+    // marker without a readable claim time, or one younger than
+    // CREATE_IN_FLIGHT_STALE_MS, refuses outright. Neither table carries
+    // `updatedAt`, so an unreadable age is the common case today, not the
+    // exception — that is deliberately fail-closed.
+    if (parked.kind === CREATE_IN_FLIGHT_MARKER || parked.kind === AMBIGUOUS_CREATE_MARKER) {
         const stillActive = parked.atMs == null || Date.now() - parked.atMs < CREATE_IN_FLIGHT_STALE_MS;
         if (stillActive) {
             return {

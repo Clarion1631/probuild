@@ -1817,7 +1817,11 @@ test("the milestone claim writes an identity-carrying marker, and compensation u
     // the docNumber later (it is a POSITION) or the note (it carries names)
     // would ask QuickBooks about a document we never created.
     assert.match(push, /const identity = \{ docNumber, privateNote, issuanceHash \}/);
-    assert.match(push, /composeCreateMarker\(CREATE_IN_FLIGHT_MARKER, identity\)/);
+    // The SAME claim timestamp is captured once and threaded into both the
+    // in-flight marker and its later promotion to ambiguous-create — a
+    // promotion must never reset the clock the resolver's cooldown reads.
+    assert.match(push, /const claimedAt = new Date\(\)/);
+    assert.match(push, /composeCreateMarker\(CREATE_IN_FLIGHT_MARKER, identity, claimedAt\)/);
     // The identity also carries a hash of the MONEY STATE the invoice is issued
     // against, taken from the literals the post-create CAS pins rather than
     // from the loaded row — otherwise a row that was already moved on at load
@@ -1852,4 +1856,115 @@ test("round 29 gate: the final link write proves ownership of the in-flight mark
         push,
         /compensateAndUnlink\(\s*prisma\.paymentSchedule,\s*schedule\.id,\s*qbId,\s*\(\)\s*=>\s*deleteQBInvoice\(tokens, qbId, cleanupDeadline\),\s*\{\},\s*inFlightMarker,\s*\)/,
     );
+});
+
+// --- deleteQBPayment / deleteQBInvoice: authoritative 404 vs. the shared wall ---
+
+/**
+ * Codex gate (round 30): both delete helpers collapsed EVERY non-2xx — a real
+ * 404 "already gone" AND a 401/403/429/5xx shared outage alike — into a bare
+ * `false`. The billing-core rebalance loop reads a `false` as a per-row
+ * refusal and carries on to the next row (see isSharedQboWall); with the
+ * outage disguised as an ordinary "couldn't delete", the loop kept dialling
+ * the same dead connection at full cost on every remaining row instead of
+ * stopping on the first one. 404 stays authoritative (`false`); everything
+ * else must now throw, same rule as readQBInvoice already applied to its read.
+ */
+
+/** Typed wrapper so a URL/method-aware mock can be passed to withFetch. */
+function fakeFetch(impl: (url: string | URL, init?: RequestInit) => Response | Promise<Response>): typeof fetch {
+    return (async (url: string | URL, init?: RequestInit) => impl(url, init)) as unknown as typeof fetch;
+}
+
+test("deleteQBPayment: a 404 read is authoritative — false, no delete attempted", async () => {
+    const { deleteQBPayment } = await import("../src/lib/quickbooks");
+    let posted = false;
+    const deleted = await withFetch(fakeFetch((url) => {
+        if (String(url).includes("/payment/")) return json(404, {});
+        posted = true;
+        return json(200, {});
+    }), () => deleteQBPayment(TOKENS, "pay-1"));
+    assert.equal(deleted, false);
+    assert.equal(posted, false, "never attempted a delete of a payment that is already gone");
+});
+
+test("deleteQBPayment: a shared failure on the READ throws instead of collapsing to false", async () => {
+    const { deleteQBPayment } = await import("../src/lib/quickbooks");
+    for (const status of [401, 429, 503]) {
+        await assert.rejects(
+            () => withFetch(fakeFetch(() => json(status, { Fault: {} })), () => deleteQBPayment(TOKENS, "pay-1")),
+            (error: unknown) => (error as Error).name === "QboHttpError" || (error as Error).name === "QboRetryableError",
+            String(status),
+        );
+    }
+});
+
+test("deleteQBPayment: a 404 on the DELETE itself is also authoritative — false", async () => {
+    const { deleteQBPayment } = await import("../src/lib/quickbooks");
+    const deleted = await withFetch(fakeFetch((url, init) => {
+        if (String(url).includes("/payment/") && (!init || init.method === "GET")) {
+            return json(200, { Payment: { SyncToken: "3" } });
+        }
+        return json(404, {}); // gone between the read and the delete
+    }), () => deleteQBPayment(TOKENS, "pay-1"));
+    assert.equal(deleted, false);
+});
+
+test("deleteQBPayment: a shared failure on the DELETE POST throws", async () => {
+    const { deleteQBPayment } = await import("../src/lib/quickbooks");
+    await assert.rejects(
+        () => withFetch(fakeFetch((url, init) => {
+            if (String(url).includes("/payment/") && (!init || init.method === "GET")) {
+                return json(200, { Payment: { SyncToken: "3" } });
+            }
+            return json(503, { Fault: {} });
+        }), () => deleteQBPayment(TOKENS, "pay-1")),
+        (error: unknown) => (error as Error).name === "QboRetryableError",
+    );
+});
+
+test("deleteQBPayment: a clean read + delete returns true", async () => {
+    const { deleteQBPayment } = await import("../src/lib/quickbooks");
+    const deleted = await withFetch(fakeFetch((url, init) => {
+        if (String(url).includes("/payment/") && (!init || init.method === "GET")) {
+            return json(200, { Payment: { SyncToken: "3" } });
+        }
+        return json(200, { Payment: { Id: "pay-1" } });
+    }), () => deleteQBPayment(TOKENS, "pay-1"));
+    assert.equal(deleted, true);
+});
+
+test("deleteQBInvoice: a 404 DELETE (post-read) is authoritative — false", async () => {
+    const { deleteQBInvoice } = await import("../src/lib/quickbooks");
+    const deleted = await withFetch(fakeFetch((url, init) => {
+        if (String(url).includes("/invoice/") && (!init || init.method === "GET")) {
+            return json(200, { Invoice: { SyncToken: "1", TotalAmt: 100, Balance: 0, CustomerRef: { value: "c1" } } });
+        }
+        return json(404, {}); // gone between the read and the delete
+    }), () => deleteQBInvoice(TOKENS, "inv-1"));
+    assert.equal(deleted, false);
+});
+
+test("deleteQBInvoice: a shared failure on the DELETE POST throws, not a swallowed false", async () => {
+    const { deleteQBInvoice } = await import("../src/lib/quickbooks");
+    await assert.rejects(
+        () => withFetch(fakeFetch((url, init) => {
+            if (String(url).includes("/invoice/") && (!init || init.method === "GET")) {
+                return json(200, { Invoice: { SyncToken: "1", TotalAmt: 100, Balance: 0, CustomerRef: { value: "c1" } } });
+            }
+            return json(401, { Fault: {} });
+        }), () => deleteQBInvoice(TOKENS, "inv-1")),
+        (error: unknown) => (error as Error).name === "QboHttpError",
+    );
+});
+
+test("deleteQBInvoice: a clean read + delete returns true", async () => {
+    const { deleteQBInvoice } = await import("../src/lib/quickbooks");
+    const deleted = await withFetch(fakeFetch((url, init) => {
+        if (String(url).includes("/invoice/") && (!init || init.method === "GET")) {
+            return json(200, { Invoice: { SyncToken: "1", TotalAmt: 100, Balance: 0, CustomerRef: { value: "c1" } } });
+        }
+        return json(200, { Invoice: { Id: "inv-1" } });
+    }), () => deleteQBInvoice(TOKENS, "inv-1"));
+    assert.equal(deleted, true);
 });

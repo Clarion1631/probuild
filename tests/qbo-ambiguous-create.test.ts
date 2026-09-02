@@ -34,6 +34,17 @@ import { milestoneIssuanceHash, progressBillingIssuanceHash } from "../src/lib/q
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
 
+/**
+ * Ambiguous-create markers now carry the ORIGINAL in-flight claim's timestamp
+ * (a promotion must preserve it, not reset it — see composeCreateMarker), and
+ * the resolver's liveness cooldown applies to both marker kinds. Fixtures
+ * default to a marker well past CREATE_IN_FLIGHT_STALE_MS so the existing
+ * "confirmed-none" tests exercise the resolver's document-matching logic
+ * rather than the cooldown — the cooldown itself is covered by its own
+ * "round 29 gate" tests below, which pin their own timestamps.
+ */
+const AMBIGUOUS_MARKER_AT = new Date(Date.now() - CREATE_IN_FLIGHT_STALE_MS - 60_000);
+
 /** The milestone's real DocNumber and PrivateNote, from the shared helpers. */
 const MILESTONE_DOC = milestoneDocNumber("INV-00171", 2);
 const MILESTONE_NOTE = milestonePrivateNote("INV-00171", "Rough-in", "Mesplay Kitchen");
@@ -71,7 +82,7 @@ function milestoneRow(overrides: Record<string, any> = {}): any {
         ...MILESTONE_STATE,
         qbInvoiceId: null,
         // The marker as the create path writes it: kind + the identity it used.
-        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY),
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT),
         invoiceId: "inv-1",
         invoice: {
             code: "INV-00171",
@@ -93,7 +104,7 @@ function billingRow(overrides: Record<string, any> = {}): any {
             docNumber: "INV-00171-P1",
             privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
             issuanceHash: progressBillingIssuanceHash(BILLING_STATE),
-        }),
+        }, AMBIGUOUS_MARKER_AT),
         invoiceId: "inv-1",
         invoice: { code: "INV-00171", projectId: "proj-1" },
         ...overrides,
@@ -243,6 +254,36 @@ test("round 29 gate: a create-in-flight marker past the staleness window CAN be 
     assert.equal(res.ok, true);
     assert.equal(res.ok && res.outcome, "cleared");
     assert.equal(row.qbSyncError, null);
+});
+
+test("round 30 gate: a young ambiguous-create marker ALSO refuses confirmed-none — promotion preserves the original claim time", async () => {
+    // Our own deadline firing (the timeout that promotes create-in-flight to
+    // ambiguous-create) only means WE gave up waiting — the original request
+    // can still be landing at QuickBooks' end. A promoted marker carries the
+    // ORIGINAL claim time now, so it must be judged by the same cooldown as a
+    // still-fresh create-in-flight marker, not treated as if the wait had
+    // just reset.
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, new Date()) });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(row.qbInvoiceId, null);
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — nothing was cleared");
+});
+
+test("round 30 gate: an ambiguous-create marker with NO readable timestamp (legacy shape) also refuses confirmed-none", async () => {
+    const legacyMarker = `${AMBIGUOUS_CREATE_MARKER}:${MILESTONE_IDENTITY.docNumber}|${MILESTONE_IDENTITY.privateNote}`;
+    const row = milestoneRow({ qbSyncError: legacyMarker });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(row.qbSyncError, legacyMarker, "still parked — nothing was cleared");
 });
 
 test("round 29 gate: a young create-in-flight marker with an EXACT match still links — adopting a real invoice does not depend on age", async () => {
@@ -425,13 +466,16 @@ test("compose/parse round-trips, and a legacy or corrupt marker yields NO identi
     assert.deepEqual(parseCreateMarker(marker), { kind: CREATE_IN_FLIGHT_MARKER, identity, atMs: 1_700_000_000_000 });
 
     // A note containing the field separator survives: the FIRST one splits.
-    // AMBIGUOUS_CREATE_MARKER never carries a timestamp — by the time a marker
-    // is promoted to it the create request has already ended.
+    // AMBIGUOUS_CREATE_MARKER carries a timestamp too — a promotion from
+    // create-in-flight must preserve that marker's ORIGINAL claim time (round
+    // 30: cooldown gap), not reset it, so the resolver's liveness cooldown
+    // still protects the request the promoted marker actually describes.
+    const pipedAt = new Date(1_700_000_001_000);
     const piped = { docNumber: "INV-9-1", privateNote: "ProBuild INV-9 · A|B · Job" };
-    assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, piped)), {
+    assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, piped, pipedAt)), {
         kind: AMBIGUOUS_CREATE_MARKER,
         identity: piped,
-        atMs: null,
+        atMs: 1_700_000_001_000,
     });
 
     // Legacy bare markers: recognised as parked, but with nothing to look up
@@ -482,7 +526,7 @@ test("the queried identity does not move when a sibling is deleted or the projec
     assert.deepEqual(asked, [MILESTONE_DOC], "asked for the ORIGINAL doc number");
     assert.equal(res.ok, true, "and matched the ORIGINAL private note");
     assert.equal(row.qbInvoiceId, "qb-9");
-    assert.equal(markerAtCreate, composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY));
+    assert.equal(markerAtCreate, composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT));
 });
 
 test("a marker with no identity refuses, and confirmed-none cannot clear it", async () => {
