@@ -54,7 +54,42 @@ export const STATEMENTS = [
          FOREIGN KEY ("percentCompleteUpdatedById") REFERENCES "User"("id")
          ON DELETE SET NULL ON UPDATE CASCADE;
      EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+
+    // ScheduleTask.costCodeId — phase attribution for CHANGE-ORDER tasks.
+    // applyChangeOrderToSchedule sets estimateItemId null on everything it
+    // creates, so a CO task had no route to a cost code, while approved CO
+    // dollars WERE already in the phase budget. Net effect before this: a
+    // CO-only phase could never advance past 0%.
+    `ALTER TABLE "ScheduleTask" ADD COLUMN IF NOT EXISTS "costCodeId" TEXT`,
+    `CREATE INDEX IF NOT EXISTS "ScheduleTask_costCodeId_idx" ON "ScheduleTask"("costCodeId")`,
+    `DO $$ BEGIN
+       ALTER TABLE "ScheduleTask" ADD CONSTRAINT "ScheduleTask_costCodeId_fkey"
+         FOREIGN KEY ("costCodeId") REFERENCES "CostCode"("id")
+         ON DELETE SET NULL ON UPDATE CASCADE;
+     EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
 ];
+
+// One-shot backfill for CO tasks created before the column existed. No durable
+// task→ChangeOrderItem link exists (the child task is created from the item's
+// `name`, in order), so the join is the name — and a name match is only
+// trustworthy when it is UNAMBIGUOUS on both sides. Both guards are required.
+// Anything ambiguous stays null and goes on being unattributed, which is the
+// honest outcome rather than a guessed phase. Idempotent (`costCodeId IS NULL`).
+export const BACKFILL_CO_TASK_COST_CODES = `
+    UPDATE "ScheduleTask" st
+    SET "costCodeId" = ci."costCodeId"
+    FROM "ChangeOrderItem" ci
+    WHERE st."generatedFromChangeOrderId" = ci."changeOrderId"
+      AND st."name" = ci."name"
+      AND st."costCodeId" IS NULL
+      AND st."estimateItemId" IS NULL
+      AND st."type" = 'task'
+      AND ci."costCodeId" IS NOT NULL
+      AND (SELECT COUNT(*) FROM "ChangeOrderItem" c2
+           WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name") = 1
+      AND (SELECT COUNT(*) FROM "ScheduleTask" s2
+           WHERE s2."generatedFromChangeOrderId" = st."generatedFromChangeOrderId"
+             AND s2."name" = st."name" AND s2."type" = 'task') = 1`;
 
 export const EXPECTED_COLUMNS = [
     "percentComplete",
@@ -92,10 +127,30 @@ try {
     if (fk.length !== 1) process.exit(1);
 
     const idx = await prisma.$queryRawUnsafe(
-        `SELECT indexname FROM pg_indexes WHERE indexname = 'Project_percentCompleteUpdatedById_idx'`
+        `SELECT indexname FROM pg_indexes WHERE indexname IN
+         ('Project_percentCompleteUpdatedById_idx', 'ScheduleTask_costCodeId_idx')`
     );
-    console.log(`verified ${idx.length}/1 index present`);
-    if (idx.length !== 1) process.exit(1);
+    console.log(`verified ${idx.length}/2 indexes present`);
+    if (idx.length !== 2) process.exit(1);
+
+    const taskCol = await prisma.$queryRawUnsafe(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'ScheduleTask' AND column_name = 'costCodeId'`
+    );
+    console.log(`verified ${taskCol.length}/1 ScheduleTask.costCodeId present`);
+    if (taskCol.length !== 1) process.exit(1);
+
+    const backfilled = await prisma.$executeRawUnsafe(BACKFILL_CO_TASK_COST_CODES);
+    console.log(`backfilled ${backfilled} change-order task(s) with a cost code`);
+
+    const stillUnattributed = await prisma.$queryRawUnsafe(
+        `SELECT COUNT(*)::int AS n FROM "ScheduleTask"
+         WHERE "generatedFromChangeOrderId" IS NOT NULL AND "type" = 'task'
+           AND "costCodeId" IS NULL AND "estimateItemId" IS NULL`
+    );
+    // Not a failure: ambiguous names and CO parent rows legitimately stay null.
+    // Reported so the number is visible rather than assumed to be zero.
+    console.log(`${stillUnattributed[0].n} CO task(s) remain without a cost code (ambiguous name or CO parent row)`);
 } finally {
     await prisma.$disconnect();
 }

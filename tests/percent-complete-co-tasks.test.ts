@@ -1,0 +1,263 @@
+/**
+ * Change-order tasks must count toward percent complete.
+ *
+ * THE BUG THIS LOCKS DOWN. Approved change-order dollars ARE part of a phase's
+ * budget (job-variance-db.ts pushes ChangeOrderItem rows into the budget side).
+ * But applyChangeOrderToSchedule sets `estimateItemId: null` on every task it
+ * creates — CO scope lives in ChangeOrderItem, a different table — and the
+ * recalc used to load only tasks WITH an estimateItemId. Net effect:
+ *
+ *   - a CO-only phase carried real budget weight and could never advance past
+ *     0%, permanently dragging the whole job's percentage down;
+ *   - CO work in a phase shared with the original estimate silently inherited
+ *     the estimate tasks' progress instead of reporting its own.
+ *
+ * The fix is ScheduleTask.costCodeId, stamped at generation for both estimate-
+ * and CO-generated tasks, with the recalc resolving
+ * `estimateItem?.costCodeId ?? task.costCodeId`.
+ *
+ * Prisma is faked with the scoped CJS require() patch used across this repo —
+ * `mock.module()` is unusable here (CI pins Node 20).
+ */
+
+import { test, before, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import Module from "node:module";
+
+interface Fixture {
+    estimateItems: any[];
+    changeOrderItems: any[];
+    scheduleTasks: any[];
+}
+let fixture: Fixture;
+let recordedTaskQuery: any;
+let written: { auto: number | null } | null;
+
+const estimateItem = (id: string, costCodeId: string | null, total: number) => ({
+    id, name: id, type: "Labor", parentId: null, total,
+    costCodeId,
+    costCode: costCodeId ? { code: costCodeId, name: costCodeId } : null,
+    costType: { name: "Labor" },
+});
+
+const coItem = (id: string, costCodeId: string | null, total: number) => ({
+    id, name: id, total, type: "Labor",
+    costCodeId,
+    costCode: costCodeId ? { code: costCodeId, name: costCodeId } : null,
+    costType: { name: "Labor" },
+});
+
+/** An estimate-generated task: phase comes from the live estimate item. */
+const estimateTask = (id: string, costCodeId: string | null, status: string) => ({
+    id, status, type: "task",
+    costCodeId: costCodeId,           // stamped at generation
+    estimateItem: { costCodeId },     // and resolvable live
+});
+
+/** A CO-generated task: estimateItemId is ALWAYS null, so the stamp is all there is. */
+const coTask = (id: string, costCodeId: string | null, status: string) => ({
+    id, status, type: "task",
+    costCodeId,
+    estimateItem: null,
+});
+
+function resetFixture() {
+    fixture = { estimateItems: [], changeOrderItems: [], scheduleTasks: [] };
+    recordedTaskQuery = null;
+    written = null;
+}
+
+const fakePrisma = {
+    project: { findMany: async () => [{ id: "p1", name: "Berg ADU", status: "In Progress" }] },
+    costCode: {
+        findMany: async () => [
+            { id: "cc-demo", code: "01-DEMO", name: "Demolition" },
+            { id: "cc-elec", code: "04-ELEC", name: "Electrical" },
+        ],
+    },
+    estimate: { findMany: async () => [{ id: "e1", items: fixture.estimateItems }] },
+    estimateItem: { findMany: async () => [] },
+    changeOrderItem: { findMany: async () => fixture.changeOrderItems },
+    timeEntry: { findMany: async () => [] },
+    expense: { findMany: async () => [] },
+    scheduleTask: {
+        findMany: async (args: any) => {
+            recordedTaskQuery = args;
+            return fixture.scheduleTasks;
+        },
+    },
+    dailyLog: { findMany: async () => [] },
+    $queryRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
+        written = { auto: values[0] as number | null };
+        return [{ percentComplete: values[0], percentCompleteSource: "AUTO" }];
+    },
+};
+
+let recalcProjectPercentComplete: (p: { id: string; name: string }) => Promise<any>;
+
+const PRISMA_SPECIFIER = "@/lib/prisma";
+
+before(async () => {
+    const originalRequire = Module.prototype.require;
+    let hit = false;
+    (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (
+        this: NodeModule,
+        id: string,
+    ) {
+        if (id === PRISMA_SPECIFIER) {
+            hit = true;
+            return { prisma: fakePrisma };
+        }
+        // eslint-disable-next-line prefer-rest-params
+        return originalRequire.apply(this, arguments as unknown as [string]);
+    } as typeof Module.prototype.require;
+
+    let mod: { recalcProjectPercentComplete?: unknown };
+    try {
+        mod = await import("../src/lib/percent-complete-db");
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+    if (typeof mod.recalcProjectPercentComplete !== "function") {
+        throw new Error(
+            `percent-complete-co-tasks.test.ts: mock of "${PRISMA_SPECIFIER}" did not apply ` +
+                `(patch ${hit ? "WAS" : "was NOT"} hit).`,
+        );
+    }
+    recalcProjectPercentComplete = mod.recalcProjectPercentComplete as any;
+});
+
+beforeEach(() => {
+    resetFixture();
+});
+
+const recalc = () => recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+// ── the query itself ────────────────────────────────────────────────────────
+
+test("the task query accepts EITHER an estimate-item link or a stamped cost code", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 1_000)];
+    await recalc();
+
+    // Filtering on estimateItemId alone is what made CO tasks invisible.
+    assert.deepEqual(recordedTaskQuery.where.OR, [
+        { estimateItemId: { not: null } },
+        { costCodeId: { not: null } },
+    ]);
+    assert.equal(recordedTaskQuery.where.estimateItemId, undefined);
+});
+
+// ── a CO-only phase ─────────────────────────────────────────────────────────
+
+test("a CO-ONLY phase advances when its tasks complete", async () => {
+    // Two equally-weighted phases: 01-DEMO from the estimate (untouched),
+    // 04-ELEC entirely from an approved change order (done).
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-elec", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Not Started"),
+        coTask("t2", "cc-elec", "Complete"),
+    ];
+
+    await recalc();
+
+    // Before the fix this read 0: the CO phase held half the budget weight and
+    // had no visible task, so it could never leave 0%.
+    assert.equal(written?.auto, 50);
+});
+
+test("a CO-only phase with its work still open holds the job back honestly", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-elec", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("t2", "cc-elec", "Not Started"),
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 50);
+});
+
+test("an uncoded CO item still contributes no phase — no guessing", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", null, 2_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("t2", null, "Not Started"),
+    ];
+
+    await recalc();
+    // The uncoded $2,000 lands in uncodedBudget: still above the 50% trust
+    // floor, and the one coded phase is done.
+    assert.equal(written?.auto, 100);
+});
+
+// ── a SHARED phase ──────────────────────────────────────────────────────────
+
+test("a shared phase blends estimate and CO tasks instead of inheriting progress", async () => {
+    // One phase, budget from both sources. Two tasks, one done.
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-demo", 5_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("t2", "cc-demo", "Not Started"),
+    ];
+
+    await recalc();
+    // Before the fix the CO task was invisible, so the phase read 1/1 = 100%
+    // — the added CO scope silently inherited the estimate task's completion.
+    assert.equal(written?.auto, 50);
+});
+
+test("a shared phase reaches 100 only when the CO work is done too", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-demo", 5_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("t2", "cc-demo", "Complete"),
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 100);
+});
+
+// ── resolution order ────────────────────────────────────────────────────────
+
+test("the LIVE estimate item wins over a stale stamped cost code", async () => {
+    // The estimate line was re-coded from 01-DEMO to 04-ELEC after the schedule
+    // was generated. The task's stamp is stale; the live link must win, or
+    // re-coding an estimate would silently stop moving its phase.
+    fixture.estimateItems = [estimateItem("i1", "cc-elec", 10_000)];
+    fixture.scheduleTasks = [
+        { id: "t1", status: "Complete", type: "task", costCodeId: "cc-demo", estimateItem: { costCodeId: "cc-elec" } },
+    ];
+
+    await recalc();
+    // Counted under 04-ELEC (the only phase with budget) → 100.
+    assert.equal(written?.auto, 100);
+});
+
+test("a task whose estimate item was deleted falls back to its stamped code", async () => {
+    // estimateItemId is onDelete: SetNull, so deleting the line used to strip
+    // the task's phase entirely. The stamp preserves it.
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.scheduleTasks = [
+        { id: "t1", status: "Complete", type: "task", costCodeId: "cc-demo", estimateItem: null },
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 100);
+});
+
+test("CO milestones are markers, not work — they never dilute a phase", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-elec", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("t2", "cc-elec", "Complete"),
+        { id: "m1", status: "Not Started", type: "milestone", costCodeId: "cc-elec", estimateItem: null },
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 100);
+});

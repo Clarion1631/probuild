@@ -66,10 +66,23 @@ export async function recalcProjectPercentComplete(
         // Budgets come from the variance basis, so the percentage is weighted by
         // the same dollars the variance report shows. Never re-derive them here.
         loadProjectVariance([project.id]),
-        // A task reaches a phase only through its estimate item's cost code.
+        // A task reaches a phase EITHER through its estimate item's cost code
+        // or through its own stamped one. Both are needed: change-order tasks
+        // can never have an estimateItemId (their scope lives in
+        // ChangeOrderItem), yet approved CO dollars are counted in the phase
+        // budget — so filtering on estimateItemId alone left every CO-only
+        // phase permanently at 0% while its budget dragged the weighted average
+        // down, and made CO work in a shared phase inherit the estimate tasks'
+        // progress instead of reporting its own.
         prisma.scheduleTask.findMany({
-            where: { projectId: project.id, estimateItemId: { not: null } },
-            select: { id: true, status: true, type: true, estimateItem: { select: { costCodeId: true } } },
+            where: {
+                projectId: project.id,
+                OR: [{ estimateItemId: { not: null } }, { costCodeId: { not: null } }],
+            },
+            select: {
+                id: true, status: true, type: true, costCodeId: true,
+                estimateItem: { select: { costCodeId: true } },
+            },
         }),
         prisma.dailyLog.findMany({
             where: { projectId: project.id, aiSuggestedTaskId: { not: null } },
@@ -84,7 +97,11 @@ export async function recalcProjectPercentComplete(
     const phaseByTaskId = new Map<string, string>();
     const counts = new Map<string, { totalTasks: number; doneTasks: number }>();
     for (const task of tasks) {
-        const costCodeId = task.estimateItem?.costCodeId;
+        // The LIVE estimate item wins over the stamped column: re-coding an
+        // estimate line must move its task's phase immediately, and the stamp
+        // is a generation-time snapshot that would go stale. The stamp is the
+        // fallback (and, for a CO task, the only value there is).
+        const costCodeId = task.estimateItem?.costCodeId ?? task.costCodeId;
         if (!costCodeId) continue; // an uncoded item belongs to no phase
         phaseByTaskId.set(task.id, costCodeId);
         // Milestones and appointments are markers, not work — they must not

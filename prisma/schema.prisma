@@ -853,6 +853,7 @@ model CostCode {
   changeOrderItems   ChangeOrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
   catalogItems       CatalogItem[]
+  scheduleTasks      ScheduleTask[]
 }
 
 model CostType {
@@ -1138,6 +1139,15 @@ model ScheduleTask {
   confirmationStatus         String? // "planned" | "requested" | "confirmed"; appointment tasks only
   estimateItemId             String?        @unique
   estimateItem               EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
+  // Phase attribution, stamped at generation time for BOTH estimate- and
+  // change-order-generated tasks. A CO task cannot carry an estimateItemId
+  // (applyChangeOrderToSchedule sets it null — CO scope lives in the separate
+  // ChangeOrderItem table), so without this column approved CO dollars sat in
+  // the phase budget with no task able to report progress against them.
+  // Estimate tasks keep resolving through the live estimateItem first; this is
+  // their fallback for when that FK is SetNull'd by an item delete.
+  costCodeId                 String?
+  costCode                   CostCode?      @relation(fields: [costCodeId], references: [id])
   // Generation provenance: set on every task kind created by
   // generateScheduleFromEstimate (phase parents, children, flat tasks,
   // milestones) so regenerate can identify them without touching manual tasks.
@@ -1174,6 +1184,7 @@ model ScheduleTask {
   @@index([leadId])
   @@index([generatedFromEstimateId])
   @@index([generatedFromChangeOrderId])
+  @@index([costCodeId])
 }
 
 model TaskMaterial {
