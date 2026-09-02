@@ -55,5 +55,16 @@ export function sniffMime(buf: Buffer, declared: string): string | null {
         // stored mimeType says what the file actually claims to be.
         if (HEIF_BRANDS.has(brand)) return "image/heif";
     }
-    return essence === "text/plain" ? "text/plain" : null;
+    // text/plain is DELIBERATELY not accepted.
+    //
+    // QuickBooks cannot attach a .txt, so such a row read fine and then parked
+    // at booking with unsupported-attachment — stuck mid-pipeline, which is
+    // worse than a clear refusal at the door. v1 converted these to PDF using
+    // Apps Script's HTML->PDF `getAs`, which has no Node equivalent: a real
+    // port means a PDF generator with wrapping, pagination and WinAnsi encoding
+    // (pdf-lib's standard fonts THROW on characters they cannot encode). That
+    // is a new silent-corruption surface on a money document, for the rarest
+    // input in the pipeline. Refused instead — see the 415 in the intake route.
+    void essence;
+    return null;
 }

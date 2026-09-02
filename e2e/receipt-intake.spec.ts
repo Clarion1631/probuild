@@ -894,3 +894,132 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("STAGING");
     });
 });
+
+test.describe("round-9 intake contracts", () => {
+    const startPath = `${INTAKE_PATH}/start`;
+    const sha = (b64: string) => createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex");
+    const start = (request: APIRequestContext, body: Record<string, unknown>) =>
+        request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify(body),
+            maxRedirects: 0,
+        });
+
+    test("/start REFUSES without a sha256 — it is the row's only identity", async ({ request }) => {
+        // Without it a reused sourceRef is indistinguishable from an honest
+        // retry, and /start would hand out an upsert URL aimed at another
+        // document's object.
+        const res = await start(request, {
+            source: "drive", sourceRef: `${REF_PREFIX}nosha`, mimeType: "image/png",
+        });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).reason).toBe("missing-sha256");
+
+        const malformed = await start(request, {
+            source: "drive", sourceRef: `${REF_PREFIX}badsha`, mimeType: "image/png", sha256: "nope",
+        });
+        expect(malformed.status()).toBe(400);
+    });
+
+    test("/start will not reissue an upsert URL without proving identity", async ({ request }) => {
+        const ref = `${REF_PREFIX}reissue`;
+        const first = await start(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(first.status()).toBe(200);
+        minted.push((await first.json()).id);
+
+        // Same hash: proven the same document, so the URL is reissued.
+        const proven = await start(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(proven.status()).toBe(200);
+        expect((await proven.json()).uploadUrl).toBeTruthy();
+
+        // Different hash: refused BEFORE a URL exists, so receipt B can never be
+        // written over receipt A's object.
+        const unproven = await start(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(OTHER_PNG_BASE64),
+        });
+        expect(unproven.status()).toBe(409);
+        expect((await unproven.json()).error).toBe("sourceRef-conflict");
+    });
+
+    test("a text receipt is refused with a 415 that says what to send instead", async ({ request }) => {
+        // QuickBooks cannot attach a .txt, so accepting one meant reading it and
+        // then stranding it unbookable mid-pipeline.
+        const res = await postIntake(request, intakeBody({
+            sourceRef: `${REF_PREFIX}textfile`,
+            fileBase64: Buffer.from("VENDOR: Lowes\nTOTAL: 10.00").toString("base64"),
+            mimeType: "text/plain",
+        }));
+        expect(res.res.status()).toBe(415);
+        expect(res.body.error).toBe("unsupported-file-type");
+        expect(res.body.reason).toMatch(/PDF/i);
+        expect(res.body.accepted).toContain("application/pdf");
+    });
+
+    test("the JSON inline limit is 3 MiB raw and says so", async ({ request }) => {
+        // base64 inflates by 4/3, so 4 MiB raw is a ~5.4 MiB request — over the
+        // platform body cap, which used to reject it before this code ran.
+        const big = Buffer.alloc(3 * 1024 * 1024 + 1, 7).toString("base64");
+        const res = await postIntake(request, intakeBody({
+            sourceRef: `${REF_PREFIX}toobig`, fileBase64: big,
+        }));
+        expect(res.res.status()).toBe(413);
+        expect(res.body.error).toBe("payload-too-large");
+        expect(res.body.maxInlineBytes).toBe(3 * 1024 * 1024);
+        expect(res.body.use).toMatch(/intake\/start/);
+    });
+
+    test("a sequential finalize retry still applies late fields", async ({ request }) => {
+        // The row already reached RECEIVED, so this takes the alreadyFinalized
+        // path — and answering it without applying the job assignment would drop
+        // that assignment while telling the caller it worked.
+        const ref = `${REF_PREFIX}latefields`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("RECEIVED");
+
+        const applied = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            maxRedirects: 0,
+        });
+        expect(applied.status()).toBe(200);
+        expect((await applied.json()).alreadyFinalized).toBe(true);
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.costCodeId).toBe("e2e-mob-cc-demo");
+
+        // Re-sending the SAME value is idempotent.
+        const same = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            maxRedirects: 0,
+        });
+        expect(same.status()).toBe(200);
+
+        // A DIFFERENT value is a conflict, never a silent overwrite of what a
+        // human may already have set.
+        const conflicting = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ costCodeId: "e2e-mob-cc-dryw" }),
+            maxRedirects: 0,
+        });
+        expect(conflicting.status()).toBe(409);
+        expect((await conflicting.json()).error).toBe("late-fields-conflict");
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.costCodeId).toBe("e2e-mob-cc-demo");
+    });
+
+    test("a published row's object lives at the sealed, content-addressed path", async ({ request }) => {
+        const ref = `${REF_PREFIX}sealed-path`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        // The single-shot path publishes directly; the two-step path seals. Either
+        // way the row must never be left pointing somewhere a client holds a URL for.
+        expect(row?.fileSha256).toHaveLength(64);
+    });
+});

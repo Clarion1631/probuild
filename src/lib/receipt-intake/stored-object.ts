@@ -43,6 +43,57 @@ export type VerifiedBytes =
     | { ok: true; bytes: Buffer }
     | { ok: false; kind: "missing" | "transient" | "sha-mismatch"; message?: string };
 
+/**
+ * SEAL AND PUBLISH — the one operation that moves a row out of STAGING.
+ *
+ * Shared by /intake/{id}/finalize and the worker's stale-STAGING sweep so the
+ * two cannot diverge: the sweeper used to publish while the row still pointed
+ * at the UPLOAD path, which is writable by anyone holding the signed URL, so a
+ * swept row's "verified" bytes stayed replaceable afterwards.
+ *
+ * Order is the whole point:
+ *   1. copy the verified bytes to the canonical (content-addressed) path
+ *   2. COMMIT the row pointer, fenced on state and claim
+ *   3. only then delete the upload object, best-effort
+ *
+ * A crash between 1 and 2 leaves both objects and a STAGING row: the retry
+ * finds the canonical copy already there, re-uploads it as a no-op, and
+ * commits. A failure at 3 is an orphan on the cleanup queue, not a lost
+ * receipt.
+ */
+export interface PublishOutcome {
+    published: boolean;
+    canonicalPath: string;
+}
+
+export interface SealPublishDeps {
+    seal: (uploadPath: string, canonicalPath: string, bytes: Buffer, contentType: string) => Promise<string | null>;
+    /** Fenced CAS. Returns the number of rows actually moved. */
+    commit: (canonicalPath: string, check: { mimeType: string; fileSize: number; fileSha256: string }) => Promise<number>;
+    /** Best-effort, AFTER the commit. Records a cleanup event on failure. */
+    dropUpload: (uploadPath: string) => Promise<void>;
+}
+
+export async function sealAndPublish(
+    uploadPath: string,
+    rowId: string,
+    check: { mimeType: string; fileSize: number; fileSha256: string; bytes: Buffer },
+    deps: SealPublishDeps,
+): Promise<PublishOutcome | null> {
+    const canonicalPath = canonicalStoragePath(rowId, check.fileSha256, check.mimeType);
+    const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
+    if (!sealed) return null;
+
+    const moved = await deps.commit(canonicalPath, check);
+    // Only once the row points at the sealed copy is the upload object safe to
+    // remove — and only if we are the one who moved the row. A publisher that
+    // lost the CAS must not delete an object the winner may still be using.
+    if (moved > 0 && uploadPath !== canonicalPath) {
+        await deps.dropUpload(uploadPath);
+    }
+    return { published: moved > 0, canonicalPath };
+}
+
 export async function downloadVerified(
     storagePath: string,
     expectedSha256: string,

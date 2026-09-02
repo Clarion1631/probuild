@@ -86,8 +86,9 @@ test("the stored mime is decided on the BYTES, not the caller's header", async (
     // An unrelated ftyp box (an MP4) is not a receipt.
     assert.equal(sniffMime(ftyp("isom"), "image/heic"), null);
 
-    // text/plain has no signature, so it is the only type taken on its word.
-    assert.equal(sniffMime(Buffer.from("VENDOR: Lowes"), "text/plain; charset=utf-8"), "text/plain");
+    // text/plain is REFUSED outright now: QuickBooks cannot attach a .txt, so
+    // accepting one meant reading it and then stranding it unbookable.
+    assert.equal(sniffMime(Buffer.from("VENDOR: Lowes"), "text/plain; charset=utf-8"), null);
     // Anything unrecognised, and every empty file, is refused.
     assert.equal(sniffMime(Buffer.from("MZ\x90\x00"), "application/pdf"), null);
     assert.equal(sniffMime(Buffer.alloc(0), "text/plain"), null);

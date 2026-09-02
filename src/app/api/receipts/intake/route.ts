@@ -6,8 +6,13 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
+import { recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
-import { MAX_INLINE_UPLOAD_BYTES, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import {
+    MAX_INLINE_JSON_BYTES,
+    MAX_INLINE_UPLOAD_BYTES,
+    MAX_STORED_BYTES,
+} from "@/lib/receipt-intake/intake-core";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -79,13 +84,35 @@ function bad(reason: string) {
  * used to die at the edge with an opaque 413 that never reached this code, so
  * the caller learned nothing. Say it plainly and name the path that works.
  */
-function tooLargeForInline() {
+/**
+ * 415, not 400: the caller's request was well-formed, we simply will never
+ * accept this format. Naming what IS accepted is the difference between a
+ * sender who fixes it and one who retries the same file forever.
+ */
+function unsupportedType(declared: string) {
+    const essence = declared.split(";")[0].trim().toLowerCase();
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "unsupported-file-type",
+            reason: essence === "text/plain"
+                ? "text receipts are not accepted: QuickBooks cannot attach a .txt, so it would be read and then stranded unbookable. Print or export it to PDF first."
+                : "the stored bytes are not a format QuickBooks can attach",
+            accepted: ["application/pdf", "image/jpeg", "image/png", "image/heic", "image/webp", "image/gif"],
+        },
+        { status: 415 },
+    );
+}
+
+function tooLargeForInline(limit: number, encoding: "json" | "multipart") {
     return NextResponse.json(
         {
             ok: false,
             error: "payload-too-large",
-            reason: `inline uploads are limited to ${MAX_INLINE_UPLOAD_BYTES} bytes (serverless request-body cap)`,
-            maxInlineBytes: MAX_INLINE_UPLOAD_BYTES,
+            reason: encoding === "json"
+                ? `JSON uploads are limited to ${limit} raw bytes; base64 inflates them by 4/3 and the serverless body cap is what actually rejects a larger one`
+                : `multipart uploads are limited to ${limit} bytes (serverless request-body cap)`,
+            maxInlineBytes: limit,
             maxBytes: MAX_STORED_BYTES,
             use: "POST /api/receipts/intake/start then PUT to the signed URL then POST /api/receipts/intake/{id}/finalize",
         },
@@ -106,9 +133,10 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         }
         const file = form.get("file");
         if (!(file instanceof File)) return bad("missing-file");
-        if (file.size > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
+        // Multipart sends the bytes as-is, so it keeps the full 4 MiB.
+        if (file.size > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline(MAX_INLINE_UPLOAD_BYTES, "multipart");
         const bytes = Buffer.from(await file.arrayBuffer());
-        if (bytes.length > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
+        if (bytes.length > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline(MAX_INLINE_UPLOAD_BYTES, "multipart");
         return {
             bytes,
             declaredMime: file.type || "application/octet-stream",
@@ -133,10 +161,14 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
     if (!base64) return bad("missing-file");
     // Cap BEFORE decoding: base64 is 4/3 the byte count, so this refuses an
     // oversize payload without materialising it.
-    if (base64.length > Math.ceil(MAX_INLINE_UPLOAD_BYTES / 3) * 4 + 4) return tooLargeForInline();
+    // Checked on the ENCODED length first, so an oversize payload is refused
+    // without materialising it.
+    if (base64.length > Math.ceil(MAX_INLINE_JSON_BYTES / 3) * 4 + 4) {
+        return tooLargeForInline(MAX_INLINE_JSON_BYTES, "json");
+    }
     const bytes = Buffer.from(base64, "base64");
     if (bytes.length === 0) return bad("missing-file");
-    if (bytes.length > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
+    if (bytes.length > MAX_INLINE_JSON_BYTES) return tooLargeForInline(MAX_INLINE_JSON_BYTES, "json");
     return {
         bytes,
         declaredMime: typeof json.mimeType === "string" ? json.mimeType : "application/octet-stream",
@@ -161,7 +193,7 @@ export async function POST(req: Request) {
     if (parsed instanceof NextResponse) return parsed;
 
     const mimeType = sniffMime(parsed.bytes, parsed.declaredMime);
-    if (!mimeType) return bad("unsupported-file-type");
+    if (!mimeType) return unsupportedType(parsed.declaredMime);
 
     // PROVENANCE AND IDENTITY ARE NOT CALLER INPUT for a human.
     //
@@ -301,6 +333,16 @@ export async function POST(req: Request) {
         uploadFailed = error instanceof Error ? `${error.name}: ${error.message}` : "upload-threw";
     }
     if (uploadFailed) {
+        // AMBIGUOUS. An upload error — especially a thrown one — does not tell
+        // us whether bytes landed: the write may have succeeded and the
+        // acknowledgement been lost. So the cleanup record is written BEFORE
+        // the row is deleted, while `storagePath` is still known to something.
+        // Delete first and the object (if any) is orphaned with nothing left
+        // pointing at it, invisible in a private bucket forever.
+        //
+        // A no-op cleanup for an upload that genuinely never landed is free;
+        // the sweeper's delete simply finds nothing.
+        await recordPendingCleanup(storagePath, `upload-ambiguous:${uploadFailed}`.slice(0, 200));
         await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
         console.error("[receipts/intake] upload failed", uploadFailed);
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });

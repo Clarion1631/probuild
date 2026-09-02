@@ -15,6 +15,18 @@ import type { IntakeAuth } from "./intake-auth";
  */
 export const MAX_INLINE_UPLOAD_BYTES = 4 * 1024 * 1024;
 
+/**
+ * The JSON path's raw-bytes ceiling, LOWER than the multipart one on purpose.
+ *
+ * A JSON body carries the file base64-encoded, which inflates it by 4/3. At the
+ * multipart limit of 4 MiB that is a ~5.4 MiB request — over the platform's
+ * body cap, so it died at the edge with an opaque 413 this code never saw and
+ * the caller learned nothing. 3 MiB raw encodes to ~4 MiB, which fits.
+ *
+ * Multipart sends the bytes as-is and keeps the full 4 MiB.
+ */
+export const MAX_INLINE_JSON_BYTES = 3 * 1024 * 1024;
+
 /** The real ceiling for a stored receipt, enforced on the object itself. */
 export const MAX_STORED_BYTES = 15 * 1024 * 1024;
 

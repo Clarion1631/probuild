@@ -52,9 +52,23 @@ export async function POST(req: Request) {
     // reused sourceRef carrying a DIFFERENT document is indistinguishable from
     // an honest retry, and /finalize would attach one receipt's bytes to
     // another receipt's identity.
-    const expectedSha256 = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
-    if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
-        return NextResponse.json({ ok: false, reason: "invalid-sha256" }, { status: 400 });
+    // REQUIRED, not optional.
+    //
+    // It is the only thing that gives this row an identity before any bytes
+    // exist. Without it a reused sourceRef is indistinguishable from an honest
+    // retry, so /start would happily hand out an upsert URL pointed at another
+    // document's object — and the swap would only surface at /finalize, by
+    // which point the original bytes are gone.
+    const expectedSha256 = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(expectedSha256)) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "missing-sha256",
+                detail: "sha256 of the bytes you are about to upload is required (64 lowercase hex chars)",
+            },
+            { status: 400 },
+        );
     }
 
     const declaredSize = Number(body.fileSize);
@@ -124,14 +138,25 @@ export async function POST(req: Request) {
                 auth.user.role === "ADMIN";
             if (!maySee) return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
 
-            // SAME KEY, DIFFERENT DOCUMENT. Caught HERE, before a signed URL is
-            // handed out — otherwise the caller would upload receipt B over
-            // receipt A's object and only /finalize would notice, by which point
-            // A's bytes are gone.
-            const knownSha = existing.fileSha256 || existing.expectedSha256;
-            if (expectedSha256 && knownSha && knownSha.toLowerCase() !== expectedSha256) {
+            // IDENTITY MUST BE PROVEN BEFORE AN UPSERT URL IS REISSUED.
+            //
+            // The URL is `upsert: true` so a caller can replace its OWN partial
+            // upload — which is exactly why handing one out for an existing path
+            // requires proof this is the same document. A mismatching or
+            // unknown-identity request would otherwise get a URL that
+            // overwrites receipt A with receipt B, and only /finalize would
+            // notice, by which point A's bytes are gone.
+            const knownSha = (existing.fileSha256 || existing.expectedSha256 || "").toLowerCase();
+            if (!knownSha || knownSha !== expectedSha256) {
                 return NextResponse.json(
-                    { ok: false, error: "sourceRef-conflict", reason: "this sourceRef already holds a different document", existingId: existing.id },
+                    {
+                        ok: false,
+                        error: "sourceRef-conflict",
+                        reason: knownSha
+                            ? "this sourceRef already holds a different document"
+                            : "this sourceRef exists with no recorded hash; identity cannot be proven",
+                        existingId: existing.id,
+                    },
                     { status: 409 },
                 );
             }

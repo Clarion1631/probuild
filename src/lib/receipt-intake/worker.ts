@@ -147,10 +147,15 @@ export interface WorkerDependencies {
      * inside the same transaction as the transition. Returns the conflicting
      * row when another document with this weak key is already BOOKING/BOOKED.
      */
-    promoteToBooking: (rowId: string, weakKey: string | null) => Promise<{ promoted: boolean; conflictId?: string }>;
+    promoteToBooking: (
+        rowId: string,
+        weakKey: string | null,
+        claimToken: string | null,
+    ) => Promise<{ promoted: boolean; conflictId?: string; stale?: boolean }>;
     /** The pass's ONE absolute deadline — never a snapshot of "time left". */
     book: (row: BookableRow) => Promise<BookResult>;
-    applyBookResult: (rowId: string, result: BookResult) => Promise<void>;
+    /** CAS'd on the claim: a superseded worker's result must write nothing. */
+    applyBookResult: (rowId: string, result: BookResult, claimToken: string | null) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string) => Promise<void>;
     /** A transient fault anywhere else: spend an attempt and back off. */
@@ -393,7 +398,13 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 // Dry-run rows PARK at READ. This is the shadow-week gate: the
                 // only thing that moves a row to BOOKING is dryRun === false.
                 if (row.dryRun) { bump("READ"); continue; }
-                const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey);
+                const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
+                if (promotion.stale) {
+                    // Superseded between the claim and the promotion. The
+                    // successor owns this row; write nothing, book nothing.
+                    bump("STALE");
+                    continue;
+                }
                 if (!promotion.promoted) {
                     // Another document with the same canonical vendor, date and
                     // amount reached BOOKING/BOOKED first. Two same-day, same-
@@ -405,12 +416,12 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                     continue;
                 }
                 const result = await deps.book({ ...row, dryRun: false });
-                await deps.applyBookResult(row.id, result);
+                await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun) { bump("BOOKING"); continue; }
                 const result = await deps.book(row);
-                await deps.applyBookResult(row.id, result);
+                await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             }
         } catch (error) {
@@ -494,6 +505,7 @@ function stateForBookResult(result: BookResult): string {
         case "needs-review": return "NEEDS_REVIEW";
         case "deferred": return "BOOKING";
         case "retry": return "BOOKING";
+        case "stale": return "STALE";
     }
 }
 

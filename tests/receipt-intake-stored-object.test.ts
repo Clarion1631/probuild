@@ -12,6 +12,7 @@ import {
     canonicalStoragePath,
     downloadVerified,
     inspectStoredObject,
+    sealAndPublish,
 } from "../src/lib/receipt-intake/stored-object";
 import { MAX_STORED_BYTES } from "../src/lib/receipt-intake/intake-core";
 import type { DocBytesResult } from "../src/lib/secure-storage";
@@ -29,19 +30,6 @@ test("a real image is accepted, and its metadata comes from the BYTES", async ()
     assert.equal(check.mimeType, "image/png");
     assert.equal(check.fileSize, PNG.length);
     assert.equal(check.fileSha256, createHash("sha256").update(PNG).digest("hex"));
-});
-
-test("text/plain is the ONE type taken on its declared word", async () => {
-    // It has no magic bytes. Same concession the single-shot path makes.
-    const txt = Buffer.from("VENDOR: Lowes\nTOTAL: 10.00");
-    const ok = await inspectStoredObject("p.txt", "text/plain", give({ ok: true, bytes: txt }));
-    assert.ok(ok.ok);
-    assert.equal(ok.mimeType, "text/plain");
-
-    // ...and without that declaration the same bytes are unidentifiable.
-    const bad = await inspectStoredObject("p.bin", "", give({ ok: true, bytes: txt }));
-    assert.equal(bad.ok, false);
-    assert.equal((bad as { reason: string }).reason, "unsupported-file-type");
 });
 
 test("oversize, empty and unidentifiable objects are REJECTED, not published", async () => {
@@ -134,4 +122,72 @@ test("the validator hands back the exact bytes it verified", async () => {
     assert.ok(check.ok);
     assert.ok(check.bytes.equals(PNG));
     assert.equal(createHash("sha256").update(check.bytes).digest("hex"), check.fileSha256);
+});
+
+// ── Seal order: copy, COMMIT, then delete (round-9 items 1 and 3) ──────────
+
+/** `sealOk`/`committed` drive the outcome; the call log is always recorded. */
+function publishHarness(opts: { sealOk?: boolean; committed?: number } = {}) {
+    const calls: string[] = [];
+    const deps = {
+        seal: async (_u: string, canonical: string) => {
+            calls.push("seal");
+            return opts.sealOk === false ? null : canonical;
+        },
+        commit: async () => { calls.push("commit"); return opts.committed ?? 1; },
+        dropUpload: async () => { calls.push("drop"); },
+    } as never;
+    return { calls, deps };
+}
+
+const CHECK = {
+    mimeType: "image/png",
+    fileSize: PNG.length,
+    fileSha256: createHash("sha256").update(PNG).digest("hex"),
+    bytes: PNG,
+};
+
+test("the upload object is deleted only AFTER the row pointer is committed", async () => {
+    // Deleting first is unrecoverable: if the UPDATE then fails, the row still
+    // points at a path whose object we just removed, and the receipt is gone
+    // with nothing left to retry from.
+    const h = publishHarness();
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.deepEqual(h.calls, ["seal", "commit", "drop"]);
+    assert.equal(outcome?.published, true);
+    assert.equal(outcome?.canonicalPath, `receipts/row-1/${CHECK.fileSha256}.png`);
+});
+
+test("a FAILED commit leaves the upload object alone, so the retry can recover", async () => {
+    const h = publishHarness({ committed: 0 });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.deepEqual(h.calls, ["seal", "commit"], "nothing was deleted");
+    assert.equal(outcome?.published, false);
+});
+
+test("a failed SEAL never touches the row or the upload object", async () => {
+    const h = publishHarness({ sealOk: false });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.equal(outcome, null);
+    assert.deepEqual(h.calls, ["seal"]);
+});
+
+test("a retry that finds the canonical object already there still commits", async () => {
+    // The crash-between-copy-and-commit case: the copy is an upsert to a
+    // content-addressed path, so re-sealing the same bytes is a no-op and the
+    // retry simply commits.
+    const h = publishHarness();
+    const first = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    const second = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.equal(first?.canonicalPath, second?.canonicalPath, "same content, same path");
+    assert.equal(second?.published, true);
+});
+
+test("text/plain is no longer accepted at all", async () => {
+    // QuickBooks cannot attach a .txt, so accepting one meant reading it and
+    // then stranding it unbookable — worse than refusing at the door.
+    const txt = Buffer.from("VENDOR: Lowes\nTOTAL: 10.00");
+    const check = await inspectStoredObject("p.txt", "text/plain", give({ ok: true, bytes: txt }));
+    assert.equal(check.ok, false);
+    assert.equal((check as { reason: string }).reason, "unsupported-file-type");
 });

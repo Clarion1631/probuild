@@ -458,6 +458,38 @@ the sweeper already parked re-validates and **recovers** it rather than reportin
 `alreadyFinalized`, which would leave a real receipt parked while telling the caller it was
 fine.
 
+### Upload limits, and text receipts
+
+| path | ceiling | why |
+|---|---|---|
+| `POST /api/receipts/intake` (JSON) | **3 MiB raw** | base64 inflates by 4/3, so 3 MiB encodes to ~4 MiB and fits the serverless body cap. 4 MiB raw would be a ~5.4 MiB request that dies at the edge with a 413 this code never sees. |
+| `POST /api/receipts/intake` (multipart) | **4 MiB** | bytes are sent as-is. |
+| two-step (`/start` + signed URL + `/finalize`) | **15 MiB** | the bytes never pass through this server. |
+
+Both inline ceilings answer with a 413 naming the two-step path.
+
+**`text/plain` is refused with a 415.** QuickBooks cannot attach a `.txt`, so accepting one
+meant reading it with Gemini and then stranding it unbookable at
+`unsupported-attachment` — worse than a clear refusal at the door. v1 converted these using
+Apps Script's HTML→PDF `getAs`, which has no Node equivalent: a real port means a PDF
+generator with wrapping, pagination and WinAnsi encoding (pdf-lib's standard fonts THROW on
+characters they cannot encode), which is a new silent-corruption surface on a money document
+for the rarest input in the pipeline. The 415 says to send a PDF or an image instead.
+
+### Every worker write is fenced on the claim token
+
+`ReceiptIntake.claimToken` is re-stamped on every claim, and each row carries it through the
+pass. Every transition — `finishRouting`, `promoteToBooking`, `markSendAttempted`, each
+book-result write, and the `BOOKED` commit — is a CAS on `{id, state, claimToken}`.
+
+The one that matters most is `markSendAttempted`: it is the **last fence before
+QuickBooks**. A worker whose invocation was killed and whose row has since been re-claimed
+finds zero rows there and aborts with `outcome: "stale"` **having sent nothing** — so a
+zombie cannot post a Purchase the live worker is about to post as well. A claim lost later,
+between the create and the commit, rolls the transaction back (Expense included); the
+successor's retry hits QBO's DocNumber idempotency, gets the same Purchase, and books it
+once under one owner.
+
 ### Two machine secrets, not one
 
 They belong to different programs, so they are different keys and rotate independently.

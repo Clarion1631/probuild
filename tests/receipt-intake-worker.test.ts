@@ -969,3 +969,44 @@ test("finishRouting is handed the token the pass claimed with", async () => {
     await runIntakeWorker(h.deps);
     assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null }]);
 });
+
+// ── A successor reclaiming mid-flight (Phase 2 gate) ───────────────────────
+
+test("a predecessor superseded before promotion writes nothing and books nothing", async () => {
+    const h = harness([workerRow({ state: "READ", dryRun: false, claimToken: "old-token" })], {
+        // The CAS finds no row at {id, state: READ, claimToken: old-token}
+        // because the successor re-claimed and re-stamped it.
+        promoteToBooking: async (id, _weak, token) => {
+            h.promoted.push(id);
+            assert.equal(token, "old-token", "the predecessor offers its OWN token");
+            return { promoted: false, stale: true };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { STALE: 1 });
+    assert.equal(h.books, 0, "no QBO call");
+    assert.deepEqual(h.states, [], "no state write");
+});
+
+test("a stale booking result is never written back", async () => {
+    const applied: unknown[] = [];
+    const h = harness([workerRow({ state: "BOOKING", dryRun: false })], {
+        book: async () => { h.books++; return { outcome: "stale" } as BookResult; },
+        applyBookResult: async (_id, result) => { applied.push(result); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { STALE: 1 });
+    // applyBookResult is still CALLED — the adapter is what refuses to write —
+    // and the production adapter returns early on a stale outcome.
+    assert.deepEqual(applied, [{ outcome: "stale" }]);
+});
+
+test("every book result carries the row's claim token to the writer", async () => {
+    const tokens: Array<string | null> = [];
+    const h = harness([workerRow({ state: "BOOKING", dryRun: false, claimToken: "tok-9" })], {
+        applyBookResult: async (_id, _result, token) => { tokens.push(token); },
+    });
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(tokens, ["tok-9"]);
+});

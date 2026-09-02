@@ -196,7 +196,17 @@ export function normalizeDocType(value: unknown): string {
  * is a poor match" must stay distinguishable.
  */
 export function normalizeConfidence(value: unknown): number | null {
-    const n = typeof value === "number" ? value : Number(coerce(value));
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : null;
+    }
+    // `Number("")` and `Number("   ")` are BOTH 0 — a real, maximally-unconfident
+    // reading — so coercing first turned "the model said nothing" into "the
+    // model is certain this phase is wrong". Those must stay distinguishable:
+    // the queue sorts by this, and 0 is a signal while null is an absence.
+    if (typeof value !== "string") return null;
+    const text = value.trim();
+    if (!text) return null;
+    const n = Number(text);
     if (!Number.isFinite(n)) return null;
     return Math.min(1, Math.max(0, n));
 }

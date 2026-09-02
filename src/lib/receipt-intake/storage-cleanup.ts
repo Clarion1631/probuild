@@ -54,13 +54,30 @@ export async function sealObject(
         return null;
     }
 
-    // The upload path has served its purpose. A failure to remove it is an
-    // orphan, not a correctness problem — the row already points at the sealed
-    // copy — so it goes on the cleanup queue rather than failing the publish.
-    if (uploadPath !== canonicalPath) {
-        await deleteObjectOrRecord(uploadPath, "sealed");
-    }
+    // NOTE: the upload object is deliberately NOT deleted here.
+    //
+    // Deleting before the row is committed is unrecoverable: if the UPDATE then
+    // fails, the row still points at a path whose object we just removed, and
+    // the receipt is gone with nothing left to retry from. The caller deletes
+    // only after the pointer is committed — see finalizeAndPublish.
     return canonicalPath;
+}
+
+/**
+ * Queue an object for deletion WITHOUT attempting one first.
+ *
+ * For the ambiguous case: an upload that errored may still have written bytes,
+ * and the row that points at them is about to be deleted. Recording the path
+ * before that happens is the only way the orphan stays findable.
+ */
+export async function recordPendingCleanup(storagePath: string, reason: string): Promise<void> {
+    await logAutomationEvent({
+        kind: STORAGE_CLEANUP_KIND,
+        status: "pending",
+        reason,
+        source: "receipt-intake",
+        detail: { storagePath },
+    }).catch(() => { /* audit only — the orphan is the lesser problem */ });
 }
 
 /**

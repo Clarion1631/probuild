@@ -13,7 +13,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReadPrompt, parseReadJson, readReceipt } from "../src/lib/receipt-intake/read";
+import { buildReadPrompt, normalizeConfidence, parseReadJson, readReceipt } from "../src/lib/receipt-intake/read";
 
 const PHASES = [
     { code: "01-DEMO", name: "Demolition" },
@@ -273,4 +273,24 @@ test("a 4xx that is not 401/403/404/429 is still DECISIVE", async () => {
         });
         assert.deepEqual(outcome, { ok: false, decisive: true }, `HTTP ${status}`);
     }
+});
+
+test("an absent confidence is NULL, never 0", () => {
+    // `Number("")` and `Number("   ")` are both 0 — a real, maximally-
+    // unconfident reading. Coercing first turned "the model said nothing" into
+    // "the model is certain this phase is a poor match", and the queue sorts on
+    // exactly that number.
+    for (const empty of ["", "   ", "\t", undefined, null, {}, [], "abc", NaN, Infinity]) {
+        assert.equal(normalizeConfidence(empty), null, JSON.stringify(empty));
+    }
+    // A genuine zero survives as a zero.
+    assert.equal(normalizeConfidence(0), 0);
+    assert.equal(normalizeConfidence("0"), 0);
+    assert.equal(normalizeConfidence("0.0"), 0);
+    // Normal values, and clamping at the edges.
+    assert.equal(normalizeConfidence(0.82), 0.82);
+    assert.equal(normalizeConfidence("0.82"), 0.82);
+    assert.equal(normalizeConfidence(1.2), 1);
+    assert.equal(normalizeConfidence(-3), 0);
+    assert.equal(normalizeConfidence(" 0.5 "), 0.5, "whitespace around a real number is fine");
 });

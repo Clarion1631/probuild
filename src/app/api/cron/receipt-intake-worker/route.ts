@@ -6,8 +6,8 @@ import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
-import { downloadVerified, inspectStoredObject } from "@/lib/receipt-intake/stored-object";
-import { deleteObjectOrRecord, retryPendingCleanups } from "@/lib/receipt-intake/storage-cleanup";
+import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
+import { deleteObjectOrRecord, retryPendingCleanups, sealObject } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
@@ -328,17 +328,32 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         parked++;
                         continue;
                     }
-                    await prisma.receiptIntake.updateMany({
-                        where: { id: row.id, state: "STAGING" },
-                        data: {
-                            state: "RECEIVED",
-                            nextRetryAt: null,
-                            mimeType: check.mimeType,
-                            fileSize: check.fileSize,
-                            fileSha256: check.fileSha256,
+
+                    // The SAME seal-and-publish /finalize uses. The sweep must
+                    // never publish a row still pointing at the UPLOAD path:
+                    // that path stays writable by whoever holds the signed URL,
+                    // so a swept row's "verified" bytes would remain replaceable
+                    // afterwards.
+                    const outcome = await sealAndPublish(row.storagePath, row.id, check, {
+                        seal: sealObject,
+                        commit: async (canonicalPath, values) => {
+                            const { count } = await prisma.receiptIntake.updateMany({
+                                where: { id: row.id, state: "STAGING" },
+                                data: {
+                                    state: "RECEIVED",
+                                    nextRetryAt: null,
+                                    storagePath: canonicalPath,
+                                    mimeType: values.mimeType,
+                                    fileSize: values.fileSize,
+                                    fileSha256: values.fileSha256,
+                                },
+                            });
+                            return count;
                         },
+                        dropUpload: uploadPath =>
+                            deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
                     });
-                    published++;
+                    if (outcome?.published) published++;
                     continue;
                 }
                 if (check.kind === "transient") continue; // unknown is not a verdict
@@ -479,7 +494,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         retryStorageCleanups: shouldStop => retryPendingCleanups(STAGING_SWEEP_BATCH, shouldStop),
 
-        promoteToBooking: async (rowId, weakKey) => prisma.$transaction(async tx => {
+        promoteToBooking: async (rowId, weakKey, claimToken) => prisma.$transaction(async tx => {
             // LAST weak-dedup check, taken INSIDE the transition. The check at
             // read time can miss a pair that arrived in the same batch window,
             // and READ -> BOOKING is the last instant before money moves.
@@ -531,8 +546,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     orderBy: { createdAt: "asc" },
                 });
                 if (conflict) {
-                    await tx.receiptIntake.update({
-                        where: { id: rowId },
+                    await tx.receiptIntake.updateMany({
+                        where: { id: rowId, state: "READ", claimToken },
                         data: {
                             state: "NEEDS_REVIEW",
                             stateReason: `weak-dup:${conflict.id}`,
@@ -545,18 +560,28 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     return { promoted: false, conflictId: conflict.id };
                 }
             }
-            await tx.receiptIntake.update({
-                where: { id: rowId },
+            // CAS: only the current claim holder promotes. A superseded worker
+            // must not move a row into BOOKING that its successor is handling.
+            const { count } = await tx.receiptIntake.updateMany({
+                where: { id: rowId, state: "READ", claimToken },
                 data: { state: "BOOKING", stateReason: null },
             });
+            if (count === 0) return { promoted: false, stale: true };
             return { promoted: true };
         }),
 
         book: row => bookReceipt(row, {
             db: prisma as unknown as BookPrismaClient,
             companyTimeZone: resolveCompanyTimeZone,
-            markSendAttempted: async rowId => {
-                await prisma.receiptIntake.update({ where: { id: rowId }, data: { sendAttempted: true } });
+            markSendAttempted: async (rowId, claimToken) => {
+                // CAS: only the CURRENT claim holder may mark a send. A zero
+                // count means this worker was superseded, and bookReceipt
+                // aborts on it before touching QuickBooks.
+                const { count } = await prisma.receiptIntake.updateMany({
+                    where: { id: rowId, state: "BOOKING", claimToken },
+                    data: { sendAttempted: true },
+                });
+                return count > 0;
             },
             isCostCodeAllowed: (projectId, costCodeId) =>
                 isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
@@ -575,12 +600,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             now: () => new Date(),
         }),
 
-        applyBookResult: async (rowId, result) => {
+        applyBookResult: async (rowId, result, claimToken) => {
             const now = new Date();
             if (result.outcome === "booked") return; // bookReceipt already committed it
+            // A superseded worker writes NOTHING: the row belongs to whoever
+            // holds the current token, and its state is theirs to set.
+            if (result.outcome === "stale") return;
+            // Every write below is a CAS on the claim, for the same reason.
+            const owns = { id: rowId, claimToken } as const;
             if (result.outcome === "needs-review") {
-                await prisma.receiptIntake.update({
-                    where: { id: rowId },
+                await prisma.receiptIntake.updateMany({
+                    where: owns,
                     data: {
                         state: "NEEDS_REVIEW",
                         stateReason: result.reason,
@@ -596,8 +626,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             if (result.outcome === "deferred") {
                 // A switch is off: hold in BOOKING, look again in an hour, and
                 // do NOT spend an attempt — this document did nothing wrong.
-                await prisma.receiptIntake.update({
-                    where: { id: rowId },
+                await prisma.receiptIntake.updateMany({
+                    where: owns,
                     data: {
                         state: "BOOKING",
                         stateReason: result.reason,
@@ -606,8 +636,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 });
                 return;
             }
-            await prisma.receiptIntake.update({
-                where: { id: rowId },
+            await prisma.receiptIntake.updateMany({
+                where: owns,
                 data: {
                     state: "BOOKING",
                     attempts: result.attempts,

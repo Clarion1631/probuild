@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
     appliedTaxCents,
     attachmentBlocker,
+    isTerminalAttachmentFailure,
     bookReceipt,
     buildGroups,
     driveFileIdOf,
@@ -54,6 +55,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         lastError: null,
         sendAttempted: false,
         fileSha256: "s".repeat(64),
+        claimToken: "claim-1",
         ...overrides,
     };
 }
@@ -88,6 +90,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
+            updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },
         },
         $transaction: async (fn: any) => fn(tx),
     };
@@ -106,7 +109,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         now: () => NOW,
         companyTimeZone: async () => "America/Los_Angeles",
         isCostCodeAllowed: async () => true,
-        markSendAttempted: async id => { sendMarks.push(id); },
+        markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
     return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events };
@@ -722,9 +725,141 @@ test("a real create DOES mark it, before the call", async () => {
             r.purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "attached" } as any;
         },
-        markSendAttempted: async id => { order.push("mark"); r.sendMarks.push(id); },
+        markSendAttempted: async id => { order.push("mark"); r.sendMarks.push(id); return true; },
     });
     await bookReceipt(row(), r.deps);
     assert.deepEqual(order, ["mark", "create"], "marked FIRST, so a mid-create death still records it");
     assert.deepEqual(r.sendMarks, ["intake-1"]);
+});
+
+// ── An attachment QBO REFUSED is terminal (round-9 item 5) ─────────────────
+
+test("a 4xx or fault attachment failure goes to a human on the FIRST one", async () => {
+    // Retrying a file QuickBooks refused changes nothing except how long the
+    // Purchase sits in the books without its receipt.
+    for (const attachment of ["failed:400", "failed:413", "failed:415", "failed:fault"]) {
+        const r = recorder({
+            createPurchase: async () => ({
+                ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment,
+            }) as any,
+        });
+        const result = await bookReceipt(row(), r.deps);
+        assert.equal(result.outcome, "needs-review", attachment);
+        assert.equal((result as any).reason, `attachment-refused:${attachment}`);
+        // The Purchase EXISTS, so the key is retained either way.
+        assert.equal((result as any).releaseStrongKey, false, attachment);
+        assert.equal(r.expenses.length, 0, attachment);
+    }
+});
+
+test("a 5xx or thrown attachment failure is still retried", async () => {
+    for (const attachment of ["failed:500", "failed:502", "failed:AbortError", "failed:TypeError"]) {
+        const r = recorder({
+            createPurchase: async () => ({
+                ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment,
+            }) as any,
+        });
+        const result = await bookReceipt(row(), r.deps);
+        assert.equal(result.outcome, "retry", attachment);
+    }
+});
+
+test("isTerminalAttachmentFailure splits refusal from blip", () => {
+    for (const t of ["failed:400", "failed:404", "failed:413", "failed:499", "failed:fault"]) {
+        assert.equal(isTerminalAttachmentFailure(t), true, t);
+    }
+    for (const t of ["failed:500", "failed:503", "failed:AbortError", "failed:unknown"]) {
+        assert.equal(isTerminalAttachmentFailure(t), false, t);
+    }
+});
+
+// ── retry() must read the CURRENT send flag (round-9 item 2) ───────────────
+
+test("attempt 20 RETAINS the key when the failure was at the create", async () => {
+    const r = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
+    assert.equal((result as any).reason, "max-retries");
+    // row.sendAttempted was false when the row was CLAIMED, but this attempt
+    // reached the create — so QBO may hold a Purchase and the key must stay.
+    assert.equal((result as any).releaseStrongKey, false, "the CURRENT send flag decides");
+    assert.deepEqual(r.sendMarks, ["intake-1"]);
+});
+
+test("attempt 20 RETAINS the key when the failure was at the attachment leg", async () => {
+    const r = recorder({
+        createPurchase: async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "failed:500",
+        }) as any,
+    });
+    const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
+    assert.equal((result as any).reason, "max-retries");
+    assert.equal((result as any).releaseStrongKey, false, "the Purchase exists");
+});
+
+test("attempt 20 RETAINS the key when the POST-create DB write failed", async () => {
+    const r = recorder();
+    (r.deps.db as any).$transaction = async () => { throw new Error("connection reset"); };
+    const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
+    assert.equal((result as any).reason, "max-retries");
+    assert.equal((result as any).releaseStrongKey, false, "the Purchase exists even though the row does not know");
+});
+
+test("attempt 20 RELEASES the key only when nothing was ever sent", async () => {
+    const r = recorder({
+        downloadBytes: async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
+    });
+    const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
+    assert.equal((result as any).reason, "max-retries");
+    assert.equal((result as any).releaseStrongKey, true);
+    assert.deepEqual(r.sendMarks, [], "never reached the create");
+});
+
+// ── A superseded worker sends nothing (Phase 2 gate) ──────────────────────
+
+test("a STALE claim aborts BEFORE the QBO create", async () => {
+    // The zombie case: an invocation killed mid-booking resumes after its row
+    // has been re-claimed. markSendAttempted is a CAS on the claim, so it
+    // affects zero rows — and the booking stops THERE, having sent nothing.
+    // Posting a Purchase the live worker is also about to post is the
+    // double-booking this whole mechanism exists to prevent.
+    const r = recorder({ markSendAttempted: async () => false });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.deepEqual(result, { outcome: "stale" });
+    assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never called");
+    assert.equal(r.expenses.length, 0, "no Expense");
+    assert.deepEqual(r.intakeUpdates, [], "and no state write at all");
+});
+
+test("the send fence receives the row's OWN claim token", async () => {
+    const seen: Array<string | null> = [];
+    const r = recorder({
+        markSendAttempted: async (_id, token) => { seen.push(token); return true; },
+    });
+    await bookReceipt(row({ claimToken: "token-xyz" }), r.deps);
+    assert.deepEqual(seen, ["token-xyz"]);
+});
+
+test("losing the claim DURING the commit rolls back and reports stale", async () => {
+    // The window between the create and the commit. The Purchase exists, so
+    // the successor's retry hits alreadyExists and books it once, under one
+    // owner — but THIS worker must not complete a BOOKED write.
+    const r = recorder();
+    (r.deps.db as any).receiptIntake.updateMany = async () => ({ count: 0 });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.deepEqual(result, { outcome: "stale" });
+    assert.equal(r.purchaseCalls.length, 1, "the create did happen");
+    assert.equal(r.events.length, 0, "but nothing is logged as booked");
+});
+
+test("the BOOKED write is a CAS on state AND token", async () => {
+    const wheres: any[] = [];
+    const r = recorder();
+    (r.deps.db as any).receiptIntake.updateMany = async (args: any) => {
+        wheres.push(args.where);
+        return { count: 1 };
+    };
+    await bookReceipt(row({ claimToken: "token-abc" }), r.deps);
+    assert.deepEqual(wheres, [{ id: "intake-1", state: "BOOKING", claimToken: "token-abc" }]);
 });

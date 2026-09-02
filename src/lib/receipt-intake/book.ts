@@ -61,6 +61,11 @@ export interface BookableRow {
     memo: string | null;
     /** What finalize recorded; every download of this row is checked against it. */
     fileSha256: string;
+    /**
+     * The token this pass claimed the row with. Every write is a CAS on it, so
+     * a worker whose claim was superseded cannot act on stale state.
+     */
+    claimToken: string | null;
     attempts: number;
     /** Carries a previous attachment failure across a retry — see below. */
     lastError: string | null;
@@ -134,6 +139,11 @@ export type BookResult =
      * held: QBO may have created the Purchase and lost the response.
      */
     | { outcome: "needs-review"; reason: string; releaseStrongKey: boolean }
+    /**
+     * This worker's claim was superseded. It wrote nothing and sent nothing;
+     * the row belongs to whoever holds the current token.
+     */
+    | { outcome: "stale" }
     /** Transport-class failure: attempts+1 and a backoff. */
     | { outcome: "retry"; attempts: number; nextRetryAt: Date; reason: string };
 
@@ -152,14 +162,22 @@ export interface BookPrismaClient {
     };
     receiptIntake: {
         update(args: any): Promise<unknown>;
+        updateMany(args: any): Promise<{ count: number }>;
     };
     $transaction<T>(fn: (tx: BookPrismaClient) => Promise<T>): Promise<T>;
 }
 
 export interface BookDependencies {
     db: BookPrismaClient;
-    /** Persists sendAttempted BEFORE the create — the flag must survive a crash. */
-    markSendAttempted: (rowId: string) => Promise<void>;
+    /**
+     * CAS on {id, state: BOOKING, claimToken} that persists sendAttempted.
+     *
+     * This is the LAST FENCE before QuickBooks. It returns false when the row
+     * has been re-claimed, and the booking then aborts having sent nothing —
+     * which is the point: a zombie worker resuming with a stale view must not
+     * create a Purchase the live worker is about to create as well.
+     */
+    markSendAttempted: (rowId: string, claimToken: string | null) => Promise<boolean>;
     /** The company's configured zone — Expense.date is a business calendar day. */
     companyTimeZone: () => Promise<string>;
     /**
@@ -431,7 +449,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // strong key would then be held forever against a Purchase that does
         // not exist. Persisted rather than in-memory, because the case the flag
         // exists for is the process dying mid-create.
-        await deps.markSendAttempted(row.id);
+        // It is ALSO the last fence: a CAS on the claim token. If this worker
+        // has been superseded the write affects zero rows and we abort HERE,
+        // before the create — so a zombie cannot post a Purchase that the live
+        // worker is about to post as well.
+        const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
+        if (!stillOurs) return { outcome: "stale" };
         sent.attempted = true;
 
         result = await deps.createPurchase(tokens, input, deps.deadline);
@@ -442,7 +465,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         if (terminal) return { outcome: "needs-review", reason: terminal, releaseStrongKey: !sent.attempted };
         // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
         // 429/5xx and DB errors are all transport-class: try again later.
-        return retry(row, deps, now, describe(error));
+        return retry(row, deps, now, describe(error), sent.attempted);
     }
 
     if (!result.ok) {
@@ -479,7 +502,20 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         if (result.attachment === "skipped") {
             return { outcome: "needs-review", reason: "unsupported-attachment:skipped", releaseStrongKey: false };
         }
-        return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`);
+        // A `failed:<4xx>` or `failed:fault` is QBO REFUSING this file — a
+        // rejected format, an oversize body, a business-rule fault. Retrying it
+        // twenty times changes nothing except how long the Purchase sits in the
+        // books without its receipt, so it goes to a human on the first one.
+        // Only a transient class (5xx, a thrown network/abort error) is worth
+        // another pass. The key is retained either way: the Purchase EXISTS.
+        if (isTerminalAttachmentFailure(result.attachment)) {
+            return {
+                outcome: "needs-review",
+                reason: `attachment-refused:${result.attachment}`,
+                releaseStrongKey: false,
+            };
+        }
+        return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`, sent.attempted);
     }
 
     // 5. One transaction: the Expense and the row's BOOKED state land together
@@ -558,8 +594,14 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 },
                 select: { id: true },
             });
-            await tx.receiptIntake.update({
-                where: { id: row.id },
+            // CAS again inside the commit. If the row was re-claimed between
+            // the create and here, this transaction rolls back — including the
+            // Expense — and the successor retries: QBO's DocNumber idempotency
+            // returns the SAME Purchase, so it books once, under one owner.
+            // Completing a BOOKED write from a stale worker would leave two
+            // owners disagreeing about the row.
+            const claimed = await tx.receiptIntake.updateMany({
+                where: { id: row.id, state: "BOOKING", claimToken: row.claimToken },
                 data: {
                     state: "BOOKED",
                     stateReason: null,
@@ -570,6 +612,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     nextRetryAt: null,
                 },
             });
+            if (claimed.count === 0) throw new StaleClaimError();
             return expense.id;
         });
 
@@ -613,9 +656,14 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             alreadyExisted: result.alreadyExists,
         };
     } catch (error) {
+        // A lost CAS is not a fault: the successor owns this row and will book
+        // it. Say so rather than spending an attempt on it.
+        if (error instanceof StaleClaimError) return { outcome: "stale" };
         // The Purchase EXISTS at this point. Retrying is correct and safe: the
-        // DocNumber lookup will find it and return alreadyExists:true.
-        return retry(row, deps, now, describe(error));
+        // DocNumber lookup will find it and return alreadyExists:true — and the
+        // key must be RETAINED, which is why this attempt's send flag is passed
+        // rather than the row's stale copy.
+        return retry(row, deps, now, describe(error), sent.attempted);
     }
 }
 
@@ -625,8 +673,30 @@ function describe(error: unknown): string {
     return "UnknownError";
 }
 
+/** Thrown inside the commit transaction when the claim token no longer matches. */
+class StaleClaimError extends Error {
+    constructor() {
+        super("the claim was superseded");
+        this.name = "StaleClaimError";
+    }
+}
+
 /** Marks a retry as "the Purchase exists but its receipt did not attach". */
 export const ATTACHMENT_FAILED_PREFIX = "attachment-failed:";
+
+/**
+ * Is this attachment failure QBO refusing the file, rather than a blip?
+ *
+ * `failed:<status>` carries the HTTP status; `failed:fault` is an Intuit
+ * business-rule rejection; `failed:<ErrorName>` comes from a thrown error and
+ * is transient by nature (AbortError, TypeError from fetch, ...).
+ */
+export function isTerminalAttachmentFailure(attachment: string): boolean {
+    const detail = attachment.slice("failed:".length);
+    if (detail === "fault") return true;
+    const status = Number(detail);
+    return Number.isFinite(status) && status >= 400 && status < 500;
+}
 
 /**
  * Which phase (if any) this Expense may carry, checked against the project the
@@ -672,16 +742,29 @@ function parkedBeforeSend(reason: string): BookResult {
     return { outcome: "needs-review", reason, releaseStrongKey: true };
 }
 
-function retry(row: BookableRow, deps: BookDependencies, now: Date, reason: string): BookResult {
+function retry(
+    row: BookableRow,
+    deps: BookDependencies,
+    now: Date,
+    reason: string,
+    /**
+     * Whether THIS attempt reached the create. `row.sendAttempted` is the value
+     * read when the row was claimed, so it is stale the moment
+     * markSendAttempted runs — and a failure AFTER the create (the attachment
+     * leg, the Expense commit) would have been judged on it and wrongly
+     * released the key of a row that really does have a Purchase.
+     */
+    sentThisAttempt = false,
+): BookResult {
+    const sendAttempted = row.sendAttempted || sentThisAttempt;
     const attempts = row.attempts + 1;
     // `>=`, so MAX_BOOK_ATTEMPTS reads as "20 attempts in total" rather than 21.
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        // Keyed on the ROW's record of whether a send ever happened, not on the
-        // assumption that reaching the retry limit implies one. A row can
-        // exhaust its attempts entirely on storage faults, having never touched
-        // QuickBooks — and holding its key then quarantines the corrected
-        // resend against nothing.
-        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: !row.sendAttempted };
+        // Keyed on whether a send ever happened, not on the assumption that
+        // reaching the retry limit implies one. A row can exhaust its attempts
+        // entirely on storage faults, having never touched QuickBooks — and
+        // holding its key then quarantines the corrected resend against nothing.
+        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: !sendAttempted };
     }
     return {
         outcome: "retry",
