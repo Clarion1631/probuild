@@ -14891,76 +14891,84 @@ export async function markTimeEntryReviewed(entryId: string) {
     const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true, email: true, role: true } });
     if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
 
+    // Cheap fail-fast only. Everything that DECIDES anything is re-read
+    // row-locked inside the transaction below — this copy is stale the moment
+    // another writer touches the row.
     const entry = await prisma.timeEntry.findUnique({
         where: { id: entryId },
-        select: {
-            id: true, needsReview: true, notes: true, reviewReason: true, durationHours: true,
-            user: { select: { id: true, name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true } },
-        },
+        select: { id: true, needsReview: true },
     });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.needsReview) return { success: true }; // already reviewed — idempotent
 
-    // The $0-rate escape hatch has to close behind itself. A manager may close
-    // someone's punch at a $0 rate, but the flag it leaves is the ONLY thing
-    // stopping that zero-cost labor being exported and locked — so clearing it
-    // is not a rubber stamp. Require a real rate now, and REPRICE the entry in
-    // the same transaction; otherwise the flag goes away and the $0 stays.
     const { ZERO_RATE_REVIEW_NOTE, zeroRateBlocks } = await import("./pay-rate-guard");
-    const isZeroRateFlag = (entry.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE);
-    let reprice: { laborCost: number; burdenCost: number } | null = null;
-    if (isZeroRateFlag) {
-        const owner = entry.user;
-        if (zeroRateBlocks({
-            role: owner.role,
-            email: owner.email,
-            payType: owner.payType,
-            hourlyRate: toNum(owner.hourlyRate),
-        })) {
-            throw new Error(
-                `${owner.name || owner.email} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
-            );
-        }
-        const hours = entry.durationHours ?? 0;
-        reprice = { laborCost: hours * toNum(owner.hourlyRate), burdenCost: hours * toNum(owner.burdenRate) };
-    }
-
-    const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
-    // Clearing the flag can REPRICE the entry, so it is a payroll write like any
-    // other and goes through the advisory-lock protocol.
     const { withPayrollWrite } = await import("./payroll-period");
     const { readOwnerRatesForUpdate } = await import("./pay-rate-guard");
-    await withPayrollWrite({ entryIds: [entryId] }, async (tx) => {
-        // Reprice from rates read FOR UPDATE in THIS transaction — the check
-        // above ran against a copy taken before it opened.
-        if (reprice) {
-            const locked = await readOwnerRatesForUpdate(tx as never, entry.user.id, toNum);
-            if (!locked || zeroRateBlocks({
-                role: locked.role,
-                email: locked.email,
-                payType: locked.payType,
-                hourlyRate: locked.hourlyRate,
-            })) {
+
+    const reviewed = await withPayrollWrite({ entryIds: [entryId] }, async (tx) => {
+        const client = tx as unknown as typeof prisma;
+
+        // The entry as it stands NOW, row-locked. Everything below is decided
+        // from this read, not from the copy taken before the transaction: an
+        // edit landing in between changes the hours the reprice multiplies, the
+        // reason being cleared, and whether there is still anything to review.
+        const [live] = (await client.$queryRawUnsafe(
+            `SELECT "needsReview", "reviewReason", "notes", "durationHours", "userId", "updatedAt"
+             FROM "TimeEntry" WHERE "id" = $1`,
+            entryId
+        )) as Array<{
+            needsReview: boolean;
+            reviewReason: string | null;
+            notes: string | null;
+            durationHours: number | null;
+            userId: string;
+            updatedAt: Date;
+        }>;
+        if (!live) throw new Error("Time entry not found");
+        // Somebody already cleared it. Idempotent, not an error.
+        if (!live.needsReview) return "already";
+
+        const data: Record<string, unknown> = {
+            needsReview: false,
+            reviewReason: stripSettlementNotes(live.reviewReason),
+        };
+
+        // The $0-rate flag is the only thing stopping a manager-closed free
+        // shift being exported. Clearing it demands a real rate NOW, and the
+        // entry is repriced from that rate in this same write.
+        if ((live.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE)) {
+            const owner = await readOwnerRatesForUpdate(tx as never, live.userId, toNum);
+            if (
+                !owner ||
+                zeroRateBlocks({
+                    role: owner.role,
+                    email: owner.email,
+                    payType: owner.payType,
+                    hourlyRate: owner.hourlyRate,
+                })
+            ) {
                 throw new Error(
-                    `${entry.user.name || entry.user.email} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
+                    `${owner?.name || "That team member"} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
                 );
             }
-            const hours = entry.durationHours ?? 0;
-            reprice = { laborCost: hours * locked.hourlyRate, burdenCost: hours * locked.burdenRate };
+            const hours = live.durationHours ?? 0;
+            data.laborCost = hours * owner.hourlyRate;
+            data.burdenCost = hours * owner.burdenRate;
         }
-        return (tx as unknown as typeof prisma).timeEntry.update({
-        where: { id: entryId },
-        data: {
-            ...(reprice ?? {}),
-            needsReview: false,
-            // Retire the settlement-owned notes (src/lib/wa-breaks.ts) so a later
-            // day re-plan cannot read them as "still unanswered" and re-flag a row
-            // a manager already looked at. Other reasons (GPS etc.) are kept.
-            reviewReason: stripSettlementNotes(entry.reviewReason),
-            notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
-        },
+
+        const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
+        data.notes = live.notes ? `${live.notes}\n${stamp}` : stamp;
+
+        // Compare-and-set on updatedAt: a concurrent write between the read
+        // above and here would make the reprice describe different hours.
+        const claim = await client.timeEntry.updateMany({
+            where: { id: entryId, updatedAt: live.updatedAt },
+            data,
         });
+        if (claim.count !== 1) throw new Error("This entry changed while it was being reviewed. Reload and try again.");
+        return "reviewed";
     });
+    if (reviewed === "already") return { success: true };
 
     revalidatePath("/manager/time-entries");
     return { success: true };
@@ -15330,7 +15338,7 @@ async function importableUsers() {
  * the value never passes through a JS float.
  */
 export async function applyGustoRateImport(
-    rows: Array<{ userId: string; newHourly: string; payType?: string | null; rowHash: string }>,
+    rows: Array<{ userId: string; newHourly: string | null; payType?: string | null; rowHash: string }>,
     /**
      * Re-parsed here, not trusted from the browser: a file with unreadable rows
      * is a file somebody has to look at again. Importing the rows that happened
@@ -15357,21 +15365,31 @@ export async function applyGustoRateImport(
     const { Prisma } = await import("@prisma/client");
 
     const seen = new Set<string>();
-    const clean: Array<{ userId: string; newHourly: string; payType: string | null; rowHash: string }> = [];
+    const clean: Array<{ userId: string; newHourly: string | null; payType: string | null; rowHash: string }> = [];
     for (const row of rows) {
         if (!row || typeof row.userId !== "string" || !row.userId) continue;
         if (typeof row.rowHash !== "string" || !row.rowHash) {
             return { success: false as const, error: "Run the preview again before saving." };
         }
         if (seen.has(row.userId)) return { success: false as const, error: "The same team member appears twice." };
-        const rate = parseRateValue(String(row.newHourly));
-        if (rate == null || rate.startsWith("-") || Number(rate) > MAX_IMPORTABLE_HOURLY_RATE) {
-            return {
-                success: false as const,
-                error: `Rate out of range or unreadable for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}, at most two decimal places).`,
-            };
-        }
         const payType = row.payType === "SALARY" || row.payType === "HOURLY" ? row.payType : null;
+
+        // A SALARY row carries no hourly rate: Gusto's compensation figure for a
+        // salaried person is ANNUAL (92,000, not 44.23), so reading it as an
+        // hourly rate is nonsense. Their pay type is the useful part.
+        let rate: string | null = null;
+        if (row.newHourly != null) {
+            rate = parseRateValue(String(row.newHourly));
+            if (rate == null || rate.startsWith("-") || Number(rate) > MAX_IMPORTABLE_HOURLY_RATE) {
+                return {
+                    success: false as const,
+                    error: `Rate out of range or unreadable for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}, at most two decimal places).`,
+                };
+            }
+        }
+        if (rate == null && !payType) {
+            return { success: false as const, error: "A row has neither a rate nor a pay type — re-run the preview." };
+        }
         seen.add(row.userId);
         clean.push({ userId: row.userId, newHourly: rate, payType, rowHash: row.rowHash });
     }
@@ -15429,8 +15447,11 @@ export async function applyGustoRateImport(
                         status: { not: "DISABLED" },
                     },
                     data: {
-                        hourlyRate: new Prisma.Decimal(row.newHourly),
-                        lastRateSyncAt: syncedAt,
+                        // A pay-type-only row leaves the rate — and its
+                        // "last confirmed" stamp — untouched.
+                        ...(row.newHourly != null
+                            ? { hourlyRate: new Prisma.Decimal(row.newHourly), lastRateSyncAt: syncedAt }
+                            : {}),
                         ...(row.payType ? { payType: row.payType } : {}),
                     },
                 });

@@ -24,9 +24,13 @@ import {
 } from "@/lib/payroll-period";
 import {
     appendZeroRateReview,
+    canAcknowledgeZeroRate,
     readOwnerRatesForUpdate,
     zeroRateBlockedResponse,
     zeroRateBlocks,
+    zeroRateManagerMessage,
+    ZERO_RATE_BLOCKED_CODE,
+    ZERO_RATE_WORKER_MESSAGE,
 } from "@/lib/pay-rate-guard";
 
 export async function GET(req: Request) {
@@ -401,7 +405,14 @@ export interface ClockOutDependencies {
          */
         buildData: (
             storedStartTime: Date,
-            lockedRates: { hourlyRate: number; burdenRate: number }
+            lockedOwner: {
+                name: string | null;
+                email: string;
+                role: string;
+                payType: string | null;
+                hourlyRate: number;
+                burdenRate: number;
+            }
         ) => Promise<Record<string, unknown>>,
         /**
          * Everything the close transaction must do atomically:
@@ -546,9 +557,12 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // acknowledge (a phone cannot fix a rate), so the flag is only
             // honoured for a manager closing someone else's punch
             // (src/lib/pay-rate-guard.ts, spec G2).
-            const zeroRate = zeroRateBlocks(owner);
-            const acknowledged = acknowledgeZeroRate && !closerIsOwner && (user.role === "MANAGER" || user.role === "ADMIN");
-            if (zeroRate && !acknowledged) {
+            // Fail-fast on the pre-read. The AUTHORITATIVE check runs again on
+            // the row-locked owner inside the close transaction (see buildData):
+            // a rate import committing in between would otherwise let a $0 shift
+            // through on the strength of a stale read.
+            const acknowledged = canAcknowledgeZeroRate(user, existing.userId) && acknowledgeZeroRate;
+            if (zeroRateBlocks(owner) && !acknowledged) {
                 return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
             }
 
@@ -560,8 +574,27 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // had since been moved to another day.
             const buildData = async (
                 storedStart: Date,
-                lockedRates: { hourlyRate: number; burdenRate: number }
+                lockedOwner: {
+                    name: string | null;
+                    email: string;
+                    role: string;
+                    payType: string | null;
+                    hourlyRate: number;
+                    burdenRate: number;
+                }
             ): Promise<Record<string, unknown>> => {
+                // THE authoritative $0 check: the owner as they are right now,
+                // row-locked in this transaction. The pre-read above is only a
+                // fail-fast — a rate set to $0 between it and here has to be
+                // caught, and a rate FIXED in between must stop refusing.
+                const zeroRate = zeroRateBlocks(lockedOwner);
+                if (zeroRate && !acknowledged) {
+                    throw new ClockOutInputError(
+                        422,
+                        closerIsOwner ? ZERO_RATE_WORKER_MESSAGE : zeroRateManagerMessage(lockedOwner.name),
+                        ZERO_RATE_BLOCKED_CODE
+                    );
+                }
                 // Re-validate against the value that is actually stored.
                 if (end.getTime() <= storedStart.getTime()) {
                     throw new ClockOutInputError(400, "endTime must be after the clock-in time");
@@ -603,8 +636,8 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     mealOutcome: meal.outcome,
                     // Priced from the rates read FOR UPDATE inside the close
                     // transaction, never from the copy read before it.
-                    laborCost: durationHours * lockedRates.hourlyRate,
-                    burdenCost: durationHours * lockedRates.burdenRate,
+                    laborCost: durationHours * lockedOwner.hourlyRate,
+                    burdenCost: durationHours * lockedOwner.burdenRate,
                 };
 
                 if (latitude) updateData.latitude = latitude;
@@ -804,9 +837,9 @@ const clockOutHandler = createClockOutHandler({
                 // The owner's rates, row-locked in THIS transaction. A rate
                 // import committing between the pre-read and here would
                 // otherwise be ignored and the shift stamped at a stale rate.
-                const lockedRates = await readOwnerRatesForUpdate(client, userId, toNum);
-                if (!lockedRates) return { ok: false as const, current: null };
-                const data = await buildData(stored.startTime, lockedRates);
+                const lockedOwner = await readOwnerRatesForUpdate(client, userId, toNum);
+                if (!lockedOwner) return { ok: false as const, current: null };
+                const data = await buildData(stored.startTime, lockedOwner);
 
                 // Compare-and-set on startTime as well as the open check: a
                 // concurrent edit that moved the punch within the same day

@@ -28,7 +28,16 @@ export type ParsedRateRow = {
      * text is carried all the way to `new Prisma.Decimal(text)` at write time so
      * nothing is ever rounded on the way through.
      */
-    hourlyRate: string;
+    /**
+     * Canonical decimal TEXT, or null for a SALARY row.
+     *
+     * A salaried person's "compensation rate" in Gusto is an ANNUAL figure —
+     * 92,000, not 44.23. Reading it as an hourly rate is nonsense, and because
+     * it also fails the plausibility ceiling it used to produce a parse error
+     * that (correctly) blocked the whole import. Their pay type is the useful
+     * part of the row; the rate is not ours to guess.
+     */
+    hourlyRate: string | null;
     /** "HOURLY" | "SALARY" when the file said so, else null. */
     payType: string | null;
 };
@@ -49,8 +58,8 @@ export type RateDiffRow = {
     email: string | null;
     /** Canonical decimal TEXT (2 places), or null when nothing matched. */
     oldHourly: string | null;
-    /** Canonical decimal TEXT (2 places) — the value that will be written verbatim. */
-    newHourly: string;
+    /** Canonical decimal TEXT (2 places), or null when the row only sets a pay type. */
+    newHourly: string | null;
     /** Pay type the file supplied for this row, if any. */
     payType: string | null;
     matched: boolean;
@@ -234,6 +243,14 @@ export function parseGustoRateCsv(text: string): RateImportParse {
 
         if (!name && !email) continue; // blank row
 
+        // Pay type FIRST: it decides whether the rate column means anything.
+        const payType = normalizePayType(at(payTypeAt));
+        if (payType === "SALARY") {
+            // Pay type only. Never an hourlyRate — see ParsedRateRow.hourlyRate.
+            rows.push({ lineNumber, name, email, hourlyRate: null, payType });
+            continue;
+        }
+
         const hourlyRate = parseRateValue(rateText);
         if (hourlyRate == null) {
             errors.push(
@@ -254,7 +271,7 @@ export function parseGustoRateCsv(text: string): RateImportParse {
             continue;
         }
 
-        rows.push({ lineNumber, name, email, hourlyRate, payType: normalizePayType(at(payTypeAt)) });
+        rows.push({ lineNumber, name, email, hourlyRate, payType });
     }
 
     return { rows, errors };
@@ -379,7 +396,7 @@ export function diffRates(
             // fudge the numeric version needed.
             changed:
                 !!user &&
-                (canonicalRateText(user.hourlyRate) !== row.hourlyRate ||
+                ((row.hourlyRate != null && canonicalRateText(user.hourlyRate) !== row.hourlyRate) ||
                     (!!row.payType && row.payType !== (user.payType ?? null))),
             note,
         };
@@ -422,7 +439,8 @@ export type RowFingerprintInput = {
     oldHourly: string | null;
     /** The member's pay type when the preview was built. */
     oldPayType: string | null;
-    newHourly: string;
+    /** The rate about to be written, or null for a pay-type-only row. */
+    newHourly: string | null;
     /** The pay type about to be written (null = leave it alone). */
     payType: string | null;
 };
@@ -442,7 +460,7 @@ export function rowFingerprint(input: RowFingerprintInput): string {
         input.userId,
         input.oldHourly ?? "",
         input.oldPayType ?? "",
-        input.newHourly,
+        input.newHourly ?? "",
         input.payType ?? "",
     ].join(":");
 }

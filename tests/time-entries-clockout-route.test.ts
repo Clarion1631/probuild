@@ -74,8 +74,18 @@ function createDeps(overrides: {
             void guard;
             // The real dependency reads these FOR UPDATE inside the close
             // transaction and prices from them; the fixture owner never changes.
-            const lockedRates = overrides.ownerRates ?? { hourlyRate: 20, burdenRate: 5 };
-            const data = await buildData(overrides.entry?.startTime ?? START, lockedRates);
+            // The real dependency hands buildData the whole row-locked owner —
+            // buildData re-runs the $0 check on it, so name/role/email/payType
+            // all matter, not just the numbers.
+            const lockedOwner = overrides.ownerRates ?? {
+                hourlyRate: 20,
+                burdenRate: 5,
+                role: "FIELD_CREW",
+                name: "Owner",
+                email: "owner@example.com",
+                payType: "HOURLY",
+            };
+            const data = await buildData(overrides.entry?.startTime ?? START, lockedOwner);
             updateCalls.push({ id, userId, data });
             if (overrides.closeRaceLost) {
                 const current = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });

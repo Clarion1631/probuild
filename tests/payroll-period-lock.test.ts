@@ -153,7 +153,7 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5 })),
+        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })),
         loadLockedPeriods: async () => lockedPeriods,
     };
     return { dependencies, updateCalls };
@@ -214,7 +214,7 @@ test("a lock taken AFTER the fail-fast check still stops the write (in-transacti
         const hit = lockedPeriodFor([period()], INSIDE);
         if (hit) return { ok: false as const, locked: hit };
         updateCalls.push({ id });
-        return { ok: true as const, entry: { id, userId, ...(await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5 })) } };
+        return { ok: true as const, entry: { id, userId, ...(await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })) } };
     };
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());
@@ -474,7 +474,7 @@ test("the close is priced from the STORED startTime and compare-and-set on it", 
     // underneath us — a close computed from a pre-transaction read would price
     // a shift that had since been shifted to another day.
     assert.match(body, /SELECT "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
-    assert.match(body, /await buildData\(stored\.startTime, lockedRates\)/);
+    assert.match(body, /await buildData\(stored\.startTime, lockedOwner\)/);
     assert.match(body, /startTime: stored\.startTime/, "the claim must CAS on startTime");
     assert.match(body, /moved: true/);
     // PeriodLockedError leaves the transaction so the write rolls back; it is
@@ -707,6 +707,9 @@ test("markTimeEntryReviewed cannot clear a zero-rate flag without repricing", ()
     assert.match(body, /ZERO_RATE_REVIEW_NOTE/);
     assert.match(body, /zeroRateBlocks\(/);
     assert.match(body, /withPayrollWrite\(/);
+    // Re-read row-locked, repriced from THAT read, and compare-and-set.
+    assert.match(body, /FROM "TimeEntry" WHERE "id" = \$1/);
+    assert.match(body, /updatedAt: live\.updatedAt/);
 });
 
 test("PATCH applies the zero-rate guard to ANY cost recomputation, not just a close", () => {

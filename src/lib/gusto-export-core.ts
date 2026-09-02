@@ -426,12 +426,15 @@ export function buildGustoExport(input: {
         let overtimeHundredths = 0;
 
         for (const week of weeks) {
-            // week.entries carries overtime.ts's own per-entry split. It is the
-            // authority; allocateWeekHundredths only rounds it so the two CSVs
-            // reconcile.
-            for (const allocation of allocateWeekHundredths(week.entries)) {
+            // week.entries carries overtime.ts's own per-entry split — computed
+            // over the WHOLE workweek, which is what makes the OT classification
+            // correct. Only the entries this period actually EMITS are then
+            // rounded together: apportioning the residue over the whole week
+            // could park a hundredth on a context entry that never reaches the
+            // detail csv, and the two files would not add up.
+            const emitted = week.entries.filter((split) => inPeriod(split.entry, periodStart, periodEnd));
+            for (const allocation of allocateWeekHundredths(emitted)) {
                 const item = allocation.entry;
-                if (!inPeriod(item, periodStart, periodEnd)) continue;
                 regularHundredths += allocation.regularHundredths;
                 overtimeHundredths += allocation.overtimeHundredths;
                 detail.push({

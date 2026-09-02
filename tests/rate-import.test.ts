@@ -459,3 +459,40 @@ test("a pay-type change is shown old -> new and is never pre-ticked", () => {
     assert.match(ui, /pay type \{row\.oldPayType \? row\.oldPayType\.toLowerCase\(\) : "not set"\}/);
     assert.match(ui, /tick those yourself/);
 });
+
+test("salaried rows carry a pay type, not an annual figure read as an hourly rate", () => {
+    // Gusto's compensation figure for a salaried person is ANNUAL: CJ 92,000,
+    // Richard 80,000. Read as hourly they fail the plausibility ceiling, and
+    // the parse errors then blocked the WHOLE import — so one salaried person
+    // in the file stopped every hourly rate in it from being saved.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate,Compensation type",
+            "CJ Manager,cj@example.com,92000,Salary",
+            "Richard Lord,rlord@example.com,80000,Salary",
+            "Tim Brennan,tim@example.com,28.50,Hourly",
+        ].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.errors, [], "a salaried row is not a parse failure");
+    assert.deepEqual(
+        parsed.rows.map((row) => [row.name, row.hourlyRate, row.payType]),
+        [
+            ["CJ Manager", null, "SALARY"],
+            ["Richard Lord", null, "SALARY"],
+            ["Tim Brennan", "28.50", "HOURLY"],
+        ]
+    );
+
+    // And the diff writes a pay type for them without touching their rate.
+    const withSalaried = [
+        { id: "s1", name: "CJ Manager", email: "cj@example.com", hourlyRate: "0.00", payType: null },
+        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00" },
+    ];
+    const rows = diffRates(parsed.rows, withSalaried);
+    const cj = rows.find((row) => row.userId === "s1");
+    assert.equal(cj?.newHourly, null, "no hourly rate is invented for a salaried person");
+    assert.equal(cj?.payType, "SALARY");
+    assert.equal(cj?.changed, true, "their pay type still needs writing");
+    // The hourly row is unaffected by the salaried ones sharing the file.
+    assert.equal(rows.find((row) => row.userId === "u1")?.newHourly, "28.50");
+});

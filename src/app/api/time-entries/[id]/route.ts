@@ -19,6 +19,7 @@ import {
 } from "@/lib/payroll-period";
 import {
     appendZeroRateReview,
+    canAcknowledgeZeroRate,
     readOwnerRatesForUpdate,
     zeroRateBlockedResponse,
     zeroRateBlocks,
@@ -235,8 +236,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // MAX_SHIFT_HOURS, but it is a deliberate separate action, not the default
     // outcome of an ordinary close. The acknowledged close is flagged, and the
     // payroll export refuses to run while that flag is set.
+    // One rule, server-side (src/lib/pay-rate-guard.ts): an office role, and
+    // never on your own entry.
     const acknowledgedZeroRate =
-        body.acknowledgeZeroRate === true && !isOwner && isPrivileged;
+        body.acknowledgeZeroRate === true && canAcknowledgeZeroRate(user, existing.userId);
     if (zeroRate && !acknowledgedZeroRate) {
         return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
     }

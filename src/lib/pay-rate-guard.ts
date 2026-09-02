@@ -65,6 +65,33 @@ export function zeroRateManagerMessage(ownerName: string | null | undefined): st
     return `Set an hourly rate for ${ownerName?.trim() || "this team member"} on Company → Team Members before closing this entry, or close it explicitly at $0 and flag it for payroll.`;
 }
 
+/** Roles that may deliberately book a $0 shift and flag it. FIELD_CREW is not one. */
+export const ZERO_RATE_ACKNOWLEDGE_ROLES = ["ADMIN", "MANAGER", "FINANCE"] as const;
+
+/**
+ * May this actor take the $0 escape hatch for this entry?
+ *
+ * Two conditions, both necessary:
+ *  - the actor holds an office role. A phone cannot fix a pay rate, so letting
+ *    FIELD_CREW acknowledge would let the crew app opt itself out of the guard
+ *    entirely;
+ *  - it is somebody ELSE'S entry. Self-acknowledgement is the same hole wearing
+ *    a different hat: a manager could book their own unpaid shift and flag it,
+ *    and the flag would be reviewed by the person who set it.
+ *
+ * Enforced server-side on every path — the API routes and the server actions —
+ * because "the UI only shows the button to managers" is not a check.
+ */
+export function canAcknowledgeZeroRate(
+    actor: { role?: string | null; id?: string | null } | null | undefined,
+    entryOwnerId: string | null | undefined
+): boolean {
+    if (!actor?.role) return false;
+    if (!(ZERO_RATE_ACKNOWLEDGE_ROLES as readonly string[]).includes(actor.role)) return false;
+    if (!actor.id || !entryOwnerId) return false;
+    return actor.id !== entryOwnerId;
+}
+
 /** Review note stamped on a punch a MANAGER closed at a $0 rate, so payroll cannot miss it. */
 export const ZERO_RATE_REVIEW_NOTE = "Closed at a $0 pay rate — set the rate and recheck this entry";
 

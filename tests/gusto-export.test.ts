@@ -691,3 +691,34 @@ test("a week entirely under 40 hours has no overtime anywhere", async () => {
         ]
     );
 });
+
+test("consecutive periods splitting one workweek each add up on their own", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // One Mon-Sun week, five 8h01m punches, cut in two by the period boundary:
+    // Mon-Tue in the first period, Wed-Fri in the second. The OT classification
+    // still comes from the WHOLE week; only the rounding residue is apportioned
+    // per period, or a hundredth could land on a row the period never emits.
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const entries = days.map((day) =>
+        entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
+    );
+    const boundary = new Date("2026-08-19T07:00:00.000Z"); // Wed 00:00 local
+
+    for (const [start, end] of [
+        [PERIOD_START, boundary],
+        [boundary, PERIOD_END],
+    ] as const) {
+        const result = buildGustoExport({
+            entries,
+            users: [alice],
+            periodStart: start,
+            periodEnd: end,
+            timeZone: TZ,
+        });
+        const totals = totalsFor(alice.id, result);
+        const detailRegular = result.detail.reduce((sum, row) => sum + toHundredths(row.regularHours), 0);
+        const detailOvertime = result.detail.reduce((sum, row) => sum + toHundredths(row.overtimeHours), 0);
+        assert.equal(detailRegular, toHundredths(totals.regularHours), "regular reconciles within the period");
+        assert.equal(detailOvertime, toHundredths(totals.overtimeHours), "overtime reconciles within the period");
+    }
+});

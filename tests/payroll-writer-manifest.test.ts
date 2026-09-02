@@ -101,10 +101,6 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     },
 
     // ---- server actions -----------------------------------------------------
-    "lib/actions.ts::update": {
-        kind: "guarded",
-        why: "markTimeEntryReviewed, wrapped in withPayrollWrite — clearing a zero-rate flag REPRICES the entry",
-    },
     "lib/actions.ts::updateMany": {
         kind: "guarded",
         why: "the meal-skip decision and logistics routing are both wrapped in withPayrollWrite; the third site is the billing invoice claim, which stamps invoiceId/invoicedAt only and is covered by lib/billing-core.ts's reasoning",

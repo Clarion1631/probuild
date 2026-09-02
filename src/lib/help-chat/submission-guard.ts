@@ -207,13 +207,12 @@ export async function reserveHelpRequest(input: {
         });
         if (existing) {
             const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
-            // Resume only when the issue was never created. providerState is
-            // what distinguishes "never tried" from "tried and finished";
-            // status alone could not, so a finished report could be re-filed.
-            const stale =
-                existing.status === "submitting" &&
-                existing.providerState !== "created" &&
-                age > HELP_SUBMITTING_STALE_MS;
+            // Resume ANY row whose issue was never created — providerState is
+            // the only reliable signal. Keying off status === "submitting"
+            // stranded every 'submitted_no_issue' row: GitHub was down, the
+            // report was saved, and no retry would ever finish it because the
+            // status had already moved on.
+            const stale = existing.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS;
             return { ok: true, id: existing.id, existing: true, resume: stale };
         }
     }

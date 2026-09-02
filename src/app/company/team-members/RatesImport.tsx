@@ -213,7 +213,11 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                                                     <td className={`px-3 py-2 text-right tabular-nums font-medium ${row.changed ? "text-hui-textMain" : "text-hui-textMuted"}`}>
                                                         {/* Rendered from the exact decimal TEXT that will be written —
                                                             not re-parsed through a float on the way to the screen. */}
-                                                        ${row.newHourly}/h
+                                                        {row.newHourly == null ? (
+                                                            <span className="text-hui-textMuted">rate unchanged</span>
+                                                        ) : (
+                                                            `$${row.newHourly}/h`
+                                                        )}
                                                         {row.payType && row.payType !== (row.oldPayType ?? null) && (
                                                             <div className="text-[10px] font-normal uppercase tracking-wide text-amber-800">
                                                                 pay type {row.oldPayType ? row.oldPayType.toLowerCase() : "not set"}

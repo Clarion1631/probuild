@@ -125,10 +125,25 @@ function deps(options: {
             void guard;
             // The real dependency reads these FOR UPDATE inside the close
             // transaction and prices from them.
-            const lockedRates = options.ownerId
-                ? options.ownerRates ?? { hourlyRate: 0, burdenRate: 0 }
-                : { hourlyRate: options.selfRate ?? 0, burdenRate: 0 };
-            const data = await buildData(START, lockedRates);
+            // The whole row-locked owner: buildData re-runs the $0 check on it.
+            const lockedOwner = options.ownerId
+                ? options.ownerRates ?? {
+                      hourlyRate: 0,
+                      burdenRate: 0,
+                      role: "FIELD_CREW",
+                      name: "Tim Brennan",
+                      email: "tim@example.com",
+                      payType: "HOURLY",
+                  }
+                : {
+                      hourlyRate: options.selfRate ?? 0,
+                      burdenRate: 0,
+                      role: options.selfRole ?? "FIELD_CREW",
+                      name: null,
+                      email: options.selfEmail ?? "worker@example.com",
+                      payType: options.ownerPayType ?? null,
+                  };
+            const data = await buildData(START, lockedOwner);
             updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },
@@ -255,7 +270,8 @@ test("clearing the zero-rate review flag requires a real rate and reprices the e
     assert.match(body, /ZERO_RATE_REVIEW_NOTE/, "it has to recognise the zero-rate flag specifically");
     assert.match(body, /zeroRateBlocks\(/, "and re-check the rate before clearing it");
     assert.match(body, /reprice/, "and reprice the entry rather than leaving the $0 cost");
-    assert.match(body, /laborCost: hours \* toNum\(owner\.hourlyRate\)/);
+    assert.match(body, /data\.laborCost = hours \* owner\.hourlyRate/);
+    assert.match(body, /updatedAt: live\.updatedAt/, "and it refuses a stale review");
 });
 
 test("a WORKER cannot acknowledge their own $0 rate", async () => {
@@ -273,6 +289,67 @@ test("the PATCH mirror also refuses by default and needs the same explicit flag"
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
     );
-    assert.match(source, /body\.acknowledgeZeroRate === true && !isOwner && isPrivileged/);
+    assert.match(source, /body\.acknowledgeZeroRate === true && canAcknowledgeZeroRate\(user, existing\.userId\)/);
     assert.match(source, /if \(zeroRate && !acknowledgedZeroRate\)/);
+});
+
+test("a rate zeroed AFTER the precheck is still caught, inside the transaction", async () => {
+    // The pre-read said the owner had a rate; a rate import committed before
+    // the close transaction opened. The authoritative check runs on the
+    // row-locked owner, so the stale precheck cannot wave it through.
+    const { dependencies, updateCalls } = deps({ selfRate: 28 });
+    const { createClockOutHandler } = await routeModulePromise;
+    dependencies.closeTimeEntry = async (id, userId, buildData) => {
+        // The owner as the transaction finds them: rate gone.
+        const data = await buildData(START, {
+            hourlyRate: 0,
+            burdenRate: 0,
+            role: "FIELD_CREW",
+            name: "Tim Brennan",
+            email: "tim@example.com",
+            payType: "HOURLY",
+        });
+        updateCalls.push({ id, data });
+        return { ok: true as const, entry: { id, userId, ...data } };
+    };
+    const res = await createClockOutHandler(dependencies).PUT(putReq());
+    assert.equal(res.status, 422, "the locked read is what decides");
+    assert.equal((await res.json()).code, "ZERO_RATE_BLOCKED");
+    assert.equal(updateCalls.length, 0, "nothing may be written");
+});
+
+test("a rate FIXED after the precheck stops refusing", async () => {
+    // The mirror image, and the reason this cannot just re-use the precheck:
+    // the office sets the rate while the worker is clocking out.
+    const { dependencies, updateCalls } = deps({ selfRate: 28 });
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq());
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls.length, 1);
+    assert.equal(updateCalls[0].data.laborCost, 28 * 4, "priced from the locked read");
+});
+
+test("only an office role, on somebody ELSE's entry, may acknowledge a $0 close", async () => {
+    const { canAcknowledgeZeroRate } = await import("../src/lib/pay-rate-guard");
+    // A phone cannot fix a pay rate, so letting the crew acknowledge would let
+    // the app opt itself out of the guard entirely.
+    assert.equal(canAcknowledgeZeroRate({ role: "FIELD_CREW", id: "u1" }, "u2"), false);
+    assert.equal(canAcknowledgeZeroRate({ role: "EMPLOYEE", id: "u1" }, "u2"), false);
+    // Self-acknowledgement is the same hole wearing a different hat.
+    assert.equal(canAcknowledgeZeroRate({ role: "MANAGER", id: "u1" }, "u1"), false);
+    assert.equal(canAcknowledgeZeroRate({ role: "ADMIN", id: "u1" }, "u1"), false);
+    // The real cases.
+    assert.equal(canAcknowledgeZeroRate({ role: "MANAGER", id: "u1" }, "u2"), true);
+    assert.equal(canAcknowledgeZeroRate({ role: "ADMIN", id: "u1" }, "u2"), true);
+    assert.equal(canAcknowledgeZeroRate({ role: "FINANCE", id: "u1" }, "u2"), true);
+    assert.equal(canAcknowledgeZeroRate(null, "u2"), false);
+    assert.equal(canAcknowledgeZeroRate({ role: "ADMIN", id: "u1" }, null), false);
+});
+
+test("a FIELD_CREW acknowledgement is ignored by the route", async () => {
+    const { dependencies, updateCalls } = deps({ selfRole: "FIELD_CREW", selfRate: 0 });
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq({ acknowledgeZeroRate: true }));
+    assert.equal(res.status, 422);
+    assert.equal(updateCalls.length, 0);
 });

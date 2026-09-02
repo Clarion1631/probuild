@@ -243,10 +243,11 @@ test("a retry resumes a submission stranded mid-flight instead of returning earl
     // the `submitting` row would strand that report forever.
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
     assert.match(source, /HELP_SUBMITTING_STALE_MS/);
-    assert.match(
-        source,
-        /existing\.status === "submitting" &&[\s\S]{0,120}providerState !== "created"[\s\S]{0,80}age > HELP_SUBMITTING_STALE_MS/
-    );
+    // providerState ALONE decides. Keying off status stranded every
+    // 'submitted_no_issue' row: GitHub was down, the report was saved, and no
+    // retry would ever finish it because the status had already moved on.
+    assert.match(source, /existing\.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS/);
+    assert.doesNotMatch(source, /existing\.status === "submitting" &&/);
     // A resume must not consume a second slot — it was already paid for.
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
     assert.ok(
