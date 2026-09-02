@@ -270,7 +270,9 @@ test.describe("intake POST", () => {
             baseURL: "http://localhost:3000",
             storageState: { cookies: [], origins: [] },
         });
-        // Same secret, but declaring `chat` while the row is a `drive` row.
+        // FIRST LINE OF DEFENCE: declaring `chat` while naming a `drive:` ref
+        // is refused outright, before the row is ever looked up. So a
+        // cross-namespace probe cannot even reach the conflict handler.
         const crossNamespace = await machine.post(INTAKE_PATH, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
             data: JSON.stringify({
@@ -279,8 +281,28 @@ test.describe("intake POST", () => {
             }),
             maxRedirects: 0,
         });
-        expect(crossNamespace.status()).toBe(409);
-        const body = await crossNamespace.json();
+        expect(crossNamespace.status()).toBe(400);
+        expect((await crossNamespace.json()).reason).toBe("sourceRef-namespace-mismatch");
+
+        // SECOND LINE: the conflict handler checks the row's OWN `source` too,
+        // so a row whose stored source disagrees with its prefix — a legacy row
+        // from before the prefix rule existed — still leaks nothing. Seeded
+        // directly, because the route can no longer create that shape.
+        const legacyRef = `${REF_PREFIX}legacy-mismatch`;
+        const legacy = await postIntake(request, intakeBody({ source: "drive", sourceRef: legacyRef }));
+        expect(legacy.res.status()).toBe(200);
+        await prisma.receiptIntake.update({ where: { id: legacy.body.id }, data: { source: "chat" } });
+
+        const probe = await machine.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "drive", sourceRef: legacyRef,
+                fileBase64: OTHER_PNG_BASE64, mimeType: "image/png",
+            }),
+            maxRedirects: 0,
+        });
+        expect(probe.status()).toBe(409);
+        const body = await probe.json();
         expect(body.error).toBe("sourceRef-conflict");
         expect(body, "no id for a caller outside the row's namespace").not.toHaveProperty("existingId");
         await machine.dispose();
