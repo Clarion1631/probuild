@@ -257,6 +257,23 @@ test("no contract value → earned revenue is null (nothing to earn against)", a
     assert.equal(fin.earnedMargin, null);
 });
 
+test("a MANUAL percent with NO approved contract keeps the percent and nulls the margin", async () => {
+    // The two questions are different and were conflated by callers counting
+    // `earnedMargin !== null` as "has a percent complete". Somebody set 60% by
+    // hand; there is simply nothing signed yet to earn against. The percentage
+    // is real and must survive -- reporting this job as "no % complete" would
+    // send the owner off to set a number that is already set.
+    fixture.estimates = [];
+    fixture.changeOrders = [];
+    const fin = await computeProjectFinancials("p1");
+
+    assert.equal(fin.contractValue, 0);
+    assert.equal(fin.percentComplete, 60);
+    assert.equal(fin.percentCompleteSource, "MANUAL");
+    assert.equal(fin.earnedRevenue, null);
+    assert.equal(fin.earnedMargin, null);
+});
+
 test("a project row that cannot be loaded degrades to null, never throws", async () => {
     fixture.project = null;
     const fin = await computeProjectFinancials("p1");

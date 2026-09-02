@@ -136,6 +136,18 @@ test("a job with no percent complete says so — never 0%", () => {
     assert.match(text, /\|adjust>/);
 });
 
+test("a job with a percent but no contract still shows its percent on the card", () => {
+    // earnedMargin is null because contract value is $0, NOT because the
+    // percentage is missing. The line must not fall into the "no % yet" branch.
+    const text = buildMarginCardText(
+        [job({ source: "MANUAL", percentComplete: 60, auto: 62, earnedMargin: null })],
+        MONDAY
+    );
+    assert.match(text, /manual 60%/);
+    assert.doesNotMatch(text, /no % yet/);
+    assert.match(text, /earned margin —/);
+});
+
 test("a drifted override carries a review flag", () => {
     const text = buildMarginCardText([job({ source: "MANUAL", percentComplete: 60, auto: 71, needsReview: true })], MONDAY);
     assert.match(text, /auto moved >5 pts since the override/);

@@ -167,16 +167,25 @@ const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
  * "What's dragging us": the two active jobs with the lowest earned margin, each
  * with its biggest unattributed cost.
  *
- * Jobs with no percent complete cannot be ranked (their earned margin is null),
- * so they are excluded from the ranking and COUNTED in a footer line instead —
- * a number with no denominator is how this report would start lying.
+ * A job can drop out of the ranking for two DIFFERENT reasons, and calling both
+ * "no percent complete yet" was wrong:
+ *   - no percent complete at all — the estimate is uncoded or the schedule is
+ *     empty, so nothing can be measured;
+ *   - a percent complete but NO APPROVED CONTRACT — earnedMargin is null
+ *     because contract value is $0, not because the percentage is missing.
+ *     Telling the owner to go set a percentage that is already set is noise.
+ * Both are counted separately and reported in the footer; a number with no
+ * denominator is how this report would start lying.
  */
 export async function sendDraggingUsLine() {
     const jobs = await loadMarginDigestJobs();
     const ranked = jobs
         .filter((job) => job.earnedMargin !== null)
         .sort((a, b) => (a.earnedMargin ?? 0) - (b.earnedMargin ?? 0));
-    const unmeasured = jobs.length - ranked.length;
+    const unmeasured = jobs.filter((job) => job.percentComplete === null).length;
+    const awaitingContract = jobs.filter(
+        (job) => job.percentComplete !== null && job.earnedMargin === null
+    ).length;
     const worst = ranked.slice(0, 2);
 
     const to = process.env.PIPELINE_DIGEST_TO?.trim();
@@ -185,13 +194,17 @@ export async function sendDraggingUsLine() {
             reason: "PIPELINE_DIGEST_TO not set",
             ranked: ranked.length,
             unmeasured,
+            awaitingContract,
         });
-        return { sent: false, reason: "PIPELINE_DIGEST_TO not set", ranked: ranked.length, unmeasured };
+        return { sent: false, reason: "PIPELINE_DIGEST_TO not set", ranked: ranked.length, unmeasured, awaitingContract };
     }
 
     if (worst.length === 0) {
-        console.log("[margin-digest] dragging-us email not sent", { reason: "no job has a % complete yet", unmeasured });
-        return { sent: false, reason: "no job has a % complete yet", ranked: 0, unmeasured };
+        const reason = awaitingContract > 0
+            ? "no job has both a % complete and an approved contract"
+            : "no job has a % complete yet";
+        console.log("[margin-digest] dragging-us email not sent", { reason, unmeasured, awaitingContract });
+        return { sent: false, reason, ranked: 0, unmeasured, awaitingContract };
     }
 
     const blocks: string[] = [];
@@ -222,6 +235,7 @@ export async function sendDraggingUsLine() {
             <p style="color:#475569;font-size:13px;">The ${worst.length === 1 ? "job" : "two jobs"} with the lowest earned margin, each with the single biggest cost that landed on no phase. Earned margin includes labor.</p>
             ${blocks.join("")}
             ${unmeasured > 0 ? `<p style="color:#64748b;font-size:12px;">${unmeasured} active job${unmeasured === 1 ? "" : "s"} could not be ranked — no percent complete yet (the estimate needs cost codes, or the schedule needs tasks).</p>` : ""}
+            ${awaitingContract > 0 ? `<p style="color:#64748b;font-size:12px;">${awaitingContract} active job${awaitingContract === 1 ? " has" : "s have"} a percent complete but no approved estimate or change order to earn against.</p>` : ""}
         </div>`,
         undefined,
         { fromName: settings?.companyName || "ProBuild" },
@@ -231,5 +245,5 @@ export async function sendDraggingUsLine() {
         console.log("[margin-digest] dragging-us email send failed");
         return { sent: false, reason: "email send failed", ranked: ranked.length, unmeasured };
     }
-    return { sent: true, ranked: ranked.length, unmeasured, jobs: worst.map((j) => j.name) };
+    return { sent: true, ranked: ranked.length, unmeasured, awaitingContract, jobs: worst.map((j) => j.name) };
 }

@@ -168,8 +168,17 @@ export default async function CompanyFinancialsPage({
     // as $0 would understate the total while looking like a measurement — the
     // tile's subtitle carries the denominator instead.
     const earnedMarginJobs = jobRows.filter((r) => !r.isLogistics);
-    const jobsWithPercent = earnedMarginJobs.filter((r) => r.fin.earnedMargin !== null);
-    const earnedMarginTotal = jobsWithPercent.reduce((sum, r) => sum + (r.fin.earnedMargin ?? 0), 0);
+    // "Has a percent complete" and "has an earned margin" are DIFFERENT
+    // questions and were previously conflated. earnedMargin is deliberately
+    // null when contract value is $0 -- no approved estimate or CO yet -- even
+    // though somebody may have set a percent by hand. Counting availability off
+    // earnedMargin therefore under-reported how many jobs are actually
+    // measured, and blamed it on a missing percentage that was right there.
+    const jobsWithPercent = earnedMarginJobs.filter((r) => r.fin.percentComplete !== null);
+    const jobsWithEarnedMargin = jobsWithPercent.filter((r) => r.fin.earnedMargin !== null);
+    // Has a percent, but nothing signed to earn against.
+    const jobsAwaitingContract = jobsWithPercent.length - jobsWithEarnedMargin.length;
+    const earnedMarginTotal = jobsWithEarnedMargin.reduce((sum, r) => sum + (r.fin.earnedMargin ?? 0), 0);
 
     // Dollar-weighted, not an average of per-job ratios: a $50 job with a
     // receipt and a $50,000 job without one is not "50% complete".
@@ -224,9 +233,9 @@ export default async function CompanyFinancialsPage({
                 />
                 <StatCard
                     label="Earned Margin"
-                    value={jobsWithPercent.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
-                    sub={`${jobsWithPercent.length} of ${earnedMarginJobs.length} job${earnedMarginJobs.length === 1 ? "" : "s"} have a % complete; includes labor`}
-                    tone={jobsWithPercent.length === 0 ? undefined : earnedMarginTotal >= 0 ? "pos" : "neg"}
+                    value={jobsWithEarnedMargin.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
+                    sub={`${jobsWithPercent.length} of ${earnedMarginJobs.length} job${earnedMarginJobs.length === 1 ? "" : "s"} have a % complete; includes labor${jobsAwaitingContract > 0 ? ` · ${jobsAwaitingContract} awaiting an approved contract` : ""}`}
+                    tone={jobsWithEarnedMargin.length === 0 ? undefined : earnedMarginTotal >= 0 ? "pos" : "neg"}
                 />
                 <StatCard
                     label="Receipt Completeness"
@@ -341,7 +350,20 @@ export default async function CompanyFinancialsPage({
                                     )}
                                 </td>
                                 <td className={`px-4 py-3 text-right font-semibold ${r.isLogistics || r.fin.earnedMargin === null ? "text-hui-textMuted" : r.fin.earnedMargin >= 0 ? "text-green-700" : "text-red-600"}`}>
-                                    {r.isLogistics || r.fin.earnedMargin === null ? "—" : formatCurrency(r.fin.earnedMargin)}
+                                    {r.isLogistics ? (
+                                        "—"
+                                    ) : r.fin.earnedMargin !== null ? (
+                                        formatCurrency(r.fin.earnedMargin)
+                                    ) : r.fin.percentComplete !== null ? (
+                                        // A percent exists; there is simply no signed
+                                        // contract to earn against. Saying "—" here
+                                        // would blame a missing percentage.
+                                        <span className="text-xs font-normal" title="This job has a percent complete but no approved estimate or change order to earn against">
+                                            No contract
+                                        </span>
+                                    ) : (
+                                        "—"
+                                    )}
                                 </td>
                             </tr>
                         ))}
@@ -363,8 +385,8 @@ export default async function CompanyFinancialsPage({
                             <td className="px-4 py-3 text-right">{totals.paid > 0 ? `${((totals.margin / totals.paid) * 100).toFixed(1)}%` : "—"}</td>
                             {/* Percent complete does not sum — the count of jobs that have one does. */}
                             <td className="px-4 py-3 text-right text-xs font-normal text-hui-textMuted">{jobsWithPercent.length}/{earnedMarginJobs.length}</td>
-                            <td className={`px-4 py-3 text-right ${jobsWithPercent.length === 0 ? "" : earnedMarginTotal >= 0 ? "text-green-700" : "text-red-600"}`}>
-                                {jobsWithPercent.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
+                            <td className={`px-4 py-3 text-right ${jobsWithEarnedMargin.length === 0 ? "" : earnedMarginTotal >= 0 ? "text-green-700" : "text-red-600"}`}>
+                                {jobsWithEarnedMargin.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
                             </td>
                         </tr>
 
