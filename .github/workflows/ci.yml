@@ -77,56 +77,69 @@ jobs:
   # were merged and auto-deployed before its scripts/apply-*.mjs ran against
   # prod, leaving every project page crashing on the generic error boundary.
   #
-  # Path filtering is done with a diff step inside the job, not a
-  # workflow-level `paths:` filter, because a workflow-level filter would
-  # skip the whole file (including the other jobs above) rather than just
-  # this one when a PR doesn't touch these paths.
+  # Deliberately runs on EVERY pull_request rather than being path-filtered:
+  # a diff-based filter could mark an actually-relevant PR "irrelevant" and
+  # fail open, and running unconditionally means pre-existing drift (from a
+  # PR that merged without running its apply script) keeps blocking the next
+  # deploy too, instead of only the PR that introduced it.
+  #
+  # The prod credential is scoped to the last step only — `npm ci` and
+  # `prisma generate` get a syntactically-valid dummy DATABASE_URL/DIRECT_URL
+  # (the datasource declares directUrl, so generation validates both), and
+  # never see the real secret.
   schema-drift:
     name: Schema drift check
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check whether this PR touches schema-relevant paths
-        id: filter
-        run: |
-          git fetch origin ${{ github.base_ref }} --depth=1
-          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -Eq '^(prisma/schema\.prisma|prisma/migrations/|scripts/apply-.*\.mjs)'; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "relevant=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Setup Node.js
-        if: steps.filter.outputs.relevant == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
 
       - name: Install dependencies
-        if: steps.filter.outputs.relevant == 'true'
         run: npm ci
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?pgbouncer=true
+          DIRECT_URL: postgresql://ci:ci@localhost:5432/ci
 
       - name: Generate Prisma client
-        if: steps.filter.outputs.relevant == 'true'
         run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?pgbouncer=true
+          DIRECT_URL: postgresql://ci:ci@localhost:5432/ci
 
       - name: Check for schema drift against production
-        if: steps.filter.outputs.relevant == 'true'
-        run: node scripts/check-schema-drift.mjs
-
-      - name: On failure
-        if: failure() && steps.filter.outputs.relevant == 'true'
+        id: drift
         run: |
-          echo "::error::Production is missing tables/columns this PR's Prisma schema expects. Run this PR's scripts/apply-*.mjs against prod first (see .claude/skills/deploy-probuild/SKILL.md), then re-run this job."
-          exit 1
+          set +e
+          node scripts/check-schema-drift.mjs --expect-host aws-0-us-west-2.pooler.supabase.com --expect-db postgres
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CI: true
+
+      # Exit 2 from the checker means real drift: prod is missing something
+      # the schema expects, and the fix is the apply script. Any other
+      # non-zero exit (missing secret, connection error, empty DMMF, a
+      # deliberate --expect-host/--expect-db mismatch) is a different kind of
+      # problem, so it gets the checker's own stderr instead of drift
+      # guidance that wouldn't apply.
+      - name: On drift found
+        if: failure() && steps.drift.outputs.exit_code == '2'
+        run: |
+          echo "::error::Production is missing tables/columns/enum values this PR's Prisma schema expects. Run this PR's scripts/apply-*.mjs against prod first (see .claude/skills/deploy-probuild/SKILL.md), then re-run this job."
+
+      - name: On other failure
+        if: failure() && steps.drift.outputs.exit_code != '2'
+        run: |
+          echo "::error::Schema drift check failed for a reason other than drift — see the 'Check for schema drift against production' step's output above for the checker's own error message."
 
   build:
     name: Build + Bundle Size

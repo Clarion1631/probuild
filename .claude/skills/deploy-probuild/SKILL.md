@@ -87,7 +87,7 @@ by any tool or backup — treat them as live secrets.
    ```
    These scripts are additive and idempotent (`IF NOT EXISTS`, guarded FKs) and safe to run while the old build is still live. But the new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 "column does not exist" until the script runs.
 
-   The `schema-drift` CI job (`.github/workflows/ci.yml`) now gates this automatically: on any PR touching `prisma/schema.prisma`, `prisma/migrations/**`, or `scripts/apply-*.mjs`, it queries prod's `information_schema` and fails the PR if a table/column the Prisma schema expects isn't there yet. Verify locally with the same check before pushing:
+   The `schema-drift` CI job (`.github/workflows/ci.yml`) now gates this automatically: it runs on **every** pull request (not just ones that touch schema paths, so pre-existing drift also blocks the next deploy), queries prod's `information_schema`/`pg_enum`, and fails the PR if a table, column, or enum value the Prisma schema expects isn't there yet. Exit codes: `0` clean, `2` drift found, `1` any other failure (missing secret, connection error, empty DMMF). Verify locally with the same check before pushing:
    ```bash
    node scripts/check-schema-drift.mjs
    ```
