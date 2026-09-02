@@ -129,9 +129,16 @@ function findColumn(headers: string[], hints: string[]): number {
     return -1;
 }
 
-/** "$28.50" / "28,50"-free money text -> number. Returns null when there is no number in it. */
+/**
+ * "$28.50" -> 28.5. Currency symbols and whitespace are stripped; a COMMA is
+ * REFUSED, not stripped. Stripping it silently turns the European "28,50" into
+ * 2850 — a 100x pay rate — and a thousands-separated "1,200" is not a plausible
+ * hourly rate anyway. An unreadable value becomes a visible error the human
+ * fixes in the file, which is the only safe answer here.
+ */
 export function parseRateValue(raw: string): number | null {
-    const cleaned = raw.replace(/[$\s,]/g, "");
+    if (raw.includes(",")) return null;
+    const cleaned = raw.replace(/[$\s]/g, "");
     if (!cleaned) return null;
     const value = Number(cleaned);
     if (!Number.isFinite(value)) return null;
@@ -266,7 +273,11 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
         return {
             userId: user?.id ?? null,
             name: user?.name ?? row.name,
-            email: row.email ?? user?.email ?? null,
+            // The MATCHED member's email wins. Showing the CSV's address for a
+            // NAME match is how a human approves a write to the wrong person:
+            // the row would display an email that belongs to nobody in
+            // ProBuild while the rate lands on whoever shares the name.
+            email: user ? user.email : row.email,
             oldHourly: user ? user.hourlyRate : null,
             newHourly: row.hourlyRate,
             matched: !!user,

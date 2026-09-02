@@ -53,9 +53,12 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
             setRows(result.rows);
             setErrors(result.errors);
             // Pre-tick exactly the rows that would actually change something.
+            // Pre-tick only EMAIL-matched changes. A name-only match is exactly
+            // the row a human should have to look at before it writes a pay
+            // rate, so it starts unticked.
             const next: Record<string, boolean> = {};
             for (const row of result.rows) {
-                if (row.userId && row.changed) next[row.userId] = true;
+                if (row.userId && row.changed && row.matchedBy === "email") next[row.userId] = true;
             }
             setSelected(next);
             if (result.rows.length === 0) toast.warning("No rows found in that file.");
@@ -171,7 +174,17 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                                                         />
                                                     </td>
                                                     <td className="px-3 py-2">
-                                                        <div className="font-medium text-hui-textMain">{row.name || "—"}</div>
+                                                        <div className="font-medium text-hui-textMain">
+                                                            {row.name || "—"}
+                                                            {row.matchedBy === "name" && (
+                                                                <span
+                                                                    className="ml-2 text-[10px] uppercase tracking-wide text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5"
+                                                                    title="Matched on name alone — no email in the file matched a team member. Check this is the right person before saving."
+                                                                >
+                                                                    name match
+                                                                </span>
+                                                            )}
+                                                        </div>
                                                         <div className="text-hui-textMuted">{row.email || ""}</div>
                                                     </td>
                                                     <td className="px-3 py-2 text-right tabular-nums text-hui-textMuted">
