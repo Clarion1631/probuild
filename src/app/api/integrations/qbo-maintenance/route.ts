@@ -70,7 +70,7 @@ export async function POST(req: Request) {
         const qbTokens = tokens!;
         if (body.action === "test-settle") {
             if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
-            const created = await createQBPaymentForInvoice(qbTokens, body.qbInvoiceId);
+            const created = await createQBPaymentForInvoice(qbTokens, body.qbInvoiceId, deadline);
             if (!created) return NextResponse.json({ ok: false, reason: "invoice-not-found-or-already-paid" });
             return NextResponse.json({ ok: true, ...created });
         }
@@ -82,12 +82,12 @@ export async function POST(req: Request) {
         }
         if (body.action === "delete-qbo-payment") {
             if (!body.qbPaymentId) return NextResponse.json({ ok: false, reason: "qbPaymentId required" }, { status: 400 });
-            const deleted = await deleteQBPayment(qbTokens, body.qbPaymentId);
+            const deleted = await deleteQBPayment(qbTokens, body.qbPaymentId, deadline);
             return NextResponse.json({ ok: deleted });
         }
         if (body.action === "delete-qbo-invoice") {
             if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
-            const deleted = await deleteQBInvoice(qbTokens, body.qbInvoiceId);
+            const deleted = await deleteQBInvoice(qbTokens, body.qbInvoiceId, deadline);
             return NextResponse.json({ ok: deleted });
         }
     }

@@ -232,6 +232,9 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
+/** Reserved for the compensating delete, independent of the push's own budget. */
+export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
+
 export async function pushMilestoneToQuickBooks(
     paymentScheduleId: string,
     passedTokens?: QBTokens,
@@ -245,6 +248,9 @@ export async function pushMilestoneToQuickBooks(
      */
     deadline?: RouteDeadline,
 ): Promise<MilestonePushResult> {
+    // Reserved up front so compensation is still possible after the main
+    // budget is spent — see the compensating delete below.
+    const cleanupDeadline = createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS);
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentScheduleId },
         include: {
@@ -323,8 +329,11 @@ export async function pushMilestoneToQuickBooks(
         if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
-    const { qbId, total } = await createQBMilestoneInvoice(tokens, {
+    const created = await createQBMilestoneInvoice(tokens, {
         docNumber,
+        // The PaymentSchedule id never changes; DocNumber is derived from the
+        // invoice code and milestone name, both editable.
+        idempotencyKey: schedule.id,
         customerId,
         itemId,
         description: `${projectName} — ${schedule.name}`,
@@ -335,11 +344,46 @@ export async function pushMilestoneToQuickBooks(
         privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
     }, deadline);
 
-    // QBO Automated Sales Tax can recalculate on top of what we send — verify the
-    // grand total still equals the milestone. A drift means the client would be
-    // asked for a different amount than ProBuild expects; flag it loudly.
+    const { qbId, total } = created;
+
+    // The requestid makes a retry safe from DUPLICATION, not from DRIFT: on an
+    // ambiguous retry Intuit returns the invoice it created the FIRST time, and
+    // the milestone may have been edited or reordered since. Linking that
+    // silently would bill the client the old amount, or attach an invoice made
+    // for a different customer. Reconcile before linking; park on a mismatch.
+    const driftReasons: string[] = [];
     if (Math.abs(total - amount) > 0.05) {
-        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+        driftReasons.push(`amount ProBuild ${amount} vs QBO ${total}`);
+    }
+    if (created.customerId && created.customerId !== customerId) {
+        driftReasons.push(`customer ProBuild ${customerId} vs QBO ${created.customerId}`);
+    }
+    const expectedDue = schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null;
+    if (expectedDue && created.dueDate && created.dueDate !== expectedDue) {
+        driftReasons.push(`due date ProBuild ${expectedDue} vs QBO ${created.dueDate}`);
+    }
+    if (driftReasons.length > 0) {
+        // Deliberately NOT deleted: it may be a real invoice a client has
+        // already seen. Flag the milestone so a human reconciles it.
+        console.error(
+            `[quickbooks-payments] invoice drift on ${docNumber} (QBO id ${qbId}): ${driftReasons.join("; ")}`,
+        );
+        await prisma.paymentSchedule.updateMany({
+            where: { id: schedule.id, qbInvoiceId: null },
+            data: { qbSyncError: "invoice-drift" },
+        }).catch(() => {});
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "invoice-drift",
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, drift: driftReasons },
+        });
+        throw new Error(
+            `QuickBooks returned an invoice that no longer matches this milestone (${driftReasons.join("; ")}). ` +
+            `Review QuickBooks invoice ${docNumber} (id ${qbId}) before retrying.`,
+        );
     }
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId, deadline);
@@ -384,11 +428,26 @@ export async function pushMilestoneToQuickBooks(
         });
     }));
     if (linked.count !== 1) {
-        // The compensating delete runs even on an exhausted budget: leaving an
-        // orphaned QBO invoice behind is worse than one more call.
-        const compensated = await deleteQBInvoice(tokens, qbId, deadline).catch(() => false);
+        // The compensating delete gets its OWN budget, reserved at the start of
+        // the push. Reusing the main deadline meant the delete was skipped
+        // precisely when the push had run long — the case most likely to have
+        // created an invoice it then failed to link — so an exhausted budget
+        // guaranteed an orphan.
+        const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
         if (!compensated) {
+            // Even the reserved budget is gone (or the delete was refused).
+            // Record the orphan durably so the maintenance sweep can resolve
+            // it; a console line is not a work queue.
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: "invoice-orphan-check",
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, docNumber },
+            });
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
+
             throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
         }
         throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");

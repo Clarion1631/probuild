@@ -1884,3 +1884,38 @@ test("the payment send succeeds normally when there is budget left", async () =>
     );
     assert.deepEqual(sent, { paymentId: "p9", amount: 250 });
 });
+
+
+// --- A failed 401 refresh must not be swallowed ---
+
+test("typed refresh failures propagate from the attachment 401 retry", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const { QBTimeoutError, QboRetryableError, QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+
+    // Codex gate: `.catch(() => null)` made a QBO outage, a stranded token and
+    // a persistence failure all look like an ordinary 401, hiding the one
+    // thing a human needs to act on.
+    const unauthorized = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    for (const error of [
+        new QBTimeoutError("refresh timed out"),
+        new QboRetryableError("503 from Intuit", 503),
+        new QBTokenStrandedError("ECONNRESET"),
+        new QBTokenPersistenceError(),
+    ]) {
+        const thrown = await withFetch(unauthorized, () =>
+            defaultUploadAttachment(TOKENS, "99", uploadFile, async () => { throw error; }),
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.equal(thrown?.name, error.name, `${error.name} was swallowed`);
+    }
+});
+
+test("an ordinary refresh failure still degrades to the plain 401 outcome", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const unauthorized = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    const thrown = await withFetch(unauthorized, () =>
+        defaultUploadAttachment(TOKENS, "99", uploadFile, async () => { throw new Error("not connected"); }),
+    ).then(() => null, (e: unknown) => e as Error);
+    // Still retryable (the 401 survived), but not masquerading as a token error.
+    assert.equal(thrown?.name, "QboRetryableError");
+});

@@ -838,6 +838,14 @@ export async function createQBMilestoneInvoice(
     tokens: QBTokens,
     input: {
         docNumber: string; // ≤ 21 chars
+        /**
+         * IMMUTABLE identity for the idempotency key — the PaymentSchedule id.
+         * DocNumber is derived from editable content (invoice code, milestone
+         * name), so keying on it meant a rename produced a NEW key and the
+         * retry created a second invoice: exactly the duplicate this exists to
+         * prevent.
+         */
+        idempotencyKey: string;
         customerId: string;
         itemId: string;
         description: string;
@@ -851,7 +859,14 @@ export async function createQBMilestoneInvoice(
         privateNote?: string;
     },
     deadline?: RouteDeadline,
-): Promise<{ qbId: string; qbUrl: string; total: number }> {
+): Promise<{
+    qbId: string;
+    qbUrl: string;
+    total: number;
+    customerId: string | null;
+    dueDate: string | null;
+    docNumber: string | null;
+}> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
@@ -888,17 +903,35 @@ export async function createQBMilestoneInvoice(
     // ambiguous timeout — the request landed, the response did not — left the
     // caller to retry and create a SECOND invoice for the same milestone, which
     // is a duplicate bill to a client. With it, Intuit returns the original.
-    const requestId = qboRequestId(`milestone-invoice:${input.docNumber}`);
+    const requestId = qboRequestId(`milestone-invoice:${input.idempotencyKey}`);
     const res = await qbFetch(`/invoice?requestid=${encodeURIComponent(requestId)}`, tokens, {
         method: "POST",
         body: JSON.stringify(payload),
         qbDeadline: deadline,
     });
     if (!res.ok) throw await qboResponseError(res, "QB milestone invoice create");
-    const data = await res.json();
-    const qbId = data.Invoice?.Id;
-    const total = Number(data.Invoice?.TotalAmt ?? 0);
-    return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
+    const data = await parseJsonOrNull(res);
+    const invoice = data?.Invoice;
+    const qbId = invoice?.Id ? String(invoice.Id) : "";
+    const total = Number(invoice?.TotalAmt);
+    // A 200 with no usable invoice is NOT a success. Returning an empty id and
+    // a NaN-coerced 0 let the caller link a milestone to nothing, or "verify" a
+    // total against a fabricated zero. We cannot tell whether QBO created
+    // something, so this is ambiguous and retryable — the requestid above makes
+    // that retry safe.
+    if (!qbId || !Number.isFinite(total)) {
+        throw new QboRetryableError("QB milestone invoice create returned no usable Invoice");
+    }
+    return {
+        qbId,
+        qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`,
+        total,
+        // What QBO actually holds, so an ambiguous-retry hit can be reconciled
+        // against the milestone before anything is linked.
+        customerId: invoice?.CustomerRef?.value ? String(invoice.CustomerRef.value) : null,
+        dueDate: typeof invoice?.DueDate === "string" ? invoice.DueDate : null,
+        docNumber: typeof invoice?.DocNumber === "string" ? invoice.DocNumber : null,
+    };
 }
 
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
@@ -1068,10 +1101,11 @@ export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadl
 }
 
 /** Receive a payment against an invoice (full open balance). TEST/admin tooling. */
-export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<{ paymentId: string; amount: number } | null> {
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<{ paymentId: string; amount: number } | null> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv || inv.balance <= 0 || !inv.customerId) return null;
     const res = await qbFetch("/payment", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             TotalAmt: inv.balance,
@@ -1194,13 +1228,14 @@ export async function createQBPaymentForInvoiceWithDetails(
 }
 
 /** Hard-delete a payment (test cleanup). */
-export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Promise<boolean> {
-    const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
+export async function deleteQBPayment(tokens: QBTokens, paymentId: string, deadline?: RouteDeadline): Promise<boolean> {
+    const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!get.ok) return false;
     const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
     const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
         {
+            qbDeadline: deadline,
             method: "POST",
             headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
             body: JSON.stringify({ Id: paymentId, SyncToken: syncToken }),

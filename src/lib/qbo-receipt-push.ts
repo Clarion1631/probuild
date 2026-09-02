@@ -31,6 +31,7 @@ import {
     qbTimedFetch,
     parseJsonOrNull,
     isQBTimeoutError,
+    isQBTokenStrandedError,
     isBudgetExhausted,
     remainingBudgetMs,
     createRouteDeadline,
@@ -415,7 +416,21 @@ export async function defaultUploadAttachment(
     // whole extra bot pass (or, before transient statuses were retryable at
     // all, was abandoned entirely).
     if (res.status === 401) {
-        const refreshed = await refresh().catch(() => null);
+        // `.catch(() => null)` swallowed the reason the refresh failed, so a
+        // QBO outage, a stranded token, or a persistence failure all became an
+        // indistinguishable "no fresh token" and the push carried on to report
+        // a plain 401. Those are all things a human or a retry must know about.
+        const refreshed = await refresh().catch((error: unknown) => {
+            if (
+                isQBTimeoutError(error) ||
+                isRetryableQboError(error) ||
+                isQBTokenStrandedError(error) ||
+                (error instanceof Error && error.name === "QBTokenPersistenceError")
+            ) {
+                throw error;
+            }
+            return null;
+        });
         if (refreshed) res = await post(refreshed);
     }
     if (!res.ok) {

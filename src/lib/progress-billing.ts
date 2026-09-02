@@ -637,6 +637,8 @@ export async function stageProgressBillingToQuickBooksCore(
 
     const { qbId } = await createQBMilestoneInvoice(tokens, {
         docNumber: billing.code,
+        // The ProgressBilling id is immutable; its code is not.
+        idempotencyKey: billing.id,
         customerId,
         itemId,
         description: billing.description,

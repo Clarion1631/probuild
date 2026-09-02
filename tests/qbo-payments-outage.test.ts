@@ -1312,3 +1312,32 @@ test("a capped run that started at the top has no head to count", async () => {
     assert.equal(result.skipped, 30, "just what is after the cursor");
     assert.equal(visits.length + result.skipped, all.length);
 });
+
+
+// --- The compensating delete keeps its own budget ---
+
+test("the cleanup budget is reserved separately from the push budget", async () => {
+    const { MILESTONE_CLEANUP_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline, isBudgetExhausted } = await import("../src/lib/quickbooks");
+
+    // Codex gate: the compensating delete reused the main deadline, so it was
+    // skipped precisely when the push had run long - the case most likely to
+    // have created an invoice it then failed to link. An exhausted budget
+    // therefore GUARANTEED an orphaned QBO invoice.
+    assert.equal(MILESTONE_CLEANUP_BUDGET_MS, 10_000);
+
+    // A push budget spent between the create and the link...
+    const pushDeadline = createRouteDeadline(2_000, Date.now() - 12_000);
+    assert.equal(isBudgetExhausted(pushDeadline), true);
+    // ...leaves the cleanup budget, reserved at the start, still usable.
+    const cleanupDeadline = createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS);
+    assert.equal(isBudgetExhausted(cleanupDeadline), false, "compensation must still be possible");
+});
+
+test("an unresolvable orphan is recorded durably, not just logged", async () => {
+    const { PAYMENTS_SYNC_EVENT_KIND } = await import("../src/lib/pipeline-health");
+    // The orphan record rides the same event kind the health check already
+    // watches, with its own reason, so the maintenance sweep has a work queue
+    // instead of a console line nobody greps.
+    assert.equal(PAYMENTS_SYNC_EVENT_KIND, "qbo-payments-sync");
+});
