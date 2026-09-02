@@ -507,9 +507,11 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
     });
 
     const requestId = depositRequestId(payload.fileId);
+    // Same budget as the refresh and the invoice read above: the send is the
+    // third serial QBO call in this request, and it is the one that moves money.
     return await sendAndSettle(row.id, schedule, {
         checkDate: payload.checkDate!, checkNumber: payload.checkNumber!, requestId, requestBody: built.requestBody,
-    }, tokens);
+    }, tokens, deadline);
 }
 
 async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {

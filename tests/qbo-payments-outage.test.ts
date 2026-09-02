@@ -977,3 +977,139 @@ test("the invoice-options write raises with the status instead of returning fals
     ).then(() => null, (e: unknown) => e as Error);
     assert.equal(qboHttpStatus(refused), 400);
 });
+
+
+// --- Cursors belong to the unscoped sweep, not to on-view refreshes ---
+
+/** Records every cursor read/write so a test can prove a run touched none. */
+function spyCursorStore() {
+    const reads: string[] = [];
+    const writes: Array<{ key: string; value: string }> = [];
+    const values = new Map<string, string>();
+    return {
+        reads,
+        writes,
+        values,
+        store: {
+            async get(key: string) { reads.push(key); return values.get(key) ?? null; },
+            async set(key: string, value: string) { writes.push({ key, value }); values.set(key, value); },
+        },
+    };
+}
+
+test("a scoped refresh uses no cursor and writes none", async () => {
+    const { forEachPendingPage } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    // Codex gate: an on-view refresh for one invoice is not a sweep. Reading
+    // the shared cursor would make it skip the very row the user is looking
+    // at; WRITING one would drag the cron's resume point to wherever that user
+    // happened to be, starving everything after it.
+    const spy = spyCursorStore();
+    const all = [{ id: "row-01" }, { id: "row-02" }];
+    const seen: string[] = [];
+
+    await forEachPendingPage(
+        emptyResult(),
+        createRouteDeadline(30_000),
+        async (cursorId, take) => (cursorId === null ? all : all.filter(r => r.id > cursorId)).slice(0, take),
+        async () => 0,
+        async (page) => {
+            for (const row of page) seen.push(row.id);
+            return { lastCompletedId: page[page.length - 1]?.id ?? null };
+        },
+        undefined, // scoped run: no cursor at all
+        100,
+    );
+
+    assert.deepEqual(seen, ["row-01", "row-02"], "a scoped run still does its work");
+    assert.deepEqual(spy.reads, [], "must not read a cursor");
+    assert.deepEqual(spy.writes, [], "must not write a cursor");
+});
+
+test("only a run that RESUMED may wrap", async () => {
+    const { forEachPendingPage } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    // Codex gate: the wrap guard was "cursor is non-null", which is true of any
+    // run that processed a page - so a run starting at the top drained the
+    // collection and then immediately re-walked it.
+    const all = Array.from({ length: 5 }, (_, i) => ({ id: `row-0${i}` }));
+    const { store } = memoryCursorStore();
+    let fetches = 0;
+    const seen: string[] = [];
+
+    const run = async () => forEachPendingPage(
+        emptyResult(),
+        createRouteDeadline(30_000),
+        async (cursorId, take) => {
+            fetches++;
+            return (cursorId === null ? all : all.filter(r => r.id > cursorId)).slice(0, take);
+        },
+        async () => 0,
+        async (page) => {
+            for (const row of page) seen.push(row.id);
+            return { lastCompletedId: page[page.length - 1]?.id ?? null };
+        },
+        { store, key: "k" },
+        100,
+    );
+
+    await run();
+    // A short page is itself the end signal, so one fetch covers it - and NO
+    // wrap, so no second walk of the same five rows.
+    assert.equal(seen.length, 5, `re-walked the collection: saw ${seen.length} rows`);
+    assert.equal(fetches, 1, `expected a single fetch, saw ${fetches}`);
+});
+
+// --- skipped is counted exactly once ---
+
+test("every row is accounted for exactly once when an outage cuts a page short", async () => {
+    const { forEachPendingPage, runQboRowLoop } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+
+    // Codex gate: runQboRowLoop added the unprocessed tail of the page AND
+    // countRemaining counted everything after the cursor - which includes that
+    // same tail. The totals silently exceeded the number of rows that exist.
+    const all = Array.from({ length: 20 }, (_, i) => ({ id: `row-${String(i).padStart(2, "0")}` }));
+    const result = emptyResult();
+    const after = (cursorId: string | null) =>
+        cursorId === null ? all : all.filter(r => r.id > cursorId);
+
+    await forEachPendingPage(
+        result,
+        createRouteDeadline(30_000),
+        async (cursorId, take) => after(cursorId).slice(0, take),
+        async (cursorId) => after(cursorId).length,
+        (page) => runQboRowLoop(
+            page,
+            result,
+            async (row) => {
+                result.checked++;
+                if (row.id >= "row-05") throw new QboRetryableError("QBO went away", 503);
+            },
+            () => {},
+            "milestones",
+            undefined,
+            false, // the paginator owns the skipped count
+        ),
+        { store: memoryCursorStore().store, key: "k" },
+        10,
+    );
+
+    // 5 verified, 15 left. Not 20, not 25.
+    assert.equal(result.checked, 6, "five clean rows plus the one that failed");
+    assert.equal(result.skipped, 15, `skipped was ${result.skipped}, expected 15`);
+    assert.equal(result.checked - 1 + result.skipped, all.length, "every row accounted for exactly once");
+});
+
+test("a standalone row loop still keeps its own tally", async () => {
+    const { runQboRowLoop } = await import("../src/lib/quickbooks-payments");
+    // Callers that are not paginating have no countRemaining to lean on, so
+    // the loop must keep counting for them.
+    const result = emptyResult();
+    const { client } = fakeQbo({
+        probe: () => ({ state: "error", status: 0, connectionFailed: true, timedOut: true }),
+    });
+    const { skippedInPage } = await runQboRowLoop(rows(30), result, rowHandler(client, result), () => {}, "milestones");
+    assert.equal(result.skipped, 29);
+    assert.equal(skippedInPage, 29, "and reports it, so a paginator can opt out");
+});

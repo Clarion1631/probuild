@@ -1842,3 +1842,45 @@ test("a 403 from an ensure is terminal too, while a 503 stays retryable", async 
     assert.equal(transientResponse.status, 503);
     assert.deepEqual(await transientResponse.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
 });
+
+
+// --- deposit-ingest: the money-moving send shares the request budget ---
+
+test("the deposit-ingest booking passes its deadline into the payment send", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { sendQBPaymentCreateRequest } = await import("../src/lib/quickbooks");
+
+    // Codex gate: the initial booking built its request under the shared
+    // budget but then sent it without one, so the third and most important
+    // serial call - the one that moves money - ran unbounded.
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    let calls = 0;
+    const countingFetch = (async () => {
+        calls++;
+        return new Response(JSON.stringify({ Payment: { Id: "p1", TotalAmt: 100 } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    const error = await withFetch(countingFetch, () =>
+        sendQBPaymentCreateRequest(TOKENS, JSON.stringify({ TotalAmt: 100 }), "req-1", spent),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(isQBBudgetExhaustedError(error), `got ${error?.name}: ${error?.message}`);
+    assert.equal(calls, 0, "an exhausted budget must not issue the payment create");
+});
+
+test("the payment send succeeds normally when there is budget left", async () => {
+    const { createRouteDeadline, sendQBPaymentCreateRequest } = await import("../src/lib/quickbooks");
+    const okFetch = (async () =>
+        new Response(JSON.stringify({ Payment: { Id: "p9", TotalAmt: 250 } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+
+    const sent = await withFetch(okFetch, () =>
+        sendQBPaymentCreateRequest(TOKENS, JSON.stringify({ TotalAmt: 250 }), "req-2", createRouteDeadline(30_000)),
+    );
+    assert.deepEqual(sent, { paymentId: "p9", amount: 250 });
+});

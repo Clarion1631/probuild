@@ -763,26 +763,38 @@ export async function runQboRowLoop<T extends { id: string }>(
     onRowError: (row: T, error: unknown) => void,
     skippedLabel: string,
     deadline?: RouteDeadline,
-): Promise<{ lastCompletedId: string | null }> {
+    /**
+     * When paginating, the caller counts what is left straight from the
+     * database AFTER this page's cursor — which already includes this page's
+     * unprocessed tail. Adding it here too counted those rows twice. Standalone
+     * callers keep the tally; `forEachPendingPage` opts out and owns the count.
+     */
+    countSkipped: boolean = true,
+): Promise<{ lastCompletedId: string | null; skippedInPage: number }> {
     // The id of the last row this loop actually finished with. The cursor may
     // only advance to HERE: jumping to the end of the page after a mid-page
     // outage would step straight over every row the outage cut short, and they
     // would not be looked at again until the cursor wrapped all the way round.
     let lastCompletedId: string | null = null;
+    let skippedInPage = 0;
+    const skip = (count: number) => {
+        skippedInPage += count;
+        if (countSkipped) result.skipped += count;
+    };
 
     for (const [index, row] of rows.entries()) {
         // A previous pass already hit the wall — the connection is shared, so
         // there is nothing to gain by trying again here.
         if (result.abortedOnQboOutage) {
-            result.skipped += rows.length - index;
-            return { lastCompletedId };
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         // Checked before EVERY row: a row costs several serial QBO calls, so
         // starting one with seconds left is how a run gets killed mid-write
         // instead of returning a result someone can act on.
         if (isBudgetExhausted(deadline)) {
-            result.skipped += rows.length - index;
-            return { lastCompletedId };
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         try {
             await handleRow(row);
@@ -791,8 +803,8 @@ export async function runQboRowLoop<T extends { id: string }>(
             // Out of time is not a QBO fault: stop cleanly, count the rest as
             // skipped (making the run partial), and let the next run continue.
             if (isQBBudgetExhaustedError(error)) {
-                result.skipped += rows.length - index;
-                return { lastCompletedId };
+                skip(rows.length - index);
+                return { lastCompletedId, skippedInPage };
             }
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
@@ -801,8 +813,8 @@ export async function runQboRowLoop<T extends { id: string }>(
                 result.errors.push(
                     `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
                 );
-                result.skipped += rows.length - index - 1;
-                return { lastCompletedId };
+                skip(rows.length - index - 1);
+                return { lastCompletedId, skippedInPage };
             }
             // A row-level failure is recorded and the run continues, so this
             // row IS finished as far as the cursor is concerned — leaving the
@@ -811,7 +823,7 @@ export async function runQboRowLoop<T extends { id: string }>(
             lastCompletedId = row.id;
         }
     }
-    return { lastCompletedId };
+    return { lastCompletedId, skippedInPage };
 }
 
 /**
@@ -929,6 +941,12 @@ export async function forEachPendingPage<T extends { id: string }>(
     const storedCursor = cursor ? await cursor.store.get(cursor.key) : null;
     // "" is how "start from the top" is stored; it is never a real id.
     let cursorId: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
+    // Wrapping exists to reach the rows BEFORE a resume point. A run that
+    // already started at the top has no such rows, so wrapping there would
+    // just re-walk everything it had only now finished — the guard has to be
+    // "did this run resume?", not "is the cursor non-null?" (which is true of
+    // any run that processed a page).
+    const startedFromCursor = cursorId !== null;
     let processed = 0;
     let wrapped = false;
 
@@ -948,7 +966,7 @@ export async function forEachPendingPage<T extends { id: string }>(
             // End of the collection. If we started mid-way, wrap once and keep
             // going with whatever budget is left; the rows before the old
             // cursor are exactly the ones a fixed start would never reach.
-            if (cursorId !== null && !wrapped) {
+            if (startedFromCursor && !wrapped) {
                 wrapped = true;
                 cursorId = null;
                 await saveCursor(null);
@@ -970,7 +988,7 @@ export async function forEachPendingPage<T extends { id: string }>(
 
         // A short page means we reached the end of the collection.
         if (page.length < take) {
-            if (cursorId !== null && !wrapped) {
+            if (startedFromCursor && !wrapped) {
                 wrapped = true;
                 cursorId = null;
                 await saveCursor(null);
@@ -1130,7 +1148,20 @@ async function runPaymentsSync(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
+    // A SCOPED run (the on-view refresh for one invoice or project) is not a
+    // sweep: it looks at a handful of rows the user is staring at. Letting it
+    // read the shared cursor would make it skip the very row it was asked
+    // about, and letting it WRITE one would move the cron's resume point to
+    // wherever that user happened to be looking — silently starving everything
+    // after it. Only the unscoped cron sweep carries cursors.
+    const isSweep = !scope?.invoiceId && !scope?.projectId;
     const cursorStore = options?.cursorStore ?? automationSettingCursorStore;
+    const milestoneCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones }
+        : undefined;
+    const billingCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings }
+        : undefined;
 
     const milestoneSelect = {
         id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
@@ -1234,8 +1265,8 @@ async function runPaymentsSync(
         }
     }, (schedule, e) => {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "milestones", routeDeadline),
-        { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones },
+        }, "milestones", routeDeadline, false),
+        milestoneCursor,
     );
 
     // ── Progress billings ───────────────────────────────────────────────────
@@ -1293,17 +1324,24 @@ async function runPaymentsSync(
         }
     }, (billing, e) => {
             result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "progress billings", routeDeadline),
-        { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings },
+        }, "progress billings", routeDeadline, false),
+        billingCursor,
     );
 
     // Alternate which collection goes first. Whichever runs second only gets
     // the budget the first one left, so a fixed order lets a busy milestone
     // queue starve progress billings indefinitely (and vice versa). Flipping
     // each run guarantees both sides get to go first half the time.
-    const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
-    const billingsFirst = lastOrder !== "billings-first";
-    await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+    //
+    // Sweep-only, for the same reason as the cursors: an on-view refresh must
+    // not rotate the cron's order, or a burst of them could pin the sweep to
+    // one collection.
+    let billingsFirst = false;
+    if (isSweep) {
+        const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
+        billingsFirst = lastOrder !== "billings-first";
+        await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+    }
 
     if (billingsFirst) {
         await runBillingPass();
