@@ -7,6 +7,7 @@ import {
     syncQboExpenses,
     upsertQboExpense,
     applyQboExpenseCostCodeSuggestion,
+    planQboExpenseUpdate,
     type QboExpenseProjectCandidate,
     type QboExpenseSyncDependencies,
     type QboExpenseWrite,
@@ -595,6 +596,19 @@ function createFakePrisma(initial: StoredExpense[] = []) {
             rows.set(current.qbPurchaseId, next);
             return next;
         },
+        // Models the PREDICATE, not just the write: `projectId: null` in the
+        // where clause has to be able to match zero rows, because that is the
+        // whole guarantee the split-out project fill is buying.
+        async updateMany(args: {
+            where: { id: string; projectId: null };
+            data: { projectId: string };
+        }) {
+            const current = [...rows.values()].find(row => row.id === args.where.id);
+            if (!current) return { count: 0 };
+            if ((current.projectId ?? null) !== null) return { count: 0 };
+            rows.set(current.qbPurchaseId, { ...current, ...args.data });
+            return { count: 1 };
+        },
     };
     let lockTail: Promise<void> = Promise.resolve();
 
@@ -1158,7 +1172,16 @@ const COST_CODE_IDS = new Map([
     ["02-FRAME", "cc-frame"],
 ]);
 
-function fakeSuggestionClient() {
+type StoredForSuggestion = {
+    projectId: string | null;
+    costCodeId: string | null;
+    costCodeSource: string | null;
+    estimate?: { projectId: string | null } | null;
+} | null;
+
+function fakeSuggestionClient(
+    stored: StoredForSuggestion = { projectId: "project-1", costCodeId: null, costCodeSource: null },
+) {
     const calls: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
     let count = 1;
     return {
@@ -1166,6 +1189,7 @@ function fakeSuggestionClient() {
         setCount(next: number) { count = next; },
         client: {
             expense: {
+                async findUnique() { return stored; },
                 async updateMany(args: {
                     where: Record<string, unknown>;
                     data: { costCodeId: string; costCodeSource: string; costCodeConfidence: number };
@@ -1186,7 +1210,6 @@ test("a NULL cost code is filled with source ai and the rule's tier confidence",
             qbPurchaseId: "purchase-1",
             vendor: "Summit Plumbing",
             description: "[QuickBooks import] rough-in",
-            projectId: "project-1",
         },
         COST_CODE_IDS,
     );
@@ -1206,7 +1229,7 @@ test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", 
     const fake = fakeSuggestionClient();
     await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x", projectId: "project-1" },
+        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
         COST_CODE_IDS,
     );
     const where = fake.calls[0].where;
@@ -1218,31 +1241,90 @@ test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", 
     ]);
 });
 
-test("a row a human already coded is reported not-written, not silently written", async () => {
-    const fake = fakeSuggestionClient();
-    fake.setCount(0); // the guard matched nothing
-    const result = await applyQboExpenseCostCodeSuggestion(
-        fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x", projectId: "project-1" },
-        COST_CODE_IDS,
-    );
-    assert.equal(result, "not-written");
+test("a row a human already coded is refused on the STORED source, before any write", async () => {
+    for (const costCodeSource of ["capture", "manual"]) {
+        const fake = fakeSuggestionClient({ projectId: "project-1", costCodeId: null, costCodeSource });
+        const result = await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+            COST_CODE_IDS,
+        );
+        assert.equal(result, "not-written", costCodeSource);
+        assert.equal(fake.calls.length, 0, "and it never even issues the guarded write");
+    }
 });
 
-test("the overhead bucket is never given a job phase, and never even queried", async () => {
-    const fake = fakeSuggestionClient();
+test("a row that is already coded is left alone", async () => {
+    const fake = fakeSuggestionClient({ projectId: "project-1", costCodeId: "cc-existing", costCodeSource: null });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+            COST_CODE_IDS,
+        ),
+        "not-written",
+    );
+    assert.equal(fake.calls.length, 0);
+});
+
+test("scope comes from the STORED project, not the incoming QBO match", async () => {
+    // A bookkeeper moved this row into the overhead bucket. The QBO customer
+    // ref still says "Mueller Bathroom", so a suggester scoped to the match
+    // would hand an overhead purchase a job phase.
+    const fake = fakeSuggestionClient({
+        projectId: OVERHEAD_PROJECT_ID,
+        costCodeId: null,
+        costCodeSource: null,
+    });
     const result = await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        {
-            qbPurchaseId: "purchase-1",
-            vendor: "Summit Plumbing",
-            description: "x",
-            projectId: OVERHEAD_PROJECT_ID,
-        },
+        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
         COST_CODE_IDS,
     );
     assert.equal(result, "skipped-overhead");
     assert.equal(fake.calls.length, 0);
+});
+
+test("the stored project is resolved through the estimate when the column is NULL", async () => {
+    const fake = fakeSuggestionClient({
+        projectId: null,
+        costCodeId: null,
+        costCodeSource: null,
+        estimate: { projectId: OVERHEAD_PROJECT_ID },
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+            COST_CODE_IDS,
+        ),
+        "skipped-overhead",
+    );
+});
+
+test("a row with no job at all gets no job phase", async () => {
+    const fake = fakeSuggestionClient({ projectId: null, costCodeId: null, costCodeSource: null, estimate: null });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+            COST_CODE_IDS,
+        ),
+        "skipped-no-project",
+    );
+    assert.equal(fake.calls.length, 0);
+});
+
+test("a vanished row is reported, not treated as a silent success", async () => {
+    const fake = fakeSuggestionClient(null);
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(
+            fake.client,
+            { qbPurchaseId: "gone", vendor: "Summit Plumbing", description: "x" },
+            COST_CODE_IDS,
+        ),
+        "missing-row",
+    );
 });
 
 test("no rule match and an unknown code both write nothing", async () => {
@@ -1250,7 +1332,7 @@ test("no rule match and an unknown code both write nothing", async () => {
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "p", vendor: "General Hardware", description: "misc", projectId: "project-1" },
+            { qbPurchaseId: "p", vendor: "General Hardware", description: "misc" },
             COST_CODE_IDS,
         ),
         "no-match",
@@ -1258,7 +1340,7 @@ test("no rule match and an unknown code both write nothing", async () => {
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "p", vendor: "Summit Plumbing", description: "x", projectId: "project-1" },
+            { qbPurchaseId: "p", vendor: "Summit Plumbing", description: "x" },
             new Map(),
         ),
         "unknown-code",
@@ -1282,18 +1364,58 @@ test("a failing suggester never fails the import it rides alongside", async () =
     assert.equal(result.imported, 1, "the money is recorded even when the phase guess blows up");
 });
 
-test("the sync asks for a phase on a matched job, carrying the job it matched", async () => {
+test("the sync asks for a phase on a matched job, by purchase id only", async () => {
+    // No projectId is passed: the suggester reads the row's stored attribution
+    // itself, so the sync cannot accidentally widen its scope.
     const fake = createFakePrisma();
-    const suggested: { qbPurchaseId: string; projectId: string | null }[] = [];
+    const suggested: string[] = [];
     const dependencies = createSyncDependencies(
         [PURCHASE],
         ACTIVE_PROJECTS,
         write => upsertQboExpense(fake.client, write),
     );
-    dependencies.suggestCostCode = async input => {
-        suggested.push({ qbPurchaseId: input.qbPurchaseId, projectId: input.projectId });
-    };
+    dependencies.suggestCostCode = async input => { suggested.push(input.qbPurchaseId); };
 
     await syncQboExpenses({ since: new Date("2026-07-01T00:00:00.000Z") }, dependencies);
-    assert.deepEqual(suggested, [{ qbPurchaseId: "purchase-1", projectId: "project-1" }]);
+    assert.deepEqual(suggested, ["purchase-1"]);
+});
+
+// ── the split project fill (Codex round 1, blocker 1) ──────────────────────
+
+test("the project fill is its OWN statement, guarded on projectId being NULL", () => {
+    const plan = planQboExpenseUpdate({ projectId: null }, WRITE);
+    assert.equal(plan.fillProjectId, "project-1");
+    assert.ok(!("projectId" in plan.data), "the main UPDATE never carries projectId");
+    assert.equal(plan.data.estimateId, "estimate-1");
+});
+
+test("a row already on a project is never re-projected, and keeps its estimate", () => {
+    // Both halves matter: leaving projectId alone while still writing the QBO
+    // match's estimateId would put the row on job B for every reader and on
+    // job A's estimate for cascade-delete and billing.
+    const plan = planQboExpenseUpdate({ projectId: "moved-by-hand" }, WRITE);
+    assert.equal(plan.fillProjectId, null);
+    assert.ok(!("projectId" in plan.data));
+    assert.ok(!("estimateId" in plan.data), "the estimate belongs to the OTHER job");
+    assert.equal(plan.data.amount, WRITE.amount, "the rest of the write still lands");
+});
+
+test("when the stored project AGREES with the match, the estimate still tracks it", () => {
+    const plan = planQboExpenseUpdate({ projectId: "project-1" }, { ...WRITE, estimateId: "estimate-2" });
+    assert.equal(plan.fillProjectId, null);
+    assert.equal(plan.data.estimateId, "estimate-2", "same job, newer estimate — that is the old behaviour");
+});
+
+test("a re-attributed row's estimateId survives a real re-sync", async () => {
+    const fake = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: "moved-by-hand", estimateId: "estimate-of-job-b", receiptUrl: null },
+    ]);
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 300 }),
+        "updated",
+    );
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.projectId, "moved-by-hand");
+    assert.equal(row?.estimateId, "estimate-of-job-b");
+    assert.equal(row?.amount, 300);
 });

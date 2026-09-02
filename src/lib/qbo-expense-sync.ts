@@ -5,7 +5,11 @@ import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
 import { after } from "next/server";
 import { suggestCode } from "./expense-cost-suggest";
-import { notHumanCodedExpenseWhere } from "./expense-attribution";
+import {
+    HUMAN_COST_CODE_SOURCES,
+    notHumanCodedExpenseWhere,
+    resolveExpenseProjectId,
+} from "./expense-attribution";
 import { isOverheadProject } from "./overhead-project";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
@@ -536,6 +540,10 @@ type ExpenseTransaction = {
             where: { id: string };
             data: Partial<QboExpenseWrite>;
         }): Promise<unknown>;
+        updateMany(args: {
+            where: { id: string; projectId: null };
+            data: { projectId: string };
+        }): Promise<{ count: number }>;
     };
 };
 
@@ -560,45 +568,79 @@ function datesEqual(left: Date | null, right: Date | null): boolean {
     return left?.getTime() === right?.getTime();
 }
 
-/**
- * The subset of `write` an UPDATE is allowed to apply to an existing row.
- *
- * `projectId` is dropped once the row already has one: re-attribution by a
- * bookkeeper is a human decision, and the QBO Purchase's customer ref is not a
- * newer fact about it. Filling a NULL is still correct — that is the backfill
- * catching up.
- */
-function qboExpenseUpdateData(
-    existing: NonNullable<Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>>,
-    write: QboExpenseWrite,
-): Partial<QboExpenseWrite> {
-    if ((existing.projectId ?? null) === null) return write;
-    const rest: Partial<QboExpenseWrite> = { ...write };
-    delete rest.projectId;
-    return rest;
+type ExistingQboExpense =
+    NonNullable<Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>>;
+
+export interface QboExpenseUpdatePlan {
+    /**
+     * Written by its OWN guarded statement, not by the main UPDATE. Null when
+     * the row already has a project (or the write has none to give).
+     */
+    fillProjectId: string | null;
+    /** Everything the main UPDATE may write. NEVER contains `projectId`. */
+    data: Partial<QboExpenseWrite>;
 }
 
-function expenseMatchesQboWrite(
-    existing: Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>,
+/**
+ * Decide what a re-sync is allowed to change on a row that already exists.
+ *
+ * TWO SEPARATE RULES, and they used to be one read-then-unconditional-update:
+ *
+ *  1. `projectId` is only ever FILLED, never overwritten, and it is filled by a
+ *     statement whose own predicate says `projectId: null`. Deciding from a
+ *     value read earlier in the transaction is not the same as deciding from
+ *     the row's state at write time, and the guarantee belongs in the SQL.
+ *
+ *  2. `estimateId` follows it. The estimate in `write` is the one the QBO
+ *     customer match picked; if a bookkeeper has since re-attributed the row to
+ *     a DIFFERENT job, writing that estimate back would leave `projectId` and
+ *     `estimateId` pointing at two different jobs — an expense that is on job B
+ *     for every reader and on job A's estimate for cascade-delete and billing.
+ *     So the estimate is left alone exactly when the projects disagree.
+ *
+ * Note rule 2 is scoped to DISAGREEMENT rather than to "projectId is set".
+ * When the stored project and the incoming match are the SAME job, moving
+ * `estimateId` to that job's newest estimate is what the sync has always done
+ * and is still correct — it is the pre-existing "attach to the active estimate"
+ * behaviour, and suppressing it there would strand rows on superseded
+ * estimates for no safety gain.
+ */
+export function planQboExpenseUpdate(
+    existing: Pick<ExistingQboExpense, "projectId">,
     write: QboExpenseWrite,
-): boolean {
-    if (!existing) return false;
-    // Compare projectId ONLY on the rows an update would actually write it to.
-    // Comparing it unconditionally would mark every hand-re-attributed row as
-    // drifted and re-issue an update forever that deliberately never changes it.
-    const projectIdMatches =
-        (existing.projectId ?? null) !== null ||
-        (existing.projectId ?? null) === (write.projectId ?? null);
-    return (
-        projectIdMatches &&
-        existing.qbSyncToken === write.qbSyncToken &&
-        existing.estimateId === write.estimateId &&
-        Number(existing.amount) === write.amount &&
-        existing.vendor === write.vendor &&
-        datesEqual(existing.date, write.date) &&
-        existing.description === write.description &&
-        existing.status === write.status
-    );
+): QboExpenseUpdatePlan {
+    const existingProjectId = existing.projectId ?? null;
+    const incomingProjectId = write.projectId ?? null;
+
+    const data: Partial<QboExpenseWrite> = { ...write };
+    delete data.projectId;
+    if (existingProjectId !== null && existingProjectId !== incomingProjectId) {
+        delete data.estimateId;
+    }
+
+    return {
+        fillProjectId: existingProjectId === null ? incomingProjectId : null,
+        data,
+    };
+}
+
+/**
+ * True when the plan would change nothing. Compares only the fields the plan
+ * actually carries — a field the plan deliberately omits must not count as
+ * drift, or the sync re-issues an update forever and reports it as "updated".
+ * `qbSyncedAt` is excluded because it changes on every run by construction.
+ */
+function planIsNoop(existing: ExistingQboExpense, plan: QboExpenseUpdatePlan): boolean {
+    if (plan.fillProjectId !== null) return false;
+    const data = plan.data;
+    if (data.qbSyncToken !== undefined && existing.qbSyncToken !== data.qbSyncToken) return false;
+    if (data.estimateId !== undefined && existing.estimateId !== data.estimateId) return false;
+    if (data.amount !== undefined && Number(existing.amount) !== data.amount) return false;
+    if (data.vendor !== undefined && existing.vendor !== data.vendor) return false;
+    if (data.date !== undefined && !datesEqual(existing.date, data.date)) return false;
+    if (data.description !== undefined && existing.description !== data.description) return false;
+    if (data.status !== undefined && existing.status !== data.status) return false;
+    return true;
 }
 
 async function lockQboExpense(
@@ -644,14 +686,26 @@ export async function upsertQboExpense(
         ) {
             return "unchanged";
         }
-        if (expenseMatchesQboWrite(existing, write)) return "unchanged";
         if (!existing) {
             await transaction.expense.create({ data: write });
             return "imported";
         }
+
+        const plan = planQboExpenseUpdate(existing, write);
+        if (planIsNoop(existing, plan)) return "unchanged";
+
+        // The project fill is its OWN statement, and its predicate — not a
+        // value read a few lines above — is what guarantees a human's
+        // re-attribution survives.
+        if (plan.fillProjectId !== null) {
+            await transaction.expense.updateMany({
+                where: { id: existing.id, projectId: null },
+                data: { projectId: plan.fillProjectId },
+            });
+        }
         await transaction.expense.update({
             where: { id: existing.id },
-            data: qboExpenseUpdateData(existing, write),
+            data: plan.data,
         });
         return "updated";
     });
@@ -738,12 +792,19 @@ export interface QboCostCodeSuggestionInput {
     qbPurchaseId: string;
     vendor: string | null;
     description: string;
-    /** The job the row was just imported against; the overhead bucket opts out. */
-    projectId: string | null;
 }
 
 export interface QboCostCodeSuggestionClient {
     expense: {
+        findUnique(args: {
+            where: { qbPurchaseId: string };
+            select: Record<string, unknown>;
+        }): Promise<{
+            projectId: string | null;
+            costCodeId: string | null;
+            costCodeSource: string | null;
+            estimate?: { projectId: string | null } | null;
+        } | null>;
         updateMany(args: {
             where: Record<string, unknown>;
             data: { costCodeId: string; costCodeSource: string; costCodeConfidence: number };
@@ -752,6 +813,10 @@ export interface QboCostCodeSuggestionClient {
 }
 
 export type QboCostCodeSuggestionResult =
+    /** The upsert did not leave a row (deactivated, or raced away). */
+    | "missing-row"
+    /** Nothing knows whose job this is, so no job phase can be right. */
+    | "skipped-no-project"
     /** The overhead bucket is not a job and does not get a job phase. */
     | "skipped-overhead"
     /** The rules refused — the honest majority case. */
@@ -762,12 +827,40 @@ export type QboCostCodeSuggestionResult =
     | "not-written"
     | "written";
 
+/**
+ * Scope comes from the row's STORED attribution, never from the incoming QBO
+ * match. Those two disagree exactly when a bookkeeper has re-attributed the
+ * expense — and that is the case where using the match would suggest a phase
+ * for the job the row is no longer on. It is also how an overhead row stays
+ * out: a row moved INTO the overhead bucket by hand must stop being offered
+ * job phases, and the match would never tell us that.
+ */
 export async function applyQboExpenseCostCodeSuggestion(
     client: QboCostCodeSuggestionClient,
     input: QboCostCodeSuggestionInput,
     costCodeIdByCode: ReadonlyMap<string, string>,
 ): Promise<QboCostCodeSuggestionResult> {
-    if (input.projectId && isOverheadProject(input.projectId)) return "skipped-overhead";
+    const stored = await client.expense.findUnique({
+        where: { qbPurchaseId: input.qbPurchaseId },
+        select: {
+            projectId: true,
+            costCodeId: true,
+            costCodeSource: true,
+            estimate: { select: { projectId: true } },
+        },
+    });
+    if (!stored) return "missing-row";
+    // Read-side twin of the update predicate below. Both are needed: this one
+    // stops us computing a suggestion nobody may use, that one is the actual
+    // guarantee.
+    if (stored.costCodeId) return "not-written";
+    if ((HUMAN_COST_CODE_SOURCES as readonly string[]).includes(stored.costCodeSource ?? "")) {
+        return "not-written";
+    }
+
+    const projectId = resolveExpenseProjectId(stored);
+    if (!projectId) return "skipped-no-project";
+    if (isOverheadProject(projectId)) return "skipped-overhead";
 
     const suggestion = suggestCode({ vendor: input.vendor, description: input.description });
     if (!suggestion) return "no-match";
@@ -1260,7 +1353,6 @@ export async function syncQboExpenses(
                     qbPurchaseId: purchase.qbPurchaseId,
                     vendor: purchase.vendor,
                     description,
-                    projectId: match.projectId,
                 });
             } catch (error) {
                 console.error(
