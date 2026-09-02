@@ -59,36 +59,36 @@ test("the lock covers the whole WORKWEEKS the period touches, not just the perio
     assert.equal(lockedPeriodFor(periods, new Date(PERIOD_START.getTime() - 1)), null);
 });
 
-test("a punch on the SUNDAY before a Monday-start locked period is frozen too", () => {
-    // Overtime is a property of the workweek. Sunday 2026-08-16 is in the
-    // Mon 2026-08-10 week, which does NOT overlap the period — untouched.
-    // But a period that opens mid-week drags its own week in: shift the period
-    // to start Wednesday and the Sunday/Monday before it become editable-no-more.
+test("the freeze reaches BACKWARD into the week, and never past the period", () => {
+    // Overtime is allocated chronologically, so influence runs one way: hours
+    // BEFORE the period (same workweek) decide how much of it is overtime;
+    // hours AFTER it cannot touch what came earlier.
     const midWeek = period({
         periodStart: new Date("2026-08-19T07:00:00.000Z"), // Wed
-        periodEnd: new Date("2026-08-31T07:00:00.000Z"),
-    });
-    const mondayBefore = new Date("2026-08-17T15:00:00.000Z");
-    const sundayBefore = new Date("2026-08-16T15:00:00.000Z");
-    assert.equal(lockedPeriodFor([midWeek], mondayBefore)?.id, "pp1", "same workweek as the period start");
-    assert.equal(
-        lockedPeriodFor([midWeek], sundayBefore),
-        null,
-        "the PREVIOUS Mon-Sun week does not decide this period's overtime"
-    );
-    // And the trailing partial week: the period ends Mon 08-31, so the week of
-    // 08-24 is fully inside. A punch on Sun 08-30 is inside the period anyway;
-    // the interesting case is a period ending MID-week.
-    const midWeekEnd = period({
-        periodStart: new Date("2026-08-17T07:00:00.000Z"),
         periodEnd: new Date("2026-08-27T07:00:00.000Z"), // Thu
     });
-    const fridayAfter = new Date("2026-08-28T15:00:00.000Z");
-    assert.equal(
-        lockedPeriodFor([midWeekEnd], fridayAfter)?.id,
-        "pp1",
-        "a punch in the trailing partial week still moves the locked period's OT split"
-    );
+
+    // Monday of the period's own week: frozen, it feeds the OT walk.
+    assert.equal(lockedPeriodFor([midWeek], new Date("2026-08-17T15:00:00.000Z"))?.id, "pp1");
+    // The PREVIOUS Mon-Sun week: not frozen, a different week entirely.
+    assert.equal(lockedPeriodFor([midWeek], new Date("2026-08-16T15:00:00.000Z")), null);
+    // AFTER the period, same week: NOT frozen. It cannot change the locked
+    // numbers, and freezing it made two adjacent periods overlap at the seam.
+    assert.equal(lockedPeriodFor([midWeek], new Date("2026-08-28T15:00:00.000Z")), null);
+});
+
+test("two adjacent periods do not freeze each other's days", () => {
+    // The regression this rule exists for: the second of two consecutive
+    // periods could be neither exported nor locked.
+    const first = period({
+        id: "pp-first",
+        periodStart: new Date("2026-08-16T07:00:00.000Z"),
+        periodEnd: new Date("2026-08-30T07:00:00.000Z"),
+    });
+    // A punch inside the SECOND period is not frozen by the first one.
+    assert.equal(lockedPeriodFor([first], new Date("2026-09-02T15:00:00.000Z")), null);
+    // And the last instant of the first period still is.
+    assert.equal(lockedPeriodFor([first], new Date("2026-08-29T15:00:00.000Z"))?.id, "pp-first");
 });
 
 test("a period row with lockedAt null does not lock anything (that is what unlock leaves behind)", () => {
@@ -153,7 +153,7 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(INSIDE)),
+        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5 })),
         loadLockedPeriods: async () => lockedPeriods,
     };
     return { dependencies, updateCalls };
@@ -214,7 +214,7 @@ test("a lock taken AFTER the fail-fast check still stops the write (in-transacti
         const hit = lockedPeriodFor([period()], INSIDE);
         if (hit) return { ok: false as const, locked: hit };
         updateCalls.push({ id });
-        return { ok: true as const, entry: { id, userId, ...(await buildData(INSIDE)) } };
+        return { ok: true as const, entry: { id, userId, ...(await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5 })) } };
     };
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());
@@ -474,7 +474,7 @@ test("the close is priced from the STORED startTime and compare-and-set on it", 
     // underneath us — a close computed from a pre-transaction read would price
     // a shift that had since been shifted to another day.
     assert.match(body, /SELECT "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
-    assert.match(body, /await buildData\(stored\.startTime\)/);
+    assert.match(body, /await buildData\(stored\.startTime, lockedRates\)/);
     assert.match(body, /startTime: stored\.startTime/, "the claim must CAS on startTime");
     assert.match(body, /moved: true/);
     // PeriodLockedError leaves the transaction so the write rolls back; it is
@@ -665,10 +665,11 @@ test("the project timeclock action never accepts a caller-supplied cost", () => 
     const updateSig = source.slice(source.indexOf("export async function updateTimeEntry(id: string, data: {"));
     assert.doesNotMatch(updateSig.slice(0, updateSig.indexOf("}")), /laborCost/);
     assert.doesNotMatch(source, /laborCost: data\.laborCost/);
-    assert.match(source, /priceManualEntry\(data\.userId, data\.durationHours, acknowledgeZeroRate\)/);
+    // Priced INSIDE the write transaction now, from a row-locked read.
+    assert.match(source, /priceManualEntry\(tx, data\.userId, data\.durationHours, acknowledgeZeroRate\)/);
     // Derived from the STORED rates, with the same $0 policy as every other
     // write path: refused unless explicitly acknowledged, then flagged.
-    assert.match(source, /select: \{ name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true \}/);
+    assert.match(source, /readOwnerRatesForUpdate\(tx, userId, toNum\)/);
     assert.match(source, /zeroRateBlocks\(/);
     assert.match(source, /zeroRate && !acknowledgeZeroRate/);
     assert.match(source, /appendZeroRateReview\(null\)/);
@@ -719,7 +720,8 @@ test("PATCH applies the zero-rate guard to ANY cost recomputation, not just a cl
     assert.match(source, /recomputesCost &&\s*\n\s*zeroRateBlocks\(/);
     // And the owner's rate is re-read, row-locked, INSIDE the write transaction:
     // a rate import could zero it between the pre-read and the write.
-    assert.match(source, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
+    // The row-locked read lives in the shared helper now.
+    assert.match(source, /readOwnerRatesForUpdate\(/);
     assert.match(source, /ZeroRateAtWriteError/);
 });
 
@@ -784,6 +786,6 @@ test("updateTimeEntry derives cost from stored rates inside the transaction", ()
     assert.match(body, /priceEntryFromStoredRates\(/);
     // Read FOR UPDATE inside the write transaction, so a concurrent rate change
     // cannot land between the read and the write.
-    assert.match(source, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
+    assert.match(source, /readOwnerRatesForUpdate\(/);
     assert.match(source, /zeroRateBlocks\(/);
 });

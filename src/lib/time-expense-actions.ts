@@ -17,7 +17,12 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
 import { toNum } from "@/lib/prisma-helpers";
-import { appendZeroRateReview, zeroRateBlocks, zeroRateManagerMessage } from "@/lib/pay-rate-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroRateBlocks,
+    zeroRateManagerMessage,
+} from "@/lib/pay-rate-guard";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -45,32 +50,20 @@ async function priceEntryFromStoredRates(
     durationHours: number,
     acknowledgeZeroRate: boolean
 ): Promise<{ laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string }> {
-    const [member] = (await tx.$queryRawUnsafe(
-        `SELECT "name", "email", "role", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR UPDATE`,
-        userId
-    )) as Array<{
-        name: string | null;
-        email: string;
-        role: string;
-        payType: string | null;
-        hourlyRate: unknown;
-        burdenRate: unknown;
-    }>;
+    const member = await readOwnerRatesForUpdate(tx, userId, toNum);
     if (!member) throw new Error("Crew member not found");
 
-    const hourlyRate = toNum(member.hourlyRate as never);
-    const burdenRate = toNum(member.burdenRate as never);
     const zeroRate = zeroRateBlocks({
         role: member.role,
         email: member.email,
         payType: member.payType,
-        hourlyRate,
+        hourlyRate: member.hourlyRate,
     });
     if (zeroRate && !acknowledgeZeroRate) throw new Error(zeroRateManagerMessage(member.name));
 
     return {
-        laborCost: durationHours * hourlyRate,
-        burdenCost: durationHours * burdenRate,
+        laborCost: durationHours * member.hourlyRate,
+        burdenCost: durationHours * member.burdenRate,
         ...(zeroRate ? appendZeroRateReview(null) : {}),
     };
 }

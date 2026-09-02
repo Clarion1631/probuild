@@ -122,8 +122,13 @@ function deps(options: {
         closeTimeEntry: async (id, userId, buildData, guard) => {
             // The real dependency reads the STORED startTime under FOR UPDATE
             // and prices the close from it; the fixture entry never moves.
-            const data = await buildData(START);
             void guard;
+            // The real dependency reads these FOR UPDATE inside the close
+            // transaction and prices from them.
+            const lockedRates = options.ownerId
+                ? options.ownerRates ?? { hourlyRate: 0, burdenRate: 0 }
+                : { hourlyRate: options.selfRate ?? 0, burdenRate: 0 };
+            const data = await buildData(START, lockedRates);
             updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },
@@ -232,7 +237,7 @@ test("the PATCH edit path mirrors the block on ANY cost recomputation", () => {
     // Widened from the OPEN -> CLOSED transition: shrinking a closed 8h entry to
     // 4h at a $0 rate rewrites the cost just as silently.
     assert.match(source, /const recomputesCost = newEnd != null;/);
-    assert.match(source, /recomputesCost &&[\s\S]{0,20}zeroRateBlocks\(/);
+    assert.match(source, /recomputesCost &&[\s\S]{0,40}zeroRateBlocks\(/);
     assert.match(source, /email: owner\.email/, "the manager mirror must pass the email, or a salaried manager is blocked");
     assert.match(source, /payType: owner\.payType/, "and the stored payType, which beats both");
     // Owner-only refusal, and a flag on the manager path — the same shape the

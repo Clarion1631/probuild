@@ -14929,8 +14929,26 @@ export async function markTimeEntryReviewed(entryId: string) {
     // Clearing the flag can REPRICE the entry, so it is a payroll write like any
     // other and goes through the advisory-lock protocol.
     const { withPayrollWrite } = await import("./payroll-period");
-    await withPayrollWrite({ entryIds: [entryId] }, async (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.update({
+    const { readOwnerRatesForUpdate } = await import("./pay-rate-guard");
+    await withPayrollWrite({ entryIds: [entryId] }, async (tx) => {
+        // Reprice from rates read FOR UPDATE in THIS transaction — the check
+        // above ran against a copy taken before it opened.
+        if (reprice) {
+            const locked = await readOwnerRatesForUpdate(tx as never, entry.user.id, toNum);
+            if (!locked || zeroRateBlocks({
+                role: locked.role,
+                email: locked.email,
+                payType: locked.payType,
+                hourlyRate: locked.hourlyRate,
+            })) {
+                throw new Error(
+                    `${entry.user.name || entry.user.email} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
+                );
+            }
+            const hours = entry.durationHours ?? 0;
+            reprice = { laborCost: hours * locked.hourlyRate, burdenCost: hours * locked.burdenRate };
+        }
+        return (tx as unknown as typeof prisma).timeEntry.update({
         where: { id: entryId },
         data: {
             ...(reprice ?? {}),
@@ -14941,8 +14959,8 @@ export async function markTimeEntryReviewed(entryId: string) {
             reviewReason: stripSettlementNotes(entry.reviewReason),
             notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
         },
-        })
-    );
+        });
+    });
 
     revalidatePath("/manager/time-entries");
     return { success: true };

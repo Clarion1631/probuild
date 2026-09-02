@@ -243,7 +243,10 @@ test("a retry resumes a submission stranded mid-flight instead of returning earl
     // the `submitting` row would strand that report forever.
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
     assert.match(source, /HELP_SUBMITTING_STALE_MS/);
-    assert.match(source, /existing\.status === "submitting" && age > HELP_SUBMITTING_STALE_MS/);
+    assert.match(
+        source,
+        /existing\.status === "submitting" &&[\s\S]{0,120}providerState !== "created"[\s\S]{0,80}age > HELP_SUBMITTING_STALE_MS/
+    );
     // A resume must not consume a second slot — it was already paid for.
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
     assert.ok(
@@ -258,4 +261,35 @@ test("a retry resumes a submission stranded mid-flight instead of returning earl
         );
         assert.match(routeSource, /reserved\.existing && !reserved\.resume/, route);
     }
+});
+
+test("a mobile caller with no submissionId is refused, with a coded error", () => {
+    // The app retries on network failure. Without an idempotency key every retry
+    // is a new report and a new GitHub issue, so there is no safe way to serve
+    // it — the web widget (a human clicking once) keeps the key optional.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /fromMobile && !submissionId/);
+    assert.match(source, /MOBILE_SUBMISSION_ID_REQUIRED/);
+    assert.match(source, /status: 400/);
+});
+
+test("a resume asks GitHub before filing, using the submission marker", () => {
+    // A resume happens precisely because the last attempt's outcome is unknown:
+    // it may have created the issue and died before recording it.
+    const guard = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.match(guard, /probuild-submission:\$\{requestId\}/);
+
+    const route = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
+        "utf8"
+    );
+    assert.match(route, /reserved\.resume \? await findIssueByMarker\(marker\) : null/);
+    assert.match(route, /alreadyFiled \?\?/, "only file when the search found nothing");
+    // The marker goes INTO the body, or the search could never find it.
+    assert.match(route, /metadata: \[[\s\S]{0,200}marker,/);
+    // providerState records the outcome so the next resume knows.
+    assert.match(route, /"providerState" = \$\{ghIssue \? "created" : "pending"\}/);
 });

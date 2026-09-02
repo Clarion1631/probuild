@@ -160,3 +160,48 @@ export function zeroRateBlockedResponse(options: { closerIsOwner: boolean; owner
         { status: 422 }
     );
 }
+
+export type LockedOwnerRates = {
+    name: string | null;
+    email: string;
+    role: string;
+    payType: string | null;
+    hourlyRate: number;
+    burdenRate: number;
+};
+
+/**
+ * The owner's pay facts, RE-READ and row-locked inside the caller's write
+ * transaction.
+ *
+ * Every path that stamps a cost has to price from THIS read, not from one taken
+ * before the transaction opened: a rate import committing in between would
+ * otherwise be ignored, and the entry would be stamped at a rate that is no
+ * longer true — including a $0 one the guard would have refused.
+ */
+export async function readOwnerRatesForUpdate(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string,
+    toNumber: (value: unknown) => number
+): Promise<LockedOwnerRates | null> {
+    const [row] = (await tx.$queryRawUnsafe(
+        `SELECT "name", "email", "role", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR UPDATE`,
+        userId
+    )) as Array<{
+        name: string | null;
+        email: string;
+        role: string;
+        payType: string | null;
+        hourlyRate: unknown;
+        burdenRate: unknown;
+    }>;
+    if (!row) return null;
+    return {
+        name: row.name,
+        email: row.email,
+        role: row.role,
+        payType: row.payType,
+        hourlyRate: toNumber(row.hourlyRate),
+        burdenRate: toNumber(row.burdenRate),
+    };
+}

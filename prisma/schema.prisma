@@ -2700,6 +2700,12 @@ model HelpRequest {
   /// one user's key would then collide with another's and hand back somebody
   /// else's report, so the uniqueness and every lookup are scoped by userId.
   submissionId      String?
+  /// GitHub issue reference for this report, and whether it has been created
+  /// yet. `providerState` is 'pending' until the issue exists and 'created'
+  /// afterwards, so a resumed submission knows whether to call GitHub at all —
+  /// status alone could not tell "never tried" from "tried and finished".
+  providerIssueRef  String?
+  providerState     String?   @default("pending")
   createdAt         DateTime? @default(now()) @db.Timestamptz(6)
 
   @@unique([userId, submissionId])

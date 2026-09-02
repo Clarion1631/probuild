@@ -22,7 +22,12 @@ import {
     type LockedPeriodRow,
     type PayrollTxClient,
 } from "@/lib/payroll-period";
-import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroRateBlockedResponse,
+    zeroRateBlocks,
+} from "@/lib/pay-rate-guard";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -394,7 +399,10 @@ export interface ClockOutDependencies {
          * from that instant, so computing them from a value read before the
          * transaction would price a shift that had since been moved.
          */
-        buildData: (storedStartTime: Date) => Promise<Record<string, unknown>>,
+        buildData: (
+            storedStartTime: Date,
+            lockedRates: { hourlyRate: number; burdenRate: number }
+        ) => Promise<Record<string, unknown>>,
         /**
          * Everything the close transaction must do atomically:
          *  - re-read + row-lock this entry and check its STORED startTime
@@ -550,7 +558,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // are all functions of that instant, so computing them out here
             // from a value read before the transaction would price a shift that
             // had since been moved to another day.
-            const buildData = async (storedStart: Date): Promise<Record<string, unknown>> => {
+            const buildData = async (
+                storedStart: Date,
+                lockedRates: { hourlyRate: number; burdenRate: number }
+            ): Promise<Record<string, unknown>> => {
                 // Re-validate against the value that is actually stored.
                 if (end.getTime() <= storedStart.getTime()) {
                     throw new ClockOutInputError(400, "endTime must be after the clock-in time");
@@ -590,8 +601,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     shiftHours: meal.shiftHours,
                     mealDeductionHours: meal.mealDeductionHours,
                     mealOutcome: meal.outcome,
-                    laborCost: durationHours * owner.hourlyRate,
-                    burdenCost: durationHours * owner.burdenRate,
+                    // Priced from the rates read FOR UPDATE inside the close
+                    // transaction, never from the copy read before it.
+                    laborCost: durationHours * lockedRates.hourlyRate,
+                    burdenCost: durationHours * lockedRates.burdenRate,
                 };
 
                 if (latitude) updateData.latitude = latitude;
@@ -788,7 +801,12 @@ const clockOutHandler = createClockOutHandler({
                     return { ok: false as const, moved: true as const };
                 }
 
-                const data = await buildData(stored.startTime);
+                // The owner's rates, row-locked in THIS transaction. A rate
+                // import committing between the pre-read and here would
+                // otherwise be ignored and the shift stamped at a stale rate.
+                const lockedRates = await readOwnerRatesForUpdate(client, userId, toNum);
+                if (!lockedRates) return { ok: false as const, current: null };
+                const data = await buildData(stored.startTime, lockedRates);
 
                 // Compare-and-set on startTime as well as the open check: a
                 // concurrent edit that moved the punch within the same day

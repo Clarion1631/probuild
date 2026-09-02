@@ -54,12 +54,19 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
             setRows(result.rows);
             setErrors(result.errors);
             // Pre-tick exactly the rows that would actually change something.
-            // Pre-tick only EMAIL-matched changes. A name-only match is exactly
-            // the row a human should have to look at before it writes a pay
-            // rate, so it starts unticked.
+            // Pre-tick only EMAIL-matched RATE changes. Two rows are
+            // deliberately left unticked:
+            //  - a name-only match, which is the row most likely to be the
+            //    wrong person;
+            //  - anything that would change a PAY TYPE. Hourly vs salary
+            //    decides whether Gusto pays someone a salary AND their exported
+            //    hours, so it is never something a CSV gets to decide quietly.
             const next: Record<string, boolean> = {};
             for (const row of result.rows) {
-                if (row.userId && row.changed && row.matchedBy === "email") next[row.userId] = true;
+                if (!row.userId || !row.changed || row.matchedBy !== "email") continue;
+                const changesPayType = !!row.payType && row.payType !== (row.oldPayType ?? null);
+                if (changesPayType) continue;
+                next[row.userId] = true;
             }
             setSelected(next);
             if (result.rows.length === 0) toast.warning("No rows found in that file.");
@@ -104,6 +111,10 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
 
     const changedCount = (rows ?? []).filter((row) => row.userId && row.changed).length;
     const unmatchedCount = (rows ?? []).filter((row) => !row.userId).length;
+    // Never pre-ticked: hourly vs salary decides whether somebody is paid twice.
+    const payTypeChanges = (rows ?? []).filter(
+        (row) => row.userId && row.payType && row.payType !== (row.oldPayType ?? null)
+    ).length;
 
     return (
         <>
@@ -155,7 +166,8 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                             {rows && (
                                 <div className="border border-hui-border rounded overflow-hidden">
                                     <div className="px-4 py-2 bg-slate-50 border-b border-hui-border text-xs text-hui-textMuted">
-                                        {changedCount} rate{changedCount === 1 ? "" : "s"} would change
+                                        {changedCount} row{changedCount === 1 ? "" : "s"} would change
+                                        {payTypeChanges > 0 && ` · ${payTypeChanges} change a pay type (tick those yourself)`}
                                         {unmatchedCount > 0 && ` · ${unmatchedCount} row${unmatchedCount === 1 ? "" : "s"} matched nobody`}
                                     </div>
                                     <table className="w-full text-left text-xs">
@@ -202,7 +214,14 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                                                         {/* Rendered from the exact decimal TEXT that will be written —
                                                             not re-parsed through a float on the way to the screen. */}
                                                         ${row.newHourly}/h
-                                                        {row.payType && (
+                                                        {row.payType && row.payType !== (row.oldPayType ?? null) && (
+                                                            <div className="text-[10px] font-normal uppercase tracking-wide text-amber-800">
+                                                                pay type {row.oldPayType ? row.oldPayType.toLowerCase() : "not set"}
+                                                                {" → "}
+                                                                {row.payType.toLowerCase()}
+                                                            </div>
+                                                        )}
+                                                        {row.payType && row.payType === (row.oldPayType ?? null) && (
                                                             <div className="text-[10px] font-normal text-hui-textMuted uppercase tracking-wide">
                                                                 {row.payType === "SALARY" ? "salary" : "hourly"}
                                                             </div>

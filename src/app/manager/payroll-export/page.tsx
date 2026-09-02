@@ -19,15 +19,19 @@ import { getSessionOrDev } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
-import { lastFullPayPeriod, MAX_PAYROLL_RANGE_DAYS, payrollPeriodLength, validatePayrollRange } from "@/lib/payroll-config";
+import {
+    isDayKey,
+    lastFullPayPeriod,
+    MAX_PAYROLL_RANGE_DAYS,
+    payrollPeriodLength,
+    validatePayrollRange,
+} from "@/lib/payroll-config";
 import { loadGustoExport } from "@/lib/gusto-export-db";
 import PayrollLockControls from "./PayrollLockControls";
 
 interface Props {
     searchParams: Promise<{ start?: string; end?: string }>;
 }
-
-const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
 export default async function PayrollExportPage({ searchParams }: Props) {
     const session = await getSessionOrDev();
@@ -51,12 +55,14 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const todayKey = dayKeyInTimeZone(new Date(), timeZone);
     const fallback = lastFullPayPeriod(todayKey);
 
-    const startKey = params.start && DAY_KEY.test(params.start) ? params.start : fallback.startKey;
+    // Both RAW keys are validated as real calendar days BEFORE any arithmetic.
+    // addDaysToKey happily accepts "2026-02-31" and rolls it forward, so adding
+    // a day first turned an impossible date into a plausible-looking period
+    // that nobody asked for.
+    const startKey = isDayKey(params.start) ? params.start : fallback.startKey;
     // fallback.endKey is exclusive; the picker shows the inclusive last day.
     const lastDayKey =
-        params.end && DAY_KEY.test(params.end) && params.end >= startKey
-            ? params.end
-            : addDaysToKey(fallback.endKey, -1);
+        isDayKey(params.end) && params.end >= startKey ? params.end : addDaysToKey(fallback.endKey, -1);
     const endKeyExclusive = addDaysToKey(lastDayKey, 1);
 
     // The SAME validator the endpoint and the lock action use (shape, real

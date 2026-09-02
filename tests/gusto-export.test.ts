@@ -598,3 +598,66 @@ test("ONE definition of an open punch, shared by the export and the settle butto
     assert.match(body, /isOpenEntry/);
     assert.match(body, /openCandidates\.filter\(\(row\) => isOpenEntry\(row\)\)/);
 });
+
+// ── Hundredth-hour allocation (review round 11, item 2) ────────────────────
+
+test("detail rows sum EXACTLY to the summary, with odd-minute punches", async () => {
+    const { allocateWeekHundredths, toHundredths } = await import("../src/lib/gusto-export-core");
+    // 7h13m, 6h47m, 8h01m, 9h59m, 8h... none of which is a clean tenth.
+    const odd = [7.2167, 6.7833, 8.0167, 9.9833, 8.0];
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const entries = odd.map((hours, i) =>
+        entry({ userId: alice.id, startTime: at8am(days[i]), durationHours: hours })
+    );
+    const result = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    const totals = totalsFor(alice.id, result);
+
+    // The reconciliation that matters: what the two CSVs would each report.
+    const detailRegular = result.detail.reduce((sum, row) => sum + toHundredths(row.regularHours), 0);
+    const detailOvertime = result.detail.reduce((sum, row) => sum + toHundredths(row.overtimeHours), 0);
+    assert.equal(detailRegular, toHundredths(totals.regularHours), "regular hours must reconcile to the cent");
+    assert.equal(detailOvertime, toHundredths(totals.overtimeHours), "overtime hours must reconcile to the cent");
+
+    // And the week's own arithmetic still holds: 40.00 regular, the rest OT.
+    const totalHundredths = odd.reduce((sum, h) => sum + toHundredths(h), 0);
+    assert.equal(toHundredths(totals.regularHours), Math.min(totalHundredths, 4000));
+    assert.equal(toHundredths(totals.overtimeHours), Math.max(0, totalHundredths - 4000));
+
+    // The allocator itself is exact for any input.
+    const allocation = allocateWeekHundredths(odd.map((durationHours) => ({ durationHours })));
+    assert.equal(
+        allocation.reduce((sum, a) => sum + a.regularHundredths + a.overtimeHundredths, 0),
+        totalHundredths
+    );
+});
+
+test("the entry that crosses 40 hours carries the split, to the hundredth", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    // 38.75 banked, then a 3.5h shift: 1.25 regular, 2.25 overtime.
+    const allocation = allocateWeekHundredths([{ durationHours: 38.75 }, { durationHours: 3.5 }]);
+    assert.deepEqual(
+        allocation.map((a) => [a.regularHundredths, a.overtimeHundredths]),
+        [
+            [3875, 0],
+            [125, 225],
+        ]
+    );
+});
+
+test("a week entirely under 40 hours has no overtime anywhere", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    const allocation = allocateWeekHundredths([{ durationHours: 7.33 }, { durationHours: 6.67 }]);
+    assert.deepEqual(
+        allocation.map((a) => [a.regularHundredths, a.overtimeHundredths]),
+        [
+            [733, 0],
+            [667, 0],
+        ]
+    );
+});

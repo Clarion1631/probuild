@@ -7,9 +7,12 @@ import {
   checkHelpSubmission,
   HELP_THROTTLED_MESSAGE,
   isMobileSubmission,
+  MOBILE_SUBMISSION_ID_REQUIRED,
   readJsonBody,
   reserveHelpRequest,
+  submissionMarker,
 } from "@/lib/help-chat/submission-guard";
+import { findIssueByMarker } from "@/lib/help-chat/github";
 
 // Phase 5 G5: any ACTIVATED staff member can file, from the web or from the
 // crew app's "Report a bug" screen (Bearer token via authenticateMobileOrSession,
@@ -41,6 +44,20 @@ export async function POST(req: NextRequest) {
   // this is the endpoint its Bearer token can reach, not because someone is
   // asking for a feature. Classify on the marker the app actually sends.
   const fromMobile = isMobileSubmission(currentPage);
+
+  // A mobile caller with no idempotency key cannot be retried safely: the app
+  // retries on network failure, and without a key every retry is a new report
+  // and a new GitHub issue. The web widget is a human clicking once, so it stays
+  // optional there.
+  if (fromMobile && !submissionId) {
+    return NextResponse.json(
+      {
+        error: "This version of the app can't report bugs safely. Please update it.",
+        code: MOBILE_SUBMISSION_ID_REQUIRED,
+      },
+      { status: 400 }
+    );
+  }
 
   try {
     if (conversationId) {
@@ -83,16 +100,27 @@ export async function POST(req: NextRequest) {
     }
     const requestId = reserved.id;
 
-    const ghIssue = await createHelpChatGitHubIssue({
-      title,
-      description,
-      currentPage,
-      labelPrefix: fromMobile ? "Bug Fix" : "Feature Request",
-      labels: fromMobile ? ["bug-fix", "from-mobile"] : ["feature-request", "from-chat"],
-      metadata: conversationId
-        ? [`**Conversation ID:** \`${conversationId}\``]
-        : [],
-    });
+    // Before filing, ask GitHub whether this submission is already there. A
+    // resume happens precisely because the previous attempt's outcome is
+    // unknown — it may have created the issue and died before recording it.
+    const marker = submissionMarker(requestId);
+    const alreadyFiled = reserved.resume ? await findIssueByMarker(marker) : null;
+
+    const ghIssue =
+      alreadyFiled ??
+      (await createHelpChatGitHubIssue({
+        title,
+        description,
+        currentPage,
+        labelPrefix: fromMobile ? "Bug Fix" : "Feature Request",
+        labels: fromMobile ? ["bug-fix", "from-mobile"] : ["feature-request", "from-chat"],
+        metadata: [
+          ...(conversationId ? [`**Conversation ID:** \`${conversationId}\``] : []),
+          // The idempotency marker, in the body, so a resumed attempt can find
+          // this issue instead of opening a second one.
+          marker,
+        ],
+      }));
 
     // Attach the issue to the row that already exists — a retry updates it
     // instead of filing a second report.
@@ -100,7 +128,9 @@ export async function POST(req: NextRequest) {
       UPDATE "HelpRequest"
       SET "status" = ${ghIssue ? "submitted" : "submitted_no_issue"},
           "changeLocation" = ${ghIssue?.url ?? null},
-          "externalIssueRef" = ${ghIssue ? `github-issue:${ghIssue.number}` : null}
+          "externalIssueRef" = ${ghIssue ? `github-issue:${ghIssue.number}` : null},
+          "providerIssueRef" = ${ghIssue ? String(ghIssue.number) : null},
+          "providerState" = ${ghIssue ? "created" : "pending"}
       WHERE "id" = ${requestId}
       RETURNING *
     `;

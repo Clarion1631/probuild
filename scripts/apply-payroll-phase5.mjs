@@ -125,6 +125,10 @@ const STATEMENTS = [
      END $$`,
     // ---- Help-widget throttle + idempotency (round 6, item 6) -----------
     `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT`,
+    // Whether the GitHub issue exists yet — `status` could not tell "never
+    // tried" from "tried and finished".
+    `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerIssueRef" TEXT`,
+    `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerState" TEXT DEFAULT 'pending'`,
     // Unique PER USER — a global key would collide across users and hand back
     // somebody else's report.
     `CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_userId_submissionId_key" ON "HelpRequest"("userId", "submissionId")`,

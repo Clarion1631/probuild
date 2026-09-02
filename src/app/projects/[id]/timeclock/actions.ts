@@ -10,7 +10,12 @@ import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timez
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
 import { toNum } from "@/lib/prisma-helpers";
-import { appendZeroRateReview, zeroRateBlocks, zeroRateManagerMessage } from "@/lib/pay-rate-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroRateBlocks,
+    zeroRateManagerMessage,
+} from "@/lib/pay-rate-guard";
 
 // A bare session check let any signed-in account write hours against any
 // project. These rows are now direct field evidence on the schedule board, so
@@ -39,31 +44,31 @@ async function assertTimeclockProjectAccess(projectId: string) {
  * entry is flagged for payroll (src/lib/pay-rate-guard.ts).
  */
 async function priceManualEntry(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
     userId: string,
     durationHours: number,
     acknowledgeZeroRate: boolean
 ): Promise<{ laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string }> {
-    const member = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
-    });
+    // Row-locked, INSIDE the caller's write transaction. Reading the rate before
+    // the transaction let a concurrent rate import land in between, and the
+    // entry was then stamped at a rate that was no longer true — including a $0
+    // one this guard would have refused.
+    const member = await readOwnerRatesForUpdate(tx, userId, toNum);
     if (!member) throw new Error("Crew member not found");
 
-    const hourlyRate = toNum(member.hourlyRate);
-    const burdenRate = toNum(member.burdenRate);
     const zeroRate = zeroRateBlocks({
         role: member.role,
         email: member.email,
         payType: member.payType,
-        hourlyRate,
+        hourlyRate: member.hourlyRate,
     });
     if (zeroRate && !acknowledgeZeroRate) {
         throw new Error(zeroRateManagerMessage(member.name));
     }
 
     return {
-        laborCost: durationHours * hourlyRate,
-        burdenCost: durationHours * burdenRate,
+        laborCost: durationHours * member.hourlyRate,
+        burdenCost: durationHours * member.burdenRate,
         ...(zeroRate ? appendZeroRateReview(null) : {}),
     };
 }
@@ -99,13 +104,12 @@ export async function createTimeEntry(data: {
         estimateItemId: null,
     });
 
-    const priced = await priceManualEntry(data.userId, data.durationHours, acknowledgeZeroRate);
-
     // Creating hours AT a date is moving hours INTO that period, so a create is
     // as much a payroll change as an edit. Check + write in one transaction
     // under the shared advisory lock (src/lib/payroll-period.ts).
-    await withPayrollWriteTx({ instants: [startTime] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.create({
+    await withPayrollWriteTx({ instants: [startTime] }, async (tx) => {
+        const priced = await priceManualEntry(tx, data.userId, data.durationHours, acknowledgeZeroRate);
+        return (tx as unknown as typeof prisma).timeEntry.create({
             data: {
                 projectId: data.projectId,
                 userId: data.userId,
@@ -117,8 +121,8 @@ export async function createTimeEntry(data: {
                 ...priced,
                 scheduleTaskId
             }
-        })
-    );
+        });
+    });
 
     revalidatePath(`/projects/${data.projectId}/timeclock`);
     revalidatePath(`/projects/${data.projectId}/costing`);
@@ -157,11 +161,10 @@ export async function updateTimeEntry(id: string, data: {
         estimateItemId: existing.estimateItemId,
     });
 
-    const priced = await priceManualEntry(data.userId, data.durationHours, acknowledgeZeroRate);
-
     // Both dates — editing inside a locked period, and moving a punch into one.
-    await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.update({
+    await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
+        const priced = await priceManualEntry(tx, data.userId, data.durationHours, acknowledgeZeroRate);
+        return (tx as unknown as typeof prisma).timeEntry.update({
             where: { id },
             data: {
                 userId: data.userId,
@@ -171,8 +174,8 @@ export async function updateTimeEntry(id: string, data: {
                 ...priced,
                 scheduleTaskId
             }
-        })
-    );
+        });
+    });
 
     revalidatePath(`/projects/${data.projectId}/timeclock`);
     revalidatePath(`/projects/${data.projectId}/costing`);

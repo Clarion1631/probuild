@@ -28,7 +28,7 @@
 // Gusto pays them a salary, so exporting hours would pay them twice — but kept
 // in the DETAIL csv, because job costing still needs those hours.
 
-import { bucketWorkweeks, type OvertimeTimeEntry } from "./overtime";
+import { bucketWorkweeks, WA_WEEKLY_OVERTIME_THRESHOLD_HOURS, type OvertimeTimeEntry } from "./overtime";
 import { dayKeyInTimeZone } from "./tz-date";
 import { isKnownPayType } from "./pay-rate-guard";
 
@@ -144,6 +144,72 @@ export type GustoExport = {
  */
 export function isOpenEntry(entry: { endTime: Date | null; durationHours: number | null }): boolean {
     return entry.endTime == null && !(Number.isFinite(entry.durationHours) && (entry.durationHours ?? 0) > 0);
+}
+
+
+/** Hours -> integer hundredths of an hour. The CSV reports two decimals, so hundredths are the atom payroll actually pays in. */
+export function toHundredths(hours: number): number {
+    return Math.round((Number.isFinite(hours) ? hours : 0) * 100);
+}
+
+export type WeekAllocation<TEntry> = {
+    entry: TEntry;
+    regularHundredths: number;
+    overtimeHundredths: number;
+};
+
+/**
+ * Allocate a workweek's regular/overtime split ACROSS ITS ENTRIES, in
+ * hundredths of an hour.
+ *
+ * Why hundredths rather than the float splits from overtime.ts: the detail CSV
+ * prints each entry to two decimals and the summary prints the employee total
+ * to two decimals. Rounding each of N entries independently and rounding their
+ * true sum separately are different operations, so the detail rows did not add
+ * up to the summary — a bookkeeper reconciling one against the other found a
+ * cent or two of hours that came from nowhere and could not be explained.
+ *
+ * The walk itself is the SAME rule as src/lib/overtime.ts: chronological, the
+ * hours that push the week past 40 are the later ones, only the threshold
+ * splits an entry. This does not re-derive the rule; it performs it on integers
+ * so the arithmetic is exact.
+ *
+ * Sums are exact by construction. The reconciliation pass afterwards is
+ * belt-and-braces: if a future change ever reintroduces drift, it lands on the
+ * LAST entry of the week rather than being silently spread, so the summary
+ * stays the authoritative number and the discrepancy is visible in one place.
+ */
+export function allocateWeekHundredths<TEntry extends { durationHours: number }>(
+    chronologicalEntries: TEntry[],
+    thresholdHours: number = WA_WEEKLY_OVERTIME_THRESHOLD_HOURS
+): WeekAllocation<TEntry>[] {
+    const thresholdHundredths = toHundredths(thresholdHours);
+    let running = 0;
+    const allocated: WeekAllocation<TEntry>[] = chronologicalEntries.map((entry) => {
+        const hundredths = toHundredths(entry.durationHours);
+        const before = running;
+        running += hundredths;
+        const regularHundredths = Math.max(0, Math.min(hundredths, thresholdHundredths - before));
+        return { entry, regularHundredths, overtimeHundredths: hundredths - regularHundredths };
+    });
+
+    // What the SUMMARY will say for this week.
+    const totalHundredths = running;
+    const targetRegular = Math.min(totalHundredths, thresholdHundredths);
+    const targetOvertime = Math.max(0, totalHundredths - thresholdHundredths);
+
+    if (allocated.length > 0) {
+        const sum = (pick: (a: WeekAllocation<TEntry>) => number) => allocated.reduce((t, a) => t + pick(a), 0);
+        const last = allocated[allocated.length - 1];
+        last.regularHundredths += targetRegular - sum((a) => a.regularHundredths);
+        last.overtimeHundredths += targetOvertime - sum((a) => a.overtimeHundredths);
+    }
+    return allocated;
+}
+
+/** Hundredths back to hours, for display and for the CSV's toFixed(2). */
+export function fromHundredths(hundredths: number): number {
+    return hundredths / 100;
 }
 
 function round2(value: number): number {
@@ -326,41 +392,51 @@ export function buildGustoExport(input: {
         const userEntries = byUser.get(user.id) ?? [];
         // OT comes from the shared lib over WHOLE workweeks; the period filter
         // is applied to the resulting per-entry splits, never to its input.
+        // bucketWorkweeks decides WHICH week each entry belongs to (the Mon-Sun
+        // rule, in the company zone). The regular/OT allocation across the
+        // entries of a week is then done in hundredths so the detail rows add up
+        // to the summary exactly — see allocateWeekHundredths.
         const weeks = bucketWorkweeks(userEntries, timeZone);
-        let regularHours = 0;
-        let overtimeHours = 0;
+        let regularHundredths = 0;
+        let overtimeHundredths = 0;
 
         for (const week of weeks) {
-            for (const split of week.entries) {
-                if (!inPeriod(split.entry, periodStart, periodEnd)) continue;
-                regularHours += split.regularHours;
-                overtimeHours += split.overtimeHours;
+            const chronological = week.entries.map((split) => split.entry);
+            for (const allocation of allocateWeekHundredths(chronological)) {
+                const item = allocation.entry;
+                if (!inPeriod(item, periodStart, periodEnd)) continue;
+                regularHundredths += allocation.regularHundredths;
+                overtimeHundredths += allocation.overtimeHundredths;
                 detail.push({
-                    dayKey: dayKeyInTimeZone(split.entry.startTime, timeZone),
+                    dayKey: dayKeyInTimeZone(item.startTime, timeZone),
                     user,
-                    projectName: split.entry.projectName ?? "",
-                    costCodeLabel: split.entry.costCodeLabel ?? "",
-                    shiftHours: split.entry.shiftHours,
-                    mealDeductionHours: split.entry.mealDeductionHours,
-                    paidHours: split.entry.durationHours,
-                    regularHours: split.regularHours,
-                    overtimeHours: split.overtimeHours,
-                    isEdited: split.entry.isEdited,
-                    startTime: split.entry.startTime,
-                    entryId: split.entry.id,
+                    projectName: item.projectName ?? "",
+                    costCodeLabel: item.costCodeLabel ?? "",
+                    shiftHours: item.shiftHours,
+                    mealDeductionHours: item.mealDeductionHours,
+                    paidHours: item.durationHours,
+                    regularHours: fromHundredths(allocation.regularHundredths),
+                    overtimeHours: fromHundredths(allocation.overtimeHundredths),
+                    isEdited: item.isEdited,
+                    startTime: item.startTime,
+                    entryId: item.id,
                 });
             }
         }
+        // The summary is the SUM OF THE ALLOCATED HUNDREDTHS, not a separately
+        // rounded total — that is what makes the two files reconcile.
+        const regularHours = fromHundredths(regularHundredths);
+        const overtimeHours = fromHundredths(overtimeHundredths);
 
         employees.push({
             user,
             gustoEmployeeId: employeeMappings[user.id] ?? "",
             salaried: isSalaried(user),
-            regularHours: round2(regularHours),
-            overtimeHours: round2(overtimeHours),
+            regularHours,
+            overtimeHours,
             // WA has no double time. Structural column — see invariant 1.
             doubleOvertimeHours: 0,
-            totalHours: round2(regularHours + overtimeHours),
+            totalHours: fromHundredths(regularHundredths + overtimeHundredths),
         });
     }
 

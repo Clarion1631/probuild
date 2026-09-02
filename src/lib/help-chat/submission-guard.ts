@@ -155,6 +155,18 @@ export type ReserveResult =
     | { ok: true; id: string; existing: boolean; resume: boolean }
     | { ok: false; reason: "throttled" };
 
+/**
+ * The marker stamped into every issue body. It is how a resumed submission can
+ * ask GitHub "did I already file this?" before filing again — the only source
+ * of truth once our own write and the provider's have diverged.
+ */
+export function submissionMarker(requestId: string): string {
+    return `probuild-submission:${requestId}`;
+}
+
+/** A mobile caller with no idempotency key cannot be made safe to retry. */
+export const MOBILE_SUBMISSION_ID_REQUIRED = "submission-id-required";
+
 /** A `submitting` row older than this was abandoned mid-flight; a retry resumes it. */
 export const HELP_SUBMITTING_STALE_MS = 2 * 60 * 1000;
 
@@ -191,11 +203,17 @@ export async function reserveHelpRequest(input: {
         // clients pick these, so collisions are a matter of time.
         const existing = await prisma.helpRequest.findUnique({
             where: { userId_submissionId: { userId: input.userId, submissionId: input.submissionId } },
-            select: { id: true, status: true, createdAt: true },
+            select: { id: true, status: true, createdAt: true, providerState: true },
         });
         if (existing) {
             const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
-            const stale = existing.status === "submitting" && age > HELP_SUBMITTING_STALE_MS;
+            // Resume only when the issue was never created. providerState is
+            // what distinguishes "never tried" from "tried and finished";
+            // status alone could not, so a finished report could be re-filed.
+            const stale =
+                existing.status === "submitting" &&
+                existing.providerState !== "created" &&
+                age > HELP_SUBMITTING_STALE_MS;
             return { ok: true, id: existing.id, existing: true, resume: stale };
         }
     }

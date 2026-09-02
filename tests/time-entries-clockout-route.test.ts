@@ -72,7 +72,10 @@ function createDeps(overrides: {
             // The real dependency re-reads the row under FOR UPDATE and prices
             // the close from its STORED startTime; the fixture entry never moves.
             void guard;
-            const data = await buildData(overrides.entry?.startTime ?? START);
+            // The real dependency reads these FOR UPDATE inside the close
+            // transaction and prices from them; the fixture owner never changes.
+            const lockedRates = overrides.ownerRates ?? { hourlyRate: 20, burdenRate: 5 };
+            const data = await buildData(overrides.entry?.startTime ?? START, lockedRates);
             updateCalls.push({ id, userId, data });
             if (overrides.closeRaceLost) {
                 const current = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });

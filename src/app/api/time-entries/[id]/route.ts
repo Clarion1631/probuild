@@ -17,7 +17,12 @@ import {
     periodLockedResponse,
     withPayrollWriteTx,
 } from "@/lib/payroll-period";
-import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroRateBlockedResponse,
+    zeroRateBlocks,
+} from "@/lib/pay-rate-guard";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -410,22 +415,23 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // this transaction. The copy above was read before it, so a
                 // concurrent rate import could set a rate to $0 in between and
                 // this edit would price the shift from the stale value.
-                const [liveOwner] = (await client.$queryRawUnsafe(
-                    `SELECT "role", "email", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR UPDATE`,
-                    existing.userId
-                )) as Array<{ role: string; email: string; payType: string | null; hourlyRate: unknown; burdenRate: unknown }>;
-                if (
-                    liveOwner &&
-                    newEnd != null &&
-                    zeroRateBlocks({
-                        role: liveOwner.role,
-                        email: liveOwner.email,
-                        payType: liveOwner.payType,
-                        hourlyRate: toNum(liveOwner.hourlyRate as never),
-                    }) &&
-                    !acknowledgedZeroRate
-                ) {
-                    throw new ZeroRateAtWriteError();
+                const liveOwner = await readOwnerRatesForUpdate(client as never, existing.userId, toNum);
+                if (liveOwner && newEnd != null) {
+                    if (
+                        zeroRateBlocks({
+                            role: liveOwner.role,
+                            email: liveOwner.email,
+                            payType: liveOwner.payType,
+                            hourlyRate: liveOwner.hourlyRate,
+                        }) &&
+                        !acknowledgedZeroRate
+                    ) {
+                        throw new ZeroRateAtWriteError();
+                    }
+                    // Re-price from the LOCKED read: the costs computed above
+                    // came from a copy taken before this transaction opened.
+                    data.laborCost = (durationHours ?? 0) * liveOwner.hourlyRate;
+                    data.burdenCost = (durationHours ?? 0) * liveOwner.burdenRate;
                 }
                 if (!stored) throw new EntryMovedError();
                 if (stored.startTime.getTime() !== existing.startTime.getTime()) {

@@ -180,6 +180,12 @@ END $$;
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT;
+
+-- Whether this report's GitHub issue exists yet. `status` could not distinguish
+-- "never tried" from "tried and finished", so a resumed submission had no way
+-- to know whether calling GitHub would duplicate an issue.
+ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerIssueRef" TEXT;
+ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerState" TEXT DEFAULT 'pending';
 -- Unique PER USER, not globally: a globally unique key means one user's value
 -- collides with another's, and the idempotency lookup then returns somebody
 -- else's report.

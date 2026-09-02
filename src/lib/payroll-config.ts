@@ -128,19 +128,22 @@ export function validatePayrollRange(startKey: unknown, endKey: unknown): Payrol
 }
 
 /**
- * WORKWEEK ENVELOPE — the range a lock actually has to freeze.
+ * THE INFLUENCE WINDOW — the range a lock has to freeze.
  *
- * Overtime is a property of the WORKWEEK, not of the pay period: an entry
- * inside a locked period can flip between regular and OT because of hours in
- * the same week that fall OUTSIDE the period. Freezing only [periodStart,
- * periodEnd) therefore does not freeze the exported numbers.
+ * Overtime is allocated chronologically across a Mon-Sun workweek: the hours
+ * that push a week past 40 are the LATER ones. So influence runs in exactly one
+ * direction. An entry BEFORE the period, in the same workweek as periodStart,
+ * changes how much of the period's time is overtime — deleting Monday's 10
+ * hours turns Friday's overtime back into regular time. An entry AFTER
+ * periodEnd cannot do that: it lands later in the walk and only ever affects
+ * itself and its successors.
  *
- * The envelope is the Mon-Sun WORKWEEK from src/lib/overtime.ts and NOTHING
- * else. PAYROLL_WEEK_START deliberately does not widen it: it moves where a
- * human draws the pay-period boundary, but WA overtime is always Monday-based,
- * and the export only ever QUERIES Monday workweeks. Widening the lock to a
- * Sunday alignment froze entries the readiness check never looked at and the
- * hash never covered — locked rows that were not in the export at all.
+ * The window is therefore [start of the workweek containing periodStart,
+ * periodEnd) — backward to the week boundary, and NOT ONE DAY past periodEnd.
+ *
+ * Reaching forward as well was wrong twice over: it froze days that no locked
+ * number depends on, and it made two adjacent periods overlap at the seam, so
+ * the second of two consecutive periods could be neither exported nor locked.
  */
 export function payrollLockEnvelope(
     periodStart: Date,
@@ -148,12 +151,10 @@ export function payrollLockEnvelope(
     timeZone: string
 ): { start: Date; end: Date } {
     const startKey = workweekStartKey(periodStart, timeZone);
-    // periodEnd is exclusive, so the last instant inside the period is the one
-    // whose week must be included.
-    const endKey = addDaysToKey(workweekStartKey(new Date(periodEnd.getTime() - 1), timeZone), 7);
     return {
         start: startOfDateInTimeZone(startKey, timeZone),
-        end: startOfDateInTimeZone(endKey, timeZone),
+        // Never past the period: later hours cannot change earlier ones.
+        end: periodEnd,
     };
 }
 

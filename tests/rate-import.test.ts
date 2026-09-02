@@ -353,7 +353,7 @@ test("payroll ranges are validated in ONE place, strictly", () => {
     assert.match((tooLong as { error: string }).error, new RegExp(String(MAX_PAYROLL_RANGE_DAYS)));
 });
 
-test("the lock envelope stretches a period out to whole workweeks", () => {
+test("the influence window reaches BACKWARD to the week start, and never past the period", () => {
     const TZ = "America/Los_Angeles";
     // Wed 2026-08-19 through Thu 2026-08-27 (exclusive) — both ends mid-week.
     const envelope = payrollLockEnvelope(
@@ -361,12 +361,15 @@ test("the lock envelope stretches a period out to whole workweeks", () => {
         new Date("2026-08-27T07:00:00.000Z"),
         TZ
     );
-    // Back to Mon 08-17, forward to Mon 08-31 (the Monday after the week
-    // containing Wed 08-26, the last day inside the period).
+    // Back to Mon 08-17: those hours decide how much of the period is overtime.
     assert.equal(envelope.start.toISOString(), "2026-08-17T07:00:00.000Z");
-    assert.equal(envelope.end.toISOString(), "2026-08-31T07:00:00.000Z");
+    // NOT forward. Overtime is allocated chronologically, so hours after the
+    // period land later in the walk and cannot change anything inside it.
+    // Reaching forward froze days no locked number depends on, and made two
+    // adjacent periods overlap at the seam.
+    assert.equal(envelope.end.toISOString(), "2026-08-27T07:00:00.000Z");
 
-    // A period that is already whole Mon-Sun weeks is left alone.
+    // A period that already starts on a Monday is left alone at both ends.
     const exact = payrollLockEnvelope(
         new Date("2026-08-17T07:00:00.000Z"),
         new Date("2026-08-31T07:00:00.000Z"),
@@ -376,7 +379,7 @@ test("the lock envelope stretches a period out to whole workweeks", () => {
     assert.equal(exact.end.toISOString(), "2026-08-31T07:00:00.000Z");
 });
 
-test("the envelope is Mon-Sun OT weeks ONLY — PAYROLL_WEEK_START never widens it", () => {
+test("PAYROLL_WEEK_START never widens the influence window", () => {
     const TZ = "America/Los_Angeles";
     // A Sunday-start pay period, Sun 2026-08-16 .. Sun 2026-08-30. An earlier
     // version also aligned the envelope to the configured week start, which
@@ -392,7 +395,7 @@ test("the envelope is Mon-Sun OT weeks ONLY — PAYROLL_WEEK_START never widens 
         TZ
     );
     assert.equal(envelope.start.toISOString(), "2026-08-10T07:00:00.000Z");
-    assert.equal(envelope.end.toISOString(), "2026-08-31T07:00:00.000Z");
+    assert.equal(envelope.end.toISOString(), "2026-08-30T07:00:00.000Z", "never past periodEnd");
 
     // Same answer whatever PAYROLL_WEEK_START says, because it is not consulted.
     const previous = process.env.PAYROLL_WEEK_START;
@@ -441,4 +444,18 @@ test("a file with SOME unreadable rows blocks the whole import", () => {
         "utf8"
     );
     assert.match(ui, /disabled=\{busy \|\| errors\.length > 0\}/);
+});
+
+test("a pay-type change is shown old -> new and is never pre-ticked", () => {
+    // Hourly vs salary decides whether Gusto pays somebody a salary AND their
+    // exported hours. That is not a decision a CSV gets to make quietly.
+    const ui = readFileSync(
+        path.join(__dirname, "..", "src", "app", "company", "team-members", "RatesImport.tsx"),
+        "utf8"
+    );
+    assert.match(ui, /const changesPayType = !!row\.payType && row\.payType !== \(row\.oldPayType \?\? null\);/);
+    assert.match(ui, /if \(changesPayType\) continue;/);
+    // And the row says what it would change it FROM.
+    assert.match(ui, /pay type \{row\.oldPayType \? row\.oldPayType\.toLowerCase\(\) : "not set"\}/);
+    assert.match(ui, /tick those yourself/);
 });
