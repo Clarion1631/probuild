@@ -23,6 +23,11 @@ export const EXT_BY_MIME: Record<string, string> = {
 
 export const MAX_INTAKE_BYTES = 15 * 1024 * 1024;
 
+/** ISO-BMFF major brands stored as image/heic (still + HEVC sequence brands). */
+export const HEIC_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "msf1"]);
+/** The generic HEIF brands — stored under their own content type. */
+export const HEIF_BRANDS = new Set(["mif1", "heif"]);
+
 /** Returns the accepted mime, or null when the bytes are not a supported document. */
 export function sniffMime(buf: Buffer, declared: string): string | null {
     const essence = declared.split(";")[0].trim().toLowerCase();
@@ -37,8 +42,18 @@ export function sniffMime(buf: Buffer, declared: string): string | null {
     ) return "image/webp";
     if (buf.length >= 5 && buf.subarray(0, 5).toString("ascii") === "%PDF-") return "application/pdf";
     if (buf.length >= 12 && buf.subarray(4, 8).toString("ascii") === "ftyp") {
+        // ISO-BMFF major brands, per ISO/IEC 23008-12. iPhones emit `heic`
+        // (still) and `heix`; a burst or a Live Photo still can carry the HEVC
+        // brands `hevc`/`hevx`, which an earlier `hei` prefix check silently
+        // refused — those uploads came back "unsupported-file-type" from a
+        // perfectly readable photo. The image-SEQUENCE brands (`hevc`, `hevx`,
+        // `msf1`) are grouped with HEIC because Gemini and QBO both accept them
+        // under that content type.
         const brand = buf.subarray(8, 12).toString("ascii").toLowerCase();
-        if (brand.startsWith("hei") || brand.startsWith("mif1") || brand.startsWith("msf1")) return "image/heic";
+        if (HEIC_BRANDS.has(brand)) return "image/heic";
+        // `mif1`/`heif` are the generic HEIF brands — kept as image/heif so the
+        // stored mimeType says what the file actually claims to be.
+        if (HEIF_BRANDS.has(brand)) return "image/heif";
     }
     return essence === "text/plain" ? "text/plain" : null;
 }

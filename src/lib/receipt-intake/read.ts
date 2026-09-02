@@ -21,9 +21,24 @@
  * ListModels 2026-08-06, see src/lib/daily-log-task-match.ts:26).
  */
 
-const MAX_RETRIES = 5;
+/**
+ * ONE row's entire read budget, models and backoffs included.
+ *
+ * The Apps Script could afford 5 retries per model with exponential backoff
+ * (2s..32s): it runs on a 6-minute trigger and only has to finish before the
+ * NEXT trigger. This worker runs inside a 60-second Vercel function that has to
+ * get through a batch of ten, so the same schedule would let ONE busy document
+ * eat the whole invocation and starve the other nine — the outage would look
+ * like a stalled queue rather than a slow one. A row that cannot be read in 25
+ * seconds is not a row worth spending a whole run on; it comes back next pass
+ * at no cost to itself (AI_UNAVAILABLE never spends `attempts`).
+ */
+export const READ_BUDGET_MS = 25_000;
+/** Retries AFTER the first attempt, per model. Three fetches per model, worst case. */
+const MAX_RETRIES = 2;
+/** Backoff before retry 1 and retry 2. Short on purpose — see READ_BUDGET_MS. */
+const RETRY_BACKOFF_MS = [1_000, 3_000];
 export const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-flash-latest"];
-const READ_TIMEOUT_MS = 25_000;
 
 /** One selectable phase, rendered into the prompt as "code — name". */
 export interface ProjectPhase {
@@ -65,15 +80,18 @@ export interface ReadDependencies {
     fetchFn: typeof fetch;
     sleep: (ms: number) => Promise<void>;
     apiKey: () => string | undefined;
-    /** Deterministic jitter seam for tests. */
-    random: () => number;
+    /** Monotonic-enough clock, injectable so the budget is testable without waiting. */
+    monotonicMs: () => number;
+    /** Total budget for this ONE read, across every model and backoff. */
+    budgetMs: number;
 }
 
 const defaultDeps: ReadDependencies = {
     fetchFn: (...args) => fetch(...args),
     sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
     apiKey: () => process.env.GEMINI_API_KEY,
-    random: () => Math.random(),
+    monotonicMs: () => Date.now(),
+    budgetMs: READ_BUDGET_MS,
 };
 
 /** Drive returns "text/plain; charset=utf-8" — strip parameters (:1073). */
@@ -179,7 +197,7 @@ export async function readReceipt(
     projectPhases: ProjectPhase[],
     deps: Partial<ReadDependencies> = {},
 ): Promise<ReadOutcome> {
-    const { fetchFn, sleep, apiKey, random } = { ...defaultDeps, ...deps };
+    const { fetchFn, sleep, apiKey, monotonicMs, budgetMs } = { ...defaultDeps, ...deps };
     const key = apiKey();
     // No key configured is a SERVICE fact, not a document fact — never spend
     // the row's attempts on it.
@@ -201,24 +219,38 @@ export async function readReceipt(
     // forever.
     let sawDecisiveFailure = false;
 
+    const startedAt = monotonicMs();
+    const remaining = () => budgetMs - (monotonicMs() - startedAt);
+
     for (const model of GEMINI_MODELS) {
         const url =
             `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
             `:generateContent?key=${encodeURIComponent(key)}`;
         let attempts = 0;
 
-        while (attempts < MAX_RETRIES) {
+        for (;;) {
+            // The budget is checked before every network call AND before every
+            // sleep, so an exhausted budget can never be discovered only after
+            // the call that blew it.
+            if (remaining() <= 0) break;
+
             let response: Response;
             try {
                 response = await fetchFn(url, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body,
-                    signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+                    // Never outlive the row's budget: a single hung socket must
+                    // not consume the worker's whole invocation.
+                    signal: AbortSignal.timeout(remaining()),
                 });
             } catch {
+                // Network error / our own abort. Both are SERVICE facts.
+                if (attempts >= MAX_RETRIES) break;
+                const wait = RETRY_BACKOFF_MS[attempts];
                 attempts++;
-                await sleep(Math.pow(2, attempts) * 1000);
+                if (remaining() <= wait) break;
+                await sleep(wait);
                 continue;
             }
 
@@ -238,8 +270,11 @@ export async function readReceipt(
             }
 
             if (code === 429 || code === 503) { // overloaded / rate-limited
+                if (attempts >= MAX_RETRIES) break; // fall through to the next model
+                const wait = RETRY_BACKOFF_MS[attempts];
                 attempts++;
-                await sleep(Math.pow(2, attempts) * 1000 + Math.floor(random() * 1000));
+                if (remaining() <= wait) break;
+                await sleep(wait);
                 continue;
             }
 
@@ -253,7 +288,15 @@ export async function readReceipt(
             sawDecisiveFailure = true;
             return { ok: false, decisive: true };
         }
+
+        // The budget, not this model, is what ended the loop — trying the next
+        // model would only overrun it further.
+        if (remaining() <= 0) break;
     }
 
+    // Budget exhausted, or every model was unavailable: AI_UNAVAILABLE. A
+    // decisive failure still outranks it — if some model DID answer and could
+    // not read the document, that is a fact about the document and the caller
+    // must spend an attempt on it.
     return { ok: false, decisive: sawDecisiveFailure };
 }

@@ -64,7 +64,7 @@ test("the stored mime is decided on the BYTES, not the caller's header", async (
     const gif = Buffer.from("GIF89a-----");
     const webp = Buffer.concat([Buffer.from("RIFF"), Buffer.from([0, 0, 0, 0]), Buffer.from("WEBP")]);
     const pdf = Buffer.from("%PDF-1.7\n...");
-    const heic = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic")]);
+    const ftyp = (brand: string) => Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from(`ftyp${brand}`)]);
 
     // A lie in the header cannot change the answer.
     assert.equal(sniffMime(jpeg, "text/plain"), "image/jpeg");
@@ -72,7 +72,19 @@ test("the stored mime is decided on the BYTES, not the caller's header", async (
     assert.equal(sniffMime(gif, "image/jpeg"), "image/gif");
     assert.equal(sniffMime(webp, "image/png"), "image/webp");
     assert.equal(sniffMime(pdf, "image/png"), "application/pdf");
-    assert.equal(sniffMime(heic, "image/jpeg"), "image/heic");
+    // ISO/IEC 23008-12 major brands. iPhones emit `heic`/`heix` for stills and
+    // the HEVC brands for a burst or a Live Photo still — an earlier `hei`
+    // prefix check silently refused hevc/hevx, so those uploads came back
+    // "unsupported-file-type" from a perfectly readable photo.
+    for (const brand of ["heic", "heix", "hevc", "hevx", "msf1"]) {
+        assert.equal(sniffMime(ftyp(brand), "image/jpeg"), "image/heic", brand);
+    }
+    // The generic HEIF brands keep their own content type.
+    for (const brand of ["mif1", "heif"]) {
+        assert.equal(sniffMime(ftyp(brand), "image/jpeg"), "image/heif", brand);
+    }
+    // An unrelated ftyp box (an MP4) is not a receipt.
+    assert.equal(sniffMime(ftyp("isom"), "image/heic"), null);
 
     // text/plain has no signature, so it is the only type taken on its word.
     assert.equal(sniffMime(Buffer.from("VENDOR: Lowes"), "text/plain; charset=utf-8"), "text/plain");

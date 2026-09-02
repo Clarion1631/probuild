@@ -76,7 +76,6 @@ test("a well-formed response parses into ReadResult", async () => {
     const outcome = await readReceipt(BYTES, "image/jpeg", PHASES, {
         apiKey: () => "test-key",
         sleep: noSleep,
-        random: () => 0,
         fetchFn: (async (_url: string, init: RequestInit) => {
             capturedBody = init.body as string;
             return geminiJson({
@@ -111,7 +110,6 @@ test("text/plain goes in as a text part, not inline_data", async () => {
     await readReceipt(Buffer.from("VENDOR: Lowes\nTOTAL: 10.00"), "text/plain; charset=utf-8", [], {
         apiKey: () => "test-key",
         sleep: noSleep,
-        random: () => 0,
         fetchFn: (async (_url: string, init: RequestInit) => {
             capturedBody = init.body as string;
             return geminiJson({ doc_type: "receipt", total_amount: "10.00" });
@@ -126,30 +124,74 @@ test("an off-list phase suggestion is discarded, not trusted", () => {
     assert.equal(parsed?.suggestedPhaseCode, "");
 });
 
-test("503 backs off five times, then falls to the next model", async () => {
+test("503 retries twice on 1s/3s, then falls through to the next model", async () => {
+    // The Apps Script could afford 5 retries at 2s..32s; this worker has 60s for
+    // a batch of ten, so one busy document must not eat the invocation.
     const calls: string[] = [];
     const sleeps: number[] = [];
     const outcome = await readReceipt(BYTES, "image/jpeg", [], {
         apiKey: () => "test-key",
-        random: () => 0,
         sleep: async (ms) => { sleeps.push(ms); },
         fetchFn: (async (url: string) => {
             calls.push(url);
-            if (calls.length <= 5) return new Response("busy", { status: 503 });
+            if (calls.length <= 3) return new Response("busy", { status: 503 });
             return geminiJson({ doc_type: "receipt", total_amount: "1.00" });
         }) as unknown as typeof fetch,
     });
     assert.ok(outcome.ok, "the second model answered");
-    assert.equal(calls.length, 6);
+    assert.equal(calls.length, 4, "3 attempts on model 1, then model 2");
     assert.ok(calls[0].includes("gemini-3.5-flash"));
-    assert.ok(calls[5].includes("gemini-flash-latest"), "fell through to the next model");
-    assert.deepEqual(sleeps, [2000, 4000, 8000, 16000, 32000]);
+    assert.ok(calls[3].includes("gemini-flash-latest"), "fell through to the next model");
+    assert.deepEqual(sleeps, [1000, 3000], "2 retries per model");
+});
+
+test("the 25s budget is a hard ceiling across models and backoffs", async () => {
+    // A row that cannot be read inside its budget comes back next pass at no
+    // cost to itself. What it must NOT do is keep the worker's 60s function
+    // open while nine other receipts wait behind it.
+    let clock = 0;
+    const calls: string[] = [];
+    const outcome = await readReceipt(BYTES, "image/jpeg", [], {
+        apiKey: () => "test-key",
+        monotonicMs: () => clock,
+        sleep: async (ms) => { clock += ms; },
+        fetchFn: (async (url: string) => {
+            calls.push(url);
+            clock += 9_000; // each call burns 9s
+            return new Response("busy", { status: 503 });
+        }) as unknown as typeof fetch,
+    });
+    // AI_UNAVAILABLE, never decisive: the document was never read, so the
+    // caller must not spend one of its attempts.
+    assert.deepEqual(outcome, { ok: false, decisive: false });
+    assert.ok(clock <= 25_000 + 9_000, `budget overrun: ${clock}ms`);
+    assert.ok(calls.length <= 3, `budget should have stopped the retries, got ${calls.length} calls`);
+});
+
+test("a per-request timeout never outlives the remaining budget", async () => {
+    let clock = 0;
+    const timeouts: number[] = [];
+    await readReceipt(BYTES, "image/jpeg", [], {
+        apiKey: () => "test-key",
+        monotonicMs: () => clock,
+        sleep: async (ms) => { clock += ms; },
+        fetchFn: (async (_url: string, init: RequestInit) => {
+            // AbortSignal.timeout is opaque; assert on the budget arithmetic by
+            // advancing the clock and checking the signal was created at all.
+            assert.ok(init.signal, "every request carries an abort signal");
+            timeouts.push(clock);
+            clock += 5_000;
+            return new Response("busy", { status: 503 });
+        }) as unknown as typeof fetch,
+    });
+    // First call at 0ms, then 1s backoff -> 6s, then 3s backoff -> 14s...
+    assert.equal(timeouts[0], 0);
+    assert.ok(timeouts.every(t => t < 25_000), "no request starts after the budget is gone");
 });
 
 test("every model unavailable is NOT decisive — the row must not spend an attempt", async () => {
     const outcome = await readReceipt(BYTES, "image/jpeg", [], {
         apiKey: () => "test-key",
-        random: () => 0,
         sleep: noSleep,
         fetchFn: (async () => new Response("nope", { status: 404 })) as unknown as typeof fetch,
     });
@@ -160,7 +202,6 @@ test("a model that answers with unusable JSON IS decisive", async () => {
     // The model responded; retrying will not make this document readable.
     const outcome = await readReceipt(BYTES, "image/jpeg", [], {
         apiKey: () => "test-key",
-        random: () => 0,
         sleep: noSleep,
         fetchFn: (async () => new Response(
             JSON.stringify({ candidates: [{ content: { parts: [{ text: "not json at all" }] } }] }),
@@ -174,7 +215,6 @@ test("HTTP 400 (payload rejected) is decisive and stops immediately", async () =
     let calls = 0;
     const outcome = await readReceipt(BYTES, "image/jpeg", [], {
         apiKey: () => "test-key",
-        random: () => 0,
         sleep: noSleep,
         fetchFn: (async () => { calls++; return new Response("too big", { status: 400 }); }) as unknown as typeof fetch,
     });
@@ -187,7 +227,6 @@ test("a missing API key is a SERVICE fact, never charged to the document", async
     const outcome = await readReceipt(BYTES, "image/jpeg", [], {
         apiKey: () => undefined,
         sleep: noSleep,
-        random: () => 0,
         fetchFn: (async () => { calls++; return geminiJson({}); }) as unknown as typeof fetch,
     });
     assert.deepEqual(outcome, { ok: false, decisive: false });
