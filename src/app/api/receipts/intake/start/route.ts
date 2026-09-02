@@ -8,6 +8,9 @@ import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import { authorizePhase } from "@/lib/receipt-intake/late-fields";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -107,6 +110,23 @@ export async function POST(req: Request) {
         }
     }
 
+    // THE PHASE IS CHECKED HERE OR NOWHERE.
+    //
+    // A costCodeId supplied at /start used to be stored unchecked, and nothing
+    // downstream re-checks it: /finalize only authorizes the fields the
+    // FINALIZE call carries, so a client could smuggle a phase from another job
+    // past every gate simply by omitting it at finalize. The FK gives a 400 for
+    // a cost code that does not exist at all, which is a different question
+    // from whether it belongs to this job.
+    //
+    // AFTER the project authorization above, never before: validating against a
+    // project the caller cannot reach would answer questions about somebody
+    // else's job.
+    const costCodeId = str(body.costCodeId);
+    const badPhase = await authorizePhase(projectId, costCodeId, (project, code) =>
+        isCostCodeAllowedForProject(prismaPhaseDataSource, project, code));
+    if (badPhase) return NextResponse.json(badPhase.body, { status: badPhase.status });
+
     const id = randomUUID();
     const storagePath = `receipts/intake/${id}.${ext}`;
 
@@ -120,7 +140,7 @@ export async function POST(req: Request) {
                 state: "STAGING",
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId,
-                costCodeId: str(body.costCodeId),
+                costCodeId,
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Forwarder-only, same as the single-shot path: this is the
                 // claim that v1 already booked the document.

@@ -6,7 +6,12 @@ import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
-import { reconcileLateFields, type Denial, type LateFields } from "@/lib/receipt-intake/late-fields";
+import {
+    authorizePhase,
+    reconcileLateFields,
+    type Denial,
+    type LateFields,
+} from "@/lib/receipt-intake/late-fields";
 import {
     deleteObjectOrRecord,
     rejectRowAndQueueCleanup,
@@ -73,31 +78,10 @@ async function authorizeLateFields(
         }
     }
 
-    if (lateFields.costCodeId) {
-        if (!projectId) {
-            return {
-                status: 400,
-                body: { ok: false, error: "cost-code-without-project", reason: "a phase is only meaningful against a job" },
-            };
-        }
-        const allowed = await isCostCodeAllowedForProject(
-            prismaPhaseDataSource,
-            projectId,
-            lateFields.costCodeId,
-        );
-        if (!allowed) {
-            return {
-                status: 400,
-                body: {
-                    ok: false,
-                    error: "cost-code-not-a-phase",
-                    reason: "that cost code is not a phase of this job",
-                    projectId,
-                },
-            };
-        }
-    }
-    return null;
+    // Same rule, same implementation, as /start applies to a phase supplied
+    // there — the two must never be able to disagree.
+    return await authorizePhase(projectId, lateFields.costCodeId ?? null, (project, code) =>
+        isCostCodeAllowedForProject(prismaPhaseDataSource, project, code));
 }
 export const maxDuration = 30;
 

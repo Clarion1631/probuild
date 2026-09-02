@@ -3,6 +3,9 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
+import { authorizePhase } from "@/lib/receipt-intake/late-fields";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
@@ -244,6 +247,14 @@ export async function POST(req: Request) {
         const allowed = await userCanAccessProject(auth.user, parsed.projectId);
         if (!allowed) return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });
     }
+
+    // A phase belongs to a job. Same gate as /start, AFTER the project
+    // authorization above: nothing downstream re-checks a cost code that was
+    // supplied when the row was created, so this is the only place to catch one
+    // that belongs to another job.
+    const badPhase = await authorizePhase(parsed.projectId, parsed.costCodeId, (project, code) =>
+        isCostCodeAllowedForProject(prismaPhaseDataSource, project, code));
+    if (badPhase) return NextResponse.json(badPhase.body, { status: badPhase.status });
 
     const id = randomUUID();
     const ext = EXT_BY_MIME[mimeType] ?? "bin";

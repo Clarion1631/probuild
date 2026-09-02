@@ -11,7 +11,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
+    authorizePhase,
     reconcileLateFields,
     type Denial,
     type LateFieldRow,
@@ -122,4 +125,87 @@ test("no late fields means no reads and no writes at all", async () => {
     const t = deps([row()], 1);
     assert.equal(await reconcileLateFields("r1", {}, t.deps), null);
     assert.deepEqual(t.applied, []);
+});
+
+// ── The phase gate: /start is the only place a start-time phase is checked ──
+
+/** A job with exactly one phase of its own. Anything else belongs elsewhere. */
+const phasesOf: Record<string, string[]> = { "proj-a": ["cc-a"], "proj-b": ["cc-b"] };
+const isCostCodeAllowed = async (projectId: string, costCodeId: string) =>
+    (phasesOf[projectId] ?? []).includes(costCodeId);
+
+test("a phase from ANOTHER job is refused at /start, before a row exists", async () => {
+    const denial = await authorizePhase("proj-a", "cc-b", isCostCodeAllowed);
+    assert.equal(denial?.status, 400);
+    assert.equal(denial?.body.error, "cost-code-not-a-phase");
+    assert.equal(denial?.body.projectId, "proj-a");
+});
+
+test("a phase with no job at all is refused: it is not meaningful", async () => {
+    const denial = await authorizePhase(null, "cc-a", isCostCodeAllowed);
+    assert.equal(denial?.status, 400);
+    assert.equal(denial?.body.error, "cost-code-without-project");
+});
+
+test("the job's own phase passes, and no phase at all is not a lookup", async () => {
+    assert.equal(await authorizePhase("proj-a", "cc-a", isCostCodeAllowed), null);
+    let looked = 0;
+    assert.equal(
+        await authorizePhase("proj-a", null, async () => { looked++; return true; }),
+        null,
+    );
+    assert.equal(looked, 0);
+});
+
+test("REGRESSION: a cross-project phase cannot survive by being OMITTED at finalize", async () => {
+    // The hole this closes. /start stored a caller-supplied costCodeId
+    // unchecked, and /finalize only authorizes the fields the FINALIZE call
+    // carries — so a client that sent the phase at /start and then finalized
+    // with an empty body got a published row holding a phase from another job,
+    // having passed no check anywhere. The Expense inherits it and the other
+    // job's variance report reads overspend on a line nobody budgeted.
+    //
+    // Step 1: finalize with no late fields runs NO authorization. That is
+    // correct — there is nothing to authorize — and it is exactly why /start
+    // has to be the gate.
+    let authorizations = 0;
+    const finalize = deps([row({ projectId: "proj-a", costCodeId: "cc-b" })], 1);
+    const counted: LateFieldsDeps = {
+        ...finalize.deps,
+        authorize: async projectId => { authorizations++; return finalize.deps.authorize(projectId); },
+    };
+    assert.equal(await reconcileLateFields("r1", {}, counted), null);
+    assert.equal(authorizations, 0, "finalize never re-checks a phase it was not sent");
+    assert.deepEqual(finalize.applied, [], "and writes nothing");
+
+    // Step 2: so the same payload must be refused at /start, where the row
+    // would otherwise be created holding it.
+    const atStart = await authorizePhase("proj-a", "cc-b", isCostCodeAllowed);
+    assert.equal(atStart?.status, 400, "the row is never created");
+    assert.equal(atStart?.body.error, "cost-code-not-a-phase");
+});
+
+test("both intake entry points call the SAME phase gate", () => {
+    // Two copies of this rule is how they drift, and a route that skips it is
+    // this whole regression again.
+    const routes = [
+        "src/app/api/receipts/intake/start/route.ts",
+        "src/app/api/receipts/intake/route.ts",
+        "src/app/api/receipts/intake/[id]/finalize/route.ts",
+    ];
+    for (const rel of routes) {
+        const source = readFileSync(path.join(__dirname, "..", rel), "utf8");
+        assert.match(source, /authorizePhase\(/, `${rel} does not use the shared gate`);
+        // CALLING it is not the same as OBEYING it: the denial has to end the
+        // request, or the row is created with the phase anyway.
+        assert.match(
+            source,
+            /if \(badPhase\) return NextResponse\.json\(badPhase\.body, \{ status: badPhase\.status \}\);|return await authorizePhase\(/,
+            `${rel} does not return the denial`,
+        );
+        assert.ok(
+            !/error: "cost-code-not-a-phase"/.test(source),
+            `${rel} carries its own copy of the rule`,
+        );
+    }
 });

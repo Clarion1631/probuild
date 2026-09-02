@@ -129,3 +129,43 @@ export async function reconcileLateFields(
     // job, which is exactly what the first authorization existed to prevent.
     return await deps.authorize(after.projectId);
 }
+
+/**
+ * A phase is only valid against the job it belongs to.
+ *
+ * Shared by /start and /finalize deliberately. /start used to store a
+ * caller-supplied `costCodeId` unchecked, and nothing downstream re-checked it:
+ * /finalize only authorizes the fields the finalize CALL carries, so omitting
+ * the field there let a cross-project phase survive all the way into the
+ * Expense — where every variance report reads it as overspend on a line nobody
+ * budgeted, on a job that never bought it.
+ */
+export async function authorizePhase(
+    projectId: string | null,
+    costCodeId: string | null,
+    isCostCodeAllowed: (projectId: string, costCodeId: string) => Promise<boolean>,
+): Promise<Denial | null> {
+    if (!costCodeId) return null;
+    if (!projectId) {
+        return {
+            status: 400,
+            body: {
+                ok: false,
+                error: "cost-code-without-project",
+                reason: "a phase is only meaningful against a job",
+            },
+        };
+    }
+    if (!(await isCostCodeAllowed(projectId, costCodeId))) {
+        return {
+            status: 400,
+            body: {
+                ok: false,
+                error: "cost-code-not-a-phase",
+                reason: "that cost code is not a phase of this job",
+                projectId,
+            },
+        };
+    }
+    return null;
+}
