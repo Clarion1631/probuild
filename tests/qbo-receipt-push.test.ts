@@ -1429,3 +1429,122 @@ test("an already-spent budget stops the real ensures before any QBO call", async
     assert.ok(isQBBudgetExhaustedError(error), `got ${error?.name}: ${error?.message}`);
     assert.equal(calls, 0, "not one QBO request may be issued on an exhausted budget");
 });
+
+
+// --- The account-verification cache must not bind waiters to another clock ---
+
+test("two concurrent pushes each honour THEIR OWN remaining budget", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: caching the in-flight PROMISE bound every waiter to the
+    // first request's lifetime, so a push with two seconds left would await a
+    // verification started under someone else's 50s deadline and sit there
+    // long past its own ceiling.
+    let verifyStarted = 0;
+    const slowAccounts = async (query: string) => {
+        if (/FROM Account/i.test(query)) {
+            verifyStarted++;
+            // Longer than the second request's budget, shorter than the first's.
+            await new Promise(resolve => setTimeout(resolve, 1_500));
+            return defaultAccountRow(query);
+        }
+        return [];
+    };
+
+    const makeDeps = () => ({
+        qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
+        ensureVendorFn: (async () => "vendor-1") as never,
+        ensureCustomerFn: (async () => "cust-1") as never,
+        listProjects: async () => [PROJECT],
+        qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
+        uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
+    });
+
+    // A realm nothing else has used, so the module-level verification cache is
+    // COLD and both pushes genuinely wait on the same in-flight verification.
+    const tokens = { ...TOKENS, realmId: `realm-concurrency-${Date.now()}` };
+    const generous = createRouteDeadline(30_000);
+    const nearlySpent = createRouteDeadline(1_400, Date.now() - 700); // ~700ms left
+
+    const started = Date.now();
+    const [slowResult, fastResult] = await Promise.allSettled([
+        createQBReceiptPurchase(tokens, baseInput(), makeDeps(), generous),
+        createQBReceiptPurchase(tokens, baseInput({ fileId: "2BcDeFgHiJkLmNoPqRsTuVwXyZ0987654321" }), makeDeps(), nearlySpent),
+    ]);
+    const elapsed = Date.now() - started;
+
+    // Both pushes shared one in-flight verification rather than duplicating it.
+    // One shared in-flight verification, not one per push.
+    assert.equal(verifyStarted, 3, "three account queries: one verification, shared");
+
+    // The short-budget push must have given up on its OWN clock, well before
+    // the 1.5s verification finished.
+    assert.equal(fastResult.status, "rejected", "the short-budget push should not have waited it out");
+    if (fastResult.status === "rejected") {
+        assert.ok(
+            isQBBudgetExhaustedError(fastResult.reason),
+            `expected a budget error, got ${(fastResult.reason as Error)?.name}: ${(fastResult.reason as Error)?.message}`,
+        );
+    }
+    // The generous push is unaffected by the other one walking away.
+    assert.equal(slowResult.status, "fulfilled", `generous push failed: ${JSON.stringify(slowResult)}`);
+    assert.ok(elapsed < 10_000, `took ${elapsed}ms`);
+});
+
+// --- Attachment lookup: classify by status, not by "it threw" ---
+
+test("a 400/403/404 attachment lookup is terminal, not an endless retry", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    for (const status of [400, 403, 404]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError(`QB query failed (${status})`, status);
+            },
+        });
+        const result = await createQBReceiptPurchase(TOKENS, input, deps);
+        // QuickBooks answered with a refusal that will repeat: record it and
+        // move on rather than resending forever.
+        assert.equal(result.ok, true, `status ${status} should stay ok:true`);
+        assert.equal(
+            result.ok && result.alreadyExists && result.attachment,
+            `failed:${status}`,
+            `status ${status}`,
+        );
+    }
+});
+
+test("a 429/5xx attachment lookup stays retryable", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    for (const status of [429, 500, 503]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError(`QB query failed (${status})`, status);
+            },
+        });
+        await assert.rejects(
+            () => createQBReceiptPurchase(TOKENS, input, deps),
+            (e: unknown) => (e as Error)?.name === "QboRetryableError",
+            `status ${status}`,
+        );
+    }
+});
+
+test("qbQuery raises a typed QboHttpError carrying the status", async () => {
+    const { qbQuery, qboHttpStatus } = await import("../src/lib/quickbooks");
+    const impl = (async () => new Response("nope", { status: 404 })) as unknown as typeof fetch;
+    const error = await withFetch(impl, () => qbQuery(TOKENS, "SELECT Id FROM Vendor")).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    assert.equal(error?.name, "QboHttpError");
+    assert.equal(qboHttpStatus(error), 404);
+});

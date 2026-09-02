@@ -27,6 +27,9 @@ import {
     type RouteDeadline,
     qbQuery,
     isQboConnectionFailure,
+    isQboMalformedResponseError,
+    QBTokenStrandedError,
+    isQBTokenStrandedError,
     QboRetryableError,
     type QBInvoiceProbe,
     ensureQBCustomer,
@@ -104,9 +107,25 @@ export async function refreshTokensOrFallBack(
         fresh = await refresh(qb.refreshToken);
     } catch (error) {
         if (isQBTimeoutError(error)) throw error;
-        // Refresh itself failed and Intuit rotated nothing, so the old access
-        // token may still be valid. This is the ONLY branch that may fall back.
+        // AMBIGUOUS failures never fall back. A reset socket, a TLS failure, a
+        // truncated or malformed body — in all of these the request may well
+        // have reached Intuit and rotated the token, so the stored pair we
+        // would return could already be spent. Reporting a healthy connection
+        // on top of a spent token is how an integration goes quietly dead.
+        if (isQboConnectionFailure(error) || isQboMalformedResponseError(error)) {
+            throw new QBTokenStrandedError(error instanceof Error ? error.name : "transport failure");
+        }
+        // What is left is an UNAMBIGUOUS refusal: Intuit answered with a
+        // non-2xx and rotated nothing, so the old access token may still be
+        // valid. This is the ONLY branch that may fall back.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
+    }
+
+    // A 200 that omits either token is the same ambiguity wearing a different
+    // hat: something rotated, and we did not receive what replaced it.
+    const usable = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+    if (!usable(fresh.accessToken) || !usable(fresh.refreshToken)) {
+        throw new QBTokenStrandedError("refresh response was missing a token");
     }
 
     // A SAVE failure is a different animal and must never share the catch
@@ -1234,6 +1253,9 @@ export function classifyPreflightFailure(error: unknown): { reason: string; abor
     }
     if (error instanceof QBTokenPersistenceError || (error instanceof Error && error.name === "QBTokenPersistenceError")) {
         return { reason: "token-not-persisted", abortedOnQboOutage: false };
+    }
+    if (isQBTokenStrandedError(error)) {
+        return { reason: "token-rotation-ambiguous", abortedOnQboOutage: false };
     }
     // Settings-store read failures, a rejected refresh, anything else.
     return { reason: "token-fetch-failed", abortedOnQboOutage: false };

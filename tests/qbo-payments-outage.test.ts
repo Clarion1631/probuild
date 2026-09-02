@@ -645,3 +645,77 @@ test("the recorded-once guard is a single flag, not per-return-path", async () =
     await record("catch-handler");
     assert.deepEqual(writes, ["normal-return"]);
 });
+
+
+// --- An ambiguous refresh must never hand back the stored pair ---
+
+const STORED_QB = { accessToken: "stored-access", refreshToken: "stored-refresh", realmId: "realm-1" };
+
+test("a RESET during refresh is stranded, not a fallback", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { QboRetryableError, isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+    // Codex gate: the request may well have reached Intuit and rotated the
+    // token, so returning the stored pair reports a healthy connection sitting
+    // on a spent refresh token.
+    let saves = 0;
+    const error = await refreshTokensOrFallBack(
+        STORED_QB,
+        async () => { throw new QboRetryableError("fetch failed: ECONNRESET"); },
+        async () => { saves++; },
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.equal(isQBTokenStrandedError(error), true, `got ${error?.name}`);
+    assert.equal(saves, 0);
+});
+
+test("a MALFORMED refresh body is stranded, not a fallback", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { QboMalformedResponseError, isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const error = await refreshTokensOrFallBack(
+        STORED_QB,
+        async () => { throw new QboMalformedResponseError("truncated body"); },
+        async () => {},
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isQBTokenStrandedError(error), true, `got ${error?.name}`);
+});
+
+test("a 200 MISSING either token is stranded, and nothing is persisted", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+    for (const bad of [
+        { accessToken: "", refreshToken: "new-refresh" },
+        { accessToken: "new-access", refreshToken: "" },
+        { accessToken: "new-access", refreshToken: "   " },
+        { accessToken: undefined as unknown as string, refreshToken: "new-refresh" },
+    ]) {
+        let saves = 0;
+        const error = await refreshTokensOrFallBack(
+            STORED_QB,
+            async () => bad,
+            async () => { saves++; },
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.equal(isQBTokenStrandedError(error), true, `${JSON.stringify(bad)} -> ${error?.name}`);
+        assert.equal(saves, 0, "an unusable pair must never be written over the stored one");
+    }
+});
+
+test("an UNAMBIGUOUS refusal still falls back to the stored pair", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    // Intuit answered with a non-2xx and rotated nothing, so the old access
+    // token may still be valid. This is the one branch that may fall back.
+    const tokens = await refreshTokensOrFallBack(
+        STORED_QB,
+        async () => { throw new Error("QB token refresh failed"); },
+        async () => {},
+    );
+    assert.deepEqual(tokens, STORED_QB);
+});
+
+test("a stranded refresh is classified as its own failed-run reason", async () => {
+    const { classifyPreflightFailure } = await import("../src/lib/quickbooks-payments");
+    const { QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    assert.deepEqual(
+        classifyPreflightFailure(new QBTokenStrandedError("ECONNRESET")),
+        { reason: "token-rotation-ambiguous", abortedOnQboOutage: false },
+    );
+});

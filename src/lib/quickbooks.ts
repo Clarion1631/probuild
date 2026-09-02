@@ -33,6 +33,31 @@ export class QBTimeoutError extends Error {
 }
 
 /**
+ * The stranded-token error: we cannot tell whether Intuit rotated the refresh
+ * token.
+ *
+ * Raised whenever a refresh ends ambiguously — a reset or TLS failure, a
+ * truncated or malformed body, a 200 that omits the tokens, or a save that
+ * did not stick. In every one of those the old refresh token may ALREADY be
+ * spent on Intuit's side, so returning the stored pair reports a healthy
+ * connection that cannot actually refresh again. There is no safe fallback:
+ * surface it and let a human reconnect if the next refresh also fails.
+ */
+export class QBTokenStrandedError extends Error {
+    name = "QBTokenStrandedError";
+    constructor(detail: string) {
+        super(`QuickBooks token refresh ended ambiguously (${detail}); reconnect QuickBooks if the next refresh fails`);
+    }
+}
+
+export function isQBTokenStrandedError(error: unknown): boolean {
+    return (
+        error instanceof QBTokenStrandedError ||
+        (error instanceof Error && error.name === "QBTokenStrandedError")
+    );
+}
+
+/**
  * Identity check for a QB timeout that does NOT depend on `instanceof`.
  *
  * A bare `instanceof` compares class IDENTITY, so it silently returns false
@@ -66,6 +91,31 @@ export class QboRetryableError extends Error {
  * next call will fail too. Collapsing them made a single malformed payload
  * look like an outage and abort a whole run.
  */
+/**
+ * QuickBooks answered with a non-2xx status.
+ *
+ * The status is the whole point: `new Error("QB query failed: ...")` forced
+ * every caller to guess, so a 404 (this thing does not exist — terminal) and a
+ * 503 (come back later — retryable) were indistinguishable and got the same
+ * treatment. Carry it.
+ */
+export class QboHttpError extends Error {
+    name = "QboHttpError";
+    constructor(message: string, readonly status: number, readonly body?: string) {
+        super(message);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function qboHttpStatus(error: unknown): number | null {
+    if (error instanceof QboHttpError) return error.status;
+    if (error instanceof Error && error.name === "QboHttpError") {
+        const status = (error as { status?: unknown }).status;
+        return typeof status === "number" ? status : null;
+    }
+    return null;
+}
+
 export class QboMalformedResponseError extends Error {
     name = "QboMalformedResponseError";
 }
@@ -574,8 +624,8 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline
         },
     });
     if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB query failed: ${err}`);
+        const err = await res.text().catch(() => "");
+        throw new QboHttpError(`QB query failed (${res.status}): ${err}`.slice(0, 500), res.status, err);
     }
     const data = await res.json();
     const response = data.QueryResponse || {};

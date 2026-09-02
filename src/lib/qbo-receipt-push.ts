@@ -32,7 +32,9 @@ import {
     parseJsonOrNull,
     isQBTimeoutError,
     isBudgetExhausted,
+    remainingBudgetMs,
     QBBudgetExhaustedError,
+    qboHttpStatus,
     type RouteDeadline,
     QboRetryableError,
     isRetryableQboError,
@@ -486,13 +488,22 @@ async function ensureAttachmentOnExistingPurchase(
         if (alreadyAttached) return "already-attached";
         return await uploadAttachment(tokens, purchaseId, plan);
     } catch (error) {
-        // Anything THROWN here is a connection-level or transient failure — a
-        // timeout, a 429/5xx, a network error, or the Attachable lookup itself
-        // failing. None of those say "this file cannot be attached", so none may
-        // become a terminal `failed:` on an ok:true response: that is what made
-        // the Apps Script stop retrying and leave the Purchase unattached.
-        // Terminal outcomes come back from uploadAttachment as VALUES.
+        // Retryable: our deadline, a 429/5xx, a transport failure. These say
+        // nothing about the file, so they must NOT become a terminal `failed:`
+        // on an ok:true response — that is what made the Apps Script stop
+        // resending and leave the Purchase unattached.
         if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+
+        // Terminal: QuickBooks answered, with a refusal that will repeat. A
+        // 400/403/404 on the Attachable lookup is a real answer (bad query,
+        // no access, no such purchase) — retrying it forever is a loop, so it
+        // rides along on ok:true as a recorded failure instead.
+        const status = qboHttpStatus(error);
+        if (status !== null && !isRetryableQboStatus(status)) {
+            return `failed:${status}`;
+        }
+
+        // Unclassifiable — treat as retryable rather than silently bank it.
         throw new QboRetryableError(
             `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
         );
@@ -522,7 +533,22 @@ export class QboAccountConfigError extends Error {
 // Keyed by realm + account ids so a reconnect to a different QBO company (or
 // an env change) re-verifies, and rejected entries are evicted so one
 // transient query failure can't poison a warm process forever.
-const verifiedAccountsCache = new Map<string, Promise<void>>();
+/**
+ * Completed verifications only, with a TTL.
+ *
+ * Caching the in-flight PROMISE bound every waiter to the first request's
+ * lifetime: a second request with two seconds of budget left would await a
+ * verification started under someone else's 50s deadline, and sit there long
+ * past its own. Worse, a request that had already given up left its promise in
+ * the map for the next one to inherit. Now only a finished, successful result
+ * is cached; concurrent callers still share the in-flight work (below) but
+ * each RACES it against its own budget and walks away on time.
+ */
+const verifiedAccountsCache = new Map<string, number>();
+/** Short TTL: account config is mutable, and this only exists to skip repeat round trips. */
+const VERIFIED_ACCOUNTS_TTL_MS = 5 * 60_000;
+/** In-flight verifications, shared so concurrent pushes do not duplicate the queries. */
+const verifyingAccounts = new Map<string, Promise<void>>();
 
 /**
  * Resolve a Shop/overhead category folder name to its QBO expense account by
@@ -558,11 +584,16 @@ async function verifyReceiptAccounts(
     bankAccountId: string,
     expenseAccountId: string,
     taxAccountId: string,
+    deadline?: RouteDeadline,
 ): Promise<void> {
     const cacheKey = `${tokens.realmId}|${bankAccountId}|${expenseAccountId}|${taxAccountId}`;
-    let verifiedAccountsPromise = verifiedAccountsCache.get(cacheKey);
-    if (!verifiedAccountsPromise) {
-        verifiedAccountsPromise = (async () => {
+
+    const verifiedAt = verifiedAccountsCache.get(cacheKey);
+    if (verifiedAt !== undefined && Date.now() - verifiedAt < VERIFIED_ACCOUNTS_TTL_MS) return;
+
+    let verifyingPromise = verifyingAccounts.get(cacheKey);
+    if (!verifyingPromise) {
+        verifyingPromise = (async () => {
             // Role separation: the whole point of the tax account is a clean
             // filing report, so it must not collapse onto another role's
             // account (e.g. QBO_RECEIPT_TAX_ACCOUNT_ID pasted as "98").
@@ -603,11 +634,38 @@ async function verifyReceiptAccounts(
                     `tax account ${taxAccountId} is ${tax?.AccountType ?? "missing"} (need Cost of Goods Sold or Expense).`,
                 );
             }
+            // Only a COMPLETED, successful verification is remembered.
+            verifiedAccountsCache.set(cacheKey, Date.now());
         })();
-        verifiedAccountsCache.set(cacheKey, verifiedAccountsPromise);
-        verifiedAccountsPromise.catch(() => verifiedAccountsCache.delete(cacheKey));
+        verifyingAccounts.set(cacheKey, verifyingPromise);
+        // Always clear the in-flight slot, success or failure, so a request
+        // that gave up cannot leave a stale promise for the next one.
+        verifyingPromise.catch(() => {}).finally(() => {
+            if (verifyingAccounts.get(cacheKey) === verifyingPromise) verifyingAccounts.delete(cacheKey);
+        });
     }
-    return verifiedAccountsPromise;
+
+    // Share the work, but never inherit another request's clock: this waiter
+    // gives up when ITS OWN budget runs out, leaving the shared verification to
+    // finish (or not) for whoever else is waiting.
+    const remaining = remainingBudgetMs(deadline);
+    if (!Number.isFinite(remaining)) return verifyingPromise;
+    if (remaining <= 0) {
+        throw new QBBudgetExhaustedError("Route budget exhausted before the QBO account verification");
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budgetExpiry = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+            () => reject(new QBBudgetExhaustedError("Route budget exhausted while verifying QBO accounts")),
+            Math.max(1, Math.floor(remaining)),
+        );
+    });
+    try {
+        await Promise.race([verifyingPromise, budgetExpiry]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /**
@@ -802,7 +860,7 @@ export async function createQBReceiptPurchase(
 
     // Once per process, before the first create — never write against a
     // misconfigured account.
-    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId);
+    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId, deadline);
 
     const requestId = receiptRequestId(input.fileId);
     // Last check before the write that actually posts money. Starting it with
