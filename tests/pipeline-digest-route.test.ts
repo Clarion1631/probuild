@@ -1,0 +1,163 @@
+/**
+ * Pipeline digest cron delivery.
+ *
+ * A monitoring job that silently fails to deliver is worse than no monitoring
+ * job, because its silence looks like good news. So: the two channels run
+ * independently, neither can hang the cron, and an unaccepted email is a 500
+ * that shows up in Vercel's cron history.
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+    createPipelineDigestHandlers,
+    type PipelineDigestDependencies,
+} from "../src/app/api/cron/pipeline-digest/route";
+import type { PipelineHealth } from "../src/lib/pipeline-health";
+
+const HEALTH: PipelineHealth = {
+    ok: true,
+    reasons: [],
+    checkedAt: "2026-09-01T14:00:00.000Z",
+    intuit: { status: "ok", indicator: "none" },
+    qbo: {
+        lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+        lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+    },
+    receipts24h: { status: "ok", counts: { created: 2 } },
+    bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
+    stuck: { status: "ok", count: 0 },
+};
+
+function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {
+    return createPipelineDigestHandlers({
+        getHealth: overrides.getHealth ?? (async () => HEALTH),
+        sendEmail: overrides.sendEmail ?? (async () => ({ success: true })),
+        postChat: overrides.postChat ?? (async () => true),
+        getChatWebhook: overrides.getChatWebhook ?? (() => undefined),
+        getRecipient: overrides.getRecipient ?? (() => "ops@example.test"),
+        deliveryTimeoutMs: overrides.deliveryTimeoutMs ?? 100,
+    });
+}
+
+function cronRequest(): Request {
+    return new Request("https://example.test/api/cron/pipeline-digest", {
+        headers: { authorization: "Bearer test-cron-secret" },
+    });
+}
+
+function withCronSecret<T>(run: () => Promise<T>): Promise<T> {
+    const previous = process.env.CRON_SECRET;
+    process.env.CRON_SECRET = "test-cron-secret";
+    return run().finally(() => {
+        if (previous === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = previous;
+    });
+}
+
+test("a delivered digest returns 200 with the health payload", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers();
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.emailed, true);
+        assert.equal(body.ok, true);
+    });
+});
+
+test("an unaccepted email is a 500 with reason email-not-accepted", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers({ sendEmail: async () => ({ success: false }) });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        const body = await response.json();
+        assert.equal(body.ok, false);
+        assert.equal(body.reason, "email-not-accepted");
+    });
+});
+
+test("a THROWN email failure is also a 500, not an unhandled rejection", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers({
+            sendEmail: async () => {
+                throw new Error("resend exploded");
+            },
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        assert.equal((await response.json()).reason, "email-not-accepted");
+    });
+});
+
+test("a hanging email send does not hang the cron — it fails on its own deadline", async () => {
+    await withCronSecret(async () => {
+        const started = Date.now();
+        // Deadline shortened for the test; production uses DELIVERY_TIMEOUT_MS.
+        const { GET } = handlers({ sendEmail: () => new Promise(() => {}), deliveryTimeoutMs: 100 });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        assert.equal((await response.json()).reason, "email-not-accepted");
+        assert.ok(Date.now() - started < 5_000, "the cron must return on its own deadline");
+    });
+});
+
+test("Chat is optional: a failing webhook never costs us the email", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers({
+            getChatWebhook: () => "https://chat.googleapis.com/v1/spaces/x",
+            postChat: async () => {
+                throw new Error("chat down");
+            },
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.emailed, true);
+        assert.equal(body.chatPosted, false);
+    });
+});
+
+test("a failing email does not stop the Chat post from being attempted", async () => {
+    await withCronSecret(async () => {
+        let chatCalls = 0;
+        const { GET } = handlers({
+            sendEmail: async () => {
+                throw new Error("resend exploded");
+            },
+            getChatWebhook: () => "https://chat.googleapis.com/v1/spaces/x",
+            postChat: async () => {
+                chatCalls += 1;
+                return true;
+            },
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        assert.equal(chatCalls, 1, "the channels must run independently");
+        assert.equal((await response.json()).chatPosted, true);
+    });
+});
+
+test("no webhook configured means chatPosted false, not an error", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers({ getChatWebhook: () => undefined });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).chatPosted, false);
+    });
+});
+
+test("an unauthenticated request is rejected before any delivery is attempted", async () => {
+    await withCronSecret(async () => {
+        let sends = 0;
+        const { GET } = handlers({
+            sendEmail: async () => {
+                sends += 1;
+                return { success: true };
+            },
+        });
+        const response = await GET(new Request("https://example.test/api/cron/pipeline-digest"));
+        assert.equal(response.status, 401);
+        assert.equal(sends, 0);
+    });
+});

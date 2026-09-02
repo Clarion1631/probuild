@@ -23,26 +23,32 @@ const HOUR_MS = 3_600_000;
 export const RECEIPT_STALE_HOURS = 72;
 
 export type ProbeStatus = "ok" | "error";
+/** Why a probe reports "error" — surfaced so a hang is distinguishable from a throw. */
+export type ProbeFailure = "timeout" | "error";
 
 /** Statuspage indicators: "none" | "minor" | "major" | "critical"; "unknown" is ours. */
 export interface IntuitProbe {
     status: ProbeStatus;
+    reason?: ProbeFailure;
     indicator: string;
     description?: string;
 }
 
 export interface TimestampProbe {
     status: ProbeStatus;
+    reason?: ProbeFailure;
     at: string | null;
 }
 
 export interface CountsProbe {
     status: ProbeStatus;
+    reason?: ProbeFailure;
     counts: Record<string, number>;
 }
 
 export interface CountProbe {
     status: ProbeStatus;
+    reason?: ProbeFailure;
     count: number;
 }
 
@@ -55,7 +61,7 @@ export interface PipelineHealth {
     qbo: {
         /** Newest Expense row QBO has synced into ProBuild job costs. */
         lastPurchaseSync: TimestampProbe;
-        /** Newest receipt the bot actually booked (created or already-exists). */
+        /** Newest receipt the bot actually CREATED (re-pushes don't count). */
         lastReceiptPush: TimestampProbe;
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
@@ -97,8 +103,16 @@ export async function fetchIntuitStatus(): Promise<IntuitProbe> {
     }
 }
 
-/** A push that BOOKED something. "fallback"/"error" are attempts, not bookings. */
-const BOOKED_PUSH_STATUSES = ["created", "already-exists"];
+/**
+ * "Last receipt booked" counts CREATES only.
+ *
+ * "already-exists" is an idempotent re-push of a receipt that was created
+ * earlier — often much earlier — so counting it here refreshed the freshness
+ * clock without any new receipt entering the books, and a bot stuck retrying
+ * one old file would have kept the pipeline looking alive indefinitely.
+ * "fallback"/"error" are attempts, not bookings.
+ */
+export const BOOKED_PUSH_STATUSES = ["created"];
 
 /**
  * The verdict, split out from the database reads so the rules are testable
@@ -155,19 +169,60 @@ export function evaluatePipelineHealth(input: {
     return { ok: reasons.length === 0, reasons };
 }
 
+/** A probe that has not answered within this long is treated as failed. */
+export const PROBE_TIMEOUT_MS = 5_000;
+
+export interface ProbeResult<T> {
+    status: ProbeStatus;
+    reason?: ProbeFailure;
+    value: T;
+}
+
+/**
+ * Run one probe under a deadline.
+ *
+ * A throwing query was already handled; a query that never SETTLES was not.
+ * Prisma has no default statement timeout here, so an unreachable or wedged
+ * database left the health check itself hanging until the platform killed it —
+ * the caller got no answer at all, which for a cron means a silent morning
+ * with no digest. Anything past the deadline is reported as a failed probe,
+ * which forces ok:false the same way a thrown error does.
+ *
+ * Exported for tests: a never-settling fake is the only way to prove this.
+ */
+export async function runProbe<T>(
+    name: string,
+    run: () => Promise<T>,
+    onError: T,
+    timeoutMs: number = PROBE_TIMEOUT_MS,
+): Promise<ProbeResult<T>> {
+    const TIMED_OUT = Symbol("probe-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const deadline = new Promise<typeof TIMED_OUT>(resolve => {
+            timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
+        });
+        const result = await Promise.race([run(), deadline]);
+        if (result === TIMED_OUT) {
+            console.error(`[pipeline-health] probe timed out after ${timeoutMs}ms: ${name}`);
+            return { status: "error", reason: "timeout", value: onError };
+        }
+        return { status: "ok", value: result as T };
+    } catch (error) {
+        console.error(`[pipeline-health] probe failed: ${name}`, error instanceof Error ? error.name : "UnknownError");
+        return { status: "error", reason: "error", value: onError };
+    } finally {
+        // Never leave a pending timer holding the event loop open.
+        clearTimeout(timer);
+    }
+}
+
 export async function getPipelineHealth(): Promise<PipelineHealth> {
     const now = Date.now();
     const since24h = new Date(now - DAY_MS);
 
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
-    const probe = async <T>(name: string, run: () => Promise<T>, onError: T): Promise<{ status: ProbeStatus; value: T }> => {
-        try {
-            return { status: "ok", value: await run() };
-        } catch (error) {
-            console.error(`[pipeline-health] probe failed: ${name}`, error instanceof Error ? error.name : "UnknownError");
-            return { status: "error", value: onError };
-        }
-    };
+    const probe = runProbe;
 
     const [intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck] = await Promise.all([
         fetchIntuitStatus(),
@@ -223,11 +278,23 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const snapshot = {
         intuit,
-        lastPurchaseSync: { status: lastPurchase.status, at: lastPurchase.value?.toISOString() ?? null },
-        lastReceiptPush: { status: lastPush.status, at: lastPush.value?.toISOString() ?? null },
-        receipts24h: { status: receiptRows.status, counts },
-        bank: { status: lastBankLine.status, at: lastBankLine.value?.toISOString() ?? null },
-        stuck: { status: stuck.status, count: stuck.value },
+        lastPurchaseSync: {
+            status: lastPurchase.status,
+            reason: lastPurchase.reason,
+            at: lastPurchase.value?.toISOString() ?? null,
+        },
+        lastReceiptPush: {
+            status: lastPush.status,
+            reason: lastPush.reason,
+            at: lastPush.value?.toISOString() ?? null,
+        },
+        receipts24h: { status: receiptRows.status, reason: receiptRows.reason, counts },
+        bank: {
+            status: lastBankLine.status,
+            reason: lastBankLine.reason,
+            at: lastBankLine.value?.toISOString() ?? null,
+        },
+        stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });

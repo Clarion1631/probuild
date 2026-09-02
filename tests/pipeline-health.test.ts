@@ -14,6 +14,8 @@ import assert from "node:assert/strict";
 import {
     evaluatePipelineHealth,
     formatPipelineDigest,
+    runProbe,
+    BOOKED_PUSH_STATUSES,
     type PipelineHealth,
 } from "../src/lib/pipeline-health";
 
@@ -243,4 +245,47 @@ test("digest renders missing timestamps as 'never' rather than a bogus date", ()
 test("digest reports zero receipt traffic as 'none', not an empty list", () => {
     const { text } = formatPipelineDigest(sampleHealth({ receipts24h: { status: "ok", counts: {} } }));
     assert.match(text, /Receipts \(24h\): none/);
+});
+
+
+// ─── Probe deadlines ────────────────────────────────────────────────────────
+
+test("a probe that never settles is reported as a timeout, not left hanging", async () => {
+    // Prisma has no statement timeout here, so a wedged database used to hang
+    // the whole health check until the platform killed it — for a cron that
+    // means a silent morning with no digest at all.
+    const started = Date.now();
+    const result = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 50);
+    assert.deepEqual(result, { status: "error", reason: "timeout", value: -1 });
+    assert.ok(Date.now() - started < 2_000, "must return on its own deadline");
+});
+
+test("a probe that resolves in time reports ok with its value", async () => {
+    const result = await runProbe("fast", async () => 42, -1, 1_000);
+    assert.deepEqual(result, { status: "ok", value: 42 });
+});
+
+test("a throwing probe is an error with reason 'error', distinct from a timeout", async () => {
+    const result = await runProbe("boom", async () => { throw new Error("db down"); }, -1, 1_000);
+    assert.deepEqual(result, { status: "error", reason: "error", value: -1 });
+});
+
+test("a timed-out probe still forces ok:false through the verdict", async () => {
+    const timedOut = await runProbe("stuck", () => new Promise<number>(() => {}), 0, 20);
+    const v = evaluatePipelineHealth(snapshot({ stuck: { status: timedOut.status, reason: timedOut.reason, count: timedOut.value } }));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:stuck"));
+});
+
+
+// ─── What counts as "booked" ────────────────────────────────────────────────
+
+test("only a CREATE refreshes the last-booked clock — a re-push does not", () => {
+    // "already-exists" is an idempotent re-push of a receipt created earlier,
+    // so counting it kept the freshness clock alive with no new receipt in the
+    // books: a bot stuck retrying one old file looked like a healthy pipeline.
+    assert.deepEqual(BOOKED_PUSH_STATUSES, ["created"]);
+    assert.equal(BOOKED_PUSH_STATUSES.includes("already-exists"), false);
+    assert.equal(BOOKED_PUSH_STATUSES.includes("fallback"), false);
+    assert.equal(BOOKED_PUSH_STATUSES.includes("error"), false);
 });
