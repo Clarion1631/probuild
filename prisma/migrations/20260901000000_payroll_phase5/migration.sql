@@ -220,3 +220,57 @@ BEGIN
      REVOKE ALL ON TABLE "HelpSubmissionQuota" FROM authenticated;
    END IF;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- Review round 16, item 2: TimeEntry no longer cascades from User or Project.
+--
+-- 'c' is CASCADE in pg_constraint.confdeltype, 'r' is RESTRICT. Re-running this
+-- against an already-converted database finds 'r' and does nothing, which is
+-- what makes it replay-safe.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    fk RECORD;
+BEGIN
+    FOR fk IN
+        SELECT unnest(ARRAY['TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey']) AS name,
+               unnest(ARRAY['userId', 'projectId'])                               AS col,
+               unnest(ARRAY['User', 'Project'])                                   AS parent
+    LOOP
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = fk.name
+              AND conrelid = '"TimeEntry"'::regclass
+              AND confdeltype = 'c'
+        ) THEN
+            EXECUTE format('ALTER TABLE "TimeEntry" DROP CONSTRAINT %I', fk.name);
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = fk.name AND conrelid = '"TimeEntry"'::regclass
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE "TimeEntry" ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+                fk.name, fk.col, fk.parent
+            );
+        END IF;
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Review round 16, item 6: a wrong-range period is DISCARDED, not deleted.
+-- Unlocking leaves the row behind and every overlap check then refuses the
+-- corrected range forever, so there was no way back from a typo.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedAt" TIMESTAMPTZ(6);
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedById" TEXT;
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedReason" TEXT;
+CREATE INDEX IF NOT EXISTS "PayrollPeriod_discardedAt_idx" ON "PayrollPeriod"("discardedAt");
+
+-- A LOCKED period is never discarded: that would retire hours already exported
+-- and paid, and every reader would stop seeing the freeze that protects them.
+ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked";
+ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_discard_unlocked"
+    CHECK ("discardedAt" IS NULL OR "lockedAt" IS NULL) NOT VALID;
+ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked";

@@ -1,7 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { withPayrollWrite } from "@/lib/payroll-period";
+import { withPayrollWrite, withPeriodLockedRoute } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canApproveMealSkip, checkMealSkipDecision } from "@/lib/wa-breaks";
 import { isValidChatWebhookUrl } from "@/lib/chat-webhook";
@@ -45,7 +45,12 @@ async function notifyApprovers(text: string): Promise<void> {
     }
 }
 
-export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => POSTHandler(req, context));
+}
+
+async function POSTHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
@@ -101,7 +106,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ id, mealSkipStatus: "PENDING", waiverOnFile: !!entry.user.mealWaiverSignedAt });
 }
 
-export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function PATCH(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => PATCHHandler(req, context));
+}
+
+async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;

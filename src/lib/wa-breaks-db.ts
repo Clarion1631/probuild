@@ -79,18 +79,34 @@ export async function settleDay(
  * must roll back with them.
  */
 /**
- * The company day keys a write touches, de-duplicated.
+ * True when the stored row already says what the re-plan would write.
  *
- * An edit that moves an entry touches TWO days — the one it left and the one it
- * joined — and each is re-planned from everything left on it. Uses the same
- * toCompanyDayKey() that settleDayInTx filters rows by, so a key produced here
- * always selects the rows settlement expects.
+ * The zero-rate branch is the subtle one: the flag is an ADDITIONAL condition on
+ * skipping, never a substitute for the hours check. Treating "already flagged"
+ * as sufficient froze a flagged day — a later shift that changed the meal
+ * allocation was skipped, and the earlier row kept hours the day no longer
+ * produces.
  */
-export function settlementDays(instants: Array<Date | null | undefined>): string[] {
-    const keys = instants
-        .filter((value): value is Date => value instanceof Date && !Number.isNaN(value.getTime()))
-        .map((value) => toCompanyDayKey(value));
-    return Array.from(new Set(keys)).sort();
+export function settlementRowIsCurrent(input: {
+    stored: {
+        durationHours: number | null;
+        mealDeductionHours: number | null;
+        mealOutcome: string | null;
+        needsReview: boolean;
+        reviewReason: string | null;
+    };
+    update: { paidHours: number; mealDeductionHours: number; mealOutcome: string };
+    zeroRate: boolean;
+    flagsChange: boolean;
+}): boolean {
+    const { stored, update } = input;
+    const hoursMatch =
+        Math.abs((stored.durationHours ?? -1) - update.paidHours) < 1e-9 &&
+        Math.abs((stored.mealDeductionHours ?? 0) - update.mealDeductionHours) < 1e-9 &&
+        stored.mealOutcome === update.mealOutcome;
+    if (!hoursMatch) return false;
+    if (!input.zeroRate) return !input.flagsChange;
+    return stored.needsReview && (stored.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE);
 }
 
 export async function settleDayWithinTx(
@@ -181,15 +197,7 @@ async function settleDayInTx(
                 const flagsChange =
                     (update.reviewReason !== undefined && update.reviewReason !== (row.reviewReason ?? "")) ||
                     (update.needsReview !== undefined && update.needsReview !== row.needsReview);
-                const same =
-                    !zeroRate &&
-                    Math.abs((row.durationHours ?? -1) - update.paidHours) < 1e-9 &&
-                    Math.abs((row.mealDeductionHours ?? 0) - update.mealDeductionHours) < 1e-9 &&
-                    row.mealOutcome === update.mealOutcome &&
-                    !flagsChange;
-                // A $0-rate row is only skipped once it already carries the flag —
-                // otherwise the shortcut would leave it unflagged forever.
-                if (same || (zeroRate && row.needsReview && (row.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE))) continue;
+                if (settlementRowIsCurrent({ stored: row, update, zeroRate, flagsChange })) continue;
                 // At a $0 rate the hours are still re-planned — the WA meal rule
                 // does not care what anybody is paid — but the COSTS are left
                 // exactly as they were and the row is flagged. Overwriting them

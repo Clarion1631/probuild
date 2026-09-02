@@ -8647,9 +8647,19 @@ export async function resetProjectPercentCompleteToAuto(projectId: string) {
 
 export async function deleteProjects(projectIds: string[]) {
     await assertActiveStaff();
-    await prisma.project.deleteMany({
-        where: { id: { in: projectIds } }
-    });
+    const { deleteParentWithTimeEntries } = await import("./payroll-parent-delete");
+    // One project at a time, each atomic with its own time entries. A single
+    // deleteMany used to CASCADE every punch on every job in the list into
+    // nothing — locked, exported, paid hours included — and report success.
+    //
+    // A locked period throws PeriodLockedError out of here. Server actions have
+    // no status code, so the caller sees its message; the API surface that CAN
+    // answer 423 is DELETE /api/users/[id].
+    for (const projectId of projectIds) {
+        await deleteParentWithTimeEntries({ projectId }, async (tx) => {
+            await (tx as unknown as typeof prisma).project.delete({ where: { id: projectId } });
+        });
+    }
     revalidatePath(`/projects`);
     return { success: true };
 }
@@ -15658,10 +15668,18 @@ export async function lockPayrollPeriod(
             // FOR UPDATE cannot lock a row nobody has inserted yet.
             await acquirePayrollLockCreationLock(tx as never);
 
+            // LOCKED overlaps only. An unlocked row is not a claim on anything —
+            // it is a leftover from an unlock or a range somebody typed wrong —
+            // and treating it as a conflict made a typo permanent: the wrong
+            // range could not be locked, and every corrected range that touched
+            // it was refused too. Discarded rows are excluded by the same
+            // predicate, because a discarded row can never be locked (CHECK
+            // PayrollPeriod_discard_unlocked).
             const overlapping = await tx.$queryRaw<Array<{ id: string; periodStartKey: string | null; periodEndKey: string | null }>>`
                 SELECT "id", "periodStartKey", "periodEndKey"
                 FROM "PayrollPeriod"
-                WHERE "periodStartKey" < ${range.endKey} AND "periodEndKey" > ${range.startKey}
+                WHERE "lockedAt" IS NOT NULL
+                  AND "periodStartKey" < ${range.endKey} AND "periodEndKey" > ${range.startKey}
                 FOR UPDATE
             `;
             // Envelope overlap, re-checked INSIDE the transaction now that the
@@ -15739,6 +15757,14 @@ export async function lockPayrollPeriod(
                     // these days may have been created in a different zone.
                     periodStart,
                     periodEnd,
+                    // Re-locking the exact same range REVIVES a discarded row.
+                    // Without this the upsert would set lockedAt on a row that
+                    // still carries discardedAt and trip the CHECK constraint,
+                    // turning a legitimate re-lock into an unreadable database
+                    // error.
+                    discardedAt: null,
+                    discardedById: null,
+                    discardedReason: null,
                     lockedAt,
                     lockedById: user.id,
                     exportHash: precheck.exportHash,
@@ -15877,6 +15903,84 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
  * Clears lockedAt but keeps the row and its exportHash: "this is what we
  * exported" has to survive the unlock.
  */
+/**
+ * Retire a period row created over the wrong range.
+ *
+ * Unlocking does not remove the row, and every overlap check refuses a range
+ * that touches an existing one — so a mistyped period used to be permanent:
+ * neither it nor any corrected range covering those days could be locked again.
+ * Discarding retires the row so the right range can be created.
+ *
+ * ADMIN only, reason required, UNLOCKED rows only. Locked hours have been
+ * exported and paid; retiring their row would take the freeze off them, which
+ * is why the database refuses it too (CHECK PayrollPeriod_discard_unlocked).
+ */
+export async function discardPayrollPeriod(periodStartKey: string, periodEndKey: string, reason: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
+
+    const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+    if (trimmedReason.length < 5) {
+        return { success: false as const, error: "Say why this period is being discarded — it goes in the audit trail." };
+    }
+
+    const { validatePayrollRange } = await import("./payroll-config");
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    const discardedAt = new Date();
+    const result = await prisma.$transaction(async (tx) => {
+        // EXCLUSIVE payroll lock, first — the same one lockPayrollPeriod takes.
+        // Without it a lock creation racing this discard could set lockedAt on
+        // the row between the check below and the write, and the discard would
+        // retire a period that had just been locked.
+        const { acquirePayrollLockCreationLock } = await import("./payroll-period");
+        await acquirePayrollLockCreationLock(tx as never);
+
+        // lockedAt IS NULL in the WHERE, not just checked beforehand: the guard
+        // and the write have to be the same statement.
+        const discarded = await tx.payrollPeriod.updateMany({
+            where: {
+                periodStartKey: range.startKey,
+                periodEndKey: range.endKey,
+                lockedAt: null,
+                discardedAt: null,
+            },
+            data: { discardedAt, discardedById: user.id, discardedReason: trimmedReason },
+        });
+        if (discarded.count === 0) return { ok: false as const };
+
+        await tx.auditLog.create({
+            data: {
+                entity: "PayrollPeriod",
+                entityId: `${range.startKey}..${range.endKey}`,
+                action: "discard",
+                actorId: user.id,
+                actorEmail: user.email ?? null,
+                snapshot: {
+                    periodStartKey: range.startKey,
+                    periodEndKey: range.endKey,
+                    reason: trimmedReason,
+                    discardedAt: discardedAt.toISOString(),
+                },
+            },
+        });
+        return { ok: true as const };
+    });
+
+    if (!result.ok) {
+        return {
+            success: false as const,
+            error: "There is no unlocked, un-discarded period for those dates. A locked period must be unlocked first.",
+        };
+    }
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const };
+}
+
 export async function unlockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Not authenticated");

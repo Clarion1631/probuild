@@ -125,13 +125,17 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "project manual create, wrapped in withPayrollWriteTx, priced from stored rates",
     },
-    "app/projects/[id]/timeclock/actions.ts::update": {
+    "app/projects/[id]/timeclock/actions.ts::updateMany": {
         kind: "guarded",
-        why: "project manual edit, wrapped in withPayrollWriteTx over both the old and the new day",
+        why: "project manual edit, wrapped in withPayrollWriteTx; updateMany rather than update so the billing columns are part of the compare-and-set",
     },
-    "app/projects/[id]/timeclock/actions.ts::delete": {
+    "app/projects/[id]/timeclock/actions.ts::deleteMany": {
         kind: "guarded",
-        why: "project manual delete, wrapped in withPayrollWriteTx",
+        why: "project manual delete, wrapped in withPayrollWriteTx; deleteMany so invoiceId/invoicedAt are in the WHERE and a row billed mid-delete is detected",
+    },
+    "lib/payroll-parent-delete.ts::deleteMany": {
+        kind: "guarded",
+        why: "deleting a User's or Project's hours before the parent row, wrapped in withPayrollWriteTx over every affected entry id and qualified day key — the FK used to CASCADE and destroy locked payroll history silently",
     },
 
     // ---- the settlement protocol -------------------------------------------

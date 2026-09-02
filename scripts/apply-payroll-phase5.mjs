@@ -200,6 +200,50 @@ try {
         `${unconfirmed[0].n} activated user(s) still have no payType — the payroll export will refuse to run for anyone with hours until they are set on Company -> Team Members. This is intentional.`
     );
 
+    // ----------------------------------------------------------------------
+    // TimeEntry no longer cascades from User or Project (review round 16).
+    // Idempotent on confdeltype: 'c' is CASCADE, 'r' is RESTRICT, so a second
+    // run finds 'r' and does nothing.
+    // ----------------------------------------------------------------------
+    await prisma.$executeRawUnsafe(`
+        DO $$
+        DECLARE
+            fk RECORD;
+        BEGIN
+            FOR fk IN
+                SELECT unnest(ARRAY['TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey']) AS name,
+                       unnest(ARRAY['userId', 'projectId'])                               AS col,
+                       unnest(ARRAY['User', 'Project'])                                   AS parent
+            LOOP
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = fk.name
+                      AND conrelid = '"TimeEntry"'::regclass
+                      AND confdeltype = 'c'
+                ) THEN
+                    EXECUTE format('ALTER TABLE "TimeEntry" DROP CONSTRAINT %I', fk.name);
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = fk.name AND conrelid = '"TimeEntry"'::regclass
+                ) THEN
+                    EXECUTE format(
+                        'ALTER TABLE "TimeEntry" ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+                        fk.name, fk.col, fk.parent
+                    );
+                END IF;
+            END LOOP;
+        END $$;
+    `);
+    const cascading = await prisma.$queryRawUnsafe(
+        `SELECT conname FROM pg_constraint
+          WHERE conrelid = '"TimeEntry"'::regclass AND confdeltype = 'c'
+            AND conname IN ('TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey')`
+    );
+    console.log(`TimeEntry parent FKs still cascading: ${cascading.length} (expected 0)`);
+    if (cascading.length !== 0) process.exit(1);
+
     const cols = await prisma.$queryRawUnsafe(
         `SELECT table_name, column_name FROM information_schema.columns
          WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))

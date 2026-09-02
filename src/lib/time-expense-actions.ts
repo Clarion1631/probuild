@@ -16,6 +16,7 @@ import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import {
+    assertBulkDeletable,
     assertManualEntryDelete,
     assertManualEntryWrite,
     assertNotClockGeneratedEntry,
@@ -24,7 +25,6 @@ import {
     canWriteHoursFor,
 } from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
-import { settleDayWithinTx, settlementDays } from "@/lib/wa-breaks-db";
 import { toNum } from "@/lib/prisma-helpers";
 import {
     appendZeroRateReview,
@@ -166,12 +166,12 @@ export async function updateTimeEntry(
     // period that was already exported. The row's STORED startTime is re-read
     // and row-locked inside the transaction — the value captured above is not
     // trusted, because another writer may have moved the row since.
-    // Both days: the one this entry is leaving and the one it is joining. Their
-    // advisory locks are taken up front by withPayrollWriteTx, keeping the
-    // documented payroll -> day -> row order.
-    const days = settlementDays([current.startTime, startTime]);
-    const owners = Array.from(new Set([current.userId, data.userId]));
-    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime], dayKeys: days }, async (tx) => {
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
         const result = await (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id, invoiceId: null, invoicedAt: null },
             data: {
@@ -194,13 +194,6 @@ export async function updateTimeEntry(
                 )),
             },
         });
-        // Only re-settle if the edit actually landed — a no-op updateMany means
-        // the row was billed out from under us and nothing on the day moved.
-        if (result.count === 1) {
-            for (const owner of owners) {
-                for (const dayKey of days) await settleDayWithinTx(tx as never, owner, dayKey);
-            }
-        }
         return result;
     });
     if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
@@ -217,17 +210,14 @@ export async function deleteTimeEntry(id: string) {
 
     // Deleting a punch out of an exported period changes hours that were paid —
     // check and delete in one transaction under the shared advisory lock.
-    const days = settlementDays([entry.startTime]);
-    const deleted = await withPayrollWriteTx({ entryIds: [id], dayKeys: days }, async (tx) => {
-        const result = await (tx as unknown as typeof prisma).timeEntry.deleteMany({
-            where: { id, invoiceId: null, invoicedAt: null },
-        });
-        // Removing hours can drop the day back under the meal-break threshold.
-        if (result.count === 1) {
-            for (const dayKey of days) await settleDayWithinTx(tx as never, entry.userId, dayKey);
-        }
-        return result;
-    });
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
+    );
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/time-expenses`);
@@ -244,25 +234,46 @@ export async function deleteTimeEntries(
 
     const entries = await prisma.timeEntry.findMany({
         where: { id: { in: ids } },
-        select: { id: true, projectId: true, userId: true, startTime: true, invoiceId: true, invoicedAt: true },
+        select: {
+            id: true, projectId: true, userId: true, startTime: true, endTime: true,
+            invoiceId: true, invoicedAt: true,
+        },
     });
 
-    const allowed = entries.filter(
-        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId) && canWriteHoursFor(user, e.userId)
-    );
-    if (!allowed.length) return { deleted: 0 };
-
-    const allowedIds = allowed.map(e => e.id);
-    const projectIds = new Set(allowed.map(e => e.projectId));
+    // REFUSED, not filtered. This used to silently drop every row the caller
+    // could not delete and report success for the rest — so a FIELD_CREW member
+    // selecting a colleague's clocked punch alongside their own manual rows was
+    // told the whole batch was deleted. Worse, the same silent filter was the
+    // only thing standing between the bulk path and the two guards the singular
+    // path enforces, so a clocked punch could be destroyed here that
+    // deleteTimeEntry(id) would have refused.
+    assertBulkDeletable(user, entries, canAccessProject);
+    const allowedIds = entries.map(e => e.id);
+    const projectIds = new Set(entries.map(e => e.projectId));
 
     // EVERY row, not a sample: a bulk delete that silently skipped the locked
     // ones would be worse than refusing outright, because the caller would be
     // told it succeeded.
-    const result = await withPayrollWriteTx({ entryIds: allowedIds }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.deleteMany({
+    const result = await withPayrollWriteTx({ entryIds: allowedIds }, async (tx) => {
+        // Re-authorized against the rows as they stand under the FOR UPDATE that
+        // withPayrollWriteTx just took. The read above is outside the
+        // transaction: between it and here, another writer can reassign a row to
+        // a different project or owner, or an invoice run can claim it.
+        const locked = await (tx as unknown as typeof prisma).timeEntry.findMany({
+            where: { id: { in: allowedIds } },
+            select: {
+                id: true, projectId: true, userId: true, endTime: true,
+                invoiceId: true, invoicedAt: true,
+            },
+        });
+        assertBulkDeletable(user, locked, canAccessProject);
+        return (tx as unknown as typeof prisma).timeEntry.deleteMany({
             where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
-        })
-    );
+        });
+    });
+    if (result.count !== allowedIds.length) {
+        throw new Error("Some of those entries were billed while they were being deleted; refresh and try again");
+    }
 
     for (const projectId of projectIds) {
         revalidatePath(`/projects/${projectId}/time-expenses`);

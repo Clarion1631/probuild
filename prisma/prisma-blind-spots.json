@@ -91,6 +91,11 @@
       "def": "CHECK ((result = ANY (ARRAY['SCHEDULED'::text, 'PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])))"
     },
     {
+      "name": "PayrollPeriod_discard_unlocked",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK (((\"discardedAt\" IS NULL) OR (\"lockedAt\" IS NULL)))"
+    },
+    {
       "name": "PayrollPeriod_keys_present",
       "table": "\"PayrollPeriod\"",
       "def": "CHECK (((\"periodStartKey\" IS NOT NULL) AND (\"periodEndKey\" IS NOT NULL)))"

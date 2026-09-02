@@ -6,6 +6,7 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   claimProviderLease,
+  completeUnderLease,
   helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
@@ -117,7 +118,8 @@ export async function POST(req: NextRequest) {
     // Claim the right to call GitHub. Two attempts can reach this point at
     // once — a double-tap, or a retry overlapping the first request — and both
     // would file, because neither issue exists yet when they both search.
-    if (!(await claimProviderLease(requestId))) {
+    const leaseToken = await claimProviderLease(requestId);
+    if (!leaseToken) {
       const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
       return helpChatResponse({
         body: { request: inFlight, duplicate: true, inFlight: true },
@@ -148,12 +150,9 @@ export async function POST(req: NextRequest) {
 
     if (!ghIssue) {
       // The report is already saved; only the Phantom hand-off failed. Leaving
-      // providerState 'pending' is what lets a later retry resume it.
-      await prisma.$executeRaw`
-        UPDATE "HelpRequest"
-        SET "status" = 'submitted_no_issue', "providerState" = 'pending'
-        WHERE "id" = ${requestId}
-      `;
+      // providerState 'pending' is what lets a later retry resume it. Fenced,
+      // so a superseded attempt cannot mark a filed report pending again.
+      await completeUnderLease(requestId, leaseToken, { filed: false, status: "submitted_no_issue" });
       return NextResponse.json(
         { error: "Failed to create GitHub issue for Phantom" },
         { status: 502 }
@@ -161,22 +160,20 @@ export async function POST(req: NextRequest) {
     }
 
     // Attach the issue to the row that already exists — a retry updates it
-    // instead of filing a second report.
-    const [request] = await prisma.$queryRaw<any[]>`
-      UPDATE "HelpRequest"
-      SET "status" = 'submitted',
-          "changeLocation" = ${ghIssue.url},
-          "externalIssueRef" = ${`github-issue:${ghIssue.number}`},
-          "providerIssueRef" = ${String(ghIssue.number)},
-          "providerState" = 'created'
-      WHERE "id" = ${requestId}
-      RETURNING *
-    `;
+    // instead of filing a second report. Fenced on the lease.
+    const held = await completeUnderLease(requestId, leaseToken, {
+      filed: true,
+      issueNumber: ghIssue.number,
+      issueUrl: ghIssue.url,
+      status: "submitted",
+    });
+    const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
 
     return NextResponse.json({
       request,
       issueNumber: ghIssue.number,
       issueUrl: ghIssue.url,
+      ...(held ? {} : { superseded: true }),
     });
   } catch (error) {
     console.error("Bug fix submission error:", error);

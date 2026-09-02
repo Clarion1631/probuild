@@ -113,7 +113,10 @@ test("both routes parse safely, validate, and throttle before creating an issue"
             source.indexOf("reserveHelpRequest(") < source.indexOf("createHelpChatGitHubIssue("),
             `${route}: the throttle+row reservation must precede issue creation`
         );
-        assert.match(source, /UPDATE "HelpRequest"/, `${route} must update the reserved row, not insert a second`);
+        // Round 16 moved the raw UPDATE behind completeUnderLease, which fences
+        // it on the lease token. Still an update of the reserved row, never a
+        // second insert.
+        assert.match(source, /completeUnderLease\(requestId, leaseToken/, `${route} must update the reserved row, not insert a second`);
     }
 });
 
@@ -303,7 +306,10 @@ test("a resume asks GitHub before filing, using the submission marker", () => {
     // The marker goes INTO the body, or the search could never find it.
     assert.match(route, /metadata: \[[\s\S]{0,200}marker,/);
     // providerState records the outcome so the next resume knows.
-    assert.match(route, /"providerState" = \$\{ghIssue \? "created" : "pending"\}/);
+    // Round 16: the same either/or, expressed through the fenced writer so a
+    // superseded attempt cannot record its own outcome.
+    assert.match(route, /completeUnderLease\(requestId, leaseToken, \{ filed: false, status: "submitted_no_issue" \}\)/);
+    assert.match(route, /filed: true,\s*\n\s*issueNumber: ghIssue\.number/);
 });
 
 test("BOTH help routes reconcile with the provider before filing", () => {
@@ -319,8 +325,9 @@ test("BOTH help routes reconcile with the provider before filing", () => {
         assert.match(source, /reserved\.resume \? await findIssueByMarker\(marker\) : null/, route);
         assert.match(source, /alreadyFiled \?\?/, route);
         assert.match(source, /marker,/, `${route} must put the marker in the issue body`);
-        assert.match(source, /"providerState" = /, route);
-        assert.match(source, /"providerIssueRef" = /, route);
+        // providerState / providerIssueRef are written by completeUnderLease now.
+        assert.match(source, /completeUnderLease\(/, route);
+        assert.match(source, /issueNumber: ghIssue\.number/, route);
         // The search must happen BEFORE the create, or it proves nothing.
         assert.ok(
             source.indexOf("findIssueByMarker(marker)") < source.indexOf("createHelpChatGitHubIssue("),
@@ -337,8 +344,13 @@ test("a crash between provider and DB leaves a row a retry can finish", () => {
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
         "utf8"
     );
-    assert.match(bugFix, /"status" = 'submitted_no_issue', "providerState" = 'pending'/);
-    assert.match(bugFix, /"providerState" = 'created'/);
+    assert.match(bugFix, /completeUnderLease\(requestId, leaseToken, \{ filed: false, status: "submitted_no_issue" \}\)/);
+    assert.match(bugFix, /filed: true/);
+    // 'pending' vs 'created' now lives in ONE place, so the two routes cannot
+    // drift on what a half-finished submission looks like.
+    const guardSource = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.match(guardSource, /"providerState" = 'created'/);
+    assert.match(guardSource, /"providerState" = 'pending'/);
 });
 
 test("the client type comes from the auth result, never the posted body", async () => {
@@ -361,7 +373,10 @@ test("the provider lease is a compare-and-set, taken before any GitHub call", ()
     // Only if nobody holds it, or the previous holder's lease has expired.
     assert.match(body, /providerLeaseExpiresAt" IS NULL OR "providerLeaseExpiresAt" < /);
     assert.match(body, /providerState" IS DISTINCT FROM 'created'/);
-    assert.match(body, /return claimed === 1;/);
+    // Round 16: the claim hands back a FENCING TOKEN, not a boolean. A late
+    // completion from a superseded attempt is rejected by matching on it.
+    assert.match(body, /return claimed === 1 \? token : null;/);
+    assert.match(guard, /WHERE "id" = \$\{requestId\} AND "providerLeaseToken" = \$\{leaseToken\}/);
 
     for (const route of ["request", "bug-fix"]) {
         const source = readFileSync(

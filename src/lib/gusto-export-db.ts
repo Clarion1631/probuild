@@ -115,6 +115,8 @@ const PAYROLL_PERIOD_SELECT = {
     periodEndKey: true,
     summaryCsvSnapshot: true,
     detailCsvSnapshot: true,
+    /// Read so findPayrollPeriod can refuse to hand a retired row back.
+    discardedAt: true,
     lockedBy: { select: { name: true, email: true } },
 } as const;
 
@@ -137,10 +139,14 @@ export function hashExport(summaryCsv: string, detailCsv: string): string {
  * live CSV and unlock updated zero rows while reporting success.
  */
 export async function findPayrollPeriod(startKey: string, endKey: string, client: ExportDbClient = prisma) {
-    return client.payrollPeriod.findUnique({
+    const period = await client.payrollPeriod.findUnique({
         where: { periodStartKey_periodEndKey: { periodStartKey: startKey, periodEndKey: endKey } },
         select: PAYROLL_PERIOD_SELECT,
     });
+    // A DISCARDED row is not a period. It is kept only for the audit trail, and
+    // every reader must be blind to it — otherwise a retired wrong-range row
+    // would still serve its snapshot and still answer "this period exists".
+    return period && (period as { discardedAt?: Date | null }).discardedAt ? null : period;
 }
 
 /**

@@ -6,6 +6,7 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   claimProviderLease,
+  completeUnderLease,
   helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
@@ -121,7 +122,8 @@ export async function POST(req: NextRequest) {
     // Claim the right to call GitHub. Two attempts can reach this point at
     // once — a double-tap, or a retry overlapping the first request — and both
     // would file, because neither issue exists yet when they both search.
-    if (!(await claimProviderLease(requestId))) {
+    const leaseToken = await claimProviderLease(requestId);
+    if (!leaseToken) {
       const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
       // Somebody else holds the lease and is filing right now. This attempt
       // does not know the outcome, so it must not report one — 202 unless the
@@ -153,24 +155,31 @@ export async function POST(req: NextRequest) {
       }));
 
     // Attach the issue to the row that already exists — a retry updates it
-    // instead of filing a second report.
-    const [request] = await prisma.$queryRaw<any[]>`
-      UPDATE "HelpRequest"
-      SET "status" = ${ghIssue ? "submitted" : "submitted_no_issue"},
-          "changeLocation" = ${ghIssue?.url ?? null},
-          "externalIssueRef" = ${ghIssue ? `github-issue:${ghIssue.number}` : null},
-          "providerIssueRef" = ${ghIssue ? String(ghIssue.number) : null},
-          "providerState" = ${ghIssue ? "created" : "pending"}
-      WHERE "id" = ${requestId}
-      RETURNING *
-    `;
+    // instead of filing a second report. FENCED on the lease: if this attempt's
+    // lease expired while GitHub was slow, another claimant has taken over and
+    // this write must not land on top of its result.
+    const held = ghIssue
+      ? await completeUnderLease(requestId, leaseToken, {
+          filed: true,
+          issueNumber: ghIssue.number,
+          issueUrl: ghIssue.url,
+          status: "submitted",
+        })
+      : await completeUnderLease(requestId, leaseToken, { filed: false, status: "submitted_no_issue" });
 
+    const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
     return helpChatResponse({
       body: {
         request,
         githubIssue: ghIssue ? { number: ghIssue.number, url: ghIssue.url } : null,
+        // Somebody else finished this submission while we were filing. The
+        // report is real either way; this attempt just is not the one that
+        // recorded it.
+        ...(held ? {} : { superseded: true }),
       },
-      filed: !!ghIssue,
+      // The STORED state decides, not "we got an issue back": a superseded
+      // attempt's own issue number is not what the row points at.
+      filed: request?.providerState === "created",
       submissionId,
     });
   } catch (error) {

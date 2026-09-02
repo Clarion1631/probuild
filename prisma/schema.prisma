@@ -109,11 +109,26 @@ model PayrollPeriod {
   summaryCsvSnapshot String?
   detailCsvSnapshot  String?
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  /// SOFT DELETE. A period created over the wrong range cannot simply be
+  /// removed — unlocking leaves the row behind, and every overlap check then
+  /// refuses the corrected range forever. Discarding retires the row instead:
+  /// it stays for the audit trail (see AuditLog entity "PayrollPeriod", action
+  /// "discard") and every reader ignores it. Only an UNLOCKED row may be
+  /// discarded; frozen hours are never retired this way.
+  ///
+  /// Note the unique on (periodStartKey, periodEndKey) still applies to
+  /// discarded rows, so discarding does NOT free the same range to be created
+  /// again — it frees the OVERLAPPING ranges around it. Re-locking the exact
+  /// same period is what unlockPayrollPeriod is for.
+  discardedAt     DateTime? @db.Timestamptz(6)
+  discardedById   String?
+  discardedReason String?
 
   @@unique([periodStart, periodEnd])
   @@unique([periodStartKey, periodEndKey])
   @@index([lockedAt])
   @@index([lockedById])
+  @@index([discardedAt])
 }
 
 model Client {
@@ -941,9 +956,14 @@ model CostType {
 model TimeEntry {
   id         String    @id @default(cuid())
   userId     String
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// RESTRICT, not CASCADE. Deleting a person or a job used to silently destroy
+  /// their payroll history — including hours inside a LOCKED period that had
+  /// already been exported and paid, leaving nothing to reconcile a Gusto run
+  /// against. The delete paths now remove the entries explicitly, under the
+  /// payroll lock, and refuse outright when any of them are frozen.
+  user       User      @relation(fields: [userId], references: [id], onDelete: Restrict)
   projectId  String
-  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Restrict)
   costCodeId String?
   costCode   CostCode? @relation(fields: [costCodeId], references: [id])
   costTypeId String?

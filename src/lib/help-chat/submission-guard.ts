@@ -219,18 +219,67 @@ export const HELP_LEASE_MS = 2 * 60 * 1000;
  * the previous holder's lease has expired. `count === 0` means somebody else is
  * mid-flight, and the caller backs off rather than filing.
  */
-export async function claimProviderLease(requestId: string): Promise<boolean> {
+export async function claimProviderLease(
+    requestId: string,
+    client: { $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<number> } = prisma as never
+): Promise<string | null> {
     const token = randomUUID();
     const now = new Date();
     const expiry = new Date(now.getTime() + HELP_LEASE_MS);
-    const claimed = await prisma.$executeRaw`
+    const claimed = await client.$executeRaw`
         UPDATE "HelpRequest"
         SET "providerLeaseToken" = ${token}, "providerLeaseExpiresAt" = ${expiry}
         WHERE "id" = ${requestId}
           AND "providerState" IS DISTINCT FROM 'created'
           AND ("providerLeaseExpiresAt" IS NULL OR "providerLeaseExpiresAt" < ${now})
     `;
-    return claimed === 1;
+    // The token is a FENCE, not a receipt. An attempt whose lease expired while
+    // GitHub was slow has already been replaced by a second claimant; every
+    // write it makes afterwards must be conditioned on still holding the lease,
+    // or it lands on top of the newer attempt's result. Returning the token is
+    // what lets the caller do that.
+    return claimed === 1 ? token : null;
+}
+
+/**
+ * The provider call must finish INSIDE the lease, with room to spare — a call
+ * that outlives its own lease is exactly the overlap the fence exists to catch,
+ * and one that is merely aborted leaves nothing to reconcile.
+ */
+export const HELP_PROVIDER_TIMEOUT_MS = 90 * 1000;
+
+/**
+ * Finish a submission, but only while this attempt still holds the lease.
+ *
+ * `WHERE providerLeaseToken = $token` is the whole point: a late completion from
+ * a superseded attempt updates nothing and returns false, instead of stamping
+ * its own issue number over the one the second claimant filed.
+ */
+export async function completeUnderLease(
+    requestId: string,
+    leaseToken: string,
+    outcome:
+        | { filed: true; issueNumber: number; issueUrl: string; status: string }
+        | { filed: false; status: string },
+    /** Injected so the superseded-attempt branch can be exercised without racing two real requests. */
+    client: { $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<number> } = prisma as never
+): Promise<boolean> {
+    const updated = outcome.filed
+        ? await client.$executeRaw`
+            UPDATE "HelpRequest"
+            SET "status" = ${outcome.status},
+                "changeLocation" = ${outcome.issueUrl},
+                "externalIssueRef" = ${`github-issue:${outcome.issueNumber}`},
+                "providerIssueRef" = ${String(outcome.issueNumber)},
+                "providerState" = 'created'
+            WHERE "id" = ${requestId} AND "providerLeaseToken" = ${leaseToken}
+        `
+        : await client.$executeRaw`
+            UPDATE "HelpRequest"
+            SET "status" = ${outcome.status}, "providerState" = 'pending'
+            WHERE "id" = ${requestId} AND "providerLeaseToken" = ${leaseToken}
+        `;
+    return updated === 1;
 }
 
 /**

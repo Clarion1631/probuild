@@ -386,6 +386,23 @@ export function periodLockedResponse(period: LockedPeriodRow): NextResponse {
     );
 }
 
+/**
+ * Run a route handler, turning PeriodLockedError into the canonical 423.
+ *
+ * ONE place. Routes that took a payroll write lock without this let the error
+ * escape as an unhandled 500, which tells the crew app to retry a write that
+ * will be refused every time — and tells the person holding the phone that
+ * ProBuild is broken rather than that payroll is closed.
+ */
+export async function withPeriodLockedRoute(run: () => Promise<NextResponse>): Promise<NextResponse> {
+    try {
+        return await run();
+    } catch (error) {
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        throw error;
+    }
+}
+
 /** Default loader — every locked period. The table holds one row per reviewed period, so this stays tiny. */
 export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
     const { prisma } = await import("./prisma");

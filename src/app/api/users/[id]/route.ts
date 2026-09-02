@@ -5,6 +5,8 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
+import { deleteParentWithTimeEntries } from "@/lib/payroll-parent-delete";
+import { isPeriodLockedError, periodLockedResponse } from "@/lib/payroll-period";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -234,9 +236,18 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
             return NextResponse.json({ error: "Only admins can delete admin accounts" }, { status: 403 });
         }
 
-        await prisma.user.delete({ where: { id } });
+        // Their time entries go first, explicitly, under the payroll lock. The
+        // foreign key used to CASCADE, so this endpoint quietly destroyed a
+        // former employee's whole payroll history — including hours already
+        // exported and paid inside a locked period.
+        await deleteParentWithTimeEntries({ userId: id }, async (tx) => {
+            await (tx as unknown as typeof prisma).user.delete({ where: { id } });
+        });
         return NextResponse.json({ success: true });
     } catch (error: any) {
+        // Hours inside a locked period are never deleted. 423, not 500: the
+        // request is well-formed and the caller is allowed — the data is frozen.
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         console.error("DELETE /api/users/[id] error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
     }

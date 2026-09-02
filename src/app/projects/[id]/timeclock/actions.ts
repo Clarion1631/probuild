@@ -13,7 +13,6 @@ import {
     assertUsableDuration,
 } from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
-import { settleDayWithinTx, settlementDays } from "@/lib/wa-breaks-db";
 import { toNum } from "@/lib/prisma-helpers";
 import {
     appendZeroRateReview,
@@ -148,6 +147,7 @@ export async function updateTimeEntry(id: string, data: {
         select: {
             projectId: true, userId: true, startTime: true, endTime: true,
             estimateItemId: true, durationHours: true, laborCost: true,
+            invoiceId: true, invoicedAt: true,
         },
     });
     if (!existing) throw new Error("Not found");
@@ -166,17 +166,24 @@ export async function updateTimeEntry(id: string, data: {
         estimateItemId: existing.estimateItemId,
     });
 
+    // Billed hours are not editable. This mirrors time-expense-actions.ts: the
+    // two manual editors write the same rows, and one of them silently allowing
+    // an edit to invoiced time is the whole gap.
+    if (existing.invoiceId || existing.invoicedAt) throw new Error("Billed time entries cannot be edited");
+
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
     // Both dates — editing inside a locked period, and moving a punch into one.
-    // Both DAYS too: an edit can move an entry off one day and onto another, and
-    // each day's meal deduction is computed from everything left on it. The day
-    // keys go in the target so their advisory locks are taken up front, in the
-    // documented payroll -> day -> row order.
-    const days = settlementDays([existing.startTime, startTime]);
-    const owners = Array.from(new Set([existing.userId, data.userId]));
-    await withPayrollWriteTx({ entryIds: [id], instants: [startTime], dayKeys: days }, async (tx) => {
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
         const priced = await priceManualEntry(tx, data.userId, durationHours, acknowledgeZeroRate);
-        const updated = await (tx as unknown as typeof prisma).timeEntry.update({
-            where: { id },
+        // updateMany with the billing columns in the WHERE is the compare-and-set:
+        // the pre-transaction read above is stale the moment a concurrent invoice
+        // run claims this row, and a count of 0 is how that is detected.
+        return (tx as unknown as typeof prisma).timeEntry.updateMany({
+            where: { id, invoiceId: null, invoicedAt: null },
             data: {
                 userId: data.userId,
                 costCodeId: data.costCodeId,
@@ -186,15 +193,8 @@ export async function updateTimeEntry(id: string, data: {
                 scheduleTaskId
             }
         });
-        // Re-settle inside the SAME transaction: if this edit changed what a day
-        // contains, that day's meal deduction / shiftHours / mealOutcome are now
-        // stale, and a settlement that ran afterwards in its own transaction
-        // could be interleaved with another writer.
-        for (const owner of owners) {
-            for (const dayKey of days) await settleDayWithinTx(tx as never, owner, dayKey);
-        }
-        return updated;
     });
+    if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
 
     revalidatePath(`/projects/${data.projectId}/timeclock`);
     revalidatePath(`/projects/${data.projectId}/costing`);
@@ -205,15 +205,17 @@ export async function deleteTimeEntry(id: string) {
     // so any signed-in account could delete ANY entry in the system by id.
     const { entry } = await assertManualEntryDelete(id);
     assertNotClockGeneratedEntry(entry);
+    if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
 
-    const days = settlementDays([entry.startTime]);
-    await withPayrollWriteTx({ entryIds: [id], dayKeys: days }, async (tx) => {
-        await (tx as unknown as typeof prisma).timeEntry.delete({ where: { id } });
-        // Removing hours can drop a day back under the meal-break threshold, so
-        // the day is re-planned here rather than left describing a shift that
-        // no longer exists.
-        for (const dayKey of days) await settleDayWithinTx(tx as never, entry.userId, dayKey);
-    });
+    // No settlement here, deliberately. settleDayInTx only ever plans rows with
+    // a real endTime, and assertNotClockGeneratedEntry above guarantees this row
+    // has none — so a settle call would take locks and re-plan a day this write
+    // cannot have changed. The clocked paths (PUT /api/time-entries and
+    // PATCH /api/time-entries/[id]) are where settlement belongs.
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
+    );
+    if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/timeclock`);
     revalidatePath(`/projects/${entry.projectId}/costing`);

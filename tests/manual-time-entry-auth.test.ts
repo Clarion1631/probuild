@@ -177,17 +177,19 @@ test("BOTH manual update/delete paths call the clocked-row guard", () => {
     }
 });
 
-test("both paths re-settle the affected day INSIDE the same transaction", () => {
+test("the manual paths do NOT settle — a manual row has no endTime to plan", () => {
+    // Round 15 added settlement here; round 16 removed it after checking the
+    // premise. settleDayInTx selects `endTime: { not: null }`, and
+    // assertNotClockGeneratedEntry guarantees these rows have none — so the
+    // settle call could only take locks and re-plan a day this write cannot
+    // have touched. Settlement belongs to the clocked paths.
+    const settle = readFileSync(path.join(process.cwd(), "src/lib/wa-breaks-db.ts"), "utf8");
+    assert.match(settle, /endTime: \{ not: null \}/);
+
     for (const file of MANUAL_ACTION_FILES) {
         const source = actionSource(file);
-        assert.match(source, /settleDayWithinTx\(tx as never/, `${file}: settles on the tx, not a new connection`);
-        // The day keys are handed to withPayrollWriteTx so their advisory locks
-        // are taken UP FRONT — payroll, then day, then row. Taking the day lock
-        // after the rows are locked is the deadlock this avoids.
-        assert.match(source, /dayKeys: days/, `${file}: locks the days up front`);
-        assert.match(source, /settlementDays\(/, `${file}`);
-        // An edit can MOVE an entry, so both days are settled, not just the new one.
-        assert.match(source, /settlementDays\(\[(current|existing)\.startTime, startTime\]\)/, `${file}: old day AND new day`);
+        assert.doesNotMatch(source, /settleDayWithinTx/, file);
+        assert.doesNotMatch(source, /dayKeys:/, file);
     }
 });
 

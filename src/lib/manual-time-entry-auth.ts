@@ -120,6 +120,29 @@ export function assertNotLegacyUnitEntry(entry: { durationHours: number | null; 
     }
 }
 
+/** Coded refusal for "these hours are already on an invoice". */
+export const BILLED_ENTRY_CODE = "billed-entry";
+
+export function isBilledEntry(entry: { invoiceId: string | null; invoicedAt: Date | null }): boolean {
+    return !!entry.invoiceId || !!entry.invoicedAt;
+}
+
+/**
+ * Billed hours are not editable or deletable.
+ *
+ * Every manual path re-checks this INSIDE its transaction as well (an
+ * updateMany/deleteMany with the billing columns in the WHERE): a read taken
+ * before the transaction is stale the moment a concurrent invoice run claims
+ * the row. This assertion is the one that produces a readable error.
+ */
+export function assertNotBilledEntry(entry: { invoiceId: string | null; invoicedAt: Date | null }): void {
+    if (isBilledEntry(entry)) {
+        const error = new Error("Billed time entries cannot be edited or deleted.");
+        (error as Error & { code?: string }).code = BILLED_ENTRY_CODE;
+        throw error;
+    }
+}
+
 /** Coded refusal for "this row came from the clock, not from a form". */
 export const CLOCK_GENERATED_ENTRY_CODE = "clock-generated-entry";
 
@@ -147,6 +170,40 @@ export function assertNotClockGeneratedEntry(entry: { endTime: Date | null }): v
         );
         (error as Error & { code?: string }).code = CLOCK_GENERATED_ENTRY_CODE;
         throw error;
+    }
+}
+
+/**
+ * Every row, or none.
+ *
+ * Runs the SAME three refusals the singular delete does — ownership/project,
+ * clocked-row, billed — one row at a time, so the error names the reason
+ * instead of the batch quietly shrinking. The bulk path used to FILTER on these
+ * conditions and report success for whatever survived, which meant a FIELD_CREW
+ * member could select a colleague's clocked punch and be told the whole
+ * selection was deleted.
+ *
+ * Lives here rather than in time-expense-actions.ts because that file is
+ * "use server": a bare export there is a live POST endpoint, not a helper.
+ */
+export function assertBulkDeletable(
+    actor: { id: string; role: string; permissions?: unknown },
+    entries: Array<{
+        projectId: string;
+        userId: string;
+        endTime: Date | null;
+        invoiceId: string | null;
+        invoicedAt: Date | null;
+    }>,
+    canAccess: (actor: { id: string; role: string; permissions?: unknown }, projectId: string) => boolean
+): void {
+    for (const entry of entries) {
+        if (actor.role !== "FINANCE" && !canAccess(actor, entry.projectId)) throw new Error("Forbidden");
+        if (!canWriteHoursFor(actor, entry.userId)) {
+            throw new Error("You can only delete your own time entries.");
+        }
+        assertNotClockGeneratedEntry(entry);
+        assertNotBilledEntry(entry);
     }
 }
 

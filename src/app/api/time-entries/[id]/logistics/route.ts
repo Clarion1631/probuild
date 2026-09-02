@@ -1,7 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { withPayrollWrite } from "@/lib/payroll-period";
+import { withPayrollWrite, withPeriodLockedRoute } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
 import { z } from "zod";
@@ -27,7 +27,12 @@ const BodySchema = z.object({
 //   - MANAGER/ADMIN: any time (the manager page is the canonical re-route)
 //   - routeToProjectId null = keep (or return to) overhead
 
-export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function PATCH(req: Request, context: { params: Promise<{ id: string }> }) {
+    // A payroll write inside: a locked period is a 423, never a 500.
+    return withPeriodLockedRoute(() => PATCHHandler(req, context));
+}
+
+async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: string }> }): Promise<NextResponse> {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;

@@ -392,13 +392,15 @@ test("the zero-rate policy reads the whole owner, not just the number", () => {
     assert.match(body, /select: \{ email: true, role: true, payType: true, hourlyRate: true, burdenRate: true \}/);
 });
 
-test("a $0-rate row is not skipped by the no-op shortcut until it carries the flag", () => {
+test("the skip decision is one pure predicate, not inlined per branch", () => {
     const fn = settlementSource();
     const body = fn.slice(fn.indexOf("async function settleDayInTx"));
-    // Otherwise a day whose hours already match would never get flagged, and
-    // the export would run straight past it.
-    assert.match(body, /const same =\s*\n\s*!zeroRate &&/);
-    assert.match(body, /zeroRate && row\.needsReview && \(row\.reviewReason \?\? ""\)\.includes\(ZERO_RATE_REVIEW_NOTE\)/);
+    // Round 16 extracted it. The flag is an ADDITIONAL condition on skipping,
+    // never a substitute for the hours check — the inline version treated it as
+    // sufficient and so froze a flagged day. The rule's own truth table lives in
+    // tests/payroll-round16.test.ts.
+    assert.match(body, /settlementRowIsCurrent\(\{ stored: row, update, zeroRate, flagsChange \}\)/);
+    assert.match(fn, /export function settlementRowIsCurrent/);
 });
 
 test("the salaried are exempt, so settlement still prices them", () => {

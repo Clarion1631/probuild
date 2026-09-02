@@ -1,3 +1,5 @@
+import { HELP_PROVIDER_TIMEOUT_MS } from "./submission-guard";
+
 interface GitHubIssueOptions {
   title: string;
   description: string;
@@ -54,6 +56,9 @@ export async function createHelpChatGitHubIssue({
     const res = await fetch(
       `https://api.github.com/repos/${owner}/${repoName}/issues`,
       {
+        // Bounded BELOW the provider lease: a call still running when the lease
+        // expires has already been superseded by another claimant.
+        signal: AbortSignal.timeout(HELP_PROVIDER_TIMEOUT_MS),
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -109,6 +114,7 @@ export async function findIssueByMarker(marker: string): Promise<GitHubIssueResu
     try {
         const query = encodeURIComponent(`repo:${owner}/${repoName} in:body "${marker}"`);
         const res = await fetch(`https://api.github.com/search/issues?q=${query}&per_page=1`, {
+            signal: AbortSignal.timeout(HELP_PROVIDER_TIMEOUT_MS),
             headers: {
                 Authorization: `Bearer ${token}`,
                 Accept: "application/vnd.github+json",
