@@ -1554,7 +1554,8 @@ export async function syncEstimateToQB(
         itemId: string;
         project: { name: string } | null;
     },
-    glMappings: Record<string, string> = {}
+    glMappings: Record<string, string> = {},
+    deadline?: RouteDeadline,
 ): Promise<{ qbId: string; qbUrl: string }> {
     const lines = buildQBEstimateLines(estimate.items, estimate.itemId);
 
@@ -1576,6 +1577,7 @@ export async function syncEstimateToQB(
     const res = await qbFetch("/estimate", tokens, {
         method: "POST",
         body: JSON.stringify(payload),
+        qbDeadline: deadline,
     });
 
     if (!res.ok) {
@@ -1602,7 +1604,8 @@ export async function syncInvoiceToQB(
         itemId: string;
         project: { name: string } | null;
         items?: Array<{ description: string; amount: number }>;
-    }
+    },
+    deadline?: RouteDeadline,
 ): Promise<{ qbId: string; qbUrl: string }> {
     const lines: object[] = (invoice.items || []).map((item, i) => ({
         LineNum: i + 1,
@@ -1632,6 +1635,7 @@ export async function syncInvoiceToQB(
     const res = await qbFetch("/invoice", tokens, {
         method: "POST",
         body: JSON.stringify(payload),
+        qbDeadline: deadline,
     });
 
     if (!res.ok) {
