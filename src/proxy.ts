@@ -62,10 +62,17 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // wildcard, so a future /api/receipts/intake/<id>/anything route does not
 // inherit the bypass before anyone has reviewed its gates. Everything else
 // under /api/receipts (notably /api/receipts/parse) keeps the proxy boundary.
+// api/automation/receipt-requests/threads and .../answers are the qbo-clasp
+// bridge for the missing-receipt Chat digest (Phase 2 §4). Same shape again:
+// the Apps Script mirror/forwarder self-authenticates with
+// x-receipt-intake-secret and needs a clean 401, not a /login redirect. Listed
+// EXACTLY — a future /api/automation/receipt-requests/<anything> route must not
+// inherit the bypass before its own gates have been reviewed, and the rest of
+// /api/automation (the register's mark-reviewed route) keeps the proxy boundary.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|api\/automation\/receipt-requests\/(?:threads|answers)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 // WHICH PATHS MAY DISPATCH A SERVER ACTION WITHOUT A SESSION.
 //
