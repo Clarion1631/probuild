@@ -43,42 +43,101 @@ function safePath(url: string): string {
     }
 }
 
-/**
- * Abort when ANY input signal aborts.
- *
- * `AbortSignal.any` is the built-in, but it does not exist on every runtime we
- * might land on. The old code fell back to using the CALLER's signal alone,
- * which silently disabled the deadline — exactly the hang this module exists to
- * prevent, and invisible until an outage. The manual combiner keeps both live.
- */
-function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
-    const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
-    if (typeof anyOf === "function") return anyOf(signals);
-
-    const controller = new AbortController();
-    for (const signal of signals) {
-        if (signal.aborted) {
-            controller.abort(signal.reason);
-            break;
-        }
-        signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
-    }
-    return controller.signal;
+/** Clamp a configured timeout to a positive integer of milliseconds. */
+function normalizeTimeoutMs(value: number, fallback: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    // AbortSignal.timeout takes an unsigned integer; a fraction or a
+    // sub-millisecond value would either be coerced or reject outright.
+    const whole = Math.floor(value);
+    return whole >= 1 ? whole : fallback;
 }
 
-/** Body-consuming members of Response — each one can outlive the headers. */
-const RESPONSE_BODY_METHODS = ["json", "text", "arrayBuffer", "blob", "formData"] as const;
+interface SignalRace {
+    /** The signal to hand to fetch. */
+    signal: AbortSignal;
+    /** Which input aborted FIRST, or null while none has. */
+    winner: () => AbortSignal | null;
+}
+
+/**
+ * Abort when ANY input signal aborts, and remember which one got there first.
+ *
+ * Two reasons this is hand-rolled rather than a bare `AbortSignal.any`:
+ *
+ *  - `AbortSignal.any` does not exist on every runtime we might land on. The
+ *    original fallback used the CALLER's signal alone, which silently disabled
+ *    the deadline — exactly the hang this module exists to prevent.
+ *  - Attribution cannot be reconstructed after the fact. Inspecting
+ *    `callerSignal.aborted` in the catch block loses a real race: the deadline
+ *    fires, the caller aborts a moment later, and by the time the rejection is
+ *    observed BOTH signals read aborted, so a genuine timeout was reported as a
+ *    caller cancellation and the receipt route answered 500 instead of 503.
+ *    The winner is therefore latched in the handler, at the instant it happens.
+ *
+ * Listeners are named and all of them are removed as soon as the race is
+ * decided, so nothing stays attached to a caller signal that outlives the call.
+ */
+function raceAbortSignals(signals: AbortSignal[]): SignalRace {
+    let winner: AbortSignal | null = null;
+    const attached: Array<{ signal: AbortSignal; handler: () => void }> = [];
+
+    const removeAllListeners = () => {
+        for (const entry of attached) entry.signal.removeEventListener("abort", entry.handler);
+        attached.length = 0;
+    };
+
+    const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+    const controller = typeof anyOf === "function" ? null : new AbortController();
+
+    const preAborted = signals.find(signal => signal.aborted);
+    if (preAborted) {
+        winner = preAborted;
+        controller?.abort(preAborted.reason);
+    } else {
+        for (const signal of signals) {
+            const handler = () => {
+                if (!winner) winner = signal;
+                removeAllListeners();
+                controller?.abort(signal.reason);
+            };
+            attached.push({ signal, handler });
+            signal.addEventListener("abort", handler, { once: true });
+        }
+    }
+
+    const signal = controller
+        ? controller.signal
+        : signals.length === 1
+            ? signals[0]
+            : (anyOf as (s: AbortSignal[]) => AbortSignal)(signals);
+
+    return { signal, winner: () => winner };
+}
+
+/**
+ * Body-consuming members of Response — each one can outlive the headers.
+ * `bytes()` is newer and absent on some runtimes; it is wrapped only when the
+ * runtime actually provides it.
+ */
+const RESPONSE_BODY_METHODS = ["json", "text", "arrayBuffer", "blob", "formData", "bytes"] as const;
+
+interface TimeoutContext {
+    timeoutSignal: AbortSignal;
+    race: SignalRace;
+    url: string;
+    ms: number;
+}
 
 /**
  * Translate an abort into QBTimeoutError, but ONLY when our own deadline is
  * what fired. A caller cancelling its own request is not a QBO outage.
+ *
+ * Attribution comes from the latched race winner, not from reading
+ * `aborted` flags here — by the time this runs both signals may be aborted.
  */
-function asQbTimeout(
-    error: unknown,
-    context: { timeoutSignal: AbortSignal; callerSignal: AbortSignal | null | undefined; url: string; ms: number },
-): unknown {
+function asQbTimeout(error: unknown, context: TimeoutContext): unknown {
     const aborted = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
-    if (aborted && context.timeoutSignal.aborted && !context.callerSignal?.aborted) {
+    if (aborted && context.race.winner() === context.timeoutSignal) {
         return new QBTimeoutError(
             `QuickBooks request timed out after ${context.ms}ms: ${safePath(context.url)}`,
         );
@@ -98,15 +157,21 @@ function asQbTimeout(
  * So the signal stays attached (the deadline must still cut off a stalled
  * body), and the returned Response is proxied so every body-consuming method
  * translates our own abort the same way the header phase does.
+ *
+ * NOT translated: streamed reads via `res.body` / `getReader()` surface the
+ * raw AbortError — no QBO caller currently streams a response.
  */
-function wrapResponseBodyTimeouts(
-    response: Response,
-    context: { timeoutSignal: AbortSignal; callerSignal: AbortSignal | null | undefined; url: string; ms: number },
-): Response {
+function wrapResponseBodyTimeouts(response: Response, context: TimeoutContext): Response {
     return new Proxy(response, {
-        get(target, prop, receiver) {
-            if (typeof prop === "string" && (RESPONSE_BODY_METHODS as readonly string[]).includes(prop)) {
-                const original = Reflect.get(target, prop, target) as (...args: unknown[]) => Promise<unknown>;
+        get(target, prop) {
+            const value = Reflect.get(target, prop, target);
+
+            if (
+                typeof prop === "string" &&
+                (RESPONSE_BODY_METHODS as readonly string[]).includes(prop) &&
+                typeof value === "function"
+            ) {
+                const original = value as (...args: unknown[]) => Promise<unknown>;
                 return async (...args: unknown[]) => {
                     try {
                         return await original.apply(target, args);
@@ -115,10 +180,17 @@ function wrapResponseBodyTimeouts(
                     }
                 };
             }
+
+            // A clone is still a QBO response under the same deadline — wrap it
+            // too, or reading the copy would leak the raw abort.
+            if (prop === "clone" && typeof value === "function") {
+                const clone = value as () => Response;
+                return () => wrapResponseBodyTimeouts(clone.apply(target), context);
+            }
+
             // Getters like `ok`/`status`/`headers` must run against the real
-            // Response (they throw on a proxy receiver), and methods like
-            // `clone()` must stay bound to it.
-            const value = Reflect.get(target, prop, target);
+            // Response (they throw on a proxy receiver), and any other method
+            // must stay bound to it.
             return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
         },
     });
@@ -142,19 +214,18 @@ export async function qbTimedFetch(
     timeoutMs: number = Number(process.env.QB_FETCH_TIMEOUT_MS) || QB_DEFAULT_TIMEOUT_MS,
 ): Promise<Response> {
     // A misconfigured env var must not break every QB call: AbortSignal.timeout
-    // rejects a non-positive delay outright.
-    const effectiveMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : QB_DEFAULT_TIMEOUT_MS;
+    // wants a positive integer, so a fraction or a non-finite value falls back
+    // to the default rather than reaching it.
+    const effectiveMs = normalizeTimeoutMs(timeoutMs, QB_DEFAULT_TIMEOUT_MS);
     const timeoutSignal = AbortSignal.timeout(effectiveMs);
 
     const callerSignal = init.signal;
-    const signal = callerSignal
-        ? combineAbortSignals([callerSignal, timeoutSignal])
-        : timeoutSignal;
+    const race = raceAbortSignals(callerSignal ? [callerSignal, timeoutSignal] : [timeoutSignal]);
 
-    const context = { timeoutSignal, callerSignal, url, ms: effectiveMs };
+    const context: TimeoutContext = { timeoutSignal, race, url, ms: effectiveMs };
     let response: Response;
     try {
-        response = await fetch(url, { ...init, signal });
+        response = await fetch(url, { ...init, signal: race.signal });
     } catch (error) {
         throw asQbTimeout(error, context);
     }
@@ -199,8 +270,10 @@ const QB_REFRESH_DEFAULT_TIMEOUT_MS = 45_000;
 const QB_REFRESH_MAX_TIMEOUT_MS = 50_000;
 
 function refreshTimeoutMs(): number {
-    const configured = Number(process.env.QB_REFRESH_TIMEOUT_MS);
-    const requested = Number.isFinite(configured) && configured > 0 ? configured : QB_REFRESH_DEFAULT_TIMEOUT_MS;
+    const requested = normalizeTimeoutMs(
+        Number(process.env.QB_REFRESH_TIMEOUT_MS),
+        QB_REFRESH_DEFAULT_TIMEOUT_MS,
+    );
     return Math.min(requested, QB_REFRESH_MAX_TIMEOUT_MS);
 }
 
@@ -218,6 +291,13 @@ function refreshTimeoutMs(): number {
  *     out a slow refresh than abandon one mid-rotation.
  *  2. A distinct, diagnosable error when it does fire, so the stranded-token
  *     case is recognisable in logs instead of looking like any other timeout.
+ *
+ * Both mitigations are BEST EFFORT, not a guarantee. The calling route's own
+ * ceiling (maxDuration 60) can preempt a late refresh: if the function is
+ * killed first, this deadline never fires, the message below is never logged,
+ * and the connection can still be left stranded with no trace beyond the
+ * platform timeout. Diagnosing that case means correlating a killed invocation
+ * with the next refresh failure.
  *
  * Persistence order is unchanged: the caller still stores what this returns,
  * only after a successful exchange.

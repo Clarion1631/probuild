@@ -151,7 +151,54 @@ test("a caller's own abort DURING the body read stays a plain error", async () =
     assert.equal(error instanceof QBTimeoutError, false);
 });
 
+test("a clone() of a QBO response is wrapped too", async () => {
+    const res = await qbTimedFetch(`${base}/v3/company/stall-body`, {}, 150);
+    const copy = res.clone();
+    const error = await copy.json().then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
+});
+
 // ─── Signal combining ───────────────────────────────────────────────────────
+
+test("the deadline wins the race even if the caller aborts a moment later", async () => {
+    // The race Codex flagged: our deadline fires first, the caller aborts
+    // before the rejection is observed, and BOTH signals then read aborted.
+    // Attribution must come from who got there FIRST (latched in the handler),
+    // not from inspecting `callerSignal.aborted` afterwards — otherwise a real
+    // outage is misreported as a caller cancellation and the receipt route
+    // answers 500 instead of 503.
+    const controller = new AbortController();
+    const pending = qbTimedFetch(`${base}/v3/company/hang`, { signal: controller.signal }, 60).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    // A sibling deadline on the same schedule: its handler aborts the caller
+    // SYNCHRONOUSLY the moment the real deadline has fired. Registered after
+    // the call, so the wrapper's own timeout signal is created — and fires —
+    // first. Both signals end up aborted; only the latched winner disambiguates.
+    AbortSignal.timeout(60).addEventListener("abort", () => controller.abort(), { once: true });
+
+    const error = await pending;
+    // Let the sibling handler land regardless of timer/microtask interleaving,
+    // then assert the caller really did abort too — that is what makes this a
+    // race rather than a plain timeout.
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    assert.equal(controller.signal.aborted, true, "the caller signal must also be aborted by now");
+    assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
+});
+
+test("the caller still wins when it aborts first, even though the deadline follows", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 40);
+    const error = await qbTimedFetch(
+        `${base}/v3/company/hang`,
+        { signal: controller.signal },
+        80,
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof Error);
+    assert.equal(error instanceof QBTimeoutError, false);
+});
 
 test("without AbortSignal.any, a caller signal does NOT silently disable the deadline", async () => {
     const original = (AbortSignal as unknown as Record<string, unknown>).any;
@@ -231,4 +278,20 @@ test("a garbage QB_FETCH_TIMEOUT_MS falls back to the 20s default rather than th
         if (previous === undefined) delete process.env.QB_FETCH_TIMEOUT_MS;
         else process.env.QB_FETCH_TIMEOUT_MS = previous;
     }
+});
+
+test("fractional and sub-1ms timeouts never reach AbortSignal.timeout", async () => {
+    // A fraction would be coerced and a 0/negative value rejected outright,
+    // which would break EVERY QB call rather than one misconfigured setting.
+    for (const value of [0.5, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const res = await qbTimedFetch(`${base}/v3/company/query`, {}, value);
+        assert.equal(res.status, 200, `timeout ${value} should fall back to the default`);
+    }
+    // A valid fraction floors instead of falling back: 150.9 -> 150.
+    const error = await qbTimedFetch(`${base}/v3/company/hang`, {}, 150.9).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    assert.ok(error instanceof QBTimeoutError);
+    assert.match(error.message, /150ms/);
 });
