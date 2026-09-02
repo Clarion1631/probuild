@@ -663,7 +663,12 @@ export interface QboExpenseUpdatePlan {
  */
 export function planQboExpenseUpdate(
     existing: Pick<ExistingQboExpense, "projectId" | "estimateId"> &
-        Partial<Pick<ExistingQboExpense, "taxAmount" | "taxDeductibleBase">>,
+        Partial<
+            Pick<
+                ExistingQboExpense,
+                "amount" | "taxAmount" | "taxDeductibleBase" | "installedAtCustomer"
+            >
+        >,
     write: QboExpenseWrite,
 ): QboExpenseUpdatePlan {
     const existingProjectId = existing.projectId ?? null;
@@ -728,6 +733,31 @@ export function planQboExpenseUpdate(
             data.needsTaxReview = true;
         }
     }
+
+    // ANY MOVEMENT IN THE GROSS RE-OPENS A TAX CLASSIFICATION.
+    //
+    // The two branches above only catch the amounts that break an invariant.
+    // An ORDINARY change does not, and it is just as capable of making a
+    // human's answer wrong: QuickBooks re-syncing a $412.10 receipt as $498.30
+    // (a line added, a return applied, a corrected entry) leaves the recorded
+    // $34.06 of tax describing a purchase that no longer exists, and an
+    // `installedAtCustomer` yes describing a different basket of goods. The
+    // numbers still satisfy every CHECK, so nothing else would ever ask.
+    //
+    // "Classified" means a human's tax answer is on the row in any form —
+    // a tax amount, an installed-at-customer decision, or a hand allocation.
+    // For those rows an amount change is a REVIEW, never a silent acceptance:
+    // the classification is kept (it may well still be right) and the row is
+    // flagged, which the report reads as "not until a person looks".
+    const classified =
+        existingTax !== null || existingBase !== null || existing.installedAtCustomer != null;
+    const existingAmount =
+        existing.amount === null || existing.amount === undefined ? null : Number(existing.amount);
+    const amountMoved =
+        existingAmount !== null &&
+        write.amount !== undefined &&
+        Math.round(existingAmount * 100) !== Math.round(write.amount * 100);
+    if (classified && amountMoved) data.needsTaxReview = true;
 
     if (existingProjectId !== null) return { fill: null, data };
 
@@ -818,6 +848,10 @@ export async function upsertQboExpense(
                 updatedAt: true,
                 taxAmount: true,
                 taxDeductibleBase: true,
+                // Read for the classification test in planQboExpenseUpdate: a
+                // human's installed-at-customer answer counts as a tax
+                // classification even when no tax amount was recorded.
+                installedAtCustomer: true,
                 amount: true,
                 vendor: true,
                 date: true,
@@ -876,6 +910,7 @@ export async function upsertQboExpense(
             select: {
                 id: true, qbSyncToken: true, estimateId: true, projectId: true,
                 updatedAt: true, taxAmount: true, taxDeductibleBase: true, amount: true,
+                installedAtCustomer: true,
                 vendor: true, date: true, description: true, status: true,
             },
         });

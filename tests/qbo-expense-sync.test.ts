@@ -1597,13 +1597,86 @@ test("a gross below the recorded tax CLEARS the classification and flags review"
 });
 
 test("a gross that still covers the tax leaves the classification alone", () => {
+    // Same gross as before, so nothing about the receipt moved.
     const plan = planQboExpenseUpdate(
-        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 10, taxDeductibleBase: 50 },
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 100, taxAmount: 10, taxDeductibleBase: 50,
+        },
         { ...WRITE, amount: 100 },
     );
     assert.ok(!("taxAmount" in plan.data));
     assert.ok(!("needsTaxReview" in plan.data));
     assert.ok(!("installedAtCustomer" in plan.data));
+});
+
+// ── ANY amount change re-opens a classification (Codex round 13, item 1) ───
+
+test("an ORDINARY increase on a classified row asks for review", () => {
+    // Nothing here breaks an invariant: $498.30 still covers $34.06 of tax and
+    // a $380 allocation. But the human classified a $412.10 receipt, and this
+    // is no longer that receipt.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 412.1, taxAmount: 34.06, taxDeductibleBase: 380,
+        },
+        { ...WRITE, amount: 498.3 },
+    );
+    assert.equal(plan.data.needsTaxReview, true);
+    // The classification is KEPT — it may still be right, and throwing away a
+    // human's numbers is not this function's call. It is only re-opened.
+    assert.ok(!("taxAmount" in plan.data), "not cleared, just flagged");
+    assert.ok(!("installedAtCustomer" in plan.data));
+    assert.ok(!("taxDeductibleBase" in plan.data));
+});
+
+test("an ORDINARY decrease that still satisfies every check asks for review", () => {
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 412.1, taxAmount: 34.06, taxDeductibleBase: 100,
+        },
+        { ...WRITE, amount: 300 },
+    );
+    assert.equal(plan.data.needsTaxReview, true);
+    assert.ok(!("taxDeductibleBase" in plan.data), "the allocation still fits, so it stands");
+});
+
+test("an installed-at-customer answer alone is a classification", () => {
+    // The row a bookkeeper answered "yes" on but never split: no tax amount,
+    // no allocation, and it is exactly the row the excise report reads.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 412.1, installedAtCustomer: true,
+        },
+        { ...WRITE, amount: 498.3 },
+    );
+    assert.equal(plan.data.needsTaxReview, true);
+});
+
+test("an UNclassified row is not flagged by an amount change", () => {
+    // No human answer to invalidate — flagging every re-synced purchase would
+    // bury the ones that matter.
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", amount: 412.1 },
+        { ...WRITE, amount: 498.3 },
+    );
+    assert.ok(!("needsTaxReview" in plan.data));
+});
+
+test("a classified row whose gross did NOT move is left alone", () => {
+    // Cent-level equality, not object identity: the same money arriving as a
+    // Decimal string must not read as a change on every single sync.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: "412.10" as unknown as number, taxAmount: 34.06,
+        },
+        { ...WRITE, amount: 412.1 },
+    );
+    assert.ok(!("needsTaxReview" in plan.data));
 });
 
 test("clearing a tax classification is never reported as 'unchanged'", () => {
@@ -1710,8 +1783,12 @@ test("a tax PATCH landing mid-sync is NOT clobbered — the sync re-plans", asyn
     const after = fake.rows.get("purchase-1") as any;
     assert.equal(after.amount, 300, "the sync's own facts still land");
     assert.equal(after.taxAmount, 16.55, "the bookkeeper's correction survives");
-    assert.notEqual(after.needsTaxReview, true, "and it is not flagged on a stale premise");
     assert.equal(after.installedAtCustomer, true, "nor is their tax answer discarded");
+    // The gross DID move ($125.50 -> $300) on a row carrying a human's tax
+    // answer, so the re-plan flags it for review — a different outcome from the
+    // stale plan, which would have retired the classification outright. What
+    // the CAS protects is the correction itself, not the flag.
+    assert.equal(after.needsTaxReview, true, "re-opened by the real amount change");
 });
 
 test("invalidating an ALLOCATION also flags the row — never a silent null", async () => {
