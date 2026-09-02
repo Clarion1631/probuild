@@ -10,8 +10,8 @@
 //
 // Usage: node scripts/apply-estimate-items-revision.mjs
 import { PrismaClient } from "@prisma/client";
-import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import fs from "node:fs";
 
 // Same resolution the sibling apply-*.mjs scripts use: env first, then the
 // checked-out .env files, since these are run by hand rather than by Next.
@@ -33,9 +33,6 @@ const STATEMENTS = [
 ];
 
 async function main() {
-    url = resolveDatabaseUrl();
-    prisma = new PrismaClient({ datasources: { db: { url } } });
-
     console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
 
     for (const sql of STATEMENTS) {
@@ -54,10 +51,12 @@ async function main() {
 
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
     main()
         .catch(error => {
             console.error(error);
             process.exitCode = 1;
         })
-        .finally(() => prisma?.$disconnect());
+        .finally(() => prisma.$disconnect());
 }

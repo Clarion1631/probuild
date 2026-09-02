@@ -35,8 +35,6 @@ const STATEMENTS = [
 ];
 
 async function main() {
-    url = resolveDatabaseUrl();
-    prisma = new PrismaClient({ datasources: { db: { url } } });
     console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
 
     for (const sql of STATEMENTS) {
@@ -63,10 +61,12 @@ async function main() {
 
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
     main()
         .catch(error => {
             console.error(error);
             process.exitCode = 1;
         })
-        .finally(() => prisma?.$disconnect());
+        .finally(() => prisma.$disconnect());
 }
