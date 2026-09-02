@@ -25,6 +25,7 @@ function makeHandlers(overrides: Partial<BankLedgerIngestHandlerDependencies> = 
             return { statementImportId: "stmt-1", inserted: (input as { lines: unknown[] }).lines.length };
         },
         findExistingQboObservations: async () => new Map(),
+        refreshQboDescriptors: async () => 0,
         createQboObservations: async rows => {
             createQboObservationsCalls.push(...rows);
             return rows.length;
@@ -296,7 +297,7 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 0 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 0, descriptorsRefreshed: 0 });
         assert.equal(createQboObservationsCalls.length, 1);
     });
 
@@ -346,7 +347,7 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1, descriptorsRefreshed: 0 });
         assert.equal(createQboObservationsCalls.length, 0);
     });
 
@@ -368,7 +369,7 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
         ])));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1 });
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1, descriptorsRefreshed: 0 });
         assert.equal(createQboObservationsCalls.length, 1);
     });
 

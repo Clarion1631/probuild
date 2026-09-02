@@ -77,13 +77,6 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT
 -- real charges, so it belongs in the same class.
 ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY;
 
--- 5. Worker OWNERSHIP, separate from scheduling. `nextRetryAt` answers "when
--- should the worker look at this next"; it was also being used as a lock, which
--- conflated retry backoff with in-flight processing — a human could not void a
--- row that was merely waiting, and a row genuinely mid-send looked free as soon
--- as its backoff elapsed.
-ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
-ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
 
 -- The card delivery state machine. POSTING is written BEFORE the webhook call,
 -- so a crash mid-send is distinguishable from a crash before it — otherwise the

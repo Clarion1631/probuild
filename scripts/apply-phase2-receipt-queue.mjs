@@ -143,11 +143,6 @@ export const statements = [
     // void it there.
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT`,
 
-    // 5. Worker OWNERSHIP, separate from scheduling. `nextRetryAt` answers
-    // "when should the worker look at this next"; it was also being used as a
-    // lock, which conflated retry backoff with in-flight processing.
-    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
-    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
 
     // RLS, matching ReceiptIntake and every other sensitive table here. ENABLE
     // with no policies and WITHOUT FORCE: the app connects as the owner/service
@@ -189,8 +184,6 @@ const expectedColumns = {
     ],
     ReceiptIntake: [
         { name: "postVoidQbPurchaseId", type: "text", nullable: true, default: null },
-        { name: "claimToken", type: "text", nullable: true, default: null },
-        { name: "claimedAt", type: "timestamp without time zone", nullable: true, default: null },
     ],
 };
 

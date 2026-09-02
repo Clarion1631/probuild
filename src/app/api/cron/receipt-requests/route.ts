@@ -509,8 +509,15 @@ export async function GET(request: Request) {
     // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
     // even briefly block the real run.
     const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
-    if (continueOnly && !(await readCursor())) {
-        return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
+    if (continueOnly) {
+        // BOTH cursors. The sweep has two independent passes with two resume
+        // points, and asking only about the line cursor meant a half-finished
+        // OPEN-ISSUE pass looked like nothing in progress — so the resume pass
+        // exited and that backlog waited for tomorrow's full sweep.
+        const [lineCursor, openCursor] = await Promise.all([readCursor(), readOpenCursor()]);
+        if (!lineCursor && !openCursor) {
+            return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
+        }
     }
 
     const leaseToken = randomUUID();
@@ -719,7 +726,8 @@ async function runSweep(now: Date) {
         bankLines: linesSeen,
         undecided,
         exhausted,
-        moreToProcess: !exhausted,
+        // Work remains if EITHER pass has more to do.
+        moreToProcess: !exhausted || !openExhausted,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,

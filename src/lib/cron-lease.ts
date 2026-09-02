@@ -46,7 +46,7 @@ export async function takeLease(key: string, leaseMs: number, now: Date, token: 
             // The advisory lock is still worth taking, but only for what it can
             // honestly do: serialize the CLAIM itself. The row is what covers
             // the run.
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
             const existing = await tx.automationSetting.findUnique({ where: { key } });
             if (existing) {
                 const held = parse(existing.value);

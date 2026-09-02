@@ -162,12 +162,41 @@ function normalizeCheckNumberForHash(value: string | null): string | null {
  * false-positive a 409 — only a genuine content change does.
  */
 export function computeQboLineContentHash(input: QboLineContentHashInput): string {
+    // CANONICAL IDENTITY, not descriptor text.
+    //
+    // Hashing the raw descriptor made a formatting change a RESTATEMENT: when
+    // the pull stopped appending the QBO transaction type, every observation
+    // stored under the old format ("LOWES #02516 Expense") hashed differently
+    // from the same transaction re-read today ("LOWES #02516 POS DEB C#8516"),
+    // so the ingest answered 409 and the nightly pull stalled on rows that had
+    // not changed at all.
+    //
+    // What actually identifies a QuickBooks transaction is its amount, its
+    // posted date, its check number and WHO it was with — so the payee is
+    // canonicalized through the same `bankLineIdentityPayee` that reconcile,
+    // minting and adoption use. A descriptor-only difference is then not a
+    // content change, and the caller updates the stored text in place.
     return versionedHash([
         input.postedDate,
         input.amountCents,
-        normalizeDescriptorForHash(input.rawDescriptor),
+        bankLineIdentityPayee({ memo: input.rawDescriptor }),
         normalizeCheckNumberForHash(input.checkNumber),
     ]);
+}
+
+/**
+ * True when two sightings of one qbTxnId differ ONLY in descriptor text.
+ *
+ * Same identity, different words: not a restatement, just a better (or older)
+ * rendering of the same transaction. The stored descriptor should move to the
+ * newer text rather than the request being refused.
+ */
+export function isDescriptorOnlyChange(
+    stored: QboLineContentHashInput,
+    incoming: QboLineContentHashInput,
+): boolean {
+    if (computeQboLineContentHash(stored) !== computeQboLineContentHash(incoming)) return false;
+    return normalizeDescriptorForHash(stored.rawDescriptor) !== normalizeDescriptorForHash(incoming.rawDescriptor);
 }
 
 // ── Validation helpers ────────────────────────────────────────────────────
@@ -319,9 +348,25 @@ export interface ReconcileResult {
  * carries — every comparison missed, so nothing reconciled, nothing adopted,
  * and minting produced twins. The type is not identity and never appears here.
  */
+/**
+ * QuickBooks transaction-type words an OLDER version of the register pull
+ * appended to the payee ("LOWES #02516 Expense").
+ *
+ * The pull stopped doing that, but rows stored while it did are still in the
+ * table — and if the canonical payee sees them differently from the same
+ * transaction re-read today, every one of them reads as a RESTATEMENT and the
+ * nightly pull 409s forever on data that never changed. Stripping the suffix is
+ * symmetric (both sides run this function), so it costs nothing on current-
+ * format rows and buys compatibility with the old ones.
+ *
+ * Longest-first, so "SALES TAX PAYMENT" is not eaten as "PAYMENT".
+ */
+const LEGACY_QBO_TYPE_SUFFIX =
+    /\s+(?:SALES TAX PAYMENT|CREDIT CARD (?:CREDIT|EXPENSE|PURCHASE|REFUND)|BILL PAYMENT|JOURNAL ENTRY|REFUND RECEIPT|VENDOR CREDIT|CASH PURCHASE|EXPENDITURE|DEPOSIT|TRANSFER|PURCHASE|PAYMENT|EXPENSE|REFUND|CREDIT|CHECK|BILL)$/;
+
 export function bankLineIdentityPayee(row: { memo?: string | null; name?: string | null }): string {
     const source = (row.memo ?? "").trim() || (row.name ?? "").trim();
-    return normalizePayee(source);
+    return normalizePayee(source).replace(LEGACY_QBO_TYPE_SUFFIX, "").trim();
 }
 
 /**

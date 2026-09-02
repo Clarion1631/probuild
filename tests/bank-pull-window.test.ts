@@ -5,6 +5,8 @@ import {
     PULL_MAX_WINDOW_DAYS,
     PULL_OVERLAP_DAYS,
     highWaterOf,
+    resumeAfter,
+    type PullWindowState,
     planPullWindow,
     runBankRegisterPull,
     type BankRegisterIngestLine,
@@ -121,10 +123,10 @@ test("inside budget, nothing is left behind", async () => {
 });
 
 test("the high-water mark advances only on a clean, COMPLETE run", async () => {
-    const saved: Array<{ highWater: string | null; lastFullSweep: string | null }> = [];
+    const saved: PullWindowState[] = [];
     const base = {
         windowState: { highWater: "2026-08-30", lastFullSweep: "2026-09-01" },
-        saveWindowState: async (next: { highWater: string | null; lastFullSweep: string | null }) => { saved.push(next); },
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
         elapsedMs: () => 0,
         budgetMs: 45_000,
     };
@@ -139,9 +141,11 @@ test("the high-water mark advances only on a clean, COMPLETE run", async () => {
         ...base,
         ingest: async () => ({ status: 500, body: { ok: false, reason: "boom" } }),
     }));
-    assert.deepEqual(saved, []);
+    assert.equal(saved.length, 0, "a failed ingest must not step the window");
 
-    // Nor may a run that ran out of budget with work left.
+    // A run that ran out of budget DOES write — it has to persist where it
+    // stopped — but the MARK must not move, or the next window would step past
+    // rows this run never stored.
     saved.length = 0;
     let clock = 0;
     await runBankRegisterPull(deps({
@@ -149,7 +153,8 @@ test("the high-water mark advances only on a clean, COMPLETE run", async () => {
         elapsedMs: () => (clock += 20_000) - 20_000,
         budgetMs: 25_000,
     }));
-    assert.deepEqual(saved, []);
+    assert.equal(saved.length, 1, "the continuation point is persisted");
+    assert.equal(saved[0].highWater, "2026-08-30", "but the mark is unchanged");
 });
 
 test("a window-state write failure fails the run", async () => {
@@ -164,12 +169,85 @@ test("a window-state write failure fails the run", async () => {
 });
 
 test("the deep sweep stamps its own date so the next one is a week away", async () => {
-    const saved: Array<{ highWater: string | null; lastFullSweep: string | null }> = [];
+    const saved: PullWindowState[] = [];
     await runBankRegisterPull(deps({
         windowState: { highWater: "2026-09-01", lastFullSweep: null },
-        saveWindowState: async (next: { highWater: string | null; lastFullSweep: string | null }) => { saved.push(next); },
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
         elapsedMs: () => 0,
         budgetMs: 45_000,
     }));
     assert.equal(saved[0].lastFullSweep, TODAY);
+});
+
+// ── The intra-window continuation cursor (round-10 item 3) ─────────────────
+
+test("resumeAfter drops the prefix already posted, in (date, qbTxnId) order", () => {
+    const l = (postedDate: string, qbTxnId: string): BankRegisterIngestLine =>
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId });
+    const lines = [l("2026-08-02", "b"), l("2026-08-01", "z"), l("2026-08-02", "a")];
+
+    // No resume point: everything, but ORDERED — the order is what makes
+    // "after" mean the same thing on the next run.
+    assert.deepEqual(resumeAfter(lines, null).map(x => `${x.postedDate}/${x.qbTxnId}`),
+        ["2026-08-01/z", "2026-08-02/a", "2026-08-02/b"]);
+
+    // Same date, different id: the tie-break must be total or a dozen
+    // transactions on one day would replay forever.
+    assert.deepEqual(resumeAfter(lines, { postedDate: "2026-08-02", qbTxnId: "a" }).map(x => x.qbTxnId), ["b"]);
+    assert.deepEqual(resumeAfter(lines, { postedDate: "2026-08-02", qbTxnId: "b" }), []);
+});
+
+test("two budget-limited runs make PROGRESS instead of replaying the same prefix", async () => {
+    // The high-water mark only moves on a COMPLETE run, which is right — but it
+    // meant a half-finished run recorded nothing, so the next one re-fetched
+    // the same window and died at the same place. A big backlog never drained.
+    const posted: string[][] = [];
+    const state: { highWater: string | null; lastFullSweep: string | null; continueAfter?: { postedDate: string; qbTxnId: string } | null } = {
+        highWater: "2026-08-30", lastFullSweep: "2026-09-01", continueAfter: null,
+    };
+    const run = async () => {
+        let clock = 0;
+        return runBankRegisterPull({
+            now: () => Date.parse("2026-09-02T02:00:00Z"),
+            fetchRows: async () => ({ rows: ROWS, stale: false }),
+            ingest: async (_a, batch) => {
+                posted.push(batch.map(l => l.qbTxnId));
+                return { status: 200, body: { ok: true, inserted: batch.length, existing: 0 } };
+            },
+            reconcile: async () => ({ linked: 0, proposed: 0 }),
+            windowState: { ...state },
+            saveWindowState: async next => { Object.assign(state, next); },
+            elapsedMs: () => (clock += 20_000) - 20_000,
+            budgetMs: 25_000,
+        });
+    };
+
+    const first = await run();
+    assert.equal(first.continues, true);
+    assert.ok(first.continueAfter, "it must record where it stopped");
+    assert.deepEqual(state.continueAfter, first.continueAfter, "and persist it");
+    assert.equal(state.highWater, "2026-08-30", "the mark does NOT move on a partial run");
+
+    const firstIds = posted.flat();
+    posted.length = 0;
+    const second = await run();
+    const secondIds = posted.flat();
+
+    assert.deepEqual(second.resumedAfter, first.continueAfter, "the second run picks up where the first stopped");
+    assert.equal(secondIds.length > 0, true, "and it does real work");
+    assert.equal(firstIds.some(id => secondIds.includes(id)), false, "no batch is posted twice");
+});
+
+test("a COMPLETE run clears the continuation point", async () => {
+    const state: PullWindowState = {
+        highWater: "2026-08-30", lastFullSweep: "2026-09-01",
+        continueAfter: { postedDate: "2026-08-30", qbTxnId: "txn-5" },
+    };
+    await runBankRegisterPull(deps({
+        windowState: { ...state },
+        saveWindowState: async (next: PullWindowState) => { Object.assign(state, next); },
+        elapsedMs: () => 0,
+        budgetMs: 45_000,
+    }));
+    assert.equal(state.continueAfter, null, "finished means there is nothing to resume");
 });

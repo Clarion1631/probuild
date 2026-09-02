@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
+    isDescriptorOnlyChange,
     normalizePayee,
     computeStatementContentHash,
     computeQboLineContentHash,
@@ -219,6 +220,12 @@ export interface BankLedgerIngestHandlerDependencies {
      * caller (handleQboRegister below) treats any throw here as "nothing
      * from this call was persisted."
      */
+    /**
+     * Updates the stored descriptor for observations whose identity is
+     * unchanged. Returns how many rows were touched.
+     */
+    refreshQboDescriptors(account: string, rows: Array<{ qbTxnId: string; rawDescriptor: string }>): Promise<number>;
+
     createQboObservations(rows: Array<{
         account: string;
         postedDate: string;
@@ -340,11 +347,24 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         const qbTxnIds = [...seenInRequest.keys()];
         const existing = await dependencies.findExistingQboObservations(account, qbTxnIds);
 
+        // A DESCRIPTOR-ONLY difference is not a restatement. Rows stored before
+        // the pull stopped appending the transaction type carry the old text;
+        // refusing them would stall the nightly pull forever on transactions
+        // that never changed. Same identity, newer words: take the newer words.
+        const refreshDescriptors: Array<{ qbTxnId: string; rawDescriptor: string }> = [];
         for (const line of validated) {
             const priorContent = existing.get(line.qbTxnId);
-            if (priorContent && computeQboLineContentHash(priorContent) !== computeQboLineContentHash(line)) {
+            if (!priorContent) continue;
+            if (computeQboLineContentHash(priorContent) !== computeQboLineContentHash(line)) {
                 return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: line.qbTxnId }, { status: 409 });
             }
+            if (isDescriptorOnlyChange(priorContent, line)) {
+                refreshDescriptors.push({ qbTxnId: line.qbTxnId, rawDescriptor: line.rawDescriptor });
+            }
+        }
+        let descriptorsRefreshed = 0;
+        if (refreshDescriptors.length > 0) {
+            descriptorsRefreshed = await dependencies.refreshQboDescriptors(account, refreshDescriptors);
         }
 
         // Content-identical repeats (already stored, or duplicated within this
@@ -383,7 +403,7 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         }
         const existingCount = validated.length - inserted;
 
-        return NextResponse.json({ ok: true, inserted, existing: existingCount });
+        return NextResponse.json({ ok: true, inserted, existing: existingCount, descriptorsRefreshed });
     }
 
     return {
@@ -464,7 +484,7 @@ const handlers = createBankLedgerIngestHandlers({
                 // the adoption read and every write below. Without it a mint
                 // committing between this read and these inserts would leave a
                 // QBO line the statement never adopted, plus the twin.
-                await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
 
                 // ADOPTION (Justin, decision 3). The nightly QBO pull may have
                 // already minted a canonical line for some of these
@@ -627,6 +647,23 @@ const handlers = createBankLedgerIngestHandlers({
             });
         }
         return result;
+    },
+
+    refreshQboDescriptors: async (account, rows) => {
+        let touched = 0;
+        for (const row of rows) {
+            const result = await prisma.bankLineObservation.updateMany({
+                where: {
+                    source: "QBO_REGISTER",
+                    account,
+                    sourceDocumentId: "QBO_REGISTER",
+                    sourceLineId: row.qbTxnId,
+                },
+                data: { rawDescriptor: row.rawDescriptor },
+            });
+            touched += result.count;
+        }
+        return touched;
     },
 
     createQboObservations: async rows => {

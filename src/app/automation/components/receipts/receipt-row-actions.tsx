@@ -43,10 +43,13 @@ export function SetJobControl({
     intakeId,
     jobs,
     currentProjectId,
+    expectedState,
 }: {
     intakeId: string;
     jobs: Array<{ id: string; name: string }>;
     currentProjectId: string | null;
+    /** The state this row was RENDERED with — the server CASes on it. */
+    expectedState: string;
 }) {
     const [projectId, setProjectId] = useState(currentProjectId ?? "");
     const { pending, run } = useAction("Job set — the pipeline will pick it up");
@@ -70,7 +73,7 @@ export function SetJobControl({
                 type="button"
                 className={BTN}
                 disabled={pending || !projectId}
-                onClick={() => run(() => setReceiptIntakeJob(intakeId, projectId))}
+                onClick={() => run(() => setReceiptIntakeJob(intakeId, projectId, expectedState))}
             >
                 Set job
             </button>
@@ -87,7 +90,7 @@ export function RetryButton({ intakeId }: { intakeId: string }) {
     );
 }
 
-export function VoidButton({ intakeId }: { intakeId: string }) {
+export function VoidButton({ intakeId, expectedState }: { intakeId: string; expectedState: string }) {
     const { pending, run } = useAction("Voided");
     return (
         <button
@@ -96,7 +99,7 @@ export function VoidButton({ intakeId }: { intakeId: string }) {
             disabled={pending}
             onClick={() => {
                 if (!window.confirm("Void this receipt? It stops being processed. A booked receipt can't be voided.")) return;
-                run(() => voidReceiptIntake(intakeId));
+                run(() => voidReceiptIntake(intakeId, expectedState));
             }}
         >
             Void
@@ -113,7 +116,7 @@ export function NotADuplicateButton({ intakeId }: { intakeId: string }) {
     );
 }
 
-export function MarkDuplicateControl({ intakeId }: { intakeId: string }) {
+export function MarkDuplicateControl({ intakeId, expectedState }: { intakeId: string; expectedState: string }) {
     const [duplicateOfId, setDuplicateOfId] = useState("");
     const { pending, run } = useAction("Marked as a duplicate");
     return (
@@ -131,7 +134,7 @@ export function MarkDuplicateControl({ intakeId }: { intakeId: string }) {
                 type="button"
                 className={BTN}
                 disabled={pending || !duplicateOfId}
-                onClick={() => run(() => markReceiptIntakeDuplicate(intakeId, duplicateOfId))}
+                onClick={() => run(() => markReceiptIntakeDuplicate(intakeId, duplicateOfId, expectedState))}
             >
                 Mark duplicate
             </button>

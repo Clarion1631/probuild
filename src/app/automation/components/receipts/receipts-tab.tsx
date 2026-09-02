@@ -200,9 +200,9 @@ export function ReceiptsTab({
                             <RowShell key={row.id}>
                                 <RowFacts row={row} />
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} />
+                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} />
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <VoidButton intakeId={row.id} />
+                                    <VoidButton intakeId={row.id} expectedState={row.state} />
                                 </div>
                             </RowShell>
                         ))
@@ -238,16 +238,16 @@ export function ReceiptsTab({
                                     )}
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} />
+                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} />
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <MarkDuplicateControl intakeId={row.id} />
+                                    <MarkDuplicateControl intakeId={row.id} expectedState={row.state} />
                                     {/* Only offered when a retry can actually
                                         do something. A document VERDICT
                                         (multi-doc, a duplicate, no estimate)
                                         needs a decision, not another attempt —
                                         the button would just park it again. */}
                                     {retryTargetFor(row.state, row.stateReason) && <RetryButton intakeId={row.id} />}
-                                    <VoidButton intakeId={row.id} />
+                                    <VoidButton intakeId={row.id} expectedState={row.state} />
                                 </div>
                             </RowShell>
                         ))
@@ -273,7 +273,7 @@ export function ReceiptsTab({
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <ReceiptLink storagePath={row.storagePath} />
                                     <RetryButton intakeId={row.id} />
-                                    <VoidButton intakeId={row.id} />
+                                    <VoidButton intakeId={row.id} expectedState={row.state} />
                                 </div>
                             </RowShell>
                         ))

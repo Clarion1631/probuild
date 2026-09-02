@@ -190,6 +190,17 @@ export interface PullWindowState {
     highWater: string | null;
     /** When the last full 60-day sweep ran, YYYY-MM-DD, or null. */
     lastFullSweep: string | null;
+    /**
+     * WHERE INSIDE THE WINDOW the last run stopped: the TxnDate and qbTxnId of
+     * the last observation it actually posted.
+     *
+     * The high-water mark only moves for a COMPLETE run, which is right — but
+     * it meant a run that ran out of budget half way recorded nothing at all,
+     * so the next one re-fetched the same window, re-posted the same first
+     * batches, and ran out of budget at the same place. A big backlog could
+     * never drain. This is the resume point that makes progress monotonic.
+     */
+    continueAfter?: { postedDate: string; qbTxnId: string } | null;
 }
 
 export interface PullWindow {
@@ -255,6 +266,27 @@ export function planPullWindow(state: PullWindowState, now: Date): PullWindow {
 }
 
 /** The newest TxnDate in a converted batch — the new high-water mark. */
+/**
+ * Drop everything up to and including the continuation point.
+ *
+ * Ordered by (postedDate, qbTxnId) — the same total order the resume point is
+ * recorded in, so "after" is unambiguous even when a dozen transactions share a
+ * date. Re-posting is harmless (the ingest is idempotent), but re-posting the
+ * same prefix every run is what stopped the backlog draining.
+ */
+export function resumeAfter(
+    lines: readonly BankRegisterIngestLine[],
+    from: { postedDate: string; qbTxnId: string } | null | undefined,
+): BankRegisterIngestLine[] {
+    const ordered = [...lines].sort((a, b) =>
+        (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1
+            : a.qbTxnId < b.qbTxnId ? -1 : a.qbTxnId > b.qbTxnId ? 1 : 0));
+    if (!from) return ordered;
+    return ordered.filter(line =>
+        line.postedDate > from.postedDate
+        || (line.postedDate === from.postedDate && line.qbTxnId > from.qbTxnId));
+}
+
 export function highWaterOf(lines: readonly BankRegisterIngestLine[], previous: string | null): string | null {
     let best = previous;
     for (const line of lines) {
@@ -329,6 +361,10 @@ export interface BankRegisterPullSummary {
      */
     conflictQbTxnIds?: string[];
     reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number } | null;
+    /** The point this run resumed FROM, when it resumed. */
+    resumedAfter?: { postedDate: string; qbTxnId: string } | null;
+    /** The point the NEXT run should resume from, when this one stopped early. */
+    continueAfter?: { postedDate: string; qbTxnId: string } | null;
     /** True when the run stopped on its own budget with work left behind. */
     continues?: boolean;
     /** Batches not attempted this invocation — the durable continuation point. */
@@ -407,8 +443,14 @@ export async function runBankRegisterPull(
     // all, so the next run re-fetched the same window and died at the same
     // point. Now the run stops on its own terms, records how far it got, and
     // says so.
-    const batches = chunkLines(lines, BANK_REGISTER_CHUNK_SIZE);
+    // RESUME INSIDE THE WINDOW. Ordered, and past whatever the last run
+    // finished, so a budget-limited run makes real progress every time instead
+    // of re-posting its own first batches.
+    const pending = resumeAfter(lines, dependencies.windowState?.continueAfter);
+    summary.resumedAfter = dependencies.windowState?.continueAfter ?? null;
+    const batches = chunkLines(pending, BANK_REGISTER_CHUNK_SIZE);
     let batchIndex = 0;
+    let lastPosted: BankRegisterIngestLine | null = null;
     for (const batch of batches) {
         if (elapsed() >= budgetMs) {
             summary.continues = true;
@@ -420,6 +462,7 @@ export async function runBankRegisterPull(
         if (status === 200 && body?.ok) {
             summary.inserted += body.inserted ?? 0;
             summary.existing += body.existing ?? 0;
+            lastPosted = batch[batch.length - 1] ?? lastPosted;
             continue;
         }
         summary.ok = false;
@@ -485,15 +528,27 @@ export async function runBankRegisterPull(
     // THE HIGH-WATER MARK MOVES ONLY ON A CLEAN, COMPLETE RUN. Advancing it
     // after a partial or conflicted pull would step the next run's window past
     // rows this one never actually stored.
-    if (dependencies.saveWindowState && dependencies.windowState && summary.ok && !summary.continues) {
-        const highWater = highWaterOf(lines, dependencies.windowState.highWater);
+    // A run that stopped early records WHERE, so the next one carries on.
+    if (summary.continues && lastPosted) {
+        summary.continueAfter = { postedDate: lastPosted.postedDate, qbTxnId: lastPosted.qbTxnId };
+    }
+
+    if (dependencies.saveWindowState && dependencies.windowState && summary.ok) {
+        const complete = !summary.continues;
+        // The high-water mark still only moves for a COMPLETE run — stepping
+        // the window past rows this one never stored would lose them.
+        const highWater = complete
+            ? highWaterOf(lines, dependencies.windowState.highWater)
+            : dependencies.windowState.highWater;
         summary.highWater = highWater;
         try {
             await dependencies.saveWindowState({
                 highWater,
-                lastFullSweep: planned.fullSweep
+                lastFullSweep: complete && planned.fullSweep
                     ? endDate
                     : dependencies.windowState.lastFullSweep,
+                // Cleared on a complete run; set when we stopped part way.
+                continueAfter: complete ? null : summary.continueAfter ?? dependencies.windowState.continueAfter ?? null,
             });
         } catch (error) {
             // Same reasoning as the sweep's cursor: work committed, the

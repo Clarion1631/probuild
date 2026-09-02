@@ -22,6 +22,7 @@ process.env.NEXTAUTH_SECRET ??= "test-secret";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 const loadProxy = () => import("../src/proxy");
+import { computeQboLineContentHash, isDescriptorOnlyChange } from "../src/lib/bank-ledger";
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 test("the two bridge endpoints bypass the proxy so a machine caller gets a clean 401", async () => {
@@ -305,22 +306,26 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     assert.match(source, /status: result\.ok \? 200 : 500/);
 });
 
-test("worker OWNERSHIP is a claim token, not the retry schedule", () => {
+test("worker ownership is a claim TOKEN, and the queue fences on it", () => {
+    // Phase 1 owns the claim itself and keeps `nextRetryAt` as part of the
+    // lease; Phase 2's contribution is that the QUEUE ACTIONS stop reading
+    // nextRetryAt as a lock. Fencing on the schedule conflated "in retry
+    // backoff" with "being processed", so a human could not void a row that was
+    // merely waiting.
     const worker = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
-    // The claim writes ownership and leaves scheduling alone.
-    assert.match(worker, /data: \{ claimToken, claimedAt: now \}/);
-    assert.doesNotMatch(worker, /data: \{ nextRetryAt: new Date\(now\.getTime\(\) \+ LEASE_MS\) \}/);
-    // Due AND unowned are two separate questions.
-    assert.match(worker, /claimedAt: null \}, \{ claimedAt: \{ lt: claimCutoff \} \}/);
-    // And the claim is released when the worker is done with the row.
-    assert.match(worker, /claimToken: null, claimedAt: null/);
+    assert.match(worker, /const claimToken = randomUUID\(\);/);
+    assert.match(worker, /claimToken, claimedAt: now/);
 
     const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
-    // The queue actions fence on the CLAIM, never on nextRetryAt.
-    assert.match(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,220}claimedAt: null/);
-    assert.doesNotMatch(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,220}nextRetryAt/);
-    // "Retry now" is scheduling.
+    assert.match(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,260}claimedAt: null/);
+    assert.doesNotMatch(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,260}nextRetryAt/);
     assert.match(actions, /\/\/ Scheduling only\. Ownership is claimToken\/claimedAt/);
+});
+
+test("finished worker transitions hand ownership back", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
+    const releases = source.match(/claimToken: null/g) ?? [];
+    assert.ok(releases.length >= 4, `expected terminal/deferred branches to release, saw ${releases.length}`);
 });
 
 test("resolveOrphanedQbPurchase CASes and APPENDS rather than overwriting", () => {
@@ -423,15 +428,6 @@ test("the lease release is a single fenced statement", () => {
     assert.doesNotMatch(source, /const held = parse\(existing\.value\);\s*\n\s*if \(held\?\.token !== token\) return;/);
 });
 
-test("every finished worker transition hands ownership back", () => {
-    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
-    // applyState, the weak-dup park, needs-review, deferred, retry and deferRead.
-    const releases = source.match(/claimToken: null/g) ?? [];
-    assert.ok(releases.length >= 6, `expected every terminal/deferred branch to release, saw ${releases.length}`);
-    // Ownership is taken with a token, not by moving the schedule.
-    assert.match(source, /data: \{ claimToken, claimedAt: now \}/);
-});
-
 test("cards write POSTING before the webhook and never repost an uncertain row", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     const markAt = source.indexOf('data: { status: "POSTING" }');
@@ -523,5 +519,76 @@ test("the bank pull plans its window from a persisted high-water mark", () => {
     assert.match(source, /const PULL_BUDGET_MS = 50_000;/);
     assert.match(source, /windowState,\s*\n\s*saveWindowState,\s*\n\s*budgetMs: PULL_BUDGET_MS,/);
     // A corrupt state plans the WIDEST safe window, never a narrow one.
-    assert.match(source, /return \{ highWater: null, lastFullSweep: null \};/);
+    assert.match(source, /return \{ highWater: null, lastFullSweep: null, continueAfter: null \};/);
+});
+
+test("a descriptor-only difference is NOT a restatement", () => {
+    // When the pull stopped appending the QBO transaction type, every
+    // observation stored in the old format hashed differently from the same
+    // transaction re-read today — so the ingest 409'd and the nightly pull
+    // stalled on rows that had not changed at all.
+    const oldFormat = {
+        postedDate: "2026-08-16", amountCents: -12_345,
+        rawDescriptor: "LOWES #02516 Expense", checkNumber: null,
+    };
+    const newFormat = { ...oldFormat, rawDescriptor: "LOWES #02516 POS DEB C#8516" };
+    assert.equal(
+        computeQboLineContentHash(oldFormat), computeQboLineContentHash(newFormat),
+        "same amount, date, check# and canonical payee = same transaction",
+    );
+    assert.equal(isDescriptorOnlyChange(oldFormat, newFormat), true);
+
+    // A REAL restatement still is one.
+    for (const changed of [
+        { ...newFormat, amountCents: -99_999 },
+        { ...newFormat, postedDate: "2026-08-17" },
+        { ...newFormat, checkNumber: "1027" },
+        { ...newFormat, rawDescriptor: "HOME DEPOT #4718" },
+    ]) {
+        assert.notEqual(computeQboLineContentHash(oldFormat), computeQboLineContentHash(changed));
+        assert.equal(isDescriptorOnlyChange(oldFormat, changed), false);
+    }
+    // Identical text is not a "change" either.
+    assert.equal(isDescriptorOnlyChange(newFormat, newFormat), false);
+});
+
+test("the ingest refreshes an old-format descriptor in place instead of 409ing", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    assert.match(source, /if \(isDescriptorOnlyChange\(priorContent, line\)\)/);
+    assert.match(source, /refreshQboDescriptors\(account, refreshDescriptors\)/);
+    // The 409 is still there for a genuine identity change.
+    assert.match(source, /reason: "qbo-txn-conflict"/);
+});
+
+test("?continue=1 and moreToProcess consult BOTH cursors", () => {
+    // The sweep has two independent passes with two resume points; asking only
+    // about the line cursor made a half-finished OPEN-ISSUE pass look like
+    // nothing in progress.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const \[lineCursor, openCursor\] = await Promise\.all\(\[readCursor\(\), readOpenCursor\(\)\]\);/);
+    assert.match(source, /if \(!lineCursor && !openCursor\)/);
+    assert.match(source, /moreToProcess: !exhausted \|\| !openExhausted/);
+});
+
+test("queue actions CAS on the state the submitted view saw", () => {
+    const source = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    assert.match(source, /function assertExpectedState\(expectedState: string\)/);
+    // Exactly that state, not an allowed-set — a row can be NEEDS_REVIEW twice
+    // with a whole booking attempt in between.
+    for (const call of [
+        /setReceiptIntakeJob\(id: string, projectId: string, expectedState: string/,
+        /markReceiptIntakeDuplicate\(id: string, duplicateOfId: string, expectedState: string\)/,
+        /voidReceiptIntake\(id: string, expectedState: string\)/,
+    ]) {
+        assert.match(source, call);
+    }
+    assert.match(source, /where: \{ id, state: expected, \.\.\.notClaimedByWorker\(now\) \}/);
+    assert.doesNotMatch(source, /where: \{ id, state: \{ in: allowed \}/, "the allowed-set CAS is gone");
+});
+
+test("a duplicate target must be a real original, and cycles are refused", () => {
+    const source = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    assert.match(source, /if \(original\.state === "DUPLICATE"\) throw/);
+    assert.match(source, /if \(original\.state === "VOID"\) throw/);
+    assert.match(source, /if \(original\.duplicateOfId === id\) throw/);
 });

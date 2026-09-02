@@ -122,6 +122,16 @@ const TEST_ONLY_DISPATCHER_PATHS = new Set([
     "/api/test-only/portal-estimate-actions",
 ]);
 
+/**
+ * True for a machine endpoint that must never dispatch a Server Action.
+ *
+ * A named export rather than an inline `.test()` so the rule can be asserted
+ * directly — a guard nobody can call is a guard nobody can prove.
+ */
+export function isMachineOnlyBypass(pathname: string) {
+    return MACHINE_ENDPOINT_PATTERN.test(pathname);
+}
+
 export function isPublicProxyBypass(pathname: string) {
     return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
 }

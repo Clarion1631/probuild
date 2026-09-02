@@ -177,20 +177,17 @@ export function isOfficeRail(rawDescriptor: string): boolean {
 /**
  * Every bank line that could plausibly claim the SAME evidence as `line`.
  *
- * One-to-one assignment is a property of the whole batch, not of one row: two
- * identical charges competing for one receipt resolve differently depending on
- * which is considered first. A retry that recomputed a single line in isolation
- * therefore saw "a matching receipt exists" and closed it — even though the
- * batch had already given that receipt to the other charge. This returns the
- * set that has to be recomputed TOGETHER for the answer to mean anything.
- *
- * "Could plausibly claim" is deliberately loose (same amount, within twice the
- * date window): being too wide only costs a few extra rows in a recompute,
- * while being too narrow reintroduces the bug.
+ * NOTE: this is the QUERY filter — deliberately wide, because a query has to be
+ * expressible in SQL. The true competition set is a CONNECTED COMPONENT (see
+ * `evidenceComponents`), which this filter is only guaranteed to contain, not
+ * to equal. Being too wide costs a few extra rows in a recompute; being too
+ * narrow reintroduces the bug.
  */
 export function competingLineFilter(line: { amountCents: number; postedDate: string }) {
     const day = dayNumber(line.postedDate);
-    const span = RECEIPT_MATCH_DATE_SLOP_DAYS * 2;
+    // Wide enough to contain a whole chain: A and C never touch directly but
+    // both touch B, so a ±2-day filter around A would miss C entirely.
+    const span = RECEIPT_MATCH_DATE_SLOP_DAYS * 4;
     return {
         amountCents: line.amountCents,
         from: day === null ? line.postedDate : ymdOf(day - span),
@@ -606,8 +603,73 @@ export function matchEvidenceToLines(
         return false;
     };
 
-    for (const line of lines) augment(line.id, new Set<string>());
+    // COMPONENT BY COMPONENT. Lines and evidence form a graph: an edge is
+    // "this receipt could answer this charge". Competition is transitive along
+    // that graph — charge A and charge C may share no candidate at all, yet
+    // both compete with B, so re-housing A can free the only receipt C can
+    // reach. Matching each connected component AS A WHOLE is what makes the
+    // 1/5/9 vs 3/7 case come out right; matching a same-amount bucket in date
+    // order does not, because the bucket is not the component.
+    //
+    // The augmenting search below is already global over `candidates`, so
+    // visiting lines in component order changes no result — it makes the
+    // grouping explicit, and gives `evidenceComponents` one place to be tested.
+    for (const component of evidenceComponents(lines, candidates)) {
+        for (const lineId of component) augment(lineId, new Set<string>());
+    }
     return assigned;
+}
+
+/**
+ * Union-find over the line×evidence adjacency, returning line ids grouped into
+ * connected components in a deterministic order.
+ *
+ * Two lines are in the same component when they can reach each other through a
+ * chain of shared candidate evidence, however long. A same-amount, same-window
+ * BUCKET is a coarser thing: it can split one real component across two
+ * buckets, and it can lump unrelated lines together.
+ */
+export function evidenceComponents(
+    lines: readonly { id: string }[],
+    candidates: ReadonlyMap<string, readonly EvidenceRow[]>,
+): string[][] {
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+        let root = x;
+        while (parent.get(root) !== undefined && parent.get(root) !== root) root = parent.get(root) as string;
+        // Path compression, so a long chain does not cost more each lookup.
+        let cursor = x;
+        while (parent.get(cursor) !== undefined && parent.get(cursor) !== cursor) {
+            const next = parent.get(cursor) as string;
+            parent.set(cursor, root);
+            cursor = next;
+        }
+        return root;
+    };
+    const union = (a: string, b: string) => {
+        const ra = find(a);
+        const rb = find(b);
+        if (ra !== rb) parent.set(rb, ra);
+    };
+
+    for (const line of lines) parent.set(`L:${line.id}`, `L:${line.id}`);
+    for (const line of lines) {
+        for (const row of candidates.get(line.id) ?? []) {
+            const key = `E:${row.unit}`;
+            if (parent.get(key) === undefined) parent.set(key, key);
+            union(`L:${line.id}`, key);
+        }
+    }
+
+    // Grouped in the caller's line order, so the output is stable run to run.
+    const groups = new Map<string, string[]>();
+    for (const line of lines) {
+        const root = find(`L:${line.id}`);
+        const group = groups.get(root);
+        if (group) group.push(line.id);
+        else groups.set(root, [line.id]);
+    }
+    return [...groups.values()];
 }
 
 // ── displayDetails merging ───────────────────────────────────────────────────

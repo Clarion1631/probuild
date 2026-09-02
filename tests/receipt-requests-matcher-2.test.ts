@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
     appendCardRecord,
     competingLineFilter,
+    evidenceComponents,
     matchEvidenceToLines,
     evidenceUnitKey,
     hasResolution,
@@ -346,10 +347,11 @@ test("the competing set is what must be recomputed together, never one line", ()
 test("competingLineFilter spans both directions of the match window", () => {
     const f = competingLineFilter({ amountCents: -12_345, postedDate: "2026-08-16" });
     assert.equal(f.amountCents, -12_345, "a different amount can never claim the same receipt");
-    // Twice the ±2-day match window, so a competitor that could reach the same
-    // evidence from the far side is still in the set.
-    assert.equal(f.from, "2026-08-12");
-    assert.equal(f.to, "2026-08-20");
+    // Wide enough to contain a whole CHAIN, not just direct neighbours: A and C
+    // may never touch each other yet both touch B, and splitting that component
+    // across two queries matches it wrongly in each.
+    assert.equal(f.from, "2026-08-08");
+    assert.equal(f.to, "2026-08-24");
 });
 
 test("two concurrent sweeps cannot both give one receipt away", async () => {
@@ -593,4 +595,91 @@ test("matchEvidenceToLines assigns each evidence unit at most once", () => {
     assert.equal(assigned.size, 2);
     const units = [...assigned.values()].map(row => row.unit);
     assert.equal(new Set(units).size, units.length, "no unit is handed to two lines");
+});
+
+// ── Competition is a CONNECTED COMPONENT (round-10 item 4) ─────────────────
+
+test("the 1/5/9 vs 3/7 chain: every charge is answered", () => {
+    // Charges on the 1st, 5th and 9th; receipts on the 3rd and 7th.
+    // Reachability (±2 days): 1↔3, 5↔3, 5↔7, 9↔7. The 1st and the 9th share no
+    // candidate at all, yet both compete with the 5th — so they are ONE
+    // component and have to be matched together. Two receipts, three charges:
+    // the right answer is exactly two closes and one open, and WHICH one stays
+    // open must not depend on the order they were seen in.
+    const result = planReceiptRequests({
+        bankLines: [
+            line({ id: "bl-1", postedDate: "2026-08-01" }),
+            line({ id: "bl-5", postedDate: "2026-08-05" }),
+            line({ id: "bl-9", postedDate: "2026-08-09" }),
+        ],
+        expenses: [
+            expense({ id: "e-3", date: "2026-08-03" }),
+            expense({ id: "e-7", date: "2026-08-07" }),
+        ],
+        intakes: [],
+        openIssueKeys: ["bl-1", "bl-5", "bl-9"],
+        resolvedIssueKeys: [],
+        now: new Date("2026-08-20T09:00:00Z"),
+    });
+    // MAXIMUM CARDINALITY is the property that matters: two receipts must
+    // answer two charges. A date-ordered pass over a same-amount bucket can
+    // strand a receipt here and answer only one.
+    assert.equal(result.close.length, 2, "both receipts are used");
+    assert.equal(result.open.length, 1, "and exactly one charge is still chased");
+    // WHICH one is left over is a free choice between equally-maximum
+    // matchings; the contract is that it is the same one every run (see the
+    // determinism test below), not that it is any particular charge.
+    assert.equal(new Set([...result.close, result.open[0].targetKey]).size, 3);
+});
+
+test("the chain's outcome does not depend on input order", () => {
+    const build = (order: string[]) => planReceiptRequests({
+        bankLines: order.map(id => line({ id: `bl-${id}`, postedDate: `2026-08-0${id}` })),
+        expenses: [expense({ id: "e-3", date: "2026-08-03" }), expense({ id: "e-7", date: "2026-08-07" })],
+        intakes: [], openIssueKeys: [], resolvedIssueKeys: [],
+        now: new Date("2026-08-20T09:00:00Z"),
+    });
+    const a = build(["1", "5", "9"]).open.map(o => o.targetKey);
+    const b = build(["9", "5", "1"]).open.map(o => o.targetKey);
+    assert.deepEqual(a, b, "the same charge is left over whatever order they arrive in");
+    assert.equal(a.length, 1);
+});
+
+test("evidenceComponents links lines through a SHARED receipt, not by date bucket", () => {
+    const ev = (unit: string, date: string) => ({
+        id: unit, unit, amountCents: 12_345, date, vendor: "Lowe's Home Improvement",
+    });
+    const candidates = new Map([
+        ["bl-1", [ev("e-3", "2026-08-03")]],
+        ["bl-5", [ev("e-3", "2026-08-03"), ev("e-7", "2026-08-07")]],
+        ["bl-9", [ev("e-7", "2026-08-07")]],
+    ]);
+    const components = evidenceComponents([{ id: "bl-1" }, { id: "bl-5" }, { id: "bl-9" }], candidates);
+    assert.equal(components.length, 1, "the chain is ONE component");
+    assert.deepEqual([...components[0]].sort(), ["bl-1", "bl-5", "bl-9"]);
+});
+
+test("lines that share no evidence are SEPARATE components", () => {
+    const ev = (unit: string, date: string) => ({
+        id: unit, unit, amountCents: 1, date, vendor: "V",
+    });
+    const components = evidenceComponents(
+        [{ id: "a" }, { id: "b" }],
+        new Map([["a", [ev("e-a", "2026-08-01")]], ["b", [ev("e-b", "2026-08-20")]]]),
+    );
+    assert.equal(components.length, 2);
+});
+
+test("a line with no candidate evidence is its own component", () => {
+    const components = evidenceComponents([{ id: "lonely" }], new Map());
+    assert.deepEqual(components, [["lonely"]]);
+});
+
+test("the query filter is wide enough to CONTAIN a chain", () => {
+    // A ±2-day filter around the 1st would stop at the 3rd and never reach the
+    // 9th, so the component would be split across two queries and matched
+    // wrongly in each.
+    const f = competingLineFilter({ amountCents: -12_345, postedDate: "2026-08-05" });
+    assert.ok(f.from <= "2026-08-01", `${f.from} must reach the chain's far end`);
+    assert.ok(f.to >= "2026-08-09", `${f.to} must reach the chain's far end`);
 });

@@ -15251,6 +15251,23 @@ async function receiptIntakeWriteFailure(id: string, allowedStates: readonly str
 /** Every state a manual write may legally act on (never BOOKED/ARCHIVED). */
 const HUMAN_WRITABLE_STATES = ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING", "DUPLICATE", "VOID", "NON_RECEIPT"];
 
+/**
+ * The state the user's page was showing when they clicked.
+ *
+ * Every queue action CASes on THIS, not on a set of "states this action is
+ * allowed from". The difference matters: a row can legally be in NEEDS_REVIEW
+ * when the page renders and legally be in NEEDS_REVIEW again a minute later
+ * having been routed, booked and parked in between — an allowed-set check
+ * happily applies a decision made about a row that no longer exists. Matching
+ * the exact state the human SAW turns that into a refusal they can act on.
+ */
+function assertExpectedState(expectedState: string): string {
+    if (typeof expectedState !== "string" || !HUMAN_WRITABLE_STATES.includes(expectedState)) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
+    return expectedState;
+}
+
 function revalidateReceiptQueue() {
     revalidatePath("/automation");
 }
@@ -15261,7 +15278,7 @@ function revalidateReceiptQueue() {
  * jumping the row straight to booking would skip the weak/strong duplicate
  * checks that stand between a re-uploaded receipt and a double purchase.
  */
-export async function setReceiptIntakeJob(id: string, projectId: string, costCodeId?: string | null) {
+export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, costCodeId?: string | null) {
     const user = await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
     if (typeof projectId !== "string" || !projectId) throw new Error("projectId is required");
@@ -15289,9 +15306,12 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
         && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
 
     const now = new Date();
-    const allowed = ["NEEDS_JOB", "NEEDS_REVIEW"];
+    const expected = assertExpectedState(expectedState);
+    if (!["NEEDS_JOB", "NEEDS_REVIEW"].includes(expected)) {
+        throw new Error("A job can only be set on a receipt waiting for one");
+    }
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: { in: allowed }, ...notClaimedByWorker(now) },
+        where: { id, state: expected, ...notClaimedByWorker(now) },
         data: {
             projectId,
             // Explicit code wins; otherwise keep one still valid here, else null.
@@ -15305,27 +15325,45 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
             nextRetryAt: null,
         },
     });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, allowed, now);
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
     revalidateReceiptQueue();
     return { success: true };
 }
 
 /** Park a row as a duplicate of another. `duplicateOfId` must be a real, different row. */
-export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string) {
+export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string, expectedState: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
     if (typeof duplicateOfId !== "string" || !duplicateOfId) throw new Error("duplicateOfId is required");
     if (id === duplicateOfId) throw new Error("A receipt can't be a duplicate of itself");
 
-    const original = await prisma.receiptIntake.findUnique({ where: { id: duplicateOfId }, select: { id: true } });
+    // THE TARGET MUST BE A REAL ORIGINAL. Pointing at a row that is itself
+    // DUPLICATE builds a chain nobody can follow ("a duplicate of a duplicate
+    // of..."), and pointing at a VOID row files this receipt behind something
+    // that was cancelled — in both cases the original it claims to duplicate
+    // does not exist as far as the pipeline is concerned.
+    const original = await prisma.receiptIntake.findUnique({
+        where: { id: duplicateOfId },
+        select: { id: true, state: true, duplicateOfId: true },
+    });
     if (!original) throw new Error("That original receipt no longer exists");
+    if (original.state === "DUPLICATE") throw new Error("That receipt is itself a duplicate — point at the original instead");
+    if (original.state === "VOID") throw new Error("That receipt was voided — it can't be the original");
+    // NO CYCLES. A points at B while B points at A is unresolvable, and the
+    // chain check above does not catch it on its own.
+    if (original.duplicateOfId === id) throw new Error("Those two receipts already point at each other");
 
     const now = new Date();
-    const result = await prisma.receiptIntake.updateMany({
+    const expected = assertExpectedState(expectedState);
+    if (["BOOKED", "ARCHIVED", "VOID"].includes(expected)) {
         // A BOOKED row is money history — it is never reclassified from here.
-        // The lease fence matters most on exactly this path: BOOKING is a legal
-        // source state, and BOOKING is where the worker is mid-send.
-        where: { id, state: { notIn: ["BOOKED", "ARCHIVED", "VOID"] }, ...notClaimedByWorker(now) },
+        throw new Error("That receipt can't be marked a duplicate");
+    }
+    const result = await prisma.receiptIntake.updateMany({
+        // CAS on the exact state the view saw. The lease fence matters most on
+        // this path: BOOKING is a legal source state, and BOOKING is where the
+        // worker is mid-send.
+        where: { id, state: expected, ...notClaimedByWorker(now) },
         data: {
             state: "DUPLICATE",
             duplicateOfId,
@@ -15337,7 +15375,7 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
             dedupStrongKey: null,
         },
     });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, HUMAN_WRITABLE_STATES, now);
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15358,16 +15396,18 @@ export async function unmarkReceiptIntakeDuplicate(id: string) {
 }
 
 /** Void anything that hasn't booked. A BOOKED/ARCHIVED row is refused outright. */
-export async function voidReceiptIntake(id: string) {
+export async function voidReceiptIntake(id: string, expectedState: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
     const now = new Date();
+    const expected = assertExpectedState(expectedState);
+    if (["BOOKED", "ARCHIVED"].includes(expected)) throw new Error("A booked receipt can't be voided");
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: { notIn: ["BOOKED", "ARCHIVED"] }, ...notClaimedByWorker(now) },
+        where: { id, state: expected, ...notClaimedByWorker(now) },
         data: { state: "VOID", stateReason: "voided-by-user", nextRetryAt: null, dedupStrongKey: null },
     });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, HUMAN_WRITABLE_STATES, now);
+    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
     revalidateReceiptQueue();
     return { success: true };
 }

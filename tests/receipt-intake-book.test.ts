@@ -843,6 +843,8 @@ test("a real create DOES mark it, before the call", async () => {
     await bookReceipt(row(), r.deps);
     assert.deepEqual(order, ["mark", "create"], "marked FIRST, so a mid-create death still records it");
     assert.deepEqual(r.sendMarks, ["intake-1"]);
+});
+
 test("a void that lands AFTER the send parks the orphaned Purchase for a human", async () => {
     // The pre-send re-read narrows this window but cannot close it: QuickBooks
     // takes real time to answer, and the money exists the moment it does. QBO

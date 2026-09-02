@@ -67,16 +67,20 @@ const WINDOW_STATE_KEY = "bankRegisterPullWindow";
 async function readWindowState(): Promise<PullWindowState> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
-        if (!row?.value) return { highWater: null, lastFullSweep: null };
+        if (!row?.value) return { highWater: null, lastFullSweep: null, continueAfter: null };
         const parsed = JSON.parse(row.value) as Partial<PullWindowState>;
+        const resume = parsed.continueAfter;
         return {
             highWater: typeof parsed.highWater === "string" ? parsed.highWater : null,
             lastFullSweep: typeof parsed.lastFullSweep === "string" ? parsed.lastFullSweep : null,
+            continueAfter: resume && typeof resume.postedDate === "string" && typeof resume.qbTxnId === "string"
+                ? { postedDate: resume.postedDate, qbTxnId: resume.qbTxnId }
+                : null,
         };
     } catch {
         // A corrupt or unreadable state is "we know nothing", which plans the
         // widest safe window — never a narrow one built on a bad mark.
-        return { highWater: null, lastFullSweep: null };
+        return { highWater: null, lastFullSweep: null, continueAfter: null };
     }
 }
 
@@ -145,7 +149,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
     // re-reads the world, so nothing is planned against stale state.
     for (let batch = 0; batch < MINT_MAX_BATCHES; batch++) {
         const result = await prisma.$transaction(async tx => {
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
 
             const [observations, existingLines] = await Promise.all([
                 tx.bankLineObservation.findMany({
