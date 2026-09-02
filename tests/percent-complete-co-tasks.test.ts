@@ -28,6 +28,7 @@ interface Fixture {
     estimateItems: any[];
     changeOrderItems: any[];
     scheduleTasks: any[];
+    dailyLogs: any[];
 }
 let fixture: Fixture;
 let recordedTaskQuery: any;
@@ -62,7 +63,7 @@ const coTask = (id: string, costCodeId: string | null, status: string) => ({
 });
 
 function resetFixture() {
-    fixture = { estimateItems: [], changeOrderItems: [], scheduleTasks: [] };
+    fixture = { estimateItems: [], changeOrderItems: [], scheduleTasks: [], dailyLogs: [] };
     recordedTaskQuery = null;
     written = null;
 }
@@ -86,7 +87,8 @@ const fakePrisma = {
             return fixture.scheduleTasks;
         },
     },
-    dailyLog: { findMany: async () => [] },
+    dailyLog: { findMany: async () => fixture.dailyLogs },
+    $executeRawUnsafe: async () => 0,
     $queryRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
         written = { auto: values[0] as number | null };
         return [{ percentComplete: values[0], percentCompleteSource: "AUTO" }];
@@ -247,6 +249,65 @@ test("a task whose estimate item was deleted falls back to its stamped code", as
 
     await recalc();
     assert.equal(written?.auto, 100);
+});
+
+test("an estimate line RE-CODED TO NULL is uncoded, not silently kept in its old phase", async () => {
+    // The line was generated under 01-DEMO (so the task carries that stamp) and
+    // has since been deliberately cleared to "no cost code". `?? task.costCodeId`
+    // fell through to the stale stamp and went on counting it under 01-DEMO --
+    // an item that EXISTS and says null means uncoded, and only a MISSING
+    // relation may fall back to the stamp.
+    fixture.estimateItems = [
+        estimateItem("i1", null, 4_000),           // re-coded to null -> uncoded budget
+        estimateItem("i2", "cc-elec", 10_000),     // the one real phase
+    ];
+    fixture.scheduleTasks = [
+        { id: "t1", status: "Complete", type: "task", costCodeId: "cc-demo", estimateItem: { costCodeId: null } },
+        { id: "t2", status: "Not Started", type: "task", costCodeId: "cc-elec", estimateItem: { costCodeId: "cc-elec" } },
+    ];
+
+    await recalc();
+
+    // Only 04-ELEC has budget, and its single task is untouched -> 0.
+    // With the stale-stamp fallback the completed t1 was counted under a
+    // phantom 01-DEMO phase instead.
+    assert.equal(written?.auto, 0);
+});
+
+test("a task-less phase with a daily log naming it counts as half started", async () => {
+    // The whole point of the fallback, exercised through the real DB path: a
+    // phase with budget, NO schedule tasks, and the crew writing about it.
+    fixture.estimateItems = [
+        estimateItem("i1", "cc-demo", 10_000),
+        estimateItem("i2", "cc-elec", 10_000),
+    ];
+    fixture.scheduleTasks = [estimateTask("t1", "cc-demo", "Not Started")];
+    fixture.dailyLogs = [{ workPerformed: "Rough-in continued; cc-elec panel work started today." }];
+
+    await recalc();
+    // 01-DEMO 0% (task not started) + 04-ELEC 50% (log evidence, no tasks).
+    assert.equal(written?.auto, 25);
+});
+
+test("a task-less phase with NO log mention stays at zero", async () => {
+    fixture.estimateItems = [
+        estimateItem("i1", "cc-demo", 10_000),
+        estimateItem("i2", "cc-elec", 10_000),
+    ];
+    fixture.scheduleTasks = [estimateTask("t1", "cc-demo", "Not Started")];
+    fixture.dailyLogs = [{ workPerformed: "Cleaned up the site and staged materials." }];
+
+    await recalc();
+    assert.equal(written?.auto, 0);
+});
+
+test("a log mention never overrides a phase that HAS tasks", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.scheduleTasks = [estimateTask("t1", "cc-demo", "Not Started")];
+    fixture.dailyLogs = [{ workPerformed: "cc-demo demolition all day" }];
+
+    await recalc();
+    assert.equal(written?.auto, 0);
 });
 
 test("CO milestones are markers, not work — they never dilute a phase", async () => {

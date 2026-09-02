@@ -12,7 +12,7 @@ import { prisma } from "@/lib/prisma";
 import { loadProjectVariance } from "@/lib/job-variance-db";
 import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
-import { computeAutoPercentComplete, type PhaseProgressInput } from "@/lib/percent-complete";
+import { computeAutoPercentComplete, phasesMentionedInLogs, type PhaseProgressInput } from "@/lib/percent-complete";
 
 /** Schedule status that counts as done — the canonical value in SCHEDULE_TASK_STATUSES. */
 const TASK_STATUS_COMPLETE = "Complete";
@@ -31,6 +31,53 @@ export function activeJobWhere() {
         id: { not: OVERHEAD_PROJECT_ID },
         isLogistics: false,
     };
+}
+
+/**
+ * Repair pass: give change-order tasks their cost code.
+ *
+ * WHY THIS RUNS NIGHTLY AND NOT JUST ONCE. The pre-deploy apply script runs
+ * BEFORE the new build is live, so every CO task the OLD build creates in the
+ * window between the script finishing and the deploy going out is born without
+ * a cost code — and a one-shot backfill has already been and gone. Anything
+ * caught in that window would stay unattributed forever, which is precisely the
+ * bug this whole change exists to fix. Re-running it nightly closes the window
+ * and costs one indexed UPDATE against a handful of rows.
+ *
+ * IDEMPOTENT by construction: `st."costCodeId" IS NULL` means a second run
+ * matches nothing it already fixed.
+ *
+ * The name is the only join available — there is no task→ChangeOrderItem FK,
+ * the child task is simply created from the item's `name` — so it is applied
+ * ONLY where the name is unambiguous on BOTH sides. Anything ambiguous stays
+ * null and goes on being honestly unattributed rather than guessed.
+ *
+ * Kept byte-identical to BACKFILL_CO_TASK_COST_CODES in
+ * scripts/apply-percent-complete.mjs; tests/percent-complete-backfill.test.ts
+ * fails if the two ever drift.
+ */
+export const BACKFILL_CO_TASK_COST_CODES = `
+    UPDATE "ScheduleTask" st
+    SET "costCodeId" = ci."costCodeId"
+    FROM "ChangeOrderItem" ci
+    WHERE st."generatedFromChangeOrderId" = ci."changeOrderId"
+      AND st."name" = ci."name"
+      AND st."costCodeId" IS NULL
+      AND st."estimateItemId" IS NULL
+      AND st."type" = 'task'
+      AND ci."costCodeId" IS NOT NULL
+      AND (SELECT COUNT(*) FROM "ChangeOrderItem" c2
+           WHERE c2."changeOrderId" = ci."changeOrderId" AND c2."name" = ci."name") = 1
+      AND (SELECT COUNT(*) FROM "ScheduleTask" s2
+           WHERE s2."generatedFromChangeOrderId" = st."generatedFromChangeOrderId"
+             AND s2."name" = st."name" AND s2."type" = 'task') = 1`;
+
+/**
+ * Run the CO-task cost-code repair. Returns how many rows it fixed — zero on
+ * every run after the first, which is the point.
+ */
+export async function repairChangeOrderTaskCostCodes(): Promise<number> {
+    return prisma.$executeRawUnsafe(BACKFILL_CO_TASK_COST_CODES);
 }
 
 export interface PercentCompleteRecalcResult {
@@ -84,26 +131,30 @@ export async function recalcProjectPercentComplete(
                 estimateItem: { select: { costCodeId: true } },
             },
         }),
+        // Free-text evidence for phases that have NO schedule tasks at all.
+        // aiSuggestedTaskId is deliberately NOT used: it only ever resolves to a
+        // schedule task, and a phase with a task never reaches the task-less
+        // fallback — routing evidence through it made the fallback dead code.
         prisma.dailyLog.findMany({
-            where: { projectId: project.id, aiSuggestedTaskId: { not: null } },
-            select: { aiSuggestedTaskId: true },
+            where: { projectId: project.id },
+            select: { workPerformed: true },
         }),
     ]);
 
     const variance = reports[0]?.variance;
 
-    // taskId → phase, for the daily-log mentions. Unfiltered by type on purpose:
-    // a log matched to a milestone still evidences that work happened.
-    const phaseByTaskId = new Map<string, string>();
     const counts = new Map<string, { totalTasks: number; doneTasks: number }>();
     for (const task of tasks) {
-        // The LIVE estimate item wins over the stamped column: re-coding an
-        // estimate line must move its task's phase immediately, and the stamp
-        // is a generation-time snapshot that would go stale. The stamp is the
-        // fallback (and, for a CO task, the only value there is).
-        const costCodeId = task.estimateItem?.costCodeId ?? task.costCodeId;
+        // Resolution order, and the null case matters:
+        //   - the estimate item EXISTS  -> its costCodeId is the answer, even
+        //     when that is null. A line deliberately re-coded to "no cost code"
+        //     is UNCODED, and falling through to the generation-time stamp would
+        //     silently keep counting it under the phase it used to be in.
+        //   - the relation is GONE (estimateItemId null, or SetNull'd by an item
+        //     delete) -> the stamp is the only thing left, and for a CO task it
+        //     is the only thing there ever was.
+        const costCodeId = task.estimateItem ? task.estimateItem.costCodeId : task.costCodeId;
         if (!costCodeId) continue; // an uncoded item belongs to no phase
-        phaseByTaskId.set(task.id, costCodeId);
         // Milestones and appointments are markers, not work — they must not
         // dilute (or inflate) a phase's completion ratio.
         if (task.type !== "task") continue;
@@ -113,11 +164,12 @@ export async function recalcProjectPercentComplete(
         counts.set(costCodeId, row);
     }
 
-    const mentionedPhases = new Set<string>();
-    for (const log of logs) {
-        const phase = log.aiSuggestedTaskId ? phaseByTaskId.get(log.aiSuggestedTaskId) : undefined;
-        if (phase) mentionedPhases.add(phase);
-    }
+    const mentionedPhases = phasesMentionedInLogs(
+        logs.map((log) => log.workPerformed),
+        (variance?.phases ?? []).map((phase) => ({
+            costCodeId: phase.costCodeId, code: phase.code, name: phase.name,
+        }))
+    );
 
     const phases: PhaseProgressInput[] = (variance?.phases ?? []).map((phase) => {
         const count = counts.get(phase.costCodeId) ?? { totalTasks: 0, doneTasks: 0 };
@@ -132,7 +184,10 @@ export async function recalcProjectPercentComplete(
 
     const auto = computeAutoPercentComplete({
         phases,
-        uncodedBudget: variance?.uncodedBudget ?? 0,
+        // POSITIVE uncoded dollars, not the net: a $10k uncoded charge plus a
+        // $10k uncoded credit nets to $0 and would report a half-uncoded
+        // estimate as fully coded.
+        uncodedPositiveBudget: variance?.uncodedPositiveBudget ?? 0,
     });
 
     // ── ONE conditional statement, deliberately ─────────────────────────────
@@ -195,8 +250,22 @@ export async function recalcProjectPercentComplete(
     };
 }
 
-/** Recompute every active job. Returns one row per job for the cron log. */
-export async function recalcAllActivePercentComplete(): Promise<PercentCompleteRecalcResult[]> {
+export interface RecalcSweepResult {
+    repairedCoTasks: number;
+    results: PercentCompleteRecalcResult[];
+}
+
+/**
+ * Recompute every active job, after repairing any CO task that is still missing
+ * its cost code. The repair runs FIRST so a task fixed tonight is counted in
+ * tonight's percentage rather than tomorrow's.
+ */
+export async function recalcAllActivePercentComplete(): Promise<RecalcSweepResult> {
+    const repairedCoTasks = await repairChangeOrderTaskCostCodes();
+    if (repairedCoTasks > 0) {
+        console.log("[percent-complete] repaired change-order task cost codes", { rows: repairedCoTasks });
+    }
+
     const projects = await prisma.project.findMany({
         where: activeJobWhere(),
         select: { id: true, name: true },
@@ -219,7 +288,7 @@ export async function recalcAllActivePercentComplete(): Promise<PercentCompleteR
         }
         results.push(result);
     }
-    return results;
+    return { repairedCoTasks, results };
 }
 
 export interface ActiveJobPercentComplete {

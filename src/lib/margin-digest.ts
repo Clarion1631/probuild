@@ -16,7 +16,7 @@
 // client. They are internal reporting only.
 
 import { prisma } from "@/lib/prisma";
-import { postTextToWebhook } from "@/lib/chat-webhook";
+import { isValidChatWebhookUrl, postTextToWebhook } from "@/lib/chat-webhook";
 import { sendNotification } from "@/lib/email";
 import { computeProjectFinancials } from "@/lib/project-financials";
 import { listActiveJobsWithPercentComplete } from "@/lib/percent-complete-db";
@@ -108,10 +108,27 @@ export function buildMarginCardText(jobs: MarginDigestJob[], today = new Date())
  * Returns `{ sent: false, reason }` and logs when the webhook is not configured.
  */
 export async function sendMondayMarginCard() {
+    // Destination FIRST, before a single query. loadMarginDigestJobs runs
+    // computeProjectFinancials per active job (~8 queries each); doing that to
+    // build a message that is then thrown away because nobody configured the
+    // webhook is pure waste on a weekly cron, and it makes an unconfigured
+    // digest look like real database load.
+    const webhookUrl = process.env.MAIN_OFFICE_CHAT_WEBHOOK;
+    if (!webhookUrl || !webhookUrl.trim()) {
+        const reason = "no webhook configured";
+        console.log("[margin-digest] margin card not sent", { reason });
+        return { sent: false, reason, jobCount: 0 };
+    }
+    if (!isValidChatWebhookUrl(webhookUrl)) {
+        const reason = "webhook url is not a Google Chat webhook";
+        console.log("[margin-digest] margin card not sent", { reason });
+        return { sent: false, reason, jobCount: 0 };
+    }
+
     const jobs = await loadMarginDigestJobs();
     const text = buildMarginCardText(jobs);
 
-    const result = await postTextToWebhook(process.env.MAIN_OFFICE_CHAT_WEBHOOK, text);
+    const result = await postTextToWebhook(webhookUrl, text);
     if (!result.sent) {
         console.log("[margin-digest] margin card not sent", { reason: result.reason, jobs: jobs.length });
         return { sent: false, reason: result.reason ?? "unknown", jobCount: jobs.length };
@@ -178,6 +195,15 @@ const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
  * denominator is how this report would start lying.
  */
 export async function sendDraggingUsLine() {
+    // Recipient FIRST — same reasoning as the margin card: no recipient, no
+    // reason to run a per-job financial sweep.
+    const to = process.env.PIPELINE_DIGEST_TO?.trim();
+    if (!to) {
+        const reason = "PIPELINE_DIGEST_TO not set";
+        console.log("[margin-digest] dragging-us email not sent", { reason });
+        return { sent: false, reason, ranked: 0, unmeasured: 0, awaitingContract: 0 };
+    }
+
     const jobs = await loadMarginDigestJobs();
     const ranked = jobs
         .filter((job) => job.earnedMargin !== null)
@@ -187,17 +213,6 @@ export async function sendDraggingUsLine() {
         (job) => job.percentComplete !== null && job.earnedMargin === null
     ).length;
     const worst = ranked.slice(0, 2);
-
-    const to = process.env.PIPELINE_DIGEST_TO?.trim();
-    if (!to) {
-        console.log("[margin-digest] dragging-us email not sent", {
-            reason: "PIPELINE_DIGEST_TO not set",
-            ranked: ranked.length,
-            unmeasured,
-            awaitingContract,
-        });
-        return { sent: false, reason: "PIPELINE_DIGEST_TO not set", ranked: ranked.length, unmeasured, awaitingContract };
-    }
 
     if (worst.length === 0) {
         const reason = awaitingContract > 0

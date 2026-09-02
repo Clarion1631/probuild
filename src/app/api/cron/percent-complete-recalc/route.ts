@@ -22,15 +22,16 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const results = await recalcAllActivePercentComplete();
+    const { repairedCoTasks, results } = await recalcAllActivePercentComplete();
     console.log(
         "[cron/percent-complete-recalc]",
         JSON.stringify({
             jobs: results.length,
+            repairedCoTasks,
             measured: results.filter((r) => !r.notFound && r.auto !== null).length,
             manualOverridesKept: results.filter((r) => r.manualOverrideKept).length,
             skippedNotFound: results.filter((r) => r.notFound).length,
         })
     );
-    return NextResponse.json({ jobs: results.length, results });
+    return NextResponse.json({ jobs: results.length, repairedCoTasks, results });
 }

@@ -29,6 +29,7 @@ import {
     normalizePercentCompleteInput,
     percentCompleteNeedsReview,
     phaseProgress,
+    phasesMentionedInLogs,
 } from "../src/lib/percent-complete";
 
 function phase(over: Partial<Parameters<typeof phaseProgress>[0]> & { costCodeId?: string; budget?: number } = {}) {
@@ -44,19 +45,19 @@ function phase(over: Partial<Parameters<typeof phaseProgress>[0]> & { costCodeId
 // ── (a) nothing to weight ───────────────────────────────────────────────────
 
 test("no phases at all → null (a job with no eligible estimate has no percent)", () => {
-    assert.equal(computeAutoPercentComplete({ phases: [], uncodedBudget: 0 }), null);
+    assert.equal(computeAutoPercentComplete({ phases: [], uncodedPositiveBudget: 0 }), null);
 });
 
 test("phases exist but carry zero positive budget → null", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 0, totalTasks: 4, doneTasks: 4 })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, null);
 });
 
 test("only uncoded budget → null, not 0%", () => {
-    assert.equal(computeAutoPercentComplete({ phases: [], uncodedBudget: 50_000 }), null);
+    assert.equal(computeAutoPercentComplete({ phases: [], uncodedPositiveBudget: 50_000 }), null);
 });
 
 // ── (b) trust gate ──────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ test("coded budget below the 50% floor → null", () => {
     // 4,000 coded of 10,000 total = 40% coded.
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 4_000, totalTasks: 2, doneTasks: 2 })],
-        uncodedBudget: 6_000,
+        uncodedPositiveBudget: 6_000,
     });
     assert.equal(result, null);
 });
@@ -73,7 +74,7 @@ test("coded budget below the 50% floor → null", () => {
 test("coded budget at EXACTLY the 50% floor → trusted, not null", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 5_000, totalTasks: 2, doneTasks: 2 })],
-        uncodedBudget: 5_000,
+        uncodedPositiveBudget: 5_000,
     });
     assert.equal(result, 100);
 });
@@ -82,21 +83,32 @@ test("the floor constant is the documented 50%", () => {
     assert.equal(CODED_BUDGET_TRUST_FLOOR, 0.5);
 });
 
-test("a NEGATIVE uncoded budget cannot shrink the denominator into fake coverage", () => {
-    // Coded 4,000 against 6,000 uncoded is below the floor. If a -6,000 credit
-    // on an uncoded line were netted in, the denominator would collapse and the
-    // job would read "fully coded". Positive dollars on both sides prevents it.
-    const belowFloor = computeAutoPercentComplete({
+test("the gate takes GROSS uncoded dollars, so a credit cannot net away a hole", () => {
+    // The caller passes ProjectVariance.uncodedPositiveBudget, which sums the
+    // uncoded rows over positive dollars only. On a job with $4,000 coded and a
+    // mixed +$6,000 / -$6,000 uncoded pair, the NET is $0 -- which would report
+    // a two-thirds-uncoded estimate as fully coded and wave the weighting
+    // through. The gross figure is $6,000 and the gate correctly refuses.
+    const gross = computeAutoPercentComplete({
         phases: [phase({ budget: 4_000, totalTasks: 2, doneTasks: 1 })],
-        uncodedBudget: 6_000,
+        uncodedPositiveBudget: 6_000,
     });
-    assert.equal(belowFloor, null);
+    assert.equal(gross, null);
 
-    const negativeUncoded = computeAutoPercentComplete({
+    // What the NET would have produced, for contrast -- this is the bug.
+    const netted = computeAutoPercentComplete({
         phases: [phase({ budget: 4_000, totalTasks: 2, doneTasks: 1 })],
-        uncodedBudget: -6_000,
+        uncodedPositiveBudget: 0,
     });
-    assert.equal(negativeUncoded, 50);
+    assert.equal(netted, 50);
+});
+
+test("a garbage negative uncoded figure still degrades safely to zero", () => {
+    const result = computeAutoPercentComplete({
+        phases: [phase({ budget: 4_000, totalTasks: 2, doneTasks: 1 })],
+        uncodedPositiveBudget: -6_000,
+    });
+    assert.equal(result, 50);
 });
 
 // ── (c)-(d) weighting ───────────────────────────────────────────────────────
@@ -104,7 +116,7 @@ test("a NEGATIVE uncoded budget cannot shrink the denominator into fake coverage
 test("one phase, every task Complete → 100", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 12_000, totalTasks: 5, doneTasks: 5 })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, 100);
 });
@@ -115,7 +127,7 @@ test("two phases 75/25 by budget, the big one done and the small one untouched �
             phase({ costCodeId: "cc-demo", budget: 7_500, totalTasks: 3, doneTasks: 3 }),
             phase({ costCodeId: "cc-frame", budget: 2_500, totalTasks: 4, doneTasks: 0 }),
         ],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, 75);
 });
@@ -126,7 +138,7 @@ test("partial progress inside a phase is weighted, not rounded to done/not-done"
             phase({ costCodeId: "cc-demo", budget: 5_000, totalTasks: 4, doneTasks: 1 }),
             phase({ costCodeId: "cc-frame", budget: 5_000, totalTasks: 2, doneTasks: 1 }),
         ],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     // 0.5 * 0.25 + 0.5 * 0.5 = 0.375
     assert.equal(result, 37.5);
@@ -137,7 +149,7 @@ test("partial progress inside a phase is weighted, not rounded to done/not-done"
 test("phase with no tasks but a daily-log mention counts as half started", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 1_000, totalTasks: 0, hasDailyLogMention: true })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, TASKLESS_PHASE_WITH_LOG_PROGRESS * 100);
     assert.equal(result, 50);
@@ -146,7 +158,7 @@ test("phase with no tasks but a daily-log mention counts as half started", () =>
 test("phase with no tasks and no mention counts as not started", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 1_000, totalTasks: 0, hasDailyLogMention: false })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, 0);
 });
@@ -161,14 +173,14 @@ test("a daily-log mention never overrides real task counts", () => {
 test("a negative-budget phase carries zero weight and cannot move the result", () => {
     const withoutCredit = computeAutoPercentComplete({
         phases: [phase({ costCodeId: "cc-demo", budget: 10_000, totalTasks: 4, doneTasks: 1 })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     const withCredit = computeAutoPercentComplete({
         phases: [
             phase({ costCodeId: "cc-demo", budget: 10_000, totalTasks: 4, doneTasks: 1 }),
             phase({ costCodeId: "cc-credit", budget: -4_000, totalTasks: 2, doneTasks: 2 }),
         ],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(withoutCredit, 25);
     assert.equal(withCredit, 25);
@@ -179,7 +191,7 @@ test("a negative-budget phase carries zero weight and cannot move the result", (
 test("more done tasks than total tasks clamps at 100, never above", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 1_000, totalTasks: 3, doneTasks: 9 })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, 100);
 });
@@ -187,7 +199,7 @@ test("more done tasks than total tasks clamps at 100, never above", () => {
 test("result is rounded to 2 decimal places", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 1_000, totalTasks: 3, doneTasks: 1 })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     // 1/3 → 33.333...% → 33.33
     assert.equal(result, 33.33);
@@ -196,7 +208,7 @@ test("result is rounded to 2 decimal places", () => {
 test("non-finite task counts degrade to not-started rather than NaN", () => {
     const result = computeAutoPercentComplete({
         phases: [phase({ budget: 1_000, totalTasks: Number.NaN, doneTasks: Number.NaN })],
-        uncodedBudget: 0,
+        uncodedPositiveBudget: 0,
     });
     assert.equal(result, 0);
 });
@@ -267,6 +279,65 @@ test("drift is measured against the auto SNAPSHOT, not the manual value", () => 
 
 test("reset to auto clears the review flag (source AUTO, snapshot null)", () => {
     assert.equal(percentCompleteNeedsReview({ source: "AUTO", auto: 82, autoAtOverride: null }), false);
+});
+
+// ── daily-log phase evidence (the task-less fallback) ───────────────────────
+
+const PHASES = [
+    { costCodeId: "cc-demo", code: "01-DEMO", name: "Demolition" },
+    { costCodeId: "cc-elec", code: "04-ELEC", name: "Electrical" },
+    { costCodeId: "cc-anon", code: "N/A", name: "Unbudgeted phase" },
+];
+
+test("a log naming a phase's cost code counts as evidence", () => {
+    const found = phasesMentionedInLogs(["Started 04-ELEC rough-in today."], PHASES);
+    assert.deepEqual([...found], ["cc-elec"]);
+});
+
+test("a log naming a phase by NAME counts too", () => {
+    const found = phasesMentionedInLogs(["Demolition of the back wall finished."], PHASES);
+    assert.deepEqual([...found], ["cc-demo"]);
+});
+
+test("matching is case-insensitive and spans several logs", () => {
+    const found = phasesMentionedInLogs(["demolition started", "then ELECTRICAL rough-in"], PHASES);
+    assert.deepEqual([...found].sort(), ["cc-demo", "cc-elec"]);
+});
+
+test("a phase nobody wrote about is not evidence", () => {
+    const found = phasesMentionedInLogs(["Framing and cleanup."], PHASES);
+    assert.equal(found.size, 0);
+});
+
+test("partial words do not match — 04-ELEC is not found inside a longer token", () => {
+    const found = phasesMentionedInLogs(["ordered 04-ELECTRICALPANEL parts"], PHASES);
+    assert.equal(found.has("cc-elec"), false);
+});
+
+test("anonymous placeholder phases are never matched", () => {
+    // "Unbudgeted phase" / "N/A" are labels job-variance invents for a cost code
+    // it could not name. Matching them would attach evidence to whichever phase
+    // happened to be anonymous.
+    const found = phasesMentionedInLogs(["N/A unbudgeted phase work"], PHASES);
+    assert.equal(found.has("cc-anon"), false);
+});
+
+test("empty or blank logs produce no evidence", () => {
+    assert.equal(phasesMentionedInLogs([], PHASES).size, 0);
+    assert.equal(phasesMentionedInLogs(["", null, undefined, "   "], PHASES).size, 0);
+});
+
+test("a cost code containing regex metacharacters is matched literally", () => {
+    const found = phasesMentionedInLogs(
+        ["worked on 01+DEMO today"],
+        [{ costCodeId: "cc-x", code: "01+DEMO", name: "Demo" }]
+    );
+    assert.equal(found.has("cc-x"), true);
+    const notFound = phasesMentionedInLogs(
+        ["worked on 01XDEMO today"],
+        [{ costCodeId: "cc-x", code: "01+DEMO", name: "Demo" }]
+    );
+    assert.equal(notFound.has("cc-x"), false);
 });
 
 // ── manual input normalization ──────────────────────────────────────────────

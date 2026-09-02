@@ -59,23 +59,31 @@ function round2(value: number): number {
  * Negative-budget phases (a discount or credit line netting a phase below zero
  * — `hasNegativeBudget` in job-variance.ts) contribute ZERO weight rather than
  * a negative one, which would otherwise let a credit line drag the whole job's
- * percentage around. `uncodedBudget` never gets weight either: it has no phase
+ * percentage around. Uncoded budget never gets weight either: it has no phase
  * and therefore no schedule tasks to measure. It only appears in the trust gate,
  * as the thing being measured against.
  */
 export function computeAutoPercentComplete(input: {
     phases: PhaseProgressInput[];
-    /** ProjectVariance.uncodedBudget — budgeted work whose estimate item has no cost code. */
-    uncodedBudget: number;
+    /**
+     * `ProjectVariance.uncodedPositiveBudget` — uncoded budget summed over
+     * POSITIVE dollars, NOT the net `uncodedBudget`.
+     *
+     * This distinction is the whole gate. Netting lets a $10,000 uncoded charge
+     * and a $10,000 uncoded credit cancel to $0, so an estimate that is half
+     * uncoded reports as fully coded and the gate waves through a weighting
+     * built on the other half. "How much did we fail to code" is a question
+     * about magnitude, never about the net.
+     */
+    uncodedPositiveBudget: number;
 }): number | null {
     const weighted = input.phases.map((phase) => ({ phase, weight: positive(phase.budget) }));
     const codedPositiveBudget = weighted.reduce((sum, row) => sum + row.weight, 0);
     if (codedPositiveBudget <= 0) return null;
 
-    // Measured on positive dollars on both sides, so a negative uncoded total
-    // (a credit line on an uncoded item) cannot shrink the denominator and fake
-    // full coverage.
-    const uncodedPositiveBudget = positive(input.uncodedBudget);
+    // Positive dollars on both sides. The caller already sums the uncoded side
+    // gross; positive() here is only a guard against a caller passing garbage.
+    const uncodedPositiveBudget = positive(input.uncodedPositiveBudget);
     const totalPositiveBudget = codedPositiveBudget + uncodedPositiveBudget;
     if (codedPositiveBudget / totalPositiveBudget < CODED_BUDGET_TRUST_FLOOR) return null;
 
@@ -100,6 +108,60 @@ export function phaseProgress(phase: Pick<PhaseProgressInput, "totalTasks" | "do
     }
     const done = Number.isFinite(phase.doneTasks) ? Math.max(0, Math.trunc(phase.doneTasks)) : 0;
     return Math.min(1, done / total);
+}
+
+/**
+ * Placeholder phase labels that job-variance.ts produces for a cost code it
+ * could not name. Matching free text against these would attach evidence to
+ * whatever phase happened to be anonymous.
+ */
+const UNMATCHABLE_PHASE_LABELS = new Set(["n/a", "unknown", "unbudgeted phase", ""]);
+
+/** Regex-escape a literal so a cost code like "01-DEMO" cannot act as a pattern. */
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Whole-token match, case-insensitive. Boundaries are "not a letter or digit"
+ * rather than \b, because cost codes contain hyphens ("01-DEMO") and \b would
+ * happily match the "DEMO" inside "DEMOLITION-ADJACENT".
+ */
+function mentionsToken(haystack: string, needle: string): boolean {
+    const token = needle.trim().toLowerCase();
+    if (token.length < 3 || UNMATCHABLE_PHASE_LABELS.has(token)) return false;
+    return new RegExp(`(^|[^a-z0-9])${escapeRegExp(token)}([^a-z0-9]|$)`, "i").test(haystack);
+}
+
+/**
+ * Which phases the crew's own words say they worked on.
+ *
+ * WHY TEXT AND NOT THE TASK MATCHER. The obvious source is
+ * `DailyLog.aiSuggestedTaskId`, but that is unusable HERE by construction: the
+ * matcher only ever resolves a log to a schedule task, and a phase that has a
+ * schedule task is a phase whose `totalTasks > 0`, which never reaches the
+ * fallback. Routing evidence through it made the fallback dead code that read
+ * as if it worked. Matching the log text against the phase's own cost code and
+ * name is coarse, and it is the only signal that exists for a phase with no
+ * tasks at all.
+ *
+ * Deliberately conservative: whole tokens only, nothing shorter than three
+ * characters, and never the anonymous placeholder labels.
+ */
+export function phasesMentionedInLogs(
+    logTexts: Array<string | null | undefined>,
+    phases: Array<{ costCodeId: string; code: string; name: string }>
+): Set<string> {
+    const mentioned = new Set<string>();
+    const haystack = logTexts.filter(Boolean).join("\n").toLowerCase();
+    if (!haystack.trim()) return mentioned;
+
+    for (const phase of phases) {
+        if (mentionsToken(haystack, phase.code) || mentionsToken(haystack, phase.name)) {
+            mentioned.add(phase.costCodeId);
+        }
+    }
+    return mentioned;
 }
 
 /**

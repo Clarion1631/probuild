@@ -101,6 +101,17 @@ export interface ProjectVariance {
     phases: PhaseVariance[];
     /** Budgeted work whose estimate item carries no cost code — an estimate cleanup task. */
     uncodedBudget: number;
+    /**
+     * The same rows summed over POSITIVE dollars only.
+     *
+     * `uncodedBudget` above is a NET figure, so a $10,000 uncoded line and a
+     * $10,000 uncoded credit cancel to $0 and the job reads as fully coded.
+     * That is fine for `totalBudget` (the net IS what the job is supposed to
+     * cost) and wrong for any question of the form "how much of this estimate
+     * did we fail to code", which is a question about magnitude. The percent-
+     * complete trust gate uses THIS field; `uncodedBudget` is unchanged.
+     */
+    uncodedPositiveBudget: number;
     coverage: VarianceCoverage;
 }
 
@@ -222,6 +233,7 @@ export function computeProjectVariance(input: {
     const phases = new Map<string, PhaseVariance>();
     const itemsById = new Map<string, ItemVariance & { costCodeId: string | null }>();
     let uncodedBudget = 0;
+    let uncodedPositiveBudget = 0;
     let malformedBudgetRows = 0;
 
     /**
@@ -254,6 +266,7 @@ export function computeProjectVariance(input: {
             // Deliberately NOT spread across phases. This is estimate cleanup
             // work, and hiding it inside a phase would misstate that phase.
             uncodedBudget += budget;
+            if (budget > 0) uncodedPositiveBudget += budget;
             continue;
         }
         const key = item.costCodeId;
@@ -409,6 +422,7 @@ export function computeProjectVariance(input: {
         percentUsed: ratio(totalActual, totalBudget),
         phases: phaseList,
         uncodedBudget,
+        uncodedPositiveBudget,
         coverage: {
             unattributedLabor,
             unattributedMaterial,
