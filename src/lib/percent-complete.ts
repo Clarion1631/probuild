@@ -117,13 +117,35 @@ export function percentCompleteNeedsReview(input: {
     source: string | null | undefined;
     auto: number | null | undefined;
     autoAtOverride: number | null | undefined;
+    /**
+     * The effective (manual) value. Only consulted in the no-snapshot case
+     * below — never when a real baseline exists.
+     */
+    manual?: number | null | undefined;
 }): boolean {
     if (input.source !== "MANUAL") return false;
-    const auto = input.auto;
-    const at = input.autoAtOverride;
-    if (typeof auto !== "number" || !Number.isFinite(auto)) return false;
-    if (typeof at !== "number" || !Number.isFinite(at)) return false;
-    return Math.abs(auto - at) > PERCENT_COMPLETE_DRIFT_POINTS;
+    const auto = finite(input.auto);
+    if (auto === null) return false;
+
+    const baseline = finite(input.autoAtOverride);
+    if (baseline !== null) return Math.abs(auto - baseline) > PERCENT_COMPLETE_DRIFT_POINTS;
+
+    // No snapshot. This happens when the override was saved before the nightly
+    // cron had ever produced an auto value, so there was nothing to freeze —
+    // and it is exactly the case where the machine catching up MATTERS, because
+    // the human was working with no machine estimate at all. Falling back to
+    // "never review" would leave that job silently unreviewable forever, so
+    // compare the auto value against the manual one instead.
+    //
+    // Deliberately weaker than the snapshot rule: here a gap only means the two
+    // numbers disagree, not that anything moved. It is still worth a look.
+    const manual = finite(input.manual);
+    if (manual === null) return false;
+    return Math.abs(auto - manual) > PERCENT_COMPLETE_DRIFT_POINTS;
+}
+
+function finite(value: number | null | undefined): number | null {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /**

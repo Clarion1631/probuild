@@ -8596,22 +8596,21 @@ export async function updateProjectPercentComplete(projectId: string, value: num
     const normalized = normalizePercentCompleteInput(value);
     if (normalized === null) throw new Error("Enter a percentage between 0 and 100");
 
-    const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { id: true, percentCompleteAuto: true },
-    });
-    if (!project) throw new Error("Project not found");
-
-    await prisma.project.update({
-        where: { id: projectId },
-        data: {
-            percentComplete: normalized,
-            percentCompleteSource: "MANUAL",
-            percentCompleteAsOf: new Date(),
-            percentCompleteAutoAtOverride: project.percentCompleteAuto,
-            percentCompleteUpdatedById: user.id,
-        },
-    });
+    // The snapshot is taken COLUMN-TO-COLUMN inside the UPDATE
+    // (percentCompleteAutoAtOverride = "percentCompleteAuto"), never from a
+    // value read into JS first. The nightly recalc rewrites percentCompleteAuto
+    // while this action is in flight, and a read-then-write here would freeze a
+    // baseline the row no longer has — making the drift flag compare against a
+    // number that was never current.
+    const updated = await prisma.$executeRaw`
+        UPDATE "Project" SET
+            "percentComplete" = ${normalized}::numeric,
+            "percentCompleteSource" = 'MANUAL'::"PercentCompleteSource",
+            "percentCompleteAsOf" = ${new Date()}::timestamp(3),
+            "percentCompleteAutoAtOverride" = "percentCompleteAuto",
+            "percentCompleteUpdatedById" = ${user.id}
+        WHERE "id" = ${projectId}`;
+    if (updated === 0) throw new Error("Project not found");
 
     revalidatePath(`/projects/${projectId}/financial-overview`);
     revalidatePath(`/reports/company-financials`);
@@ -8626,26 +8625,23 @@ export async function updateProjectPercentComplete(projectId: string, value: num
 export async function resetProjectPercentCompleteToAuto(projectId: string) {
     await assertPercentCompleteEditor();
 
-    const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { id: true, percentCompleteAuto: true },
-    });
-    if (!project) throw new Error("Project not found");
-
-    await prisma.project.update({
-        where: { id: projectId },
-        data: {
-            percentComplete: project.percentCompleteAuto,
-            percentCompleteSource: "AUTO",
-            percentCompleteAsOf: new Date(),
-            percentCompleteAutoAtOverride: null,
-            percentCompleteUpdatedById: null,
-        },
-    });
+    // Adopts the column's CURRENT auto value in the UPDATE itself, for the same
+    // reason as the override above: a stale JS copy could resurrect an auto
+    // value the nightly recalc has already replaced.
+    const rows = await prisma.$queryRaw<Array<{ percentComplete: unknown }>>`
+        UPDATE "Project" SET
+            "percentComplete" = "percentCompleteAuto",
+            "percentCompleteSource" = 'AUTO'::"PercentCompleteSource",
+            "percentCompleteAsOf" = ${new Date()}::timestamp(3),
+            "percentCompleteAutoAtOverride" = NULL,
+            "percentCompleteUpdatedById" = NULL
+        WHERE "id" = ${projectId}
+        RETURNING "percentComplete"`;
+    if (rows.length === 0) throw new Error("Project not found");
 
     revalidatePath(`/projects/${projectId}/financial-overview`);
     revalidatePath(`/reports/company-financials`);
-    return { success: true, percentComplete: project.percentCompleteAuto === null ? null : Number(project.percentCompleteAuto) };
+    return { success: true, percentComplete: rows[0].percentComplete == null ? null : Number(rows[0].percentComplete) };
 }
 
 export async function deleteProjects(projectIds: string[]) {

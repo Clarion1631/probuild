@@ -56,6 +56,7 @@ export default async function FinancialOverviewPage({ params }: { params: Promis
             source,
             auto: percentCompleteAuto,
             autoAtOverride: percentCompleteAutoAtOverride,
+            manual: percentComplete,
           })}
           editorName={project.percentCompleteUpdatedBy?.name ?? project.percentCompleteUpdatedBy?.email ?? null}
           canEdit={canEdit}

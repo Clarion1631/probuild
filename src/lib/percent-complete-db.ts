@@ -54,7 +54,7 @@ export interface PercentCompleteRecalcResult {
 export async function recalcProjectPercentComplete(
     project: { id: string; name: string }
 ): Promise<PercentCompleteRecalcResult> {
-    const [reports, tasks, logs, stored] = await Promise.all([
+    const [reports, tasks, logs] = await Promise.all([
         // Budgets come from the variance basis, so the percentage is weighted by
         // the same dollars the variance report shows. Never re-derive them here.
         loadProjectVariance([project.id]),
@@ -66,10 +66,6 @@ export async function recalcProjectPercentComplete(
         prisma.dailyLog.findMany({
             where: { projectId: project.id, aiSuggestedTaskId: { not: null } },
             select: { aiSuggestedTaskId: true },
-        }),
-        prisma.project.findUnique({
-            where: { id: project.id },
-            select: { percentCompleteSource: true },
         }),
     ]);
 
@@ -114,29 +110,40 @@ export async function recalcProjectPercentComplete(
         uncodedBudget: variance?.uncodedBudget ?? 0,
     });
 
-    const manualOverrideKept = stored?.percentCompleteSource === "MANUAL";
+    // ── ONE conditional statement, deliberately ─────────────────────────────
+    // Reading percentCompleteSource in JS and then updating on the strength of
+    // that read is a lost update: this recalc does ~8 queries per job, and
+    // somebody saving a manual override anywhere in that window would have it
+    // silently stamped back to AUTO. The guard therefore has to be evaluated by
+    // the database, inside the same UPDATE that writes.
+    //
+    // Every CASE below sees the row's PRE-UPDATE percentCompleteSource, so the
+    // four assignments cannot disagree with each other. percentCompleteAuto is
+    // written unconditionally — the drift flag depends on it staying current
+    // even under an override.
+    //
+    // IS DISTINCT FROM (not <>) because the column is NULL on a job that has
+    // never been computed, and `NULL <> 'MANUAL'` is NULL, i.e. false — which
+    // would skip exactly the jobs that most need an auto value.
     const now = new Date();
+    const rows = await prisma.$queryRaw<Array<{
+        percentComplete: unknown;
+        percentCompleteSource: string | null;
+    }>>`
+        UPDATE "Project" SET
+            "percentCompleteAuto" = ${auto}::numeric,
+            "percentComplete" = CASE WHEN "percentCompleteSource" IS DISTINCT FROM 'MANUAL'
+                THEN ${auto}::numeric ELSE "percentComplete" END,
+            "percentCompleteSource" = CASE WHEN "percentCompleteSource" IS DISTINCT FROM 'MANUAL'
+                THEN 'AUTO'::"PercentCompleteSource" ELSE "percentCompleteSource" END,
+            "percentCompleteAsOf" = CASE WHEN "percentCompleteSource" IS DISTINCT FROM 'MANUAL'
+                THEN ${now}::timestamp(3) ELSE "percentCompleteAsOf" END
+        WHERE "id" = ${project.id}
+        RETURNING "percentComplete", "percentCompleteSource"`;
 
-    await prisma.project.update({
-        where: { id: project.id },
-        data: manualOverrideKept
-            ? { percentCompleteAuto: auto }
-            : {
-                percentCompleteAuto: auto,
-                percentComplete: auto,
-                percentCompleteSource: "AUTO",
-                percentCompleteAsOf: now,
-            },
-    });
-
-    let percentComplete = auto;
-    if (manualOverrideKept) {
-        const after = await prisma.project.findUnique({
-            where: { id: project.id },
-            select: { percentComplete: true },
-        });
-        percentComplete = after?.percentComplete == null ? null : Number(after.percentComplete);
-    }
+    const row = rows[0];
+    const manualOverrideKept = row?.percentCompleteSource === "MANUAL";
+    const percentComplete = row?.percentComplete == null ? null : Number(row.percentComplete);
 
     return { projectId: project.id, projectName: project.name, auto, manualOverrideKept, percentComplete };
 }

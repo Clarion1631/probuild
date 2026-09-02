@@ -210,9 +210,42 @@ test("an AUTO project never needs review, however far the auto value moved", () 
     );
 });
 
-test("a MANUAL project with no auto snapshot cannot drift (nothing to compare to)", () => {
+test("no auto value at all → nothing to review, whatever the snapshot says", () => {
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: null, autoAtOverride: 10, manual: 60 }), false);
+});
+
+// No snapshot happens when the override was saved before the cron had ever
+// produced an auto value. Returning false there would leave that job silently
+// unreviewable forever — which is the case where the machine catching up
+// matters MOST, because the human was working with no machine estimate at all.
+test("no snapshot → drift falls back to comparing auto against the manual value", () => {
+    assert.equal(
+        percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null, manual: 60 }),
+        true
+    );
+    assert.equal(
+        percentCompleteNeedsReview({ source: "MANUAL", auto: 63, autoAtOverride: null, manual: 60 }),
+        false
+    );
+});
+
+test("no snapshot: the fallback uses the same strictly-greater 5-point threshold", () => {
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65, autoAtOverride: null, manual: 60 }), false);
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65.01, autoAtOverride: null, manual: 60 }), true);
+});
+
+test("no snapshot AND no manual value → still nothing to compare", () => {
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null, manual: null }), false);
     assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null }), false);
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: null, autoAtOverride: 10 }), false);
+});
+
+test("a real snapshot always wins over the manual fallback", () => {
+    // Snapshot says the auto value has not moved (60 → 62), even though the
+    // manual value sits far away at 5. The snapshot is the baseline; no review.
+    assert.equal(
+        percentCompleteNeedsReview({ source: "MANUAL", auto: 62, autoAtOverride: 60, manual: 5 }),
+        false
+    );
 });
 
 test("drift of exactly 5.00 points does NOT flag a review", () => {

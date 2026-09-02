@@ -21,6 +21,7 @@ import { sendNotification } from "@/lib/email";
 import { computeProjectFinancials } from "@/lib/project-financials";
 import { listActiveJobsWithPercentComplete } from "@/lib/percent-complete-db";
 import { percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { resolveActualCostCodeId } from "@/lib/job-variance";
 import { formatCurrency } from "@/lib/utils";
 
 function appBaseUrl(): string {
@@ -68,6 +69,7 @@ export async function loadMarginDigestJobs(): Promise<MarginDigestJob[]> {
                 source: job.percentCompleteSource,
                 auto: job.percentCompleteAuto,
                 autoAtOverride: job.percentCompleteAutoAtOverride,
+                manual: job.percentComplete,
             }),
             earnedMargin: fin.earnedMargin,
         });
@@ -134,12 +136,23 @@ export interface UnattributedCost {
 export async function biggestUnattributedCost(projectId: string): Promise<UnattributedCost | null> {
     const rows = await prisma.expense.findMany({
         // Expense has no projectId — it reaches the job through its estimate.
+        //
+        // `costCodeId: null` is only HALF the filter. An expense with no cost
+        // code of its own but an itemId pointing at a coded estimate item IS
+        // attributed — the variance report places it on that item's phase. So
+        // the item's code is fetched and the same resolution rule applied,
+        // rather than reporting an attributed cost as a hole.
         where: { estimate: { projectId }, costCodeId: null },
-        select: { amount: true, vendor: true, date: true, description: true },
+        select: {
+            amount: true, vendor: true, date: true, description: true,
+            costCodeId: true,
+            item: { select: { costCodeId: true } },
+        },
     });
 
     let worst: UnattributedCost | null = null;
     for (const row of rows) {
+        if (resolveActualCostCodeId(row.costCodeId, row.item?.costCodeId) !== null) continue;
         const amount = Number(row.amount) || 0;
         if (worst === null || Math.abs(amount) > Math.abs(worst.amount)) {
             worst = { vendor: row.vendor, amount, date: row.date, description: row.description };
