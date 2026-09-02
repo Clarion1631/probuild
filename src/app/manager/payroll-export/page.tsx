@@ -18,7 +18,8 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
+import { addDaysToKey, dayKeyInTimeZone, daysBetweenDayKeys, startOfDateInTimeZone } from "@/lib/tz-date";
+import { MAX_PAY_PERIOD_RANGE_DAYS } from "@/lib/pay-period-summary-core";
 import { lastFullPayPeriod, payrollPeriodLength } from "@/lib/payroll-config";
 import { loadGustoExport } from "@/lib/gusto-export-db";
 import { lockPayrollPeriod, unlockPayrollPeriod } from "@/lib/actions";
@@ -58,6 +59,22 @@ export default async function PayrollExportPage({ searchParams }: Props) {
             ? params.end
             : addDaysToKey(fallback.endKey, -1);
     const endKeyExclusive = addDaysToKey(lastDayKey, 1);
+
+    // Same cap as the download endpoint and the lock action. Refuse up front
+    // rather than rendering totals for a range neither of them would accept.
+    if (daysBetweenDayKeys(startKey, endKeyExclusive) > MAX_PAY_PERIOD_RANGE_DAYS) {
+        return (
+            <div className="max-w-3xl mx-auto py-16 px-6 text-center space-y-3">
+                <h1 className="text-xl font-bold text-hui-textMain">That period is too long</h1>
+                <p className="text-sm text-hui-textMuted">
+                    A pay period cannot be longer than {MAX_PAY_PERIOD_RANGE_DAYS} days. Pick a shorter range.
+                </p>
+                <Link href="/manager/payroll-export" className="hui-btn hui-btn-primary text-sm">
+                    Back to the current period
+                </Link>
+            </div>
+        );
+    }
 
     const periodStart = startOfDateInTimeZone(startKey, timeZone);
     const periodEnd = startOfDateInTimeZone(endKeyExclusive, timeZone);
@@ -118,7 +135,8 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                         {result.blocking.length} entr{result.blocking.length === 1 ? "y is" : "ies are"} not ready to export
                     </h2>
                     <p className="text-sm text-hui-textMuted mb-3">
-                        Payroll will not export a period that still has an open punch or a flagged entry. Clear these on{" "}
+                        Payroll will not export a period that still has an open punch, a flagged entry, a closed
+                        entry with no hours, or a meal break that never settled. Clear these on{" "}
                         <Link href="/manager/time-entries?flagged=1" className="underline">Time &amp; Expenses</Link> first.
                     </p>
                     <ul className="text-sm divide-y divide-hui-border">
@@ -127,7 +145,13 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                                 <span className="font-medium text-hui-textMain">{row.userLabel}</span>
                                 <span className="text-hui-textMuted">
                                     {new Date(row.startTime).toLocaleString()} ·{" "}
-                                    {row.reason === "open" ? "still clocked in" : "needs review"}
+                                    {row.reason === "open"
+                                        ? "still clocked in"
+                                        : row.reason === "needsReview"
+                                          ? "needs review"
+                                          : row.reason === "zeroDuration"
+                                            ? "closed with no hours"
+                                            : "meal break not settled"}
                                 </span>
                             </li>
                         ))}
@@ -235,12 +259,14 @@ export default async function PayrollExportPage({ searchParams }: Props) {
 
             <div className="text-xs text-hui-textMuted space-y-1">
                 <p>
-                    Summary hash (sha256 of the summary CSV): <code className="font-mono">{result.summaryHash.slice(0, 16)}…</code>
+                    Export hash — sha256 over BOTH CSVs (summary and detail), so a change to any single
+                    entry shows up even when the rounded per-employee totals happen to match:{" "}
+                    <code className="font-mono">{result.exportHash.slice(0, 16)}…</code>
                     {result.period?.exportHash && (
                         <>
                             {" "}· stored at lock:{" "}
                             <code className="font-mono">{result.period.exportHash.slice(0, 16)}…</code>
-                            {result.period.exportHash === result.summaryHash ? (
+                            {result.period.exportHash === result.exportHash ? (
                                 <span className="text-green-700"> · matches</span>
                             ) : (
                                 <span className="text-red-700"> · CHANGED since the lock</span>

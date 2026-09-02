@@ -80,16 +80,20 @@ export type ExportEntry = OvertimeTimeEntry & {
     mealDeductionHours: number | null;
     needsReview: boolean;
     isEdited: boolean;
+    /** WA meal settlement outcome. A DEFERRED day never settled would export at FULL pay — it blocks. */
+    mealOutcome: string | null;
     projectName: string | null;
     costCodeLabel: string | null;
 };
+
+export type BlockingReason = "open" | "needsReview" | "zeroDuration" | "deferred";
 
 export type BlockingEntry = {
     id: string;
     userId: string;
     userLabel: string;
     startTime: Date;
-    reason: "open" | "needsReview";
+    reason: BlockingReason;
 };
 
 export type EmployeeTotals = {
@@ -146,7 +150,9 @@ function inPeriod(entry: { startTime: Date }, periodStart: Date, periodEnd: Date
  * workweek days were fetched for the 40h threshold and are not being exported.
  */
 export function blockingEntries(
-    entries: Array<Pick<ExportEntry, "id" | "userId" | "startTime" | "endTime" | "needsReview">>,
+    entries: Array<
+        Pick<ExportEntry, "id" | "userId" | "startTime" | "endTime" | "needsReview" | "durationHours" | "mealOutcome">
+    >,
     users: ExportUser[],
     periodStart: Date,
     periodEnd: Date
@@ -155,7 +161,28 @@ export function blockingEntries(
     const blocking: BlockingEntry[] = [];
     for (const entry of entries) {
         if (!inPeriod(entry, periodStart, periodEnd)) continue;
-        const reason = entry.endTime == null ? "open" : entry.needsReview ? "needsReview" : null;
+        // Order matters only for which single reason is reported first; each
+        // condition is independently disqualifying.
+        //
+        // zeroDuration: a CLOSED entry with no positive paid hours is dropped by
+        // buildGustoExport, which is precisely why it has to be surfaced here.
+        // Silently exporting fewer rows than the period contains is how a
+        // missing shift reaches payroll unnoticed.
+        //
+        // deferred: a DEFERRED day is "meal not settled yet, paid in full". The
+        // export settles what it can first; anything still DEFERRED afterwards
+        // (the worker is mid-shift, or settlement failed) would export at FULL
+        // pay with no meal deduction. Refuse rather than overpay.
+        const reason: BlockingReason | null =
+            entry.endTime == null
+                ? "open"
+                : entry.needsReview
+                  ? "needsReview"
+                  : !(Number.isFinite(entry.durationHours) && entry.durationHours > 0)
+                    ? "zeroDuration"
+                    : entry.mealOutcome === "DEFERRED"
+                      ? "deferred"
+                      : null;
         if (!reason) continue;
         blocking.push({
             id: entry.id,
@@ -247,7 +274,13 @@ export function buildGustoExport(input: {
         });
     }
 
-    employees.sort((a, b) => userLabel(a.user, a.user.id).localeCompare(userLabel(b.user, b.user.id)));
+    // Label, then id: two people can share a display name, and an unstable
+    // order would change the export hash for no real reason.
+    employees.sort(
+        (a, b) =>
+            userLabel(a.user, a.user.id).localeCompare(userLabel(b.user, b.user.id)) ||
+            a.user.id.localeCompare(b.user.id)
+    );
     detail.sort(
         (a, b) =>
             a.startTime.getTime() - b.startTime.getTime() ||
@@ -262,9 +295,20 @@ export function buildGustoExport(input: {
     };
 }
 
-/** RFC4180 field: always quoted (so a comma or newline in a project name can never shift a column), inner quotes doubled. */
+/**
+ * Leading characters that make Excel / Sheets / Numbers treat a cell as a
+ * FORMULA rather than text. A project name, a cost code, or an employee name is
+ * attacker-influenced free text, and this file is opened by a bookkeeper on a
+ * machine with access to payroll — CSV injection is a real path, not a
+ * theoretical one. Quoting alone does NOT stop it: the spreadsheet strips the
+ * quotes and then evaluates what is inside.
+ */
+const CSV_FORMULA_LEAD = /^[=+\-@\t\r\n]/;
+
+/** RFC4180 field: always quoted (so a comma or newline in a project name can never shift a column), inner quotes doubled, formula leads defused with a leading apostrophe. */
 function csvField(value: string | number | null | undefined): string {
-    const text = value == null ? "" : String(value);
+    let text = value == null ? "" : String(value);
+    if (CSV_FORMULA_LEAD.test(text)) text = `'${text}`;
     return `"${text.replace(/"/g, '""')}"`;
 }
 
@@ -335,17 +379,24 @@ export function toDetailCsv(detail: DetailRow[]): string {
  */
 export function planDeferredSettlements(input: {
     unsettled: Array<{ userId: string; dayKey: string }>;
-    openPunchUserIds: Iterable<string>;
+    /** `${userId}|${dayKey}` for every OPEN punch, keyed by the day that punch started. */
+    openPunchDayKeys: Iterable<string>;
     todayKey: string;
-    locked: boolean;
+    /** True when that company-local day falls inside ANY locked period. */
+    isDayLocked: (dayKey: string) => boolean;
 }): Array<{ userId: string; dayKey: string }> {
-    if (input.locked) return [];
-    const open = new Set(input.openPunchUserIds);
+    const open = new Set(input.openPunchDayKeys);
     const plan = new Map<string, { userId: string; dayKey: string }>();
     for (const row of input.unsettled) {
         if (!row.dayKey || row.dayKey === input.todayKey) continue;
-        if (open.has(row.userId)) continue;
-        plan.set(`${row.userId}|${row.dayKey}`, row);
+        const key = `${row.userId}|${row.dayKey}`;
+        // Scoped to the DAY, not the worker. The old company-wide "does this
+        // person have any open punch" test meant a punch open right now
+        // suppressed settlement of that worker's DEFERRED day weeks earlier —
+        // which then exported at full pay with no meal deducted.
+        if (open.has(key)) continue;
+        if (input.isDayLocked(row.dayKey)) continue;
+        plan.set(key, row);
     }
     return [...plan.values()];
 }

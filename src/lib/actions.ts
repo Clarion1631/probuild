@@ -15272,41 +15272,69 @@ export async function applyGustoRateImport(rows: Array<{ userId: string; newHour
 export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
     const user = await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
-    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { startOfDateInTimeZone, daysBetweenDayKeys } = await import("./tz-date");
+    const { MAX_PAY_PERIOD_RANGE_DAYS } = await import("./pay-period-summary-core");
     const { loadGustoExport } = await import("./gusto-export-db");
 
     const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
     if (!DAY_KEY.test(periodStartKey) || !DAY_KEY.test(periodEndKey) || periodEndKey <= periodStartKey) {
         return { success: false as const, error: "Pick a valid period." };
     }
+    // Same cap as the download endpoint — a lock must never cover a range the
+    // export itself would refuse to produce.
+    if (daysBetweenDayKeys(periodStartKey, periodEndKey) > MAX_PAY_PERIOD_RANGE_DAYS) {
+        return { success: false as const, error: `A pay period cannot be longer than ${MAX_PAY_PERIOD_RANGE_DAYS} days.` };
+    }
     const timeZone = await resolveCompanyTimeZone();
     const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
     const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
 
-    const result = await loadGustoExport(periodStart, periodEnd);
-    if (result.blocking.length > 0) {
+    // Pass 1, OUTSIDE the transaction: settle DEFERRED days and check
+    // readiness. Settlement takes its own advisory locks, so it cannot run
+    // inside the lock transaction.
+    const precheck = await loadGustoExport(periodStart, periodEnd);
+    if (precheck.blocking.length > 0) {
         return {
             success: false as const,
-            error: `${result.blocking.length} time ${result.blocking.length === 1 ? "entry is" : "entries are"} still open or flagged — clear them before locking.`,
+            error: `${precheck.blocking.length} time ${precheck.blocking.length === 1 ? "entry is" : "entries are"} not ready (open, flagged, zero hours, or an unsettled meal) — clear them before locking.`,
         };
     }
 
+    // Pass 2, INSIDE one transaction: take the lock FIRST, then recompute. The
+    // ordering is the whole point. Once lockedAt is committed every gated write
+    // path is refused, so a recompute that still agrees with the pre-check
+    // proves nothing slipped in between — and if it disagrees, the throw rolls
+    // the lock back rather than freezing a period around numbers a human never
+    // saw. Check-then-act would have locked whatever the racing write left.
     const lockedAt = new Date();
-    await prisma.payrollPeriod.upsert({
-        where: { periodStart_periodEnd: { periodStart, periodEnd } },
-        create: {
-            periodStart,
-            periodEnd,
-            lockedAt,
-            lockedById: user.id,
-            exportHash: result.summaryHash,
-        },
-        update: { lockedAt, lockedById: user.id, exportHash: result.summaryHash },
-    });
+    try {
+        const committed = await prisma.$transaction(async (tx) => {
+            await tx.payrollPeriod.upsert({
+                where: { periodStart_periodEnd: { periodStart, periodEnd } },
+                create: { periodStart, periodEnd, lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
+                update: { lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
+            });
 
-    revalidatePath("/manager/payroll-export");
-    revalidatePath("/manager/time-entries");
-    return { success: true as const, exportHash: result.summaryHash };
+            const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx, settle: false });
+            if (confirmed.blocking.length > 0) {
+                throw new Error(
+                    "Someone changed a time entry in this period while it was being locked. Nothing was locked — refresh and try again."
+                );
+            }
+            if (confirmed.exportHash !== precheck.exportHash) {
+                throw new Error(
+                    "The hours in this period changed while it was being locked. Nothing was locked — re-download the CSVs and try again."
+                );
+            }
+            return confirmed.exportHash;
+        });
+
+        revalidatePath("/manager/payroll-export");
+        revalidatePath("/manager/time-entries");
+        return { success: true as const, exportHash: committed };
+    } catch (error: any) {
+        return { success: false as const, error: error?.message || "Could not lock this period." };
+    }
 }
 
 /**
