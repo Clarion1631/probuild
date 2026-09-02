@@ -36,11 +36,19 @@ export function activeJobWhere() {
 export interface PercentCompleteRecalcResult {
     projectId: string;
     projectName: string;
+    /**
+     * The UPDATE matched no row — the project was deleted between being listed
+     * and being written. NOT an error: a nightly sweep must not abort the
+     * remaining jobs over one vanished row. But it must not be reported as a
+     * successful recalc with a null percentage either, which is exactly what a
+     * zero-row RETURNING used to look like.
+     */
+    notFound: boolean;
     /** The computed value, or null when the trust gate refused to guess. */
     auto: number | null;
     /** True when a MANUAL override meant `percentComplete` was left alone. */
     manualOverrideKept: boolean;
-    /** The effective value after the write. */
+    /** The effective value after the write, or null when nothing was written. */
     percentComplete: number | null;
 }
 
@@ -142,10 +150,32 @@ export async function recalcProjectPercentComplete(
         RETURNING "percentComplete", "percentCompleteSource"`;
 
     const row = rows[0];
-    const manualOverrideKept = row?.percentCompleteSource === "MANUAL";
-    const percentComplete = row?.percentComplete == null ? null : Number(row.percentComplete);
+    if (!row) {
+        // Zero rows means the WHERE matched nothing: the project was deleted
+        // between being listed and being updated (or a caller passed a stale
+        // id). Nothing was stored, so say so — `percentComplete: null` alone
+        // reads identically to "computed, and the answer was unknowable".
+        return {
+            projectId: project.id,
+            projectName: project.name,
+            notFound: true,
+            auto,
+            manualOverrideKept: false,
+            percentComplete: null,
+        };
+    }
 
-    return { projectId: project.id, projectName: project.name, auto, manualOverrideKept, percentComplete };
+    const manualOverrideKept = row.percentCompleteSource === "MANUAL";
+    const percentComplete = row.percentComplete == null ? null : Number(row.percentComplete);
+
+    return {
+        projectId: project.id,
+        projectName: project.name,
+        notFound: false,
+        auto,
+        manualOverrideKept,
+        percentComplete,
+    };
 }
 
 /** Recompute every active job. Returns one row per job for the cron log. */
@@ -161,7 +191,16 @@ export async function recalcAllActivePercentComplete(): Promise<PercentCompleteR
     // six jobs in parallel would burst the pooler for no useful latency win on a
     // nightly cron.
     for (const project of projects) {
-        results.push(await recalcProjectPercentComplete(project));
+        const result = await recalcProjectPercentComplete(project);
+        // Log and carry on: one project deleted mid-sweep must not cost the
+        // other jobs their nightly recalculation.
+        if (result.notFound) {
+            console.warn("[percent-complete] skipped — project vanished mid-recalc", {
+                projectId: result.projectId,
+                projectName: result.projectName,
+            });
+        }
+        results.push(result);
     }
     return results;
 }

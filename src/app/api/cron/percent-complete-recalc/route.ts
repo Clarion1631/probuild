@@ -27,8 +27,9 @@ export async function GET(request: Request) {
         "[cron/percent-complete-recalc]",
         JSON.stringify({
             jobs: results.length,
-            measured: results.filter((r) => r.auto !== null).length,
+            measured: results.filter((r) => !r.notFound && r.auto !== null).length,
             manualOverridesKept: results.filter((r) => r.manualOverrideKept).length,
+            skippedNotFound: results.filter((r) => r.notFound).length,
         })
     );
     return NextResponse.json({ jobs: results.length, results });

@@ -35,6 +35,8 @@ let row: Row;
 let sqlSeen: string[];
 /** Runs during the recalc's READ phase, standing in for a concurrent save. */
 let duringReads: (() => void) | null;
+/** When true the fake UPDATE matches no row — a project deleted mid-sweep. */
+let rowDeleted: boolean;
 
 function resetFixture() {
     row = {
@@ -47,6 +49,7 @@ function resetFixture() {
     };
     sqlSeen = [];
     duringReads = null;
+    rowDeleted = false;
 }
 
 // One coded phase worth $10,000 with a single Complete task → auto = 100.
@@ -101,6 +104,9 @@ const fakePrisma = {
 
         const auto = values[0] as number | null;
         const now = values.find((v) => v instanceof Date) as Date | undefined;
+
+        // WHERE "id" = ... matched nothing.
+        if (rowDeleted) return [];
 
         row.percentCompleteAuto = auto;
         if (row.percentCompleteSource !== "MANUAL") {
@@ -158,6 +164,7 @@ test("with no override, the recalc adopts the computed value as AUTO", async () 
     const result = await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
 
     assert.equal(result.auto, 100);
+    assert.equal(result.notFound, false);
     assert.equal(result.manualOverrideKept, false);
     assert.equal(row.percentComplete, 100);
     assert.equal(row.percentCompleteSource, "AUTO");
@@ -199,6 +206,41 @@ test("a manual save landing MID-RECALC survives the recalc's write", async () =>
     assert.equal(result.manualOverrideKept, true);
     assert.equal(result.percentComplete, 60);
     assert.equal(result.auto, 100);
+});
+
+// ── the row vanished ────────────────────────────────────────────────────────
+
+test("a project deleted mid-recalc reports notFound, not a successful null", async () => {
+    // Zero rows from RETURNING used to be indistinguishable from "computed, and
+    // the trust gate refused to guess" — both surfaced as percentComplete null
+    // with notFound absent, so a vanished project looked like a clean recalc.
+    rowDeleted = true;
+
+    const result = await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    assert.equal(result.notFound, true);
+    assert.equal(result.percentComplete, null);
+    assert.equal(result.manualOverrideKept, false);
+    // The computed value is still reported — it was computed, just not stored.
+    assert.equal(result.auto, 100);
+});
+
+test("a vanished project is distinguishable from an unmeasurable one", async () => {
+    rowDeleted = true;
+    const vanished = await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    resetFixture();
+    // Uncoded estimate → the trust gate returns null. A real, stored recalc.
+    ESTIMATES[0].items[0].costCodeId = null as unknown as string;
+    const unmeasurable = await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+    ESTIMATES[0].items[0].costCodeId = "cc-demo";
+
+    assert.equal(vanished.percentComplete, null);
+    assert.equal(unmeasurable.percentComplete, null);
+    // Same percentage, different meaning — which is the whole point of the flag.
+    assert.equal(vanished.notFound, true);
+    assert.equal(unmeasurable.notFound, false);
+    assert.equal(unmeasurable.auto, null);
 });
 
 test("the recalc never reads the source into JS to decide — one guarded statement", async () => {
