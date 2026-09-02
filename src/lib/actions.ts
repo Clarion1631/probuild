@@ -15434,11 +15434,11 @@ export async function lockPayrollPeriod(
     periodEndKey: string,
     /**
      * The export hash the human actually reviewed, from the page they were
-     * looking at. Compared under the exclusive lock: if the period has moved
-     * since it was rendered, the lock is refused rather than freezing numbers
-     * nobody approved.
+     * looking at. REQUIRED, and compared unconditionally under the exclusive
+     * lock: an optional check is one a caller can skip, and skipping it is
+     * exactly how a period gets frozen around numbers nobody approved.
      */
-    reviewedExportHash?: string
+    reviewedExportHash: string
 ) {
     const user = await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
@@ -15452,6 +15452,16 @@ export async function lockPayrollPeriod(
     // range the export itself would refuse to produce.
     const range = validatePayrollRange(periodStartKey, periodEndKey);
     if (!range.ok) return { success: false as const, error: range.error };
+
+    // Shape-checked before anything else: a caller that sends "" or junk is not
+    // proving it reviewed anything, and must not be able to slip past the
+    // comparison below by sending a falsy value.
+    if (typeof reviewedExportHash !== "string" || !/^[0-9a-f]{64}$/.test(reviewedExportHash)) {
+        return {
+            success: false as const,
+            error: "Reload the page before locking — the numbers being locked could not be identified.",
+        };
+    }
 
     const timeZone = await resolveCompanyTimeZone();
     const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
@@ -15636,7 +15646,7 @@ export async function lockPayrollPeriod(
             // self-consistent across this request. If the page they clicked from
             // was rendered before somebody edited an entry, both hashes above
             // agree with each other and disagree with what was on screen.
-            if (reviewedExportHash && confirmed.exportHash !== reviewedExportHash) {
+            if (confirmed.exportHash !== reviewedExportHash) {
                 throw new Error(
                     "This period changed since the page you are looking at was loaded. Nothing was locked - refresh, check the numbers again, then lock."
                 );

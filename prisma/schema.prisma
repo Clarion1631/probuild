@@ -2696,11 +2696,13 @@ model HelpRequest {
   changeLocation    String?
   externalIssueRef  String?
   conversationId    String?
-  /// Client-supplied idempotency key. A retry carrying the same value returns
-  /// the row that already exists instead of filing a second GitHub issue.
-  submissionId      String?   @unique
+  /// Client-supplied idempotency key, unique PER USER. Not globally unique:
+  /// one user's key would then collide with another's and hand back somebody
+  /// else's report, so the uniqueness and every lookup are scoped by userId.
+  submissionId      String?
   createdAt         DateTime? @default(now()) @db.Timestamptz(6)
 
+  @@unique([userId, submissionId])
   @@index([conversationId])
   @@index([externalIssueRef])
   /// The throttle counts a user's submissions in the last hour.

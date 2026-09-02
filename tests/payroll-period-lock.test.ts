@@ -231,7 +231,7 @@ const GATED_WRITERS: Array<{ file: string; mustMatch: RegExp[] }> = [
         file: "src/app/api/time-entries/[id]/route.ts",
         mustMatch: [
             /entryIds: \[id\],[\s\S]{0,400}dayKeys: \[/, // PATCH declares its rows AND its days up front
-            /assertEntriesUnlockedInTx\(tx, \[id\], \{[\s\S]{0,200}dayKeys/, // DELETE
+            /assertEntriesUnlockedInTx\(tx, \[id\], \{ dayKeys \}\)/, // DELETE
         ],
     },
 ];
@@ -365,8 +365,8 @@ test("PATCH and DELETE on /api/time-entries/[id] both still call the lock guard"
     assert.match(patchHalf, /settleDayWithinTx\(/);
     // DELETE: the guard runs inside deleteEntryAndSettle's own transaction, and
     // locks the day before the row (the global order).
-    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id\], \{/);
-    assert.match(deleteHalf, /dayKeys: \[dayLockKey\(/);
+    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id\], \{ dayKeys \}\)/);
+    assert.match(deleteHalf, /dayLockKey\(/);
 });
 
 test("assertPeriodUnlockedOrThrow throws with the same message the routes return", async () => {
@@ -485,14 +485,14 @@ test("the entry guard validates the row's STORED startTime, not anything passed 
     await assertEntriesUnlockedInTx(free, ["te1"]);
 });
 
-test("DELETE guards on the entry ID, so the stored time is re-read inside the transaction", () => {
+test("DELETE guards on the entry ID, re-reading the stored time inside the transaction", () => {
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
     );
     const deleteHalf = source.slice(source.indexOf("export async function DELETE"));
     assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id\], \{/);
-    assert.match(deleteHalf, /dayKeys: \[dayLockKey\(/, "the day must be locked before the row");
+    assert.match(deleteHalf, /dayLockKey\(/, "the day must be locked before the row");
 });
 
 test("settlement takes the payroll lock BEFORE the wa-breaks day lock", () => {
@@ -627,8 +627,14 @@ test("the lock binds to the hash the reviewer was shown", () => {
     const body = lock.slice(0, lock.indexOf(LF + "export "));
     // Both internal hashes can agree with each other and still disagree with
     // what was on the page the human clicked from.
-    assert.match(body, /reviewedExportHash\?: string/);
-    assert.match(body, /reviewedExportHash && confirmed\.exportHash !== reviewedExportHash/);
+    // REQUIRED, and shape-checked: an optional comparison is one a caller can
+    // skip by sending nothing, which is exactly how a period gets frozen around
+    // numbers nobody approved.
+    assert.match(body, /reviewedExportHash: string/);
+    assert.doesNotMatch(body, /reviewedExportHash\?: string/);
+    assert.match(body, /\/\^\[0-9a-f\]\{64\}\$\//);
+    assert.match(body, /confirmed\.exportHash !== reviewedExportHash/);
+    assert.doesNotMatch(body, /reviewedExportHash && confirmed/, "the check must be unconditional");
     assert.match(body, /refresh, check the numbers again/);
 
     // And the page hands it over, from a client component that can actually
@@ -648,7 +654,7 @@ test("the lock binds to the hash the reviewer was shown", () => {
     assert.doesNotMatch(page, /await lockPayrollPeriod\(/, "no inline form action — it would swallow the error");
 });
 
-test("PATCH re-reads the row and compare-and-sets on the stored startTime", () => {
+test("PATCH re-reads the row and compare-and-sets on updatedAt", () => {
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
@@ -656,9 +662,13 @@ test("PATCH re-reads the row and compare-and-sets on the stored startTime", () =
     const patchHalf = source.slice(0, source.indexOf("export async function DELETE"));
     // Day locks are derived from BOTH the stored value and the new one, and the
     // row is re-read under the FOR UPDATE those locks were taken with.
-    assert.match(patchHalf, /SELECT "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
+    assert.match(patchHalf, /SELECT "startTime", "updatedAt" FROM "TimeEntry" WHERE "id" = \$1/);
     assert.match(patchHalf, /stored\.startTime\.getTime\(\) !== existing\.startTime\.getTime\(\)/);
-    assert.match(patchHalf, /updateMany\(\{[\s\S]{0,120}startTime: stored\.startTime/);
+    // CAS on updatedAt: a concurrent write can change endTime, the meal
+    // outcome or the attestations WITHOUT moving startTime, and this edit
+    // recomputed duration and cost from a copy read before any of that.
+    assert.match(patchHalf, /updateMany\(\{[\s\S]{0,160}updatedAt: stored\.updatedAt/);
+    assert.match(patchHalf, /SELECT "startTime", "updatedAt" FROM "TimeEntry"/);
     assert.match(patchHalf, /EntryMovedError/);
     assert.match(source, /code: "ENTRY_MOVED"/);
 });
@@ -672,4 +682,52 @@ test("the project timeclock actions parse date-only input in the company zone", 
     );
     assert.doesNotMatch(source, /new Date\(data\.date\)/);
     assert.equal((source.match(/dateInputInTimeZone\(data\.date, timeZone/g) ?? []).length, 2, "create AND update");
+});
+
+test("DELETE locks every candidate day before the row, and retries once if it moves", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const deleteHalf = source.slice(source.indexOf("export async function DELETE"));
+    // deleteEntryAndSettle re-plans BOTH the day it was told about and the day
+    // it actually finds, so both have to be locked up front — in sorted order,
+    // like every other path.
+    assert.match(deleteHalf, /dayLockKey\(existing\.userId, toCompanyDayKey\(existing\.startTime\)\)/);
+    assert.match(deleteHalf, /dayLockKey\(fresh\.userId, toCompanyDayKey\(fresh\.startTime\)\)/);
+    assert.match(deleteHalf, /\]\)\]\.sort\(\)/);
+    // One retry from a FRESH read, then give up: looping would hold locks while
+    // whatever is rewriting the row keeps rewriting it.
+    assert.match(deleteHalf, /deleteOnce\(0\)\) === "moved" && \(await deleteOnce\(1\)\) === "moved"/);
+    assert.match(deleteHalf, /code: "ENTRY_MOVED"/);
+});
+
+test("the project timeclock action never accepts a caller-supplied cost", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "projects", "[id]", "timeclock", "actions.ts"),
+        "utf8"
+    );
+    // A server action's arguments are an HTTP body: any cost posted from the
+    // client could be anything, against anyone, straight into payroll.
+    // The ACTION's parameter object must not carry it (the pricing helper's
+    // own return type legitimately does).
+    const createSig = source.slice(source.indexOf("export async function createTimeEntry(data: {"));
+    assert.doesNotMatch(createSig.slice(0, createSig.indexOf("}")), /laborCost/);
+    const updateSig = source.slice(source.indexOf("export async function updateTimeEntry(id: string, data: {"));
+    assert.doesNotMatch(updateSig.slice(0, updateSig.indexOf("}")), /laborCost/);
+    assert.doesNotMatch(source, /laborCost: data\.laborCost/);
+    assert.match(source, /priceManualEntry\(data\.userId, data\.durationHours, acknowledgeZeroRate\)/);
+    // Derived from the STORED rates, with the same $0 policy as every other
+    // write path: refused unless explicitly acknowledged, then flagged.
+    assert.match(source, /select: \{ name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true \}/);
+    assert.match(source, /zeroRateBlocks\(/);
+    assert.match(source, /zeroRate && !acknowledgeZeroRate/);
+    assert.match(source, /appendZeroRateReview\(null\)/);
+
+    // The client stopped sending one too.
+    const client = readFileSync(
+        path.join(__dirname, "..", "src", "app", "projects", "[id]", "timeclock", "TimeClockClient.tsx"),
+        "utf8"
+    );
+    assert.doesNotMatch(client, /laborCost: cost/);
 });

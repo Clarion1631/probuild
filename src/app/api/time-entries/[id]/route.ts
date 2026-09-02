@@ -389,21 +389,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // the moment a concurrent writer moves the punch, and the days
                 // locked above were derived from it.
                 const [stored] = (await client.$queryRawUnsafe(
-                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                    `SELECT "startTime", "updatedAt" FROM "TimeEntry" WHERE "id" = $1`,
                     id
-                )) as Array<{ startTime: Date }>;
+                )) as Array<{ startTime: Date; updatedAt: Date }>;
                 if (!stored) throw new EntryMovedError();
                 if (stored.startTime.getTime() !== existing.startTime.getTime()) {
-                    // It moved. The day locks we hold are for the old day, so we
-                    // cannot safely settle — refuse and let the client retry
-                    // against the row's real state.
+                    // It moved days. The day locks we hold are for the old day,
+                    // so we cannot safely settle — refuse and let the client
+                    // retry against the row's real state.
                     throw new EntryMovedError();
                 }
 
-                // Compare-and-set on the value we just read: nothing may slip
-                // between the read and the write.
+                // Compare-and-set on updatedAt, not just startTime: a
+                // concurrent write can change the endTime, the meal outcome or
+                // the attestations WITHOUT moving startTime, and this edit
+                // recomputed duration and cost from a copy read before any of
+                // that. updatedAt moves on every write, so it is the one value
+                // that catches all of them.
                 const claim = await client.timeEntry.updateMany({
-                    where: { id, startTime: stored.startTime },
+                    where: { id, updatedAt: stored.updatedAt },
                     data,
                 });
                 if (claim.count !== 1) throw new EntryMovedError();
@@ -468,18 +472,73 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     // so the lock check and the delete cannot be split by a concurrent lock
     // creation. Deleting a punch out of an exported period changes hours that
     // were already paid.
-    try {
-        await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId, {
-            // Re-reads the row FOR UPDATE inside the delete transaction and
-            // validates its STORED startTime — the value read above is stale
-            // the moment another writer moves the row.
-            guard: (tx) =>
-                assertEntriesUnlockedInTx(tx, [id], {
-                    dayKeys: [dayLockKey(existing.userId, toCompanyDayKey(existing.startTime))],
-                }),
+    // The row may move between the read above and the delete, and
+    // deleteEntryAndSettle re-plans BOTH the day it thought the row was on and
+    // the day it actually finds. Every one of those days has to be locked
+    // BEFORE the row lock (the global order), so the candidate set is collected
+    // up front from a fresh read and passed in sorted.
+    //
+    // If it moves again after that, we re-read once and try with the new set.
+    // Once: a second miss means something is rewriting this row continuously,
+    // and looping would just hold locks while it does.
+    const deleteOnce = async (attempt: number): Promise<"ok" | "moved"> => {
+        const fresh = await prisma.timeEntry.findUnique({
+            where: { id },
+            select: { userId: true, startTime: true },
         });
+        if (!fresh) return "ok"; // already gone — deleting is idempotent
+
+        const dayKeys = [...new Set([
+            dayLockKey(existing.userId, toCompanyDayKey(existing.startTime)),
+            dayLockKey(fresh.userId, toCompanyDayKey(fresh.startTime)),
+        ])].sort();
+
+        try {
+            await deleteEntryAndSettle(id, toCompanyDayKey(fresh.startTime), fresh.userId, {
+                // Re-reads the row FOR UPDATE inside the delete transaction and
+                // validates its STORED startTime — the values read above are
+                // stale the moment another writer moves the row.
+                guard: async (tx) => {
+                    await assertEntriesUnlockedInTx(tx, [id], { dayKeys });
+                    const [now] = (await tx.$queryRawUnsafe(
+                        `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                        id
+                    )) as Array<{ startTime: Date }>;
+                    // Moved again, into a day we did not lock: bail so the
+                    // outer retry can collect the new day.
+                    if (now && toCompanyDayKey(now.startTime) !== toCompanyDayKey(fresh.startTime)) {
+                        throw new EntryMovedError();
+                    }
+                },
+            });
+            return "ok";
+        } catch (error) {
+            if (error instanceof EntryMovedError && attempt === 0) return "moved";
+            throw error;
+        }
+    };
+
+    try {
+        if ((await deleteOnce(0)) === "moved" && (await deleteOnce(1)) === "moved") {
+            return NextResponse.json(
+                {
+                    error: "This entry kept changing while it was being deleted. Reload and try again.",
+                    code: "ENTRY_MOVED",
+                },
+                { status: 409 }
+            );
+        }
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        if (error instanceof EntryMovedError) {
+            return NextResponse.json(
+                {
+                    error: "This entry changed while it was being deleted. Reload and try again.",
+                    code: "ENTRY_MOVED",
+                },
+                { status: 409 }
+            );
+        }
         throw error;
     }
     return NextResponse.json({ ok: true });

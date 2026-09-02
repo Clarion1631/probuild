@@ -172,7 +172,10 @@ END $$;
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_submissionId_key" ON "HelpRequest"("submissionId");
+-- Unique PER USER, not globally: a globally unique key means one user's value
+-- collides with another's, and the idempotency lookup then returns somebody
+-- else's report.
+CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_userId_submissionId_key" ON "HelpRequest"("userId", "submissionId");
 CREATE INDEX IF NOT EXISTS "HelpRequest_userId_createdAt_idx" ON "HelpRequest"("userId", "createdAt");
 
 CREATE TABLE IF NOT EXISTS "HelpSubmissionQuota" (

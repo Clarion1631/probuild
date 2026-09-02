@@ -10,6 +10,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+
+const LF = String.fromCharCode(10);
 import {
     checkHelpSubmission,
     hourBucket,
@@ -184,6 +186,27 @@ test("submissionId is optional, bounded, and makes a retry idempotent", () => {
         fn.indexOf("findUnique") < fn.indexOf("HelpSubmissionQuota"),
         "the submissionId lookup must precede the counter"
     );
+});
+
+test("the idempotency key is scoped PER USER, not globally", () => {
+    // Clients choose these values. A globally unique key means two users who
+    // pick the same one collide — and the loser's lookup returns SOMEBODY
+    // ELSE'S report, which is a data leak, not just a bug.
+    const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+    const model = schema.slice(schema.indexOf("model HelpRequest"));
+    const body = model.slice(0, model.indexOf(LF + "}"));
+    assert.match(body, /@@unique\(\[userId, submissionId\]\)/);
+    assert.doesNotMatch(body, /submissionId\s+String\?\s+@unique/, "must not be globally unique");
+
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.match(source, /userId_submissionId: \{ userId: input\.userId, submissionId: input\.submissionId \}/);
+
+    // And the migration/apply script agree with the schema.
+    const migration = readFileSync(
+        path.join(__dirname, "..", "prisma", "migrations", "20260901000000_payroll_phase5", "migration.sql"),
+        "utf8"
+    );
+    assert.match(migration, /"HelpRequest_userId_submissionId_key" ON "HelpRequest"\("userId", "submissionId"\)/);
 });
 
 test("the throttle is a conditional UPDATE on a counter row, not a count-then-insert", () => {

@@ -9,6 +9,8 @@ import { dayKeyFromDateOnly } from "@/lib/company-day";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
+import { toNum } from "@/lib/prisma-helpers";
+import { appendZeroRateReview, zeroRateBlocks, zeroRateManagerMessage } from "@/lib/pay-rate-guard";
 
 // A bare session check let any signed-in account write hours against any
 // project. These rows are now direct field evidence on the schedule board, so
@@ -21,16 +23,63 @@ async function assertTimeclockProjectAccess(projectId: string) {
     if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
 }
 
+
+/**
+ * Price a manual entry from the member's STORED rates, and apply the same
+ * $0-rate policy as every other write path.
+ *
+ * laborCost used to be a parameter. A server action's arguments are an HTTP
+ * body, so that let a caller post any cost they liked against any worker —
+ * straight into payroll and job costing. The rate is read from the database
+ * here and nowhere else.
+ *
+ * This is always an office action (there is no worker-side manual create), so
+ * it follows the MANAGER branch of the zero-rate rule: refused by default, and
+ * allowed only when the caller explicitly acknowledges it, in which case the
+ * entry is flagged for payroll (src/lib/pay-rate-guard.ts).
+ */
+async function priceManualEntry(
+    userId: string,
+    durationHours: number,
+    acknowledgeZeroRate: boolean
+): Promise<{ laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string }> {
+    const member = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
+    });
+    if (!member) throw new Error("Crew member not found");
+
+    const hourlyRate = toNum(member.hourlyRate);
+    const burdenRate = toNum(member.burdenRate);
+    const zeroRate = zeroRateBlocks({
+        role: member.role,
+        email: member.email,
+        payType: member.payType,
+        hourlyRate,
+    });
+    if (zeroRate && !acknowledgeZeroRate) {
+        throw new Error(zeroRateManagerMessage(member.name));
+    }
+
+    return {
+        laborCost: durationHours * hourlyRate,
+        burdenCost: durationHours * burdenRate,
+        ...(zeroRate ? appendZeroRateReview(null) : {}),
+    };
+}
+
 export async function createTimeEntry(data: {
     projectId: string;
     userId: string;
     costCodeId: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
+    /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+    acknowledgeZeroRate?: boolean;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
+    const acknowledgeZeroRate = data.acknowledgeZeroRate === true;
 
     await assertTimeclockProjectAccess(data.projectId);
 
@@ -50,6 +99,8 @@ export async function createTimeEntry(data: {
         estimateItemId: null,
     });
 
+    const priced = await priceManualEntry(data.userId, data.durationHours, acknowledgeZeroRate);
+
     // Creating hours AT a date is moving hours INTO that period, so a create is
     // as much a payroll change as an edit. Check + write in one transaction
     // under the shared advisory lock (src/lib/payroll-period.ts).
@@ -63,7 +114,7 @@ export async function createTimeEntry(data: {
                 // endTime stays NULL — durationHours is the paid time entered
                 // by hand, not a span (see time-expense-core.ts).
                 durationHours: data.durationHours,
-                laborCost: data.laborCost,
+                ...priced,
                 scheduleTaskId
             }
         })
@@ -79,10 +130,12 @@ export async function updateTimeEntry(id: string, data: {
     costCodeId: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
+    /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+    acknowledgeZeroRate?: boolean;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
+    const acknowledgeZeroRate = data.acknowledgeZeroRate === true;
 
     const timeZone = await resolveCompanyTimeZone();
     const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
@@ -104,6 +157,8 @@ export async function updateTimeEntry(id: string, data: {
         estimateItemId: existing.estimateItemId,
     });
 
+    const priced = await priceManualEntry(data.userId, data.durationHours, acknowledgeZeroRate);
+
     // Both dates — editing inside a locked period, and moving a punch into one.
     await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.update({
@@ -113,7 +168,7 @@ export async function updateTimeEntry(id: string, data: {
                 costCodeId: data.costCodeId,
                 startTime,
                 durationHours: data.durationHours,
-                laborCost: data.laborCost,
+                ...priced,
                 scheduleTaskId
             }
         })

@@ -4,7 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
-import { applyRateChange } from "@/lib/pay-rate-write";
+import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -66,17 +66,18 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const body = await req.json();
         const { permissions, projectIds, userInfo, pinCode } = body;
 
-        // Update user info if provided
+        // Profile fields and rates commit TOGETHER, in one transaction. They
+        // were two sequential writes: a rate refusal left the profile half
+        // already saved, so a manager without payroll access could rename
+        // somebody and get a 403 that made it look like nothing happened.
         if (userInfo || pinCode !== undefined) {
             const data: any = {};
             if (userInfo) {
                 if (userInfo.name !== undefined) data.name = userInfo.name;
                 if (userInfo.role !== undefined) data.role = userInfo.role;
                 if (userInfo.status !== undefined) data.status = userInfo.status;
-                // Rates are NOT written here — see the applyRateChange call
-                // below. They need a payroll permission, an exact-decimal parse
-                // and a lastRateSyncAt stamp, and doing that inline in three
-                // routes is how two of them ended up skipping the stamp.
+                // Rates are NOT written here — applyRateChange below owns them
+                // (payroll permission, exact decimal, lastRateSyncAt stamp).
                 // FINANCE accounts must never be offered as dispatch-board crew —
                 // guard server-side even though the Team page hides the toggle.
                 if (userInfo.showOnDispatch !== undefined) {
@@ -85,27 +86,39 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 }
             }
             if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
+
+            try {
+                await prisma.$transaction(async (tx) => {
+                    if (userInfo) {
+                        const rateResult = await applyRateChange(
+                            currentUser,
+                            id,
+                            {
+                                hourlyRate: userInfo.hourlyRate,
+                                burdenRate: userInfo.burdenRate,
+                                payType: userInfo.payType,
+                            },
+                            tx as never
+                        );
+                        if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                    }
+                    if (Object.keys(data).length > 0) {
+                        await tx.user.update({ where: { id }, data });
+                    }
+                });
+            } catch (error) {
+                if (error instanceof RateChangeError) {
+                    return NextResponse.json({ error: error.message }, { status: error.status });
+                }
+                throw error;
+            }
+
             if (Object.keys(data).length > 0) {
-                await prisma.user.update({ where: { id }, data });
                 // Newly ACTIVATED FIELD_CREW (or CJ) joins every "In Progress"
                 // project. Fail-soft inside the helper; never blocks the save.
+                // Runs only once the transaction has COMMITTED.
                 const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
                 after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
-            }
-        }
-
-        // Pay rates and pay type: ONE validated path, with its own permission
-        // boundary (ADMIN or financialReports). Returns changed:false when the
-        // payload had no rate fields, so an ordinary profile edit by a MANAGER
-        // is unaffected.
-        if (userInfo) {
-            const rateResult = await applyRateChange(currentUser, id, {
-                hourlyRate: userInfo.hourlyRate,
-                burdenRate: userInfo.burdenRate,
-                payType: userInfo.payType,
-            });
-            if (!rateResult.ok) {
-                return NextResponse.json({ error: rateResult.error }, { status: rateResult.status });
             }
         }
 

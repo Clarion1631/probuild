@@ -236,29 +236,38 @@ export function unknownPayTypeBlockers(
     periodEnd: Date
 ): BlockingEntry[] {
     const byId = new Map(users.map((user) => [user.id, user]));
+
+    // Earliest in-period entry per worker, for a useful startTime on the blocker.
     const firstEntryFor = new Map<string, { id: string; startTime: Date }>();
     for (const entry of entries) {
         if (!inPeriod(entry, periodStart, periodEnd)) continue;
-        const user = byId.get(entry.userId);
-        // A punch by somebody not on the roster is already impossible (the
-        // roster includes everyone who punched), but if it happened we cannot
-        // vouch for their pay type either. An UNRECOGNISED value counts as
-        // unknown, exactly like null — never as a default.
-        if (user && isKnownPayType(user.payType)) continue;
         const seen = firstEntryFor.get(entry.userId);
         if (!seen || entry.startTime < seen.startTime) {
             firstEntryFor.set(entry.userId, { id: entry.id, startTime: entry.startTime });
         }
     }
-    return [...firstEntryFor.entries()]
-        .map(([userId, entry]) => ({
-            id: entry.id,
-            userId,
-            userLabel: userLabel(byId.get(userId), userId),
-            startTime: entry.startTime,
+
+    // EVERY user on the roster, not only those with hours. A zero-hour worker is
+    // in the summary csv as a 0.00 row, so the file makes a claim about them —
+    // and whether they belong in it at all depends on their pay type. Checking
+    // only the ones who punched let an unanswered account ship a row that says
+    // "this person worked nothing", when they may be salaried and not belong in
+    // the file, or hourly and genuinely owed nothing. Unknown is unknown.
+    const blockers: BlockingEntry[] = [];
+    for (const user of users) {
+        // An UNRECOGNISED value counts as unknown, exactly like null — never as
+        // a default.
+        if (isKnownPayType(user.payType)) continue;
+        const entry = firstEntryFor.get(user.id);
+        blockers.push({
+            id: entry?.id ?? `no-pay-type:${user.id}`,
+            userId: user.id,
+            userLabel: userLabel(user, user.id),
+            startTime: entry?.startTime ?? periodStart,
             reason: "unknownPayType" as const,
-        }))
-        .sort((a, b) => a.userLabel.localeCompare(b.userLabel) || a.userId.localeCompare(b.userId));
+        });
+    }
+    return blockers.sort((a, b) => a.userLabel.localeCompare(b.userLabel) || a.userId.localeCompare(b.userId));
 }
 
 /**

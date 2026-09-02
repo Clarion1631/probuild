@@ -234,7 +234,10 @@ test("a worker with no payType blocks the export — guessing is a wrong paycheq
     assert.equal(result.blocking[0].userLabel, "New Hire");
 });
 
-test("a payType-less worker with NO hours in the period does not block it", () => {
+test("a payType-less worker on the roster blocks even with no in-period hours", () => {
+    // This used to pass only people who PUNCHED. A roster member with no hours
+    // still gets a 0.00 row in the summary, so the file asserts something about
+    // them; if nobody has said how they are paid, that assertion is a guess.
     const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
     const result = buildGustoExport({
         // Same workweek, before the period — fetched for the 40h threshold only.
@@ -244,7 +247,7 @@ test("a payType-less worker with NO hours in the period does not block it", () =
         periodEnd: PERIOD_END,
         timeZone: TZ,
     });
-    assert.deepEqual(result.blocking, [], "only people actually being paid for this period need an answer");
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
 });
 
 test("readiness looks at the whole workweek ENVELOPE, not just the period", () => {
@@ -532,4 +535,25 @@ test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
     // off role alone dropped them from the file entirely.
     assert.match(source, /status: "ACTIVATED", payType: "HOURLY"/);
     assert.match(source, /status: "ACTIVATED", payType: null, role: \{ in: \[\.\.\.HOURLY_PAID_ROLES\] \}/);
+});
+
+test("a ZERO-HOUR roster member with no payType blocks the export too", () => {
+    // A zero-hour worker still gets a 0.00 row, so the file makes a claim about
+    // them — and whether they belong in it at all depends on their pay type.
+    // Checking only the people who punched let an unanswered account ship a row
+    // saying "worked nothing" when they might be salaried and not belong there.
+    const unanswered: ExportUser = { id: "u-quiet", name: "Quiet Hire", email: "quiet@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: alice.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [alice, unanswered],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(
+        result.blocking.map((row) => [row.userId, row.reason]),
+        [["u-quiet", "unknownPayType"]]
+    );
+    // The blocker still carries a sensible instant even with no entry to hang it on.
+    assert.equal(result.blocking[0].startTime.getTime(), PERIOD_START.getTime());
 });

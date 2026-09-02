@@ -120,7 +120,9 @@ const STATEMENTS = [
      END $$`,
     // ---- Help-widget throttle + idempotency (round 6, item 6) -----------
     `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_submissionId_key" ON "HelpRequest"("submissionId")`,
+    // Unique PER USER — a global key would collide across users and hand back
+    // somebody else's report.
+    `CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_userId_submissionId_key" ON "HelpRequest"("userId", "submissionId")`,
     `CREATE INDEX IF NOT EXISTS "HelpRequest_userId_createdAt_idx" ON "HelpRequest"("userId", "createdAt")`,
     `CREATE TABLE IF NOT EXISTS "HelpSubmissionQuota" (
         "id" TEXT NOT NULL,

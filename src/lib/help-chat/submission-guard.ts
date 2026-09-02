@@ -178,8 +178,11 @@ export async function reserveHelpRequest(input: {
     submissionId: string | null;
 }): Promise<ReserveResult> {
     if (input.submissionId) {
+        // Scoped by userId. A lookup on the key alone would return another
+        // user's report the moment two clients picked the same value — and
+        // clients pick these, so collisions are a matter of time.
         const existing = await prisma.helpRequest.findUnique({
-            where: { submissionId: input.submissionId },
+            where: { userId_submissionId: { userId: input.userId, submissionId: input.submissionId } },
             select: { id: true },
         });
         if (existing) return { ok: true, id: existing.id, existing: true };
