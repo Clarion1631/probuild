@@ -16,6 +16,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
+import { logAutomationEvent } from "./automation-events";
 import {
     type QBTokens,
     refreshQBToken,
@@ -665,6 +666,14 @@ export interface QBPaymentSyncResult {
     // separate counter from `settled` (which counts individual milestones)
     // since one progress billing can carry several milestone lines.
     progressBillingsSettled: number;
+    /**
+     * Rows we deliberately did not probe because QBO had already stopped
+     * answering this run. Non-zero means the run is INCOMPLETE, not clean —
+     * every skipped row is simply retried next run.
+     */
+    skipped: number;
+    /** True when the run stopped early on a connection-level QBO failure. */
+    abortedOnQboOutage: boolean;
 }
 
 /**
@@ -672,7 +681,10 @@ export interface QBPaymentSyncResult {
  * Safe to run repeatedly (cron + on-view). Never throws on a single bad row.
  */
 export async function syncQuickBooksPayments(scope?: { invoiceId?: string; projectId?: string }): Promise<QBPaymentSyncResult> {
-    const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0 };
+    const result: QBPaymentSyncResult = {
+        checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0,
+        skipped: 0, abortedOnQboOutage: false,
+    };
 
     const pending = await prisma.paymentSchedule.findMany({
         where: {
@@ -708,13 +720,23 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
         take: 100,
     });
 
-    if (pending.length === 0 && pendingBillings.length === 0) return result;
+    if (pending.length === 0 && pendingBillings.length === 0) {
+        await recordPaymentsSyncEvent(result);
+        return result;
+    }
 
     let tokens: QBTokens;
     try {
         tokens = await getFreshQBTokens();
     } catch (e) {
         result.errors.push(e instanceof Error ? e.message : "QB tokens unavailable");
+        // A timed-out refresh is the same outage as a timed-out probe; nothing
+        // was checked, so everything we loaded counts as skipped.
+        if (isQBTimeoutError(e)) {
+            result.abortedOnQboOutage = true;
+            result.skipped = pending.length + pendingBillings.length;
+        }
+        await recordPaymentsSyncEvent(result);
         return result;
     }
 
@@ -722,12 +744,25 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
-    for (const schedule of pending) {
+    // On a connection-level failure this loop STOPS rather than working through
+    // the rest: every remaining row would burn its own full deadline against the
+    // same wall, and six 20s timeouts is the cron's whole 120s ceiling.
+    for (const [index, schedule] of pending.entries()) {
         result.checked++;
         try {
             const probe = await probeQBInvoice(tokens, schedule.qbInvoiceId!);
-            // Transient error (token/429/5xx/network) — leave untouched and retry next run.
-            if (probe.state === "error") continue;
+            if (probe.state === "error") {
+                if (probe.connectionFailed) {
+                    result.abortedOnQboOutage = true;
+                    result.errors.push(
+                        `QuickBooks stopped responding (${probe.timedOut ? "timeout" : `status ${probe.status}`}) — remaining rows skipped, will retry next run`,
+                    );
+                    result.skipped += pending.length - index - 1;
+                    break;
+                }
+                // Ordinary transient error — leave untouched and retry next run.
+                continue;
+            }
 
             if (probe.state === "voided" || probe.state === "notFound") {
                 // The QBO invoice is gone/voided: it can never settle. Flag so the UI can
@@ -802,10 +837,27 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // (custom/change-order lines were materialized into a real PaymentSchedule
     // at billing-creation time — see createProgressBillingCore — so every line
     // has a scheduleId and settles like any other milestone; no special case).
-    for (const billing of pendingBillings) {
+    for (const [index, billing] of pendingBillings.entries()) {
+        // Same rule as the milestone loop: never keep dialling a dead QBO. A
+        // milestone-loop abort also skips this whole pass — the connection is
+        // shared, so there is nothing to gain by trying it again here.
+        if (result.abortedOnQboOutage) {
+            result.skipped += pendingBillings.length - index;
+            break;
+        }
         try {
             const probe = await probeQBInvoice(tokens, billing.qbInvoiceId!);
-            if (probe.state === "error") continue; // transient — retry next run
+            if (probe.state === "error") {
+                if (probe.connectionFailed) {
+                    result.abortedOnQboOutage = true;
+                    result.errors.push(
+                        `QuickBooks stopped responding (${probe.timedOut ? "timeout" : `status ${probe.status}`}) — remaining progress billings skipped, will retry next run`,
+                    );
+                    result.skipped += pendingBillings.length - index - 1;
+                    break;
+                }
+                continue; // ordinary transient — retry next run
+            }
             if (probe.state === "voided" || probe.state === "notFound") {
                 result.errors.push(`${billing.invoice.code}/${billing.code}: QBO invoice ${probe.state}`);
                 continue;
@@ -835,5 +887,37 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
         await notifyQBSyncIssues(newlyFlagged);
     }
 
+    await recordPaymentsSyncEvent(result);
     return result;
+}
+
+/** The AutomationEvent kind the payments cron writes once per run. */
+export const QBO_PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+
+/**
+ * One audit row per payments-sync run, so an outage on this rail is VISIBLE.
+ *
+ * Before this, a QBO outage during the payments cron left no trace anywhere a
+ * human or the morning digest would look: the run returned a tidy result object
+ * to a cron log nobody reads. The pipeline health check counts these errors and
+ * reports the last successful run, so a stalled money rail turns the digest red
+ * instead of staying silent. Fire-and-forget, like every other automation
+ * event — the audit row must never fail the sync it describes.
+ */
+async function recordPaymentsSyncEvent(result: QBPaymentSyncResult): Promise<void> {
+    const failed = result.abortedOnQboOutage;
+    await logAutomationEvent({
+        kind: QBO_PAYMENTS_SYNC_EVENT_KIND,
+        status: failed ? "error" : "ok",
+        reason: failed ? "qbo-unavailable" : undefined,
+        source: "cron",
+        detail: {
+            checked: result.checked,
+            settled: result.settled,
+            partiallyPaid: result.partiallyPaid,
+            progressBillingsSettled: result.progressBillingsSettled,
+            skipped: result.skipped,
+            errors: result.errors.slice(0, 5),
+        },
+    });
 }

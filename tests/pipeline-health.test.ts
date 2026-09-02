@@ -31,6 +31,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intuit: { status: "ok" as const, indicator: "none" },
         lastPurchaseSync: { status: "ok" as const, at: iso(2 * HOUR) },
         lastReceiptPush: { status: "ok" as const, at: iso(3 * HOUR) },
+        lastPaymentsSync: { status: "ok" as const, at: iso(1 * HOUR) },
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
         bank: { status: "ok" as const, at: iso(48 * HOUR) },
         stuck: { status: "ok" as const, count: 0 },
@@ -46,7 +47,7 @@ test("a healthy snapshot is ok with no reasons", () => {
 // ─── False green from a failed probe ────────────────────────────────────────
 
 test("ANY failed probe forces ok:false with probe-failed:<name>", () => {
-    const names = ["lastPurchaseSync", "lastReceiptPush", "receipts24h", "bank", "stuck"] as const;
+    const names = ["lastPurchaseSync", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck"] as const;
     for (const name of names) {
         const base = snapshot();
         const broken = {
@@ -76,13 +77,14 @@ test("a total database outage reports every probe, still never ok", () => {
         snapshot({
             lastPurchaseSync: { status: "error", at: null },
             lastReceiptPush: { status: "error", at: null },
+            lastPaymentsSync: { status: "error", at: null },
             receipts24h: { status: "error", counts: {} },
             bank: { status: "error", at: null },
             stuck: { status: "error", count: 0 },
         }),
     );
     assert.equal(v.ok, false);
-    assert.equal(v.reasons.length, 5);
+    assert.equal(v.reasons.length, 6);
 });
 
 // ─── Receipt staleness ──────────────────────────────────────────────────────
@@ -162,6 +164,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+            lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
         },
         receipts24h: { status: "ok", counts: { created: 4, fallback: 1 } },
         bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
@@ -199,6 +202,7 @@ test("digest says how long the silence has been, so a human can judge it", () =>
             qbo: {
                 lastPurchaseSync: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
                 lastReceiptPush: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
+                lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
             },
         }),
     );
@@ -235,6 +239,7 @@ test("digest renders missing timestamps as 'never' rather than a bogus date", ()
             qbo: {
                 lastPurchaseSync: { status: "ok", at: null },
                 lastReceiptPush: { status: "ok", at: null },
+                lastPaymentsSync: { status: "ok", at: null },
             },
         }),
     );
@@ -288,4 +293,32 @@ test("only a CREATE refreshes the last-booked clock — a re-push does not", () 
     assert.equal(BOOKED_PUSH_STATUSES.includes("already-exists"), false);
     assert.equal(BOOKED_PUSH_STATUSES.includes("fallback"), false);
     assert.equal(BOOKED_PUSH_STATUSES.includes("error"), false);
+});
+
+
+// ─── The payments rail is part of the pulse ─────────────────────────────────
+
+test("a payments-sync outage turns the verdict RED", async () => {
+    const { PAYMENTS_SYNC_EVENT_KIND } = await import("../src/lib/pipeline-health");
+    const { QBO_PAYMENTS_SYNC_EVENT_KIND } = await import("../src/lib/quickbooks-payments");
+    // The health check and the cron must agree on the event kind, or the
+    // outage is written to a row nothing reads.
+    assert.equal(PAYMENTS_SYNC_EVENT_KIND, QBO_PAYMENTS_SYNC_EVENT_KIND);
+
+    // The cron writes status "error" on an aborted run; `stuck` counts errors
+    // of ANY kind in 24h, so the digest goes red on the money rail too.
+    const v = evaluatePipelineHealth(snapshot({ stuck: { status: "ok", count: 1 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["errors-24h:1"]);
+});
+
+test("a payments-sync probe failure is its own reason", () => {
+    const v = evaluatePipelineHealth(snapshot({ lastPaymentsSync: { status: "error", reason: "timeout", at: null } }));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:lastPaymentsSync"));
+});
+
+test("the digest reports the payments rail alongside the receipt rail", () => {
+    const { text } = formatPipelineDigest(sampleHealth());
+    assert.match(text, /Last payments sync: /);
 });

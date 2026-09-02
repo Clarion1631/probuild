@@ -641,7 +641,13 @@ export type QBInvoiceProbe =
     | { state: "ok"; balance: number; total: number; paymentTxnIds: string[] }
     | { state: "voided" } // HTTP 200, exists, total & balance === 0, no linked payments
     | { state: "notFound" } // HTTP 400 Fault 610 or HTTP 404 (authoritative "gone" only)
-    | { state: "error"; status: number }; // 401/429/5xx/network/malformed — transient, never act on
+    // 401/429/5xx/network/malformed — transient, never act on.
+    // `connectionFailed` marks the subset where we never got a usable answer
+    // from QBO at all (our deadline fired, or the request threw). A caller
+    // looping over many rows must STOP on that: the next row will fail the
+    // same way and burn another full deadline, which is how six timeouts still
+    // added up to the payments cron's 120s ceiling.
+    | { state: "error"; status: number; connectionFailed?: boolean; timedOut?: boolean };
 
 /**
  * Probe a QBO invoice and classify it. QBO's behavior for gone invoices is
@@ -653,8 +659,10 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
     let res: Response;
     try {
         res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
-    } catch {
-        return { state: "error", status: 0 };
+    } catch (error) {
+        // A timeout or a thrown network error means QBO never answered — the
+        // connection itself is the problem, not this invoice.
+        return { state: "error", status: 0, connectionFailed: true, timedOut: isQBTimeoutError(error) };
     }
     if (res.ok) {
         // A 200 should always carry an Invoice. A parse failure or a missing payload
@@ -663,7 +671,11 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
         let data: any;
         try {
             data = await res.json();
-        } catch {
+        } catch (error) {
+            // The body can stall past the deadline after headers arrived.
+            if (isQBTimeoutError(error)) {
+                return { state: "error", status: res.status, connectionFailed: true, timedOut: true };
+            }
             return { state: "error", status: res.status };
         }
         const inv = data?.Invoice;
@@ -682,9 +694,21 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
         return { state: "ok", balance, total, paymentTxnIds };
     }
     if (res.status === 404) return { state: "notFound" };
-    const body = await res.text().catch(() => "");
+    let body = "";
+    try {
+        body = await res.text();
+    } catch (error) {
+        if (isQBTimeoutError(error)) {
+            return { state: "error", status: res.status, connectionFailed: true, timedOut: true };
+        }
+    }
     if (res.status === 400 && /"code"\s*:\s*"610"|Object Not Found/i.test(body)) {
         return { state: "notFound" };
+    }
+    // 429 and 5xx are QBO telling us it cannot serve requests right now; the
+    // next row would hit the same wall, so they count as connection-level too.
+    if (res.status === 429 || res.status >= 500) {
+        return { state: "error", status: res.status, connectionFailed: true };
     }
     return { state: "error", status: res.status };
 }

@@ -35,6 +35,37 @@ import {
     type QBAttachable,
 } from "./quickbooks";
 
+/**
+ * A QBO failure that WILL plausibly succeed on a later attempt: 429, 5xx, a
+ * thrown network error, or a failed attachment lookup.
+ *
+ * These used to be flattened into `failed:<status>` next to `ok: true`, which
+ * the Apps Script treats as FINAL — it stops resending, so a rate-limited or
+ * briefly-5xx attachment upload left the Purchase permanently without its
+ * receipt. Raising instead lets the route answer 503 retry:true, and the next
+ * pass hits the idempotent existing-Purchase recovery. A 4xx other than 429 is
+ * a real business rejection and stays terminal: retrying it forever is worse.
+ */
+export class QboRetryableError extends Error {
+    name = "QboRetryableError";
+    constructor(message: string, readonly status?: number) {
+        super(message);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isRetryableQboError(error: unknown): boolean {
+    return (
+        error instanceof QboRetryableError ||
+        (error instanceof Error && error.name === "QboRetryableError")
+    );
+}
+
+/** A QBO HTTP status we should come back to rather than give up on. */
+export function isRetryableQboStatus(status: number): boolean {
+    return status === 429 || status >= 500;
+}
+
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
 export class QboVendorDuplicateError extends Error {
     constructor(name: string) {
@@ -348,9 +379,17 @@ async function defaultUploadAttachment(
         },
         body,
     });
-    if (!res.ok) return `failed:${res.status}`;
+    if (!res.ok) {
+        // 429/5xx: QBO is busy or broken, not refusing this file. Raise so the
+        // push is retried rather than banked as a terminal "failed:503".
+        if (isRetryableQboStatus(res.status)) {
+            throw new QboRetryableError(`QB attachment upload failed with status ${res.status}`, res.status);
+        }
+        return `failed:${res.status}`;
+    }
     const data = await parseJsonOrNull(res);
     const fault = data?.AttachableResponse?.[0]?.Fault;
+    // A Fault is a business rejection (bad ref, unsupported type) — terminal.
     if (fault) return "failed:fault";
     return "attached";
 }
@@ -415,10 +454,16 @@ async function ensureAttachmentOnExistingPurchase(
         if (alreadyAttached) return "already-attached";
         return await uploadAttachment(tokens, purchaseId, plan);
     } catch (error) {
-        // A timeout must NOT become a terminal "failed:..." on an ok:true
-        // response — see the create path below for why.
-        if (isQBTimeoutError(error)) throw error;
-        return `failed:${error instanceof Error ? error.name : "error"}`;
+        // Anything THROWN here is a connection-level or transient failure — a
+        // timeout, a 429/5xx, a network error, or the Attachable lookup itself
+        // failing. None of those say "this file cannot be attached", so none may
+        // become a terminal `failed:` on an ok:true response: that is what made
+        // the Apps Script stop retrying and leave the Purchase unattached.
+        // Terminal outcomes come back from uploadAttachment as VALUES.
+        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        throw new QboRetryableError(
+            `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
+        );
     }
 }
 
@@ -724,16 +769,18 @@ export async function createQBReceiptPurchase(
         try {
             attachment = await uploadAttachment(tokens, created.id, plan);
         } catch (error) {
-            // A TIMEOUT propagates, unlike every other attachment failure.
-            // Reporting it as `failed:QBTimeoutError` alongside ok:true made it
-            // TERMINAL: the Apps Script treats any ok:true as final and stops
-            // resending, so the Purchase would keep its missing receipt forever
-            // and the existing-Purchase recovery above would never run. Letting
-            // it out gives the route a 503, the bot retries, and the next pass
-            // finds the Purchase and attaches the file. Non-timeout failures
-            // keep the old best-effort behaviour — they are not retryable.
-            if (isQBTimeoutError(error)) throw error;
-            attachment = `failed:${error instanceof Error ? error.name : "error"}`;
+            // Every THROWN attachment failure propagates; only the terminal
+            // ones (4xx other than 429, a QBO Fault) come back as values.
+            // Reporting a transient failure as `failed:<reason>` alongside
+            // ok:true made it TERMINAL — the Apps Script treats any ok:true as
+            // final and stops resending, so the Purchase kept its missing
+            // receipt forever and the existing-Purchase recovery above never
+            // ran. Propagating gives the route a 503, the bot retries, and the
+            // next pass finds the Purchase and attaches the file.
+            if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+            throw new QboRetryableError(
+                `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
+            );
         }
     }
 

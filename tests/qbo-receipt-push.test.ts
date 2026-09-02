@@ -379,11 +379,12 @@ test("createQBReceiptPurchase attaches a small image receipt", async () => {
     assert.equal(uploads.length, 1);
 });
 
-test("createQBReceiptPurchase treats an attachment failure as non-fatal", async () => {
+test("createQBReceiptPurchase treats a TERMINAL attachment failure as non-fatal", async () => {
+    // Terminal outcomes (a 4xx other than 429, a QBO Fault) come back as
+    // VALUES, and those still ride along on ok:true — the Purchase is booked
+    // and retrying would never make QBO accept the file.
     const { deps } = createDeps({
-        uploadAttachment: async () => {
-            throw new Error("boom");
-        },
+        uploadAttachment: async () => "failed:400" as ReceiptAttachmentStatus,
     });
     const result = await createQBReceiptPurchase(
         TOKENS,
@@ -392,7 +393,7 @@ test("createQBReceiptPurchase treats an attachment failure as non-fatal", async 
     );
     assert.equal(result.ok, true);
     if (result.ok && !result.alreadyExists) {
-        assert.match(result.attachment, /^failed:/);
+        assert.equal(result.attachment, "failed:400");
     } else {
         assert.fail("expected a fresh create");
     }
@@ -907,7 +908,10 @@ test("already-exists ignores an Attachable that belongs to a different entity ty
     assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
 });
 
-test("already-exists reports a failed attachment lookup without failing the push", async () => {
+test("a failed attachment LOOKUP is retryable, not a terminal ok:true", async () => {
+    // Codex gate: the lookup failing tells us nothing about whether the file is
+    // attached. Banking that as `failed:Error` on ok:true made the bot stop
+    // retrying and left the Purchase possibly unattached forever.
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
@@ -917,10 +921,10 @@ test("already-exists reports a failed attachment lookup without failing the push
         },
     });
 
-    const result = await createQBReceiptPurchase(TOKENS, input, deps);
-    // The books entry exists and must still be reported ok.
-    assert.equal(result.ok, true);
-    assert.equal(result.ok && result.alreadyExists && result.attachment, "failed:Error");
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
 });
 
 test("an attachment upload that times out PROPAGATES from both paths, so the push is retryable", async () => {
@@ -952,17 +956,75 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     );
 });
 
-test("a NON-timeout attachment failure stays best-effort: failed:<reason> with ok:true", async () => {
+test("a thrown NETWORK-ish attachment failure is retryable from both paths", async () => {
     const input = baseInput({ ...FILE_INPUT });
-    const { deps } = createDeps({
-        uploadAttachment: async () => {
-            throw new Error("boom");
-        },
+    const marker = `[gtr-file:${input.fileId}]`;
+    const boom = async () => {
+        throw new Error("ECONNRESET");
+    };
+
+    const fresh = createDeps({ uploadAttachment: boom });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, fresh.deps),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+
+    const existing = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableRows: [],
+        uploadAttachment: boom,
     });
-    const result = await createQBReceiptPurchase(TOKENS, input, deps);
-    // The Purchase is on the books; a broken image is not worth a retry loop.
-    assert.equal(result.ok, true);
-    assert.equal(result.ok && !result.alreadyExists && result.attachment, "failed:Error");
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, existing.deps),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+});
+
+test("a TERMINAL attachment status still rides along on ok:true from both paths", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const terminal = async () => "failed:fault" as ReceiptAttachmentStatus;
+
+    const fresh = createDeps({ uploadAttachment: terminal });
+    const freshResult = await createQBReceiptPurchase(TOKENS, input, fresh.deps);
+    assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:fault");
+
+    const existing = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableRows: [],
+        uploadAttachment: terminal,
+    });
+    const existingResult = await createQBReceiptPurchase(TOKENS, input, existing.deps);
+    assert.equal(existingResult.ok && existingResult.alreadyExists && existingResult.attachment, "failed:fault");
+});
+
+test("route: a retryable attachment failure surfaces as 503 qbo-unavailable", async () => {
+    const { QboRetryableError } = await import("../src/lib/qbo-receipt-push");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QboRetryableError("QB attachment upload failed with status 503", 503);
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
+    assert.equal(events[0].reason, "qbo-unavailable");
+});
+
+test("isRetryableQboStatus: 429 and 5xx retry, other 4xx are terminal", async () => {
+    const { isRetryableQboStatus } = await import("../src/lib/qbo-receipt-push");
+    for (const status of [429, 500, 502, 503, 504]) {
+        assert.equal(isRetryableQboStatus(status), true, String(status));
+    }
+    for (const status of [400, 401, 403, 404, 409, 422]) {
+        assert.equal(isRetryableQboStatus(status), false, String(status));
+    }
 });
 
 test("route: an attachment timeout surfaces as 503 qbo-timeout so the bot retries", async () => {

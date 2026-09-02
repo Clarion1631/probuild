@@ -24,6 +24,7 @@ const HEALTH: PipelineHealth = {
     qbo: {
         lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
         lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+        lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
     },
     receipts24h: { status: "ok", counts: { created: 2 } },
     bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },

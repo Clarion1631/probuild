@@ -6,6 +6,7 @@ import {
     createQBReceiptPurchase,
     QboAccountConfigError,
     QboPurchaseFaultError,
+    isRetryableQboError,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
 } from "@/lib/qbo-receipt-push";
@@ -258,6 +259,14 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     console.error("QBO receipt push timed out", error.message);
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
                     return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
+                }
+                if (isRetryableQboError(error)) {
+                    // 429/5xx/network, or a failed attachment step. Same
+                    // reasoning and same idempotency guarantees as the timeout
+                    // branch: retry beats banking a half-finished receipt.
+                    console.error("QBO receipt push hit a retryable failure", error instanceof Error ? error.message : "unknown");
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-unavailable" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "qbo-unavailable" }, { status: 503 });
                 }
                 if (error instanceof QboAccountConfigError) {
                     // Deterministic misconfiguration (missing/wrong-type/

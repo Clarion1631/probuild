@@ -8,13 +8,16 @@ import { prisma } from "@/lib/prisma";
  *    endpoint (created / already-exists / fallback / error).
  *  - "qbo-sync": one row per QBO→ProBuild sync run (cron, manual button, or
  *    backfill) with the run counts in `detail`.
+ *  - "qbo-payments-sync": one row per payments-sync run (the money rail), so a
+ *    QBO outage there is visible to the health check instead of vanishing into
+ *    a cron log.
  *
  * Logging is FIRE-AND-FORGET everywhere: an event-log failure must never fail
  * the automation it describes — the books write always outranks the audit row.
  */
 
 export interface AutomationEventInput {
-    kind: "receipt-push" | "qbo-sync" | "receipt-stage" | "setting";
+    kind: "receipt-push" | "qbo-sync" | "receipt-stage" | "setting" | "qbo-payments-sync";
     stage?: string;
     status: string;
     reason?: string;

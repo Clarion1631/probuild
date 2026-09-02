@@ -63,6 +63,8 @@ export interface PipelineHealth {
         lastPurchaseSync: TimestampProbe;
         /** Newest receipt the bot actually CREATED (re-pushes don't count). */
         lastReceiptPush: TimestampProbe;
+        /** Newest SUCCESSFUL payments-sync run — the money rail's own pulse. */
+        lastPaymentsSync: TimestampProbe;
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
     receipts24h: CountsProbe;
@@ -114,6 +116,9 @@ export async function fetchIntuitStatus(): Promise<IntuitProbe> {
  */
 export const BOOKED_PUSH_STATUSES = ["created"];
 
+/** The payments cron's per-run audit row (see quickbooks-payments.ts). */
+export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+
 /**
  * The verdict, split out from the database reads so the rules are testable
  * without a DB.
@@ -134,6 +139,7 @@ export function evaluatePipelineHealth(input: {
     intuit: IntuitProbe;
     lastPurchaseSync: TimestampProbe;
     lastReceiptPush: TimestampProbe;
+    lastPaymentsSync: TimestampProbe;
     receipts24h: CountsProbe;
     bank: TimestampProbe;
     stuck: CountProbe;
@@ -144,6 +150,7 @@ export function evaluatePipelineHealth(input: {
     const namedProbes: Array<[string, { status: ProbeStatus }]> = [
         ["lastPurchaseSync", input.lastPurchaseSync],
         ["lastReceiptPush", input.lastReceiptPush],
+        ["lastPaymentsSync", input.lastPaymentsSync],
         ["receipts24h", input.receipts24h],
         ["bank", input.bank],
         ["stuck", input.stuck],
@@ -224,7 +231,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck] = await Promise.all([
+    const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -241,6 +248,18 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 (
                     await prisma.automationEvent.findFirst({
                         where: { kind: "receipt-push", status: { in: BOOKED_PUSH_STATUSES } },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    })
+                )?.createdAt ?? null,
+            null,
+        ),
+        probe<Date | null>(
+            "lastPaymentsSync",
+            async () =>
+                (
+                    await prisma.automationEvent.findFirst({
+                        where: { kind: PAYMENTS_SYNC_EVENT_KIND, status: "ok" },
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     })
@@ -288,6 +307,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: lastPush.reason,
             at: lastPush.value?.toISOString() ?? null,
         },
+        lastPaymentsSync: {
+            status: lastPaymentsSync.status,
+            reason: lastPaymentsSync.reason,
+            at: lastPaymentsSync.value?.toISOString() ?? null,
+        },
         receipts24h: { status: receiptRows.status, reason: receiptRows.reason, counts },
         bank: {
             status: lastBankLine.status,
@@ -306,6 +330,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         qbo: {
             lastPurchaseSync: snapshot.lastPurchaseSync,
             lastReceiptPush: snapshot.lastReceiptPush,
+            lastPaymentsSync: snapshot.lastPaymentsSync,
         },
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
@@ -344,6 +369,7 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         `Intuit status: ${health.intuit.indicator}${health.intuit.description ? ` (${health.intuit.description})` : ""}${health.intuit.status === "error" ? " [status page unreachable]" : ""}`,
         `Last QBO purchase sync: ${ago(health.qbo.lastPurchaseSync, now)}`,
         `Last receipt booked: ${ago(health.qbo.lastReceiptPush, now)}`,
+        `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}`,
         `Receipts (24h): ${receiptsLine}`,
         `Bank ledger through: ${
             health.bank.status === "error"
