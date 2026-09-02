@@ -92,6 +92,7 @@ test("every statement is idempotent — the script is safe to re-run", () => {
         const guarded =
             /CREATE TABLE IF NOT EXISTS/.test(sql) ||
             /CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/.test(sql) ||
+            /ALTER TABLE .* ADD COLUMN IF NOT EXISTS/.test(sql) ||
             /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(sql);
         assert.ok(guarded, `not idempotent: ${sql.slice(0, 80)}`);
     }
@@ -133,4 +134,23 @@ test("the state CHECK guard is scoped to the ReceiptIntake table", () => {
     const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
     assert.match(check!, /conrelid = '"ReceiptIntake"'::regclass/);
     assert.match(migrationSql, /conrelid = '"ReceiptIntake"'::regclass/);
+});
+
+test("the busyPasses column is ALSO added by an ALTER, so an earlier table upgrades", () => {
+    // CREATE TABLE IF NOT EXISTS is a no-op on a table that already exists, so
+    // a column added only to the CREATE would never reach a database where the
+    // rollout script had already run once. This is the whole reason the script
+    // is re-runnable.
+    const alter = statements.find((s: string) => /ADD COLUMN IF NOT EXISTS "busyPasses"/.test(s));
+    assert.ok(alter, "the apply script must ALTER as well as CREATE");
+    assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses"/);
+});
+
+test("STAGING is in the state set, and is the column DEFAULT", () => {
+    // A row is born STAGING: it exists, but its object is not in the bucket
+    // yet, so the worker's claim predicate must not be able to see it.
+    assert.ok(RECEIPT_INTAKE_STATES.includes("STAGING"));
+    const create = statements.find((s: string) => s.includes('CREATE TABLE IF NOT EXISTS "ReceiptIntake"'));
+    assert.match(create!, /"state"\s+TEXT NOT NULL DEFAULT 'STAGING'/);
+    assert.match(migrationSql, /"state" TEXT NOT NULL DEFAULT 'STAGING'/);
 });

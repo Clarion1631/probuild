@@ -6,6 +6,8 @@
  */
 
 export const RECEIPT_INTAKE_STATES = [
+    // STAGING: the row exists but its file does not yet. Never claimable.
+    "STAGING",
     "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
 ] as const;

@@ -184,7 +184,14 @@ export async function POST(req: Request) {
                 id,
                 source,
                 sourceRef,
-                state: "RECEIVED",
+                // STAGING, not RECEIVED. Inserting first is what makes the
+                // unique index the decision point (see below), but it also
+                // publishes a claimable row whose object is not in the bucket
+                // yet — the worker would grab it, find nothing, and park a
+                // perfectly good receipt as "file-missing". STAGING is excluded
+                // from the claim predicate; the UPDATE after a successful
+                // upload is what actually hands the row to the worker.
+                state: "STAGING",
                 // Captured per row, never read from env again after this point.
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId: parsed.projectId,
@@ -204,7 +211,7 @@ export async function POST(req: Request) {
         });
     } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-            return respondToSourceRefConflict(auth, sourceRef, fileSha256);
+            return respondToSourceRefConflict(auth, source, sourceRef, fileSha256);
         }
         // A projectId/costCodeId that doesn't exist is the CALLER's mistake, so
         // it must be a deterministic 400 — a 500 would make a forwarder retry a
@@ -232,7 +239,15 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
     }
 
-    return NextResponse.json({ ok: true, ...created });
+    // The object exists now, so the row becomes claimable. One UPDATE, and it
+    // is the ONLY thing that publishes a row to the worker.
+    const published = await prisma.receiptIntake.update({
+        where: { id },
+        data: { state: "RECEIVED" },
+        select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
+    });
+
+    return NextResponse.json({ ok: true, ...published });
 }
 
 /**
@@ -251,19 +266,41 @@ export async function POST(req: Request) {
  */
 async function respondToSourceRefConflict(
     auth: Extract<IntakeAuth, { ok: true }>,
+    source: string,
     sourceRef: string,
     fileSha256: string,
 ): Promise<NextResponse> {
     const existing = await prisma.receiptIntake.findUnique({
         where: { sourceRef },
         select: {
-            id: true, state: true, sourceRef: true, projectId: true,
+            id: true, state: true, source: true, sourceRef: true, projectId: true,
             dryRun: true, fileSha256: true, createdById: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
     // racing us). Tell the caller to retry rather than inventing an answer.
     if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
+
+    // AUTHORIZATION BEFORE ANY DETAIL, including on the mismatch branch.
+    // `existingId` is a real identifier for someone else's document; returning
+    // it to a caller who may not read the row turns a 409 into an oracle that
+    // confirms a guessed sourceRef and hands back a usable id.
+    //
+    // For a secret caller "may read" is narrower than "holds the secret": it
+    // may only see rows in ITS OWN namespace. The forwarders are separate
+    // scripts, and a chat forwarder guessing `drive:<fileId>` should learn
+    // nothing about the Drive pipeline's rows.
+    const maySee =
+        auth.via === "secret"
+            ? MACHINE_SOURCES.has(existing.source) &&
+              existing.source === source &&
+              existing.sourceRef.startsWith(`${source}:`)
+            : existing.createdById === auth.user.id || STAFF_READ_ROLES.includes(auth.user.role);
+
+    if (!maySee) {
+        // No fields at all: an id or a state would still confirm the row exists.
+        return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
+    }
 
     if (existing.fileSha256 !== fileSha256) {
         return NextResponse.json(
@@ -272,13 +309,15 @@ async function respondToSourceRefConflict(
         );
     }
 
-    const maySee =
-        auth.via === "secret" ||
-        existing.createdById === auth.user.id ||
-        STAFF_READ_ROLES.includes(auth.user.role);
-    if (!maySee) {
-        // No fields at all: an id or a state would still confirm the row exists.
-        return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
+    // Same bytes, but the FIRST request has not finished uploading yet. 200
+    // would tell the caller its document is queued when the object may still
+    // fail to land; 202 says "accepted, not yet published" so a forwarder can
+    // re-poll instead of moving the file out from under a half-written row.
+    if (existing.state === "STAGING") {
+        return NextResponse.json(
+            { ok: true, status: "staging", alreadyReceived: true, id: existing.id, sourceRef: existing.sourceRef },
+            { status: 202 },
+        );
     }
 
     return NextResponse.json({

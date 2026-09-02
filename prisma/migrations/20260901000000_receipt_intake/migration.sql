@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "id" TEXT NOT NULL,
     "source" TEXT NOT NULL,
     "sourceRef" TEXT NOT NULL,
-    "state" TEXT NOT NULL DEFAULT 'RECEIVED',
+    "state" TEXT NOT NULL DEFAULT 'STAGING',
     "dryRun" BOOLEAN NOT NULL DEFAULT true,
     "stateReason" TEXT,
     "projectId" TEXT,
@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     CONSTRAINT "ReceiptIntake_pkey" PRIMARY KEY ("id")
 );
 
+-- Additive upgrade for a table created by an earlier run of
+-- scripts/apply-receipt-intake.mjs: CREATE TABLE IF NOT EXISTS is a no-op on an
+-- existing table, so a column added to the CREATE above would never reach it.
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NULL DEFAULT 0;
+
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_dedupStrongKey_active_key"
@@ -72,7 +77,7 @@ BEGIN
           AND conrelid = '"ReceiptIntake"'::regclass
     ) THEN
         ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
-            CHECK ("state" IN ('RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
+            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                                'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));
     END IF;
 END $$;

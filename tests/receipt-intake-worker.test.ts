@@ -87,20 +87,21 @@ interface Harness {
     promoted: string[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
-    requeueCalls: number;
+    claimOpts: { requeueDryRunParked: boolean }[];
+    sweepCalls: number;
     clock: number;
 }
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], deferred: [],
-        retried: [], requeueCalls: 0, clock: 0,
+        retried: [], claimOpts: [], sweepCalls: 0, clock: 0,
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
-        claim: async () => rows,
+        claim: async opts => { h.claimOpts.push(opts); return { rows, requeued: 0 }; },
         isDryRunEnabled: () => true,
-        requeueDryRunParked: async () => { h.requeueCalls++; return 0; },
+        sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
         downloadBytes: async () => Buffer.from("bytes"),
         read: async () => { h.reads++; return goodRead; },
@@ -260,45 +261,59 @@ test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", 
 
 // ── Dry-run starvation (Codex blocker 1) ─────────────────────────────────────
 
-test("the shadow week does NOT requeue parked rows", async () => {
+test("the shadow week does NOT ask the claim to requeue", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.requeueCalls, 0);
+    assert.deepEqual(h.claimOpts, [{ requeueDryRunParked: false }]);
     assert.equal(summary.requeued, undefined);
 });
 
-test("the FIRST live pass un-parks the shadow week's backlog, once", async () => {
+test("the FIRST live pass asks the claim to un-park the backlog, INSIDE the lock", async () => {
     // Parked rows are excluded from the claim (see the cron route's
     // NOT_DRY_RUN_PARKED) precisely so they cannot starve the ten-row batch —
-    // which also means nothing else would ever wake them.
+    // which also means nothing else would ever wake them. The requeue rides in
+    // the claim transaction so two overlapping invocations cannot both un-park
+    // the same backlog and race each other's claim.
     const h = harness([], {
         isDryRunEnabled: () => false,
-        requeueDryRunParked: async () => { h.requeueCalls++; return 7; },
+        claim: async opts => { h.claimOpts.push(opts); return { rows: [], requeued: 7 }; },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.requeueCalls, 1);
+    assert.deepEqual(h.claimOpts, [{ requeueDryRunParked: true }]);
     assert.equal(summary.requeued, 7);
 
     // Idempotent by construction: nothing is left matching the predicate.
-    const second = harness([], {
-        isDryRunEnabled: () => false,
-        requeueDryRunParked: async () => { second.requeueCalls++; return 0; },
-    });
-    const secondSummary = await runIntakeWorker(second.deps);
-    assert.equal(secondSummary.requeued, undefined, "a no-op requeue is not reported");
+    const second = harness([], { isDryRunEnabled: () => false });
+    assert.equal((await runIntakeWorker(second.deps)).requeued, undefined, "a no-op requeue is not reported");
 });
 
-test("the requeue happens even when another worker holds the lock", async () => {
-    // The lock guards the BATCH, not the cutover. A run that finds the lock
-    // taken must still not swallow the one-shot requeue.
-    const h = harness([], {
-        isDryRunEnabled: () => false,
-        claim: async () => null,
-        requeueDryRunParked: async () => { h.requeueCalls++; return 3; },
+test("a run that loses the lock does nothing at all — including the requeue", async () => {
+    // The requeue is now part of the claim transaction, so losing the lock
+    // means losing it too. That is correct: the run that HOLDS the lock does it.
+    const h = harness([], { isDryRunEnabled: () => false, claim: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary, { processed: 0, byState: {}, skipped: "already-running" });
+    assert.equal(h.sweepCalls, 0, "no work of any kind happens without the lock");
+});
+
+// ── STAGING sweep (Codex round 2, blocker 1) ─────────────────────────────────
+
+test("every pass sweeps STAGING rows whose upload never landed", async () => {
+    // A STAGING row is invisible to the claim by design (its object is not in
+    // the bucket), so without this sweep nothing would ever notice one.
+    const h = harness([], { sweepStaleStaging: async () => { h.sweepCalls++; return 2; } });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.sweepCalls, 1);
+    assert.equal(summary.staleStagingSwept, 2);
+});
+
+test("a failing sweep never takes the pass down with it", async () => {
+    const h = harness([workerRow()], {
+        sweepStaleStaging: async () => { throw new Error("db blip"); },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(summary.skipped, "already-running");
-    assert.equal(summary.requeued, 3);
+    assert.equal(summary.staleStagingSwept, undefined);
+    assert.deepEqual(summary.byState, { READ: 1 }, "the batch still ran");
 });
 
 // ── Soft deadline (Codex blocker 2) ──────────────────────────────────────────
@@ -319,6 +334,48 @@ test("the worker stops TAKING rows at 40s and leaves the rest for the next run",
 });
 
 // ── Weak-dedup race at the READ -> BOOKING transition (Codex blocker 5) ───────
+
+test("two rows sharing a weak key SERIALIZE: the second is blocked, not booked", async () => {
+    // Write skew. Both rows pass the read-time weak check (neither is BOOKING
+    // yet), so without the per-weak-key advisory lock inside promoteToBooking
+    // both SELECTs run before either UPDATE commits, READ COMMITTED sees no
+    // conflict (neither row writes what the other read), and the SAME purchase
+    // books twice. The lock is what makes the second one observe the first.
+    const WEAK = "lowes|2026-08-03|364.98|amt";
+    const booking = new Set<string>();
+    const h = harness(
+        [
+            workerRow({ id: "row-a", state: "READ", dryRun: false, dedupWeakKey: WEAK }),
+            workerRow({ id: "row-b", state: "READ", dryRun: false, dedupWeakKey: WEAK }),
+        ],
+        {
+            // Stands in for the serialized transaction: the lock means this
+            // body runs to completion for row-a before row-b enters it.
+            promoteToBooking: async (id, weakKey) => {
+                h.promoted.push(id);
+                const twin = [...booking].find(other => other !== id);
+                if (weakKey && twin) return { promoted: false, conflictId: twin };
+                booking.add(id);
+                return { promoted: true };
+            },
+        },
+    );
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(h.promoted, ["row-a", "row-b"], "both rows attempted the transition");
+    assert.equal(h.books, 1, "exactly ONE of them books");
+    assert.equal(summary.byState.BOOKED, 1);
+    assert.equal(summary.byState.NEEDS_REVIEW, 1);
+});
+
+test("rows with DIFFERENT weak keys never block each other", async () => {
+    const h = harness([
+        workerRow({ id: "row-a", state: "READ", dryRun: false, dedupWeakKey: "lowes|2026-08-03|364.98|amt" }),
+        workerRow({ id: "row-b", state: "READ", dryRun: false, dedupWeakKey: "amazon|2026-08-03|12.00|amt" }),
+    ]);
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.books, 2);
+    assert.deepEqual(summary.byState, { BOOKED: 2 });
+});
 
 test("a weak-key twin already BOOKING blocks the transition and asks a human", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: false, dedupWeakKey: "lowes|2026-08-03|364.98|amt" })], {

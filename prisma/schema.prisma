@@ -3023,7 +3023,11 @@ model ReceiptIntake {
   /// "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" |
   /// "chat:<messageName>:<n>" | "web:<uuid>" — the caller's idempotency key.
   sourceRef   String  @unique
-  state       String  @default("RECEIVED") // RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT
+  /// STAGING is the state a row is BORN in: the object is not in the bucket
+  /// yet, so the worker's claim predicate excludes it. The intake route flips
+  /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets
+  /// there is swept to NEEDS_REVIEW after 15 minutes.
+  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT
   dryRun      Boolean @default(true)
   /// no-estimate | multi-doc | zero-total | weak-dup:<id> |
   /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |

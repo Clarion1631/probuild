@@ -102,7 +102,7 @@
     {
       "name": "ReceiptIntake_state_check",
       "table": "\"ReceiptIntake\"",
-      "def": "CHECK ((state = ANY (ARRAY['RECEIVED'::text, 'READ'::text, 'NEEDS_JOB'::text, 'NEEDS_REVIEW'::text, 'BOOKING'::text, 'BOOKED'::text, 'ARCHIVED'::text, 'DUPLICATE'::text, 'VOID'::text, 'NON_RECEIPT'::text])))"
+      "def": "CHECK ((state = ANY (ARRAY['STAGING'::text, 'RECEIVED'::text, 'READ'::text, 'NEEDS_JOB'::text, 'NEEDS_REVIEW'::text, 'BOOKING'::text, 'BOOKED'::text, 'ARCHIVED'::text, 'DUPLICATE'::text, 'VOID'::text, 'NON_RECEIPT'::text])))"
     },
     {
       "name": "RefundEvent_amountCents_check",

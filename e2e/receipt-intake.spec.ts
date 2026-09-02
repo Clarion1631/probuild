@@ -168,6 +168,10 @@ test.describe("intake POST", () => {
         const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: SOURCE_REF } });
         expect(rows).toHaveLength(1);
         expect(rows[0].id).toBe(first.body.id);
+        // The row is only published to the worker AFTER its object lands. A row
+        // still in STAGING here would mean the claim could pick up a receipt
+        // whose file does not exist and park it "file-missing".
+        expect(rows[0].state).toBe("RECEIVED");
         expect(rows[0].mimeType).toBe("image/png");
         expect(rows[0].fileSha256).toHaveLength(64);
         expect(rows[0].storagePath).toBe(`receipts/intake/${first.body.id}.png`);
@@ -201,6 +205,46 @@ test.describe("intake POST", () => {
         // And the row's stored object is the one the FIRST request wrote — the
         // conflicting call must never touch storage.
         expect(rows[0].storagePath).toBe(`receipts/intake/${first.body.id}.png`);
+    });
+
+    test("a different-SHA 409 leaks NOTHING to a caller who may not read the row", async ({ request, playwright }) => {
+        // `existingId` is a real identifier for someone else's document. Handing
+        // it to a caller that fails the read check turns the 409 into an oracle:
+        // guess a sourceRef, learn it exists, and get a usable id back.
+        //
+        // A shared-secret caller is scoped to its OWN namespace — the forwarders
+        // are separate scripts, and the chat one should learn nothing about the
+        // Drive pipeline's rows.
+        const ref = `${REF_PREFIX}ns-drive`;
+        const seeded = await postIntake(request, intakeBody({ source: "drive", sourceRef: ref }));
+        expect(seeded.res.status()).toBe(200);
+
+        const machine = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: { cookies: [], origins: [] },
+        });
+        // Same secret, but declaring `chat` while the row is a `drive` row.
+        const crossNamespace = await machine.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "chat", sourceRef: ref,
+                fileBase64: OTHER_PNG_BASE64, mimeType: "image/png",
+            }),
+            maxRedirects: 0,
+        });
+        expect(crossNamespace.status()).toBe(409);
+        const body = await crossNamespace.json();
+        expect(body.error).toBe("sourceRef-conflict");
+        expect(body, "no id for a caller outside the row's namespace").not.toHaveProperty("existingId");
+        await machine.dispose();
+
+        // The row's OWN namespace still gets the id, so the real forwarder can
+        // act on the conflict.
+        const sameNamespace = await postIntake(request, intakeBody({
+            source: "drive", sourceRef: ref, fileBase64: OTHER_PNG_BASE64,
+        }));
+        expect(sameNamespace.res.status()).toBe(409);
+        expect(sameNamespace.body.existingId).toBe(seeded.body.id);
     });
 
     test("a session caller may not choose its own source or sourceRef", async ({ request }) => {

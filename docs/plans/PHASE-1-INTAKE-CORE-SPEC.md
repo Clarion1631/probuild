@@ -492,9 +492,12 @@ Two things a human must do before this can leave shadow mode:
 1. **Public-bypass route**: `/api/receipts/intake` bypasses the proxy, so the handler is
    the only gate. Mitigated by the fail-closed secret check + the 401 e2e matrix; Codex
    must review the auth block specifically. (Risk to watch, no decision needed.)
-2. **Expense.amount = pre-tax when tax is split** (mirrors the QBO COGS line under the
-   reseller-permit rule in sendToQBOviaAPI.js). Confirm pre-tax is the job-cost number you
-   want feeding variance reports.
+2. ~~**Expense.amount = pre-tax when tax is split**~~ **RESOLVED 2026-09-01: GROSS.**
+   Justin's call. `Expense.amount` is the total paid, tax INCLUDED, matching what the
+   QBO-imported expenses in `lib/qbo-expense-sync.ts` already record. The QBO Purchase
+   still splits the tax onto its own reclaimable account — that is unchanged and it is
+   what the reseller-permit filing reads. `ReceiptIntake.taxCents` keeps the split so
+   Phase 3 can add `Expense.taxAmount`. No open question here.
 3. **Archive via nightly Apps Script mirror** (§6) instead of a Drive service account —
    confirm, or provision a service account now if same-hour archiving matters to Marge.
 4. **HEIC**: stored and read fine (Gemini accepts image/heic), but the Phase 2 queue page

@@ -45,6 +45,13 @@ export const CLAIM_LEASE_MINUTES = 10;
  */
 export const RUN_SOFT_DEADLINE_MS = 40_000;
 /**
+ * How long a row may sit in STAGING before it is presumed to have lost its
+ * upload. Generous on purpose: the intake route uploads inline, so a row that
+ * is still STAGING after this either crashed mid-request or hit a storage
+ * outage, and neither resolves itself.
+ */
+export const STAGING_SWEEP_MINUTES = 15;
+/**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
  * from v3.4: an outage that never ends still has to end somewhere, and 20
  * passes at 5 minutes each is over an hour of "we tried".
@@ -68,17 +75,25 @@ export interface WorkerRow extends BookableRow {
 }
 
 export interface WorkerDependencies {
-    /** Claims up to BATCH_SIZE rows and bumps their nextRetryAt. Returns null when another run holds the lock. */
-    claim: () => Promise<WorkerRow[] | null>;
-    /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the requeue is testable. */
+    /**
+     * ONE transaction under the global advisory lock: optionally requeue the
+     * shadow-week backlog, then claim up to BATCH_SIZE due rows and bump their
+     * nextRetryAt. Returns null when another run holds the lock.
+     *
+     * The requeue lives INSIDE this transaction rather than beside it: run
+     * outside the lock, two overlapping invocations could both see the parked
+     * backlog and both un-park it, and the second one's UPDATE would race the
+     * first one's claim.
+     */
+    claim: (opts: { requeueDryRunParked: boolean }) => Promise<{ rows: WorkerRow[]; requeued: number } | null>;
+    /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the cutover is testable. */
     isDryRunEnabled: () => boolean;
     /**
-     * One-shot at the start of the first LIVE pass: un-park every row the
-     * shadow week left sitting at READ/BOOKING with dryRun=true. Returns the
-     * number requeued. Naturally idempotent — after one live pass there is
-     * nothing left to match.
+     * Move STAGING rows older than STAGING_SWEEP_MINUTES to NEEDS_REVIEW
+     * `file-missing`. A row whose upload never landed is invisible to the claim
+     * predicate by design, so nothing else would ever notice it.
      */
-    requeueDryRunParked: () => Promise<number>;
+    sweepStaleStaging: () => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
     downloadBytes: (secureRef: string) => Promise<Buffer | null>;
     read: (bytes: Buffer, mime: string, phases: ProjectPhase[]) => Promise<ReadOutcome>;
@@ -139,6 +154,8 @@ export interface WorkerRunSummary {
     deferredToNextRun?: number;
     /** Rows un-parked by the first live pass after the shadow week. */
     requeued?: number;
+    /** STAGING rows whose upload never landed, parked for a human. */
+    staleStagingSwept?: number;
 }
 
 function centsOf(amount: string): number | null {
@@ -163,16 +180,17 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // Cutover: the FIRST live pass hands the shadow week's parked backlog back
     // to the queue. Rows parked under dryRun are excluded from the claim (see
     // the cron route's claim predicate) precisely so they cannot starve the
-    // batch — which also means nothing else would ever wake them.
-    let requeued = 0;
-    if (!deps.isDryRunEnabled()) {
-        requeued = await deps.requeueDryRunParked();
+    // batch — which also means nothing else would ever wake them. It runs
+    // INSIDE the claim transaction, under the same lock.
+    const claimed = await deps.claim({ requeueDryRunParked: !deps.isDryRunEnabled() });
+    if (claimed === null) {
+        return { processed: 0, byState: {}, skipped: "already-running" };
     }
+    const { rows, requeued } = claimed;
 
-    const rows = await deps.claim();
-    if (rows === null) {
-        return { processed: 0, byState: {}, skipped: "already-running", ...(requeued ? { requeued } : {}) };
-    }
+    // Rows whose upload never landed are invisible to the claim by design, so
+    // this is the only thing that will ever notice them.
+    const staged = await deps.sweepStaleStaging().catch(() => 0);
 
     const startedAt = deps.monotonicMs();
     const byState: Record<string, number> = {};
@@ -228,6 +246,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         byState,
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
         ...(requeued ? { requeued } : {}),
+        ...(staged ? { staleStagingSwept: staged } : {}),
     };
 }
 

@@ -14,6 +14,7 @@ import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
+    STAGING_SWEEP_MINUTES,
     isUniqueViolation,
     runIntakeWorker,
     type ReadPatch,
@@ -68,7 +69,9 @@ const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
     NOT: { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
 };
 
-async function claim(): Promise<WorkerRow[] | null> {
+async function claim(
+    opts: { requeueDryRunParked: boolean },
+): Promise<{ rows: WorkerRow[]; requeued: number } | null> {
     const now = new Date();
     return prisma.$transaction(async tx => {
         const [lock] = await tx.$queryRaw<{ locked: boolean }[]>(
@@ -76,8 +79,27 @@ async function claim(): Promise<WorkerRow[] | null> {
         );
         if (!lock?.locked) return null;
 
+        // Cutover, INSIDE the lock and the same transaction as the claim. Run
+        // outside it, two overlapping invocations could both see the parked
+        // backlog and both un-park it, and the second UPDATE would race the
+        // first one's claim. `dryRun` flips WITH the requeue: a row that
+        // reappeared still carrying dryRun=true would be skipped and re-parked
+        // forever.
+        let requeued = 0;
+        if (opts.requeueDryRunParked) {
+            const result = await tx.receiptIntake.updateMany({
+                where: { dryRun: true, state: { in: ["READ", "BOOKING"] } },
+                data: { dryRun: false, nextRetryAt: null },
+            });
+            requeued = result.count;
+            if (requeued > 0) console.log("[cron/receipt-intake-worker] cutover requeue", requeued);
+        }
+
         const due = await tx.receiptIntake.findMany({
             where: {
+                // STAGING is absent on purpose: the row exists but its object
+                // does not, so claiming it would park a good receipt as
+                // "file-missing". sweepStaleStaging is what watches those.
                 state: { in: ["RECEIVED", "READ", "BOOKING"] },
                 OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
                 ...NOT_DRY_RUN_PARKED,
@@ -86,7 +108,7 @@ async function claim(): Promise<WorkerRow[] | null> {
             take: BATCH_SIZE,
             select: WORKER_ROW_SELECT,
         });
-        if (due.length === 0) return [];
+        if (due.length === 0) return { rows: [], requeued };
 
         // THE claim. Anything this run took is invisible to the next one for
         // the lease, whether or not the advisory lock held.
@@ -94,7 +116,7 @@ async function claim(): Promise<WorkerRow[] | null> {
             where: { id: { in: due.map(r => r.id) } },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS) },
         });
-        return due as WorkerRow[];
+        return { rows: due as WorkerRow[], requeued };
     });
 }
 
@@ -104,15 +126,13 @@ function buildDeps(): WorkerDependencies {
 
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
 
-        requeueDryRunParked: async () => {
+        sweepStaleStaging: async () => {
+            const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
             const { count } = await prisma.receiptIntake.updateMany({
-                where: { dryRun: true, state: { in: ["READ", "BOOKING"] } },
-                // dryRun flips WITH the requeue, in one statement: a row that
-                // reappears in the queue still carrying dryRun=true would be
-                // skipped by the loop and re-parked forever.
-                data: { dryRun: false, nextRetryAt: null },
+                where: { state: "STAGING", createdAt: { lt: cutoff } },
+                data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
             });
-            if (count > 0) console.log("[cron/receipt-intake-worker] cutover requeue", count);
+            if (count > 0) console.log("[cron/receipt-intake-worker] stale STAGING swept", count);
             return count;
         },
 
@@ -185,7 +205,25 @@ function buildDeps(): WorkerDependencies {
             // LAST weak-dedup check, taken INSIDE the transition. The check at
             // read time can miss a pair that arrived in the same batch window,
             // and READ -> BOOKING is the last instant before money moves.
+            //
+            // WHY A SECOND LOCK, keyed on the weak key rather than just relying
+            // on the global claim lock: that lock is transaction-scoped and is
+            // released the moment the CLAIM transaction commits, which is
+            // before any row is processed. Holding it across the whole pass
+            // instead would mean one long-lived transaction wrapping every
+            // Gemini and QuickBooks call — minutes of open transaction on a
+            // pgbouncer pool, which is exactly what the pooler cannot afford.
+            //
+            // So the serialization is narrowed to what actually needs it. Two
+            // rows sharing a weak key take the SAME lock here and go one at a
+            // time; the loser's SELECT then sees the winner already in BOOKING.
+            // Without it both SELECTs can run before either UPDATE commits
+            // (classic write skew, and READ COMMITTED will not catch it because
+            // neither row writes what the other read) and both documents book.
+            // Rows with different weak keys take different locks and never
+            // block each other.
             if (weakKey) {
+                await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
                 const conflict = await tx.receiptIntake.findFirst({
                     where: {
                         dedupWeakKey: weakKey,

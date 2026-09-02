@@ -70,7 +70,7 @@ export function targetMatches(actual, expectDb, expectHost) {
 
 /** The closed set of states the CHECK constraint allows. Exported for tests. */
 export const RECEIPT_INTAKE_STATES = [
-    "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
+    "STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING",
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
 ];
 
@@ -79,7 +79,7 @@ export const statements = [
        "id"                  TEXT NOT NULL,
        "source"              TEXT NOT NULL,
        "sourceRef"           TEXT NOT NULL,
-       "state"               TEXT NOT NULL DEFAULT 'RECEIVED',
+       "state"               TEXT NOT NULL DEFAULT 'STAGING',
        "dryRun"              BOOLEAN NOT NULL DEFAULT true,
        "stateReason"         TEXT,
        "projectId"           TEXT,
@@ -116,6 +116,12 @@ export const statements = [
        "updatedAt"           TIMESTAMP(3) NOT NULL,
        CONSTRAINT "ReceiptIntake_pkey" PRIMARY KEY ("id")
      )`,
+
+    // Additive upgrade for a table created by an EARLIER run of this script,
+    // before busyPasses existed: CREATE TABLE IF NOT EXISTS is a no-op on an
+    // existing table, so a column added to the CREATE above would never reach
+    // it. This is the whole reason the script is re-runnable.
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NULL DEFAULT 0`,
 
     // Intake idempotency: one row per caller-supplied sourceRef. A forwarder
     // replaying the same Drive file / Gmail message is a no-op.
@@ -154,7 +160,7 @@ export const statements = [
                        WHERE conname = 'ReceiptIntake_state_check'
                          AND conrelid = '"ReceiptIntake"'::regclass) THEN
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
-           CHECK ("state" IN ('RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
+           CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));
        END IF;
      END $$`,
