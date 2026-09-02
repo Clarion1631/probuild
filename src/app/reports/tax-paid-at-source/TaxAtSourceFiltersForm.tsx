@@ -2,19 +2,31 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { formatLocalDateString, type TaxAtSourceFilters } from "@/lib/tax-at-source-report";
 
-/** The `to` the server holds is EXCLUSIVE; the picker shows the inclusive day. */
-function inclusiveTo(filters: TaxAtSourceFilters): string {
-    const day = new Date(filters.to.getTime());
-    day.setDate(day.getDate() - 1);
-    return formatLocalDateString(day);
+/**
+ * Dates in, dates out — both as company-calendar "YYYY-MM-DD" keys the server
+ * computed. The browser deliberately does NO date math: a crew laptop set to
+ * Mountain Time must not shift a quarter boundary, and `new Date()` here would
+ * do exactly that. The quarter presets are the server's own values, passed in.
+ */
+export interface QuarterPreset {
+    label: string;
+    fromKey: string;
+    toKey: string;
 }
 
-export default function TaxAtSourceFiltersForm({ filters }: { filters: TaxAtSourceFilters }) {
+export default function TaxAtSourceFiltersForm({
+    fromKey,
+    toKey,
+    presets,
+}: {
+    fromKey: string;
+    toKey: string;
+    presets: QuarterPreset[];
+}) {
     const router = useRouter();
-    const [from, setFrom] = useState<string>(formatLocalDateString(filters.from));
-    const [to, setTo] = useState<string>(inclusiveTo(filters));
+    const [from, setFrom] = useState<string>(fromKey);
+    const [to, setTo] = useState<string>(toKey);
 
     function apply(next?: { from: string; to: string }) {
         const params = new URLSearchParams({
@@ -22,17 +34,6 @@ export default function TaxAtSourceFiltersForm({ filters }: { filters: TaxAtSour
             to: next?.to ?? to,
         });
         router.push(`/reports/tax-paid-at-source?${params.toString()}`);
-    }
-
-    function applyQuarter(offset: number) {
-        const now = new Date();
-        const start = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3 + offset * 3, 1);
-        const end = new Date(start.getFullYear(), start.getMonth() + 3, 0);
-        const nextFrom = formatLocalDateString(start);
-        const nextTo = formatLocalDateString(end);
-        setFrom(nextFrom);
-        setTo(nextTo);
-        apply({ from: nextFrom, to: nextTo });
     }
 
     return (
@@ -59,12 +60,20 @@ export default function TaxAtSourceFiltersForm({ filters }: { filters: TaxAtSour
                 Apply
             </button>
             <div className="flex items-center gap-2 ml-auto">
-                <button type="button" className="hui-btn hui-btn-secondary text-sm" onClick={() => applyQuarter(0)}>
-                    This quarter
-                </button>
-                <button type="button" className="hui-btn hui-btn-secondary text-sm" onClick={() => applyQuarter(-1)}>
-                    Last quarter
-                </button>
+                {presets.map(preset => (
+                    <button
+                        key={preset.label}
+                        type="button"
+                        className="hui-btn hui-btn-secondary text-sm"
+                        onClick={() => {
+                            setFrom(preset.fromKey);
+                            setTo(preset.toKey);
+                            apply({ from: preset.fromKey, to: preset.toKey });
+                        }}
+                    >
+                        {preset.label}
+                    </button>
+                ))}
             </div>
         </div>
     );

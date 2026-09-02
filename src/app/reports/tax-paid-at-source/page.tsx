@@ -3,16 +3,19 @@ import Link from "next/link";
 import { getSessionOrDev } from "@/lib/auth";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { formatCurrency } from "@/lib/utils";
-import { formatMoneyDate } from "@/lib/payment-date";
 import {
     TAX_REPORT_AMOUNT_NOTE,
     TAX_REPORT_FOOTNOTE,
+    centsToDollars,
+    currentQuarterKeys,
     groupTaxAtSource,
-    parseTaxAtSourceFilters,
+    monthLabelFromKey,
     queryTaxAtSourceRows,
+    resolveTaxAtSourceFilters,
     stringifyTaxAtSourceFilters,
 } from "@/lib/tax-at-source-report";
-import TaxAtSourceFiltersForm from "./TaxAtSourceFiltersForm";
+import { addDaysToKey } from "@/lib/tz-date";
+import TaxAtSourceFiltersForm, { type QuarterPreset } from "./TaxAtSourceFiltersForm";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
@@ -34,15 +37,29 @@ export default async function TaxPaidAtSourcePage({
         return <div className="p-8 text-red-500">Access denied. This report requires the Financial Reports permission.</div>;
     }
 
-    const filters = parseTaxAtSourceFilters(await searchParams);
+    const filters = await resolveTaxAtSourceFilters(await searchParams);
     const rows = await queryTaxAtSourceRows(filters);
     const { months, summary } = groupTaxAtSource(rows);
     const csvHref = `/api/reports/tax-paid-at-source/export?${stringifyTaxAtSourceFilters(filters)}`;
 
-    const dateLabel = (value: Date) =>
-        value.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-    const inclusiveTo = new Date(filters.to.getTime());
-    inclusiveTo.setDate(inclusiveTo.getDate() - 1);
+    // Presets are computed HERE, in the company zone, and handed to the client
+    // as plain day keys. A browser on a different clock must not be able to
+    // shift a quarter boundary and move a deduction onto the wrong return.
+    const thisQuarter = currentQuarterKeys(new Date(), filters.timeZone);
+    const lastQuarter = currentQuarterKeys(
+        new Date(`${addDaysToKey(thisQuarter.fromKey, -1)}T12:00:00Z`),
+        "UTC",
+    );
+    const presets: QuarterPreset[] = [
+        { label: "This quarter", ...thisQuarter },
+        { label: "Last quarter", ...lastQuarter },
+    ];
+
+    // Labels are formatted from the day KEY, not from a Date: rendering a
+    // company-midnight instant with the server's locale/zone would print the
+    // day before whenever the server sits east of the company.
+    const dayLabel = (dayKey: string) =>
+        `${monthLabelFromKey(dayKey).split(" ")[0].slice(0, 3)} ${Number(dayKey.slice(8, 10))}, ${dayKey.slice(0, 4)}`;
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
@@ -50,7 +67,7 @@ export default async function TaxPaidAtSourcePage({
                 <div>
                     <h1 className="text-2xl font-bold text-hui-textMain">Tax Paid at Source</h1>
                     <p className="text-sm text-hui-textMuted mt-1">
-                        Material tax paid at the register and installed at a customer job · {dateLabel(filters.from)} → {dateLabel(inclusiveTo)}
+                        Material tax paid at the register and installed at a customer job · {dayLabel(filters.fromKey)} → {dayLabel(filters.toKey)}
                     </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -59,12 +76,12 @@ export default async function TaxPaidAtSourcePage({
                 </div>
             </div>
 
-            <TaxAtSourceFiltersForm filters={filters} />
+            <TaxAtSourceFiltersForm fromKey={filters.fromKey} toKey={filters.toKey} presets={presets} />
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <SummaryCard label="Receipts" value={String(summary.count)} sub="installed at a customer job" />
-                <SummaryCard label="Taxable Amount" value={formatCurrency(summary.deductionBase)} sub="deduction base" />
-                <SummaryCard label="Tax Paid at Source" value={formatCurrency(summary.tax)} accent="amber" />
+                <SummaryCard label="Taxable Amount" value={formatCurrency(centsToDollars(summary.deductionBaseCents))} sub="deduction base" />
+                <SummaryCard label="Tax Paid at Source" value={formatCurrency(centsToDollars(summary.taxCents))} accent="amber" />
             </div>
 
             <div className="hui-card overflow-hidden">
@@ -97,16 +114,16 @@ export default async function TaxPaidAtSourcePage({
                                                 </td>
                                                 <td className="px-4 py-3 text-hui-textMuted">{job.projectName}</td>
                                                 <td className="px-4 py-3 text-right tabular-nums text-hui-textMuted">{job.count}</td>
-                                                <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(job.deductionBase)}</td>
-                                                <td className="px-4 py-3 text-right tabular-nums font-medium text-amber-600">{formatCurrency(job.tax)}</td>
+                                                <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(centsToDollars(job.deductionBaseCents))}</td>
+                                                <td className="px-4 py-3 text-right tabular-nums font-medium text-amber-600">{formatCurrency(centsToDollars(job.taxCents))}</td>
                                             </tr>
                                         ))}
                                         <tr key={`${month.key}-total`} className="border-b border-hui-border bg-hui-surface/60 font-medium">
                                             <td className="px-4 py-2 text-hui-textMuted text-xs uppercase tracking-wide">{month.label} total</td>
                                             <td className="px-4 py-2" />
                                             <td className="px-4 py-2 text-right tabular-nums text-hui-textMain">{month.count}</td>
-                                            <td className="px-4 py-2 text-right tabular-nums text-hui-textMain">{formatCurrency(month.deductionBase)}</td>
-                                            <td className="px-4 py-2 text-right tabular-nums text-amber-600">{formatCurrency(month.tax)}</td>
+                                            <td className="px-4 py-2 text-right tabular-nums text-hui-textMain">{formatCurrency(centsToDollars(month.deductionBaseCents))}</td>
+                                            <td className="px-4 py-2 text-right tabular-nums text-amber-600">{formatCurrency(centsToDollars(month.taxCents))}</td>
                                         </tr>
                                     </>
                                 ))}
@@ -115,8 +132,8 @@ export default async function TaxPaidAtSourcePage({
                                 <tr className="font-semibold">
                                     <td className="px-4 py-3 text-hui-textMain" colSpan={2}>Total</td>
                                     <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{summary.count}</td>
-                                    <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(summary.deductionBase)}</td>
-                                    <td className="px-4 py-3 text-right tabular-nums text-amber-600">{formatCurrency(summary.tax)}</td>
+                                    <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(centsToDollars(summary.deductionBaseCents))}</td>
+                                    <td className="px-4 py-3 text-right tabular-nums text-amber-600">{formatCurrency(centsToDollars(summary.taxCents))}</td>
                                 </tr>
                             </tfoot>
                         </table>
@@ -149,14 +166,14 @@ export default async function TaxPaidAtSourcePage({
                                 {rows.map(row => (
                                     <tr key={row.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                         <td className="px-4 py-3 text-hui-textMuted whitespace-nowrap">
-                                            {formatMoneyDate(row.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
+                                            {dayLabel(row.dayKey)}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMain">{row.vendor || "—"}</td>
                                         <td className="px-4 py-3 text-hui-textMuted">{row.projectName}</td>
                                         <td className="px-4 py-3 font-mono text-xs text-hui-textMuted">{row.reference || "—"}</td>
-                                        <td className="px-4 py-3 text-right tabular-nums text-hui-textMuted">{formatCurrency(row.receiptTotal)}</td>
-                                        <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(row.deductionBase)}</td>
-                                        <td className="px-4 py-3 text-right tabular-nums font-medium text-amber-600">{formatCurrency(row.tax)}</td>
+                                        <td className="px-4 py-3 text-right tabular-nums text-hui-textMuted">{formatCurrency(centsToDollars(row.receiptTotalCents))}</td>
+                                        <td className="px-4 py-3 text-right tabular-nums text-hui-textMain">{formatCurrency(centsToDollars(row.deductionBaseCents))}</td>
+                                        <td className="px-4 py-3 text-right tabular-nums font-medium text-amber-600">{formatCurrency(centsToDollars(row.taxCents))}</td>
                                     </tr>
                                 ))}
                             </tbody>

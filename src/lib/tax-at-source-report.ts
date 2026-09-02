@@ -15,39 +15,55 @@
 //     must never be spent as a deduction, and
 //   * `taxAmount > 0` — a zero is an answer (no tax), not an absence.
 //
-// The aggregation is pure and unit-tested; only `queryTaxAtSourceRows` touches
-// Prisma.
+// TWO THINGS THIS FILE IS FUSSY ABOUT, both because it feeds a tax filing:
+//
+//  1. INTEGER CENTS. Every sum is in whole cents, converted from the Decimal's
+//     STRING form so no float is ever involved. Summing dollars as floats
+//     drifts — 0.1 + 0.2 is the canonical example, and a quarter's worth of
+//     receipts drifts by more than a cent — and a total that disagrees with the
+//     sum of its own rows is exactly the thing a bookkeeper will find and stop
+//     trusting the report over.
+//
+//  2. THE COMPANY TIME ZONE. Period boundaries and month buckets are computed
+//     in the company's configured zone, never in the server's or the browser's.
+//     A receipt bought on 30 September at 6pm Pacific is stored as 1 October
+//     UTC; bucketed in UTC it lands in the wrong QUARTER, and moves a deduction
+//     onto the wrong excise return.
+//
+// The aggregation is pure and unit-tested; only `queryTaxAtSourceRows` and
+// `resolveTaxAtSourceFilters` touch Prisma.
 import { prisma } from "@/lib/prisma";
-import { toNum } from "@/lib/prisma-helpers";
-import { formatMoneyMonth, formatMoneyMonthKey, formatMoneyDateISO } from "./payment-date";
-import { parseLocalDateString, formatLocalDateString } from "./report-utils";
+import { resolveCompanyTimeZone } from "./company-timezone";
+import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
 import { resolveExpenseProjectId } from "./expense-attribution";
-
-export { parseLocalDateString, formatLocalDateString } from "./report-utils";
+import { csvCell, csvDocument, csvNumber } from "./csv-safe";
 
 export interface TaxAtSourceFilters {
+    /** First day of the period, company calendar, "YYYY-MM-DD" — INCLUSIVE. */
+    fromKey: string;
+    /** Last day of the period, company calendar — INCLUSIVE, as a human reads it. */
+    toKey: string;
+    /** Instant bounds for the query: [from, to), both company-midnight. */
     from: Date;
-    /** Exclusive upper bound. */
     to: Date;
+    timeZone: string;
 }
 
 export interface TaxAtSourceRow {
     id: string;
     date: Date;
+    /** Company-calendar day the receipt falls on, "YYYY-MM-DD". */
+    dayKey: string;
     vendor: string;
     projectId: string | null;
     projectName: string;
     /** Invoice / check reference, when the description carries one. */
     reference: string;
-    /**
-     * What was paid in total. See the caveat in `TAX_REPORT_AMOUNT_NOTE`:
-     * intake-born rows are gross-with-tax, and legacy QBO rows carry no
-     * taxAmount at all so they never reach this report.
-     */
-    receiptTotal: number;
-    /** receiptTotal - tax. The figure the excise line is computed from. */
-    deductionBase: number;
-    tax: number;
+    /** Gross paid, in whole cents. */
+    receiptTotalCents: number;
+    /** receiptTotal - tax, in whole cents. The excise line's base. */
+    deductionBaseCents: number;
+    taxCents: number;
 }
 
 export const TAX_REPORT_AMOUNT_NOTE =
@@ -58,17 +74,66 @@ export const TAX_REPORT_FOOTNOTE =
     "\"taxable amount for tax paid at source\". Only receipts flagged installed-at-customer count; Shop and consumable " +
     "purchases are excluded.";
 
-/** Calendar quarter containing `now`, as [from, to) local dates. */
-export function currentQuarterRange(now: Date = new Date()): TaxAtSourceFilters {
-    const quarterStartMonth = Math.floor(now.getMonth() / 3) * 3;
-    return {
-        from: new Date(now.getFullYear(), quarterStartMonth, 1, 0, 0, 0, 0),
-        to: new Date(now.getFullYear(), quarterStartMonth + 3, 1, 0, 0, 0, 0),
-    };
+/** Whole cents from a value for display only. */
+export function centsToDollars(cents: number): number {
+    return cents / 100;
 }
 
+/**
+ * Exact cents from a Prisma Decimal (or anything that stringifies to a decimal
+ * literal), WITHOUT going through a float.
+ *
+ * `Number("16.55") * 100` is 1655.0000000000002 — fine once, wrong after enough
+ * additions. Prisma's Decimal stringifies exactly, so the digits are parsed
+ * directly and the third decimal place decides a half-up round.
+ */
+export function toCents(value: unknown): number {
+    if (value === null || value === undefined) return 0;
+    const text = String(value).trim();
+    const match = /^(-?)(\d+)(?:\.(\d*))?$/.exec(text);
+    if (!match) {
+        // Scientific notation or junk — not a shape money arrives in, but a
+        // silent 0 would understate a deduction. Fall back rather than drop.
+        const asNumber = Number(text);
+        return Number.isFinite(asNumber) ? Math.round(asNumber * 100) : 0;
+    }
+    const sign = match[1] === "-" ? -1 : 1;
+    const fraction = (match[3] ?? "").padEnd(3, "0");
+    const cents = Number(match[2]) * 100 + Number(fraction.slice(0, 2));
+    const roundUp = Number(fraction[2]) >= 5;
+    return sign * (cents + (roundUp ? 1 : 0));
+}
+
+/** Calendar quarter containing `now`, expressed in the COMPANY's zone. */
+export function currentQuarterKeys(now: Date, timeZone: string): { fromKey: string; toKey: string } {
+    const today = dayKeyInTimeZone(now, timeZone);
+    const year = Number(today.slice(0, 4));
+    const month = Number(today.slice(5, 7));
+    const quarterStartMonth = Math.floor((month - 1) / 3) * 3 + 1;
+    const fromKey = `${year}-${String(quarterStartMonth).padStart(2, "0")}-01`;
+    // First day of the month AFTER the quarter, then step back one day to get
+    // the inclusive last day — no month-length table, and correct in February.
+    const endExclusiveMonth = quarterStartMonth + 3;
+    const endYear = endExclusiveMonth > 12 ? year + 1 : year;
+    const endMonth = endExclusiveMonth > 12 ? endExclusiveMonth - 12 : endExclusiveMonth;
+    const toKey = addDaysToKey(`${endYear}-${String(endMonth).padStart(2, "0")}-01`, -1);
+    return { fromKey, toKey };
+}
+
+function isDayKey(value: string | undefined): value is string {
+    return !!value && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+/**
+ * Build the filters from URL params, in the company's zone.
+ *
+ * An inverted or unparseable range falls back to the current quarter rather
+ * than returning an empty period: an empty table reads as "no tax was paid this
+ * quarter", which is a very different claim from "your dates are backwards".
+ */
 export function parseTaxAtSourceFilters(
     params: URLSearchParams | Record<string, string | string[] | undefined>,
+    timeZone: string,
     now: Date = new Date(),
 ): TaxAtSourceFilters {
     const get = (key: string): string | undefined => {
@@ -76,27 +141,39 @@ export function parseTaxAtSourceFilters(
         const value = (params as Record<string, string | string[] | undefined>)[key];
         return Array.isArray(value) ? value[0] : value ?? undefined;
     };
-    const fallback = currentQuarterRange(now);
-    const from = (get("from") && parseLocalDateString(get("from")!)) || fallback.from;
-    const parsedTo = get("to") ? parseLocalDateString(get("to")!) : null;
-    // The picker's "to" is INCLUSIVE to a human; the query bound is exclusive.
-    const to = parsedTo
-        ? new Date(parsedTo.getFullYear(), parsedTo.getMonth(), parsedTo.getDate() + 1, 0, 0, 0, 0)
-        : fallback.to;
-    // An inverted range is a typo, not a query. Returning the fallback rather
-    // than an empty table stops the page reading as "no tax paid this quarter".
-    if (to.getTime() <= from.getTime()) return fallback;
-    return { from, to };
+
+    const fallback = currentQuarterKeys(now, timeZone);
+    const rawFrom = get("from");
+    const rawTo = get("to");
+    let fromKey = isDayKey(rawFrom) ? rawFrom : fallback.fromKey;
+    let toKey = isDayKey(rawTo) ? rawTo : fallback.toKey;
+    if (toKey < fromKey) {
+        fromKey = fallback.fromKey;
+        toKey = fallback.toKey;
+    }
+
+    return {
+        fromKey,
+        toKey,
+        from: startOfDateInTimeZone(fromKey, timeZone),
+        // `toKey` is the last day a human means to include, so the exclusive
+        // bound is the start of the NEXT company day. Taken literally, an
+        // exclusive bound would silently drop everything bought on the last day
+        // of the quarter.
+        to: startOfDateInTimeZone(addDaysToKey(toKey, 1), timeZone),
+        timeZone,
+    };
+}
+
+/** Resolve the company zone, then parse. The one Prisma-touching entry point. */
+export async function resolveTaxAtSourceFilters(
+    params: URLSearchParams | Record<string, string | string[] | undefined>,
+): Promise<TaxAtSourceFilters> {
+    return parseTaxAtSourceFilters(params, await resolveCompanyTimeZone());
 }
 
 export function stringifyTaxAtSourceFilters(filters: TaxAtSourceFilters): string {
-    // `to` goes back out as the INCLUSIVE day the user typed.
-    const inclusiveTo = new Date(filters.to.getTime());
-    inclusiveTo.setDate(inclusiveTo.getDate() - 1);
-    return new URLSearchParams({
-        from: formatLocalDateString(filters.from),
-        to: formatLocalDateString(inclusiveTo),
-    }).toString();
+    return new URLSearchParams({ from: filters.fromKey, to: filters.toKey }).toString();
 }
 
 /**
@@ -118,9 +195,9 @@ export interface TaxAtSourceJobGroup {
     projectId: string | null;
     projectName: string;
     count: number;
-    deductionBase: number;
-    receiptTotal: number;
-    tax: number;
+    deductionBaseCents: number;
+    receiptTotalCents: number;
+    taxCents: number;
 }
 
 export interface TaxAtSourceMonthGroup {
@@ -128,38 +205,56 @@ export interface TaxAtSourceMonthGroup {
     label: string;
     jobs: TaxAtSourceJobGroup[];
     count: number;
-    deductionBase: number;
-    receiptTotal: number;
-    tax: number;
+    deductionBaseCents: number;
+    receiptTotalCents: number;
+    taxCents: number;
 }
 
 export interface TaxAtSourceSummary {
     count: number;
-    deductionBase: number;
-    receiptTotal: number;
-    tax: number;
+    deductionBaseCents: number;
+    receiptTotalCents: number;
+    taxCents: number;
 }
 
-/** Month × job rollup. Pure — this is the function the unit tests drive. */
+const MONTH_LABELS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+];
+
+/** "2026-06" -> "June 2026", from the company-calendar key. No Date involved. */
+export function monthLabelFromKey(monthKey: string): string {
+    const year = monthKey.slice(0, 4);
+    const month = Number(monthKey.slice(5, 7));
+    return `${MONTH_LABELS[month - 1] ?? monthKey} ${year}`;
+}
+
+/**
+ * Month × job rollup, in whole cents. Pure — this is the function the unit
+ * tests drive. Month buckets come from each row's COMPANY-calendar day key, so
+ * a late-evening purchase never falls into the next month (or quarter).
+ */
 export function groupTaxAtSource(rows: TaxAtSourceRow[]): {
     months: TaxAtSourceMonthGroup[];
     summary: TaxAtSourceSummary;
 } {
     const months = new Map<string, TaxAtSourceMonthGroup>();
-    const summary: TaxAtSourceSummary = { count: 0, deductionBase: 0, receiptTotal: 0, tax: 0 };
+    const summary: TaxAtSourceSummary = {
+        count: 0, deductionBaseCents: 0, receiptTotalCents: 0, taxCents: 0,
+    };
 
     for (const row of rows) {
-        const key = formatMoneyMonthKey(row.date);
+        const key = row.dayKey.slice(0, 7);
         let month = months.get(key);
         if (!month) {
             month = {
                 key,
-                label: formatMoneyMonth(row.date),
+                label: monthLabelFromKey(key),
                 jobs: [],
                 count: 0,
-                deductionBase: 0,
-                receiptTotal: 0,
-                tax: 0,
+                deductionBaseCents: 0,
+                receiptTotalCents: 0,
+                taxCents: 0,
             };
             months.set(key, month);
         }
@@ -171,32 +266,32 @@ export function groupTaxAtSource(rows: TaxAtSourceRow[]): {
                 projectId: row.projectId,
                 projectName: row.projectName,
                 count: 0,
-                deductionBase: 0,
-                receiptTotal: 0,
-                tax: 0,
+                deductionBaseCents: 0,
+                receiptTotalCents: 0,
+                taxCents: 0,
             };
             month.jobs.push(job);
         }
 
         job.count += 1;
-        job.deductionBase += row.deductionBase;
-        job.receiptTotal += row.receiptTotal;
-        job.tax += row.tax;
+        job.deductionBaseCents += row.deductionBaseCents;
+        job.receiptTotalCents += row.receiptTotalCents;
+        job.taxCents += row.taxCents;
 
         month.count += 1;
-        month.deductionBase += row.deductionBase;
-        month.receiptTotal += row.receiptTotal;
-        month.tax += row.tax;
+        month.deductionBaseCents += row.deductionBaseCents;
+        month.receiptTotalCents += row.receiptTotalCents;
+        month.taxCents += row.taxCents;
 
         summary.count += 1;
-        summary.deductionBase += row.deductionBase;
-        summary.receiptTotal += row.receiptTotal;
-        summary.tax += row.tax;
+        summary.deductionBaseCents += row.deductionBaseCents;
+        summary.receiptTotalCents += row.receiptTotalCents;
+        summary.taxCents += row.taxCents;
     }
 
     const ordered = [...months.values()].sort((a, b) => a.key.localeCompare(b.key));
     for (const month of ordered) {
-        month.jobs.sort((a, b) => b.tax - a.tax);
+        month.jobs.sort((a, b) => b.taxCents - a.taxCents);
     }
     return { months: ordered, summary };
 }
@@ -224,46 +319,48 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
     });
 
     return rows.map(row => {
-        const tax = toNum(row.taxAmount);
-        const receiptTotal = toNum(row.amount);
+        const taxCents = toCents(row.taxAmount);
+        const receiptTotalCents = toCents(row.amount);
         return {
             id: row.id,
             // The `date: { gte }` filter above already excluded null dates.
             date: row.date!,
+            dayKey: dayKeyInTimeZone(row.date!, filters.timeZone),
             vendor: row.vendor ?? "",
             projectId: resolveExpenseProjectId(row),
             projectName: row.project?.name ?? row.estimate?.project?.name ?? "(unassigned)",
             reference: extractReference(row.description),
-            receiptTotal,
-            deductionBase: receiptTotal - tax,
-            tax,
+            receiptTotalCents,
+            deductionBaseCents: receiptTotalCents - taxCents,
+            taxCents,
         };
     });
-}
-
-function escapeCsv(value: string): string {
-    return `"${String(value ?? "").replace(/"/g, '""')}"`;
 }
 
 /**
  * Mirrors the columns of the workbook Vanessa already receives
  * (Date, Vendor, Job, Invoice, Receipt Total, deduction base, Tax), so the
  * handoff file shape survives the move into ProBuild.
+ *
+ * Text cells go through `csvCell`, which neutralizes the leading characters a
+ * spreadsheet reads as a formula — vendor names and descriptions are free text
+ * lifted off receipts, so that is real input, not a hypothetical.
  */
 export function rowsToCsv(rows: TaxAtSourceRow[]): string {
-    const lines = [
-        ["Date", "Vendor", "Job", "Invoice", "Receipt Total", "Material Amount (deduction base)", "Tax Paid at Source"].join(","),
-    ];
+    const document: string[][] = [[
+        "Date", "Vendor", "Job", "Invoice",
+        "Receipt Total", "Material Amount (deduction base)", "Tax Paid at Source",
+    ]];
     for (const row of rows) {
-        lines.push([
-            formatMoneyDateISO(row.date),
-            escapeCsv(row.vendor),
-            escapeCsv(row.projectName),
-            escapeCsv(row.reference),
-            row.receiptTotal.toFixed(2),
-            row.deductionBase.toFixed(2),
-            row.tax.toFixed(2),
-        ].join(","));
+        document.push([
+            csvCell(row.dayKey),
+            csvCell(row.vendor),
+            csvCell(row.projectName),
+            csvCell(row.reference),
+            csvNumber(centsToDollars(row.receiptTotalCents)),
+            csvNumber(centsToDollars(row.deductionBaseCents)),
+            csvNumber(centsToDollars(row.taxCents)),
+        ]);
     }
-    return lines.join("\r\n") + "\r\n";
+    return csvDocument(document);
 }

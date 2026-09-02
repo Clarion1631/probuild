@@ -2,84 +2,133 @@
  * The WA excise deduction. Getting this wrong overstates a tax deduction, so
  * the exclusions matter more than the sums: a row counts only on POSITIVE
  * evidence, never on the absence of a contradiction.
+ *
+ * Three properties are asserted hard, because each has a failure mode that is
+ * invisible in the output:
+ *   * INTEGER CENTS — a float sum drifts and the grand total stops agreeing
+ *     with the rows it is made of;
+ *   * COMPANY TIME ZONE — a 6pm-Pacific receipt on 30 September is 1 October
+ *     UTC, and bucketed in UTC it lands on the wrong excise return;
+ *   * CSV FORMULA NEUTRALIZATION — vendor and description are free text off a
+ *     receipt, so a leading `=` reaches Marge's spreadsheet as a formula.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-    currentQuarterRange,
+    currentQuarterKeys,
     extractReference,
     groupTaxAtSource,
+    monthLabelFromKey,
     parseTaxAtSourceFilters,
     rowsToCsv,
     stringifyTaxAtSourceFilters,
+    toCents,
     type TaxAtSourceRow,
 } from "../src/lib/tax-at-source-report";
+import { csvCell, csvNumber } from "../src/lib/csv-safe";
+
+const PACIFIC = "America/Los_Angeles";
 
 function row(overrides: Partial<TaxAtSourceRow> = {}): TaxAtSourceRow {
-    const receiptTotal = overrides.receiptTotal ?? 207.74;
-    const tax = overrides.tax ?? 16.55;
+    const receiptTotalCents = overrides.receiptTotalCents ?? 20774;
+    const taxCents = overrides.taxCents ?? 1655;
     return {
         id: "e1",
-        date: new Date("2026-06-26T00:00:00.000Z"),
+        date: new Date("2026-06-26T19:00:00.000Z"),
+        dayKey: "2026-06-26",
         vendor: "Harbor Freight",
         projectId: "job-mesplay",
         projectName: "Mesplay Kitchen",
         reference: "001916749100246",
-        receiptTotal,
-        deductionBase: receiptTotal - tax,
-        tax,
+        receiptTotalCents,
+        deductionBaseCents: receiptTotalCents - taxCents,
+        taxCents,
         ...overrides,
     };
 }
+
+// ── integer cents ───────────────────────────────────────────────────────────
+
+test("toCents reads a Decimal's digits, never a float", () => {
+    assert.equal(toCents("16.55"), 1655);
+    assert.equal(toCents("16.550000000000000000000000000000"), 1655, "Prisma's Decimal string form");
+    assert.equal(toCents("0.1"), 10);
+    assert.equal(toCents("207"), 20700);
+    assert.equal(toCents("-4.79"), -479);
+    assert.equal(toCents("1.005"), 101, "half-up on the third decimal");
+    assert.equal(toCents("1.004"), 100);
+    assert.equal(toCents(null), 0);
+    assert.equal(toCents(""), 0);
+});
+
+test("a hundred float-hostile receipts still sum exactly", () => {
+    // The canonical drift: 0.1 + 0.2 !== 0.3. Summing dollars as numbers, 100
+    // rows of $0.10 tax lands at 10.000000000000002 and the grand total stops
+    // matching the sum of the rows a bookkeeper can see.
+    const rows = Array.from({ length: 100 }, (_, i) =>
+        row({ id: `e${i}`, receiptTotalCents: 30, taxCents: 10 }),
+    );
+    const { summary, months } = groupTaxAtSource(rows);
+    assert.equal(summary.taxCents, 1000, "exactly $10.00");
+    assert.equal(summary.deductionBaseCents, 2000);
+    assert.equal(months[0].taxCents, 1000);
+    assert.equal(
+        summary.taxCents,
+        months.reduce((total, month) => total + month.taxCents, 0),
+        "the grand total is the month totals, not a second computation",
+    );
+    // Proof the guard is load-bearing: the same thing in floats does drift.
+    const floatSum = rows.reduce(total => total + 0.1, 0);
+    assert.notEqual(floatSum, 10);
+});
 
 // ── grouping ────────────────────────────────────────────────────────────────
 
 test("sums per month and per job, and the totals tie out", () => {
     const { months, summary } = groupTaxAtSource([
-        row({ id: "a", tax: 10, receiptTotal: 110, deductionBase: 100 }),
-        row({ id: "b", tax: 5, receiptTotal: 55, deductionBase: 50 }),
+        row({ id: "a", taxCents: 1000, receiptTotalCents: 11000, deductionBaseCents: 10000 }),
+        row({ id: "b", taxCents: 500, receiptTotalCents: 5500, deductionBaseCents: 5000 }),
         row({
             id: "c",
             projectId: "job-mueller",
             projectName: "Mueller Bath",
-            tax: 20,
-            receiptTotal: 220,
-            deductionBase: 200,
+            taxCents: 2000,
+            receiptTotalCents: 22000,
+            deductionBaseCents: 20000,
         }),
-        row({
-            id: "d",
-            date: new Date("2026-07-02T00:00:00.000Z"),
-            tax: 1,
-            receiptTotal: 11,
-            deductionBase: 10,
-        }),
+        row({ id: "d", dayKey: "2026-07-02", taxCents: 100, receiptTotalCents: 1100, deductionBaseCents: 1000 }),
     ]);
 
     assert.deepEqual(months.map(m => m.key), ["2026-06", "2026-07"], "months are chronological");
     const june = months[0];
     assert.equal(june.count, 3);
-    assert.equal(june.tax, 35);
-    assert.equal(june.deductionBase, 350);
+    assert.equal(june.taxCents, 3500);
+    assert.equal(june.deductionBaseCents, 35000);
+    assert.equal(june.label, "June 2026");
     // Jobs sort by tax, largest first — that is the row a bookkeeper checks.
     assert.deepEqual(june.jobs.map(j => j.projectId), ["job-mueller", "job-mesplay"]);
     assert.equal(june.jobs.find(j => j.projectId === "job-mesplay")!.count, 2);
-    assert.equal(june.jobs.find(j => j.projectId === "job-mesplay")!.tax, 15);
+    assert.equal(june.jobs.find(j => j.projectId === "job-mesplay")!.taxCents, 1500);
 
     assert.equal(summary.count, 4);
-    assert.equal(summary.tax, 36);
-    assert.equal(summary.deductionBase, 360);
-    assert.equal(
-        summary.tax,
-        months.reduce((total, month) => total + month.tax, 0),
-        "the grand total is the month totals, not a second computation",
-    );
+    assert.equal(summary.taxCents, 3600);
+    assert.equal(summary.deductionBaseCents, 36000);
+});
+
+test("month buckets follow the COMPANY day key, not the UTC instant", () => {
+    // 30 Sep 2026, 6pm Pacific = 1 Oct 01:00 UTC. Bucketed on the instant this
+    // row lands in October — a different QUARTER, so the deduction would be
+    // claimed on the wrong excise return.
+    const { months } = groupTaxAtSource([
+        row({ id: "late", date: new Date("2026-10-01T01:00:00.000Z"), dayKey: "2026-09-30" }),
+    ]);
+    assert.deepEqual(months.map(m => m.key), ["2026-09"]);
 });
 
 test("two jobs sharing a name stay separate", () => {
-    // Bucketing by name would merge one client's deduction into another's.
     const { months } = groupTaxAtSource([
-        row({ id: "a", projectId: "job-1", projectName: "Bathroom Remodel", tax: 10 }),
-        row({ id: "b", projectId: "job-2", projectName: "Bathroom Remodel", tax: 20 }),
+        row({ id: "a", projectId: "job-1", projectName: "Bathroom Remodel", taxCents: 1000 }),
+        row({ id: "b", projectId: "job-2", projectName: "Bathroom Remodel", taxCents: 2000 }),
     ]);
     assert.equal(months[0].jobs.length, 2);
     assert.deepEqual(months[0].jobs.map(j => j.projectId), ["job-2", "job-1"]);
@@ -87,54 +136,83 @@ test("two jobs sharing a name stay separate", () => {
 
 test("an unattributed receipt is shown, not dropped", () => {
     // Money that was spent is real even when nobody said whose job it was.
-    // Hiding it would make the report quietly understate the deduction.
     const { months, summary } = groupTaxAtSource([
-        row({ projectId: null, projectName: "(unassigned)", tax: 7 }),
+        row({ projectId: null, projectName: "(unassigned)", taxCents: 700 }),
     ]);
     assert.equal(months[0].jobs[0].projectId, null);
-    assert.equal(summary.tax, 7);
+    assert.equal(summary.taxCents, 700);
 });
 
 test("an empty period is zeros, not NaN", () => {
     const { months, summary } = groupTaxAtSource([]);
     assert.deepEqual(months, []);
-    assert.deepEqual(summary, { count: 0, deductionBase: 0, receiptTotal: 0, tax: 0 });
+    assert.deepEqual(summary, { count: 0, deductionBaseCents: 0, receiptTotalCents: 0, taxCents: 0 });
 });
 
-// ── the filter contract ─────────────────────────────────────────────────────
+// ── period boundaries, in the company zone ──────────────────────────────────
 
-test("the default period is the current calendar quarter, [from, to)", () => {
-    const filters = parseTaxAtSourceFilters({}, new Date(2026, 7, 15));
-    assert.equal(filters.from.getMonth(), 6, "Q3 starts in July");
-    assert.equal(filters.from.getDate(), 1);
-    assert.equal(filters.to.getMonth(), 9, "and ends at the start of October, exclusive");
-    assert.equal(filters.to.getDate(), 1);
-    assert.deepEqual(filters, currentQuarterRange(new Date(2026, 7, 15)));
+test("the quarter is the company's calendar quarter, not the server's", () => {
+    // 1 Jan 2027, 04:00 UTC is still 31 Dec 2026, 8pm Pacific. A server in UTC
+    // would offer Q1 2027; the company is still filing Q4 2026.
+    const newYearInstant = new Date("2027-01-01T04:00:00.000Z");
+    assert.deepEqual(currentQuarterKeys(newYearInstant, PACIFIC), {
+        fromKey: "2026-10-01",
+        toKey: "2026-12-31",
+    });
+    assert.deepEqual(currentQuarterKeys(newYearInstant, "UTC"), {
+        fromKey: "2027-01-01",
+        toKey: "2027-03-31",
+    });
 });
 
-test("the picker's `to` is inclusive to a human and exclusive to the query", () => {
-    // A receipt dated on the last day of the range must be IN it. An exclusive
-    // bound taken literally from the picker would silently drop that day.
-    const filters = parseTaxAtSourceFilters({ from: "2026-06-01", to: "2026-06-30" });
-    assert.equal(filters.from.getDate(), 1);
-    assert.equal(filters.to.getMonth(), 6);
-    assert.equal(filters.to.getDate(), 1, "start of July");
-    // ...and it round-trips back to the day the user typed.
+test("quarter ends land on the right last day, February included", () => {
+    assert.deepEqual(currentQuarterKeys(new Date("2028-02-10T20:00:00.000Z"), PACIFIC), {
+        fromKey: "2028-01-01",
+        toKey: "2028-03-31",
+    });
+    assert.deepEqual(currentQuarterKeys(new Date("2026-05-10T20:00:00.000Z"), PACIFIC), {
+        fromKey: "2026-04-01",
+        toKey: "2026-06-30",
+    });
+});
+
+test("the query bounds are company midnights, and `to` is exclusive-next-day", () => {
+    const filters = parseTaxAtSourceFilters({ from: "2026-06-01", to: "2026-06-30" }, PACIFIC);
+    assert.equal(filters.fromKey, "2026-06-01");
+    assert.equal(filters.toKey, "2026-06-30");
+    // June is PDT (UTC-7): midnight local is 07:00Z.
+    assert.equal(filters.from.toISOString(), "2026-06-01T07:00:00.000Z");
+    // A receipt bought on the LAST day of the range must be inside it, so the
+    // exclusive bound is the start of 1 July, not of 30 June.
+    assert.equal(filters.to.toISOString(), "2026-07-01T07:00:00.000Z");
     assert.equal(stringifyTaxAtSourceFilters(filters), "from=2026-06-01&to=2026-06-30");
+});
+
+test("a winter range uses the winter offset — the bound is not a fixed number of hours", () => {
+    const filters = parseTaxAtSourceFilters({ from: "2026-01-01", to: "2026-03-31" }, PACIFIC);
+    assert.equal(filters.from.toISOString(), "2026-01-01T08:00:00.000Z", "PST is UTC-8");
+    assert.equal(filters.to.toISOString(), "2026-04-01T07:00:00.000Z", "PDT by 1 April");
 });
 
 test("an inverted or unparseable range falls back to the quarter, not to empty", () => {
     // An empty table reads as "no tax was paid", which is a very different
     // claim from "your dates are backwards".
-    const now = new Date(2026, 7, 15);
-    assert.deepEqual(
-        parseTaxAtSourceFilters({ from: "2026-06-30", to: "2026-06-01" }, now),
-        currentQuarterRange(now),
-    );
-    assert.deepEqual(
-        parseTaxAtSourceFilters({ from: "not-a-date", to: "also-not" }, now),
-        currentQuarterRange(now),
-    );
+    const now = new Date("2026-08-15T20:00:00.000Z");
+    const quarter = currentQuarterKeys(now, PACIFIC);
+    for (const params of [
+        { from: "2026-06-30", to: "2026-06-01" },
+        { from: "not-a-date", to: "also-not" },
+        {},
+    ]) {
+        const filters = parseTaxAtSourceFilters(params, PACIFIC, now);
+        assert.equal(filters.fromKey, quarter.fromKey, JSON.stringify(params));
+        assert.equal(filters.toKey, quarter.toKey, JSON.stringify(params));
+    }
+});
+
+test("monthLabelFromKey formats from the key, with no Date in the way", () => {
+    assert.equal(monthLabelFromKey("2026-06"), "June 2026");
+    assert.equal(monthLabelFromKey("2026-12"), "December 2026");
 });
 
 // ── reference extraction ────────────────────────────────────────────────────
@@ -152,7 +230,7 @@ test("the invoice reference is recovered from the description, or left blank", (
 // ── CSV ─────────────────────────────────────────────────────────────────────
 
 test("the CSV mirrors the workbook columns Vanessa already receives", () => {
-    const csv = rowsToCsv([row({ receiptTotal: 207.74, tax: 16.55, deductionBase: 191.19 })]);
+    const csv = rowsToCsv([row({ receiptTotalCents: 20774, taxCents: 1655, deductionBaseCents: 19119 })]);
     const [header, line] = csv.trimEnd().split("\r\n");
     assert.equal(
         header,
@@ -160,11 +238,31 @@ test("the CSV mirrors the workbook columns Vanessa already receives", () => {
     );
     assert.equal(
         line,
-        '2026-06-26,"Harbor Freight","Mesplay Kitchen","001916749100246",207.74,191.19,16.55',
+        '"2026-06-26","Harbor Freight","Mesplay Kitchen","001916749100246",207.74,191.19,16.55',
     );
 });
 
-test("CSV quoting survives a vendor name with a comma or a quote", () => {
-    const csv = rowsToCsv([row({ vendor: 'Lowe"s, Vancouver' })]);
-    assert.match(csv, /"Lowe""s, Vancouver"/);
+test("a vendor name that starts a formula is neutralized, not executed", () => {
+    // Vendor and description are free text lifted off a receipt by a model.
+    const csv = rowsToCsv([row({ vendor: "=cmd|'/c calc'!A1", reference: "+1-555", projectName: "@job" })]);
+    const line = csv.trimEnd().split("\r\n")[1];
+    assert.match(line, /"'=cmd\|'\/c calc'!A1"/);
+    assert.match(line, /"'\+1-555"/);
+    assert.match(line, /"'@job"/);
+});
+
+test("CSV quoting survives a comma, a quote, and a newline", () => {
+    const csv = rowsToCsv([row({ vendor: 'Lowe"s, Vancouver\nStore 42' })]);
+    assert.match(csv, /"Lowe""s, Vancouver\nStore 42"/);
+});
+
+test("csv-safe: numbers stay numbers, text gets neutralized", () => {
+    // A negative amount must NOT be quote-prefixed — that would turn a number
+    // into text and break every SUM in the sheet.
+    assert.equal(csvNumber(-12.5), "-12.50");
+    assert.equal(csvNumber(Number.NaN), "", "never the string NaN, which poisons a SUM");
+    assert.equal(csvCell("-12.50"), '"\'-12.50"', "the same digits as TEXT are neutralized");
+    assert.equal(csvCell("plain"), '"plain"');
+    assert.equal(csvCell(null), '""');
+    assert.equal(csvCell("\tlead-tab"), '"\'\tlead-tab"');
 });
