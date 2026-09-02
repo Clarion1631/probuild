@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import {
     canAccessProject,
     canUseDevAuthFallback,
@@ -60,7 +61,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         select: { amount: true, paidAt: true, createdAt: true }
     });
     const allExpenseRecords = await prisma.expense.findMany({
-        where: { estimate: { projectId } },
+        where: expenseForProjectWhere(projectId),
         select: { amount: true, date: true, createdAt: true }
     });
 

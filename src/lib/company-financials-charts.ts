@@ -6,6 +6,11 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 // (src/lib/overhead-project.ts) so this page, the QBO expense sync, and the job
 // variance report can never point at different projects.
 import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
+import {
+    expenseForProjectWhere,
+    expenseForProjectsWhere,
+    resolveExpenseProjectId,
+} from "@/lib/expense-attribution";
 
 // Same parent-status gating as computeProjectFinancials (src/lib/project-financials.ts,
 // includeUnissued: false) — Draft invoices/retainers are not receivables and must
@@ -289,10 +294,17 @@ export async function getCompanyFinancialsChartData(
         }),
         prisma.expense.findMany({
             where: {
-                estimate: { projectId: { in: projectIds } },
+                // Under AND, not spread: coalescedDateRange2 returns this
+                // object's `OR` key, and a second `OR` would replace it and
+                // silently fetch the whole of history.
+                AND: [expenseForProjectsWhere(projectIds)],
                 ...coalescedDateRange2(from, to, "date", "createdAt"),
             },
-            select: { amount: true, date: true, createdAt: true, estimate: { select: { projectId: true } } },
+            select: {
+                amount: true, date: true, createdAt: true,
+                projectId: true,
+                estimate: { select: { projectId: true } },
+            },
         }),
         prisma.timeEntry.findMany({
             where: {
@@ -304,7 +316,7 @@ export async function getCompanyFinancialsChartData(
         includeOverhead
             ? prisma.expense.findMany({
                   where: {
-                      estimate: { projectId: OVERHEAD_PROJECT_ID },
+                      AND: [expenseForProjectWhere(OVERHEAD_PROJECT_ID)],
                       ...coalescedDateRange2(from, to, "date", "createdAt"),
                   },
                   select: { amount: true, date: true, createdAt: true },
@@ -336,6 +348,12 @@ export async function getCompanyFinancialsChartData(
         // than materializing every expense row. Expense has no direct projectId
         // column, so group by estimateId and resolve project ids via a small
         // estimate lookup below.
+        // DELIBERATELY LEFT ON THE RELATION. Phase 3 added Expense.projectId,
+        // so this could become a plain groupBy(["projectId"]) — but only once
+        // every row is backfilled AND every writer stamps it, and this PR's
+        // contract is identical output. Changing it here would also change the
+        // grouping key, which is a real behaviour change dressed as a
+        // refactor. Revisit after the backfill has run in production.
         prisma.expense.groupBy({
             by: ["estimateId"],
             where: { estimate: { projectId: { in: allJobIds } } },
@@ -455,8 +473,8 @@ export async function getCompanyFinancialsChartData(
         if (!inRange(d)) continue;
         const idx = bucketIndex.get(monthKey(d));
         if (idx === undefined) continue;
-        const pid = e.estimate.projectId;
-        if (!pid) continue; // Estimate.projectId is nullable on this schema
+        const pid = resolveExpenseProjectId(e);
+        if (!pid) continue; // both sides can be null on this schema
         const key = topSet.has(pid) ? pid : "other";
         spendByMonth[idx][key] = (spendByMonth[idx][key] ?? 0) + Number(e.amount);
     }

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import {
     formatLocalDateString,
     defaultMonthRange,
@@ -61,8 +62,13 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
                         { date: { gte: filters.from, lt: filters.to } },
                         { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
-                    // Expense → Project via estimate.projectId
-                    ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
+                    // Expense → Project BOTH ways (Phase 3). Nested under AND,
+                    // never spread: this `where` already owns an `OR` key for
+                    // the date coalesce, and spreading a second one would
+                    // silently replace it and drop the date window entirely.
+                    ...(filters.projectId
+                        ? { AND: [expenseForProjectWhere(filters.projectId)] }
+                        : {}),
                 },
                 include: {
                     estimate: { select: { project: { select: { id: true, name: true } } } },

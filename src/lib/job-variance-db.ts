@@ -1,11 +1,15 @@
 // Server-side data loading for the variance report. Kept out of the page
 // component so the page stays presentational and this stays swappable.
 //
-// Expense has NO projectId column — it reaches a project through its estimate
-// (`where: { estimate: { projectId } }`). Querying expense.projectId throws
-// PrismaClientValidationError, which once made a job's expenses look like $0.
+// Expense reaches a project TWO ways since Phase 3: its own denormalized
+// `projectId` (new, nullable, backfilled) or its estimate's. Never hand-roll
+// either — `expenseForProjectWhere` covers both in one OR key, and it is what
+// keeps this report's numbers identical to the pre-Phase-3 traversal. (The
+// header used to say the column does not exist; that stopped being true the
+// moment scripts/apply-expense-attribution.mjs ran.)
 
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 import { computeProjectVariance, type ProjectVariance, type VarianceEstimateItem } from "@/lib/job-variance";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
@@ -188,7 +192,7 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 // with no matching budget, it surfaces honestly as an unbudgeted
                 // phase or in the unattributed bucket — visible, not silently
                 // dropped.
-                where: { estimate: { projectId: project.id } },
+                where: expenseForProjectWhere(project.id),
                 select: { costCodeId: true, itemId: true, amount: true },
             }),
         ]);

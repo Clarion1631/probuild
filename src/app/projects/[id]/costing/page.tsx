@@ -1,6 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import { redirect } from "next/navigation";
 import JobCostingClient from "./JobCostingClient";
 
@@ -55,11 +56,7 @@ export default async function JobCostingPage({
         }),
         // Fetch Actuals: Expenses
         prisma.expense.findMany({
-            where: {
-                estimate: {
-                    projectId: projectId
-                }
-            },
+            where: expenseForProjectWhere(projectId),
             include: { costCode: true }
         }),
         // Fetch Purchase Orders for "Committed Costs"

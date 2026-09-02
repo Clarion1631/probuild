@@ -3,6 +3,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import {
@@ -228,13 +229,18 @@ export async function deleteExpenses(
         select: {
             id: true,
             qbPurchaseId: true,
+            projectId: true,
             invoiceId: true,
             invoicedAt: true,
             estimate: { select: { projectId: true } },
         },
     });
-    const accessible = expenses.filter(
-        e => e.estimate?.projectId && canAccessProject(user, e.estimate.projectId),
+    // Resolve each row's job the ONE way — the new column when it has one, the
+    // estimate otherwise. Reading `e.estimate.projectId` directly would send a
+    // re-attributed expense's access check to the project it used to be on.
+    const withProject = expenses.map(e => ({ ...e, resolvedProjectId: resolveExpenseProjectId(e) }));
+    const accessible = withProject.filter(
+        e => e.resolvedProjectId && canAccessProject(user, e.resolvedProjectId),
     );
     for (const expense of accessible) assertExpenseMutableOutsideQbo(expense);
     const allowed = accessible.filter(e => !e.invoiceId && !e.invoicedAt);
@@ -242,7 +248,7 @@ export async function deleteExpenses(
 
     const allowedIds = allowed.map(e => e.id);
     const projectIds = new Set(
-        allowed.map(e => e.estimate!.projectId).filter(Boolean) as string[]
+        allowed.map(e => e.resolvedProjectId).filter(Boolean) as string[]
     );
 
     const result = await prisma.expense.deleteMany({
@@ -304,7 +310,7 @@ export async function getExpenses(projectId: string) {
     await assertTimeExpenseProjectAccess(projectId);
 
     return prisma.expense.findMany({
-        where: { estimate: { projectId } },
+        where: expenseForProjectWhere(projectId),
         include: {
             costCode: { select: { id: true, name: true, code: true } },
             costType: { select: { id: true, name: true } },
@@ -330,7 +336,7 @@ export async function getTimeExpenseData(projectId: string) {
     });
 
     const expenseRows = await prisma.expense.findMany({
-        where: { estimate: { projectId } },
+        where: expenseForProjectWhere(projectId),
         include: {
             costCode: { select: { id: true, name: true, code: true } },
             costType: { select: { id: true, name: true } },

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { expenseForProjectWhere } from "@/lib/expense-attribution";
 import {
     formatLocalDateString,
     defaultMonthRange,
@@ -111,7 +112,11 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
                         { date: { gte: filters.from, lt: filters.to } },
                         { AND: [{ date: null }, { createdAt: { gte: filters.from, lt: filters.to } }] },
                     ],
-                    ...(filters.projectId ? { estimate: { projectId: filters.projectId } } : {}),
+                    // Nested under AND, never spread — the date coalesce above
+                    // already owns this object's only `OR` key.
+                    ...(filters.projectId
+                        ? { AND: [expenseForProjectWhere(filters.projectId)] }
+                        : {}),
                 },
                 include: {
                     estimate: { select: { project: { select: { id: true, name: true } } } },

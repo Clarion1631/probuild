@@ -22,6 +22,8 @@
 // spend across phases to make the report look complete; that would present a
 // guess as a measurement.
 
+import { resolveExpenseCostCodeId } from "@/lib/expense-attribution";
+
 /** A budget row: one estimate line item. Section headers must be EXCLUDED by the caller. */
 export interface VarianceEstimateItem {
     id: string;
@@ -279,6 +281,13 @@ export function computeProjectVariance(input: {
         phase.items.push(itemRow);
     }
 
+    // The item pool flattened to just "item id -> its cost code", which is all
+    // the shared fallback needs. Built once, after the budget loop above has
+    // filled `itemsById`.
+    const itemCostCodeById: ReadonlyMap<string, string | null> = new Map(
+        [...itemsById].map(([id, item]) => [id, item.costCodeId]),
+    );
+
     /**
      * Decide which phase a cost belongs to, and whether its item link may be
      * used — keeping the two CONSISTENT.
@@ -297,9 +306,18 @@ export function computeProjectVariance(input: {
      */
     const reconcileAttribution = (
         explicitCostCodeId: string | null | undefined,
-        linkedItem: (ItemVariance & { costCodeId: string | null }) | undefined
+        itemId: string | null | undefined
     ): { costCodeId: string | null; item: (ItemVariance & { costCodeId: string | null }) | undefined } => {
-        const costCodeId = resolveActualCostCodeId(explicitCostCodeId, linkedItem?.costCodeId);
+        const linkedItem = itemId ? itemsById.get(itemId) : undefined;
+        // The "own code, else the linked item's code" fallback lives in
+        // src/lib/expense-attribution.ts — ONE copy, shared with the tax report
+        // and the readers, so this report and the rest of the app can never
+        // disagree about which phase a posting lands on. `resolveActualCostCodeId`
+        // above is the same rule by its older name and delegates to it.
+        const costCodeId = resolveExpenseCostCodeId(
+            { costCodeId: explicitCostCodeId ?? null, itemId: itemId ?? null },
+            itemCostCodeById,
+        );
         if (!costCodeId) return { costCodeId: null, item: undefined };
         // Only credit the item when it lives under the phase being charged.
         const item = linkedItem && linkedItem.costCodeId === costCodeId ? linkedItem : undefined;
@@ -326,7 +344,7 @@ export function computeProjectVariance(input: {
         // An entry may carry an item, a phase, or neither.
         const { costCodeId, item: linkedItem } = reconcileAttribution(
             entry.costCodeId,
-            entry.estimateItemId ? itemsById.get(entry.estimateItemId) : undefined
+            entry.estimateItemId
         );
 
         if (!costCodeId) {
@@ -353,7 +371,7 @@ export function computeProjectVariance(input: {
 
         const { costCodeId, item: linkedItem } = reconcileAttribution(
             expense.costCodeId,
-            expense.itemId ? itemsById.get(expense.itemId) : undefined
+            expense.itemId
         );
 
         if (!costCodeId) {
