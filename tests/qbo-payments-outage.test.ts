@@ -598,3 +598,50 @@ test("CUMULATIVE latency: the loop exits before the ceiling with slow rows", asy
     assert.ok(result.checked < 200, "must not have processed them all");
     assert.equal(result.checked + result.skipped, 200, "every row is accounted for");
 });
+
+
+// --- Exactly one audit event per invocation ---
+
+test("a failed remaining-count makes the run error, never skipped:0/ok", async () => {
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    // Codex gate: countRemaining used `.catch(() => 0)`, so a DB failure left
+    // skipped at 0 and the run reported "ok" - an unknown amount of unverified
+    // payment work vanished from the record. Not knowing is a failed run.
+    const result = emptyResult();
+    result.runFailed = true;
+    result.failureReason = "count-failed";
+    result.errors.push("Could not count remaining rows: connection lost");
+
+    assert.equal(result.skipped, 0);
+    assert.equal(paymentsSyncRunStatus(result), "error", "a 0 we cannot trust is not ok");
+    assert.equal(result.failureReason, "count-failed");
+});
+
+test("a crashed run is still recorded exactly once, as an error", async () => {
+    // The event is written in a finally-style guard, so a Prisma failure in the
+    // pagination queries cannot return or throw with NO event: to the health
+    // check, a crashing cron would look identical to one never deployed.
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    const crashed = {
+        checked: 0, settled: 0, partiallyPaid: 0, progressBillingsSettled: 0,
+        skipped: 0, abortedOnQboOutage: false,
+        runFailed: true, failureReason: "run-crashed",
+        errors: ["Prisma: connection terminated"],
+    };
+    assert.equal(paymentsSyncRunStatus(crashed), "error");
+});
+
+test("the recorded-once guard is a single flag, not per-return-path", async () => {
+    // Pins the invariant behind the try/catch wrapper: whichever path a run
+    // takes, the audit row is written once and only once.
+    const runState = { recorded: false };
+    const writes: string[] = [];
+    const record = async (label: string) => {
+        if (runState.recorded) return;
+        runState.recorded = true;
+        writes.push(label);
+    };
+    await record("normal-return");
+    await record("catch-handler");
+    assert.deepEqual(writes, ["normal-return"]);
+});

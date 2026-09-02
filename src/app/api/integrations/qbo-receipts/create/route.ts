@@ -15,6 +15,7 @@ import {
     isQBBudgetExhaustedError,
     createRouteDeadline,
     type QBTokens,
+    type RouteDeadline,
 } from "@/lib/quickbooks";
 
 /**
@@ -115,8 +116,12 @@ function buildInput(body: ReceiptPushBody, groups: CreateQBReceiptPurchaseInput[
 export interface QboReceiptCreateHandlerDependencies {
     getIngestSecret(): string | undefined;
     isPushEnabled(): boolean;
-    getFreshTokens(): Promise<QBTokens>;
-    createPurchase(tokens: QBTokens, input: CreateQBReceiptPurchaseInput): Promise<CreateQBReceiptPurchaseResult>;
+    getFreshTokens(deadline?: RouteDeadline): Promise<QBTokens>;
+    createPurchase(
+        tokens: QBTokens,
+        input: CreateQBReceiptPurchaseInput,
+        deadline?: RouteDeadline,
+    ): Promise<CreateQBReceiptPurchaseResult>;
     /** Fire-and-forget audit row for the Automation Command Center. Optional so tests need not stub it. */
     logEvent?: (event: AutomationEventInput) => void | Promise<void>;
     /** Command Center pause switch (pause-only; env stays the opt-in master). Optional for tests. */
@@ -179,6 +184,11 @@ function pushEventFromOutcome(
 export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHandlerDependencies) {
     return {
         async POST(request: Request) {
+            // Started HERE, at request entry, not when the first QBO call is
+            // made: auth, JSON parsing, the pause lookup and the token refresh
+            // all consume the same 60s ceiling, so a budget that only began at
+            // the create would let everything before it run free.
+            const deadline = createRouteDeadline(RECEIPT_PUSH_BUDGET_MS);
             // Auth first so a bad key is always a 401 (alertable misconfig),
             // then the opt-in kill switch. push-disabled is deterministic —
             // 200/ok:false, not a 503: it is expected steady-state until the
@@ -238,8 +248,12 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
 
             let tokens: QBTokens;
             try {
-                tokens = await dependencies.getFreshTokens();
+                tokens = await dependencies.getFreshTokens(deadline);
             } catch (error) {
+                if (isQBBudgetExhaustedError(error)) {
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-budget-exhausted" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "qbo-budget-exhausted" }, { status: 503 });
+                }
                 if (error instanceof QBNotConnectedError) {
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "quickbooks-not-connected" }));
                     return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
@@ -260,7 +274,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 // ...) come back as ok:false here and are forwarded as 200 — the
                 // Apps Script treats ok:false as terminal, same convention as
                 // sendToProBuild.txt.
-                const result = await dependencies.createPurchase(tokens, input);
+                const result = await dependencies.createPurchase(tokens, input, deadline);
                 // A booking whose receipt never made it is reported as
                 // attachment-failed, not as a clean create — see
                 // ATTACHMENT_FAILED_STATUS.
@@ -343,8 +357,7 @@ const handlers = createQboReceiptCreateHandlers({
     getIngestSecret: () => process.env.RECEIPT_INGEST_SECRET,
     isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
     getFreshTokens: getFreshQBTokens,
-    createPurchase: (tokens, input) =>
-        createQBReceiptPurchase(tokens, input, {}, createRouteDeadline(RECEIPT_PUSH_BUDGET_MS)),
+    createPurchase: (tokens, input, deadline) => createQBReceiptPurchase(tokens, input, {}, deadline),
 });
 
 export async function POST(request: Request) {

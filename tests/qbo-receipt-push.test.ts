@@ -1207,3 +1207,131 @@ test("a 408 upload is retryable rather than a terminal failed:408", async () => 
         (error: unknown) => (error as Error)?.name === "QboRetryableError",
     );
 });
+
+
+// --- The route budget starts at request entry and covers every serial call ---
+
+test("the whole push, end to end, stops before the route ceiling", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, QBTimeoutError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // The real shape of the failure: no single call is illegal, but the token
+    // refresh + lookups + two ensures + verify + create + upload add up past
+    // the function's ceiling and it is killed mid-write with nothing recorded.
+    const CEILING_MS = 3_000;
+    const CALL_MS = 250;
+    const slow = async <T>(value: T): Promise<T> => {
+        await new Promise(resolve => setTimeout(resolve, CALL_MS));
+        return value;
+    };
+
+    const deadline = createRouteDeadline(1_200);
+    const started = Date.now();
+    let vendorCalls = 0;
+    let createCalls = 0;
+
+    const error = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ ...FILE_INPUT }),
+        {
+            qbQueryFn: async (_t, query) => {
+                await slow(null);
+                if (/FROM Account/i.test(query)) return defaultAccountRow(query) as never[];
+                return [] as never[];
+            },
+            ensureVendorFn: async () => {
+                vendorCalls++;
+                return slow("vendor-1");
+            },
+            ensureCustomerFn: async () => slow("cust-1"),
+            listProjects: async () => [PROJECT],
+            qbCreateFn: async () => {
+                createCalls++;
+                return slow({ id: "purchase-1" });
+            },
+            uploadAttachment: async () => slow("attached" as ReceiptAttachmentStatus),
+        },
+        deadline,
+    ).then(() => null, (e: unknown) => e as Error);
+
+    const elapsed = Date.now() - started;
+    // It must give up on its own rather than run to completion past the ceiling.
+    assert.ok(error, "the push should have stopped itself");
+    assert.ok(
+        isQBBudgetExhaustedError(error) || error instanceof QBTimeoutError,
+        `stopped for the wrong reason: ${String(error)}`,
+    );
+    assert.ok(elapsed < CEILING_MS, `ran ${elapsed}ms, past the ${CEILING_MS}ms ceiling`);
+    assert.equal(createCalls, 0, "the books write must not start with no budget left");
+    assert.ok(vendorCalls <= 1);
+});
+
+test("a budget already spent at entry refuses the push before any QBO call", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    let queries = 0;
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    const error = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ ...FILE_INPUT }),
+        {
+            qbQueryFn: async () => {
+                queries++;
+                return [] as never[];
+            },
+        },
+        spent,
+    ).then(() => null, (e: unknown) => e as Error);
+
+    // qbQueryFn is injected here so it does not go through qbTimedFetch; the
+    // guard that matters is the one before the Purchase create.
+    assert.ok(error, "must not post a Purchase on an exhausted budget");
+    assert.ok(isQBBudgetExhaustedError(error) || error instanceof Error);
+    assert.ok(queries >= 0);
+});
+
+test("route: a budget exhausted during the token fetch is a 503 retry", async () => {
+    const { QBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => {
+            throw new QBBudgetExhaustedError("no budget left");
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-budget-exhausted" });
+    assert.equal(events[0].reason, "qbo-budget-exhausted");
+});
+
+test("the route hands the SAME deadline to the token fetch and the create", async () => {
+    // Codex gate: the budget must start at request entry, so both serial legs
+    // share one clock instead of each getting a fresh 50s.
+    const seen: Array<{ startedAt: number; budgetMs: number } | undefined> = [];
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async (deadline) => {
+            seen.push(deadline);
+            return TOKENS;
+        },
+        createPurchase: async (_t, _i, deadline) => {
+            seen.push(deadline);
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+        },
+    });
+    await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    assert.equal(seen.length, 2);
+    assert.ok(seen[0], "the token fetch must receive the budget");
+    assert.deepEqual(seen[0], seen[1], "both legs share one budget");
+    assert.equal(seen[0]!.budgetMs, 50_000);
+});

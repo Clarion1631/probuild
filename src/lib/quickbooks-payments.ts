@@ -61,7 +61,7 @@ export class QBNotConnectedError extends Error {
 }
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
-export async function getFreshQBTokens(): Promise<QBTokens> {
+export async function getFreshQBTokens(deadline?: RouteDeadline): Promise<QBTokens> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts. The mock
     // replaces the NETWORK, not the CONNECTION STATE: with no connected settings row
     // it still throws QBNotConnectedError, so fail-closed specs (e.g.
@@ -76,11 +76,10 @@ export async function getFreshQBTokens(): Promise<QBTokens> {
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
     }
-    return refreshTokensOrFallBack({
-        accessToken: qb.accessToken,
-        refreshToken: qb.refreshToken,
-        realmId: qb.realmId,
-    });
+    return refreshTokensOrFallBack(
+        { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId },
+        (token) => refreshQBToken(token, deadline),
+    );
 }
 
 /**
@@ -866,13 +865,61 @@ async function forEachPendingPage<T extends { id: string }>(
     // Stopped early. Count what is genuinely left AFTER the cursor rather than
     // subtracting from a stale total — rows settled during this run have
     // already dropped out of the pending set.
-    const remaining = await countRemaining(cursorId).catch(() => 0);
-    if (remaining > 0) result.skipped += remaining;
+    //
+    // If that count FAILS we do not know how much was left. Defaulting to 0
+    // was the worst possible answer: skipped stayed 0, the run reported "ok",
+    // and an unknown amount of unverified payment work vanished from the
+    // record. Not knowing is a failed run.
+    try {
+        const remaining = await countRemaining(cursorId);
+        if (remaining > 0) result.skipped += remaining;
+    } catch (error) {
+        result.runFailed = true;
+        result.failureReason = "count-failed";
+        result.errors.push(
+            `Could not count remaining rows: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+    }
 }
 
 export async function syncQuickBooksPayments(
     scope?: { invoiceId?: string; projectId?: string },
     options?: SyncQuickBooksPaymentsOptions,
+): Promise<QBPaymentSyncResult> {
+    // Exactly one audit event per invocation, whatever happens.
+    //
+    // The event used to be written at each return point, so any path that did
+    // not reach one — a Prisma failure in the pagination queries, a bug in the
+    // loop — returned or threw with NO event at all. The health check reads
+    // those events, so a crashing cron looked exactly like a cron that had
+    // never been deployed: silent. try/finally makes the record unconditional,
+    // and `recorded` keeps it to one.
+    const runState = { recorded: false };
+    try {
+        return await runPaymentsSync(scope, options, runState);
+    } catch (error) {
+        // A DB/pagination exception is still a failed RUN and must be visible.
+        if (!runState.recorded) {
+            runState.recorded = true;
+            await recordPaymentsSyncEvent(
+                {
+                    checked: 0, settled: 0, partiallyPaid: 0, progressBillingsSettled: 0,
+                    skipped: 0, abortedOnQboOutage: false,
+                    runFailed: true,
+                    failureReason: "run-crashed",
+                    errors: [error instanceof Error ? error.message : "payments sync threw"],
+                },
+                options?.source,
+            ).catch(() => {});
+        }
+        throw error;
+    }
+}
+
+async function runPaymentsSync(
+    scope: { invoiceId?: string; projectId?: string } | undefined,
+    options: SyncQuickBooksPaymentsOptions | undefined,
+    runState: { recorded: boolean },
 ): Promise<QBPaymentSyncResult> {
     const result: QBPaymentSyncResult = {
         checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0,
@@ -907,7 +954,7 @@ export async function syncQuickBooksPayments(
     // read a perfectly alive money rail that could not have synced anything.
     let tokens: QBTokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(routeDeadline);
     } catch (e) {
         result.errors.push(e instanceof Error ? e.message : "QB tokens unavailable");
         // ANY preflight failure means the run did no work — not connected, the
@@ -920,6 +967,7 @@ export async function syncQuickBooksPayments(
         result.abortedOnQboOutage = preflight.abortedOnQboOutage;
         // Nothing was checked, so everything we loaded counts as skipped.
         result.skipped = pendingRowCount + billingRowCount;
+        runState.recorded = true;
         await recordPaymentsSyncEvent(result, options?.source);
         return result;
     }
@@ -954,6 +1002,7 @@ export async function syncQuickBooksPayments(
                 `QuickBooks connectivity check failed: ${error instanceof Error ? error.message : "unknown error"}`,
             );
         }
+        runState.recorded = true;
         await recordPaymentsSyncEvent(result, options?.source);
         return result;
     }
@@ -1130,6 +1179,7 @@ export async function syncQuickBooksPayments(
         await notifyQBSyncIssues(newlyFlagged);
     }
 
+    runState.recorded = true;
     await recordPaymentsSyncEvent(result, options?.source);
     return result;
 }
@@ -1219,7 +1269,7 @@ export const QBO_PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
  * event — the audit row must never fail the sync it describes.
  */
 async function recordPaymentsSyncEvent(
-    result: QBPaymentSyncResult,
+    result: Omit<QBPaymentSyncResult, "runFailed"> & { runFailed: boolean },
     source: SyncQuickBooksPaymentsOptions["source"],
 ): Promise<void> {
     const status = paymentsSyncRunStatus(result);

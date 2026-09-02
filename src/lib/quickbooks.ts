@@ -497,7 +497,10 @@ function refreshTimeoutMs(): number {
  * Persistence order is unchanged: the caller still stores what this returns,
  * only after a successful exchange.
  */
-export async function refreshQBToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+export async function refreshQBToken(
+    refreshToken: string,
+    deadline?: RouteDeadline,
+): Promise<{ accessToken: string; refreshToken: string }> {
     const clientId = process.env.QB_CLIENT_ID!;
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
@@ -506,6 +509,7 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
         const res = await qbTimedFetch(
             TOKEN_URL,
             {
+                qbDeadline: deadline,
                 method: "POST",
                 headers: {
                     Authorization: `Basic ${encoded}`,
@@ -645,7 +649,8 @@ export async function getQBPurchaseAttachables(
 /** Find a QBO customer by display name, creating it if missing. Returns the QBO customer Id. */
 export async function ensureQBCustomer(
     tokens: QBTokens,
-    client: { name: string; email?: string | null; qbCustomerId?: string | null }
+    client: { name: string; email?: string | null; qbCustomerId?: string | null },
+    deadline?: RouteDeadline,
 ): Promise<string> {
     // Trust a previously stored id if it still exists
     if (client.qbCustomerId) {

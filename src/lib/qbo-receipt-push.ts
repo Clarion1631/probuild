@@ -80,11 +80,15 @@ export class QboPurchaseFaultError extends Error {
 }
 
 /** Find a QBO vendor by display name, creating it if missing. Returns the QBO vendor Id. */
-export async function ensureQBVendor(tokens: QBTokens, name: string): Promise<string> {
+export async function ensureQBVendor(
+    tokens: QBTokens,
+    name: string,
+    deadline?: RouteDeadline,
+): Promise<string> {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("Vendor name is empty — cannot sync vendor to QuickBooks.");
 
-    const byName = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`);
+    const byName = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`, deadline);
     if (byName.length > 0) return byName[0].Id;
 
     // QBO normalizes whitespace when enforcing DisplayName uniqueness, so an
@@ -340,10 +344,7 @@ export async function defaultUploadAttachment(
     purchaseId: string,
     file: { base64: string; contentType: string; fileName: string },
     /** Injectable for tests; defaults to the real token refresh. */
-    refreshTokens: () => Promise<QBTokens> = async () => {
-        const { getFreshQBTokens } = await import("./quickbooks-payments");
-        return getFreshQBTokens();
-    },
+    refreshTokens?: () => Promise<QBTokens>,
     deadline?: RouteDeadline,
 ): Promise<ReceiptAttachmentStatus> {
     const safeFileName = attachmentFileName(file.fileName);
@@ -371,6 +372,13 @@ export async function defaultUploadAttachment(
         Buffer.from(`${CRLF}--${boundary}--${CRLF}`),
     ]);
 
+    // The forced refresh on a 401 is itself a QBO round trip, so it runs under
+    // the same budget as everything else.
+    const refresh = refreshTokens ?? (async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens(deadline);
+    });
+
     const post = (active: QBTokens) =>
         qbTimedFetch(`${QB_API_BASE}/${active.realmId}/upload?minorversion=73`, {
             qbDeadline: deadline,
@@ -389,7 +397,7 @@ export async function defaultUploadAttachment(
     // whole extra bot pass (or, before transient statuses were retryable at
     // all, was abandoned entirely).
     if (res.status === 401) {
-        const refreshed = await refreshTokens().catch(() => null);
+        const refreshed = await refresh().catch(() => null);
         if (refreshed) res = await post(refreshed);
     }
     if (!res.ok) {
@@ -623,10 +631,15 @@ export async function createQBReceiptPurchase(
 ): Promise<CreateQBReceiptPurchaseResult> {
     const qbQueryFn = deps.qbQueryFn ?? ((t, q) => qbQuery(t, q, deadline));
     const qbCreateFn = deps.qbCreateFn ?? ((t, p, r) => defaultQbCreatePurchase(t, p, r, deadline));
-    const ensureVendorFn = deps.ensureVendorFn ?? ensureQBVendor;
-    const ensureCustomerFn = deps.ensureCustomerFn ?? ensureQBCustomer;
+    // Every default QBO call carries the route budget: the ensures are two more
+    // serial round trips, and they were the gap that let a push still overrun.
+    const ensureVendorFn = deps.ensureVendorFn ?? ((t, n) => ensureQBVendor(t, n, deadline));
+    const ensureCustomerFn = deps.ensureCustomerFn ?? ((t, c) => ensureQBCustomer(t, c, deadline));
     const listProjects = deps.listProjects ?? defaultListInProgressProjects;
     const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, undefined, deadline));
+    // The QBO calls above (queries, ensures, create, upload) are all bounded by
+    // `deadline`; the account-identity verify below goes through qbQueryFn, so
+    // it is covered too.
 
     const docNumber = input.fileId.slice(0, 21);
     const marker = `[gtr-file:${input.fileId}]`;
