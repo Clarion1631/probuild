@@ -82,7 +82,8 @@ Planner output for the executor: build exactly this; do not guess.
   - ProBuild's own Chat app can POST (service-account key env `GOOGLE_CHAT_SA_KEY`,
     UNIFIED-REGISTER-PLAN §4) but has NO interactive endpoint (`/api/chat/events` does not
     exist) — buttons on ProBuild-posted cards cannot work. Interactive signing stays with
-    Beverly's app.
+    Beverly's app. (BACKGROUND FACT ONLY — Phase 2 does not use that service account; it
+    posts through an incoming webhook, `RECEIPTS_CHAT_WEBHOOK`. See §4 "Posting".)
 
 ## 1. Goals and acceptance criteria
 
@@ -225,12 +226,27 @@ Planner output for the executor: build exactly this; do not guess.
   RolloutGate; the digest posts directly with Chat's own idempotency:
   requestId/messageId = `receipt-req-<owner>-<YYYY-MM-DD Pacific>` (a repeated id returns
   the existing message), so a retried cron can never double-post.
-- **Posting**: new `src/lib/receipt-request-cards.ts` — pure exported builder + a poster
-  using the ProBuild Chat app service account (env `GOOGLE_CHAT_SA_KEY`, space env
-  `GOOGLE_CHAT_REVIEW_SPACE` = `spaces/AAQAKhvMYtg`, the sweep's constant, NOT the plan
-  doc's `...YTg` typo). Each owner's card starts a NEW thread (threadKey
-  `receipt-req-<owner>-<date>`); capture the returned `message.name` + `thread.name` and
-  store `{threadName, messageName, n}` on each listed issue's `displayDetails`.
+- **Posting** (AS BUILT — this supersedes the service-account plan above it): new
+  `src/lib/receipt-request-cards.ts` — pure exported builder + a poster using a Google
+  Chat **incoming webhook** on the Receipts Need Review space `spaces/AAQAKhvMYtg` (the
+  sweep's constant, NOT the plan doc's `...YTg` typo), read from env
+  `RECEIPTS_CHAT_WEBHOOK`. Unset ⇒ the cron returns `{skipped:"no-webhook"}` and fails
+  soft; the queue page still shows every item. The URL is held to `chat-webhook.ts`'s
+  SSRF allowlist (https, `chat.googleapis.com`, `/v1/spaces/…`). `GOOGLE_CHAT_SA_KEY` /
+  `GOOGLE_CHAT_REVIEW_SPACE` are NOT used — the webhook choice is final, and a service
+  account would add a credential for a capability nothing here needs (ProBuild cards
+  carry no working buttons either way; see the sign step below).
+  Each owner's card starts a NEW thread (threadKey `receipt-req-<owner>-<date>`);
+  capture the returned `message.name` + `thread.name` and store
+  `{threadName, messageName, n, date}` on each listed issue's `displayDetails`.
+- **Replay-guard consequence of the webhook.** An incoming webhook offers no
+  message-level idempotency — there is no `requestId`/`messageId` to hand it, so a
+  retried cron CANNOT be made safe by Chat. `threadKey` only guarantees a retry lands in
+  the same thread, never that it doesn't post twice into it. The guard that actually
+  holds is therefore ours and lives in the database: every listed item records
+  `displayDetails.card.date`, and `buildOwnerCards` skips an owner whose items were ALL
+  already listed on today's Pacific date. Do not treat the deterministic requestId as
+  the idempotency mechanism; it is a thread key that happens to be stable.
 - **Bridge contract (what keeps ProBuild and the sweep/Beverly in sync)** — the sweep only
   understands threads present in `affidavit-threads.json`, and ProBuild has no Drive
   writer, so a qbo-clasp mirror closes the gap (same pattern as Phase 1 §6):
@@ -290,10 +306,20 @@ Planner output for the executor: build exactly this; do not guess.
 - **No schema change.** Reason code + `displayDetails` JSON ride existing `ReviewIssue`
   columns (no CHECK blocks them — verified above); the queue reads Phase 1's
   `ReceiptIntake` as-is. No `scripts/apply-*.mjs`, no `prisma/migrations/` entry.
-- New env (Vercel prod): `RECEIPT_OWNER_CHAT_USERS`, `RECEIPT_REQUEST_CARDS_ENABLED`
-  (unset initially), and `GOOGLE_CHAT_SA_KEY` + `GOOGLE_CHAT_REVIEW_SPACE` if not already
-  set (Justin handles the service-account key — Claude never touches the credential; key
-  generation was already flagged as Justin's in UNIFIED-REGISTER-PLAN §4).
+- New env (Vercel prod), AS BUILT:
+  - `RECEIPTS_CHAT_WEBHOOK` — the incoming-webhook URL for `spaces/AAQAKhvMYtg`. Unset ⇒
+    `{skipped:"no-webhook"}`, fails soft. Justin creates it in the space and sets it;
+    Claude never handles the value. This REPLACES `GOOGLE_CHAT_SA_KEY` +
+    `GOOGLE_CHAT_REVIEW_SPACE`, which are not used by anything in Phase 2 — the webhook
+    choice is final. Because a webhook has no message-level idempotency, the day's
+    replay guard is `displayDetails.card.date` in the database, not anything Chat does
+    (see §4).
+  - `RECEIPT_OWNER_CHAT_USERS` — `{"CJ":"users/…","Richard":"users/…"}`. Still needs
+    collecting once; a wrong id locks that owner out of signing their own memo
+    (chatAffidavitApp.js:211 gates on it). Malformed ⇒ empty map, and `owner_user`
+    serializes as `""` rather than breaking the bridge JSON.
+  - `RECEIPT_REQUEST_CARDS_ENABLED` — unset initially; must be exactly `"true"` to arm.
+  - `RECEIPT_INTAKE_SECRET` (Phase 1's, reused) gates both bridge endpoints.
 
 ## 7. Tests (node:test, `test/receipt-requests/*.test.mjs`; no `mock.module` — CI is Node 20)
 

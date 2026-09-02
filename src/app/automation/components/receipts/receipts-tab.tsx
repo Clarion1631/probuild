@@ -265,6 +265,16 @@ export function ReceiptsTab({
                             </a>
                         ))}
                     </div>
+                    {/* The badge counts the WHOLE open queue (a count query, so a
+                        backlog past the display cap can never read as small);
+                        this says how much of it is on screen, so the two numbers
+                        can always be reconciled. */}
+                    {queue.counts.missingReceiptsShown !== queue.counts.missingReceipts && (
+                        <p className="px-4 py-2 text-xs text-hui-textMuted border-b border-slate-100">
+                            Showing {queue.counts.missingReceiptsShown} of {queue.counts.missingReceipts}
+                            {filters.owner ? ` (filtered to ${filters.owner})` : " (oldest are shown first)"}.
+                        </p>
+                    )}
                     {missingByOwner.length === 0 ? (
                         <EmptyGroup message="Nothing here — every bank charge has a receipt." />
                     ) : (

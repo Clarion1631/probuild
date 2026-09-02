@@ -76,7 +76,10 @@ export interface ReceiptQueue {
         booking: number;
         bookedToday: number;
         duplicates: number;
+        /** The whole open missing-receipt queue, from a count query. */
         missingReceipts: number;
+        /** How many of those this render is actually showing (owner filter + display cap). */
+        missingReceiptsShown: number;
     };
 }
 
@@ -208,7 +211,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
 
     const [
         needsJob, needsReview, booking, bookedToday, duplicates, issues,
-        needsJobCount, needsReviewCount, bookingCount, bookedTodayCount, duplicatesCount,
+        needsJobCount, needsReviewCount, bookingCount, bookedTodayCount, duplicatesCount, missingReceiptsCount,
     ] = await Promise.all([
         loadIntakes(needsJobWhere),
         loadIntakes(needsReviewWhere),
@@ -229,6 +232,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
         prisma.receiptIntake.count({ where: bookingWhere }),
         prisma.receiptIntake.count({ where: bookedTodayWhere }),
         prisma.receiptIntake.count({ where: duplicatesWhere }),
+        prisma.reviewIssue.count({ where: issueWhere }),
     ]);
 
     const missingReceipts = issues
@@ -253,10 +257,15 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
             booking: bookingCount,
             bookedToday: bookedTodayCount,
             duplicates: duplicatesCount,
-            // The issue list is already owner-filtered in memory, so the badge
-            // counts what this view shows rather than a number the page can't
-            // reconcile with its own rows.
-            missingReceipts: missingReceipts.length,
+            // A real count query, like the other five. Deriving this from the
+            // capped list understated the queue the moment it exceeded
+            // RECEIPT_GROUP_TAKE — a 300-item backlog would have read as "100",
+            // which is the specific failure the count-query rule exists to
+            // prevent. The owner filter cannot go into SQL (owner lives inside
+            // a JSON blob), so this counts the WHOLE open queue; the two
+            // numbers are reconciled for the reader by `missingReceiptsShown`.
+            missingReceipts: missingReceiptsCount,
+            missingReceiptsShown: missingReceipts.length,
         },
     };
 }
