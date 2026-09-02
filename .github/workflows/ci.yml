@@ -87,6 +87,9 @@ jobs:
         run: npx tsx --test tests/time-entry-reassign-db.test.ts
         env:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Imports the app's prisma singleton via wa-breaks-db — see the note
+          # on the rate-lock step below.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
       - name: Prove the apply script is idempotent and --dry-run is read-only
         run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
@@ -97,6 +100,15 @@ jobs:
         run: npx tsx --test tests/payroll-rate-lock-db.test.ts
         env:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # This test imports the app's prisma singleton, which REFUSES a
+          # DATABASE_URL without pgbouncer=true. That guard is production safety,
+          # not a nuisance: without the flag the Supabase transaction pooler
+          # returns 42P05 "prepared statement already exists" and the site goes
+          # down (CLAUDE.md). It is satisfied here rather than weakened — the
+          # same thing the Playwright job below already does for its own
+          # localhost URL. On a direct connection the flag only tells Prisma to
+          # skip prepared statements, which is harmless.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
