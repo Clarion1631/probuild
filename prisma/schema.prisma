@@ -16,6 +16,12 @@ model User {
   status                    String                   @default("PENDING") // PENDING, ACTIVATED, DISABLED
   hourlyRate                Decimal                  @default(0)
   burdenRate                Decimal                  @default(0)
+  /// How Gusto pays this member: "HOURLY" or "SALARY". NULL means nobody has
+  /// said yet, which is deliberately NOT the same as "hourly" — the payroll
+  /// export refuses to run while an in-period worker is null, because guessing
+  /// either way is a wrong paycheque. The env list PAYROLL_SALARIED_EMAILS is
+  /// only a fallback for rows this column has not answered.
+  payType                   String?
   /// Last time this member's pay rate was CONFIRMED — set by the Gusto rate
   /// import and by a manual hourlyRate/burdenRate edit. Null means "never
   /// confirmed since this column shipped", which the Payroll rates panel

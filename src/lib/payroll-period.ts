@@ -50,6 +50,7 @@
 import { NextResponse } from "next/server";
 import { COMPANY_TIME_ZONE } from "./company-day";
 import { dayKeyInTimeZone, addDaysToKey } from "./tz-date";
+import { payrollLockEnvelope, type PayrollWeekStart } from "./payroll-config";
 
 export type LockedPeriodRow = {
     id: string;
@@ -62,18 +63,27 @@ export type LockedPeriodRow = {
 export type LockedPeriodLoader = () => Promise<LockedPeriodRow[]>;
 
 /**
- * The LOCKED period whose half-open [periodStart, periodEnd) range contains
- * `instant`, or null. Pure — this is the whole rule, and every caller shares it.
+ * The LOCKED period that freezes `instant`, or null. Pure — this is the whole
+ * rule, and every caller shares it.
+ *
+ * The comparison is against the period's WORKWEEK ENVELOPE, not its literal
+ * [periodStart, periodEnd) range (see payrollLockEnvelope). An entry in the same
+ * workweek as a locked period, but outside the period itself, still decides how
+ * much of that period's time is overtime — so editing it changes numbers that
+ * were already exported and paid. Freezing the period alone was not enough.
  */
 export function lockedPeriodFor(
     periods: LockedPeriodRow[],
-    instant: Date | null | undefined
+    instant: Date | null | undefined,
+    options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
 ): LockedPeriodRow | null {
     if (!instant || Number.isNaN(instant.getTime())) return null;
+    const timeZone = options.timeZone ?? COMPANY_TIME_ZONE;
     const at = instant.getTime();
     for (const period of periods) {
         if (!period.lockedAt) continue;
-        if (at >= period.periodStart.getTime() && at < period.periodEnd.getTime()) return period;
+        const envelope = payrollLockEnvelope(period.periodStart, period.periodEnd, timeZone, options.weekStart);
+        if (at >= envelope.start.getTime() && at < envelope.end.getTime()) return period;
     }
     return null;
 }
@@ -90,7 +100,7 @@ export function periodDisplayRange(period: Pick<LockedPeriodRow, "periodStart" |
 
 export function periodLockedMessage(period: Pick<LockedPeriodRow, "periodStart" | "periodEnd">): string {
     const { startKey, lastDayKey } = periodDisplayRange(period);
-    return `Payroll for ${startKey} to ${lastDayKey} is locked. An admin has to unlock that period before this entry can change.`;
+    return `Payroll for ${startKey} to ${lastDayKey} is locked, including the rest of the workweeks it touches — overtime is worked out per week, so a punch just outside the period still changes what was paid inside it. An admin has to unlock that period before this entry can change.`;
 }
 
 export const PERIOD_LOCKED_CODE = "PERIOD_LOCKED";

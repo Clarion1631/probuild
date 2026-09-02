@@ -6,6 +6,12 @@
 -- AlterTable: last time a member's pay rate was confirmed (import or manual edit).
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRateSyncAt" TIMESTAMPTZ(6);
 
+-- AlterTable: how Gusto pays this member ("HOURLY" | "SALARY"). Nullable on
+-- purpose — NULL means unanswered, which the payroll export refuses to guess.
+-- The backfill from PAYROLL_SALARIED_EMAILS lives in the apply script, where
+-- the env value is readable; it is a ONE-SHOT seed, not the ongoing source.
+ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payType" TEXT;
+
 -- CreateTable: reviewed/exported pay periods. Half-open [periodStart, periodEnd).
 CREATE TABLE IF NOT EXISTS "PayrollPeriod" (
     "id" TEXT NOT NULL,

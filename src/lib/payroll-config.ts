@@ -20,7 +20,8 @@
 // Pure and browser-safe (only imports tz-date.ts) so the review page, the
 // export endpoint, and the tests all read the same values.
 
-import { addDaysToKey, daysBetweenDayKeys } from "./tz-date";
+import { addDaysToKey, daysBetweenDayKeys, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
+import { workweekStartKey } from "./overtime";
 
 export type PayrollPeriodLength = "weekly" | "biweekly";
 export type PayrollWeekStart = "monday" | "sunday";
@@ -84,6 +85,101 @@ export function isSalariedEmail(email: string | null | undefined, salaried = sal
 
 export function payrollPeriodDays(length = payrollPeriodLength()): number {
     return length === "weekly" ? 7 : 14;
+}
+
+/** Longest range a pay period may cover. Shared by the export endpoint, the lock action and the review page so none of them can accept a range another would refuse. */
+export const MAX_PAYROLL_RANGE_DAYS = 62;
+
+const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** True only for a real YYYY-MM-DD calendar day — "2026-02-31" and "2026-1-5" are both rejected. */
+export function isDayKey(value: unknown): value is string {
+    if (typeof value !== "string" || !DAY_KEY_PATTERN.test(value)) return false;
+    // Round-trip through UTC: Date normalises 2026-02-31 to 2026-03-03, so a
+    // value that does not come back identical was never a real calendar day.
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+export type PayrollRangeCheck =
+    | { ok: true; startKey: string; endKey: string; days: number }
+    | { ok: false; error: string };
+
+/**
+ * The ONE validator for a payroll range. `endKey` is EXCLUSIVE (the day after
+ * the last day), matching PayrollPeriod and the export endpoint.
+ *
+ * Shared rather than re-typed at each call site: a lock that covers a range the
+ * download refuses, or a page that renders one, is a period nobody can actually
+ * reproduce.
+ */
+export function validatePayrollRange(startKey: unknown, endKey: unknown): PayrollRangeCheck {
+    if (!isDayKey(startKey) || !isDayKey(endKey)) {
+        return { ok: false, error: "Pick a valid period (YYYY-MM-DD, with the end date exclusive)." };
+    }
+    const days = daysBetweenDayKeys(startKey, endKey);
+    if (!Number.isFinite(days) || days <= 0) {
+        return { ok: false, error: "The end of the period must be after its start." };
+    }
+    if (days > MAX_PAYROLL_RANGE_DAYS) {
+        return { ok: false, error: `A pay period cannot be longer than ${MAX_PAYROLL_RANGE_DAYS} days.` };
+    }
+    return { ok: true, startKey, endKey, days };
+}
+
+/** The configured pay-period week start, as a day key on or before `dayKey`. */
+function configuredWeekStartKey(dayKey: string, weekStart: PayrollWeekStart): string {
+    const dow = new Date(`${dayKey}T00:00:00Z`).getUTCDay(); // 0 = Sunday
+    const back = weekStart === "sunday" ? dow : dow === 0 ? 6 : dow - 1;
+    return addDaysToKey(dayKey, -back);
+}
+
+/**
+ * WORKWEEK ENVELOPE — the range a lock actually has to freeze.
+ *
+ * Overtime is a property of the WORKWEEK, not of the pay period: an entry
+ * inside a locked period can flip between regular and OT because of hours in
+ * the same week that fall OUTSIDE the period. Freezing only [periodStart,
+ * periodEnd) therefore does not freeze the exported numbers — someone edits the
+ * Sunday before a Monday-start period and the locked period's OT split moves.
+ *
+ * The envelope is the UNION of two week alignments, and both are load-bearing:
+ *
+ *  - the Mon-Sun WORKWEEK from src/lib/overtime.ts, which is what the 40-hour
+ *    threshold is actually computed over (WA law, not configuration); and
+ *  - the configured PAYROLL_WEEK_START, which is where a human draws the
+ *    period boundary.
+ *
+ * They coincide on the default (monday). With PAYROLL_WEEK_START=sunday they do
+ * not, and taking only the configured one would leave a Monday of OT-relevant
+ * hours editable. Widest wins.
+ */
+export function payrollLockEnvelope(
+    periodStart: Date,
+    periodEnd: Date,
+    timeZone: string,
+    weekStart: PayrollWeekStart = payrollWeekStart()
+): { start: Date; end: Date } {
+    const firstDayKey = dayKeyInTimeZone(periodStart, timeZone);
+    // periodEnd is exclusive, so the last DAY inside the period is the day
+    // containing the final instant, not the day periodEnd names.
+    const lastDayKey = dayKeyInTimeZone(new Date(periodEnd.getTime() - 1), timeZone);
+
+    const startCandidates = [
+        workweekStartKey(periodStart, timeZone),
+        configuredWeekStartKey(firstDayKey, weekStart),
+    ];
+    const endCandidates = [
+        addDaysToKey(workweekStartKey(new Date(periodEnd.getTime() - 1), timeZone), 7),
+        addDaysToKey(configuredWeekStartKey(lastDayKey, weekStart), 7),
+    ];
+
+    const startKey = startCandidates.sort()[0];
+    const endKey = endCandidates.sort()[endCandidates.length - 1];
+    return {
+        start: startOfDateInTimeZone(startKey, timeZone),
+        end: startOfDateInTimeZone(endKey, timeZone),
+    };
 }
 
 /**

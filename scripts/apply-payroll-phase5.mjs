@@ -36,6 +36,7 @@ const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE
 
 const STATEMENTS = [
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRateSyncAt" TIMESTAMPTZ(6)`,
+    `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payType" TEXT`,
     `CREATE TABLE IF NOT EXISTS "PayrollPeriod" (
         "id" TEXT NOT NULL,
         "periodStart" TIMESTAMPTZ(6) NOT NULL,
@@ -65,13 +66,38 @@ try {
         await prisma.$executeRawUnsafe(sql);
         console.log("ok:", sql.split("\n")[0].trim().slice(0, 90));
     }
+    // ONE-SHOT seed for User.payType from the env list, so the export is not
+    // blocked on day one by a column nobody has filled in yet. Only touches
+    // rows still NULL, so a re-run never overwrites a human's answer — after
+    // this, the COLUMN is the source of truth and the env list is a fallback.
+    const salaried = (process.env.PAYROLL_SALARIED_EMAILS ?? "cj@goldentouchremodeling.com,rlord@goldentouchremodeling.com")
+        .split(",")
+        .map((email) => email.trim().toLowerCase())
+        .filter(Boolean);
+    if (salaried.length) {
+        const seededSalary = await prisma.$executeRawUnsafe(
+            `UPDATE "User" SET "payType" = 'SALARY' WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,
+            salaried
+        );
+        console.log(`seeded ${seededSalary} user(s) to payType = SALARY from PAYROLL_SALARIED_EMAILS`);
+    }
+    // Everyone else who is an ACTIVATED crew/manager account is hourly. ADMIN
+    // and FINANCE are left NULL deliberately: they are salaried by role for the
+    // rate guard, but the export only demands an answer for people who actually
+    // punched, and a human should confirm rather than a script assuming.
+    const seededHourly = await prisma.$executeRawUnsafe(
+        `UPDATE "User" SET "payType" = 'HOURLY'
+         WHERE "payType" IS NULL AND "status" = 'ACTIVATED' AND "role" IN ('FIELD_CREW', 'EMPLOYEE', 'MANAGER')`
+    );
+    console.log(`seeded ${seededHourly} user(s) to payType = HOURLY`);
+
     const cols = await prisma.$queryRawUnsafe(
         `SELECT table_name, column_name FROM information_schema.columns
-         WHERE (table_name = 'User' AND column_name = 'lastRateSyncAt')
+         WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))
             OR (table_name = 'PayrollPeriod' AND column_name IN ('id','periodStart','periodEnd','lockedAt','lockedById','exportHash','createdAt'))`
     );
-    console.log(`verified ${cols.length}/8 columns present`);
-    if (cols.length !== 8) process.exit(1);
+    console.log(`verified ${cols.length}/9 columns present`);
+    if (cols.length !== 9) process.exit(1);
 } finally {
     await prisma.$disconnect();
 }
