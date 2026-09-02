@@ -20,6 +20,7 @@ import {
     sealAndPublish,
 } from "../src/lib/receipt-intake/stored-object";
 import { MAX_STORED_BYTES } from "../src/lib/receipt-intake/intake-core";
+import { receiptObjectSize } from "../src/lib/receipt-intake/bucket";
 import type { DocBytesResult } from "../src/lib/secure-storage";
 
 const PNG = Buffer.from(
@@ -437,4 +438,74 @@ test("both publishers use the shared fence, and finalize refuses the other parks
     );
     assert.match(finalize, /error: "not-recoverable"/);
     assert.match(finalize, /disposition === "not-recoverable"/);
+});
+
+// ── Presence is TAGGED: 404 and "storage is unhappy" are different answers ──
+
+test("the size lookup separates a real absence from a storage fault", async () => {
+    // The bug this closes: a helper that collapsed both into `false`. The intake
+    // replay path reads it, and on a false it RE-UPLOADS and re-points the row —
+    // so a transient fault orphaned the object that was really there and left
+    // the row pointing at a second copy.
+    const lister = (result: unknown) => ({ list: async () => result as never });
+
+    const missing = await receiptObjectSize("receipts/intake/a.png", lister({ data: [], error: null }));
+    assert.deepEqual(missing, { ok: false, kind: "missing" }, "an empty listing IS an answer");
+
+    const notFound = await receiptObjectSize(
+        "receipts/intake/a.png",
+        lister({ data: null, error: { status: 404, message: "Object not found" } }),
+    );
+    assert.equal((notFound as { kind: string }).kind, "missing");
+
+    for (const error of [
+        { status: 500, message: "boom" },
+        { status: 401, message: "invalid jwt" },
+        { status: 429, message: "slow down" },
+        { message: "fetch failed" },
+    ]) {
+        const fault = await receiptObjectSize("receipts/intake/a.png", lister({ data: null, error }));
+        assert.equal((fault as { kind: string }).kind, "transient", JSON.stringify(error));
+    }
+
+    const found = await receiptObjectSize(
+        "receipts/intake/a.png",
+        lister({ data: [{ name: "a.png", metadata: { size: 1234 } }], error: null }),
+    );
+    assert.deepEqual(found, { ok: true, size: 1234 });
+
+    // Present but sizeless is the one genuinely unknown case, and it must not
+    // become permission to download.
+    const sizeless = await receiptObjectSize(
+        "receipts/intake/a.png",
+        lister({ data: [{ name: "a.png", metadata: {} }], error: null }),
+    );
+    assert.equal((sizeless as { kind: string }).kind, "transient");
+
+    // A throwing client is a transport fault, never evidence of absence.
+    const threw = await receiptObjectSize("receipts/intake/a.png", {
+        list: async () => { throw new TypeError("fetch failed"); },
+    });
+    assert.equal((threw as { kind: string }).kind, "transient");
+});
+
+test("the replay path heals only on an AFFIRMATIVE absence, and 503s on a fault", () => {
+    const intake = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
+        "utf8",
+    );
+    const branch = intake.slice(intake.indexOf("const present = await receiptObjectSize("));
+    const head = branch.slice(0, branch.indexOf("const healable"));
+    assert.match(head, /present\.kind === "transient"/);
+    assert.match(head, /status: 503/);
+    // The transient answer is handled BEFORE the not-ok branch that heals, so a
+    // storage fault can never reach storeObject.
+    assert.ok(
+        head.indexOf('present.kind === "transient"') < head.indexOf("if (!present.ok) {"),
+        "the fault check comes first",
+    );
+    assert.ok(!/storeObject/.test(head), "nothing is written on the fault path");
+    // And the collapsing helper is gone, so nothing can reintroduce it.
+    const storage = readFileSync(path.join(__dirname, "..", "src/lib/secure-storage.ts"), "utf8");
+    assert.ok(!/secureObjectExists/.test(storage), "no boolean exists-check to reach for");
 });

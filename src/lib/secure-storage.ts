@@ -278,12 +278,6 @@ export async function downloadDocBytesResult(
     }
 }
 
-/** True only when storage affirmatively confirms the object is there. */
-export async function secureObjectExists(storagePath: string): Promise<boolean> {
-    const result = await downloadDocBytesResult(toSecureRef(storagePath));
-    return result.ok;
-}
-
 /**
  * Read a stored document's bytes server-side using the service key.
  *

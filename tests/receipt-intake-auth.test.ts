@@ -12,6 +12,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -534,4 +536,35 @@ test("a sourceRef must carry a real id for its source, not just the prefix", asy
         { ok: false, reason: "invalid-sourceRef" });
     assert.deepEqual(decideSource(secret, { source: "drive", sourceRef: `drive:${"a".repeat(600)}` }),
         { ok: false, reason: "sourceRef-too-long" });
+});
+
+// ── A secret owns SOURCES, not rows (Phase 2 gate, B) ─────────────────────
+
+test("finalize scopes a secret caller to the sources its key owns", () => {
+    const finalize = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    // The row's OWN source is selected and checked against the same list that
+    // scopes creation — otherwise the Apps Script key is authority over a
+    // mobile capture that belongs to a person.
+    assert.match(finalize, /source: true,/, "the source is selected");
+    assert.match(finalize, /auth\.via === "secret" && !auth\.allowedSources\.has\(row\.source\)/);
+    assert.match(finalize, /error: "source-not-owned"/);
+    assert.match(finalize, /status: 403/);
+    // BEFORE any detail is returned or any late field applied.
+    const gate = finalize.indexOf("source-not-owned");
+    for (const later of ["const maySee", "authorizeFinalization(auth, row.projectId", "await sealAndPublish("]) {
+        assert.ok(gate < finalize.indexOf(later), `the source gate precedes ${later}`);
+    }
+});
+
+test("the ingest key's source list is exactly the machine sources", async () => {
+    const { INGEST_ALLOWED_SOURCES } = await loadAuth();
+    const { MACHINE_SOURCES } = await import("../src/lib/receipt-intake/intake-core");
+    assert.deepEqual([...INGEST_ALLOWED_SOURCES].sort(), [...MACHINE_SOURCES].sort());
+    // So a mobile or web row is owned by NO secret, which is the point.
+    for (const source of ["mobile", "web"]) {
+        assert.ok(!INGEST_ALLOWED_SOURCES.has(source), source);
+    }
 });

@@ -143,12 +143,34 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
         select: {
-            id: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
+            id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // A SECRET OWNS SOURCES, NOT ROWS.
+    //
+    // decideSource already refuses to let a forwarder CREATE a row outside its
+    // own namespace, but finalize took `via === "secret"` as blanket authority
+    // over any id — so the Apps Script key could publish, re-point and attach a
+    // job to a mobile capture or a web upload that belongs to a person. The
+    // same list that scopes creation scopes this: an ingest key owns
+    // drive/email/chat, and nothing else.
+    //
+    // 403, not 404: the caller is authenticated and the row is real; what it
+    // lacks is authority. Checked BEFORE any detail is returned or written.
+    if (auth.via === "secret" && !auth.allowedSources.has(row.source)) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "source-not-owned",
+                reason: `this key does not own ${row.source} rows`,
+            },
+            { status: 403 },
+        );
+    }
 
     // Same rule as the conflict path: a session caller may only finalize its
     // OWN row (or hold a bookkeeping role). Otherwise a guessed id would let one

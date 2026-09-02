@@ -66,18 +66,33 @@ export type SizeResult =
  * is precisely the thing this call exists to avoid, on precisely the objects we
  * know least about.
  */
-export async function receiptObjectSize(storagePath: string): Promise<SizeResult> {
+export interface BucketLister {
+    list(
+        dir: string,
+        opts: { search: string; limit: number },
+    ): Promise<{
+        data: Array<{ name: string; metadata?: unknown }> | null;
+        error: { message?: string; status?: number; statusCode?: string | number; error?: string } | null;
+    }>;
+}
+
+export async function receiptObjectSize(
+    storagePath: string,
+    /** Injected only by tests: the classification is the whole subject here. */
+    lister: BucketLister | null = null,
+): Promise<SizeResult> {
     const path = safePath(storagePath);
     if (!path) return { ok: false, kind: "missing" };
-    const supabase = getSupabase();
-    if (!supabase) return { ok: false, kind: "transient", message: "storage-not-configured" };
+    const from = lister ?? getSupabase()?.storage.from(RECEIPT_BUCKET) ?? null;
+    // No client is a CONFIGURATION fault, not an absent object. Saying "missing"
+    // here is what let a misconfigured deployment re-upload over a document that
+    // was really there.
+    if (!from) return { ok: false, kind: "transient", message: "storage-not-configured" };
     const slash = path.lastIndexOf("/");
     const dir = slash > 0 ? path.slice(0, slash) : "";
     const name = slash > 0 ? path.slice(slash + 1) : path;
     try {
-        const { data, error } = await supabase.storage
-            .from(RECEIPT_BUCKET)
-            .list(dir, { search: name, limit: 100 });
+        const { data, error } = await from.list(dir, { search: name, limit: 100 });
         if (error) {
             return isNotFoundError(error as { message?: string; status?: number })
                 ? { ok: false, kind: "missing" }

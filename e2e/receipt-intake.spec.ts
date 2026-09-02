@@ -1182,6 +1182,38 @@ test.describe("round-10 finalize authorization and recovery", () => {
         expect((await res.json()).error).toBe("cost-code-without-project");
     });
 
+    test("the ingest secret cannot finalize a row it does not own the SOURCE of", async ({ request }) => {
+        // decideSource already stops a forwarder CREATING a row outside its
+        // namespace, but finalize took `via === "secret"` as blanket authority
+        // over any id — so the Apps Script key could publish, re-point and
+        // attach a job to somebody's mobile capture or web upload.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}notmysource` }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+
+        // Exactly the shape a phone or the web uploader leaves behind. Seeded
+        // directly because the secret can no longer create one.
+        await prisma.receiptIntake.update({
+            where: { id },
+            data: { source: "mobile", sourceRef: `mobile:${id}` },
+        });
+
+        const res = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ projectId: PROJECT_ID }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(403);
+        const body = await res.json();
+        expect(body.error).toBe("source-not-owned");
+        // 403 before ANY detail is returned or written.
+        expect(body.storagePath).toBeUndefined();
+        expect(body.state).toBeUndefined();
+        const after = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(after?.projectId).toBeNull();
+    });
+
     test("a user with no access to the row's OWN job cannot finalize it", async ({ playwright, request }) => {
         // Revocation has to bite on the project the ROW holds, not only on one
         // the request supplies. Before this, a user whose access was revoked
