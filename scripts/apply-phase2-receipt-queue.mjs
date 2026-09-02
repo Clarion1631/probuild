@@ -123,6 +123,20 @@ export const statements = [
     `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
     `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
 
+    // The delivery state machine. POSTING is written BEFORE the webhook call so
+    // a crash mid-send is distinguishable from a crash before it — otherwise
+    // the next run must either double-post or silently drop the day's card.
+    `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT 'PENDING'`,
+
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'ReceiptRequestCard_status_check'
+                         AND conrelid = '"ReceiptRequestCard"'::regclass) THEN
+         ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check"
+           CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
+       END IF;
+     END $$`,
+
     // 4. A Purchase QuickBooks created for a receipt somebody voided while the
     // send was in flight. NOT qbPurchaseId — that column means "this row is
     // booked", and this row is not; the money exists in QBO and a human has to
@@ -164,6 +178,7 @@ const expectedColumns = {
         { name: "overflow", type: "integer", nullable: false, default: "0" },
         { name: "claimedAt", type: "timestamp without time zone", nullable: true, default: null },
         { name: "claimToken", type: "text", nullable: true, default: null },
+        { name: "status", type: "text", nullable: false, default: "'PENDING'::text" },
         { name: "postedAt", type: "timestamp without time zone", nullable: true, default: null },
         { name: "threadName", type: "text", nullable: true, default: null },
         { name: "messageName", type: "text", nullable: true, default: null },
@@ -183,6 +198,7 @@ const expectedRlsTables = ["ReceiptRequestCard"];
 
 const expectedConstraints = [
     { name: "BankLine_sourceOfRecord_check", table: "BankLine" },
+    { name: "ReceiptRequestCard_status_check", table: "ReceiptRequestCard" },
 ];
 
 // The unique index is the one object a "table exists" check cannot vouch for,

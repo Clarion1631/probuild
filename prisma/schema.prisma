@@ -2758,6 +2758,14 @@ model ReceiptRequestCard {
   /// grabs again, which is what makes a crashed run recoverable.
   claimedAt   DateTime?
   claimToken  String?
+  /// PENDING -> POSTING -> POSTED, or UNCERTAIN.
+  ///
+  /// POSTING is written BEFORE the webhook call. Without it, a crash between
+  /// the call and the `postedAt` write was indistinguishable from a crash
+  /// before the call — so the next run either re-posted a card that had already
+  /// gone out, or dropped one that never had. A row found in POSTING means "we
+  /// asked Chat and never heard back": it is NOT reposted, it is reconciled.
+  status      String    @default("PENDING")
   postedAt    DateTime?
   threadName  String?
   messageName String?

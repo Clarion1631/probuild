@@ -84,3 +84,18 @@ ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY;
 -- as its backoff elapsed.
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
+
+-- The card delivery state machine. POSTING is written BEFORE the webhook call,
+-- so a crash mid-send is distinguishable from a crash before it — otherwise the
+-- next run has to either double-post or silently drop the day's card. A row
+-- found in POSTING is UNCERTAIN, not retryable.
+ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT 'PENDING';
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'ReceiptRequestCard_status_check'
+                    AND conrelid = '"ReceiptRequestCard"'::regclass) THEN
+    ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check"
+      CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
+  END IF;
+END $$;

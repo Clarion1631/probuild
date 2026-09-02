@@ -416,7 +416,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
                 vendor: intake.vendor,
             })),
     ]);
-    const consumed = new Set<string>();
+
 
     // Oldest charge first, id breaking the tie: the assignment below depends on
     // the order lines are visited, so it must not depend on query order.
@@ -436,6 +436,32 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
 
     const orderedLines = [...input.bankLines].sort((a, b) =>
         (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+    // ONE matching over the whole cohort, computed before any verdict. A
+    // per-line greedy pass cannot see that re-housing an earlier line frees the
+    // only receipt a later one can reach.
+    const matchable = orderedLines
+        .filter(line => {
+            if (resolvedKeys.has(line.id)) return false;
+            if (line.amountCents >= 0) return false;
+            const verdict = classifyReceiptRequirement({
+                amountCents: line.amountCents,
+                rawDescriptor: line.rawDescriptor,
+                checkNumber: line.checkNumber ?? null,
+            });
+            if (verdict.requirement !== "receipt_expected") return false;
+            const day = dayNumber(line.postedDate);
+            if (day === null || todayDay === null) return false;
+            if (todayDay - day < RECEIPT_REQUEST_GRACE_DAYS) return false;
+            return evidenceIsComplete(day);
+        })
+        .map(line => ({
+            id: line.id,
+            postedDate: line.postedDate,
+            amountCents: line.amountCents,
+            payee: normalizePayee(line.rawDescriptor),
+        }));
+    const matched = matchEvidenceToLines(matchable, evidence);
 
     for (const line of orderedLines) {
         const closeIfOpen = () => { if (openKeys.has(line.id)) close.push(line.id); };
@@ -488,13 +514,11 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             continue;
         }
 
-        const payee = normalizePayee(line.rawDescriptor);
-        const match = assignEvidence(line, payee, evidence, consumed);
-        if (match) {
-            consumed.add(match.unit);
+        if (matched.has(line.id)) {
             closeIfOpen();
             continue;
         }
+        const payee = normalizePayee(line.rawDescriptor);
 
         const ownerVerdict = resolveReceiptOwner(line.rawDescriptor);
         // No card tail anywhere in the descriptor means we genuinely do not
@@ -522,30 +546,68 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
 }
 
 /**
- * The single unconsumed evidence row that answers for this line, or null.
- * Closest date wins; the lowest id breaks a tie, so two equally-close rows
- * always resolve the same way and a re-run reproduces the assignment exactly.
+ * Assign evidence to lines so that the MOST lines get answered.
+ *
+ * Greedy nearest-first loses matches, and it loses them silently. Two charges
+ * on the 14th and the 16th, two receipts on the 12th and the 15th: the 14th
+ * grabs the 15th (distance 1, its nearest), which leaves the 16th with only the
+ * 12th — four days away, outside the window — so it opens a chase for a receipt
+ * that is sitting right there. Pairing 14↔12 and 16↔15 answers both.
+ *
+ * So this is a real bipartite maximum-cardinality matching (Kuhn's augmenting
+ * path). Cohorts are tiny — lines sharing one amount within a few days — so the
+ * O(V·E) simplicity is worth far more than asymptotics here.
+ *
+ * DETERMINISM is a requirement, not a nicety: the sweep re-runs nightly and on
+ * every OCC retry, and a matching that flips between runs would open and close
+ * the same chase forever. Lines are visited in their caller-given order (itself
+ * sorted), and each line's candidates are ordered by date distance, then by
+ * evidence id — so the same inputs always produce the same pairing.
  */
-function assignEvidence(
-    line: ReceiptRequestBankLine,
-    payee: string,
+export function matchEvidenceToLines(
+    lines: readonly { id: string; postedDate: string; payee: string; amountCents: number }[],
     evidence: readonly EvidenceRow[],
-    consumed: ReadonlySet<string>,
-): EvidenceRow | null {
-    const lineDay = dayNumber(line.postedDate);
-    if (lineDay === null) return null;
-    let best: EvidenceRow | null = null;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    for (const row of evidence) {
-        if (consumed.has(row.unit)) continue;
-        if (!satisfies(line, payee, row)) continue;
-        const distance = Math.abs((dayNumber(row.date as string) as number) - lineDay);
-        if (distance < bestDistance || (distance === bestDistance && best !== null && row.id < best.id)) {
-            best = row;
-            bestDistance = distance;
-        }
+): Map<string, EvidenceRow> {
+    // Candidate lists, deterministically ordered.
+    const candidates = new Map<string, EvidenceRow[]>();
+    for (const line of lines) {
+        const lineDay = dayNumber(line.postedDate);
+        const eligible = evidence
+            .filter(row => satisfies(
+                { id: line.id, postedDate: line.postedDate, amountCents: line.amountCents, rawDescriptor: "" },
+                line.payee,
+                row,
+            ))
+            .map(row => ({
+                row,
+                distance: lineDay === null ? 0 : Math.abs((dayNumber(row.date as string) as number) - lineDay),
+            }))
+            .sort((a, b) => a.distance - b.distance || (a.row.unit < b.row.unit ? -1 : a.row.unit > b.row.unit ? 1 : 0))
+            .map(entry => entry.row);
+        candidates.set(line.id, eligible);
     }
-    return best;
+
+    /** unit key -> line id currently holding it. */
+    const takenBy = new Map<string, string>();
+    const assigned = new Map<string, EvidenceRow>();
+
+    const augment = (lineId: string, seen: Set<string>): boolean => {
+        for (const row of candidates.get(lineId) ?? []) {
+            if (seen.has(row.unit)) continue;
+            seen.add(row.unit);
+            const holder = takenBy.get(row.unit);
+            // Free, or its current holder can be re-housed elsewhere.
+            if (holder === undefined || augment(holder, seen)) {
+                takenBy.set(row.unit, lineId);
+                assigned.set(lineId, row);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const line of lines) augment(line.id, new Set<string>());
+    return assigned;
 }
 
 // ── displayDetails merging ───────────────────────────────────────────────────

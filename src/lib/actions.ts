@@ -22,6 +22,8 @@ import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from 
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { RECEIPT_OWNER_CHOICES, RECEIPT_REQUEST_TARGET_TYPE } from "./receipt-requests";
+import { isCostCodeAllowedForProject } from "./project-phases";
+import { prismaPhaseDataSource } from "./project-phases-db";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
 import { normalizePercentCompleteInput } from "./percent-complete";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
@@ -15267,10 +15269,24 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
 
     const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
     if (!project) throw new Error("That job no longer exists");
-    if (costCodeId) {
-        const costCode = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
-        if (!costCode) throw new Error("That cost code no longer exists");
+
+    // "The cost code exists" is not a permission — it has to be a phase of THIS
+    // job. The same rule the clock-in validator applies.
+    if (costCodeId && !(await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId))) {
+        throw new Error("That cost code isn't a phase on this job");
     }
+
+    // MOVING A RECEIPT MOVES ITS JOB, so a code carried over from the old job is
+    // almost certainly wrong for the new one — and a wrong code is a wrong job
+    // cost, which is worse than no code at all. Clear it and let the worker
+    // re-suggest against the new project's phases.
+    const existing = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { costCodeId: true },
+    });
+    const keepExisting = !costCodeId
+        && existing?.costCodeId
+        && await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, existing.costCodeId);
 
     const now = new Date();
     const allowed = ["NEEDS_JOB", "NEEDS_REVIEW"];
@@ -15278,7 +15294,11 @@ export async function setReceiptIntakeJob(id: string, projectId: string, costCod
         where: { id, state: { in: allowed }, ...notClaimedByWorker(now) },
         data: {
             projectId,
-            ...(costCodeId ? { costCodeId } : {}),
+            // Explicit code wins; otherwise keep one still valid here, else null.
+            costCodeId: costCodeId ?? (keepExisting ? existing!.costCodeId : null),
+            // A stale suggestion is re-derived against the new job's phases.
+            suggestedCostCodeId: null,
+            suggestedConfidence: null,
             state: "READ",
             stateReason: null,
             lastError: null,

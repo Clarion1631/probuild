@@ -62,6 +62,10 @@
     },
     {
       "path": "/api/cron/receipt-requests",
+      "schedule": "0 13 * * *"
+    },
+    {
+      "path": "/api/cron/receipt-requests?continue=1",
       "schedule": "*/15 * * * *"
     },
     {

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { resolveCompanyTimeZone, startOfDateInTimeZone } from "@/lib/company-timezone";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
 import { evaluateReviewIssue, type EvaluateReviewIssueResult } from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
@@ -202,23 +203,22 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
         amountCents: line.amountCents,
         postedDate: line.postedDate.toISOString().slice(0, 10),
     });
-    const from = new Date(`${competing.from}T00:00:00Z`);
-    const to = new Date(`${competing.to}T00:00:00Z`);
+    const range = await evidenceRange(competing.from, competing.to);
 
     const [lines, expenseRows, intakeRows] = await Promise.all([
         prisma.bankLine.findMany({
-            where: { amountCents: competing.amountCents, postedDate: { gte: from, lte: to } },
+            where: { amountCents: competing.amountCents, postedDate: range },
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         }),
         prisma.expense.findMany({
-            where: { date: { gte: from, lte: to } },
+            where: { date: range },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
                 receiptUrl: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
-            where: { txnDate: { gte: from, lte: to }, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            where: { txnDate: range, state: { notIn: [...DEAD_INTAKE_STATES] } },
             select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
@@ -318,15 +318,12 @@ async function processBatch(
         select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
     });
 
-    // Open-issue lines join the cohort whatever their age: a line the matcher
-    // cannot see is a line it can never CLOSE.
-    const openIssueLineRows = openIssues.length === 0 ? [] : await prisma.bankLine.findMany({
-        where: { id: { in: openIssues.map(issue => issue.targetKey) } },
-        select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-    });
-
+    // Open-issue lines are NOT bolted on here any more — they get their own
+    // pass (see runSweep). Loading every one of them into every batch made each
+    // batch's evidence window span the whole backlog, which is exactly what
+    // made batching pointless.
     const lines = [...new Map(
-        [...batch, ...cohortRows, ...openIssueLineRows].map(row => [row.id, row]),
+        [...batch, ...cohortRows].map(row => [row.id, row]),
     ).values()];
     if (lines.length === 0) {
         return { summary: { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] }, undecided: 0 };
@@ -334,19 +331,21 @@ async function processBatch(
 
     // 2. EVIDENCE FOR THE COHORT'S FULL SPAN, widened by the match window.
     const days = lines.map(row => row.postedDate.getTime());
-    const from = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
-    const to = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
+    const fromYmd = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const toYmd = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    // HALF-OPEN, company timezone. See evidenceRange.
+    const range = await evidenceRange(fromYmd, toYmd);
 
     const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
-            where: { date: { gte: from, lte: to } },
+            where: { date: range },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
                 receiptUrl: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
-            where: { txnDate: { gte: from, lte: to }, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            where: { txnDate: range, state: { notIn: [...DEAD_INTAKE_STATES] } },
             select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
@@ -385,8 +384,8 @@ async function processBatch(
         })),
         openIssueKeys: openIssues.map(row => row.targetKey),
         resolvedIssueKeys,
-        evidenceLoadedFrom: from.toISOString().slice(0, 10),
-        evidenceLoadedTo: to.toISOString().slice(0, 10),
+        evidenceLoadedFrom: fromYmd,
+        evidenceLoadedTo: toYmd,
         now,
     });
 
@@ -425,6 +424,28 @@ async function processBatch(
     return { summary, undecided: plan.undecided.length };
 }
 
+
+/**
+ * The evidence window, as a half-open range in the COMPANY's timezone.
+ *
+ * `lte: <a Date at UTC midnight>` silently excluded most of the last allowed
+ * day: an expense stamped 14:00 on the 18th is after `2026-08-18T00:00:00Z`, so
+ * a receipt filed in the afternoon of the last in-window day was invisible and
+ * its charge got chased. And UTC is the wrong day boundary anyway — a receipt
+ * uploaded at 5pm Pacific belongs to that Pacific day, not the next UTC one.
+ *
+ * So: start of the FIRST allowed day, inclusive; start of the day AFTER the
+ * last allowed day, exclusive. Both resolved in the company's zone.
+ */
+async function evidenceRange(fromYmd: string, toYmd: string): Promise<{ gte: Date; lt: Date }> {
+    const zone = await resolveCompanyTimeZone();
+    const dayAfter = new Date(Date.parse(`${toYmd}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+    return {
+        gte: startOfDateInTimeZone(fromYmd, zone),
+        lt: startOfDateInTimeZone(dayAfter, zone),
+    };
+}
+
 /** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
 function ymdDaysBefore(now: Date, days: number): string {
     return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
@@ -437,6 +458,16 @@ export async function GET(request: Request) {
     const now = new Date();
     // A DURABLE lease, held for the whole reconciliation. The old advisory
     // claim released before any work began and excluded nothing.
+    // `?continue=1` is the every-15-minutes RESUME pass. It does no work of its
+    // own: if no cursor is parked it exits immediately, so the full sweep keeps
+    // its one predictable 6 AM slot instead of re-deriving the world 96 times a
+    // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
+    // even briefly block the real run.
+    const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
+    if (continueOnly && !(await readCursor())) {
+        return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
+    }
+
     const leaseToken = randomUUID();
     if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
         return NextResponse.json({ ok: true, skipped: "already-running" });
@@ -479,13 +510,36 @@ async function runSweep(now: Date) {
     // run exits cleanly when the budget is spent. The 15-minute schedule drains
     // whatever is left.
     const startedAt = Date.now();
+
+    // PASS 1: EVERY OPEN ISSUE, every run, whatever the cursor says.
+    //
+    // The cursor walks recent lines. An issue opened 90 days ago sits behind it
+    // for the whole sweep, so the receipt that finally answers it could arrive
+    // and the chase would keep nagging until the cursor happened to lap round —
+    // which, with a `?continue=1` resume, might be never. Closing is the half
+    // that must not depend on where the cursor is, so it runs first and alone.
+    const openPass = openIssues.length === 0
+        ? { summary: { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] as string[] }, undecided: 0 }
+        : await processBatch(
+            await prisma.bankLine.findMany({
+                where: { id: { in: openIssues.map(issue => issue.targetKey) } },
+                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            }),
+            openIssues, resolvedIssueKeys, detailsByKey, now,
+        );
+
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {
-        opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
+        opened: openPass.summary.opened,
+        closed: openPass.summary.closed,
+        touched: openPass.summary.touched,
+        skipped: openPass.summary.skipped,
+        errors: openPass.summary.errors,
+        failedTargets: [...openPass.summary.failedTargets],
     };
     let batches = 0;
     let linesSeen = 0;
-    let undecided = 0;
+    let undecided = openPass.undecided;
     let exhausted = false;
 
     while (Date.now() - startedAt < RUN_BUDGET_MS) {

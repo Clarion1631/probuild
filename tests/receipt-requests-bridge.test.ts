@@ -266,7 +266,7 @@ test("a configured webhook that fails to deliver FAILS the run", () => {
     assert.match(source, /status: summary\.ok \? 200 : 500/);
     // The row is left UNPOSTED with its claim released, so the retry pass can
     // take it straight away rather than waiting out a lease.
-    assert.match(source, /lastError: "post-failed", claimedAt: null, claimToken: null/);
+    assert.match(source, /status: "PENDING",[\s\S]{0,120}lastError: "post-failed"/);
 });
 
 test("the retry pass re-posts unposted rows and never selects new work", () => {
@@ -303,15 +303,6 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     // And errors make the run a 500.
     assert.match(source, /ok: totals\.errors === 0/);
     assert.match(source, /status: result\.ok \? 200 : 500/);
-});
-
-test("the sweep runs every 15 minutes so a backlog drains across invocations", () => {
-    const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
-        crons: Array<{ path: string; schedule: string }>;
-    };
-    const sweep = vercel.crons.find(c => c.path === "/api/cron/receipt-requests");
-    assert.ok(sweep);
-    assert.equal(sweep.schedule, "*/15 * * * *");
 });
 
 test("worker OWNERSHIP is a claim token, not the retry schedule", () => {
@@ -374,4 +365,97 @@ test("health enablement is the cron's existence, not an undocumented env var", (
         crons: Array<{ path: string }>;
     };
     assert.ok(vercel.crons.some(c => c.path === "/api/cron/bank-register-pull"), "which is true because the cron is scheduled");
+});
+
+test("the evidence upper bound is EXCLUSIVE and in the company timezone", () => {
+    // `lte: <UTC midnight>` silently excluded most of the last allowed day: a
+    // receipt filed at 2pm on the 18th sat after 2026-08-18T00:00:00Z and was
+    // invisible, so its charge got chased.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /async function evidenceRange\(fromYmd: string, toYmd: string\)/);
+    assert.match(source, /const zone = await resolveCompanyTimeZone\(\);/);
+    assert.match(source, /lt: startOfDateInTimeZone\(dayAfter, zone\)/);
+    // No caller may still use an inclusive upper bound on evidence.
+    assert.doesNotMatch(source, /date: \{ gte: from, lte: to \}/);
+    assert.doesNotMatch(source, /txnDate: \{ gte: from, lte: to \}/);
+    assert.match(source, /where: \{ date: range \}/);
+    assert.match(source, /where: \{ txnDate: range, state:/);
+});
+
+test("open issues get their OWN pass, independent of the cursor", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    // The pass runs BEFORE the cursor is even read.
+    const passAt = source.indexOf("const openPass =");
+    const cursorAt = source.indexOf("let cursor = await readCursor();");
+    assert.ok(passAt > 0 && cursorAt > passAt, "closing must not wait for the cursor to lap round");
+    // And they are no longer bolted onto every batch.
+    assert.doesNotMatch(source, /const openIssueLineRows =/);
+});
+
+test("?continue=1 only resumes; with no cursor it exits immediately", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const continueOnly = new URL\(request\.url\)\.searchParams\.get\("continue"\) === "1";/);
+    assert.match(source, /skipped: "nothing-in-progress"/);
+    // Checked BEFORE the lease, so a no-op resume cannot block the real run.
+    const gateAt = source.indexOf('skipped: "nothing-in-progress"');
+    const leaseAt = source.indexOf("await takeLease(LEASE_KEY");
+    assert.ok(gateAt > 0 && leaseAt > gateAt);
+
+    const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
+        crons: Array<{ path: string; schedule: string }>;
+    };
+    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests")?.schedule, "0 13 * * *");
+    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "*/15 * * * *");
+});
+
+test("reconciliation always runs; minting needs a fresh, conflict-free pull", () => {
+    const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
+    // No early return that would skip the backlog on an empty fetch.
+    assert.doesNotMatch(lib, /if \(lines\.length === 0\) return summary;/);
+    assert.match(lib, /const mintIsSafe = summary\.ok && !fetched\.stale && conflicts\.length === 0;/);
+    assert.match(lib, /mintSkipped = fetched\.stale \? "stale-fetch"/);
+});
+
+test("the lease release is a single fenced statement", () => {
+    // A read-then-write release can clear a lease someone else has since taken.
+    const source = readFileSync(join(repoRoot, "src/lib/cron-lease.ts"), "utf8");
+    assert.match(source, /updateMany\(\{\s*\n\s*where: \{ key, value: \{ contains: `"token":"\$\{token\}"` \} \}/);
+    assert.doesNotMatch(source, /const held = parse\(existing\.value\);\s*\n\s*if \(held\?\.token !== token\) return;/);
+});
+
+test("every finished worker transition hands ownership back", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
+    // applyState, the weak-dup park, needs-review, deferred, retry and deferRead.
+    const releases = source.match(/claimToken: null/g) ?? [];
+    assert.ok(releases.length >= 6, `expected every terminal/deferred branch to release, saw ${releases.length}`);
+    // Ownership is taken with a token, not by moving the schedule.
+    assert.match(source, /data: \{ claimToken, claimedAt: now \}/);
+});
+
+test("cards write POSTING before the webhook and never repost an uncertain row", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    const markAt = source.indexOf('data: { status: "POSTING" }');
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    assert.ok(markAt > 0 && postAt > markAt, "POSTING must be written BEFORE the call");
+    // A post that succeeded but whose completion write lost is UNCERTAIN.
+    assert.match(source, /if \(completed\.count === 0\) \{[\s\S]{0,200}status: "UNCERTAIN"/);
+    // A row found in POSTING is reconciled, not resent.
+    assert.match(source, /if \(existing\.status === "POSTING"\)/);
+    assert.match(source, /if \(existing\.status === "UNCERTAIN"\) \{ uncertain\.push\(owner\); continue; \}/);
+    // A REFUSED send is a known failure and goes back to PENDING for the retry.
+    assert.match(source, /status: "PENDING",\s*\n\s*attempts: \{ increment: 1 \}/);
+});
+
+test("cost codes must be a phase of the job, in all three write paths", () => {
+    for (const [label, file, needle] of [
+        ["intake route", "src/app/api/receipts/intake/route.ts", /isCostCodeAllowedForProject\(/],
+        ["setReceiptIntakeJob", "src/lib/actions.ts", /isCostCodeAllowedForProject\(prismaPhaseDataSource, projectId, costCodeId\)/],
+        ["worker suggestions", "src/app/api/cron/receipt-intake-worker/route.ts", /resolveProjectPhaseCodes\(prismaPhaseDataSource, projectId\)/],
+    ] as const) {
+        assert.match(readFileSync(join(repoRoot, file), "utf8"), needle, label);
+    }
+    // Moving the job clears a code that is not valid for the new one.
+    const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    assert.match(actions, /costCodeId: costCodeId \?\? \(keepExisting \? existing!\.costCodeId : null\)/);
+    assert.match(actions, /suggestedCostCodeId: null/);
 });

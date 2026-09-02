@@ -64,19 +64,25 @@ export async function takeLease(key: string, leaseMs: number, now: Date, token: 
     }
 }
 
-/** Release, but only if we still hold it — an overrun run must not free someone else's lease. */
-export async function releaseLease(key: string, token: string): Promise<void> {
+/**
+ * Release, but only if we still hold it.
+ *
+ * A read-then-write release has a window: run A reads "I hold it", run B's
+ * claim overwrites the row, then A's write clears B's lease and two runs are
+ * live at once. This is ONE fenced statement — `updateMany` matching both the
+ * key AND our token — so a release that lost the race updates zero rows and
+ * says nothing, which is exactly right.
+ */
+export async function releaseLease(key: string, token: string): Promise<boolean> {
     try {
-        const existing = await prisma.automationSetting.findUnique({ where: { key } });
-        if (!existing) return;
-        const held = parse(existing.value);
-        if (held?.token !== token) return;
-        await prisma.automationSetting.update({
-            where: { key },
+        const released = await prisma.automationSetting.updateMany({
+            where: { key, value: { contains: `"token":"${token}"` } },
             data: { value: JSON.stringify({ token: "", expiresAt: new Date(0).toISOString() }) },
         });
+        return released.count === 1;
     } catch {
         // The lease expires on its own; a failed release costs one skipped run.
+        return false;
     }
 }
 

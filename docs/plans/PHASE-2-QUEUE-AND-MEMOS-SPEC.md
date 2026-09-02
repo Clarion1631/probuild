@@ -287,7 +287,23 @@ Planner output for the executor: build exactly this; do not guess.
 
 ## 5. Crons — `vercel.json` additions
 
-- `/api/cron/receipt-requests`, `"0 13 * * *"` (6 AM Pacific, after the overnight QBO
+- **AS BUILT — the chaser runs as TWO invocations of one route.**
+  - `/api/cron/receipt-requests`, `"0 13 * * *"` — the full sweep. One
+    predictable slot a day.
+  - `/api/cron/receipt-requests?continue=1`, `"*/15 * * * *"` — the RESUME pass.
+    It does no work of its own: if no cursor is parked it returns
+    `{skipped:"nothing-in-progress"}` immediately, checked before the lease so a
+    no-op resume cannot even briefly block the real run. It exists because the
+    sweep is time-budgeted (200-line batches, a 45s budget, the cursor
+    checkpointed after every batch), so a backlog too big for one invocation
+    drains over the following quarter-hours instead of dying at the same point
+    every night. Once the cursor clears, the resume passes cost one indexed
+    read each until the next full sweep.
+  - Open issues are reconciled in their OWN pass on every run, before the cursor
+    is even read: closing must never wait for the cursor to lap round to an
+    issue opened months ago.
+- ORIGINAL PLAN (superseded by the two entries above):
+  `/api/cron/receipt-requests`, `"0 13 * * *"` (6 AM Pacific, after the overnight QBO
   register push lands; NOTE: no in-repo register cron exists yet — ordering vs the
   external `post-qbo-register.mjs` run is operational; restate it in the route comment).
   Auth `isCronAuthorized` (cron-auth.ts, Phase 0); `maxDuration 60`;

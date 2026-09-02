@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
     appendCardRecord,
     competingLineFilter,
+    matchEvidenceToLines,
     evidenceUnitKey,
     hasResolution,
     mergeReceiptRequestDetails,
@@ -453,7 +454,7 @@ test("the sweep expands each page to its competing cohort before matching", () =
     assert.ok(planAt > evidenceAt, "and the decision comes last");
     // The loaded window is declared, so the matcher can decline to judge
     // anything it falls outside.
-    assert.match(source, /evidenceLoadedFrom: from\.toISOString\(\)\.slice\(0, 10\)/);
+    assert.match(source, /evidenceLoadedFrom: fromYmd/);
 });
 
 // ── No decision without a fully-loaded evidence window (round-6 item 8) ─────
@@ -517,4 +518,79 @@ test("an undecided line is not counted as satisfied — its evidence stays free"
     });
     assert.deepEqual(result.undecided, ["bl-edge"]);
     assert.deepEqual(result.close, ["bl-ok"], "the in-window line still gets its receipt");
+});
+
+// ── Maximum-cardinality matching (round-7 item 2) ──────────────────────────
+
+test("the 14/16 vs 12/15 counterexample: greedy loses a match, this does not", () => {
+    // Charges on the 14th and 16th; receipts on the 12th and 15th.
+    // Greedy nearest-first: the 14th takes the 15th (distance 1), leaving the
+    // 16th only the 12th — four days out, outside the window — so it opens a
+    // chase for a receipt sitting right there. 14↔12 and 16↔15 answers both.
+    const result = planReceiptRequests({
+        bankLines: [
+            line({ id: "bl-14", postedDate: "2026-08-14" }),
+            line({ id: "bl-16", postedDate: "2026-08-16" }),
+        ],
+        expenses: [
+            expense({ id: "e-12", date: "2026-08-12" }),
+            expense({ id: "e-15", date: "2026-08-15" }),
+        ],
+        intakes: [],
+        openIssueKeys: ["bl-14", "bl-16"],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.deepEqual(result.open, [], "both charges are answered");
+    assert.deepEqual([...result.close].sort(), ["bl-14", "bl-16"]);
+});
+
+test("matching is deterministic across runs and input orders", () => {
+    const build = (reverse: boolean) => {
+        const lines = [
+            line({ id: "bl-14", postedDate: "2026-08-14" }),
+            line({ id: "bl-16", postedDate: "2026-08-16" }),
+        ];
+        const ev = [
+            expense({ id: "e-12", date: "2026-08-12" }),
+            expense({ id: "e-15", date: "2026-08-15" }),
+        ];
+        return planReceiptRequests({
+            bankLines: reverse ? [...lines].reverse() : lines,
+            expenses: reverse ? [...ev].reverse() : ev,
+            intakes: [], openIssueKeys: ["bl-14", "bl-16"], resolvedIssueKeys: [], now: NOW,
+        });
+    };
+    assert.deepEqual([...build(false).close].sort(), [...build(true).close].sort());
+});
+
+test("a genuinely unmatchable line still opens", () => {
+    // One receipt, two charges: maximum matching answers ONE of them, never
+    // both and never neither.
+    const result = planReceiptRequests({
+        bankLines: [
+            line({ id: "bl-a", postedDate: "2026-08-16" }),
+            line({ id: "bl-b", postedDate: "2026-08-16" }),
+        ],
+        expenses: [expense()],
+        intakes: [], openIssueKeys: ["bl-a", "bl-b"], resolvedIssueKeys: [], now: NOW,
+    });
+    assert.equal(result.close.length, 1);
+    assert.equal(result.open.length, 1);
+});
+
+test("matchEvidenceToLines assigns each evidence unit at most once", () => {
+    const assigned = matchEvidenceToLines(
+        [
+            { id: "bl-14", postedDate: "2026-08-14", payee: "LOWES #02516", amountCents: -12_345 },
+            { id: "bl-16", postedDate: "2026-08-16", payee: "LOWES #02516", amountCents: -12_345 },
+        ],
+        [
+            { id: "expense:e-12", unit: "expense:e-12", amountCents: 12_345, date: "2026-08-12", vendor: "Lowe's Home Improvement" },
+            { id: "expense:e-15", unit: "expense:e-15", amountCents: 12_345, date: "2026-08-15", vendor: "Lowe's Home Improvement" },
+        ],
+    );
+    assert.equal(assigned.size, 2);
+    const units = [...assigned.values()].map(row => row.unit);
+    assert.equal(new Set(units).size, units.length, "no unit is handed to two lines");
 });

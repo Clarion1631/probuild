@@ -53,11 +53,28 @@ test("both crons take the lease BEFORE any work and release it after", () => {
     }
 });
 
-test("the release is token-fenced, so an overrun run cannot free someone else's lease", () => {
+test("the release is token-fenced in ONE statement, not read-then-write", () => {
+    // A read-then-write release has a window: A reads "I hold it", B's claim
+    // overwrites the row, A's write then clears B's lease and two runs are live.
     const source = readFileSync(join(repoRoot, "src/lib/cron-lease.ts"), "utf8");
-    assert.match(source, /if \(held\?\.token !== token\) return;/);
+    assert.match(source, /where: \{ key, value: \{ contains: `"token":"\$\{token\}"` \} \}/);
+    assert.doesNotMatch(source, /if \(held\?\.token !== token\) return;/, "the read-then-write shape is gone");
     // And the claim refuses when someone else holds it.
     assert.match(source, /if \(held && new Date\(held\.expiresAt\) > now\) return null;/);
+});
+
+test("two simultaneous releases: only the token holder wins", async () => {
+    // Modelled on the fenced predicate the real release uses.
+    let stored = JSON.stringify({ token: "B", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    const release = async (token: string) => {
+        // updateMany where key AND value contains our token.
+        if (!stored.includes(`"token":"${token}"`)) return 0;
+        stored = JSON.stringify({ token: "", expiresAt: new Date(0).toISOString() });
+        return 1;
+    };
+    const [a, b] = await Promise.all([release("A"), release("B")]);
+    assert.equal(a, 0, "A no longer holds it and must clear nothing");
+    assert.equal(b, 1, "B holds it and releases it");
 });
 
 test("the lease FAILS CLOSED: an unreadable lease means the run is skipped", () => {

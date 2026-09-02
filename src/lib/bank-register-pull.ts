@@ -235,6 +235,8 @@ export interface BankRegisterPullSummary {
      */
     conflictQbTxnIds?: string[];
     reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number } | null;
+    /** Why minting was held back this run, when it was. */
+    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed";
     minted?: { minted: number; skipped: Record<string, number> } | null;
 }
 
@@ -287,8 +289,10 @@ export async function runBankRegisterPull(
         summary.error = "qbo-duplicate-conflict";
         summary.conflictQbTxnIds = [...conflicts];
     }
-    if (lines.length === 0) return summary;
-
+    // NOTE: no early return on an empty fetch. Reconciliation still has to run —
+    // yesterday's observations may be waiting for a canonical line that only
+    // arrived today, and skipping the backlog because TONIGHT'S register was
+    // empty is how those sat unlinked indefinitely.
     for (const batch of chunkLines(lines, BANK_REGISTER_CHUNK_SIZE)) {
         const { status, body } = await dependencies.ingest(account, batch);
         if (status === 200 && body?.ok) {
@@ -332,10 +336,20 @@ export async function runBankRegisterPull(
         console.error("[bank-register-pull] reconcile failed", error instanceof Error ? error.message : "UnknownError");
     }
 
-    // Minting runs AFTER reconcile, never before: an observation the statement
-    // already covers gets linked first and is then no longer a mint candidate,
-    // which is what keeps one transaction on one canonical line.
-    if (dependencies.mintFromQbo) {
+    // MINTING NEEDS A CLEAN, FRESH PULL — reconciliation does not.
+    //
+    // Minting CREATES canonical ledger rows from what this run believes it saw.
+    // A stale cache is last run's data; a divergent repeat or an ingest conflict
+    // means QuickBooks restated something we hold. Minting on any of those
+    // writes a permanent row from a picture we already know is wrong, and
+    // `amountCents` is immutable by trigger, so only a human can undo it.
+    // Reconciliation just LINKS rows that already exist, so it always runs.
+    const mintIsSafe = summary.ok && !fetched.stale && conflicts.length === 0;
+    if (dependencies.mintFromQbo && !mintIsSafe) {
+        summary.minted = null;
+        summary.mintSkipped = fetched.stale ? "stale-fetch" : conflicts.length > 0 ? "conflicts" : "ingest-failed";
+    }
+    if (dependencies.mintFromQbo && mintIsSafe) {
         try {
             summary.minted = await dependencies.mintFromQbo(account);
         } catch (error) {

@@ -4,6 +4,8 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
+import { resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
 import {
@@ -655,6 +657,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         data: {
                             state: "NEEDS_REVIEW",
                             stateReason: `weak-dup:${conflict.id}`,
+                            claimToken: null,
+                            claimedAt: null,
                             // Parked without ever reaching QuickBooks, so the
                             // strong key goes back (same rule as book.ts).
                             dedupStrongKey: null,

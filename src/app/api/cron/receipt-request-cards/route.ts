@@ -255,16 +255,31 @@ export async function GET(request: Request) {
         ? { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true }
         : await scanCandidates();
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
+    // Sent, but we never confirmed it. Reported, never reposted.
+    const uncertain: string[] = [];
 
     for (const owner of CARD_OWNERS_ASKED) {
         const existing = await prisma.receiptRequestCard.findUnique({
             where: { owner_pacificDate: { owner, pacificDate: date } },
-            select: { id: true, itemsJson: true, overflow: true, postedAt: true },
+            select: { id: true, itemsJson: true, overflow: true, postedAt: true, status: true },
         });
 
         if (existing) {
             // Already asked today — nothing to do, whoever posted it.
             if (existing.postedAt !== null) continue;
+            // POSTING means an earlier run called the webhook and never heard
+            // back. It is NOT retried: Chat may well have the message, and a
+            // repost is a second card in the crew's face for the same charges.
+            // It is marked UNCERTAIN and left for the same-day check.
+            if (existing.status === "POSTING") {
+                await prisma.receiptRequestCard.updateMany({
+                    where: { id: existing.id, status: "POSTING" },
+                    data: { status: "UNCERTAIN", lastError: "uncertain-delivery", claimedAt: null, claimToken: null },
+                });
+                uncertain.push(owner);
+                continue;
+            }
+            if (existing.status === "UNCERTAIN") { uncertain.push(owner); continue; }
 
             // A claimed-but-unposted row: last run crashed, or its post failed.
             // TAKE THE POST-CLAIM BY TOKEN. `claimedAt` older than the lease (or
@@ -334,13 +349,34 @@ export async function GET(request: Request) {
         // starvation the ordering exists to prevent. The post is now only a
         // success when it returns both bridge identities, so "carded" means
         // "there is a real thread to reply in".
+        // POSTING, BEFORE the call. This is the whole point of the state: a
+        // crash after this write and before the response is distinguishable
+        // from a crash before it, so the next run knows not to repost.
+        const marked = await prisma.receiptRequestCard.updateMany({
+            where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
+            data: { status: "POSTING" },
+        });
+        if (marked.count === 0) {
+            // Someone else owns it now; do not send.
+            continue;
+        }
+
         const result = await postOwnerCard(webhookUrl, card);
         if (!result) {
             // Left UNPOSTED on purpose, and the claim is RELEASED so the 2-hour
             // retry pass can take it immediately rather than waiting out a lease.
             await prisma.receiptRequestCard.updateMany({
                 where: { id: rowId, claimToken: token },
-                data: { attempts: { increment: 1 }, lastError: "post-failed", claimedAt: null, claimToken: null },
+                data: {
+                    // A REFUSED send (no bridge identity, or a non-2xx) is a
+                    // known failure, not an unknown one — back to PENDING so
+                    // the retry pass can take it.
+                    status: "PENDING",
+                    attempts: { increment: 1 },
+                    lastError: "post-failed",
+                    claimedAt: null,
+                    claimToken: null,
+                },
             });
             failures.push(card.owner);
             continue;
@@ -348,9 +384,13 @@ export async function GET(request: Request) {
         // COMPLETION IS TOKEN-FENCED: only the run that holds the claim may
         // record the post, so a late completion from a superseded run cannot
         // mark a row posted that it did not post.
-        await prisma.receiptRequestCard.updateMany({
-            where: { id: rowId, claimToken: token },
+        // THE POST SUCCEEDED. If this write does not land, the card IS out and
+        // we have no record of it — so a zero count is `uncertain-delivery`,
+        // never a silent success and never a repost.
+        const completed = await prisma.receiptRequestCard.updateMany({
+            where: { id: rowId, claimToken: token, status: "POSTING" },
             data: {
+                status: "POSTED",
                 postedAt: new Date(),
                 threadName: result.threadName,
                 messageName: result.messageName,
@@ -358,6 +398,14 @@ export async function GET(request: Request) {
                 lastError: null,
             },
         });
+        if (completed.count === 0) {
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId },
+                data: { status: "UNCERTAIN", lastError: "uncertain-delivery" },
+            }).catch(() => { /* the row is already beyond us */ });
+            uncertain.push(card.owner);
+            continue;
+        }
         await recordCardOnIssues(card, result.threadName, result.messageName, now);
         posted.push({ owner: card.owner, items: card.items.length, threadName: result.threadName, resumed });
     }
@@ -365,6 +413,7 @@ export async function GET(request: Request) {
     const summary = {
         ok: failures.length === 0,
         failedOwners: failures,
+        uncertainOwners: uncertain,
         date,
         retryOnly,
         scanned: scan.candidates.length,

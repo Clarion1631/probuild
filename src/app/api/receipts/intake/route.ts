@@ -244,6 +244,18 @@ export async function POST(req: Request) {
     // A session/Bearer caller may only file against a project they can reach.
     // The secret caller is a trusted forwarder resolving the project from the
     // Drive folder, and has no user to scope by.
+    // A cost code must be a PHASE OF THE JOB it is filed against — "the code
+    // exists" is not a permission, and the FK check alone would happily accept
+    // a code from an unrelated job, which books the expense somewhere nobody
+    // looks. Deterministic 400: a forwarder must not retry this forever.
+    if (parsed.costCodeId) {
+        if (!parsed.projectId) return bad("cost-code-without-project");
+        const allowed = await isCostCodeAllowedForProject(
+            prismaPhaseDataSource, parsed.projectId, parsed.costCodeId,
+        );
+        if (!allowed) return bad("cost-code-not-a-phase-of-project");
+    }
+
     if (auth.via === "session" && parsed.projectId) {
         const allowed = await userCanAccessProject(auth.user, parsed.projectId);
         if (!allowed) return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });
