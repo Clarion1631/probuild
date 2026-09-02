@@ -70,6 +70,14 @@ jobs:
       # proof in the suite is an injected sequence, which shows the branch exists
       # but not that PostgreSQL serializes the way the code assumes. Runs BEFORE
       # the drift test below, which deliberately mutates this database.
+      # Production received this migration on 2026-09-02, so the documented
+      # deploy command must be a safe no-op against an already-applied database
+      # and --dry-run must execute nothing. Proven here, never against prod.
+      - name: Prove the apply script is idempotent and --dry-run is read-only
+        run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove settlement's FOR SHARE blocks a concurrent rate write
         run: npx tsx --test tests/payroll-rate-lock-db.test.ts
         env:

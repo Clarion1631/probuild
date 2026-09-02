@@ -47,6 +47,90 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+/**
+ * Every object this script is responsible for, as a catalog query.
+ *
+ * Used two ways: `--dry-run` reports which of these already exist (and prints
+ * "nothing to do" when they all do), and the normal run verifies them after
+ * writing. One list, so the dry run and the real run cannot disagree about what
+ * "applied" means.
+ */
+export const EXPECTED_OBJECTS = [
+    { kind: "column", table: "User", name: "lastRateSyncAt" },
+    { kind: "column", table: "User", name: "payType" },
+    { kind: "table", name: "PayrollPeriod" },
+    { kind: "column", table: "PayrollPeriod", name: "timeZone" },
+    { kind: "column", table: "PayrollPeriod", name: "summaryCsvSnapshot" },
+    { kind: "column", table: "PayrollPeriod", name: "detailCsvSnapshot" },
+    { kind: "column", table: "PayrollPeriod", name: "periodStartKey" },
+    { kind: "column", table: "PayrollPeriod", name: "periodEndKey" },
+    { kind: "column", table: "PayrollPeriod", name: "discardedAt" },
+    { kind: "column", table: "PayrollPeriod", name: "discardedById" },
+    { kind: "column", table: "PayrollPeriod", name: "discardedReason" },
+    { kind: "index", name: "PayrollPeriod_periodStart_periodEnd_key" },
+    { kind: "index", name: "PayrollPeriod_periodStartKey_periodEndKey_key" },
+    { kind: "index", name: "PayrollPeriod_lockedAt_idx" },
+    { kind: "index", name: "PayrollPeriod_lockedById_idx" },
+    { kind: "index", name: "PayrollPeriod_discardedAt_idx" },
+    { kind: "index", name: "TimeEntry_startTime_idx" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_fkey" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked" },
+    { kind: "constraint", table: "User", name: "User_payType_check" },
+    { kind: "column", table: "HelpRequest", name: "submissionId" },
+    { kind: "column", table: "HelpRequest", name: "providerIssueRef" },
+    { kind: "column", table: "HelpRequest", name: "providerState" },
+    { kind: "column", table: "HelpRequest", name: "providerLeaseToken" },
+    { kind: "column", table: "HelpRequest", name: "providerLeaseExpiresAt" },
+    { kind: "index", name: "HelpRequest_userId_submissionId_key" },
+    { kind: "index", name: "HelpRequest_userId_createdAt_idx" },
+    { kind: "table", name: "HelpSubmissionQuota" },
+    { kind: "index", name: "HelpSubmissionQuota_userId_hourBucket_key" },
+    // Not created by a statement — CONVERTED. 'r' is RESTRICT; 'c' is the old
+    // CASCADE that silently destroyed payroll history.
+    { kind: "fk-restrict", table: "TimeEntry", name: "TimeEntry_userId_fkey" },
+    { kind: "fk-restrict", table: "TimeEntry", name: "TimeEntry_projectId_fkey" },
+];
+
+/** Read-only. Returns the subset of EXPECTED_OBJECTS that is NOT yet present. */
+export async function findMissingObjects(db, expected = EXPECTED_OBJECTS) {
+    const missing = [];
+    for (const object of expected) {
+        let rows;
+        if (object.kind === "column") {
+            rows = await db.$queryRawUnsafe(
+                `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+                object.table,
+                object.name
+            );
+        } else if (object.kind === "table") {
+            rows = await db.$queryRawUnsafe(
+                `SELECT 1 FROM information_schema.tables WHERE table_name = $1`,
+                object.name
+            );
+        } else if (object.kind === "index") {
+            rows = await db.$queryRawUnsafe(`SELECT 1 FROM pg_indexes WHERE indexname = $1`, object.name);
+        } else if (object.kind === "constraint") {
+            // convalidated: a NOT VALID constraint is not enforced for existing
+            // rows, so an unvalidated one does not count as applied.
+            rows = await db.$queryRawUnsafe(
+                `SELECT 1 FROM pg_constraint WHERE conname = $1 AND conrelid = to_regclass($2) AND convalidated`,
+                object.name,
+                `"${object.table}"`
+            );
+        } else if (object.kind === "fk-restrict") {
+            rows = await db.$queryRawUnsafe(
+                `SELECT 1 FROM pg_constraint WHERE conname = $1 AND conrelid = to_regclass($2) AND confdeltype = 'r'`,
+                object.name,
+                `"${object.table}"`
+            );
+        }
+        if (!rows || rows.length === 0) missing.push(object);
+    }
+    return missing;
+}
+
 const STATEMENTS = [
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRateSyncAt" TIMESTAMPTZ(6)`,
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payType" TEXT`,
@@ -196,10 +280,48 @@ async function main() {
     const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
 
     const dryRun = isDryRun();
-    if (dryRun) console.log("[dry-run] the payType seed will print what it would do and write nothing.");
-
 
     try {
+        // --dry-run is READ-ONLY, for the whole script — not just the seed.
+        //
+        // It is the verification step for a deploy, so it has to be safe to point
+        // at production. An earlier revision gated only the payType seed on this
+        // flag and executed every DDL statement regardless, which made "--dry-run"
+        // a lie in the one place it mattered most.
+        if (dryRun) {
+            const missing = await findMissingObjects(prisma);
+            if (missing.length === 0) {
+                console.log(
+                    `[dry-run] nothing to do — all ${EXPECTED_OBJECTS.length} objects this script manages are already present.`
+                );
+            } else {
+                console.log(`[dry-run] ${missing.length} of ${EXPECTED_OBJECTS.length} object(s) would be created or converted:`);
+                for (const object of missing) {
+                    console.log(`[dry-run]   ${object.kind} ${object.table ? object.table + "." : ""}${object.name}`);
+                }
+            }
+
+            const salariedPreview = classifySalariedEmails(process.env.PAYROLL_SALARIED_EMAILS);
+            if (!salariedPreview.length) {
+                console.log("[dry-run] PAYROLL_SALARIED_EMAILS is not set — no payType would be seeded.");
+            } else {
+                const would = await prisma.$queryRawUnsafe(
+                    `SELECT "email" FROM "User" WHERE "payType" IS NULL AND lower("email") = ANY($1::text[]) ORDER BY "email"`,
+                    salariedPreview
+                );
+                console.log(`[dry-run] would set payType = SALARY for ${would.length} user(s):`);
+                for (const row of would) console.log(`[dry-run]   ${row.email}`);
+                const unmatched = salariedPreview.filter(
+                    (email) => !would.some((row) => String(row.email).toLowerCase() === email)
+                );
+                if (unmatched.length) {
+                    console.log(`[dry-run] ${unmatched.length} listed address(es) matched no NULL-payType user: ${unmatched.join(", ")}`);
+                }
+            }
+            console.log("[dry-run] no statement was executed.");
+            return;
+        }
+
         for (const sql of STATEMENTS) {
             await prisma.$executeRawUnsafe(sql);
             console.log("ok:", sql.split("\n")[0].trim().slice(0, 90));
@@ -234,21 +356,6 @@ async function main() {
             console.log(
                 "PAYROLL_SALARIED_EMAILS is not set — no payType is being seeded. Everyone stays NULL until a human answers on Company -> Team Members."
             );
-        } else if (dryRun) {
-            const would = await prisma.$queryRawUnsafe(
-                `SELECT "email" FROM "User" WHERE "payType" IS NULL AND lower("email") = ANY($1::text[]) ORDER BY "email"`,
-                salaried
-            );
-            console.log(`[dry-run] would set payType = SALARY for ${would.length} user(s):`);
-            for (const row of would) console.log(`[dry-run]   ${row.email}`);
-            const unmatched = salaried.filter(
-                (email) => !would.some((row) => String(row.email).toLowerCase() === email)
-            );
-            // Listed but not matched: already answered, or the address is wrong.
-            // Worth printing — a typo in the env var is otherwise invisible.
-            if (unmatched.length) {
-                console.log(`[dry-run] ${unmatched.length} listed address(es) matched no NULL-payType user: ${unmatched.join(", ")}`);
-            }
         } else {
             const seededSalary = await prisma.$executeRawUnsafe(
                 `UPDATE "User" SET "payType" = 'SALARY' WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,

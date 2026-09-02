@@ -145,20 +145,63 @@ test("no hardcoded person survives anywhere in the script", () => {
     assert.match(script, /PAYROLL_SALARIED_EMAILS is not set/);
 });
 
-test("--dry-run prints what it would set and writes nothing", async () => {
+test("--dry-run is read-only for the WHOLE script, not just the seed", async () => {
     const { isDryRun } = await import("../scripts/apply-payroll-phase5.mjs");
     assert.equal(isDryRun(["node", "s.mjs", "--dry-run"]), true);
     assert.equal(isDryRun(["node", "s.mjs"]), false);
 
     const script = read(SCRIPT);
-    // The dry-run branch must SELECT, never UPDATE.
-    const seed = script.slice(script.indexOf("const salaried = classifySalariedEmails"));
+    // It is the verification step for a deploy now, so it has to be safe to
+    // point at production. An earlier revision gated only the payType seed on
+    // this flag and executed every DDL statement regardless — which made
+    // "--dry-run" a lie in the one place it mattered most.
+    const main = script.slice(script.indexOf("async function main()"));
+    const gate = main.slice(main.indexOf("if (dryRun) {"), main.indexOf("no statement was executed"));
+    assert.match(gate, /findMissingObjects\(prisma\)/);
+    assert.match(gate, /nothing to do/);
+    assert.doesNotMatch(gate, /\$executeRawUnsafe/, "a dry run that writes is not a dry run");
+
+    // It RETURNS before the statement loop — the gate is not merely a branch
+    // inside it.
+    assert.ok(
+        main.indexOf("no statement was executed") < main.indexOf("for (const sql of STATEMENTS)"),
+        "the dry-run gate must precede the DDL"
+    );
+
+    // And the seed's own dry-run branch is gone, rather than left unreachable.
+    const seed = main.slice(main.indexOf("const salaried = classifySalariedEmails"));
     const body = seed.slice(0, seed.indexOf("const unconfirmed"));
-    const dryBranch = body.slice(body.indexOf("} else if (dryRun) {"), body.indexOf("} else {"));
-    assert.match(dryBranch, /SELECT "email" FROM "User"/);
-    assert.doesNotMatch(dryBranch, /UPDATE "User"/, "a dry run that writes is not a dry run");
-    // The real branch is the only one that updates.
-    assert.match(body.slice(body.indexOf("} else {")), /UPDATE "User" SET "payType" = 'SALARY'/);
+    assert.doesNotMatch(body, /dryRun/, "dead branches rot into false assurance");
+    assert.match(body, /UPDATE "User" SET "payType" = 'SALARY'/);
+});
+
+test("the object list is what both the dry run and the real run verify against", async () => {
+    const { EXPECTED_OBJECTS } = await import("../scripts/apply-payroll-phase5.mjs");
+    // One list, so "applied" cannot mean two different things.
+    assert.ok(EXPECTED_OBJECTS.length >= 30, `expected a full object list, got ${EXPECTED_OBJECTS.length}`);
+    const names = EXPECTED_OBJECTS.map((o: { name: string }) => o.name);
+    for (const required of [
+        "payType",
+        "lastRateSyncAt",
+        "discardedAt",
+        "PayrollPeriod_discard_unlocked",
+        "TimeEntry_userId_fkey",
+        "TimeEntry_projectId_fkey",
+        "HelpSubmissionQuota",
+    ]) {
+        assert.ok(names.includes(required), `${required} missing from EXPECTED_OBJECTS`);
+    }
+    // The FK entries assert RESTRICT specifically — present-but-CASCADE is not
+    // "applied", it is the bug.
+    const fks = EXPECTED_OBJECTS.filter((o: { kind: string }) => o.kind === "fk-restrict");
+    assert.equal(fks.length, 2);
+
+    // Every column the migration creates should be in the list, or the dry run
+    // under-reports what is missing.
+    const sql = read(MIGRATION);
+    for (const match of sql.matchAll(/ADD COLUMN(?:\s+IF NOT EXISTS)?\s+"(\w+)"/gi)) {
+        assert.ok(names.includes(match[1]), `column ${match[1]} is created but not verified`);
+    }
 });
 
 test("IMPORTING the script must not load production env or run anything", () => {
