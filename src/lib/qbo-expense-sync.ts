@@ -549,9 +549,20 @@ type ExpenseTransaction = {
             where: { id: string };
             data: QboExpenseUpdateData | QboExpenseRetirementData;
         }): Promise<unknown>;
+        /**
+         * Two guarded writes go through here, and both put their guarantee in
+         * the PREDICATE rather than in a value read earlier in the transaction:
+         * the attribution fill (`projectId: null`) and a COMPARE-AND-SET on the
+         * tax values a plan was computed from. The tax PATCH can commit between
+         * this transaction's read and its write, and a bookkeeper's answer must
+         * not be overwritten by a plan made before it existed.
+         */
         updateMany(args: {
-            where: { id: string; projectId: null };
-            data: { projectId?: string; estimateId: string };
+            where: Record<string, unknown>;
+            data:
+                | { projectId?: string; estimateId: string }
+                | QboExpenseUpdateData
+                | QboExpenseRetirementData;
         }): Promise<{ count: number }>;
     };
 };
@@ -808,10 +819,38 @@ export async function upsertQboExpense(
                 data: plan.fill,
             });
         }
-        await transaction.expense.update({
-            where: { id: existing.id },
+        // CAS when the client supports it: a tax correction committing between
+        // the read above and this write would otherwise be clobbered by a plan
+        // that never saw it. Zero rows means the row moved — re-read and
+        // re-plan once, which is enough because the second read is inside the
+        // advisory lock this transaction already holds.
+        const cas = await transaction.expense.updateMany({
+            where: {
+                id: existing.id,
+                taxAmount: existing.taxAmount ?? null,
+                taxDeductibleBase: existing.taxDeductibleBase ?? null,
+            },
             data: plan.data,
         });
+        if (cas.count > 0) return "updated";
+
+        // The tax values moved between the read and the write — a bookkeeper's
+        // PATCH landed. Re-read and RE-PLAN once against what is actually
+        // there. Once is enough: this transaction holds the per-purchase
+        // advisory lock, so the only writer that can beat it is that PATCH, and
+        // it has now committed.
+        const fresh = await transaction.expense.findUnique({
+            where: { qbPurchaseId: write.qbPurchaseId },
+            select: {
+                id: true, qbSyncToken: true, estimateId: true, projectId: true,
+                taxAmount: true, taxDeductibleBase: true, amount: true,
+                vendor: true, date: true, description: true, status: true,
+            },
+        });
+        if (!fresh) return "unchanged";
+        const replanned = planQboExpenseUpdate(fresh, write);
+        if (planIsNoop(fresh, replanned)) return "unchanged";
+        await transaction.expense.update({ where: { id: fresh.id }, data: replanned.data });
         return "updated";
     });
 }

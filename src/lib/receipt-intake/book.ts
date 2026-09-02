@@ -167,8 +167,19 @@ export interface BookPrismaClient {
         } | null>;
     };
     expense: {
-        findUnique(args: any): Promise<{ id: string } | null>;
+        /** The Phase 3 columns the already-exists fill reads before deciding. */
+        findUnique(args: any): Promise<{
+            id: string;
+            projectId?: string | null;
+            costCodeId?: string | null;
+            costCodeSource?: string | null;
+            taxAmount?: unknown;
+            taxAtSource?: boolean;
+            installedAtCustomer?: boolean | null;
+            estimate?: { projectId: string | null } | null;
+        } | null>;
         create(args: any): Promise<{ id: string }>;
+        update(args: any): Promise<unknown>;
     };
     receiptIntake: {
         update(args: any): Promise<unknown>;
@@ -637,14 +648,74 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
-        const expenseId = await deps.db.$transaction(async tx => {
+        const booked = await deps.db.$transaction(async tx => {
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
             // and the insert would fail on that constraint anyway.
             const existing = await tx.expense.findUnique({
                 where: { qbPurchaseId: result.qbPurchaseId },
-                select: { id: true },
+                select: {
+                    id: true,
+                    projectId: true,
+                    costCodeId: true,
+                    costCodeSource: true,
+                    taxAmount: true,
+                    taxAtSource: true,
+                    installedAtCustomer: true,
+                    estimate: { select: { projectId: true } },
+                },
             });
+
+            // AN ALREADY-BOOKED PURCHASE STILL NEEDS ITS PHASE 3 FIELDS.
+            //
+            // `alreadyExists` is the lost-response retry, and it also covers a
+            // row v1 created before this pipeline existed. Returning it
+            // untouched left `projectId`, the phase, the provenance and the tax
+            // columns NULL forever on exactly the receipts the tax report is
+            // made of — the booking said BOOKED and the report saw nothing.
+            //
+            // So the gaps are filled and only the gaps: a human's decision
+            // outranks anything this pass knows. `costCodeSource` "capture" or
+            // "manual" is untouchable, and an `installedAtCustomer` that is
+            // already answered (true OR false) is a tax answer nobody but a
+            // bookkeeper may change.
+            if (existing) {
+                const existingProjectId = existing.projectId ?? existing.estimate?.projectId ?? null;
+                // ATTRIBUTION CONFLICT. The Purchase is already on a different
+                // job than this intake row claims. Filling fields would be
+                // guessing which one is right, and overwriting would silently
+                // move real money between jobs — so nobody is booked and a
+                // person is asked. The strong key stays held: the Purchase
+                // exists.
+                if (existingProjectId && row.projectId && existingProjectId !== row.projectId) {
+                    return { conflict: true as const };
+                }
+
+                const humanCoded =
+                    existing.costCodeSource === "capture" || existing.costCodeSource === "manual";
+                const fill: Record<string, unknown> = {};
+                if (!existing.projectId && row.projectId) fill.projectId = row.projectId;
+                if (!existing.costCodeId && !humanCoded && costCodeId) {
+                    fill.costCodeId = costCodeId;
+                    fill.costCodeSource = costCodeSource;
+                    fill.costCodeConfidence = costCodeConfidence;
+                }
+                // Tax is filled only when there is none recorded at all —
+                // a stored figure came either from an earlier booking of this
+                // same document or from a bookkeeper, and both outrank a
+                // re-read.
+                if (existing.taxAmount === null && taxApplied > 0) {
+                    fill.taxAmount = taxApplied / 100;
+                    fill.taxAtSource = true;
+                }
+                if (existing.installedAtCustomer === null && row.installedAtCustomer !== null) {
+                    fill.installedAtCustomer = row.installedAtCustomer;
+                }
+                if (Object.keys(fill).length > 0) {
+                    await tx.expense.update({ where: { id: existing.id }, data: fill });
+                }
+            }
+
             const expense = existing ?? await tx.expense.create({
                 data: {
                     estimateId,
@@ -724,9 +795,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     claimedAt: null,
                 },
             });
+            // Phase 1's claim fence stays: a row whose claim token moved has
+            // been taken over by another worker, and this transaction must not
+            // commit a booking on its behalf.
             if (claimed.count === 0) throw new StaleClaimError();
-            return expense.id;
+            return { conflict: false as const, expenseId: expense.id };
         });
+
+        if (booked.conflict) {
+            // A send WAS attempted, so the strong key stays claimed.
+            return {
+                outcome: "needs-review",
+                reason: "attribution-conflict",
+                releaseStrongKey: false,
+            };
+        }
+        const expenseId = booked.expenseId;
 
         // Audit row so the /automation register keeps seeing v2 bookings
         // alongside the bot's. Fire-and-forget by contract — never fails a

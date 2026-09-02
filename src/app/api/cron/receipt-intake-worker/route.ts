@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
@@ -24,8 +24,6 @@ import {
     driveFileIdOf,
     triageCutoverRows, resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
-import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
@@ -73,7 +71,6 @@ const LEASE_MS = CLAIM_LEASE_MINUTES * 60_000;
 const WORKER_ROW_SELECT = {
     id: true, source: true, sourceRef: true, state: true, dryRun: true,
     projectId: true, costCodeId: true, suggestedCostCodeId: true,
-    suggestedConfidence: true,
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     // Phase 3 attribution — booking copies these straight onto the Expense.

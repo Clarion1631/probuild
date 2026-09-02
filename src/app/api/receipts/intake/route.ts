@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { optionalBool } from "@/lib/receipt-capture-validation";
 import { resolveInstalledAtCustomer } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { receiptObjectSize, uploadReceiptObject } from "@/lib/receipt-intake/bucket";
@@ -130,17 +131,6 @@ function tooLargeForInline(limit: number, encoding: "json" | "multipart") {
         },
         { status: 413 },
     );
-}
-
-/**
- * Accept a boolean from either a JSON body (real boolean) or a multipart form
- * (everything is a string). Anything else is "the caller did not say".
- */
-function optionalBool(value: unknown): boolean | null {
-    if (typeof value === "boolean") return value;
-    if (value === "true") return true;
-    if (value === "false") return false;
-    return null;
 }
 
 async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {

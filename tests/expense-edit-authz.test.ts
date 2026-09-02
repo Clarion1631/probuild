@@ -33,6 +33,18 @@ const fakePrisma = {
             updateArgs = args;
             return { id: "e1", ...args.data };
         },
+        // The PATCH writes through a COMPARE-AND-SET on the values its
+        // validation depended on, so the stub has to be able to MISS.
+        updateMany: async (args: { where: Record<string, any>; data: Record<string, unknown> }) => {
+            const row = storedExpense as Record<string, any> | null;
+            if (!row) return { count: 0 };
+            const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+            for (const key of ["amount", "taxAmount", "taxDeductibleBase"]) {
+                if (key in args.where && !eq(row[key], args.where[key])) return { count: 0 };
+            }
+            updateArgs = args;
+            return { count: 1 };
+        },
         deleteMany: async (args: unknown) => {
             deleteArgs = args;
             return { count: 1 };
@@ -384,4 +396,56 @@ test("...and NOT one from the job it left, even via its own estimate", async () 
     const res = await call({ itemId: "item-old-job" });
     assert.equal(res.status, 400);
     assert.equal(updateArgs, null);
+});
+
+// ── #5 PUT's strict allowlist ──────────────────────────────────────────────
+
+test("PUT rejects EVERY tax-return field, by name", async () => {
+    // A silent drop looks like a successful correction, and the caller would
+    // believe a deduction was recorded that never was.
+    for (const field of [
+        "taxAmount", "taxAtSource", "needsTaxReview",
+        "installedAtCustomer", "taxDeductibleBase",
+    ]) {
+        const res = await call({ [field]: field === "taxAtSource" ? true : 1 });
+        assert.equal(res.status, 400, field);
+        const body = await res.json();
+        assert.equal(body.field, field, "the response names the offending field");
+        assert.match(body.error, /PATCH/);
+    }
+    assert.equal(updateArgs, null, "and nothing is ever written");
+});
+
+test("PUT still accepts its own fields", async () => {
+    assert.equal((await call({ vendor: "Fine", amount: "10.00" })).status, 200);
+});
+
+// ── #4 the PATCH is a compare-and-set on what it validated against ─────────
+
+test("a PATCH whose row moved under it is refused, not applied", async () => {
+    // The ceiling for taxDeductibleBase is amount - taxAmount, and a QBO
+    // re-sync can move either between the read and the write. Writing anyway
+    // would store a figure that was legal a moment ago and is not now.
+    const res = await patch({ taxDeductibleBase: 50 });
+    assert.equal(res.status, 200, "control: it writes when nothing moved");
+
+    // Now make the CAS miss the way a concurrent sync would.
+    const original = fakePrisma.expense.updateMany;
+    (fakePrisma.expense as any).updateMany = async () => ({ count: 0 });
+    try {
+        const stale = await patch({ taxDeductibleBase: 50 });
+        assert.equal(stale.status, 409);
+        assert.equal((await stale.json()).code, "STALE_EXPENSE");
+    } finally {
+        (fakePrisma.expense as any).updateMany = original;
+    }
+});
+
+test("the CAS names the values the decision rested on", async () => {
+    await patch({ taxDeductibleBase: 50 });
+    const where = updateArgs?.where as Record<string, unknown>;
+    assert.equal(where.id, "e1");
+    assert.equal(where.amount, 207.74);
+    assert.equal(where.taxAmount, 16.55);
+    assert.equal(where.taxDeductibleBase, null);
 });

@@ -173,14 +173,29 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
-        // The tax-deduction fields are NOT editable here — the PATCH below is
-        // their single writer, because this handler's QBO-mutability guard
-        // excludes exactly the pipeline rows the tax report is made of. A
-        // silent ignore would look like a successful correction.
-        for (const field of ["installedAtCustomer", "taxDeductibleBase"]) {
+        // STRICT ALLOWLIST. Every tax-return field is refused here BY NAME —
+        // PATCH is their single writer, because this handler's QBO-mutability
+        // guard excludes exactly the pipeline rows the tax report is made of.
+        //
+        // Refused rather than ignored: a silent drop looks like a successful
+        // correction, and the caller would believe a deduction was recorded
+        // that never was. `needsTaxReview` is in the list too — it is a
+        // lifecycle flag the server owns, and no client may clear it without
+        // supplying the answer that justifies clearing it.
+        const TAX_FIELDS_OWNED_BY_PATCH = [
+            "taxAmount",
+            "taxAtSource",
+            "needsTaxReview",
+            "installedAtCustomer",
+            "taxDeductibleBase",
+        ];
+        for (const field of TAX_FIELDS_OWNED_BY_PATCH) {
             if (Object.prototype.hasOwnProperty.call(body, field)) {
                 return NextResponse.json(
-                    { error: `Use PATCH on this expense to edit ${field}.` },
+                    {
+                        error: `${field} can't be edited here. Use PATCH on this expense.`,
+                        field,
+                    },
                     { status: 400 },
                 );
             }
@@ -471,9 +486,29 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             }
         }
 
-        const updated = await prisma.expense.update({
-            where: { id },
-            data: {
+        // COMPARE-AND-SET on the VALUES the decision rested on.
+        //
+        // Everything above was validated against the row as it was READ: the
+        // ceiling for `taxDeductibleBase` is `amount - taxAmount`, and a QBO
+        // re-sync can move either between that read and this write. Writing
+        // anyway would store a figure that was legal a moment ago and is not
+        // now — which the database CHECK then refuses (aborting the request) or
+        // which slips through as an overstated deduction.
+        //
+        // The predicate names those inputs rather than a row version, so it
+        // fails ONLY when something the answer depended on actually moved; an
+        // unrelated edit does not force the bookkeeper to redo their work.
+        //
+        // Zero rows means it moved: 409, and the caller re-reads. No automatic
+        // retry — a human decided against numbers that have since changed, so
+        // the ANSWER may be wrong now, not just the write.
+        const casWhere = {
+            id,
+            amount: expense.amount,
+            taxAmount: expense.taxAmount,
+            taxDeductibleBase: expense.taxDeductibleBase,
+        };
+        const data = {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
                 ...(editsBase ? { taxDeductibleBase: nextBase } : {}),
                 ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
@@ -492,9 +527,19 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                         costCodeConfidence: null,
                     }
                     : {}),
-            },
-        });
+        };
+        const written = await prisma.expense.updateMany({ where: casWhere, data });
+        if (written.count === 0) {
+            return NextResponse.json(
+                {
+                    error: "This expense changed while you were editing it. Reopen it and check the figures before saving.",
+                    code: "STALE_EXPENSE",
+                },
+                { status: 409 },
+            );
+        }
 
+        const updated = await prisma.expense.findUnique({ where: { id } });
         return NextResponse.json(updated);
     } catch (error) {
         console.error("Error correcting expense:", error);

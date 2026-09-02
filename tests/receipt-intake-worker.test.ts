@@ -70,7 +70,6 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         dedupWeakKey: null,
         busyPasses: 0,
         lastError: null,
-        suggestedConfidence: null,
         sendAttempted: false,
         claimToken: "claim-1",
         fileSha256: "s".repeat(64),

@@ -17,6 +17,8 @@ import { resolveCostCode, type CostCodingDataSource } from "../src/lib/cost-codi
 // mobile-auth, which throws at import time unless NEXTAUTH_SECRET is set —
 // true in CI, and a unit test has no business needing a JWT secret.
 import { resolveInstalledAtCustomer } from "../src/lib/expense-attribution";
+import { optionalBool } from "../src/lib/receipt-capture-validation";
+import { authorizePhase } from "../src/lib/receipt-intake/late-fields";
 
 // ── the two checks every phase writer must run ─────────────────────────────
 
@@ -101,4 +103,43 @@ test("an explicit answer from the capturer is honoured, both ways", () => {
     // knows, so the app's toggle must survive untouched.
     assert.equal(resolveInstalledAtCustomer(true), true);
     assert.equal(resolveInstalledAtCustomer(false), false);
+});
+
+// ── the two-step upload doors enforce the same capture rules ───────────────
+
+const allow = (project: string, code: string) =>
+    isCostCodeAllowedForProject(phaseSource, project, code);
+
+test("a captured phase with no project to check it against is refused", async () => {
+    // The row would otherwise carry an unvalidated human-authority phase that
+    // booking later copies verbatim onto the Expense.
+    const denial = await authorizePhase(null, "cc-plumb", allow);
+    assert.equal(denial?.status, 400);
+    assert.equal(denial?.body.error, "cost-code-without-project");
+});
+
+test("a captured phase from another job is refused at the door", async () => {
+    const denial = await authorizePhase("job-mesplay", "cc-plumb", allow);
+    assert.equal(denial?.status, 400);
+    assert.equal(denial?.body.error, "cost-code-not-a-phase");
+});
+
+test("no phase at all is fine — the capture is optional", async () => {
+    assert.equal(await authorizePhase("job-mueller", null, allow), null);
+});
+
+test("the job's own phase passes the door gate", async () => {
+    assert.equal(await authorizePhase("job-mueller", "cc-plumb", allow), null);
+});
+
+test("optionalBool is tri-state across JSON and multipart", () => {
+    // Multipart sends strings; JSON sends real booleans. Anything else means
+    // "the caller did not say", which is NOT "no".
+    assert.equal(optionalBool(true), true);
+    assert.equal(optionalBool(false), false);
+    assert.equal(optionalBool("true"), true);
+    assert.equal(optionalBool("false"), false);
+    for (const silent of [undefined, null, "", "yes", 1, {}]) {
+        assert.equal(optionalBool(silent), null, JSON.stringify(silent) ?? "undefined");
+    }
 });

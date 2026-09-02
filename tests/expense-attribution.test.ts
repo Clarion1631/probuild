@@ -17,6 +17,7 @@ import {
     notHumanCodedExpenseWhere,
     resolveExpenseCostCodeId,
     resolveExpenseProjectId,
+    resolveExpenseProjectLabel,
 } from "../src/lib/expense-attribution";
 
 // ── project resolution ──────────────────────────────────────────────────────
@@ -158,4 +159,52 @@ test("notHumanCodedExpenseWhere has an explicit NULL branch", () => {
     assert.deepEqual(branches[0], { costCodeSource: null });
     assert.deepEqual(branches[1], { costCodeSource: { notIn: ["capture", "manual"] } });
     assert.deepEqual([...HUMAN_COST_CODE_SOURCES], ["capture", "manual"]);
+});
+
+// ── the display/routing label, for the readers converted last ──────────────
+
+test("a re-attributed row is LABELLED by the job it is actually on", () => {
+    // schedule-core, automation-events, the ai-review route and the manager
+    // receipt queue all read the estimate. A label that disagrees with the
+    // ledger is worse than none: it is a wrong answer that looks authoritative,
+    // and in the review-alert case it also ROUTES the alert.
+    assert.deepEqual(
+        resolveExpenseProjectLabel({
+            projectId: "job-b",
+            project: { id: "job-b", name: "Mesplay Kitchen" },
+            estimate: { projectId: "job-a", project: { id: "job-a", name: "Mueller Bath" } },
+        }),
+        { projectId: "job-b", projectName: "Mesplay Kitchen" },
+    );
+});
+
+test("it falls back to the estimate for the id and the name TOGETHER", () => {
+    // Taking the id from one row and the name from another would print a real
+    // job's name against a different job's id.
+    assert.deepEqual(
+        resolveExpenseProjectLabel({
+            projectId: null,
+            estimate: { projectId: "job-a", project: { id: "job-a", name: "Mueller Bath" } },
+        }),
+        { projectId: "job-a", projectName: "Mueller Bath" },
+    );
+});
+
+test("a re-attributed row whose direct relation was not selected gives no NAME, not the wrong one", () => {
+    // The estimate's name belongs to the OLD job. Returning it beside the new
+    // id would be the exact mislabel this helper exists to stop.
+    assert.deepEqual(
+        resolveExpenseProjectLabel({
+            projectId: "job-b",
+            estimate: { projectId: "job-a", project: { id: "job-a", name: "Mueller Bath" } },
+        }),
+        { projectId: "job-b", projectName: null },
+    );
+});
+
+test("an unattributed row labels as nothing at all", () => {
+    assert.deepEqual(
+        resolveExpenseProjectLabel({ projectId: null, estimate: { projectId: null, project: null } }),
+        { projectId: null, projectName: null },
+    );
 });

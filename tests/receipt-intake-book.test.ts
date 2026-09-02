@@ -110,6 +110,8 @@ interface Recorder {
     expenses: any[];
     intakeUpdates: any[];
     events: any[];
+    expenseUpdates: any[];
+    existingExpense: any;
 }
 
 function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
@@ -117,7 +119,10 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
     const sendMarks: string[] = [];
     const expenses: any[] = [];
     const intakeUpdates: any[] = [];
+    const expenseUpdates: any[] = [];
     const events: any[] = [];
+    // Set by a test to model a Purchase that is ALREADY booked.
+    const state: { existingExpense: any } = { existingExpense: null };
 
     const tx = {
         project: {
@@ -128,8 +133,9 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
             }),
         },
         expense: {
-            findUnique: async () => null,
+            findUnique: async () => state.existingExpense,
             create: async (args: any) => { expenses.push(args.data); return { id: `exp-${expenses.length}` }; },
+            update: async (args: any) => { expenseUpdates.push(args); return {}; },
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
@@ -155,7 +161,11 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events };
+    return {
+        deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, expenseUpdates,
+        set existingExpense(value: any) { state.existingExpense = value; },
+        get existingExpense() { return state.existingExpense; },
+    };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {

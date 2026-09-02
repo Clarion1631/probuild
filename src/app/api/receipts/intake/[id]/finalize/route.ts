@@ -117,7 +117,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     const { id } = await context.params;
 
-    let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
+    let body: {
+        sha256?: unknown;
+        costCodeId?: unknown;
+        projectId?: unknown;
+        installedAtCustomer?: unknown;
+    } = {};
     try {
         body = await req.json();
     } catch {

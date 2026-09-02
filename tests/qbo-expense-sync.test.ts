@@ -599,13 +599,18 @@ function createFakePrisma(initial: StoredExpense[] = []) {
         // Models the PREDICATE, not just the write: `projectId: null` in the
         // where clause has to be able to match zero rows, because that is the
         // whole guarantee the split-out project fill is buying.
-        async updateMany(args: {
-            where: { id: string; projectId: null };
-            data: { projectId?: string; estimateId: string };
-        }) {
+        // Models the PREDICATE, not just the write — both the attribution fill
+        // (`projectId: null`) and the tax COMPARE-AND-SET have to be able to
+        // match ZERO rows, because that is the whole guarantee they buy.
+        async updateMany(args: { where: Record<string, any>; data: Record<string, any> }) {
             const current = [...rows.values()].find(row => row.id === args.where.id);
             if (!current) return { count: 0 };
-            if ((current.projectId ?? null) !== null) return { count: 0 };
+            const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+            for (const key of ["projectId", "taxAmount", "taxDeductibleBase"]) {
+                if (key in args.where && !eq((current as any)[key], args.where[key])) {
+                    return { count: 0 };
+                }
+            }
             rows.set(current.qbPurchaseId, { ...current, ...args.data });
             return { count: 1 };
         },
@@ -614,6 +619,9 @@ function createFakePrisma(initial: StoredExpense[] = []) {
 
     return {
         rows,
+        // Exposed so a test can model a concurrent writer landing between
+        // the read and the write.
+        expense,
         client: {
             async $transaction<T>(callback: (tx: {
                 expense: typeof expense;
@@ -1638,4 +1646,47 @@ test("a second deactivation of an already-retired row is unchanged", async () =>
         }),
         "unchanged",
     );
+});
+
+test("a tax PATCH landing mid-sync is NOT clobbered — the sync re-plans", async () => {
+    // DETERMINISTIC CONCURRENCY, on the interleaving that actually loses data.
+    //
+    // The sync reads a row whose recorded tax ($500) is larger than the gross
+    // it is about to write ($300), so its plan says "retire the whole
+    // classification and flag it for review". Meanwhile a bookkeeper's PATCH
+    // corrects the tax to $16.55 — perfectly valid against $300.
+    //
+    // Without the compare-and-set the sync writes a plan built from a figure
+    // that no longer exists and wipes the correction. With it, the write misses
+    // and the plan is recomputed against what is really there.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            taxAmount: 500, taxDeductibleBase: null, installedAtCustomer: true,
+        } as any,
+    ]);
+
+    const stored = fake.rows.get("purchase-1") as any;
+    const prePatch = { ...stored };                       // what the sync read
+    fake.rows.set("purchase-1", { ...stored, taxAmount: 16.55 });  // what the PATCH left
+
+    let firstRead = true;
+    const realFindUnique = fake.expense.findUnique;
+    fake.expense.findUnique = async (args: any) => {
+        if (firstRead) {
+            firstRead = false;
+            return prePatch;
+        }
+        return realFindUnique(args);
+    };
+
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 300 }),
+        "updated",
+    );
+    const after = fake.rows.get("purchase-1") as any;
+    assert.equal(after.amount, 300, "the sync's own facts still land");
+    assert.equal(after.taxAmount, 16.55, "the bookkeeper's correction survives");
+    assert.notEqual(after.needsTaxReview, true, "and it is not flagged on a stale premise");
+    assert.equal(after.installedAtCustomer, true, "nor is their tax answer discarded");
 });

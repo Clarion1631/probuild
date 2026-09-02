@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 
 /**
  * Append-only event log behind the Automation Command Center.
@@ -715,12 +716,11 @@ function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: S
         const { exp: newest, fullId, syncedAt } = withSyncedAt[0];
 
         j.syncedExpenseId = newest.id;
-        j.syncedProjectName = newest.estimate?.project?.name ?? null;
+        j.syncedProjectName = resolveExpenseProjectLabel(newest).projectName;
         j.driveFileId = j.driveFileId ?? fullId;
         j.synced = {
             expenseId: newest.id,
-            projectId: newest.estimate?.project?.id ?? null,
-            projectName: newest.estimate?.project?.name ?? null,
+            ...resolveExpenseProjectLabel(newest),
             // Prisma Decimal → cents; guard the conversion, this is display data.
             amountCents: newest.amount != null ? Math.round(Number(newest.amount) * 100) : null,
             vendor: newest.vendor ?? null,
@@ -755,6 +755,10 @@ const SYNCED_EXPENSE_SELECT = {
     createdAt: true,
     qbPurchaseId: true,
     // Expense hangs off the ESTIMATE, not the project directly.
+    // BOTH sides — the register names the job the money is on, not the one
+    // the estimate happens to belong to.
+    projectId: true,
+    project: { select: { id: true, name: true } },
     estimate: { select: { project: { select: { id: true, name: true } } } },
 } as const;
 

@@ -4,6 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI } from "@google/genai";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import { logAutomationEvent, resolveEventFileId } from "@/lib/automation-events";
 import { readIdentifier, resolveReceiptPushEvent, trustedQbPurchaseId } from "@/lib/automation-key-resolver";
 import { decimalToCents, type DecimalLike } from "@/lib/register-merge";
@@ -389,12 +390,20 @@ async function computeReasonableness(
         date: Date | null;
         costCode: { name: string } | null;
         costType: { name: string } | null;
+        projectId: string | null;
+        project: { name: string; status: string } | null;
         estimate: { project: { name: string; status: string } | null } | null;
     },
 ): Promise<ReasonablenessVerdict> {
     try {
         const vendor = expense.vendor ?? pushEvent.vendor;
-        const project = expense.estimate?.project ?? null;
+        // The resolver's rule, applied to the display object: the denormalized
+        // job when the row has one, the estimate's otherwise. An AI review that
+        // names the wrong job is worse than one that names none, because a
+        // reader will act on it.
+        const project = expense.projectId
+            ? expense.project
+            : (expense.estimate?.project ?? null);
         const vendorHistory = vendor ? await vendorExpenseStats(vendor, expense.id) : null;
         return await judgeReasonableness({
             vendor,
@@ -593,6 +602,8 @@ export async function POST(request: Request) {
             date: true,
             costCode: { select: { name: true } },
             costType: { select: { name: true } },
+            projectId: true,
+            project: { select: { name: true, status: true } },
             estimate: { select: { project: { select: { name: true, status: true } } } },
         },
     });
