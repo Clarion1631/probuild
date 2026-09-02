@@ -102,18 +102,20 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         const body = await req.json();
 
-        // #5: an item link must belong to THIS expense's job. Checking only
-        // that the id exists let an edit point the expense at a line item on
-        // another project — which then feeds the item->costCode fallback and
+        // An item link must belong to THIS expense's RESOLVED job. Checking
+        // only that the id exists let an edit point the expense at a line item
+        // on another project, which then feeds the item->costCode fallback and
         // silently books the phase of a different job.
+        //
+        // The `estimateId` escape hatch is gone: for a RE-ATTRIBUTED expense
+        // the estimate belongs to the job it left, so that branch admitted
+        // exactly the cross-job link the check exists to stop. The resolved
+        // project is the only authority.
         if (body.itemId) {
             const itemExists = await prisma.estimateItem.findFirst({
                 where: {
                     id: body.itemId,
-                    OR: [
-                        { estimateId: expense.estimateId },
-                        { estimate: { projectId: resolvedProjectId } },
-                    ],
+                    estimate: { projectId: resolvedProjectId },
                 },
                 select: { id: true },
             });
@@ -476,6 +478,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 ...(editsBase ? { taxDeductibleBase: nextBase } : {}),
                 ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
                 ...(editsTaxAtSource ? { taxAtSource: nextTaxAtSource as boolean } : {}),
+                // A human just answered, so the row is no longer awaiting one.
+                // Cleared in the SAME write as the answer: two statements would
+                // leave a window where the report sees an answered row it still
+                // refuses to count.
+                ...(editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource
+                    ? { needsTaxReview: false }
+                    : {}),
                 ...(editsCostCode
                     ? {
                         costCodeId: nextCostCodeId,

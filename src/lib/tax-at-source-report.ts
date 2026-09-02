@@ -17,6 +17,13 @@
 //     bookkeeper on the expense edit route, and
 //   * `taxAmount > 0` — a zero is an answer (no tax), not an absence.
 //
+// ...and one NEGATIVE condition, which is about the row's LIFECYCLE rather
+// than its content: `needsTaxReview` must be false. A QBO re-sync that moves
+// the gross under a recorded tax retires the classification and raises that
+// flag; until a human answers again the row is not a deduction, and in
+// particular the "a null `taxDeductibleBase` means the whole pre-tax total"
+// rule must not fire on it.
+//
 // TWO THINGS THIS FILE IS FUSSY ABOUT, both because it feeds a tax filing:
 //
 //  1. INTEGER CENTS. Every sum is in whole cents, converted from the Decimal's
@@ -360,6 +367,11 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
             taxAtSource: true,
             installedAtCustomer: true,
             taxAmount: { gt: 0 },
+            // A row whose gross moved under a human's tax answer is NOT a
+            // deduction until a person looks again. Without this the "null
+            // taxDeductibleBase means the whole pre-tax total" rule would claim
+            // the full amount of a receipt nobody has re-checked.
+            needsTaxReview: false,
             date: { gte: filters.from, lt: filters.to },
             // The page promises Shop purchases are excluded; until now nothing
             // enforced it. An overhead receipt mistakenly flagged

@@ -70,3 +70,19 @@ test("a UTC company sees the same calendar day it stored", () => {
     // company must not be shifted either.
     assert.equal(dayKeyInTimeZone(dateOnlyInTimeZone("2026-07-01", "UTC"), "UTC"), "2026-07-01");
 });
+
+test("a @db.Date read back and stored on an Expense keeps its calendar day", () => {
+    // The pipeline path end to end: `ReceiptIntake.txnDate` is `@db.Date`, so
+    // Prisma hands it back as UTC midnight. Phase 1 re-anchors it before it
+    // reaches `Expense.date`; this asserts the RESULT at the quarter boundary
+    // that used to break — 1 July arriving as 2026-07-01T00:00:00Z.
+    const fromDbDate = new Date("2026-07-01T00:00:00.000Z");
+    const calendarDay = fromDbDate.toISOString().slice(0, 10);
+    const stored = dateOnlyInTimeZone(calendarDay, PACIFIC);
+
+    assert.equal(dayKeyInTimeZone(stored, PACIFIC), "2026-07-01");
+    // ...and it lands inside Q3, which the raw DATE instant did not.
+    const q3Start = startOfDateInTimeZone("2026-07-01", PACIFIC);
+    assert.ok(stored >= q3Start, "the re-anchored value is in the quarter");
+    assert.ok(fromDbDate < q3Start, "the raw @db.Date instant was not");
+});

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
@@ -298,7 +299,13 @@ export async function POST(req: NextRequest) {
                         projectId,
                         description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
                         amount: parsed.total as number,
-                        date: parsed.date ? new Date(parsed.date as string) : new Date(),
+                        // A COMPANY CALENDAR DAY, like every other writer. The
+                        // model returns a bare "2026-07-01", and `new Date()` on
+                        // that is UTC midnight — which reads as 30 June in
+                        // Pacific and files the receipt in the wrong quarter.
+                        date: typeof parsed.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
+                            ? dateOnlyInTimeZone(parsed.date, await resolveCompanyTimeZone())
+                            : (parsed.date ? new Date(parsed.date as string) : new Date()),
                         vendor: parsed.vendor as string,
                         status: "Pending",
                     },

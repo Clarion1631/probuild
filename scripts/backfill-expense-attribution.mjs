@@ -67,6 +67,35 @@ const pct = (part, whole) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%
  * that was 0% attributed. Magnitude of money moved is the honest base, and it
  * is the same choice computeProjectVariance makes (job-variance.ts).
  */
+/**
+ * Build the per-expense item lookup the VARIANCE REPORT would use.
+ *
+ * The variance report resolves an item link only within the project's own item
+ * pool (job-variance-db.ts), so an expense pointing at another job's line item
+ * is unattributed there. A single global id->code map does not model that: it
+ * counted cross-job dollars as covered, which is the one direction this
+ * metric must not flatter.
+ *
+ * The returned map is keyed by item id but populated ONLY with items whose
+ * project matches the expense set being measured.
+ */
+export function scopedItemCostCodes(rows, items, allowedCodesByProject) {
+    const scoped = new Map();
+    for (const row of rows) {
+        if (!row.itemId) continue;
+        const item = items.get(row.itemId);
+        if (!item || !item.costCodeId) continue;
+        const projectId = resolveExpenseProjectId(row);
+        // Same two gates the writer applies: the link must not cross jobs, and
+        // the code must be a live phase of that job.
+        if (!projectId || item.projectId !== projectId) continue;
+        const allowed = allowedCodesByProject.get(projectId);
+        if (!allowed || !allowed.has(item.costCodeId)) continue;
+        scoped.set(row.itemId, item.costCodeId);
+    }
+    return scoped;
+}
+
 export function measureCoverage(rows, itemCostCodeById = new Map()) {
     let attributed = 0;
     let unattributed = 0;
@@ -384,8 +413,11 @@ export async function runBackfill({
     // ── the table ───────────────────────────────────────────────────────────
     const scoped = new Set(scopedProjectIds);
     const inScopeExpenses = expenses.filter(e => scoped.has(resolveExpenseProjectId(e) ?? ""));
-    const before = measureCoverage(inScopeExpenses, itemCostCodeById);
-    const after = measureCoverage(projectedRows(inScopeExpenses, plan.codeFills), itemCostCodeById);
+    // Project-scoped and phase-validated, so a cross-job item link stays
+    // unattributed in the metric exactly as it does on the variance page.
+    const coverageItems = scopedItemCostCodes(inScopeExpenses, items, allowedCodesByProject);
+    const before = measureCoverage(inScopeExpenses, coverageItems);
+    const after = measureCoverage(projectedRows(inScopeExpenses, plan.codeFills), coverageItems);
 
     log(`scope: ${scopedProjectIds.length} In Progress customer job(s); overhead project ${overheadProjectId} excluded`);
     log("");
@@ -394,8 +426,8 @@ export async function runBackfill({
     for (const projectId of scopedProjectIds) {
         const rows = inScopeExpenses.filter(e => resolveExpenseProjectId(e) === projectId);
         if (rows.length === 0) continue;
-        const b = measureCoverage(rows, itemCostCodeById);
-        const a = measureCoverage(projectedRows(rows, plan.codeFills), itemCostCodeById);
+        const b = measureCoverage(rows, coverageItems);
+        const a = measureCoverage(projectedRows(rows, plan.codeFills), coverageItems);
         log(
             `  ${(projectNameById.get(projectId) ?? projectId).slice(0, 34).padEnd(34)} ` +
             `${`${a.codedCount}/${a.count}`.padStart(11)} ${money(a.total).padStart(13)}  ` +

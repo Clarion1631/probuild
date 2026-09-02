@@ -1582,3 +1582,60 @@ test("clearing a tax classification is never reported as 'unchanged'", () => {
     );
     assert.equal(plan.data.needsTaxReview, true);
 });
+
+test("deactivation RETIRES the tax classification in the same statement as the zeroing", async () => {
+    // Codex round 7, item 2. Zeroing `amount` while leaving `taxAmount` behind
+    // leaves taxAmount > amount, which the new CHECK refuses — so one
+    // classified receipt would abort the whole sync. And the classification is
+    // about a purchase QuickBooks says never happened.
+    const fake = createFakePrisma([
+        {
+            ...WRITE,
+            id: "expense-1",
+            projectId: "project-1",
+            receiptUrl: null,
+            taxAmount: 16.55,
+            taxAtSource: true,
+            installedAtCustomer: true,
+            taxDeductibleBase: 50,
+            needsTaxReview: true,
+        } as any,
+    ]);
+    assert.equal(
+        await deactivateQboExpense(fake.client, {
+            qbPurchaseId: "purchase-1",
+            qbSyncToken: "1",
+            qbSyncedAt: new Date("2026-07-29T14:00:00.000Z"),
+            reason: "deleted",
+        }),
+        "removed",
+    );
+    const row = fake.rows.get("purchase-1") as any;
+    assert.equal(row.amount, 0);
+    assert.equal(row.taxAmount, null);
+    assert.equal(row.taxAtSource, false);
+    assert.equal(row.installedAtCustomer, null);
+    assert.equal(row.taxDeductibleBase, null);
+    assert.equal(row.needsTaxReview, false, "a vanished purchase is not something to re-check");
+    // The constrained row is legal: tax <= amount and base <= amount - tax.
+    assert.ok(Number(row.taxAmount ?? 0) <= Number(row.amount));
+});
+
+test("a second deactivation of an already-retired row is unchanged", async () => {
+    const retired = {
+        ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+        amount: 0, status: "Reviewed" as const,
+        description: "[QuickBooks import] Removed in QBO (deleted)",
+        qbSyncToken: "1",
+        taxAmount: null, taxAtSource: false, installedAtCustomer: null,
+        taxDeductibleBase: null, needsTaxReview: false,
+    };
+    const fake = createFakePrisma([retired as any]);
+    assert.equal(
+        await deactivateQboExpense(fake.client, {
+            qbPurchaseId: "purchase-1", qbSyncToken: "1",
+            qbSyncedAt: new Date("2026-07-29T15:00:00.000Z"), reason: "deleted",
+        }),
+        "unchanged",
+    );
+});

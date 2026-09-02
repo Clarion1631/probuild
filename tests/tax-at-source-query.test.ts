@@ -168,3 +168,14 @@ test("the query excludes the Shop/overhead bucket, both ways round", async () =>
         AND: [{ projectId: null }, { estimate: { projectId: null } }],
     });
 });
+
+test("a row awaiting re-review is not a deduction", async () => {
+    // Codex round 7, item 3. Without this the "a null taxDeductibleBase means
+    // the whole pre-tax total" rule would claim the FULL amount of a receipt
+    // whose gross moved under a human's tax answer and that nobody has
+    // re-checked.
+    const filters = parseTaxAtSourceFilters({ from: "2026-07-01", to: "2026-09-30" }, PACIFIC);
+    recorded.length = 0;
+    await queryTaxAtSourceRows(filters);
+    assert.equal(recorded[0].where.needsTaxReview, false);
+});

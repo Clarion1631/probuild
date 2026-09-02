@@ -40,16 +40,11 @@ const fakePrisma = {
     },
     estimateItem: {
         findFirst: async (args: { where: Record<string, any> }) => {
-            const { id, OR } = args.where;
-            const item = estimateItems.find(candidate => candidate.id === id);
+            // The route now scopes purely on the RESOLVED project — no
+            // estimateId escape hatch — so the stub models exactly that.
+            const item = estimateItems.find(candidate => candidate.id === args.where.id);
             if (!item) return null;
-            const branches = (OR ?? []) as Record<string, any>[];
-            const ok = branches.some(branch =>
-                branch.estimateId !== undefined
-                    ? branch.estimateId === item.estimateId
-                    : branch.estimate?.projectId === item.projectId,
-            );
-            return ok ? { id: item.id } : null;
+            return args.where.estimate?.projectId === item.projectId ? { id: item.id } : null;
         },
         findUnique: async (args: { where: { id: string } }) => {
             const item = estimateItems.find(candidate => candidate.id === args.where.id);
@@ -107,6 +102,7 @@ beforeEach(() => {
         taxAmount: 16.55,
         taxAtSource: true,
         taxDeductibleBase: null,
+        needsTaxReview: false,
         estimateId: "est-job-1",
         projectId: "job-1",
         estimate: { projectId: "job-1" },
@@ -195,7 +191,9 @@ test("PATCH reaches a QBO-managed row — the population the report is made of",
 
 test("PATCH touches NOTHING but the three ProBuild-only columns", async () => {
     await patch({ installedAtCustomer: true });
-    assert.deepEqual(Object.keys(updateArgs?.data ?? {}), ["installedAtCustomer"]);
+    // `needsTaxReview` rides along because answering IS clearing the flag —
+    // still nothing outside the ProBuild-only set.
+    assert.deepEqual(Object.keys(updateArgs?.data ?? {}), ["installedAtCustomer", "needsTaxReview"]);
     // A caller sending a QBO-synced field is told, not silently ignored.
     const res = await patch({ amount: "1.00" });
     assert.equal(res.status, 400);
@@ -328,4 +326,62 @@ test("a line item from another project is refused", async () => {
 test("a line item on this job's estimate is accepted", async () => {
     assert.equal((await call({ itemId: "item-own" })).status, 200);
     assert.equal(updateArgs?.data.itemId, "item-own");
+});
+
+// ── the needsTaxReview lifecycle (Codex round 7, item 3) ───────────────────
+
+test("a human answer CLEARS needsTaxReview in the same write", async () => {
+    // Two statements would leave a window where the report sees an answered
+    // row it still refuses to count.
+    storedExpense = { ...storedExpense, needsTaxReview: true };
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.installedAtCustomer, true);
+    assert.equal(updateArgs?.data.needsTaxReview, false, "answered, so no longer awaiting one");
+});
+
+test("every tax field clears the flag, and a phase-only edit does not", async () => {
+    storedExpense = { ...storedExpense, needsTaxReview: true };
+    for (const body of [
+        { taxAmount: 10 },
+        { taxAtSource: false },
+        { taxDeductibleBase: 50 },
+        { installedAtCustomer: false },
+    ]) {
+        await patch(body);
+        assert.equal(updateArgs?.data.needsTaxReview, false, JSON.stringify(body));
+    }
+    // A cost-code edit is not an answer to the tax question, so the row stays
+    // flagged — otherwise re-phasing a receipt would quietly re-admit it to the
+    // filing.
+    await patch({ costCodeId: null });
+    assert.equal(updateArgs?.data.needsTaxReview, undefined);
+});
+
+// ── the item link is judged on the RESOLVED job (item 4) ───────────────────
+
+test("a re-attributed expense may take an item from its NEW job", async () => {
+    storedExpense = {
+        ...storedExpense,
+        projectId: "job-1",
+        estimateId: "est-job-2",
+        estimate: { projectId: "job-2" },
+    };
+    estimateItems = [{ id: "item-new-job", estimateId: "est-job-1", projectId: "job-1" }];
+    assert.equal((await call({ itemId: "item-new-job" })).status, 200);
+});
+
+test("...and NOT one from the job it left, even via its own estimate", async () => {
+    // The `estimateId` escape hatch used to admit exactly this: for a
+    // re-attributed row the estimate belongs to the job it left.
+    storedExpense = {
+        ...storedExpense,
+        projectId: "job-1",
+        estimateId: "est-job-2",
+        estimate: { projectId: "job-2" },
+    };
+    estimateItems = [{ id: "item-old-job", estimateId: "est-job-2", projectId: "job-2" }];
+    const res = await call({ itemId: "item-old-job" });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
 });

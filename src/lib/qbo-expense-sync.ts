@@ -532,7 +532,10 @@ type ExpenseTransaction = {
             estimateId: string;
             projectId?: string | null;
             taxAmount?: unknown;
+            taxAtSource?: boolean;
+            installedAtCustomer?: boolean | null;
             taxDeductibleBase?: unknown;
+            needsTaxReview?: boolean;
             amount: unknown;
             vendor: string | null;
             date: Date | null;
@@ -544,7 +547,7 @@ type ExpenseTransaction = {
         }): Promise<unknown>;
         update(args: {
             where: { id: string };
-            data: QboExpenseUpdateData;
+            data: QboExpenseUpdateData | QboExpenseRetirementData;
         }): Promise<unknown>;
         updateMany(args: {
             where: { id: string; projectId: null };
@@ -582,6 +585,24 @@ type ExistingQboExpense =
  * non-QBO field it can carry, and only to clear an allocation the new amount
  * would make impossible — see planQboExpenseUpdate.
  */
+/**
+ * What `deactivateQboExpense` writes. Separate from the update shape because it
+ * is the only path allowed to zero the amount AND retire a tax classification
+ * in one statement — see the comment at its call site.
+ */
+export interface QboExpenseRetirementData {
+    amount: 0;
+    description: string;
+    status: "Reviewed";
+    qbSyncToken?: string | undefined;
+    qbSyncedAt: Date;
+    taxAmount: null;
+    taxAtSource: false;
+    installedAtCustomer: null;
+    taxDeductibleBase: null;
+    needsTaxReview: false;
+}
+
 export type QboExpenseUpdateData = Partial<QboExpenseWrite> & {
     taxDeductibleBase?: null;
     taxAmount?: null;
@@ -821,6 +842,11 @@ export async function deactivateQboExpense(
                 date: true,
                 description: true,
                 status: true,
+                taxAmount: true,
+                taxAtSource: true,
+                installedAtCustomer: true,
+                taxDeductibleBase: true,
+                needsTaxReview: true,
             },
         });
         if (!existing) return "unchanged";
@@ -833,11 +859,30 @@ export async function deactivateQboExpense(
 
         const description = `[QuickBooks import] Removed in QBO (${removal.reason})`;
         const qbSyncToken = removal.qbSyncToken ?? existing.qbSyncToken;
+        // A DELETED PURCHASE HAS NO TAX CLASSIFICATION TO KEEP.
+        //
+        // Zeroing `amount` while leaving `taxAmount` behind leaves
+        // `taxAmount > amount` — which the new CHECK refuses, so the whole sync
+        // transaction would abort on a receipt someone had classified. And the
+        // classification is about a purchase QuickBooks says never happened, so
+        // there is nothing to preserve: it is RETIRED, in the same statement as
+        // the zeroing, or the row is briefly inconsistent in a way the report
+        // can read.
+        //
+        // `needsTaxReview` is cleared rather than set: this is not a figure a
+        // human needs to re-check, it is a purchase that is gone.
+        const classificationIsRetired =
+            existing.taxAmount === null &&
+            existing.taxAtSource === false &&
+            existing.installedAtCustomer === null &&
+            existing.taxDeductibleBase === null &&
+            existing.needsTaxReview === false;
         if (
             Number(existing.amount) === 0 &&
             existing.description === description &&
             existing.qbSyncToken === qbSyncToken &&
-            existing.status === "Reviewed"
+            existing.status === "Reviewed" &&
+            classificationIsRetired
         ) {
             return "unchanged";
         }
@@ -849,6 +894,11 @@ export async function deactivateQboExpense(
                 status: "Reviewed",
                 qbSyncToken: qbSyncToken ?? undefined,
                 qbSyncedAt: removal.qbSyncedAt,
+                taxAmount: null,
+                taxAtSource: false,
+                installedAtCustomer: null,
+                taxDeductibleBase: null,
+                needsTaxReview: false,
             },
         });
         return "removed";

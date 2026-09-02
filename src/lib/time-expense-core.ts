@@ -3,6 +3,7 @@ import { resolveCostCode } from "./cost-coding";
 import { prismaCostCodingDataSource } from "./cost-coding-db";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { prismaPhaseDataSource } from "./project-phases-db";
+import { resolveExpenseProjectId } from "./expense-attribution";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
@@ -267,13 +268,20 @@ export async function tagExpensesToChangeOrderCore(
         select: {
             id: true,
             qbPurchaseId: true,
+            projectId: true,
             estimate: { select: { projectId: true } },
             invoiceId: true,
             invoicedAt: true,
         },
     });
     if (rows.length !== new Set(input.ids).size) throw new Error("One or more expenses were not found");
-    if (rows.some((row) => row.estimate.projectId !== changeOrder.projectId)) throw new Error("All expenses must belong to the change order project");
+    // Resolved, not read off the estimate. A re-attributed expense belongs to
+    // the job its `projectId` names — checking the estimate would let it be
+    // tagged to a change order on the job it USED to be on, and would refuse a
+    // legitimate tag on the job it is actually on now.
+    if (rows.some((row) => resolveExpenseProjectId(row) !== changeOrder.projectId)) {
+        throw new Error("All expenses must belong to the change order project");
+    }
     for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
     const result = await prisma.expense.updateMany({

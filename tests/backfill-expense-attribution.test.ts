@@ -14,6 +14,7 @@ import {
     projectedRows,
     remainderCsv,
     runBackfill,
+    scopedItemCostCodes,
 } from "../scripts/backfill-expense-attribution.mjs";
 
 const OVERHEAD_ID = "overhead-project";
@@ -613,4 +614,40 @@ test("coverage still counts a genuinely uncoded row as a gap", () => {
     const rows = [{ costCodeId: null, itemId: null, amount: 100 }];
     assert.equal(measureCoverage(rows, new Map()).unattributed, 100);
     assert.equal(measureCoverage(rows, new Map()).codedCount, 0);
+});
+
+test("coverage keeps CROSS-JOB item dollars unattributed", () => {
+    // Codex round 7, item 5. The variance report resolves an item link only
+    // within the project's own item pool, so an expense pointing at another
+    // job's line item is unattributed there. A global id->code map counted
+    // those dollars as covered — flattering the one number this metric exists
+    // to report honestly.
+    const rows = [
+        expense({ id: "cross", projectId: "job-1", itemId: "item-elsewhere", amount: 500 }),
+        expense({ id: "own", projectId: "job-1", itemId: "item-own", amount: 300 }),
+    ];
+    const items = new Map([
+        ["item-elsewhere", { costCodeId: "cc-frame", estimateId: "est-2", projectId: "job-2" }],
+        ["item-own", { costCodeId: "cc-plumb", estimateId: "est-1", projectId: "job-1" }],
+    ]);
+    const scoped = scopedItemCostCodes(rows, items, ALL_PHASES);
+
+    assert.equal(scoped.has("item-own"), true, "the same-job link counts");
+    assert.equal(scoped.has("item-elsewhere"), false, "the cross-job link does not");
+
+    const coverage = measureCoverage(rows, scoped);
+    assert.equal(coverage.attributed, 300);
+    assert.equal(coverage.unattributed, 500, "the cross-job dollars stay a gap");
+});
+
+test("coverage ignores an item whose code is not a live phase of the job", () => {
+    // Same gate the writer applies: a code from a draft estimate is not a
+    // phase, so it cannot count as coverage either.
+    const rows = [expense({ id: "e1", projectId: "job-1", itemId: "item-draft", amount: 100 })];
+    const items = new Map([
+        ["item-draft", { costCodeId: "cc-retired", estimateId: "est-1", projectId: "job-1" }],
+    ]);
+    const scoped = scopedItemCostCodes(rows, items, ALL_PHASES);
+    assert.equal(scoped.size, 0);
+    assert.equal(measureCoverage(rows, scoped).unattributed, 100);
 });
