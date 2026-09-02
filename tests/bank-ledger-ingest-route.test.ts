@@ -138,7 +138,10 @@ test("bank-ledger ingest: happy path", async t => {
             ],
         }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0 });
+        // `adopted` (Phase 2): how many lines attached to a canonical row the QBO
+        // pull had already minted, instead of minting a twin. 0 here — this fake
+        // has no QBO-minted lines to adopt.
+        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0, adopted: 0 });
         assert.equal(createStatementImportCalls.length, 1);
         const call = createStatementImportCalls[0] as { account: string; lines: Array<{ normalizedPayee: string }> };
         assert.equal(call.account, "WTB-0723");
@@ -229,7 +232,10 @@ test("bank-ledger ingest: happy path", async t => {
                 { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
             ],
         }));
-        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0 });
+        // `adopted` (Phase 2): how many lines attached to a canonical row the QBO
+        // pull had already minted, instead of minting a twin. 0 here — this fake
+        // has no QBO-minted lines to adopt.
+        assert.deepEqual(await res.json(), { ok: true, statementImportId: "stmt-1", inserted: 2, existing: 0, adopted: 0 });
         const call = createStatementImportCalls[0] as { lines: Array<{ sequence: number }> };
         assert.equal(call.lines.length, 2);
         assert.notEqual(call.lines[0].sequence, call.lines[1].sequence);

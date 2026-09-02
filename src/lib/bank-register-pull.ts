@@ -93,30 +93,59 @@ export interface ConvertedRegisterRows {
     lines: BankRegisterIngestLine[];
     /** Rows with no transaction identity (balance/summary lines). */
     skipped: number;
-    /** Repeat qbTxnIds collapsed to one observation. */
+    /** Repeat qbTxnIds with IDENTICAL content, collapsed to one observation. */
     collapsed: number;
+    /**
+     * Repeat qbTxnIds with DIFFERENT content. Two rows claiming the same
+     * durable identity with different dates/amounts/descriptors cannot both be
+     * right, and neither is posted.
+     */
+    conflicts: string[];
+}
+
+/** The content that makes two rows under one qbTxnId the same observation. */
+function lineContent(line: BankRegisterIngestLine): string {
+    return JSON.stringify([line.postedDate, line.amountCents, line.rawDescriptor, line.checkNumber]);
 }
 
 /**
  * Convert a whole register fetch into ingest lines. PURE.
  *
  * A qbTxnId must appear at most once per request — the ingest route's own
- * duplicate check 400s the whole batch otherwise. QBO can emit the same txn
- * twice in a GL when it has multiple account-affecting splits; those are the
- * SAME observation, so the first wins and the rest are counted, not summed
- * (the amounts are per-row and identical rows are true duplicates).
+ * duplicate check 409s the whole batch otherwise. QBO can emit the same txn
+ * twice in a GL when it has multiple account-affecting splits.
+ *
+ * CONTENT-COMPARED, not first-wins. Identical repeats really are the same
+ * observation and collapse to one. DIVERGENT repeats are a different animal:
+ * picking the first is a guess, and it is the guess that hides a QuickBooks
+ * restatement — exactly the thing the ingest route's 409 contract exists to
+ * surface. Those ids are dropped from the payload (they cannot be represented
+ * as one observation) and reported in `conflicts`, which the cron turns into a
+ * 500 so the platform flags it for a human.
  */
 export function convertRegisterRows(rows: readonly BankRegisterRowLike[]): ConvertedRegisterRows {
-    const byTxnId = new Map<string, BankRegisterIngestLine>();
+    const byTxnId = new Map<string, { line: BankRegisterIngestLine; content: string }>();
+    const conflicts = new Set<string>();
     let skipped = 0;
     let collapsed = 0;
     for (const row of rows) {
         const line = registerRowToIngestLine(row);
         if (!line) { skipped++; continue; }
-        if (byTxnId.has(line.qbTxnId)) { collapsed++; continue; }
-        byTxnId.set(line.qbTxnId, line);
+        const content = lineContent(line);
+        const prior = byTxnId.get(line.qbTxnId);
+        if (!prior) { byTxnId.set(line.qbTxnId, { line, content }); continue; }
+        if (prior.content === content) { collapsed++; continue; }
+        conflicts.add(line.qbTxnId);
     }
-    return { lines: [...byTxnId.values()], skipped, collapsed };
+    // A conflicting id is posted by nobody: not the first sighting, not the
+    // second. Half of a contradiction is still a guess.
+    for (const qbTxnId of conflicts) byTxnId.delete(qbTxnId);
+    return {
+        lines: [...byTxnId.values()].map(entry => entry.line),
+        skipped,
+        collapsed,
+        conflicts: [...conflicts].sort(),
+    };
 }
 
 export function chunkLines<T>(items: readonly T[], size: number): T[][] {
@@ -151,6 +180,14 @@ export interface BankRegisterPullDependencies {
     ingest(account: string, lines: BankRegisterIngestLine[]): Promise<BankRegisterIngestResult>;
     /** Runs the reconcile step for the account. Errors here never fail the pull. */
     reconcile(account: string): Promise<{ linked: number; proposed: number } | null>;
+    /**
+     * Mints canonical BankLines from still-unlinked QBO observations
+     * (Justin decision 3). Optional and OFF by default: the caller only
+     * supplies it when `BANK_LINE_MINT_FROM_QBO === "true"`. Runs after
+     * reconcile, so anything the statement already covers is linked and no
+     * longer a mint candidate.
+     */
+    mintFromQbo?(account: string): Promise<{ minted: number; skipped: Record<string, number> } | null>;
     now?(): number;
     account?: string;
     days?: number;
@@ -171,8 +208,16 @@ export interface BankRegisterPullSummary {
     existing: number;
     /** Set when a batch came back non-OK; later batches are not attempted. */
     error?: string;
-    conflictQbTxnId?: string;
+    /**
+     * Every qbTxnId this run refused to post: divergent repeats inside the
+     * fetch, plus the id the ingest route 409'd on, if any. A non-empty list
+     * makes the cron answer 500 — it is a QuickBooks restatement, and a human
+     * has to look. Batches that already committed stay committed; re-running is
+     * a no-op for them.
+     */
+    conflictQbTxnIds?: string[];
     reconciled?: { linked: number; proposed: number } | null;
+    minted?: { minted: number; skipped: Record<string, number> } | null;
 }
 
 /**
@@ -194,7 +239,7 @@ export async function runBankRegisterPull(
     const startDate = ymdDaysAgo(days - 1, nowMs);
 
     const fetched = await dependencies.fetchRows(startDate, endDate);
-    const { lines, skipped, collapsed } = convertRegisterRows(fetched.rows);
+    const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
 
     const summary: BankRegisterPullSummary = {
         ok: true,
@@ -209,6 +254,16 @@ export async function runBankRegisterPull(
         inserted: 0,
         existing: 0,
     };
+    // Divergent repeats inside the fetch are already a conflict, and the run is
+    // already failed — but the NON-conflicting lines still post. They are good
+    // evidence, the ingest is idempotent, and holding a whole night's register
+    // hostage to one restated transaction would starve the matcher for a reason
+    // that has nothing to do with the other rows.
+    if (conflicts.length > 0) {
+        summary.ok = false;
+        summary.error = "qbo-duplicate-conflict";
+        summary.conflictQbTxnIds = [...conflicts];
+    }
     if (lines.length === 0) return summary;
 
     for (const batch of chunkLines(lines, BANK_REGISTER_CHUNK_SIZE)) {
@@ -220,7 +275,9 @@ export async function runBankRegisterPull(
         }
         summary.ok = false;
         summary.error = body?.reason ?? `http-${status}`;
-        if (status === 409 && body?.qbTxnId) summary.conflictQbTxnId = body.qbTxnId;
+        if (body?.qbTxnId) {
+            summary.conflictQbTxnIds = [...new Set([...(summary.conflictQbTxnIds ?? []), body.qbTxnId])];
+        }
         break;
     }
 
@@ -232,6 +289,18 @@ export async function runBankRegisterPull(
     } catch (error) {
         summary.reconciled = null;
         console.error("[bank-register-pull] reconcile failed", error instanceof Error ? error.message : "UnknownError");
+    }
+
+    // Minting runs AFTER reconcile, never before: an observation the statement
+    // already covers gets linked first and is then no longer a mint candidate,
+    // which is what keeps one transaction on one canonical line.
+    if (dependencies.mintFromQbo) {
+        try {
+            summary.minted = await dependencies.mintFromQbo(account);
+        } catch (error) {
+            summary.minted = null;
+            console.error("[bank-register-pull] mint failed", error instanceof Error ? error.message : "UnknownError");
+        }
     }
 
     return summary;

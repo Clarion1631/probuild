@@ -10,6 +10,7 @@ import {
     isValidCalendarDate,
     isSafeCents,
 } from "@/lib/bank-ledger";
+import { planStatementAdoption } from "@/lib/bank-line-mint";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -197,7 +198,7 @@ export interface BankLedgerIngestHandlerDependencies {
         closingCents: number;
         contentHash: string;
         lines: StatementImportLineInput[];
-    }): Promise<{ statementImportId: string; inserted: number }>;
+    }): Promise<{ statementImportId: string; inserted: number; adopted?: number }>;
 
     /** Returns the currently-stored content for each already-seen qbTxnId (whatever is present in the input list), keyed by qbTxnId — used to detect a retried id with DIFFERENT content. */
     findExistingQboObservations(account: string, qbTxnIds: string[]): Promise<Map<string, ExistingQboObservation>>;
@@ -298,7 +299,9 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
 
         try {
             const result = await dependencies.createStatementImport({ account, periodStart, periodEnd, openingCents, closingCents, contentHash, lines });
-            return NextResponse.json({ ok: true, statementImportId: result.statementImportId, inserted: result.inserted, existing: 0 });
+            // `adopted` says how many lines attached to a canonical row the QBO
+            // pull had already minted, instead of minting a twin.
+            return NextResponse.json({ ok: true, statementImportId: result.statementImportId, inserted: result.inserted, existing: 0, adopted: result.adopted ?? 0 });
         } catch (error) {
             if (error instanceof StatementImportRaceError) {
                 const raced = await resolveExisting();
@@ -454,6 +457,49 @@ const handlers = createBankLedgerIngestHandlers({
     createStatementImport: async input => {
         try {
             return await prisma.$transaction(async tx => {
+                // ADOPTION (Justin, decision 3). The nightly QBO pull may have
+                // already minted a canonical line for some of these
+                // transactions. Minting a second one would be the dual-identity
+                // failure that the "statements only" rule used to prevent, so a
+                // statement line that matches a QBO-minted line EXACTLY
+                // (account+date+amount+payee+check#) attaches to it and flips
+                // sourceOfRecord to STATEMENT instead of creating a twin.
+                //
+                // Read inside the transaction, so a mint committing between a
+                // pre-read and this write can't be missed.
+                const adoptable = await tx.bankLine.findMany({
+                    where: {
+                        account: input.account,
+                        sourceOfRecord: "QBO",
+                        postedDate: { gte: new Date(input.periodStart), lte: new Date(input.periodEnd) },
+                    },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true },
+                });
+                const adoptionPlan = planStatementAdoption(
+                    input.lines.map(line => ({
+                        sequence: line.sequence,
+                        postedDate: line.postedDate,
+                        amountCents: line.amountCents,
+                        normalizedPayee: line.normalizedPayee,
+                        checkNumber: line.checkNumber,
+                    })),
+                    adoptable.map(row => ({
+                        id: row.id,
+                        account: row.account,
+                        postedDate: row.postedDate.toISOString().slice(0, 10),
+                        amountCents: row.amountCents,
+                        normalizedPayee: row.normalizedPayee,
+                        checkNumber: row.checkNumber,
+                        sourceOfRecord: row.sourceOfRecord,
+                    })),
+                    input.account,
+                );
+                if (adoptionPlan.ambiguous.length > 0) {
+                    // Reported, never guessed: those lines mint as they always
+                    // did, and the stale QBO line stays visible for a human.
+                    console.warn("[bank-ledger/ingest] ambiguous adoption groups", adoptionPlan.ambiguous.length);
+                }
+
                 const statementImport = await tx.statementImport.create({
                     data: {
                         account: input.account,
@@ -469,22 +515,42 @@ const handlers = createBankLedgerIngestHandlers({
                 // Pre-generate every id so both tables can be bulk-inserted with
                 // createMany (2 statements total) instead of one create() per
                 // line per table (2N serial round-trips) — see the module
-                // comment / MAX_LINES_PER_REQUEST for why that mattered.
-                const bankLineIds = input.lines.map(() => randomUUID());
+                // comment / MAX_LINES_PER_REQUEST for why that mattered. An
+                // ADOPTED line reuses the QBO-minted line's id instead, so the
+                // observation below attaches to the existing canonical row.
+                const bankLineIds = input.lines.map(line => adoptionPlan.adopt.get(line.sequence) ?? randomUUID());
+                const mintedIndexes = input.lines
+                    .map((line, i) => (adoptionPlan.adopt.has(line.sequence) ? -1 : i))
+                    .filter(i => i >= 0);
 
                 await tx.bankLine.createMany({
-                    data: input.lines.map((line, i) => ({
-                        id: bankLineIds[i],
-                        account: input.account,
-                        postedDate: new Date(line.postedDate),
-                        amountCents: line.amountCents,
-                        rawDescriptor: line.rawDescriptor,
-                        normalizedPayee: line.normalizedPayee,
-                        checkNumber: line.checkNumber,
-                        state: line.exception ? "EXCEPTION" : "POSTED",
-                        exceptionReason: line.exception ? "empty-normalized-payee" : null,
-                    })),
+                    data: mintedIndexes.map(i => {
+                        const line = input.lines[i];
+                        return {
+                            id: bankLineIds[i],
+                            account: input.account,
+                            postedDate: new Date(line.postedDate),
+                            amountCents: line.amountCents,
+                            rawDescriptor: line.rawDescriptor,
+                            normalizedPayee: line.normalizedPayee,
+                            checkNumber: line.checkNumber,
+                            state: line.exception ? "EXCEPTION" : "POSTED",
+                            exceptionReason: line.exception ? "empty-normalized-payee" : null,
+                        };
+                    }),
                 });
+
+                // The statement now owns every line it adopted. `amountCents`
+                // is immutable by trigger and identical by construction (it is
+                // part of the match key), so this touches only the flag and the
+                // descriptor the statement is authoritative for.
+                const adoptedIds = [...adoptionPlan.adopt.values()];
+                if (adoptedIds.length > 0) {
+                    await tx.bankLine.updateMany({
+                        where: { id: { in: adoptedIds }, sourceOfRecord: "QBO" },
+                        data: { sourceOfRecord: "STATEMENT" },
+                    });
+                }
 
                 await tx.bankLineObservation.createMany({
                     data: input.lines.map((line, i) => ({
@@ -502,7 +568,7 @@ const handlers = createBankLedgerIngestHandlers({
                     })),
                 });
 
-                return { statementImportId: statementImport.id, inserted: input.lines.length };
+                return { statementImportId: statementImport.id, inserted: input.lines.length, adopted: adoptedIds.length };
             });
         } catch (error) {
             if (isUniqueConstraintError(error)) throw new StatementImportRaceError();

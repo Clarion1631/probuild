@@ -268,7 +268,7 @@ test("runBankRegisterPull: a QBO restatement stops the run and is reported, neve
     const summary = await runBankRegisterPull(pullDeps(store, restated, []));
     assert.equal(summary.ok, false);
     assert.equal(summary.error, "qbo-txn-conflict");
-    assert.equal(summary.conflictQbTxnId, "6625");
+    assert.deepEqual(summary.conflictQbTxnIds, ["6625"]);
     assert.equal(store.stored.get("6625"), JSON.stringify(["2026-08-12", -12_345, "LOWES #02516 Expense", null]),
         "the stored observation is never silently overwritten");
 });
@@ -284,4 +284,68 @@ test("runBankRegisterPull: a reconcile failure never fails the pull", async () =
     assert.equal(summary.ok, true);
     assert.equal(summary.inserted, 3);
     assert.equal(summary.reconciled, null);
+});
+
+test("divergent repeats under one qbTxnId are a CONFLICT, never first-wins", async t => {
+    const divergent: BankRegisterRowLike[] = [
+        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", amountCents: -12_345 },
+        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", amountCents: -99_999 },
+        { date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", amountCents: -500 },
+    ];
+
+    await t.test("neither sighting is posted — half a contradiction is still a guess", () => {
+        const result = convertRegisterRows(divergent);
+        assert.deepEqual(result.conflicts, ["6625"]);
+        assert.deepEqual(result.lines.map(l => l.qbTxnId), ["6610"]);
+        assert.equal(result.collapsed, 0, "a divergent repeat is not a collapse");
+    });
+
+    await t.test("identical repeats still collapse and are NOT conflicts", () => {
+        const result = convertRegisterRows(FIVE_ROW_FIXTURE);
+        assert.deepEqual(result.conflicts, []);
+        assert.equal(result.collapsed, 1);
+    });
+
+    await t.test("the good rows still post, and the run fails with the ids", async () => {
+        const store = fakeIngestStore();
+        const summary = await runBankRegisterPull(pullDeps(store, divergent, []));
+        assert.equal(summary.ok, false);
+        assert.equal(summary.error, "qbo-duplicate-conflict");
+        assert.deepEqual(summary.conflictQbTxnIds, ["6625"]);
+        assert.equal(summary.inserted, 1, "the non-conflicting row is good evidence and still lands");
+        assert.equal(store.stored.has("6625"), false, "the contradicted id is stored by nobody");
+    });
+});
+
+test("the mint step runs only when the caller supplies it, and after reconcile", async () => {
+    const store = fakeIngestStore();
+    const order: string[] = [];
+
+    const withoutMint = await runBankRegisterPull(pullDeps(store, FIVE_ROW_FIXTURE, []));
+    assert.equal(withoutMint.minted, undefined, "absent dependency = feature off, no branch to get wrong");
+
+    const store2 = fakeIngestStore();
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false }),
+        ingest: store2.ingest,
+        reconcile: async () => { order.push("reconcile"); return { linked: 1, proposed: 1 }; },
+        mintFromQbo: async () => { order.push("mint"); return { minted: 2, skipped: { tooRecent: 1 } }; },
+    });
+    assert.deepEqual(order, ["reconcile", "mint"], "an observation the statement covers must be linked BEFORE it is a mint candidate");
+    assert.deepEqual(summary.minted, { minted: 2, skipped: { tooRecent: 1 } });
+});
+
+test("a mint failure never fails the pull — the observations are already stored", async () => {
+    const store = fakeIngestStore();
+    const summary = await runBankRegisterPull({
+        now: () => Date.parse("2026-08-12T02:00:00Z"),
+        fetchRows: async () => ({ rows: FIVE_ROW_FIXTURE, stale: false }),
+        ingest: store.ingest,
+        reconcile: async () => ({ linked: 0, proposed: 0 }),
+        mintFromQbo: async () => { throw new Error("pool exhausted"); },
+    });
+    assert.equal(summary.ok, true);
+    assert.equal(summary.inserted, 3);
+    assert.equal(summary.minted, null);
 });
