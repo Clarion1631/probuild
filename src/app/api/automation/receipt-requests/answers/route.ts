@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
-import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, isDurableArtifactUrl } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, driveFileIdFromUrl, isDurableArtifactUrl } from "@/lib/receipt-requests";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
@@ -140,11 +140,21 @@ export async function POST(request: Request) {
             { status: 422 },
         );
     }
-    // The caller's link if it is a durable one, else Drive's own — both are
-    // display data hanging off the id, which is the identity that was verified.
-    const artifactUrl = isDurableArtifactUrl(body.pdf_url)
+    /**
+     * THE LINK MUST NAME THE FILE WE JUST VERIFIED.
+     *
+     * `pdf_id` is proved against Drive; `pdf_url` was not proved against
+     * anything. Storing the caller's link merely because it was durable-looking
+     * meant the id and the URL need never describe the same object — the id
+     * passes the probe, and the link a human actually clicks a year later can
+     * point somewhere else entirely. So the caller's URL is accepted only when
+     * the file id inside it IS `pdfId`; otherwise the probed `webViewLink`,
+     * which came from the verification itself, is what gets stored.
+     */
+    const callerUrl = isDurableArtifactUrl(body.pdf_url) && driveFileIdFromUrl(body.pdf_url) === pdfId
         ? (body.pdf_url as string).slice(0, MAX_URL_LEN)
-        : (probe.webViewLink ?? null);
+        : null;
+    const artifactUrl = callerUrl ?? probe.webViewLink ?? null;
 
     // RECORD FIRST, CLEAR ONLY IF IT COMMITTED.
     //

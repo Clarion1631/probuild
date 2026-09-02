@@ -381,6 +381,40 @@ export function isDurableArtifactUrl(value: unknown): value is string {
     return false;
 }
 
+/**
+ * The Drive file id a Drive URL points at, or null if it does not name one.
+ *
+ * A durable-looking URL is NOT evidence about a particular file. The bridge
+ * verifies a `pdf_id` with Drive and then stores a caller-supplied `pdf_url`
+ * beside it; without this check the two need not describe the same object, so a
+ * caller could pass a real id it owns and a link to somebody else's document —
+ * and the link is what a human clicks a year later. The stored URL must
+ * therefore either BE the probed one or resolve to the id that was verified.
+ *
+ * Covers the shapes Drive and Docs actually mint:
+ *   /file/d/<id>/view, /document/d/<id>/edit, /drive/folders/<id>,
+ *   /open?id=<id>, /uc?id=<id>&export=download.
+ */
+export function driveFileIdFromUrl(value: unknown): string | null {
+    if (typeof value !== "string" || value.length === 0 || value.length > 2_000) return null;
+    let parsed: URL;
+    try {
+        parsed = new URL(value);
+    } catch {
+        return null;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "drive.google.com" && host !== "docs.google.com") return null;
+    const fromQuery = parsed.searchParams.get("id");
+    if (fromQuery && DRIVE_FILE_ID.test(fromQuery)) return fromQuery;
+    const path = parsed.pathname.match(/\/d\/([^/]+)/) ?? parsed.pathname.match(/\/folders\/([^/]+)/);
+    if (path && DRIVE_FILE_ID.test(path[1])) return path[1];
+    return null;
+}
+
+/** The id shape Drive uses. Mirrors isDriveFileId in google-drive.ts, which cannot be imported here (googleapis). */
+const DRIVE_FILE_ID = /^[A-Za-z0-9_-]{10,200}$/;
+
 /** `"pb-<bankLineId>"` — the identity the Chat card, the sweep, and Beverly's affidavit PDF all carry. */
 export function receiptRequestFingerprint(bankLineId: string): string {
     return `pb-${bankLineId}`;

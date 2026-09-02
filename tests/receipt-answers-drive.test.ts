@@ -201,3 +201,58 @@ test("Drive is never asked about a body that cannot carry an artifact", async ()
     assert.equal((await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: "x" })).status, 422);
     assert.deepEqual(probedIds, [], "no Drive call on any of those paths");
 });
+
+test("a caller URL naming a DIFFERENT file is refused — the link must be the id we verified", async () => {
+    // `pdf_id` is proved against Drive; `pdf_url` is not proved against
+    // anything. Storing a durable-looking link that points somewhere else means
+    // the row's identity and the link a human clicks a year later describe two
+    // different documents — and only one of them was ever checked.
+    reset();
+    const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink };
+    const someoneElse = "1AAAAAAAAAAAAAAAAAAAA";
+    const res = await post({
+        fingerprint: "pb-bl-1",
+        signed: true,
+        pdf_id: FILE_ID,
+        pdf_url: `https://drive.google.com/file/d/${someoneElse}/view`,
+    });
+    assert.equal(res.status, 200);
+    const details = JSON.parse(writes[0].displayDetails as string);
+    assert.equal(details.pdfId, FILE_ID);
+    assert.equal(details.pdfUrl, probedLink, "the probed link, not the caller's");
+});
+
+test("a durable URL that names no file at all is refused too", async () => {
+    // Supabase Storage and googleusercontent pass isDurableArtifactUrl, and
+    // neither can prove anything about a Drive id. Durability is not identity.
+    reset();
+    const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink };
+    const res = await post({
+        fingerprint: "pb-bl-1",
+        signed: true,
+        pdf_id: FILE_ID,
+        pdf_url: "https://ghzdbzdnwjxazvmcefbh.supabase.co/storage/v1/object/public/memos/whatever.pdf",
+    });
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(writes[0].displayDetails as string).pdfUrl, probedLink);
+});
+
+test("an alternate Drive shape for the SAME id is still accepted", async () => {
+    // The rule is identity, not string equality: /open?id=, /uc?id= and
+    // /file/d/<id>/ all name the file, and refusing them would throw away a
+    // perfectly good link the forwarder had.
+    reset();
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null };
+    for (const url of [
+        `https://drive.google.com/open?id=${FILE_ID}`,
+        `https://drive.google.com/uc?id=${FILE_ID}&export=download`,
+        `https://docs.google.com/document/d/${FILE_ID}/edit`,
+    ]) {
+        writes = [];
+        const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, pdf_url: url });
+        assert.equal(res.status, 200);
+        assert.equal(JSON.parse(writes[0].displayDetails as string).pdfUrl, url, url);
+    }
+});

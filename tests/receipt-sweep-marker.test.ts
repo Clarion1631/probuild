@@ -145,7 +145,9 @@ test("a changed component is replanned, and never committed from a stale plan", 
     // Bounded, and the give-up is an OPEN chase, not a close.
     assert.match(source, /const MAX_COMPONENT_REPLANS = 3;/);
     assert.match(source, /for \(let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt\+\+\)/);
-    assert.match(source, /return \{ summary: emptySummary\(\), undecided: batch\.length, replans \};/);
+    // ...and it is reported as CONTENDED as well as undecided, which is what
+    // stops the run stamping a completion over a component nobody reconciled.
+    assert.match(source, /return \{ summary: emptySummary\(\), undecided: batch\.length, contended: batch\.length, replans \};/);
     // Both passes go through the replanning wrapper.
     const wrapped = source.match(/await processBatchWithReplan\(/g) ?? [];
     assert.equal(wrapped.length, 2, "the open-issue pass and the line pass");

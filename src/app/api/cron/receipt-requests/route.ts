@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { resolveCompanyTimeZone, startOfDateInTimeZone } from "@/lib/company-timezone";
+import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
 import {
     evaluateReviewIssue,
@@ -20,7 +21,7 @@ import {
     componentTouchesBoundary,
     componentVersionOf,
     componentVersionsMatch,
-    loadComponentToClosure,
+    loadComponentToClosure,
     groupCompetingLines,
     isComponentKey,
     pageComponents,
@@ -129,15 +130,36 @@ export type { SweepPhase };
  * on the failure, and the phase has to keep pointing at it or the next resume
  * would step over the row that failed — the same "silently never chased" bug
  * the cursor rule exists to prevent.
+ *
+ * CONTENDED WORK KEEPS THE CYCLE OPEN TOO, and for a sharper reason than an
+ * error does. A component that ran out of replans got NO verdict: it was not
+ * opened, not closed, and not counted as failed. Reporting the cycle "done"
+ * there stamps `chaserCompletedAt`, which is the one signal the cards cron
+ * waits for — so the morning card would be built from an issue set that was
+ * never reconciled, asking for receipts already sent and staying silent about
+ * the ones that are genuinely missing. The phase stays on the pass that hit the
+ * contention so the next `?continue=1` run redoes it; a component contended
+ * because a human is editing it settles within minutes.
+ *
+ * Only CONTENTION counts here, not every `undecided` line. A line outside the
+ * loaded evidence span, or one whose competing set is too large to load, is a
+ * STABLE non-verdict: the next run reproduces it exactly, so blocking on it
+ * would stall the cards for good rather than for one cycle. Those stay open,
+ * reported, and visible — which is the safe direction — while the cycle is
+ * allowed to complete.
  */
 export function sweepPhaseAfter(run: {
     openExhausted: boolean;
     openErrors: number;
+    /** Components that ran out of replans in the open-issue pass. */
+    openContended?: number;
     lineExhausted: boolean;
     lineErrors: number;
+    /** Components that ran out of replans in the line pass. */
+    lineContended?: number;
 }): SweepPhase {
-    if (!run.openExhausted || run.openErrors > 0) return "open-issues";
-    if (!run.lineExhausted || run.lineErrors > 0) return "lines";
+    if (!run.openExhausted || run.openErrors > 0 || (run.openContended ?? 0) > 0) return "open-issues";
+    if (!run.lineExhausted || run.lineErrors > 0 || (run.lineContended ?? 0) > 0) return "lines";
     return "done";
 }
 
@@ -291,10 +313,21 @@ export type EvaluateFn = (
  * and the caller must neither advance its cursor past it nor call the run a
  * success. Previously a throw was swallowed into `skipped` and the cursor moved
  * on regardless, so a row that failed every night was silently never chased.
+ *
+ * `abortOnError` INVERTS that for the one caller that cannot survive it. Inside
+ * the per-component transaction the verdicts are supposed to commit together or
+ * not at all, and swallowing a failure broke exactly that promise: the first
+ * lifecycle write committed with the transaction while the second was quietly
+ * downgraded to a counter. The component then held HALF an allocation — one
+ * charge chased, its twin neither chased nor closed — which is the state the
+ * one-to-one matching exists to make impossible. So that caller asks for the
+ * throw to propagate, the transaction rolls back, and the failure is reported
+ * and retried OUTSIDE it (the cursor stops there, so the next run redoes it).
  */
 export async function applyReceiptRequestPlan(
     plan: ReceiptRequestPlan,
     evaluate: EvaluateFn,
+    options: { abortOnError?: boolean } = {},
 ): Promise<ReceiptRequestApplySummary> {
     const summary: ReceiptRequestApplySummary = {
         opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
@@ -310,6 +343,7 @@ export async function applyReceiptRequestPlan(
             summary.errors++;
             summary.failedTargets.push(item.targetKey);
             console.error("[cron/receipt-requests] open failed", item.targetKey, error instanceof Error ? error.message : "UnknownError");
+            if (options.abortOnError) throw error;
         }
     }
 
@@ -322,6 +356,7 @@ export async function applyReceiptRequestPlan(
             summary.errors++;
             summary.failedTargets.push(targetKey);
             console.error("[cron/receipt-requests] close failed", targetKey, error instanceof Error ? error.message : "UnknownError");
+            if (options.abortOnError) throw error;
         }
     }
 
@@ -374,7 +409,8 @@ async function loadCompetingComponent(seed: {
             // One past the cap, so an oversized component is DETECTED rather
             // than silently truncated into a wrong answer.
             take: MAX_COMPONENT_LINES + 1,
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            // `updatedAt` rides along for the component fingerprint — see BatchLine.
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         }).then(rows => rows.map(row => ({ ...row, postedDate: row.postedDate.toISOString().slice(0, 10) }))),
         { maxNodes: MAX_COMPONENT_LINES },
     );
@@ -384,7 +420,10 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     const [line, issue] = await Promise.all([
         prisma.bankLine.findUnique({
             where: { id: targetKey },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            // Same shape as every other BankLine read here, `updatedAt`
+            // included: one rule for all of them is what keeps a select that
+            // feeds a fingerprint from quietly losing the column again.
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         }),
         prisma.reviewIssue.findUnique({
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
@@ -426,7 +465,10 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     const componentDays = lines.map(row => Date.parse(`${row.postedDate}T00:00:00Z`));
     const fromYmd = new Date(Math.min(...componentDays) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     const toYmd = new Date(Math.max(...componentDays) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
-    const range = await evidenceRange(fromYmd, toYmd);
+    // ONE resolved zone for the window AND for every day key derived below —
+    // see the day-key note in processBatch.
+    const zone = await resolveCompanyTimeZone();
+    const range = evidenceBoundsFor(fromYmd, toYmd, zone);
 
     const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
@@ -459,7 +501,8 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
                 qbPurchaseId: row.qbPurchaseId,
                 hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
                 amountCents: cents,
-                date: row.date ? row.date.toISOString().slice(0, 10) : null,
+                // COMPANY-LOCAL DAY, not the UTC one — see processBatch.
+                date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
                 vendor: row.vendor,
             }];
         }),
@@ -468,6 +511,9 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
             expenseId: row.expenseId,
             qbPurchaseId: row.qbPurchaseId,
             totalCents: row.totalCents,
+            // `txnDate` is `@db.Date` — no zone at all, read at UTC midnight —
+            // so the UTC slice IS its calendar day. Only `Expense.date` is an
+            // instant needing a zone.
             txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
             vendor: row.vendor,
             state: row.state,
@@ -569,14 +615,17 @@ async function processBatchWithReplan(
     detailsByKey: Map<string, Record<string, unknown>>,
     now: Date,
     cohortMode: "window" | "closure" = "window",
-): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replans: number }> {
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; contended: number; replans: number }> {
     let replans = 0;
     let issues = openIssues;
     let resolved = resolvedIssueKeys;
     let details = detailsByKey;
     for (let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt++) {
         const outcome = await processBatch(batch, issues, resolved, details, now, cohortMode);
-        if (!outcome.replan) return { ...outcome, replans };
+        // A batch that reached a verdict is never contended, whatever else it
+        // left undecided — those are the STABLE non-verdicts (see
+        // sweepPhaseAfter), and they must not hold the cycle open forever.
+        if (!outcome.replan) return { ...outcome, contended: 0, replans };
         replans++;
         console.log("[cron/receipt-requests] component changed mid-plan; replanning", batch.length, "line(s)", attempt);
 
@@ -598,7 +647,12 @@ async function processBatchWithReplan(
     // Deliberately no verdict, and it is REPORTED as undecided rather than
     // hidden: a chase left open is a question a human can answer; a chase
     // closed from a stale plan is a receipt nobody ever asks for again.
-    return { summary: emptySummary(), undecided: batch.length, replans };
+    //
+    // It is also reported as CONTENDED, which is the stronger claim: this batch
+    // was not reconciled at all, so the cycle may not be called complete and
+    // the morning card may not be built from it. The caller keeps the phase on
+    // this pass and the next run redoes it.
+    return { summary: emptySummary(), undecided: batch.length, contended: batch.length, replans };
 }
 
 interface BatchLine {
@@ -607,6 +661,18 @@ interface BatchLine {
     amountCents: number;
     rawDescriptor: string;
     checkNumber: string | null;
+    /**
+     * CARRIED FOR THE FINGERPRINT, not for the matcher.
+     *
+     * The in-transaction fingerprint re-reads the component's bank lines WITH
+     * their `updatedAt`, so a planned fingerprint that omitted it could never
+     * match: for a brand-new unmatched line — no issue, no intake — the planned
+     * `newest` was the empty string while the locked one was the line's own
+     * timestamp. Every attempt "replanned", the component was abandoned as
+     * undecided, and the one case this feature exists for (a fresh charge with
+     * no receipt) was the one case it never chased.
+     */
+    updatedAt: Date;
 }
 
 /**
@@ -680,7 +746,7 @@ async function processBatch(
                     postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
                 })),
             },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         });
         cohortRows.push(...found);
     }
@@ -701,7 +767,13 @@ async function processBatch(
     const fromYmd = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     const toYmd = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
     // HALF-OPEN, company timezone. See evidenceRange.
-    const range = await evidenceRange(fromYmd, toYmd);
+    //
+    // ONE resolved zone for the whole batch: the window boundaries and the day
+    // keys derived from `Expense.date` below must come from the SAME zone or
+    // they disagree at the edges — the window would load an expense the
+    // matcher then files on a different calendar day than the query claimed.
+    const zone = await resolveCompanyTimeZone();
+    const range = evidenceBoundsFor(fromYmd, toYmd, zone);
 
     const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
@@ -740,7 +812,19 @@ async function processBatch(
                 qbPurchaseId: row.qbPurchaseId,
                 hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
                 amountCents: cents,
-                date: row.date ? row.date.toISOString().slice(0, 10) : null,
+                /**
+                 * THE COMPANY'S CALENDAR DAY, not UTC's.
+                 *
+                 * `Expense.date` is a TIMESTAMP — an instant — and the query
+                 * that loaded it used company-local midnights. Deriving its day
+                 * key with `.toISOString()` moves every expense stamped after
+                 * 5pm Pacific to the NEXT day, so a receipt filed at 7pm on the
+                 * 16th was matched against the 17th: at the ±2-day edge it
+                 * dropped out of range entirely and its charge got chased with
+                 * the receipt sitting right there. DST-correct, which a fixed
+                 * offset would not be.
+                 */
+                date: row.date ? dayKeyInTimeZone(row.date, zone) : null,
                 vendor: row.vendor,
             }];
         }),
@@ -749,6 +833,9 @@ async function processBatch(
             expenseId: row.expenseId,
             qbPurchaseId: row.qbPurchaseId,
             totalCents: row.totalCents,
+            // `txnDate` is `@db.Date` — a calendar day with no zone, read at
+            // UTC midnight — so the UTC slice IS its day. Only the TIMESTAMP
+            // above needs a zone.
             txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
             vendor: row.vendor,
             state: row.state,
@@ -823,7 +910,17 @@ async function processBatch(
         const planned = componentVersionOf({
             issues: planIssueRows.filter(issue => ids.has(issue.targetKey)),
             intakes: intakeRows.filter(row => intakeInWindow(row.txnDate)),
-            lines: componentLines.map(row => ({ id: row.id, rawDescriptor: row.rawDescriptor })),
+            // `updatedAt` TOO, and it is not decoration: the locked re-read
+            // below selects it, so leaving it out here made `newest` disagree
+            // for any component with no issue and no intake — i.e. every
+            // brand-new unmatched line — and no amount of replanning could
+            // reconcile a fingerprint that was never computed from the same
+            // fields.
+            lines: componentLines.map(row => ({
+                id: row.id,
+                rawDescriptor: row.rawDescriptor,
+                updatedAt: row.updatedAt,
+            })),
             // EVERY FIELD THE PLANNER READS, not just identity: an amount, date
             // or vendor correction changes which line an expense can answer.
             expenses: expenseRows
@@ -963,6 +1060,13 @@ async function processBatch(
                             },
                         );
                     },
+                    // A verdict that throws ABORTS THE COMPONENT. Counting it
+                    // and carrying on would let the verdicts that already
+                    // succeeded commit with this transaction — a half-applied
+                    // allocation, which is the one outcome "all or nothing"
+                    // was written to prevent. The catch below records it and
+                    // the cursor stops, so the next run redoes the component.
+                    { abortOnError: true },
                 );
                 summary.opened += applied.opened;
                 summary.closed += applied.closed;
@@ -1137,6 +1241,9 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
     };
     let openUndecided = 0;
+    // Batches this pass could not reconcile at all (replans exhausted). Unlike
+    // `openUndecided` this BLOCKS the completion stamp — see sweepPhaseAfter.
+    let openContended = 0;
     let openCursor = await readOpenCursor();
     // A resume that already completed this pass goes straight to the lines:
     // re-running it would be correct but would eat the budget the line pass has
@@ -1161,7 +1268,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
 
         const lines = await prisma.bankLine.findMany({
             where: { id: { in: page.map(issue => issue.targetKey) } },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         });
 
         // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
@@ -1216,6 +1323,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             openPass.errors += outcome.summary.errors;
             openPass.failedTargets.push(...outcome.summary.failedTargets);
             openUndecided += outcome.undecided;
+            openContended += outcome.contended;
             pageErrors += outcome.summary.errors;
         }
 
@@ -1242,6 +1350,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     let batches = 0;
     let linesSeen = 0;
     let undecided = openUndecided;
+    let lineContended = 0;
     let exhausted = false;
 
     // COMPONENTS FIRST, THEN PAGES — never the other way round.
@@ -1301,7 +1410,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         const batch = await prisma.bankLine.findMany({
             where: { id: { in: ids } },
             orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, updatedAt: true },
         });
         // Every line in the page vanished between the two queries. Nothing to
         // judge, but the checkpoint still has to move past it.
@@ -1327,6 +1436,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             const outcome = await processBatchWithReplan(rows, openIssues, resolvedIssueKeys, detailsByKey, now, mode);
             replans += outcome.replans;
             undecided += outcome.undecided;
+            lineContended += outcome.contended;
             totals.opened += outcome.summary.opened;
             totals.closed += outcome.summary.closed;
             totals.touched += outcome.summary.touched;
@@ -1364,12 +1474,18 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     const phase = sweepPhaseAfter({
         openExhausted,
         openErrors: openPass.errors,
+        openContended,
         lineExhausted: exhausted,
         lineErrors: totals.errors - openPass.errors,
+        lineContended,
     });
     // A CLEAN, COMPLETE cycle stamps the clock the cards cron reads. Anything
     // else leaves the previous stamp alone: yesterday's completion is still a
     // true statement about yesterday, and the cards cron compares it to TODAY.
+    //
+    // "Anything else" INCLUDES a run that left contended work behind. The stamp
+    // is a claim that tonight's issue set is reconciled, and a component nobody
+    // could reconcile makes that claim false.
     await writePhase(phase, phase === "done" ? new Date().toISOString() : undefined);
 
     const result = {
@@ -1384,9 +1500,14 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         replans,
         bankLines: linesSeen,
         undecided,
+        // The share of `undecided` that was CONTENDED — no verdict because the
+        // component kept moving. It is the part that blocks the completion
+        // stamp and comes back on the next run.
+        contended: openContended + lineContended,
         exhausted,
-        // Work remains if EITHER pass has more to do.
-        moreToProcess: !exhausted || !openExhausted,
+        // Work remains if EITHER pass has more to do — including a pass that
+        // exhausted its pages but left a component unreconciled.
+        moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,
