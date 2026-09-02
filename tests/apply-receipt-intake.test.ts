@@ -95,7 +95,11 @@ test("every statement is idempotent — the script is safe to re-run", () => {
             /ALTER TABLE .* ADD COLUMN IF NOT EXISTS/.test(sql) ||
             // Re-enabling RLS on a table that already has it is a no-op.
             /ENABLE ROW LEVEL SECURITY/.test(sql) ||
-            /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(sql);
+            /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(sql) ||
+            // The state CHECK is convergent rather than skip-if-present: it
+            // compares pg_get_constraintdef and only rewrites on a difference,
+            // so a second run is a no-op just the same.
+            (/pg_get_constraintdef/.test(sql) && /IS DISTINCT FROM/.test(sql));
         assert.ok(guarded, `not idempotent: ${sql.slice(0, 80)}`);
     }
 });
@@ -203,4 +207,44 @@ test("SHADOW_DONE stays in the strong-key active set", () => {
     const index = statements.find((s: string) => s.includes("ReceiptIntake_dedupStrongKey_active_key"));
     assert.match(index!, /NOT IN \('DUPLICATE', 'VOID'\)/);
     assert.ok(!/SHADOW_DONE/.test(index!), "SHADOW_DONE must NOT be excluded");
+});
+
+test("the state CHECK is REPLACED when its definition drifts, not skipped", () => {
+    // `IF NOT EXISTS` alone is wrong for a set that GROWS: a database carrying
+    // the constraint from an earlier run keeps the OLD state list, so the first
+    // write of a newly-added state (SHADOW_DONE, at cutover, inside the claim
+    // transaction) fails and takes the whole cutover with it — while the script
+    // that exists to prevent exactly that reported "ok".
+    const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
+    assert.ok(check);
+    assert.match(check!, /pg_get_constraintdef/, "it compares the DEFINITION");
+    assert.match(check!, /IS DISTINCT FROM/, "and reacts to a difference");
+    assert.match(check!, /DROP CONSTRAINT "ReceiptIntake_state_check"/);
+    assert.match(check!, /ADD CONSTRAINT "ReceiptIntake_state_check"/);
+    // The wanted definition must name every state the code can produce, in
+    // pg_get_constraintdef's own rendering.
+    for (const state of RECEIPT_INTAKE_STATES) {
+        assert.ok(check!.includes(`''${state}''::text`), `wanted_def is missing ${state}`);
+    }
+});
+
+test("the wanted definition matches the snapshot CI compares against production", () => {
+    // Two renderings of the same constraint that disagree would make the
+    // apply script drop and re-add it on EVERY run.
+    const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"))!;
+    // [\s\S] rather than the /s flag — the tsconfig target predates it.
+    const wanted = check.match(/wanted_def\s+TEXT\s*:=\s*'([\s\S]+?)';/)![1].replace(/''/g, "'");
+    const snapshot = JSON.parse(
+        readFileSync(path.join(__dirname, "..", "prisma", "prisma-blind-spots.json"), "utf8"),
+    );
+    const recorded = snapshot.checkConstraints.find(
+        (r: { name: string }) => r.name === "ReceiptIntake_state_check",
+    );
+    assert.equal(wanted, recorded.def);
+});
+
+test("verification asserts the CHECK ALLOWS every state, not just that it exists", () => {
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-intake.mjs"), "utf8");
+    assert.match(source, /pg_get_constraintdef\(oid\) AS def FROM pg_constraint/, "verify reads the definition");
+    assert.match(source, /does not allow/, "and fails loudly naming what is missing");
 });

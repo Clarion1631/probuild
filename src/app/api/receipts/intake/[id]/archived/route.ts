@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { secretMatches, RECEIPT_INTAKE_SECRET_HEADER } from "@/lib/receipt-intake/intake-auth";
+import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -21,7 +21,14 @@ export const dynamic = "force-dynamic";
  * PUBLIC_PROXY_BYPASS_PATTERN for that reason, each one exact.
  */
 export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
-    if (!secretMatches(req.headers.get(RECEIPT_INTAKE_SECRET_HEADER), process.env.RECEIPT_INTAKE_SECRET)) {
+    // ARCHIVE capability only. This transition means "a file exists in Drive",
+    // which only the mirror can know — and the ingest forwarders must not be
+    // able to mark rows archived just because they hold a receipt-intake key.
+    const auth = await authenticateIntake(req, "archive");
+    if (!auth.ok) return auth.response;
+    if (auth.via !== "secret") {
+        // No session path: a staff user clicking this would be asserting
+        // something they cannot verify.
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
 

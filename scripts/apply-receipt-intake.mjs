@@ -157,10 +157,33 @@ export const statements = [
 
     // state is a closed set — a typo must fail loudly rather than create a
     // silent eleventh state that no query ever selects.
-    `DO $$ BEGIN
-       IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                       WHERE conname = 'ReceiptIntake_state_check'
-                         AND conrelid = '"ReceiptIntake"'::regclass) THEN
+    // The state set GROWS. `IF NOT EXISTS` alone is wrong for that: a database
+    // that already has the constraint from an earlier run keeps the OLD set, so
+    // the first write of a newly-added state (SHADOW_DONE, at cutover, inside
+    // the claim transaction) fails and takes the whole cutover with it — and
+    // the script that was supposed to prevent exactly this reported "ok".
+    //
+    // So compare the DEFINITION, and replace it when it differs. Postgres
+    // validates the new CHECK against existing rows as part of the ADD, so a
+    // set that would orphan live data fails loudly here rather than later.
+    `DO $$
+     DECLARE current_def TEXT;
+             wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''SHADOW_DONE''::text])))';
+     BEGIN
+       SELECT pg_get_constraintdef(oid) INTO current_def
+         FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_state_check'
+          AND conrelid = '"ReceiptIntake"'::regclass;
+
+       IF current_def IS NULL THEN
+         ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
+           CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
+                              'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
+                              'SHADOW_DONE'));
+       ELSIF current_def IS DISTINCT FROM wanted_def THEN
+         -- One statement each, in the SAME transaction as everything else this
+         -- script runs, so the table is never briefly unconstrained.
+         ALTER TABLE "ReceiptIntake" DROP CONSTRAINT "ReceiptIntake_state_check";
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
@@ -308,11 +331,22 @@ async function main() {
         }
         for (const { name, table } of expectedConstraints) {
             const [row] = await prisma.$queryRawUnsafe(
-                `SELECT 1 AS ok FROM pg_constraint WHERE conname = $1`, name,
+                `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = $1`, name,
             );
             if (!row) {
                 console.error(`VERIFY FAILED: constraint ${name} missing on ${table}`);
                 process.exit(1);
+            }
+            // Existence is not enough for the state CHECK: an OLD definition
+            // still exists, and it is the thing that breaks the cutover.
+            if (name === "ReceiptIntake_state_check") {
+                const missing = RECEIPT_INTAKE_STATES.filter(state => !row.def.includes(`'${state}'`));
+                if (missing.length) {
+                    console.error(`VERIFY FAILED: ${name} does not allow: ${missing.join(", ")}
+  actual: ${row.def}`);
+                    process.exit(1);
+                }
+                console.log(`verified ${name}: all ${RECEIPT_INTAKE_STATES.length} states allowed`);
             }
         }
         console.log(`verified ${expectedConstraints.length} constraints`);

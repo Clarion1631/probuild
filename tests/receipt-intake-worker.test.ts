@@ -26,6 +26,7 @@ import {
 } from "../src/lib/receipt-intake/worker";
 import { normalizeDocType, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
+import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
 import { QBTimeoutError } from "../src/lib/quickbooks";
 import { QboAccountConfigError, QboPurchaseFaultError } from "../src/lib/qbo-receipt-push";
 
@@ -61,6 +62,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         dedupWeakKey: null,
         busyPasses: 0,
         lastError: null,
+        suggestedConfidence: null,
         ...overrides,
     };
 }
@@ -77,6 +79,7 @@ const goodRead: ReadOutcome = {
         totalAmount: "364.98",
         taxAmount: "29.20",
         suggestedPhaseCode: "03-PLUMB",
+        suggestedConfidence: 0.82,
         raw: '{"vendor":"Lowes"}',
     },
 };
@@ -91,19 +94,26 @@ interface Harness {
     finished: { id: string; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
-    claimOpts: { retireShadowBacklog: boolean }[];
+    claimOpts: CutoverRequest[];
+    boundary: Date | null;
     sweepCalls: number;
+    bookBudgets: number[];
     clock: number;
 }
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
-        retried: [], claimOpts: [], sweepCalls: 0, clock: 0,
+        retried: [], claimOpts: [], sweepCalls: 0, bookBudgets: [], clock: 0,
+        boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
-        claim: async opts => { h.claimOpts.push(opts); return { rows, shadowRetired: 0 }; },
+        claim: async opts => {
+            h.claimOpts.push(opts);
+            return { rows, shadowRetired: 0, requeued: 0, boundaryMissing: false };
+        },
+        cutoverBoundary: async () => h.boundary,
         isDryRunEnabled: () => true,
         sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
@@ -115,7 +125,11 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         finishRouting: async (id, stateReason) => { h.finished.push({ id, stateReason }); },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
-        book: async () => { h.books++; return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult; },
+        book: async (_row, remainingMs) => {
+            h.books++;
+            h.bookBudgets.push(remainingMs);
+            return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult;
+        },
         applyBookResult: async () => {},
         deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); },
         retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); },
@@ -285,35 +299,59 @@ test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", 
 
 // ── Dry-run starvation (Codex blocker 1) ─────────────────────────────────────
 
-test("the shadow week does NOT retire anything", async () => {
+test("the shadow week does NOT run the cutover", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
     const summary = await runIntakeWorker(h.deps);
-    assert.deepEqual(h.claimOpts, [{ retireShadowBacklog: false }]);
+    assert.equal(h.claimOpts[0].run, false);
+    assert.equal(h.claimOpts[0].boundary, null, "the boundary is not even read while dry-run is on");
     assert.equal(summary.shadowRetired, undefined);
 });
 
-test("CUTOVER: the shadow backlog is RETIRED, never requeued", async () => {
+test("CUTOVER: the boundary is passed to the claim so the backlog can be split", async () => {
     // The double-booking hazard this closes: v2's QBO identity for an
     // email/chat/mobile/web row is the intake UUID, which v1 never saw, so
     // QuickBooks' DocNumber idempotency could not recognise the Purchase v1
     // already made — and requeuing would have booked the entire shadow backlog
     // a second time, on real books, in one pass.
+    const boundary = new Date("2026-08-25T00:00:00.000Z");
     const h = harness([], {
         isDryRunEnabled: () => false,
-        claim: async opts => { h.claimOpts.push(opts); return { rows: [], shadowRetired: 7 }; },
+        cutoverBoundary: async () => boundary,
+        claim: async opts => {
+            h.claimOpts.push(opts);
+            // Rows BEFORE the boundary were booked by v1; rows after it by nobody.
+            return { rows: [], shadowRetired: 7, requeued: 2, boundaryMissing: false };
+        },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.deepEqual(h.claimOpts, [{ retireShadowBacklog: true }]);
-    assert.equal(summary.shadowRetired, 7);
-    assert.equal(h.books, 0, "nothing from the shadow week is ever booked by v2");
-
-    // Idempotent by construction: SHADOW_DONE no longer matches the predicate.
-    const second = harness([], { isDryRunEnabled: () => false });
-    assert.equal((await runIntakeWorker(second.deps)).shadowRetired, undefined, "a no-op retire is not reported");
+    assert.equal(h.claimOpts[0].run, true);
+    assert.equal(h.claimOpts[0].boundary?.toISOString(), boundary.toISOString());
+    assert.equal(summary.shadowRetired, 7, "v1 already booked these");
+    assert.equal(summary.requeued, 2, "nobody booked these — v2 must");
+    assert.equal(summary.cutoverBlocked, undefined);
 });
 
-test("a run that loses the lock does nothing at all — including the retire", async () => {
-    // The retire is part of the claim transaction, so losing the lock means
+test("CUTOVER refuses entirely when no boundary is recorded", async () => {
+    // Nothing in the database can infer when v1 stopped booking. Retiring on a
+    // guess destroys evidence of real expenses; requeuing on a guess
+    // double-books them. A logged no-op is the only honest third option.
+    const h = harness([], {
+        isDryRunEnabled: () => false,
+        cutoverBoundary: async () => null,
+        claim: async opts => {
+            h.claimOpts.push(opts);
+            assert.equal(opts.boundary, null);
+            return { rows: [], shadowRetired: 0, requeued: 0, boundaryMissing: true };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.cutoverBlocked, "cutover-boundary-missing");
+    assert.equal(summary.shadowRetired, undefined);
+    assert.equal(summary.requeued, undefined);
+});
+
+test("a run that loses the lock does nothing at all — including the cutover", async () => {
+    // The cutover is part of the claim transaction, so losing the lock means
     // losing it too. That is correct: the run that HOLDS the lock does it.
     const h = harness([], { isDryRunEnabled: () => false, claim: async () => null });
     const summary = await runIntakeWorker(h.deps);

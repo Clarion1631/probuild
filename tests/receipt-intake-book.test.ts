@@ -17,6 +17,7 @@ import {
     buildGroups,
     driveFileIdOf,
     expenseAmountCents,
+    MIN_BOOKING_BUDGET_MS,
     type BookableRow,
     type BookDependencies,
 } from "../src/lib/receipt-intake/book";
@@ -38,6 +39,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         projectId: "proj-1",
         costCodeId: null,
         suggestedCostCodeId: "cc-plumb",
+        suggestedConfidence: 0.82,
         storagePath: "receipts/intake/intake-1.jpg",
         fileName: "receipt.jpg",
         mimeType: "image/jpeg",
@@ -98,6 +100,8 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         logEvent: async (event) => { events.push(event); },
         now: () => NOW,
+        companyTimeZone: async () => "America/Los_Angeles",
+        isCostCodeAllowed: async () => true,
         ...overrides,
     };
     return { deps, purchaseCalls, expenses, intakeUpdates, events };
@@ -482,4 +486,157 @@ test("the receipt bytes always ride along with the Purchase", async () => {
     await bookReceipt(row(), r.deps);
     assert.equal(r.purchaseCalls[0].fileBase64, Buffer.from("bytes").toString("base64"));
     assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
+});
+
+// ── Expense.date is a business calendar day (round-6 item 3) ────────────────
+
+test("Expense.date is re-anchored to the company's local midnight", async () => {
+    // txnDate is a @db.Date column and round-trips as UTC midnight. Written
+    // straight into Expense.date (a full timestamp) that records 5pm the
+    // PREVIOUS day in Pacific, and every job-cost or variance report bounded by
+    // local midnight then counts the expense in the wrong period.
+    const r = recorder();
+    await bookReceipt(row({ txnDate: new Date("2026-08-03T00:00:00.000Z") }), r.deps);
+
+    const written = r.expenses[0].date as Date;
+    assert.equal(written.toISOString(), "2026-08-03T07:00:00.000Z", "local midnight PDT");
+
+    // The assertion that matters: read back in the company zone it is the 3rd.
+    const localDay = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(written);
+    assert.equal(localDay, "2026-08-03");
+
+    // Control: the raw txnDate would have read as the 2nd. That was the bug.
+    assert.equal(
+        new Intl.DateTimeFormat("en-CA", {
+            timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(new Date("2026-08-03T00:00:00.000Z")),
+        "2026-08-02",
+    );
+
+    // ...and QBO still gets the bare calendar day, unchanged.
+    assert.equal(r.purchaseCalls[0].date, "2026-08-03");
+});
+
+test("winter dates use the winter offset — no hardcoded -07:00", async () => {
+    const r = recorder();
+    await bookReceipt(row({ txnDate: new Date("2026-01-15T00:00:00.000Z") }), r.deps);
+    assert.equal((r.expenses[0].date as Date).toISOString(), "2026-01-15T08:00:00.000Z");
+});
+
+// ── A booking must not start without room to finish (round-6 item 4) ────────
+
+test("a booking with less than 25s of runway DEFERS instead of starting", async () => {
+    // Two QuickBooks round trips plus the attachment upload and the commit do
+    // not fit in a few seconds, and a booking cut off mid-flight is the worst
+    // outcome available: the Purchase may exist in the real books while the row
+    // never learns it did.
+    const r = recorder({ remainingBudgetMs: () => 9_000 });
+    const result = await bookReceipt(row(), r.deps);
+    assert.deepEqual(result, { outcome: "deferred", reason: "out-of-budget" });
+    assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
+    assert.equal(r.expenses.length, 0);
+});
+
+test("the runway check spends no attempt — the document did nothing wrong", async () => {
+    const r = recorder({ remainingBudgetMs: () => 0 });
+    const result = await bookReceipt(row({ attempts: 3 }), r.deps);
+    assert.equal(result.outcome, "deferred");
+    assert.ok(!("attempts" in result), "not a retry, so no attempt is spent");
+});
+
+test("ample runway books normally, and threads ONE deadline into both QBO calls", async () => {
+    const seen: unknown[] = [];
+    const r = recorder({
+        remainingBudgetMs: () => 50_000,
+        deadline: () => ({ startedAt: 0, budgetMs: 50_000 }) as any,
+        getTokens: async d => { seen.push(d); return { accessToken: "t", realmId: "r" } as any; },
+        createPurchase: async (_t, input, d) => {
+            seen.push(d);
+            r.purchaseCalls.push(input);
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "attached" } as any;
+        },
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(seen.length, 2);
+    assert.strictEqual(seen[0], seen[1], "the SAME deadline object, so a slow refresh shortens the create");
+});
+
+test("MIN_BOOKING_BUDGET_MS is the documented 25s", () => {
+    assert.equal(MIN_BOOKING_BUDGET_MS, 25_000);
+});
+
+// ── The phase is re-validated against the FINAL project (Phase 3 gate, a) ───
+
+test("a cost code that is not a phase of THIS job is cleared, and the row still books", async () => {
+    // The scenario: the receipt was READ while it had no project (NEEDS_JOB) or
+    // a different one, and a human then assigned the real job. A cost code from
+    // the old project is not a phase of the new one, and posting against it puts
+    // real money on a phase that job does not have — which every variance report
+    // reads as overspend on a line nobody budgeted.
+    const r = recorder({ isCostCodeAllowed: async () => false });
+    const result = await bookReceipt(row({ costCodeId: "cc-from-another-job" }), r.deps);
+
+    assert.equal(result.outcome, "booked", "the receipt is fine — it books UNCODED");
+    assert.equal(r.expenses[0].costCodeId, null, "the wrong phase is cleared, never posted");
+    assert.match(r.expenses[0].description, /phase cleared \(not a phase of this job\)/);
+    assert.equal(r.events[0].detail.phaseRejected, "cc-from-another-job", "and it is auditable");
+});
+
+test("the SUGGESTED code is checked against the final project too", async () => {
+    // The model suggested it from the phase list of whatever project the row had
+    // at READ time. That list is not authority over the project it books to.
+    const asked: Array<[string, string]> = [];
+    const r = recorder({
+        isCostCodeAllowed: async (projectId, costCodeId) => {
+            asked.push([projectId, costCodeId]);
+            return false;
+        },
+    });
+    await bookReceipt(row({ costCodeId: null }), r.deps);
+    assert.deepEqual(asked, [["proj-1", "cc-plumb"]], "asked about the FINAL project");
+    assert.equal(r.expenses[0].costCodeId, null);
+});
+
+test("unassigned during READ, assigned before BOOKING: the phase is re-checked", async () => {
+    // End to end for the exact sequence the gate named.
+    const allowedByProject: Record<string, string[]> = {
+        "proj-1": ["cc-demo"], // the job it was finally assigned to
+    };
+    const r = recorder({
+        isCostCodeAllowed: async (projectId, costCodeId) =>
+            (allowedByProject[projectId] ?? []).includes(costCodeId),
+    });
+
+    // Suggested "cc-plumb" while unassigned; the job it landed on has no plumbing phase.
+    await bookReceipt(row({ costCodeId: null, suggestedCostCodeId: "cc-plumb" }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, null, "the stale suggestion does not survive");
+
+    // A code that IS a phase of the final project is kept.
+    const ok = recorder({
+        isCostCodeAllowed: async (projectId, costCodeId) =>
+            (allowedByProject[projectId] ?? []).includes(costCodeId),
+    });
+    await bookReceipt(row({ costCodeId: "cc-demo" }), ok.deps);
+    assert.equal(ok.expenses[0].costCodeId, "cc-demo");
+});
+
+// ── Confidence rides through to the booking (Phase 3 gate, b) ──────────────
+
+test("the phase-suggestion confidence is recorded when the suggestion is used", async () => {
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.42 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-plumb");
+    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.42\)/);
+    assert.equal(r.events[0].detail.suggestedConfidence, 0.42);
+});
+
+test("a human's explicit pick is not labelled a suggestion", async () => {
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: "cc-chosen" }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-chosen");
+    assert.ok(!/phase suggested/.test(r.expenses[0].description));
+    assert.equal(r.events[0].detail.suggestedConfidence, undefined);
 });

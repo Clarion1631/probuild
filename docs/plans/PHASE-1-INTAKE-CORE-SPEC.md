@@ -435,6 +435,65 @@ here); multipart buffering before the size check (the platform body limit applie
 PDFs carrying embedded JavaScript (never opened server-side — the bytes go to Gemini and to
 QBO as an attachment).
 
+
+### Two machine secrets, not one
+
+They belong to different programs, so they are different keys and rotate independently.
+A single shared secret gave a script that only copies files to Drive the power to inject
+Purchases into the books, and gave the ingest forwarders the power to enumerate every
+receipt in the system.
+
+| secret | may do | may NOT do |
+|---|---|---|
+| `RECEIPT_INTAKE_SECRET` (the Apps Script forwarders) | `POST /api/receipts/intake`, `/intake/start`, `/intake/{id}/finalize`, declaring `source` in **drive, email, chat** only | read the queue; archive anything |
+| `RECEIPT_ARCHIVE_SECRET` (the nightly Drive mirror) | `GET /api/receipts/intake?state=BOOKED|ARCHIVED` (minimal field set + signed URL), `POST /api/receipts/intake/{id}/archived` | create, publish or modify a row; declare any source |
+
+Cross-use is **403**, not 401: the caller is authenticated, it is just holding the other
+program's key, and saying so is what makes a mis-wired script obvious instead of looking
+like a rotation problem. Setting both variables to the same value is refused at runtime —
+that would silently undo the split.
+
+### Phase suggestion: confidence, and re-validation at booking
+
+The reader returns `suggested_phase_confidence` (0..1) alongside the phase code. It is
+persisted as `ReceiptIntake.suggestedConfidence`, so the queue can sort by it, and it is
+recorded on the booking's `AutomationEvent` when the suggestion is what got used. Absent or
+unparseable is **null, never 0** — "the model didn't say" and "the model is sure it is a
+poor match" have to stay distinguishable.
+
+At booking, BOTH the captured `costCodeId` and the suggestion are re-checked against the
+project the row will actually book to, via the same `isCostCodeAllowedForProject` the
+clock-in uses. The row may have been read while it had no project (`NEEDS_JOB`) or a
+different one that a human then corrected, and a cost code from the old project is not a
+phase of the new one. A mismatch clears the code and books UNCODED with a note — the
+receipt and its total are still right, and a bookkeeper assigning a phase is routine, while
+an expense silently attached to the wrong phase is not.
+
+### Upload paths (two of them)
+
+`POST /api/receipts/intake` carries the file in the REQUEST BODY, so it is limited by the
+serverless body cap (~4.5 MB, and base64 JSON inflates a payload by a third). It rejects
+anything over **4 MB** with a 413 that names the two-step path. That limit is about the
+transport, not the document.
+
+For anything larger — most phone photos — use the two-step flow, which never puts the bytes
+through this server at all:
+
+1. `POST /api/receipts/intake/start` with `{mimeType, fileName?, fileSize?, source?,
+   sourceRef?, uploadId?, projectId?}` -> `{id, uploadUrl, token, storagePath, maxBytes}`.
+   Creates the row in `STAGING` (invisible to the worker) and returns a short-lived Supabase
+   signed upload URL bound to a server-chosen path.
+2. `PUT` the bytes straight to `uploadUrl`.
+3. `POST /api/receipts/intake/{id}/finalize` with `{sha256?}` -> publishes `STAGING` ->
+   `RECEIVED`. The server re-reads the object and derives the mime, the size and the sha
+   FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409. Over
+   15 MB or an unreadable format deletes the row and refuses.
+
+Both paths share `decideSource` (provenance and idempotency), so a session/Bearer caller can
+never choose `source` or `sourceRef` on either, and `uploadId` is scoped to the authenticated
+user on both. Both new paths are on the proxy's exact-match bypass and both refuse a
+`next-action` dispatch with 403.
+
 ### CUTOVER SEQUENCE — do these in this order (2026-09-02)
 
 The hazard this order exists to prevent: v2's QuickBooks identity for an
@@ -458,10 +517,19 @@ an overlap safe in general.
 4. **Confirm zero v1 bookings for 24 hours.** Watch the Automation register and QBO. This
    is the step that makes the next one safe: it proves v1 is out of the books before v2
    enters them, so the two can never both create a Purchase for one document.
-5. **Only then set `RECEIPT_INTAKE_DRYRUN=false`.** On its first pass the worker RETIRES the
-   entire shadow backlog to `SHADOW_DONE` / `booked-by-v1` — terminal, never booked by v2,
-   because v1 already booked all of it. Nothing is requeued. Only rows received AFTER this
-   point are booked by v2.
+4a. **Record the boundary.** When step 3 happens, write the instant v1 stopped booking into
+   the `cutoverV1StoppedAt` AutomationSetting row (or the `CUTOVER_V1_STOPPED_AT` env var) as
+   an ISO timestamp. This is the ONLY input that separates "v1 booked it" from "nobody booked
+   it", and nothing in the database can infer it.
+5. **Only then set `RECEIPT_INTAKE_DRYRUN=false`.** On its first pass the worker splits the
+   shadow backlog on that boundary:
+   - received BEFORE it -> `SHADOW_DONE` / `booked-by-v1`. Terminal; v2 never books these,
+     because v1 already did and QBO's DocNumber idempotency cannot recognise a v2 UUID.
+   - received AFTER it -> handed to v2 for real booking. v1 had already stopped, so nobody
+     booked these; retiring them would drop real expenses on the floor.
+   With no boundary recorded the pass touches NEITHER side and logs
+   `cutover-boundary-missing`. That is deliberate: retiring on a guess destroys evidence,
+   requeuing on a guess double-books, and a visible no-op is the only honest third option.
 
 Retired rows keep their read results and dedup keys, so a post-cutover resend of a
 shadow-week receipt still collides with them and is caught as a duplicate.

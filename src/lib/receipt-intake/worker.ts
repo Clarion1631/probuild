@@ -53,6 +53,12 @@ export const CLAIM_LEASE_MINUTES = 10;
  */
 export const RUN_SOFT_DEADLINE_MS = 40_000;
 /**
+ * The invocation's real ceiling (`maxDuration = 60`), minus a small margin so a
+ * booking that starts near the edge still gets to write its result. Bookings
+ * measure their runway against THIS, not the soft deadline.
+ */
+export const RUN_HARD_BUDGET_MS = 55_000;
+/**
  * How long a row may sit in STAGING before it is presumed to have lost its
  * upload. Generous on purpose: the intake route uploads inline, so a row that
  * is still STAGING after this either crashed mid-request or hit a storage
@@ -95,9 +101,11 @@ export interface WorkerDependencies {
      * backlog and both un-park it, and the second one's UPDATE would race the
      * first one's claim.
      */
-    claim: (opts: { retireShadowBacklog: boolean }) => Promise<{ rows: WorkerRow[]; shadowRetired: number } | null>;
+    claim: (opts: CutoverRequest) => Promise<ClaimResult | null>;
     /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the cutover is testable. */
     isDryRunEnabled: () => boolean;
+    /** The instant v1 stopped booking. null = not recorded; the cutover then refuses. */
+    cutoverBoundary: () => Promise<Date | null>;
     /**
      * Move STAGING rows older than STAGING_SWEEP_MINUTES to NEEDS_REVIEW
      * `file-missing`, or PUBLISH them when the object is actually there.
@@ -123,7 +131,8 @@ export interface WorkerDependencies {
      * row when another document with this weak key is already BOOKING/BOOKED.
      */
     promoteToBooking: (rowId: string, weakKey: string | null) => Promise<{ promoted: boolean; conflictId?: string }>;
-    book: (row: BookableRow) => Promise<BookResult>;
+    /** `remainingMs` is what is left of the invocation when the booking starts. */
+    book: (row: BookableRow, remainingMs: number) => Promise<BookResult>;
     applyBookResult: (rowId: string, result: BookResult) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string) => Promise<void>;
@@ -164,6 +173,7 @@ export interface ReadPatch {
     dedupWeakKey: string;
     duplicateOfId: string | null;
     suggestedCostCodeId: string | null;
+    suggestedConfidence: number | null;
 }
 
 export interface WorkerRunSummary {
@@ -172,8 +182,12 @@ export interface WorkerRunSummary {
     skipped?: "already-running";
     /** Rows left unprocessed because the soft deadline hit. They keep their lease. */
     deferredToNextRun?: number;
-    /** Shadow-week rows retired as SHADOW_DONE by the first live pass. */
+    /** Rows v1 already booked, retired as SHADOW_DONE by the first live pass. */
     shadowRetired?: number;
+    /** Rows received AFTER v1 stopped: nobody booked these, so they are handed to v2. */
+    requeued?: number;
+    /** The cutover could not run because no boundary is recorded. */
+    cutoverBlocked?: "cutover-boundary-missing";
     /** STAGING rows whose upload never landed, parked for a human. */
     staleStagingSwept?: number;
 }
@@ -259,6 +273,24 @@ export function toDateStr(date: Date): string {
 }
 
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
+export interface CutoverRequest {
+    /** Run the cutover this pass (i.e. dry-run is off). */
+    run: boolean;
+    /**
+     * The instant v1 stopped booking. Rows received BEFORE it were booked by
+     * v1 and are retired; rows received AFTER it were booked by nobody and are
+     * handed to v2. null refuses to touch either side.
+     */
+    boundary: Date | null;
+}
+
+export interface ClaimResult {
+    rows: WorkerRow[];
+    shadowRetired: number;
+    requeued: number;
+    boundaryMissing: boolean;
+}
+
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
     // THE DEADLINE STARTS HERE, at invocation entry — not after the claim and
     // the sweep. The sweep downloads objects, so timing it out of the budget
@@ -266,6 +298,10 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // STILL go on to start a 25s Gemini read and a QBO round trip.
     const startedAt = deps.monotonicMs();
     const outOfTime = () => deps.monotonicMs() - startedAt >= RUN_SOFT_DEADLINE_MS;
+    // What is left of the PLATFORM budget, not the soft deadline: a booking may
+    // legitimately run past the point where we stop taking new rows, it just
+    // must not start without room to finish.
+    const remainingMs = () => RUN_HARD_BUDGET_MS - (deps.monotonicMs() - startedAt);
 
     // CUTOVER. Rows received while dry-run was on were booked by v1, so v2 must
     // never book them: they are RETIRED as SHADOW_DONE, not requeued.
@@ -275,11 +311,22 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // QuickBooks' DocNumber idempotency could not recognise a Purchase v1 had
     // already created for the same document — and the whole shadow backlog
     // would have been booked a second time, on real books, in one pass.
-    const claimed = await deps.claim({ retireShadowBacklog: !deps.isDryRunEnabled() });
+    // The shadow backlog splits on ONE timestamp: when v1 stopped booking.
+    // Everything before it was booked by v1 and is retired to SHADOW_DONE;
+    // everything after it was booked by NOBODY and must be handed to v2, or
+    // those receipts are silently dropped. Nothing in the database can infer
+    // that instant, so with no boundary recorded the pass refuses to touch
+    // either side and says so.
+    const runCutover = !deps.isDryRunEnabled();
+    const boundary = runCutover ? await deps.cutoverBoundary() : null;
+    const claimed = await deps.claim({ run: runCutover, boundary });
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, shadowRetired } = claimed;
+    const { rows, shadowRetired, requeued, boundaryMissing } = claimed;
+    if (boundaryMissing) {
+        console.error("[cron/receipt-intake-worker] cutover-boundary-missing: refusing to retire or requeue");
+    }
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
@@ -319,12 +366,12 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                     bump("NEEDS_REVIEW");
                     continue;
                 }
-                const result = await deps.book({ ...row, dryRun: false });
+                const result = await deps.book({ ...row, dryRun: false }, remainingMs());
                 await deps.applyBookResult(row.id, result);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun) { bump("BOOKING"); continue; }
-                const result = await deps.book(row);
+                const result = await deps.book(row, remainingMs());
                 await deps.applyBookResult(row.id, result);
                 bump(stateForBookResult(result));
             }
@@ -338,6 +385,8 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         byState,
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
         ...(shadowRetired ? { shadowRetired } : {}),
+        ...(requeued ? { requeued } : {}),
+        ...(boundaryMissing ? { cutoverBlocked: "cutover-boundary-missing" as const } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
     };
 }
@@ -488,6 +537,9 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         readAt: deps.now(),
         dedupWeakKey: keys.weak,
         suggestedCostCodeId: resolveSuggestedCostCodeId(read.suggestedPhaseCode, costCodes),
+        // Stored beside the suggestion so the queue can sort by it and the
+        // booking can record how sure the phase pick was.
+        suggestedConfidence: read.suggestedConfidence,
     };
 
     const routeInput = {

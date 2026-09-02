@@ -6,7 +6,8 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
-import { EXT_BY_MIME, MAX_INTAKE_BYTES, sniffMime } from "@/lib/receipt-intake/file-type";
+import { EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
+import { MAX_INLINE_UPLOAD_BYTES, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -70,6 +71,26 @@ function bad(reason: string) {
     return NextResponse.json({ ok: false, reason }, { status: 400 });
 }
 
+/**
+ * The inline path carries the file in the request body, which the platform caps
+ * around 4.5 MB — base64 JSON inflates it by a third on top. Anything bigger
+ * used to die at the edge with an opaque 413 that never reached this code, so
+ * the caller learned nothing. Say it plainly and name the path that works.
+ */
+function tooLargeForInline() {
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "payload-too-large",
+            reason: `inline uploads are limited to ${MAX_INLINE_UPLOAD_BYTES} bytes (serverless request-body cap)`,
+            maxInlineBytes: MAX_INLINE_UPLOAD_BYTES,
+            maxBytes: MAX_STORED_BYTES,
+            use: "POST /api/receipts/intake/start then PUT to the signed URL then POST /api/receipts/intake/{id}/finalize",
+        },
+        { status: 413 },
+    );
+}
+
 async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
     const contentType = req.headers.get("content-type") ?? "";
     const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
@@ -83,9 +104,9 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         }
         const file = form.get("file");
         if (!(file instanceof File)) return bad("missing-file");
-        if (file.size > MAX_INTAKE_BYTES) return bad("file-too-large");
+        if (file.size > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
         const bytes = Buffer.from(await file.arrayBuffer());
-        if (bytes.length > MAX_INTAKE_BYTES) return bad("file-too-large");
+        if (bytes.length > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
         return {
             bytes,
             declaredMime: file.type || "application/octet-stream",
@@ -109,10 +130,10 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
     if (!base64) return bad("missing-file");
     // Cap BEFORE decoding: base64 is 4/3 the byte count, so this refuses an
     // oversize payload without materialising it.
-    if (base64.length > Math.ceil(MAX_INTAKE_BYTES / 3) * 4 + 4) return bad("file-too-large");
+    if (base64.length > Math.ceil(MAX_INLINE_UPLOAD_BYTES / 3) * 4 + 4) return tooLargeForInline();
     const bytes = Buffer.from(base64, "base64");
     if (bytes.length === 0) return bad("missing-file");
-    if (bytes.length > MAX_INTAKE_BYTES) return bad("file-too-large");
+    if (bytes.length > MAX_INLINE_UPLOAD_BYTES) return tooLargeForInline();
     return {
         bytes,
         declaredMime: typeof json.mimeType === "string" ? json.mimeType : "application/octet-stream",
@@ -127,7 +148,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
 }
 
 export async function POST(req: Request) {
-    const auth = await authenticateIntake(req);
+    const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
     const parsed = await parseBody(req);
@@ -445,7 +466,10 @@ async function respondToSourceRefConflict(
  * bookkeeping role gets 403, not a redirect.
  */
 export async function GET(req: Request) {
-    const auth = await authenticateIntake(req);
+    // A secret caller here is the ARCHIVE mirror. The ingest forwarders hold a
+    // different key and are refused with 403 — a script that only copies files
+    // to Drive has no business enumerating the queue, and vice versa.
+    const auth = await authenticateIntake(req, "archive");
     if (!auth.ok) return auth.response;
     if (auth.via === "session" && !STAFF_READ_ROLES.includes(auth.user.role)) {
         return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });

@@ -6,9 +6,13 @@ import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
+import { createRouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
+import { resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
@@ -17,6 +21,8 @@ import {
     CLAIM_LOCK_KEY,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
+    type ClaimResult,
+    type CutoverRequest,
     isUniqueViolation,
     runIntakeWorker,
     type ReadPatch,
@@ -55,6 +61,7 @@ const WORKER_ROW_SELECT = {
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
+    suggestedConfidence: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true,
 } as const;
 
@@ -71,9 +78,7 @@ const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
     NOT: { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
 };
 
-async function claim(
-    opts: { retireShadowBacklog: boolean },
-): Promise<{ rows: WorkerRow[]; shadowRetired: number } | null> {
+async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
     const now = new Date();
     return prisma.$transaction(async tx => {
         const [lock] = await tx.$queryRaw<{ locked: boolean }[]>(
@@ -96,14 +101,41 @@ async function claim(
         // The rows keep their read results and dedup keys, so a post-cutover
         // resend of the same receipt still collides with them and is caught.
         let shadowRetired = 0;
-        if (opts.retireShadowBacklog) {
-            const result = await tx.receiptIntake.updateMany({
-                where: { dryRun: true, state: { in: ["READ", "BOOKING"] } },
-                data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
-            });
-            shadowRetired = result.count;
-            if (shadowRetired > 0) {
-                console.log("[cron/receipt-intake-worker] shadow backlog retired", shadowRetired);
+        let requeued = 0;
+        let boundaryMissing = false;
+        if (opts.run) {
+            if (!opts.boundary) {
+                // Refuse. Retiring on a guess destroys evidence of real
+                // expenses; requeuing on a guess double-books them. A logged
+                // no-op is the only honest third option.
+                boundaryMissing = true;
+            } else {
+                const parked: Prisma.ReceiptIntakeWhereInput = {
+                    dryRun: true,
+                    state: { in: ["READ", "BOOKING"] },
+                };
+
+                // BEFORE the boundary: v1 was still booking, so it booked these.
+                const retired = await tx.receiptIntake.updateMany({
+                    where: { ...parked, createdAt: { lt: opts.boundary } },
+                    data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
+                });
+                shadowRetired = retired.count;
+
+                // AFTER it: v1 had already stopped, so NOBODY booked these.
+                // They are the only rows from the shadow week that v2 must
+                // actually book — dropping them would lose real expenses.
+                const handed = await tx.receiptIntake.updateMany({
+                    where: { ...parked, createdAt: { gte: opts.boundary } },
+                    data: { dryRun: false, nextRetryAt: null },
+                });
+                requeued = handed.count;
+
+                if (shadowRetired > 0 || requeued > 0) {
+                    console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
+                        boundary: opts.boundary.toISOString(), shadowRetired, requeued,
+                    }));
+                }
             }
         }
 
@@ -120,7 +152,7 @@ async function claim(
             take: BATCH_SIZE,
             select: WORKER_ROW_SELECT,
         });
-        if (due.length === 0) return { rows: [], shadowRetired };
+        if (due.length === 0) return { rows: [], shadowRetired, requeued, boundaryMissing };
 
         // THE claim. Anything this run took is invisible to the next one for
         // the lease, whether or not the advisory lock held.
@@ -128,7 +160,7 @@ async function claim(
             where: { id: { in: due.map(r => r.id) } },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS) },
         });
-        return { rows: due as WorkerRow[], shadowRetired };
+        return { rows: due as WorkerRow[], shadowRetired, requeued, boundaryMissing };
     });
 }
 
@@ -137,6 +169,8 @@ function buildDeps(): WorkerDependencies {
         claim,
 
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
+
+        cutoverBoundary: resolveCutoverBoundary,
 
         sweepStaleStaging: async shouldStop => {
             // NEVER a blanket "old therefore missing". A STAGING row that is old
@@ -329,12 +363,21 @@ function buildDeps(): WorkerDependencies {
             return { promoted: true };
         }),
 
-        book: row => bookReceipt(row, {
+        book: (row, remainingMs) => bookReceipt(row, {
             db: prisma as unknown as BookPrismaClient,
+            companyTimeZone: resolveCompanyTimeZone,
+            isCostCodeAllowed: (projectId, costCodeId) =>
+                isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
+            remainingBudgetMs: () => remainingMs,
+            // ONE deadline for the whole booking, threaded into the token
+            // refresh AND the Purchase create so they share a budget instead of
+            // each helping itself to a fresh 20s.
+            deadline: () => createRouteDeadline(Math.max(0, remainingMs)),
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
-            getTokens: getFreshQBTokens,
-            createPurchase: (tokens, input) => createQBReceiptPurchase(tokens, input),
+            getTokens: deadline => getFreshQBTokens(deadline),
+            createPurchase: (tokens, input, deadline) =>
+                createQBReceiptPurchase(tokens, input, {}, deadline),
             downloadBytes: downloadDocBytesResult,
             logEvent: logAutomationEvent,
             now: () => new Date(),

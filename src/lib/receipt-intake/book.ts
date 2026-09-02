@@ -19,7 +19,8 @@
  */
 import { matchCostCode } from "@/lib/project-match";
 import { toSecureRef } from "@/lib/secure-storage";
-import { QBTimeoutError, type QBTokens } from "@/lib/quickbooks";
+import { startOfDateInTimeZone } from "@/lib/tz-date";
+import { QBTimeoutError, type QBTokens, type RouteDeadline } from "@/lib/quickbooks";
 import {
     QboAccountConfigError,
     QboPurchaseFaultError,
@@ -41,6 +42,8 @@ export interface BookableRow {
     projectId: string | null;
     costCodeId: string | null;
     suggestedCostCodeId: string | null;
+    /** The model's confidence in that phase suggestion, 0..1. */
+    suggestedConfidence: number | null;
     storagePath: string;
     fileName: string | null;
     mimeType: string;
@@ -90,11 +93,21 @@ export function attachmentBlocker(mimeType: string, byteLength: number): string 
     return null;
 }
 
+/**
+ * A booking needs enough runway to finish what it starts. Two QuickBooks round
+ * trips (token refresh + the Purchase create, each with its own 20s fetch
+ * deadline) plus the attachment upload and the commit do not fit in a few
+ * seconds — and a booking cut off mid-flight is the worst outcome available: the
+ * Purchase may exist in the real books while the row never learns it did.
+ * Better to not start.
+ */
+export const MIN_BOOKING_BUDGET_MS = 25_000;
+
 export type BookResult =
     /** Purchase + Expense exist and the row is BOOKED. */
     | { outcome: "booked"; qbPurchaseId: string; expenseId: string; alreadyExisted: boolean }
     /** A switch is off: stay BOOKING, try again in an hour, spend NO attempt. */
-    | { outcome: "deferred"; reason: "push-disabled" | "push-paused" }
+    | { outcome: "deferred"; reason: "push-disabled" | "push-paused" | "out-of-budget" }
     /**
      * Terminal: a human must look at it. No further automatic attempt.
      *
@@ -132,12 +145,27 @@ export interface BookPrismaClient {
 
 export interface BookDependencies {
     db: BookPrismaClient;
+    /** The company's configured zone — Expense.date is a business calendar day. */
+    companyTimeZone: () => Promise<string>;
+    /**
+     * Is this cost code a phase of THIS project? Re-asked at booking because the
+     * project can change between READ and BOOKING.
+     */
+    isCostCodeAllowed: (projectId: string, costCodeId: string) => Promise<boolean>;
     /** env master switch — opt-IN, exactly like the qbo-receipts/create route. */
     isPushEnabled: () => boolean;
     /** Command Center pause switch (pause-only; fail-CLOSED on a read error). */
     isPushPaused: () => Promise<boolean>;
-    getTokens: () => Promise<QBTokens>;
-    createPurchase: (tokens: QBTokens, input: CreateQBReceiptPurchaseInput) => Promise<CreateQBReceiptPurchaseResult>;
+    getTokens: (deadline?: RouteDeadline) => Promise<QBTokens>;
+    createPurchase: (
+        tokens: QBTokens,
+        input: CreateQBReceiptPurchaseInput,
+        deadline?: RouteDeadline,
+    ) => Promise<CreateQBReceiptPurchaseResult>;
+    /** Milliseconds left in the worker's invocation. Undefined = unbounded (tests). */
+    remainingBudgetMs?: () => number;
+    /** Threads the same budget into every QuickBooks call this booking makes. */
+    deadline?: () => RouteDeadline | undefined;
     /**
      * Reads the stored file back out of the private bucket. TAGGED, because a
      * confirmed 404 and a transient storage fault must not book the same way.
@@ -244,6 +272,7 @@ function terminalReasonFor(error: unknown): string | null {
  */
 export async function bookReceipt(row: BookableRow, deps: BookDependencies): Promise<BookResult> {
     const now = deps.now();
+    const timeZone = await deps.companyTimeZone();
 
     // Shadow mode is enforced by the WORKER, which never routes a dryRun row
     // here. This second check exists because "no QBO calls in dry run" is the
@@ -259,11 +288,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     if (!deps.isPushEnabled()) return { outcome: "deferred", reason: "push-disabled" };
     if (await deps.isPushPaused()) return { outcome: "deferred", reason: "push-paused" };
 
+    // Runway check BEFORE anything else that could touch QuickBooks. Deferred,
+    // not retried: the document is fine and this costs it no attempt — the
+    // invocation simply ran out of room, and the next pass has a full budget.
+    const remaining = deps.remainingBudgetMs?.();
+    if (remaining !== undefined && remaining < MIN_BOOKING_BUDGET_MS) {
+        return { outcome: "deferred", reason: "out-of-budget" };
+    }
+
     // Everything down to the QBO call is a PRE-SEND refusal: nothing was ever
     // sent, so the strong key must be handed back (see BookResult).
     if (!row.projectId) return parkedBeforeSend("no-estimate");
     if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend("refund-or-zero");
     if (!row.txnDate) return parkedBeforeSend("invalid-date");
+    // Hoisted so the calendar day is computed ONCE and both the QBO TxnDate and
+    // the Expense.date instant are derived from the same value.
+    const calendarDay = toCalendarDate(row.txnDate);
 
     // 2. The project's LATEST estimate — the same "primary estimate" rule the
     //    v1 receipt-ingest endpoint uses (route.ts:69). Expense.estimateId is
@@ -325,7 +365,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         projectName: project.name,
         docType: isCheck ? "check" : "receipt",
         vendor: row.vendor ?? "",
-        date: toCalendarDate(row.txnDate),
+        date: calendarDay,
         invoice: !isCheck && row.refNumber && row.refNumber !== "NoInv" ? row.refNumber : undefined,
         checkNumber: isCheck && row.refNumber ? row.refNumber.replace(/^Check/, "") : undefined,
         memo: row.memo ?? undefined,
@@ -339,8 +379,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
 
     let result: CreateQBReceiptPurchaseResult;
     try {
-        const tokens = await deps.getTokens();
-        result = await deps.createPurchase(tokens, input);
+        // ONE budget threaded through both round trips, so a slow token refresh
+        // shortens the create rather than each getting a fresh 20s.
+        const deadline = deps.deadline?.();
+        const tokens = await deps.getTokens(deadline);
+        result = await deps.createPurchase(tokens, input, deadline);
     } catch (error) {
         const terminal = terminalReasonFor(error);
         // A send WAS attempted: QBO may hold a Purchase whose response we lost,
@@ -392,7 +435,23 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    there is exactly one Purchase.
     const amountCents = expenseAmountCents(groups, row.totalCents);
     const taxApplied = appliedTaxCents(groups);
-    const costCodeId = row.costCodeId ?? row.suggestedCostCodeId ?? null;
+    // RE-VALIDATE THE PHASE AGAINST THE FINAL PROJECT.
+    //
+    // Both the captured code and the model's suggestion were resolved while the
+    // row was being READ — and at that point the row may have had NO project at
+    // all (NEEDS_JOB), or a different one that a human then corrected. A cost
+    // code from the old project is not a phase of the new one, and posting an
+    // Expense against it puts real money on a phase that job does not have,
+    // which every variance report then reads as overspend on a line nobody
+    // budgeted.
+    //
+    // "The cost code exists" is not a permission (project-phases.ts:125), so
+    // this asks the same question the clock-in validation asks. A mismatch is
+    // NOT a failure: the receipt is fine and its total is right, so it books
+    // UNCODED and says why. A bookkeeper assigning a phase is routine; an
+    // expense silently attached to the wrong one is not.
+    const phaseCheck = await resolvePhase(row, project.id, deps);
+    const costCodeId = phaseCheck.costCodeId;
     const driveFileId = driveFileIdOf(row);
     const receiptUrl = driveFileId
         ? `https://drive.google.com/file/d/${driveFileId}/view`
@@ -416,12 +475,20 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     costCodeId,
                     amount: amountCents / 100,
                     vendor: row.vendor || "Unknown",
-                    date: row.txnDate,
+                    // RE-ANCHORED at write time. `txnDate` is a @db.Date column
+                    // and round-trips as UTC midnight, so writing it straight
+                    // into Expense.date (a full timestamp) records 5pm the
+                    // PREVIOUS day in Pacific — and every job-cost and variance
+                    // report that bounds by local midnight then counts the
+                    // expense in the wrong period. The intake row keeps the
+                    // calendar day; this makes the instant match it.
+                    date: startOfDateInTimeZone(calendarDay, timeZone),
                     status: "Pending",
                     receiptUrl,
                     qbPurchaseId: result.qbPurchaseId,
                     description:
                         `[Receipt intake] ${docRef}` +
+                        phaseCheck.note +
                         (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
                         ` · pending bookkeeper review`,
                 },
@@ -464,6 +531,14 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 intakeId: row.id,
                 expenseId,
                 sourceRef: row.sourceRef,
+                costCodeId,
+                // Carried through so the Command Center can show HOW confident
+                // the phase pick was, and so a low-confidence run is auditable
+                // after the fact rather than only at review time.
+                suggestedConfidence: costCodeId && costCodeId === row.suggestedCostCodeId
+                    ? row.suggestedConfidence
+                    : undefined,
+                phaseRejected: phaseCheck.rejected || undefined,
             },
         }).catch(() => { /* audit only */ });
 
@@ -488,6 +563,38 @@ function describe(error: unknown): string {
 
 /** Marks a retry as "the Purchase exists but its receipt did not attach". */
 export const ATTACHMENT_FAILED_PREFIX = "attachment-failed:";
+
+/**
+ * Which phase (if any) this Expense may carry, checked against the project the
+ * row will ACTUALLY book to.
+ */
+async function resolvePhase(
+    row: BookableRow,
+    projectId: string,
+    deps: BookDependencies,
+): Promise<{ costCodeId: string | null; note: string; rejected: string | null }> {
+    // A human's explicit pick outranks the model's suggestion, but neither is
+    // trusted without the project check.
+    const candidate = row.costCodeId ?? row.suggestedCostCodeId ?? null;
+    if (!candidate) return { costCodeId: null, note: "", rejected: null };
+
+    const allowed = await deps.isCostCodeAllowed(projectId, candidate);
+    if (allowed) {
+        const fromSuggestion = !row.costCodeId && candidate === row.suggestedCostCodeId;
+        const confidence = row.suggestedConfidence;
+        const note =
+            fromSuggestion && typeof confidence === "number"
+                ? ` · phase suggested (confidence ${confidence.toFixed(2)})`
+                : "";
+        return { costCodeId: candidate, note, rejected: null };
+    }
+
+    return {
+        costCodeId: null,
+        note: " · phase cleared (not a phase of this job) — assign one",
+        rejected: candidate,
+    };
+}
 
 /** A refusal reached WITHOUT any QBO call — the strong key goes back. */
 function parkedBeforeSend(reason: string): BookResult {

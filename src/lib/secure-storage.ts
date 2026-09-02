@@ -192,13 +192,32 @@ export type DocBytesResult =
     | { ok: false; kind: "not-found" }
     | { ok: false; kind: "transient"; message: string };
 
-/** Supabase storage's shapes for "this key does not exist". */
-function isNotFoundError(error: { message?: string; status?: number; statusCode?: string | number } | null): boolean {
+/**
+ * Storage's shapes for "this key does not exist", and ONLY those.
+ *
+ * `status === 400` used to count as not-found, which is badly wrong: Supabase
+ * returns 400 for a malformed request, a bad JWT, an expired service key, and
+ * assorted config faults. Any of those made the caller conclude the receipt was
+ * GONE — a terminal verdict that parks the row and RELEASES its dedup key — when
+ * the object was sitting there untouched. A rotated key would have emptied the
+ * queue into review and unlocked every key on the way out.
+ *
+ * So: an affirmative 404, or an explicit not-found error code. Everything else,
+ * including every other 4xx, is transient/config and retries.
+ */
+const NOT_FOUND_CODES = new Set(["nosuchkey", "not_found", "object_not_found", "entitynotfound"]);
+
+export function isNotFoundError(
+    error: { message?: string; status?: number; statusCode?: string | number; error?: string } | null,
+): boolean {
     if (!error) return false;
-    const status = Number(error.status ?? error.statusCode);
-    if (status === 404 || status === 400) return true;
+    if (Number(error.status ?? error.statusCode) === 404) return true;
+    const code = String(error.error ?? "").toLowerCase().replace(/[\s-]/g, "_");
+    if (NOT_FOUND_CODES.has(code)) return true;
     const message = String(error.message ?? "").toLowerCase();
-    return message.includes("not found") || message.includes("object not found");
+    // Exact phrases only — a substring like "not found" inside some other
+    // sentence is not evidence of absence.
+    return message === "object not found" || message === "the resource was not found";
 }
 
 /**

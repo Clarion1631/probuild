@@ -205,6 +205,9 @@ jobs:
       # a literal rather than a repo secret. The spec's "env var unset" case is
       # a unit test (tests/receipt-intake-auth.test.ts), not this job.
       RECEIPT_INTAKE_SECRET: "e2e-ci-receipt-intake-secret"
+      # The archive mirror's key is DELIBERATELY different — the specs assert
+      # that cross-use between the two capabilities is a 403.
+      RECEIPT_ARCHIVE_SECRET: "e2e-ci-receipt-archive-secret"
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.

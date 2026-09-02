@@ -60,6 +60,13 @@ export interface ReadResult {
     taxAmount: string;
     /** One of the supplied phase codes, or "". */
     suggestedPhaseCode: string;
+    /**
+     * How sure the model is about that phase, 0..1. Null when it gave no usable
+     * number — which is NOT the same as 0, and must not be stored as 0: "the
+     * model didn't say" and "the model is sure it is a poor match" would then be
+     * indistinguishable in the queue.
+     */
+    suggestedConfidence: number | null;
     /** The model's raw JSON text, stored for audit. */
     raw: string;
 }
@@ -150,9 +157,12 @@ export function buildReadPrompt(projectPhases: ProjectPhase[]): string {
         promptText +
         "\n\nSTEP 3 - this document belongs to a job with the following phases:\n" +
         phaseList +
-        "\nAdd ONE more output field, \"suggested_phase\", holding the CODE of the single phase " +
-        "this purchase most clearly belongs to. Use only a code from the list above, exactly as " +
-        'written. If nothing on the document points clearly at one phase, return "".'
+        "\nAdd TWO more output fields: \"suggested_phase\", holding the CODE of the single phase " +
+        "this purchase most clearly belongs to (use only a code from the list above, exactly as " +
+        'written; return "" if nothing on the document points clearly at one phase), and ' +
+        '"suggested_phase_confidence", a number from 0 to 1 for how sure you are of that phase. ' +
+        "Be honest about uncertainty — a low number sends the receipt to a human, which is the " +
+        "right outcome when the document is ambiguous."
     );
 }
 
@@ -178,6 +188,17 @@ export function normalizeDocType(value: unknown): string {
     if (typeof value !== "string") return UNKNOWN_DOC_TYPE;
     const raw = value.trim().toLowerCase();
     return (DOC_TYPES as readonly string[]).includes(raw) ? raw : UNKNOWN_DOC_TYPE;
+}
+
+/**
+ * 0..1, or null. Clamped at the edges (a model that says 1.2 means "very sure"),
+ * but anything non-numeric is null — never 0, because "no answer" and "sure it
+ * is a poor match" must stay distinguishable.
+ */
+export function normalizeConfidence(value: unknown): number | null {
+    const n = typeof value === "number" ? value : Number(coerce(value));
+    if (!Number.isFinite(n)) return null;
+    return Math.min(1, Math.max(0, n));
 }
 
 function coerce(value: unknown): string {
@@ -208,6 +229,11 @@ export function parseReadJson(text: string, projectPhases: ProjectPhase[]): Read
         totalAmount: coerce(json.total_amount),
         taxAmount: coerce(json.tax_amount),
         suggestedPhaseCode: allowed.has(suggested) ? suggested : "",
+        // Only meaningful alongside an ACCEPTED phase — a confidence attached
+        // to a suggestion we discarded would be actively misleading.
+        suggestedConfidence: allowed.has(suggested)
+            ? normalizeConfidence(json.suggested_phase_confidence)
+            : null,
         raw: text,
     };
 }

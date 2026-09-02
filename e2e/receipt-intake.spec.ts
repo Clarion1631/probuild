@@ -29,6 +29,9 @@ import { PrismaClient } from "@prisma/client";
 const prisma = new PrismaClient();
 const INTAKE_PATH = "/api/receipts/intake";
 const SECRET = process.env.RECEIPT_INTAKE_SECRET || "";
+// The archive mirror holds a DIFFERENT key: it may read BOOKED/ARCHIVED rows and
+// report what it archived, and nothing else. Cross-use is a 403.
+const ARCHIVE_SECRET = process.env.RECEIPT_ARCHIVE_SECRET || "";
 
 // One prefix for everything this file creates, so teardown can be exact.
 const REF_PREFIX = "drive:e2e-intake-";
@@ -465,7 +468,7 @@ test.describe("intake GET", () => {
             storageState: { cookies: [], origins: [] },
         });
         const res = await machine.get(`${INTAKE_PATH}?state=BOOKED`, {
-            headers: { "x-receipt-intake-secret": SECRET },
+            headers: { "x-receipt-intake-secret": ARCHIVE_SECRET },
             maxRedirects: 0,
         });
         expect(res.status()).toBe(200);
@@ -489,14 +492,14 @@ test.describe("intake GET", () => {
         });
         for (const state of ["NEEDS_REVIEW", "RECEIVED", "READ", ""]) {
             const res = await machine.get(`${INTAKE_PATH}${state ? `?state=${state}` : ""}`, {
-                headers: { "x-receipt-intake-secret": SECRET },
+                headers: { "x-receipt-intake-secret": ARCHIVE_SECRET },
                 maxRedirects: 0,
             });
             expect(res.status(), state || "(no state)").toBe(400);
         }
         // ARCHIVED is allowed — the mirror re-checks what it already copied.
         const archived = await machine.get(`${INTAKE_PATH}?state=ARCHIVED`, {
-            headers: { "x-receipt-intake-secret": SECRET },
+            headers: { "x-receipt-intake-secret": ARCHIVE_SECRET },
             maxRedirects: 0,
         });
         expect(archived.status()).toBe(200);
@@ -558,7 +561,7 @@ test.describe("archive callback", () => {
         expect(sessionAttempt.status()).toBe(401);
 
         const notBooked = await anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
-            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
             data: JSON.stringify({ driveFileId: "DRIVE1" }),
             maxRedirects: 0,
         });
@@ -566,7 +569,7 @@ test.describe("archive callback", () => {
 
         await prisma.receiptIntake.update({ where: { id }, data: { state: "BOOKED" } });
         const archive = (driveFileId: string) => anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
-            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
             data: JSON.stringify({ driveFileId }),
             maxRedirects: 0,
         });
@@ -607,7 +610,7 @@ test.describe("archive callback", () => {
             storageState: { cookies: [], origins: [] },
         });
         const res = await machine.post(`${INTAKE_PATH}/no-such-row/archived`, {
-            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
             data: JSON.stringify({ driveFileId: "DRIVE1" }),
             maxRedirects: 0,
         });
@@ -660,5 +663,40 @@ test.describe("orphan recovery", () => {
         expect(replay.res.status()).toBe(409);
         expect(replay.body.error).toBe("object-missing");
         expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.state).toBe("BOOKED");
+    });
+});
+
+test.describe("the two machine secrets are not interchangeable", () => {
+    test("the ingest key cannot read the queue, and the archive key cannot ingest", async ({ playwright }) => {
+        // One shared secret gave a script that only copies files to Drive the
+        // power to inject Purchases into the books, and gave the forwarders the
+        // power to enumerate every receipt. 403, not 401: the caller IS
+        // authenticated, it is holding the wrong program's key.
+        const machine = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: { cookies: [], origins: [] },
+        });
+
+        const forwarderReadingQueue = await machine.get(`${INTAKE_PATH}?state=BOOKED`, {
+            headers: { "x-receipt-intake-secret": SECRET },
+            maxRedirects: 0,
+        });
+        expect(forwarderReadingQueue.status()).toBe(403);
+
+        const mirrorIngesting = await machine.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}wrongkey` }),
+            maxRedirects: 0,
+        });
+        expect(mirrorIngesting.status()).toBe(403);
+
+        const mirrorStartingUpload = await machine.post(`${INTAKE_PATH}/start`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": ARCHIVE_SECRET },
+            data: JSON.stringify({ mimeType: "image/png", source: "drive", sourceRef: `${REF_PREFIX}wrongkey2` }),
+            maxRedirects: 0,
+        });
+        expect(mirrorStartingUpload.status()).toBe(403);
+
+        await machine.dispose();
     });
 });

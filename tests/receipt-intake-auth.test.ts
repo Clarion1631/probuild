@@ -147,3 +147,213 @@ test("a Next-Action dispatch on a bypassed intake path is 403, not waved through
         env.NODE_ENV = prod;
     }
 });
+
+test("the two-step upload paths bypass the proxy, exactly", async () => {
+    const { isPublicProxyBypass } = await loadProxy();
+    for (const path of [
+        "/api/receipts/intake/start",
+        "/api/receipts/intake/start/",
+        "/api/receipts/intake/abc123/finalize",
+        "/api/receipts/intake/abc123/finalize/",
+    ]) {
+        assert.equal(isPublicProxyBypass(path), true, path);
+    }
+    // ...and no wider than that.
+    for (const path of [
+        "/api/receipts/intake/start/extra",
+        "/api/receipts/intake/abc123/finalize/extra",
+        "/api/receipts/intake/abc123",
+        "/api/receipts/intake/abc123/other",
+    ]) {
+        assert.equal(isPublicProxyBypass(path), false, path);
+    }
+});
+
+test("a Next-Action dispatch is refused on the two-step paths too", async () => {
+    // Same reasoning as the single-shot route: these bypass the proxy, so the
+    // in-handler secret/session check is their ONLY gate, and an action dispatch
+    // never reaches the handler at all.
+    const { default: proxy } = await loadProxy();
+    const { NextRequest } = await import("next/server");
+    const event = { waitUntil() {} } as any;
+    const env = process.env as Record<string, string | undefined>;
+    const prod = env.NODE_ENV;
+    env.NODE_ENV = "production";
+    try {
+        for (const path of ["/api/receipts/intake/start", "/api/receipts/intake/abc123/finalize"]) {
+            const res = await proxy(
+                new NextRequest(`https://probuild.test${path}`, {
+                    method: "POST",
+                    headers: { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+                }),
+                event,
+            );
+            assert.ok(res, path);
+            assert.equal(res.status, 403, `${path} must refuse an action dispatch`);
+            assert.equal(res.headers.get("x-middleware-next"), null, path);
+        }
+        // A normal machine POST still passes through.
+        const normal = await proxy(
+            new NextRequest("https://probuild.test/api/receipts/intake/start", {
+                method: "POST",
+                headers: { "x-receipt-intake-secret": "whatever" },
+            }),
+            event,
+        );
+        assert.equal(normal!.headers.get("x-middleware-next"), "1");
+    } finally {
+        env.NODE_ENV = prod;
+    }
+});
+
+test("provenance rules are shared by BOTH upload paths", async () => {
+    // decideSource is the single implementation, so the two-step flow cannot
+    // drift into accepting a caller-chosen source or sourceRef.
+    const { decideSource, MAX_INLINE_UPLOAD_BYTES, MAX_STORED_BYTES } =
+        await import("../src/lib/receipt-intake/intake-core");
+
+    const session = { ok: true, via: "session", userVia: "next-auth", user: { id: "u1", role: "ADMIN" } } as any;
+    assert.deepEqual(decideSource(session, { source: "drive" }), { ok: false, reason: "invalid-source" });
+    assert.deepEqual(decideSource(session, { sourceRef: "web:x" }), { ok: false, reason: "sourceRef-not-allowed" });
+    assert.deepEqual(decideSource(session, { uploadId: "nope" }), { ok: false, reason: "invalid-uploadId" });
+
+    const scoped = decideSource(session, { uploadId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301" });
+    assert.ok(scoped.ok);
+    assert.equal(scoped.sourceRef, "web:u1:3f2504e0-4f89-41d3-9a0c-0305e82c3301", "scoped to the USER");
+
+    const mobile = { ok: true, via: "session", userVia: "mobile-jwt", user: { id: "u2", role: "FIELD_CREW" } } as any;
+    const minted = decideSource(mobile, {});
+    assert.ok(minted.ok);
+    assert.match(minted.sourceRef, /^mobile:[0-9a-f-]{36}$/);
+
+    const secret = {
+        ok: true, via: "secret", user: null, userVia: null,
+        capability: "ingest", allowedSources: new Set(["drive", "email", "chat"]),
+    } as any;
+    assert.deepEqual(decideSource(secret, { source: "chat", sourceRef: "drive:x" }),
+        { ok: false, reason: "sourceRef-namespace-mismatch" });
+    assert.deepEqual(decideSource(secret, { source: "web", sourceRef: "web:x" }),
+        { ok: false, reason: "invalid-source" });
+    assert.ok(decideSource(secret, { source: "drive", sourceRef: "drive:FILE1" }).ok);
+
+    // The inline body cap is well under the stored cap, which is the whole
+    // reason the two-step path exists.
+    assert.ok(MAX_INLINE_UPLOAD_BYTES < MAX_STORED_BYTES);
+    assert.equal(MAX_STORED_BYTES, 15 * 1024 * 1024);
+});
+
+// ── Two secrets, two blast radii (Phase 3 gate, c) ─────────────────────────
+
+test("each secret may only do its own job; cross-use is 403", async () => {
+    const { authenticateIntake, INGEST_ALLOWED_SOURCES } = await loadAuth();
+    const env = process.env as Record<string, string | undefined>;
+    const before = { i: env.RECEIPT_INTAKE_SECRET, a: env.RECEIPT_ARCHIVE_SECRET };
+    env.RECEIPT_INTAKE_SECRET = "ingest-key";
+    env.RECEIPT_ARCHIVE_SECRET = "archive-key";
+    const req = (secret: string) =>
+        new Request("https://probuild.test/api/receipts/intake", {
+            method: "POST",
+            headers: { "x-receipt-intake-secret": secret },
+        });
+
+    try {
+        // Right key, right job.
+        const ingesting = await authenticateIntake(req("ingest-key"), "ingest");
+        assert.ok(ingesting.ok);
+        assert.equal(ingesting.via, "secret");
+        if (ingesting.via !== "secret") throw new Error("unreachable");
+        assert.equal(ingesting.capability, "ingest");
+        assert.deepEqual([...ingesting.allowedSources].sort(), ["chat", "drive", "email"]);
+
+        const archiving = await authenticateIntake(req("archive-key"), "archive");
+        assert.ok(archiving.ok);
+        if (archiving.via !== "secret") throw new Error("unreachable");
+        assert.equal(archiving.capability, "archive");
+        assert.equal(archiving.allowedSources.size, 0, "the mirror declares no sources at all");
+
+        // Cross-use: authenticated, but holding the OTHER program's key. 403,
+        // not 401 — saying so is what makes a mis-wired script obvious rather
+        // than looking like a rotation problem.
+        const forwarderReadingTheQueue = await authenticateIntake(req("ingest-key"), "archive");
+        assert.equal(forwarderReadingTheQueue.ok, false);
+        assert.equal((forwarderReadingTheQueue as { response: Response }).response.status, 403);
+
+        const mirrorInjectingReceipts = await authenticateIntake(req("archive-key"), "ingest");
+        assert.equal(mirrorInjectingReceipts.ok, false);
+        assert.equal((mirrorInjectingReceipts as { response: Response }).response.status, 403);
+
+        // An unknown secret is 401, not 403 — it is not authenticated at all.
+        const stranger = await authenticateIntake(req("neither"), "ingest");
+        assert.equal((stranger as { response: Response }).response.status, 401);
+
+        assert.deepEqual([...INGEST_ALLOWED_SOURCES].sort(), ["chat", "drive", "email"]);
+    } finally {
+        env.RECEIPT_INTAKE_SECRET = before.i;
+        env.RECEIPT_ARCHIVE_SECRET = before.a;
+    }
+});
+
+test("configuring ONE value for both variables is refused, not silently merged", async () => {
+    // Otherwise the split is undone by a copy-paste and nobody finds out.
+    const { authenticateIntake } = await loadAuth();
+    const env = process.env as Record<string, string | undefined>;
+    const before = { i: env.RECEIPT_INTAKE_SECRET, a: env.RECEIPT_ARCHIVE_SECRET };
+    env.RECEIPT_INTAKE_SECRET = "same";
+    env.RECEIPT_ARCHIVE_SECRET = "same";
+    try {
+        const res = await authenticateIntake(
+            new Request("https://probuild.test/api/receipts/intake", {
+                method: "POST",
+                headers: { "x-receipt-intake-secret": "same" },
+            }),
+            "ingest",
+        );
+        assert.equal(res.ok, false);
+        assert.equal((res as { response: Response }).response.status, 401);
+    } finally {
+        env.RECEIPT_INTAKE_SECRET = before.i;
+        env.RECEIPT_ARCHIVE_SECRET = before.a;
+    }
+});
+
+test("an unset secret refuses that capability — never fails open", async () => {
+    const { authenticateIntake } = await loadAuth();
+    const env = process.env as Record<string, string | undefined>;
+    const before = { i: env.RECEIPT_INTAKE_SECRET, a: env.RECEIPT_ARCHIVE_SECRET };
+    delete env.RECEIPT_INTAKE_SECRET;
+    delete env.RECEIPT_ARCHIVE_SECRET;
+    try {
+        for (const need of ["ingest", "archive"] as const) {
+            const res = await authenticateIntake(
+                new Request("https://probuild.test/api/receipts/intake", {
+                    method: "POST",
+                    headers: { "x-receipt-intake-secret": "anything" },
+                }),
+                need,
+            );
+            assert.equal(res.ok, false, need);
+            assert.equal((res as { response: Response }).response.status, 401, need);
+        }
+    } finally {
+        env.RECEIPT_INTAKE_SECRET = before.i;
+        env.RECEIPT_ARCHIVE_SECRET = before.a;
+    }
+});
+
+test("a secret may only declare the sources ITS key owns", async () => {
+    const { decideSource } = await import("../src/lib/receipt-intake/intake-core");
+    const ingest = {
+        ok: true, via: "secret", user: null, userVia: null,
+        capability: "ingest", allowedSources: new Set(["drive", "email", "chat"]),
+    } as any;
+    const archive = {
+        ok: true, via: "secret", user: null, userVia: null,
+        capability: "archive", allowedSources: new Set(),
+    } as any;
+
+    assert.ok(decideSource(ingest, { source: "drive", sourceRef: "drive:F1" }).ok);
+    // The archive key owns no sources, so it can never mint an intake row even
+    // if it somehow reached this code.
+    assert.deepEqual(decideSource(archive, { source: "drive", sourceRef: "drive:F1" }),
+        { ok: false, reason: "invalid-source" });
+});
