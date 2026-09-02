@@ -556,7 +556,9 @@ test("the journey mapper renders attachment-failed as failed, not in-flight", as
     // arriving - the bot has already stopped.
     assert.equal(journey.finalState, "error");
     assert.equal(journey.finalReason, "failed:fault");
-// ── Receipt Pipeline v2 intake queue (Codex round 3, item 7) ────────────────
+});
+
+// ── Receipt Pipeline v2 intake queue ───────────────────────────────────────
 // Every other probe in this file reads AutomationEvent, which only records a
 // BOOKING — so a v2 row that never reaches QuickBooks is invisible to all of
 // them. A jammed intake queue reported a perfectly healthy pipeline.
@@ -578,6 +580,24 @@ test("a NEEDS_REVIEW backlog alone is NOT a failure", () => {
     assert.deepEqual(v, { ok: true, reasons: [] });
 });
 
+test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
+    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
+    // while every other probe reads green. Its own reason, because the fix is
+    // different: assign a project, not restart a worker.
+    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
+});
+
+test("stuck and unassigned are reported separately", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeUnassigned: { status: "ok", count: 3 },
+    }));
+    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
+    assert.ok(v.reasons.includes("intake-unassigned:3"));
+});
+
 test("an intake probe that FAILED is not an intake probe that found nothing", () => {
     for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned"] as const) {
         const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
@@ -595,7 +615,15 @@ test("the stuck reason survives a failed backlog probe rather than lying about i
     assert.ok(v.reasons.includes("probe-failed:intakeNeedsReview"));
 });
 
-test("the digest prints both intake numbers", () => {
+test("STAGING gets a much shorter fuse than the working states", () => {
+    // STAGING is meant to last one HTTP request; RECEIVED/BOOKING/READ are
+    // queue states measured in hours.
+    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
+    assert.equal(INTAKE_STUCK_HOURS, 6);
+    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+});
+
+test("the digest prints all three intake numbers", () => {
     const { text } = formatPipelineDigest(sampleHealth({
         intake: {
             stuck: { status: "ok", count: 3 },
@@ -618,61 +646,4 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
     assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
-});
-
-test("the intake stuck probe covers the three shapes of 'the worker stopped'", async () => {
-    // Regression: it counted only RECEIVED/BOOKING, so a dead worker left stale
-    // STAGING rows invisible, and a worker that died right after routing left
-    // live READ rows invisible. Both reported green.
-    const wheres: any[] = [];
-    const db = {
-        receiptIntake: {
-            count: async (args: any) => { wheres.push(args.where); return 0; },
-        },
-    };
-    // Rebuild the predicate the probe uses, from the exported constants, and
-    // assert its shape rather than re-deriving the numbers.
-    const now = Date.parse("2026-09-01T14:00:00.000Z");
-    const where = {
-        OR: [
-            { state: { in: ["RECEIVED", "BOOKING"] }, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
-            { state: "STAGING", createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) } },
-            { state: "READ", dryRun: false, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
-        ],
-    };
-    await db.receiptIntake.count({ where });
-
-    const branches = wheres[0].OR;
-    assert.equal(branches.length, 3);
-    // STAGING is meant to last one HTTP request, so it gets a much shorter fuse.
-    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
-    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
-    // dryRun rows legitimately REST in READ for the whole shadow week — counting
-    // them would make the check red by design and train everyone to ignore it.
-    assert.equal(branches[2].dryRun, false);
-});
-
-test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
-    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
-    // while every other probe reads green — the exact silent failure this whole
-    // check exists to eliminate. Its own reason, because the fix is different:
-    // assign a project, not restart a worker.
-    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
-    assert.equal(v.ok, false);
-    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
-});
-
-test("a freshly uploaded unassigned receipt is not an alert", () => {
-    // Only rows OLDER than the stuck threshold are counted by the probe, so a
-    // receipt uploaded ten minutes ago never reaches this reason.
-    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
-});
-
-test("unassigned and stuck are reported separately", () => {
-    const v = evaluatePipelineHealth(snapshot({
-        intakeStuck: { status: "ok", count: 2 },
-        intakeUnassigned: { status: "ok", count: 3 },
-    }));
-    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
-    assert.ok(v.reasons.includes("intake-unassigned:3"));
 });

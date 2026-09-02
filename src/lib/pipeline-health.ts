@@ -84,14 +84,18 @@ export interface PipelineHealth {
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
     /**
-     * Receipt Pipeline v2 (ReceiptIntake). The v1 probes above all read
+     * Receipt Pipeline v2 (ReceiptIntake). Every other probe here reads
      * AutomationEvent, which only ever records a BOOKING — so a v2 row that
-     * never reaches QuickBooks is invisible to every check in this file. A
-     * jammed intake queue would report a perfectly healthy pipeline right up
-     * until somebody noticed the expenses were missing.
+     * never reaches QuickBooks is invisible to all of them. A jammed intake
+     * queue reported a perfectly healthy pipeline right up until somebody
+     * noticed the expenses were missing.
      */
     intake: {
-        /** RECEIVED or BOOKING and older than 6h — the queue is not draining. */
+        /**
+         * Three shapes of "the worker stopped": RECEIVED/BOOKING overdue,
+         * STAGING overdue (the route died mid-upload, or the sweeper is dead),
+         * and live READ overdue (a worker that died right after routing).
+         */
         stuck: CountProbe;
         /** NEEDS_REVIEW backlog. Reported always; a reason only when rows are STUCK. */
         needsReview: CountProbe;
@@ -250,6 +254,26 @@ export function evaluatePipelineHealth(input: {
         reasons.push(`errors-24h:${input.stuck.count}`);
     }
 
+    // A row sitting in RECEIVED/BOOKING/STAGING or live READ past its fuse means
+    // the worker is not draining the queue — a wedged cron, an exhausted retry
+    // budget, a storage outage. The backlog number rides along so the digest can
+    // say how big the hole is, but only the STUCK count is a failure:
+    // NEEDS_REVIEW rows are working as designed (a human was asked a question)
+    // and would otherwise hold the pipeline red until somebody cleared them.
+    if (input.intakeStuck.status === "ok" && input.intakeStuck.count > 0) {
+        const backlog =
+            input.intakeNeedsReview.status === "ok" ? `,needs-review:${input.intakeNeedsReview.count}` : "";
+        reasons.push(`intake-stuck:${input.intakeStuck.count}${backlog}`);
+    }
+
+    // A receipt waiting hours for someone to say which job it belongs to is not
+    // "working as designed" — it is an expense that will never reach job cost.
+    // Its own reason, because the fix is different: assign a project, not
+    // restart a worker.
+    if (input.intakeUnassigned.status === "ok" && input.intakeUnassigned.count > 0) {
+        reasons.push(`intake-unassigned:${input.intakeUnassigned.count}`);
+    }
+
     if (input.lastPaymentsSync.status === "ok") {
         // The money rail's heartbeat. Null means the hourly cron has never
         // completed a run we can see; stale means it stopped. Either way the
@@ -268,24 +292,6 @@ export function evaluatePipelineHealth(input: {
         // It proves the cron is alive, so it counts for freshness — but it must
         // be reported the same day, not hidden inside the 26h staleness window.
         else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
-    // A row sitting in RECEIVED or BOOKING for six hours means the worker is
-    // not draining the queue — a wedged cron, an exhausted retry budget, a
-    // storage outage. The backlog number rides along so the digest can say how
-    // big the hole is, but only the STUCK count is a failure: NEEDS_REVIEW rows
-    // are working as designed (a human was asked a question) and would
-    // otherwise hold the pipeline red until somebody cleared the queue.
-    if (input.intakeStuck.status === "ok" && input.intakeStuck.count > 0) {
-        const backlog =
-            input.intakeNeedsReview.status === "ok" ? `,needs-review:${input.intakeNeedsReview.count}` : "";
-        reasons.push(`intake-stuck:${input.intakeStuck.count}${backlog}`);
-    }
-
-    // A receipt that has been waiting hours for someone to say which job it
-    // belongs to is not "working as designed" — it is an expense that will
-    // never reach job cost. It is its own reason, separate from intake-stuck,
-    // because the fix is different: assign a project, not restart a worker.
-    if (input.intakeUnassigned.status === "ok" && input.intakeUnassigned.count > 0) {
-        reasons.push(`intake-unassigned:${input.intakeUnassigned.count}`);
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -352,11 +358,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck] = await Promise.all([
-    const [intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck, intakeStuck, intakeNeedsReview] =
-        await Promise.all([
     const [
-        intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck,
+        intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
         intakeStuck, intakeNeedsReview, intakeUnassigned,
     ] = await Promise.all([
         fetchIntuitStatus(),
@@ -451,19 +454,17 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             }),
             0,
         ),
-        // ReceiptIntake: the v2 queue. STAGING is excluded on purpose — those
-        // rows are mid-upload and the intake route's own 15-minute sweeper owns
-        // them; counting them here would flag every in-flight request.
-        // Three shapes of "the worker stopped", all of which used to read green:
-        //   RECEIVED/BOOKING overdue  — the classic jam.
-        //   STAGING overdue           — the route died mid-upload, or the
-        //                               sweeper is dead. Excluded before,
-        //                               which hid a dead worker completely.
-        //   READ overdue, LIVE only   — a worker that died right after routing
-        //                               leaves a bookable row parked forever.
-        //                               dryRun rows legitimately rest in READ
-        //                               for the whole shadow week, so they are
-        //                               excluded or the check is red by design.
+        // ReceiptIntake: the v2 queue. Three shapes of "the worker stopped",
+        // all of which used to read green:
+        //   RECEIVED/BOOKING overdue — the classic jam.
+        //   STAGING overdue          — the route died mid-upload, or the sweeper
+        //                              is dead. STAGING is invisible to the
+        //                              claim by design, so nothing else notices.
+        //   READ overdue, LIVE only  — a worker that died right after routing
+        //                              leaves a bookable row parked forever.
+        //                              dryRun rows legitimately REST in READ for
+        //                              the whole shadow week, so they are
+        //                              excluded or the check is red by design.
         probe<number>(
             "intakeStuck",
             () =>
