@@ -29,7 +29,7 @@ function row(over: Partial<LateFieldRow> = {}): LateFieldRow {
 
 interface Trace {
     deps: LateFieldsDeps;
-    applied: Record<string, string>[];
+    applied: Record<string, string | boolean>[];
     authorized: (string | null)[];
 }
 

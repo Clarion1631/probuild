@@ -136,6 +136,26 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
             findUnique: async () => state.existingExpense,
             create: async (args: any) => { expenses.push(args.data); return { id: `exp-${expenses.length}` }; },
             update: async (args: any) => { expenseUpdates.push(args); return {}; },
+            // Models the PREDICATE. Each guarded fill has to be able to match
+            // ZERO rows, because that is the whole guarantee it buys.
+            updateMany: async (args: any) => {
+                expenseUpdates.push(args);
+                const cur = state.existingExpense ?? {};
+                const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+                for (const key of ["projectId", "costCodeId", "taxAmount", "installedAtCustomer"]) {
+                    if (key in args.where && !eq(cur[key], args.where[key])) return { count: 0 };
+                }
+                if (Array.isArray(args.where.OR)) {
+                    const src = cur.costCodeSource ?? null;
+                    const ok = args.where.OR.some((b: any) =>
+                        b.costCodeSource === null
+                            ? src === null
+                            : src !== null && !(b.costCodeSource?.notIn ?? []).includes(src));
+                    if (!ok) return { count: 0 };
+                }
+                if (state.existingExpense) Object.assign(state.existingExpense, args.data);
+                return { count: 1 };
+            },
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
@@ -1028,4 +1048,93 @@ test("the QBO core fires onExistingPurchase before it touches the attachment", (
     );
     // And the create hook is NOT fired on this path.
     assert.ok(!body.includes("onBeforeCreate"), "onBeforeCreate belongs to the create path only");
+
+// ── the already-booked Purchase still needs its Phase 3 fields ─────────────
+
+test("an alreadyExists row is FILLED, not left blank", async () => {
+    // `alreadyExists` covers the lost-response retry AND a row v1 created
+    // before this pipeline existed. Returning it untouched left projectId, the
+    // phase, the provenance and the tax columns NULL forever on exactly the
+    // receipts the tax report is made of.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: null, costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, installedAtCustomer: null,
+        estimate: { projectId: null },
+    };
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    const fill = Object.assign({}, ...rec.expenseUpdates.map((u: any) => u.data));
+    assert.equal(fill.projectId, "proj-1");
+    assert.equal(fill.installedAtCustomer, true);
+    assert.ok("taxAmount" in fill, "the tax the booking validated lands too");
+});
+
+test("a human's decisions on an existing row are never overwritten", async () => {
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: "cc-human",
+        costCodeSource: "manual", taxAmount: 9.99, taxAtSource: true,
+        installedAtCustomer: false, estimate: { projectId: "proj-1" },
+    };
+    await bookReceipt(row(), rec.deps);
+    // Nothing a human owns may be written — the guarded predicates are what
+    // enforce it, so assert on what actually LANDED, not on what was attempted.
+    const after = rec.existingExpense;
+    assert.equal(after.costCodeId, "cc-human", "a manual phase is untouchable");
+    assert.equal(after.taxAmount, 9.99, "a recorded tax outranks a re-read");
+    assert.equal(after.installedAtCustomer, false, "an answered tax question is a human's");
+    // The writes are ATTEMPTED and rejected by their predicates — that is the
+    // point of moving the guarantee into SQL, so there is nothing to assert
+    // about whether the statements were issued.
+    assert.ok(rec.expenseUpdates.every((u: any) => u.where.id === "expense-1"));
+});
+
+test("a PATCH landing between the read and the fill is not overrun", async () => {
+    // The read happens inside the transaction, but a bookkeeper's PATCH can
+    // still commit before these writes. Deciding from the read and writing
+    // unconditionally would overrun exactly the authority this fill must
+    // respect; the predicate is what makes the gap safe.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: null, costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, installedAtCustomer: null,
+        estimate: { projectId: null },
+    };
+    const seenByBooking = { ...rec.existingExpense };
+    (rec.deps.db as any).expense.findUnique = async () => {
+        // Hand booking the PRE-patch snapshot, then let the PATCH land.
+        rec.existingExpense = {
+            ...rec.existingExpense,
+            costCodeId: "cc-human",
+            costCodeSource: "manual",
+            installedAtCustomer: false,
+        };
+        return seenByBooking;
+    };
+
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(rec.existingExpense.costCodeId, "cc-human", "the human's phase survives");
+    assert.equal(rec.existingExpense.costCodeSource, "manual");
+    assert.equal(rec.existingExpense.installedAtCustomer, false, "and their tax answer");
+    // ...while the field nobody contended for is still filled.
+    assert.equal(rec.existingExpense.projectId, "proj-1");
+});
+
+test("a Purchase already on ANOTHER job parks instead of booking", async () => {
+    // Filling would be guessing which job is right; overwriting would silently
+    // move real money between jobs.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "some-other-job", costCodeId: null,
+        costCodeSource: null, taxAmount: null, taxAtSource: false,
+        installedAtCustomer: null, estimate: { projectId: "some-other-job" },
+    };
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "attribution-conflict");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
 });

@@ -1690,3 +1690,18 @@ test("a tax PATCH landing mid-sync is NOT clobbered — the sync re-plans", asyn
     assert.notEqual(after.needsTaxReview, true, "and it is not flagged on a stale premise");
     assert.equal(after.installedAtCustomer, true, "nor is their tax answer discarded");
 });
+
+test("invalidating an ALLOCATION also flags the row — never a silent null", async () => {
+    // Clearing the allocation on its own leaves a row that still reads as a
+    // valid deduction: installedAtCustomer is untouched and a null base means
+    // "the whole pre-tax total", so the report would quietly claim MORE than
+    // the human allocated. This is the report-level regression.
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 10, taxDeductibleBase: 150 },
+        { ...WRITE, amount: 100 },
+    );
+    assert.equal(plan.data.taxDeductibleBase, null, "100 - 10 = 90 < 150");
+    assert.equal(plan.data.needsTaxReview, true, "and the report must skip it until re-checked");
+    // The tax itself is still valid against the new gross, so it stays.
+    assert.ok(!("taxAmount" in plan.data));
+});

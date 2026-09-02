@@ -716,7 +716,14 @@ export function planQboExpenseUpdate(
     } else if (existingBase !== null) {
         const ceiling = Math.round((write.amount - (existingTax ?? 0)) * 100) / 100;
         if (!Number.isFinite(ceiling) || existingBase > ceiling) {
+            // NEVER A SILENT NULL. Clearing the allocation on its own leaves a
+            // row that still reads as a valid deduction — `installedAtCustomer`
+            // is untouched and a null base means "the whole pre-tax total", so
+            // the report would quietly claim MORE than the human allocated.
+            // Flagging it is what keeps the report's exclusion honest until a
+            // person re-splits the receipt.
             data.taxDeductibleBase = null;
+            data.needsTaxReview = true;
         }
     }
 
@@ -1174,8 +1181,16 @@ export interface QboExpenseSyncDependencies {
      * and so existing tests that build dependencies by hand keep compiling.
      */
     suggestCostCode?(input: QboCostCodeSuggestionInput): Promise<void>;
-    /** The company's configured zone — `Expense.date` is a day in it, not an instant. */
-    companyTimeZone(): Promise<string>;
+    /**
+     * The company's configured zone — `Expense.date` is a day in it, not an
+     * instant.
+     *
+     * OPTIONAL, defaulting to the shared resolver. Making it required broke
+     * every caller that builds its own dependency set (the e2e reconcile spec
+     * among them) for a value none of them has an opinion about; a dependency
+     * exists to be overridden, not to be re-stated.
+     */
+    companyTimeZone?(): Promise<string>;
     now(): Date;
 }
 
@@ -1378,7 +1393,7 @@ export async function syncQboExpenses(
     const mode = options.mode ?? "backfill";
     // One read per sync. `Expense.date` is a company CALENDAR DAY, and every
     // writer has to agree on that or the tax report reads them in two zones.
-    const companyTimeZone = await dependencies.companyTimeZone();
+    const companyTimeZone = await (dependencies.companyTimeZone?.() ?? resolveCompanyTimeZone());
     const [purchaseRead, projects] = await Promise.all([
         dependencies.readPurchases(tokens, options.since, mode, options.until),
         dependencies.listProjects(),

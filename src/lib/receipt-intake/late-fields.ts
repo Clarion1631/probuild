@@ -15,11 +15,26 @@
 export interface LateFields {
     costCodeId?: string;
     projectId?: string;
+    /**
+     * Phase 3's tax answer: was this material installed at a customer job?
+     *
+     * A BOOLEAN among two ids, which matters in one place — `undefined` is the
+     * only "not supplied". `false` is a real answer (shop consumables) and must
+     * survive the same null-or-equal rule as the others; treating it as absent
+     * would silently drop a bookkeeper saying "no" and leave the row
+     * unreviewed, which the tax report reads as "never claimed" rather than
+     * "answered no".
+     */
+    installedAtCustomer?: boolean;
 }
+
+export type LateFieldKey = "costCodeId" | "projectId" | "installedAtCustomer";
+export type LateFieldValue = string | boolean;
 
 export interface LateFieldRow {
     costCodeId: string | null;
     projectId: string | null;
+    installedAtCustomer?: boolean | null;
     state: string;
     claimToken?: string | null;
 }
@@ -33,7 +48,7 @@ export interface Denial {
 export interface LateFieldsDeps {
     read(id: string): Promise<LateFieldRow | null>;
     /** updateMany fenced on {id, state, claimToken: null, <field>: null}; returns the count. */
-    applyIfNull(id: string, state: string, toApply: Record<string, string>): Promise<number>;
+    applyIfNull(id: string, state: string, toApply: Record<string, LateFieldValue>): Promise<number>;
     /** Re-runs the caller's authorization against a given project. */
     authorize(projectId: string | null): Promise<Denial | null>;
 }
@@ -47,7 +62,7 @@ export async function reconcileLateFields(
     deps: LateFieldsDeps,
 ): Promise<Denial | null> {
     const entries = Object.entries(lateFields).filter(([, value]) => value !== undefined) as Array<
-        ["costCodeId" | "projectId", string]
+        [LateFieldKey, LateFieldValue]
     >;
     if (entries.length === 0) return null;
 
@@ -100,7 +115,7 @@ export async function reconcileLateFields(
     // change what it decided — it just makes the row disagree with the routing
     // it is about to publish (a receipt that now HAS a job, parked NEEDS_JOB).
     // The fence is applied by the caller's `applyIfNull`.
-    const count = await deps.applyIfNull(id, current.state, toApply as Record<string, string>);
+    const count = await deps.applyIfNull(id, current.state, toApply as Record<string, LateFieldValue>);
     if (count > 0) return null;
 
     // The CAS lost. That is NOT automatically "busy": the same zero comes back

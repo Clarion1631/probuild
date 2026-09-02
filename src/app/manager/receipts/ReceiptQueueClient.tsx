@@ -1,5 +1,7 @@
 "use client";
 
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
+
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
@@ -14,7 +16,11 @@ interface Expense {
     date: string | null;
     status: string;
     receiptUrl: string | null;
+    // BOTH sides: the queue labels a receipt by the job the money is on.
+    projectId?: string | null;
+    project?: { id: string; name: string } | null;
     estimate: {
+        projectId?: string | null;
         project: { id: string; name: string } | null;
     } | null;
     costCode: { code: string; name: string } | null;
@@ -124,7 +130,7 @@ export default function ReceiptQueueClient({
                                         </span>
                                     </span>
                                     {exp.date && <span><strong>Date:</strong> {new Date(exp.date).toLocaleDateString()}</span>}
-                                    {exp.estimate?.project && <span><strong>Project:</strong> {exp.estimate.project.name}</span>}
+                                    {resolveExpenseProjectLabel(exp).projectName && <span><strong>Project:</strong> {resolveExpenseProjectLabel(exp).projectName}</span>}
                                     {exp.costCode && <span><strong>Code:</strong> {exp.costCode.code} — {exp.costCode.name}</span>}
                                     <span className="text-hui-textMuted/60">
                                         Submitted {new Date(exp.createdAt).toLocaleDateString()}
@@ -191,7 +197,7 @@ export default function ReceiptQueueClient({
                                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-hui-textMuted">
                                     <span className="text-hui-textMain font-semibold">{formatCurrency(Number(exp.amount))}</span>
                                     {exp.date && <span>{new Date(exp.date).toLocaleDateString(undefined, { timeZone: "UTC" })}</span>}
-                                    {exp.estimate?.project && <span>{exp.estimate.project.name}</span>}
+                                    {resolveExpenseProjectLabel(exp).projectName && <span>{resolveExpenseProjectLabel(exp).projectName}</span>}
                                     {exp.qbPurchaseId && <span>QBO transaction {exp.qbPurchaseId}</span>}
                                     {exp.qbSyncedAt && <span>Imported {new Date(exp.qbSyncedAt).toLocaleString()}</span>}
                                 </div>

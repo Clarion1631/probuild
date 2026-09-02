@@ -19,6 +19,9 @@ export default async function BookkeeperReceiptsPage() {
         prisma.expense.findMany({
             where: { status: "Pending" },
             include: {
+                // BOTH sides — the queue labels a receipt by the job the money
+                // is on, not by the estimate it happened to be booked against.
+                project: { select: { id: true, name: true } },
                 estimate: {
                     include: { project: { select: { id: true, name: true } } },
                 },
@@ -30,6 +33,9 @@ export default async function BookkeeperReceiptsPage() {
         prisma.expense.findMany({
             where: { qbPurchaseId: { not: null } },
             include: {
+                // BOTH sides — the queue labels a receipt by the job the money
+                // is on, not by the estimate it happened to be booked against.
+                project: { select: { id: true, name: true } },
                 estimate: {
                     include: { project: { select: { id: true, name: true } } },
                 },

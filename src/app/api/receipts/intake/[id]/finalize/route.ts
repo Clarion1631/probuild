@@ -4,6 +4,7 @@ import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/rec
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { optionalBool } from "@/lib/receipt-capture-validation";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import {
     finalizeDisposition,
@@ -44,7 +45,12 @@ async function applyLateFields(
     const denial = await reconcileLateFields(id, lateFields, {
         read: rowId => prisma.receiptIntake.findUnique({
             where: { id: rowId },
-            select: { costCodeId: true, projectId: true, state: true, claimToken: true },
+            // `installedAtCustomer` rides the same null-or-equal,
+            // only-before-routed, unclaimed rule as the two ids.
+            select: {
+                costCodeId: true, projectId: true, installedAtCustomer: true,
+                state: true, claimToken: true,
+            },
         }),
         applyIfNull: async (rowId, state, toApply) => {
             const { count } = await prisma.receiptIntake.updateMany({
@@ -135,15 +141,17 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // disagree — silently overwriting a value a human already set is the one
     // outcome that loses information nobody can recover.
     //
-    // NOTE: Phase 3's `installedAtCustomer` does not exist on this model; the
-    // same rule will apply to it when it lands.
+    // Phase 3's `installedAtCustomer` rides the same rule. It is a TRI-STATE,
+    // so "the caller did not say" (null) is excluded from the set below exactly
+    // like an absent id — silence is never an answer, and never overwrites one.
     const lateInput = {
         costCodeId: typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null,
         projectId: typeof body.projectId === "string" && body.projectId.trim() ? body.projectId.trim() : null,
+        installedAtCustomer: optionalBool(body.installedAtCustomer),
     };
     const lateFields = Object.fromEntries(
         Object.entries(lateInput).filter(([, v]) => v !== null),
-    ) as Partial<{ costCodeId: string; projectId: string }>;
+    ) as LateFields;
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
@@ -401,7 +409,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // would be a lie the client acts on.
         const current = await prisma.receiptIntake.findUnique({
             where: { id },
-            select: { state: true, sourceRef: true, projectId: true, dryRun: true },
+            select: {
+                state: true, sourceRef: true, projectId: true, dryRun: true,
+                costCodeId: true, installedAtCustomer: true,
+            },
         });
         if (!current || current.state === "STAGING") {
             return NextResponse.json(

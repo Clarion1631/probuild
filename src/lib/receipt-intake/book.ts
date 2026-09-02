@@ -180,6 +180,8 @@ export interface BookPrismaClient {
         } | null>;
         create(args: any): Promise<{ id: string }>;
         update(args: any): Promise<unknown>;
+        /** Guarded per-field fill — the predicate IS the guarantee. */
+        updateMany(args: any): Promise<{ count: number }>;
     };
     receiptIntake: {
         update(args: any): Promise<unknown>;
@@ -691,28 +693,58 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     return { conflict: true as const };
                 }
 
-                const humanCoded =
-                    existing.costCodeSource === "capture" || existing.costCodeSource === "manual";
-                const fill: Record<string, unknown> = {};
-                if (!existing.projectId && row.projectId) fill.projectId = row.projectId;
-                if (!existing.costCodeId && !humanCoded && costCodeId) {
-                    fill.costCodeId = costCodeId;
-                    fill.costCodeSource = costCodeSource;
-                    fill.costCodeConfidence = costCodeConfidence;
+                // EACH FIELD GETS ITS OWN GUARDED WRITE.
+                //
+                // The read above happened inside this transaction, but a
+                // bookkeeper's PATCH can commit between it and these writes —
+                // and that PATCH is exactly the authority this fill must not
+                // overrun. Deciding from the read and then writing
+                // unconditionally is the same read-then-write shape the sync
+                // was already made to give up: the guarantee belongs in the
+                // predicate, so a row that gained an answer in the gap simply
+                // matches zero rows.
+                //
+                // Split per field because the conditions differ and a single
+                // predicate would make one field's contention veto another's
+                // legitimate fill.
+                if (!existing.projectId && row.projectId) {
+                    await tx.expense.updateMany({
+                        where: { id: existing.id, projectId: null },
+                        data: { projectId: row.projectId },
+                    });
                 }
-                // Tax is filled only when there is none recorded at all —
-                // a stored figure came either from an earlier booking of this
+                if (costCodeId) {
+                    await tx.expense.updateMany({
+                        where: {
+                            id: existing.id,
+                            costCodeId: null,
+                            // A human's phase outranks anything booking knows.
+                            // The explicit NULL branch matters: SQL `NOT IN`
+                            // drops NULL rows, and an unset source is the
+                            // common case.
+                            OR: [
+                                { costCodeSource: null },
+                                { costCodeSource: { notIn: ["capture", "manual"] } },
+                            ],
+                        },
+                        data: { costCodeId, costCodeSource, costCodeConfidence },
+                    });
+                }
+                // Tax is filled only where there is none recorded at all — a
+                // stored figure came either from an earlier booking of this
                 // same document or from a bookkeeper, and both outrank a
                 // re-read.
-                if (existing.taxAmount === null && taxApplied > 0) {
-                    fill.taxAmount = taxApplied / 100;
-                    fill.taxAtSource = true;
+                if (taxApplied > 0) {
+                    await tx.expense.updateMany({
+                        where: { id: existing.id, taxAmount: null },
+                        data: { taxAmount: taxApplied / 100, taxAtSource: true },
+                    });
                 }
-                if (existing.installedAtCustomer === null && row.installedAtCustomer !== null) {
-                    fill.installedAtCustomer = row.installedAtCustomer;
-                }
-                if (Object.keys(fill).length > 0) {
-                    await tx.expense.update({ where: { id: existing.id }, data: fill });
+                if (row.installedAtCustomer !== null) {
+                    await tx.expense.updateMany({
+                        where: { id: existing.id, installedAtCustomer: null },
+                        data: { installedAtCustomer: row.installedAtCustomer },
+                    });
                 }
             }
 
