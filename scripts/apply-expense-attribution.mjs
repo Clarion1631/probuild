@@ -167,16 +167,15 @@ END $$`,
     // then UPDATE. A QBO re-sync changing `amount` between those two statements
     // leaves a row the tax report TRUSTS verbatim. Prisma cannot express a
     // CHECK, so it is hand-written here and in prisma-blind-spots.json.
-    `DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'Expense_taxDeductibleBase_check'
-                    AND conrelid = '"Expense"'::regclass) THEN
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
-      CHECK ("taxDeductibleBase" IS NULL
-             OR ("taxDeductibleBase" >= 0
-                 AND "taxDeductibleBase" <= "amount" - COALESCE("taxAmount", 0)));
-  END IF;
-END $$`,
+    // SIGNED, for the same reason the tax check is: the resold portion of a
+    // return is negative. `base >= 0` made every credit unallocatable.
+    // Dropped and re-added by name so an old definition is corrected.
+    `ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxDeductibleBase_check"`,
+    `ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
+  CHECK ("taxDeductibleBase" IS NULL
+         OR "taxDeductibleBase" = 0
+         OR (sign("taxDeductibleBase") = sign("amount")
+             AND abs("taxDeductibleBase") <= abs("amount" - COALESCE("taxAmount", 0))))`,
 
     // RE-ANCHOR THE LEGACY UTC-MIDNIGHT ROWS (Codex round 6, item 1).
     //
@@ -264,10 +263,11 @@ export const expectedCheckConstraints = [
         table: "Expense",
         mustMatch: [
             /"taxDeductibleBase" IS NULL/,
-            /"taxDeductibleBase" >= \(?0/,
+            /"taxDeductibleBase" = \(?0/,
+            /sign\("taxDeductibleBase"\) = sign\(amount\)/,
             // pg_get_constraintdef renders `amount` UNQUOTED (all-lowercase,
             // not a keyword) while the mixed-case columns keep their quotes.
-            /amount - COALESCE\("taxAmount"/,
+            /abs\("taxDeductibleBase"\) <= abs\(\(?amount - COALESCE\("taxAmount"/,
         ],
     },
 ];

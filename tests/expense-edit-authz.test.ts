@@ -698,13 +698,22 @@ test("answering ONLY installedAtCustomer does not claim the tax figures", async 
     assert.equal(updateArgs?.data.taxSource, undefined);
 });
 
-test("CLEARING the tax back to blank leaves the provenance alone", async () => {
-    // A blank is an absence, not a decision. Locking the column on it would
-    // stop OCR ever filling the figure again.
+test("an EXPLICIT null tax is a manual 'no tax' decision", async () => {
+    // Round 17, item 2. Sending the key with null is a bookkeeper looking at
+    // the receipt and saying there is no sales tax on it. Booking must not then
+    // write an OCR guess over that answer, which is what `taxSource` prevents.
     const res = await patch({ taxAmount: null, taxAtSource: false });
     assert.equal(res.status, 200);
-    assert.equal(updateArgs?.data.taxAmount, null, "the clear still lands");
-    assert.equal(updateArgs?.data.taxSource, undefined, "but nobody claimed a figure");
+    assert.equal(updateArgs?.data.taxAmount, null, "the clear lands");
+    assert.equal(updateArgs?.data.taxSource, "manual", "and it is recorded as theirs");
+});
+
+test("an OMITTED tax key leaves the provenance alone", async () => {
+    // The request said nothing about tax, so nobody decided anything and a
+    // later OCR read may still fill it.
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, undefined);
 });
 
 test("supplying either FIGURE stamps manual", async () => {
@@ -720,4 +729,70 @@ test("a phase-only edit touches neither the flag nor the provenance", async () =
     await patch({ costCodeId: null });
     assert.equal(updateArgs?.data.taxSource, undefined);
     assert.equal(updateArgs?.data.needsTaxReview, undefined);
+});
+
+// ── an acknowledgement must carry real figures (round 17, item 2) ──────────
+
+test("an ack whose taxAmount is null is refused, and the flag stays", async () => {
+    // "I re-checked these numbers" has to contain numbers. A null would
+    // certify an empty row straight back into the excise report.
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: null, taxDeductibleBase: 50 });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_REVIEW_INCOMPLETE");
+    assert.equal(updateArgs, null, "nothing is written, so the flag stands");
+});
+
+test("an ack whose figures point the wrong way is refused", async () => {
+    // Coherent means sign and magnitude, the same rules the writes enforce.
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, amount: 207.74,
+    } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: -16.55, taxDeductibleBase: 50 });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
+});
+
+test("an ack whose base exceeds the receipt is refused", async () => {
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, amount: 207.74,
+    } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 500 });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
+});
+
+test("a coherent ack still clears the flag", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+});
+
+// ── signed credits, end to end (round 17, item 1) ──────────────────────────
+
+test("a refund accepts a NEGATIVE deduction base, and refuses a positive one", async () => {
+    storedExpense = {
+        ...(storedExpense as object), amount: -50, taxAmount: -4, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    const ok = await patch({ taxDeductibleBase: -40 });
+    assert.equal(ok.status, 200);
+    assert.equal(updateArgs?.data.taxDeductibleBase, -40);
+
+    updateArgs = null;
+    const wrongWay = await patch({ taxDeductibleBase: 40 });
+    assert.equal(wrongWay.status, 400);
+    assert.equal((await wrongWay.json()).code, "BASE_SIGN_MISMATCH");
+    assert.equal(updateArgs, null);
+});
+
+test("a refund's base is bounded by the pre-tax MAGNITUDE", async () => {
+    storedExpense = {
+        ...(storedExpense as object), amount: -50, taxAmount: -4, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    assert.equal((await patch({ taxDeductibleBase: -46 })).status, 200, "-50 + 4 of tax");
+    updateArgs = null;
+    const tooBig = await patch({ taxDeductibleBase: -47 });
+    assert.equal(tooBig.status, 400);
+    assert.equal(updateArgs, null);
 });

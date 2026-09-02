@@ -338,3 +338,27 @@ test("the exclusion is written POSITIVELY so unattributed rows survive it", () =
         ],
     });
 });
+
+// ── a credit SUBTRACTS from the filing (Codex round 17, item 1) ──
+
+test("a return nets against the purchases in the same month", () => {
+    // The excise deduction is the cost of articles actually resold. Material
+    // that went back to the store was not resold, and the credit carries the
+    // tax back with it, so it belongs in the total as a subtraction rather than
+    // being excluded and leaving the deduction overstated.
+    const purchase = row({
+        id: "buy", dayKey: "2026-09-04",
+        receiptTotalCents: 20774, deductionBaseCents: 19119, taxCents: 1655,
+    });
+    const credit = row({
+        id: "return", dayKey: "2026-09-11",
+        receiptTotalCents: -5000, deductionBaseCents: -4600, taxCents: -400,
+    });
+    const { summary, months } = groupTaxAtSource([purchase, credit]);
+    assert.equal(summary.count, 2);
+    assert.equal(summary.taxCents, 1255, "1655 - 400");
+    assert.equal(summary.deductionBaseCents, 14519, "19119 - 4600");
+    assert.equal(summary.receiptTotalCents, 15774);
+    assert.equal(months.length, 1, "same month, one group");
+    assert.equal(months[0].taxCents, 1255);
+});

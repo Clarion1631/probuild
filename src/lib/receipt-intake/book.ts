@@ -21,7 +21,8 @@ import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
 import { isPlausibleReceiptTax } from "@/lib/expense-attribution";
-import { lockExpense, lockProjectPhaseRowsForShare } from "@/lib/expense-lock";
+import { lockExpense } from "@/lib/expense-lock";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -674,24 +675,28 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
         const booked = await deps.db.$transaction(async tx => {
-            // THE PHASE IS RE-ASKED HERE, UNDER A LOCK (Codex round 16, item 2).
+            // THE PHASE IS RE-ASKED HERE, THROUGH THIS TRANSACTION
+            // (round 16 item 2; round 17 item 5).
             //
-            // The two checks before this one both happened outside any
-            // transaction: one before the QBO create, one after it. Neither
-            // holds anything still, so a phase deleted from the job while this
+            // The two checks before this one both went through the global
+            // datasource, outside any transaction: one before the QBO create,
+            // one after it. Neither holds anything still, so an estimate
+            // archived, reassigned, or a cost code deactivated while this
             // transaction runs would still be written into job cost.
             //
-            // The phase rows are share-locked first, so from this point the
-            // answer cannot change under us; then the same question is asked
-            // again. A code that is no longer a phase of this job PARKS the
-            // row: booking it would post money to a line the job does not have,
-            // and booking it UNCODED would silently discard a phase a person
-            // captured. Neither is ours to decide, and the Purchase already
-            // exists, so a human is asked instead.
-            await lockProjectPhaseRowsForShare(tx as any, project.id);
-            if (costCodeId && !(await deps.isCostCodeAllowed(project.id, costCodeId))) {
-                throw new PhaseRemovedError();
-            }
+            // `assertPhaseOfProjectTx` locks the four tables the answer depends
+            // on and then answers on THIS transaction's snapshot, so from here
+            // the answer cannot change before the write. A code that is no
+            // longer a phase PARKS the row: booking it would post money to a
+            // line the job does not have, and booking it UNCODED would silently
+            // discard a phase a person captured. Neither is ours to decide, and
+            // the Purchase already exists, so a human is asked instead.
+            const phaseStillValid = await assertPhaseOfProjectTx(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                project.id,
+                costCodeId,
+            );
+            if (!phaseStillValid.ok) throw new PhaseRemovedError(phaseStillValid.reason);
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
             // and the insert would fail on that constraint anyway.
@@ -1054,7 +1059,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         if (error instanceof PhaseRemovedError) {
             return {
                 outcome: "needs-review",
-                reason: "phase-changed",
+                reason: `phase-changed:${error.reason}`,
                 releaseStrongKey: false,
             };
         }
@@ -1090,9 +1095,12 @@ function describe(error: unknown): string {
  * half-filled against a job it does not belong to.
  */
 class PhaseRemovedError extends Error {
-    constructor() {
-        super("the cost code stopped being a phase of this job while booking");
+    /** Carries WHY, so the parked row names the thing a person has to fix. */
+    readonly reason: string;
+    constructor(reason: string) {
+        super(`the cost code stopped being a phase of this job while booking (${reason})`);
         this.name = "PhaseRemovedError";
+        this.reason = reason;
     }
 }
 

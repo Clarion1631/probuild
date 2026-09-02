@@ -62,7 +62,8 @@ import {
     resolveExpenseProjectId,
 } from "../src/lib/expense-attribution";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
-import { lockExpense, lockProjectPhaseRowsForShare } from "../src/lib/expense-lock";
+import { lockExpense } from "../src/lib/expense-lock";
+import { lockPhaseRowsForShare } from "../src/lib/phase-invariant";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
 import { csvCell, csvNumber } from "../src/lib/csv-safe";
 
@@ -415,7 +416,7 @@ export async function writeUnderAttributionLocks(db, locks, run) {
     return db.$transaction(async tx => {
         await lockRowsForShare(tx, '"Estimate"', estimateIds);
         await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
-        await lockProjectPhaseRowsForShare(tx, phaseProjectId);
+        await lockPhaseRowsForShare(tx, phaseProjectId);
         await lockExpense(tx, expenseId);
         return run(tx);
     });

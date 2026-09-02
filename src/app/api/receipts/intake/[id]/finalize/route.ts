@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { optionalBool } from "@/lib/receipt-capture-validation";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
@@ -162,6 +163,13 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
+            // A CAPTURED TAX ANSWER, and therefore part of the merge and the
+            // publish CAS. Leaving it out of this read made the publish the one
+            // path that could overwrite it: `mergeCapturedFields` saw no stored
+            // value, so a late `false` landed on a row that already said `true`
+            // and the excise report changed answer with nothing recording that
+            // the first one existed.
+            installedAtCustomer: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
@@ -334,7 +342,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // the job at /start and sent a different one at finalize simply won, and
     // nothing recorded that the first answer had ever existed.
     const merged = mergeCapturedFields(
-        { projectId: row.projectId, costCodeId: row.costCodeId },
+        {
+            projectId: row.projectId,
+            costCodeId: row.costCodeId,
+            installedAtCustomer: row.installedAtCustomer,
+        },
         lateFields,
     );
     if ("status" in merged) return NextResponse.json(merged.body, { status: merged.status });
@@ -372,10 +384,32 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
+    // Set by the commit below when the phase stopped being one while we were
+    // publishing. Distinct from a lost CAS, which means somebody else moved the
+    // row — this means the row is fine and the world changed around it.
+    let phaseRejectedAtPublish: string | null = null;
     const outcome = await sealAndPublish(row.storagePath, id, check, {
         seal: sealObject,
-        commit: async (canonicalPath, values) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+        commit: async (canonicalPath, values) => prisma.$transaction(async tx => {
+            // THE PHASE ANSWER THAT COUNTS (round 17, item 5).
+            //
+            // `authorizePhase` above ran on the global client and held nothing.
+            // This one locks the four tables the answer rests on and reads them
+            // on the transaction that is about to publish, so an estimate
+            // archived or reassigned, or a code deactivated, in that window
+            // cannot be published onto the row.
+            if (merged.resulting.costCodeId) {
+                const verdict = await assertPhaseOfProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    merged.resulting.projectId,
+                    merged.resulting.costCodeId,
+                );
+                if (!verdict.ok) {
+                    phaseRejectedAtPublish = verdict.reason;
+                    return 0;
+                }
+            }
+            const { count } = await tx.receiptIntake.updateMany({
                 // Fenced on the EXACT state and reason observed, on the row
                 // being unclaimed, and on every captured value this publish was
                 // validated against. Anything that moved between the read and
@@ -397,12 +431,24 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 },
             });
             return count;
-        },
+        }),
         dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
     });
 
     if (!outcome) {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+    }
+    // Checked BEFORE the lost-CAS branch: nothing was published, and answering
+    // "already finalized" would be a lie the client acts on.
+    if (phaseRejectedAtPublish) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "phase-not-on-project",
+                reason: `the phase stopped being one of this job's phases while publishing (${phaseRejectedAtPublish})`,
+            },
+            { status: 409 },
+        );
     }
     if (!outcome.published) {
         // The CAS lost — which is now TWO different things. Either another

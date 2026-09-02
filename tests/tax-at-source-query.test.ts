@@ -94,7 +94,10 @@ test("the where clause asks for all three conditions POSITIVELY", async () => {
     // `true`, not `{ not: false }`: a NULL means "nobody said", and a NULL must
     // never be spent as a tax deduction.
     assert.equal(where.installedAtCustomer, true);
-    assert.deepEqual(where.taxAmount, { gt: 0 }, "a $0 tax row is an ANSWER, not a candidate");
+    // A figure is PRESENT, signed. `{ gt: 0 }` dropped every vendor credit,
+    // so the deduction went on claiming tax that had been refunded (round 17,
+    // item 1). A $0 tax row is still an ANSWER, not a candidate.
+    assert.deepEqual(where.taxAmount, { not: 0 }, "credits belong on the filing too");
 });
 
 test("the date window is the COMPANY quarter, in instants", async () => {

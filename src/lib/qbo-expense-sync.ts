@@ -15,6 +15,7 @@ import { dateOnlyInTimeZone } from "./tz-date";
 import { resolveCompanyTimeZone } from "./company-timezone";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { lockExpense } from "./expense-lock";
+import { assertPhaseOfProjectTx, type PhaseTxClient as PhaseTxLike } from "./phase-invariant";
 import { prismaPhaseDataSource } from "./project-phases-db";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
@@ -707,7 +708,7 @@ export function planQboExpenseUpdate(
             ? null
             : Number(existing.taxDeductibleBase);
 
-    // A LOWERED GROSS INVALIDATES THE WHOLE TAX CLASSIFICATION.
+    // A GROSS THAT CANNOT CARRY THE RECORDED TAX INVALIDATES IT.
     //
     // If QuickBooks now says the purchase was smaller than the tax a human
     // recorded, that tax is about a receipt this row no longer describes.
@@ -715,20 +716,40 @@ export function planQboExpenseUpdate(
     // money from the filing; the database CHECK would also refuse the write and
     // take the entire QBO import down with it.
     //
+    // MAGNITUDES AND SIGNS, not `>`. Amounts are signed: a refund is a negative
+    // expense carrying negative tax, and `-4 > -50` is true, so the old
+    // comparison retired the classification on every credit it ever saw. The
+    // test is the database CHECK's own: the tax must point the same way as the
+    // money and be no larger than it. A REDUCED refund (-$50 becoming -$3 with
+    // -$4 of tax still on the row) fails that, and the answer is the same as
+    // for a purchase — clear the classification and ask a person — never an
+    // aborted sync.
+    //
     // So the classification is CLEARED, not clamped — a guessed-down tax is
     // still a guess on a tax return — and `needsTaxReview` marks the row so a
     // person is asked rather than the silence being mistaken for "no tax".
     // `costCodeSource` is deliberately untouched: which PHASE the money is on
     // is a separate question the gross does not bear on.
-    if (existingTax !== null && existingTax > write.amount) {
+    const taxCannotFitGross =
+        existingTax !== null &&
+        existingTax !== 0 &&
+        (Math.sign(existingTax) !== Math.sign(write.amount) ||
+            Math.abs(existingTax) > Math.abs(write.amount));
+    if (taxCannotFitGross) {
         data.taxAmount = null;
         data.taxAtSource = false;
         data.installedAtCustomer = null;
         data.taxDeductibleBase = null;
         data.needsTaxReview = true;
-    } else if (existingBase !== null) {
+    } else if (existingBase !== null && existingBase !== 0) {
+        // Same rule for the allocation: it points the way the money does and
+        // never exceeds the pre-tax remainder in magnitude.
         const ceiling = Math.round((write.amount - (existingTax ?? 0)) * 100) / 100;
-        if (!Number.isFinite(ceiling) || existingBase > ceiling) {
+        const baseCannotFit =
+            !Number.isFinite(ceiling) ||
+            Math.sign(existingBase) !== Math.sign(ceiling) ||
+            Math.abs(existingBase) > Math.abs(ceiling);
+        if (baseCannotFit) {
             // NEVER A SILENT NULL. Clearing the allocation on its own leaves a
             // row that still reads as a valid deduction — `installedAtCustomer`
             // is untouched and a null base means "the whole pre-tax total", so
@@ -1066,6 +1087,13 @@ export interface QboCostCodeSuggestionInput {
 }
 
 export interface QboCostCodeSuggestionClient {
+    /**
+     * Present on a real Prisma client, absent on the pure unit-test stubs.
+     * When it is here the phase check and the write run in ONE transaction,
+     * under the shared locks; when it is not, the injected
+     * `isAllowedForProject` is the check. Neither path skips the question.
+     */
+    $transaction?<T>(callback: (tx: QboCostCodeSuggestionClient & PhaseTxLike) => Promise<T>): Promise<T>;
     expense: {
         findUnique(args: {
             where: { qbPurchaseId: string };
@@ -1180,30 +1208,53 @@ export async function applyQboExpenseCostCodeSuggestion(
         return "phase-not-on-project";
     }
 
+    // ONE definition of the write, used by both paths below.
+    const suggestionWhere = {
+        qbPurchaseId: input.qbPurchaseId,
+        // Everything the decision depended on, re-asserted at write time.
+        // A row re-attributed or coded between the read above and here is
+        // skipped rather than written on stale reasoning.
+        projectId: expectedProjectId,
+        costCodeId: null,
+        // The exact row version the suggestion was computed from. Without
+        // `qbSyncToken` a NEWER sync could commit between the read and this
+        // write, and the row would be coded from the text of a purchase it no
+        // longer holds — the same staleness the read above fixed, one statement
+        // later.
+        ...(stored.updatedAt ? { updatedAt: stored.updatedAt } : {}),
+        qbSyncToken: stored.qbSyncToken,
+        ...notHumanCodedExpenseWhere(),
+    };
+    const suggestionData = {
+        costCodeId,
+        // "ai" is the spec's value for "a machine chose this". The rules are
+        // regexes; the label is about provenance, not about technique.
+        costCodeSource: "ai",
+        costCodeConfidence: suggestion.confidence,
+    };
+
+    // THE TRANSACTIONAL FORM OF THE SAME QUESTION (round 17, item 5).
+    //
+    // The check above answers on the global client and holds nothing: an
+    // estimate archived, or the code deactivated, between it and the write
+    // would still be stamped onto the row by an automated pass. Where the
+    // client can open a transaction, the check is re-taken inside it under the
+    // shared locks and the write happens on that same snapshot.
+    if (typeof client.$transaction === "function") {
+        return client.$transaction(async tx => {
+            const verdict = await assertPhaseOfProjectTx(tx, projectId, costCodeId);
+            if (!verdict.ok) return "phase-not-on-project";
+            const inTx = await tx.expense.updateMany({
+                where: suggestionWhere,
+                data: suggestionData,
+            });
+            return inTx.count > 0 ? "written" : "not-written";
+        });
+    }
+
     const written = await client.expense.updateMany({
-        where: {
-            qbPurchaseId: input.qbPurchaseId,
-            // Everything the decision depended on, re-asserted at write time.
-            // A row re-attributed or coded between the read above and here is
-            // skipped rather than written on stale reasoning.
-            projectId: expectedProjectId,
-            costCodeId: null,
-            // The exact row version the suggestion was computed from. Without
-            // `qbSyncToken` a NEWER sync could commit between the read and this
-            // write, and the row would be coded from the text of a purchase it
-            // no longer holds — the same staleness the read above fixed, just
-            // one statement later.
-            ...(stored.updatedAt ? { updatedAt: stored.updatedAt } : {}),
-            qbSyncToken: stored.qbSyncToken,
-            ...notHumanCodedExpenseWhere(),
-        },
-        data: {
-            costCodeId,
-            // "ai" is the spec's value for "a machine chose this". The rules are
-            // regexes; the label is about provenance, not about technique.
-            costCodeSource: "ai",
-            costCodeConfidence: suggestion.confidence,
-        },
+        where: suggestionWhere,
+        data: suggestionData,
     });
     return written.count > 0 ? "written" : "not-written";
 }

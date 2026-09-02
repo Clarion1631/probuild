@@ -71,8 +71,13 @@ export default function TaxPhaseModal({
 
     const parsedTax = taxAmount.trim() === "" ? null : Number(taxAmount);
     const effectiveTax = parsedTax ?? 0;
-    const taxCeiling = Math.round(expense.amount * MAX_TAX_RATE * 100) / 100;
-    const baseCeiling = Math.round((expense.amount - effectiveTax) * 100) / 100;
+    // SIGNED. A return or vendor credit is a negative expense: its tax and its
+    // deductible portion are negative too, and the server refuses a figure
+    // pointing the other way. The inputs follow the receipt rather than
+    // assuming every expense is money going out.
+    const isCredit = expense.amount < 0;
+    const taxCeiling = Math.round(Math.abs(expense.amount) * MAX_TAX_RATE * 100) / 100;
+    const baseCeiling = Math.round(Math.abs(expense.amount - effectiveTax) * 100) / 100;
 
     async function save() {
         // Only what actually changed. The endpoint refuses unknown keys, and
@@ -196,15 +201,19 @@ export default function TaxPhaseModal({
                     <input
                         type="number"
                         step="0.01"
-                        min="0"
+                        // Signed: a credit's tax is negative, and the server
+                        // refuses a figure pointing against the amount.
+                        {...(isCredit ? { max: 0 } : { min: 0 })}
                         className="hui-input w-full"
                         value={taxAmount}
                         onChange={event => setTaxAmount(event.target.value)}
                         placeholder="0.00"
                     />
                     <span className="text-xs text-hui-textMuted">
-                        Up to {money(taxCeiling)} (12% of the receipt). Leave blank if the read was wrong and
-                        you don&apos;t know the figure.
+                        {isCredit
+                            ? `This is a refund, so enter the tax as a negative, down to -${money(taxCeiling)} (12% of the receipt).`
+                            : `Up to ${money(taxCeiling)} (12% of the receipt).`}{" "}
+                        Leave blank if the read was wrong and you don&apos;t know the figure.
                     </span>
                 </label>
 
@@ -215,15 +224,16 @@ export default function TaxPhaseModal({
                     <input
                         type="number"
                         step="0.01"
-                        min="0"
+                        {...(isCredit ? { max: 0 } : { min: 0 })}
                         className="hui-input w-full"
                         value={base}
                         onChange={event => setBase(event.target.value)}
-                        placeholder={`whole pre-tax total — ${money(Math.max(baseCeiling, 0))}`}
+                        placeholder={`whole pre-tax total — ${isCredit ? "-" : ""}${money(baseCeiling)}`}
                     />
                     <span className="text-xs text-hui-textMuted">
                         Leave blank to claim the whole pre-tax total. Set it when only part of the receipt was
-                        resold to the client; must be between 0 and {money(Math.max(baseCeiling, 0))}.
+                        resold to the client; it must point the same way as the receipt and cannot exceed{" "}
+                        {isCredit ? `-${money(baseCeiling)}` : money(baseCeiling)}.
                     </span>
                 </label>
 

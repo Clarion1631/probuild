@@ -54,33 +54,3 @@ export async function lockExpense(
         expenseLockKey(expenseId),
     );
 }
-
-
-/**
- * SHARE-LOCK A JOB'S PHASE ROWS for the rest of the transaction.
- *
- * "Is this cost code a phase of this job?" is answered from `EstimateItem`
- * rows, which anyone with the estimate open can delete. Two writers depend on
- * that answer being still true when they act on it — the receipt booking, which
- * posts real money against the phase, and the attribution backfill, which
- * writes a code onto historical rows — and neither can express the question as
- * a predicate on the row it is writing.
- *
- * `FOR SHARE OF ei` blocks an UPDATE or DELETE of those rows until this
- * transaction commits, while leaving other readers (including the other writer)
- * free. Ordered by id so two holders can never take them in opposite orders.
- */
-export async function lockProjectPhaseRowsForShare(
-    client: AdvisoryLockClient,
-    projectId: string | null,
-): Promise<void> {
-    if (!projectId) return;
-    await client.$queryRawUnsafe(
-        `SELECT ei.id FROM "EstimateItem" ei
-           JOIN "Estimate" e ON e.id = ei."estimateId"
-          WHERE e."projectId" = $1 AND ei."costCodeId" IS NOT NULL
-          ORDER BY ei.id
-            FOR SHARE OF ei`,
-        projectId,
-    );
-}

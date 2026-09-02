@@ -15,7 +15,10 @@
 //     must never be spent as a deduction. Nothing defaults this: it is set at
 //     capture by the person holding the material, or corrected afterwards by a
 //     bookkeeper on the expense edit route, and
-//   * `taxAmount > 0` — a zero is an answer (no tax), not an absence.
+//   * `taxAmount != 0` — a zero is an answer (no tax), not an absence. NOT
+//     `> 0`: a return or vendor credit is a NEGATIVE expense carrying negative
+//     tax, and it belongs on the filing as a SUBTRACTION. Excluding it would
+//     leave the deduction claiming tax on material that went back to the store.
 //
 // ...and one NEGATIVE condition, which is about the row's LIFECYCLE rather
 // than its content: `needsTaxReview` must be false. A QBO re-sync that moves
@@ -366,7 +369,9 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
         where: {
             taxAtSource: true,
             installedAtCustomer: true,
-            taxAmount: { gt: 0 },
+            // Signed: credits subtract. Excluding them would claim a
+            // deduction for tax that was refunded.
+            taxAmount: { not: 0 },
             // A row whose gross moved under a human's tax answer is NOT a
             // deduction until a person looks again. Without this the "null
             // taxDeductibleBase means the whole pre-tax total" rule would claim

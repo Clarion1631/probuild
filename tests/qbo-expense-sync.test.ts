@@ -2019,3 +2019,78 @@ test("the sync READS taxSource, or the rule above can never fire", () => {
         assert.equal(row.taxSource, "manual", "and left standing");
     })();
 });
+
+// ── signed credits in the sync (Codex round 17, item 1) ────────────────────
+
+test("a REFUND's negative tax is not retired by a re-sync", () => {
+    // `-4 > -50` is true, so the old comparison retired the classification on
+    // every credit it ever saw: a -$50 return with -$4 of tax lost its tax
+    // fields on the next sync, and the filing quietly stopped netting it.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: -50, taxAmount: -4, taxDeductibleBase: -40,
+        },
+        { ...WRITE, amount: -50 },
+    );
+    assert.ok(!("taxAmount" in plan.data), "the classification stands");
+    assert.ok(!("taxDeductibleBase" in plan.data));
+    assert.ok(!("needsTaxReview" in plan.data), "and nothing to re-check");
+});
+
+test("a REDUCED refund that can no longer carry its tax is flagged, not aborted", () => {
+    // QBO now says the credit was only $3 while the row still records $4 of tax
+    // coming back. That violates |tax| <= |amount| — the database CHECK would
+    // refuse the write and take the whole import down with it — so the
+    // classification is cleared and a person is asked.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: -50, taxAmount: -4, taxDeductibleBase: -40,
+        },
+        { ...WRITE, amount: -3 },
+    );
+    assert.equal(plan.data.taxAmount, null);
+    assert.equal(plan.data.taxAtSource, false);
+    assert.equal(plan.data.taxDeductibleBase, null);
+    assert.equal(plan.data.installedAtCustomer, null);
+    assert.equal(plan.data.needsTaxReview, true, "asked, never silently dropped");
+});
+
+test("a credit that FLIPS to a purchase invalidates the classification", () => {
+    // The tax now points against the money: whatever this row is, it is not the
+    // receipt somebody classified.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: -50, taxAmount: -4, taxDeductibleBase: null,
+        },
+        { ...WRITE, amount: 50 },
+    );
+    assert.equal(plan.data.taxAmount, null);
+    assert.equal(plan.data.needsTaxReview, true);
+});
+
+test("a refund's ALLOCATION is judged on magnitude too", () => {
+    // -$46 of allocation against a -$50 credit with -$4 of tax is exact; a
+    // shrunken credit strands it and the row is flagged rather than left
+    // claiming more than the receipt.
+    const fits = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: -50, taxAmount: -4, taxDeductibleBase: -46,
+        },
+        { ...WRITE, amount: -50 },
+    );
+    assert.ok(!("needsTaxReview" in fits.data));
+
+    const stranded = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: -50, taxAmount: -4, taxDeductibleBase: -46,
+        },
+        { ...WRITE, amount: -20 },
+    );
+    assert.equal(stranded.data.taxDeductibleBase, null);
+    assert.equal(stranded.data.needsTaxReview, true);
+});

@@ -202,7 +202,7 @@ export type CapturedValues = Record<string, string | boolean | null | undefined>
 
 export interface CapturedMerge {
     /** Only the fields that are actually changing. */
-    apply: Record<string, string>;
+    apply: Record<string, string | boolean>;
     /**
      * The ORIGINAL captured values, for a CAS on the publishing update: if any
      * of them moved between the read and the write, the publish must lose.
@@ -227,7 +227,7 @@ export function mergeCapturedFields(
     captured: CapturedValues,
     lateFields: LateFields,
 ): Denial | CapturedMerge {
-    const apply: Record<string, string> = {};
+    const apply: Record<string, string | boolean> = {};
     const guard: Record<string, string | boolean | null> = {};
     const conflicts: Record<string, { stored: unknown; supplied: unknown }> = {};
 

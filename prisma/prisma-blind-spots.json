@@ -97,7 +97,7 @@
     {
       "name": "Expense_taxDeductibleBase_check",
       "table": "\"Expense\"",
-      "def": "CHECK (((\"taxDeductibleBase\" IS NULL) OR ((\"taxDeductibleBase\" >= (0)::numeric) AND (\"taxDeductibleBase\" <= (amount - COALESCE(\"taxAmount\", (0)::numeric))))))"
+      "def": "CHECK (((\"taxDeductibleBase\" IS NULL) OR (\"taxDeductibleBase\" = (0)::numeric) OR ((sign(\"taxDeductibleBase\") = sign(amount)) AND (abs(\"taxDeductibleBase\") <= abs((amount - COALESCE(\"taxAmount\", (0)::numeric)))))))"
     },
     {
       "name": "Inspection_required_date_check",

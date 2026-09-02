@@ -12,6 +12,7 @@ import { lockExpense } from "@/lib/expense-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
@@ -404,29 +405,54 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 { status: 400 },
             );
         }
+        // AN ACKNOWLEDGEMENT MUST CARRY REAL FIGURES.
+        //
+        // Clearing the flag says "I have re-checked these numbers", so the
+        // request has to contain numbers to have checked: both keys present,
+        // both non-null, both finite, and both coherent with the amount — the
+        // same sign and magnitude rules the writes themselves enforce. An ack
+        // carrying `taxAmount: null` would otherwise certify an empty row back
+        // into the excise report.
         const acknowledgesReview = body.taxReviewAck === true;
-        if (acknowledgesReview && !(editsTaxAmount && editsBase)) {
-            return NextResponse.json(
-                {
-                    error: "Acknowledging a tax review needs both taxAmount and taxDeductibleBase in the same request.",
-                    code: "TAX_REVIEW_INCOMPLETE",
-                },
-                { status: 400 },
-            );
+        if (acknowledgesReview) {
+            const gross = Number(expense.amount);
+            const ackTax = editsTaxAmount ? Number(body.taxAmount) : Number.NaN;
+            const ackBase = editsBase ? Number(body.taxDeductibleBase) : Number.NaN;
+            const coherent = (value: number) =>
+                Number.isFinite(value) &&
+                (value === 0 || Math.sign(value) === Math.sign(gross)) &&
+                Math.abs(value) <= Math.abs(gross);
+            const complete =
+                editsTaxAmount && body.taxAmount !== null &&
+                editsBase && body.taxDeductibleBase !== null &&
+                coherent(ackTax) && coherent(ackBase);
+            if (!complete) {
+                return NextResponse.json(
+                    {
+                        error: "Acknowledging a tax review needs a real taxAmount and taxDeductibleBase in the same request.",
+                        code: "TAX_REVIEW_INCOMPLETE",
+                    },
+                    { status: 400 },
+                );
+            }
         }
         // An unflagged row has nothing to clear, so the ack is not required of
         // ordinary edits; a flagged one keeps its flag until it is given.
         const clearsReview = !expense.needsTaxReview || acknowledgesReview;
 
-        // A tax FIGURE, not merely a tax-shaped request: `taxSource` governs
-        // `taxAmount` and `taxDeductibleBase`, so only a non-null value for one
-        // of those is a person deciding what this column describes.
-        // `installedAtCustomer` is NOT one of them — its own value is its
+        // A DECISION ABOUT THE TAX FIGURES, which an explicit null IS.
+        //
+        // `taxSource` governs `taxAmount` and `taxDeductibleBase`. Sending
+        // `taxAmount: null` is not an absence — it is a bookkeeper looking at
+        // the receipt and saying there is no sales tax on it, and booking must
+        // not then write an OCR guess over that. What leaves the column alone
+        // is OMITTING the key: the request said nothing about tax, so nobody
+        // decided anything and a later read may still fill it.
+        //
+        // `installedAtCustomer` is NOT one of these — its own value is its
         // evidence (non-null means answered) and booking already refuses to
         // touch it once it is set.
-        const stampsTaxProvenance =
-            (editsTaxAmount && body.taxAmount !== null) ||
-            (editsBase && body.taxDeductibleBase !== null);
+        const stampsTaxProvenance = editsTaxAmount || editsBase;
 
         // `taxReviewAck` is not a column, so a request carrying nothing else
         // has no field to write. Told, not silently no-opped.
@@ -512,9 +538,24 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         let nextBase: number | null = null;
         if (editsBase && body.taxDeductibleBase !== null) {
             const parsed = Number(body.taxDeductibleBase);
-            if (!Number.isFinite(parsed) || parsed < 0) {
+            if (!Number.isFinite(parsed)) {
                 return NextResponse.json(
-                    { error: "taxDeductibleBase must be a number ≥ 0, or null." },
+                    { error: "taxDeductibleBase must be a number, or null." },
+                    { status: 400 },
+                );
+            }
+            // Signed, like the amount it is a portion of: the resold part of a
+            // -$50 return is negative too. A base pointing the other way is a
+            // dropped minus sign, and it would ADD to a filing that should be
+            // reduced.
+            if (parsed !== 0 && Math.sign(parsed) !== Math.sign(Number(expense.amount))) {
+                return NextResponse.json(
+                    {
+                        error: Number(expense.amount) < 0
+                            ? "This is a refund, so its deductible amount must be negative too (or zero)."
+                            : "The deductible amount must be positive on a purchase (or zero).",
+                        code: "BASE_SIGN_MISMATCH",
+                    },
                     { status: 400 },
                 );
             }
@@ -531,9 +572,15 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const resultingTax = editsTaxAmount
             ? (nextTaxAmount ?? 0)
             : Number(expense.taxAmount ?? 0);
-        if (resultingBase !== null) {
+        if (resultingBase !== null && resultingBase !== 0) {
             const ceiling = Math.round((Number(expense.amount) - resultingTax) * 100) / 100;
-            if (!Number.isFinite(ceiling) || resultingBase > ceiling) {
+            // MAGNITUDE, because both sides are signed. On a refund the ceiling
+            // is negative and `base > ceiling` would pass anything.
+            if (
+                !Number.isFinite(ceiling) ||
+                Math.sign(resultingBase) !== Math.sign(ceiling) ||
+                Math.abs(resultingBase) > Math.abs(ceiling)
+            ) {
                 return NextResponse.json(
                     { error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).` },
                     { status: 400 },
@@ -575,6 +622,12 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                         { status: resolved.status },
                     );
                 }
+                // A FIRST pass, outside the transaction, purely so the
+                // caller gets a clean 400 instead of a rolled-back write. The
+                // ANSWER THAT COUNTS is re-taken inside the transaction below,
+                // where the rows it depends on are locked — this one can go
+                // stale between here and the write and that is fine, because
+                // nothing acts on it.
                 const onProject = await isCostCodeAllowedForProject(
                     prismaPhaseDataSource,
                     projectId,
@@ -667,9 +720,32 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // that TAKE it, the predicate is what still protects against one that
         // does not.
         const written = await prisma.$transaction(async tx => {
-            await lockExpense(tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> }, id);
-            return tx.expense.updateMany({ where: casWhere, data });
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await lockExpense(raw, id);
+            // THE PHASE ANSWER THAT COUNTS, taken here (round 17, item 5).
+            //
+            // The check above ran on the global client and held nothing: an
+            // estimate archived or reassigned, or the code deactivated, between
+            // it and this write would still be stamped onto the row. This one
+            // locks the four tables the answer rests on and reads them on this
+            // transaction's snapshot, so it cannot go stale before the update.
+            if (editsCostCode && nextCostCodeId) {
+                const verdict = await assertPhaseOfProjectTx(raw, projectId, nextCostCodeId);
+                if (!verdict.ok) return { count: 0, phaseRejected: verdict.reason } as const;
+            }
+            const result = await tx.expense.updateMany({ where: casWhere, data });
+            return { count: result.count, phaseRejected: null } as const;
         });
+        if (written.phaseRejected) {
+            return NextResponse.json(
+                {
+                    error: "That cost code stopped being one of this project's phases while you were editing.",
+                    code: "PHASE_NOT_ON_PROJECT",
+                    reason: written.phaseRejected,
+                },
+                { status: 400 },
+            );
+        }
         if (written.count === 0) {
             return NextResponse.json(
                 {

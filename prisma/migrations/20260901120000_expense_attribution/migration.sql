@@ -117,16 +117,19 @@ ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAmount_check"
 -- Prisma cannot express a CHECK, so this lives here by hand and is recorded in
 -- prisma/prisma-blind-spots.json; scripts/check-migrations-match.mjs asserts it.
 -- Safe to add: `taxDeductibleBase` is new and every existing row is NULL.
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'Expense_taxDeductibleBase_check'
-                    AND conrelid = '"Expense"'::regclass) THEN
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
-      CHECK ("taxDeductibleBase" IS NULL
-             OR ("taxDeductibleBase" >= 0
-                 AND "taxDeductibleBase" <= "amount" - COALESCE("taxAmount", 0)));
-  END IF;
-END $$;
+-- SIGNED, for the same reason the tax check is: a return or vendor credit is a
+-- negative expense, and the resold portion of it is negative too. `base >= 0`
+-- made every credit unallocatable, which is the shape that pushes a bookkeeper
+-- into recording it as a positive and ADDING to a filing that should shrink.
+--
+-- Dropped and re-added by name, so a database carrying the unsigned definition
+-- is corrected rather than skipped. Both statements are re-runnable.
+ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxDeductibleBase_check";
+ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
+  CHECK ("taxDeductibleBase" IS NULL
+         OR "taxDeductibleBase" = 0
+         OR (sign("taxDeductibleBase") = sign("amount")
+             AND abs("taxDeductibleBase") <= abs("amount" - COALESCE("taxAmount", 0))));
 
 UPDATE "Expense" e SET "projectId" = est."projectId"
 FROM "Estimate" est

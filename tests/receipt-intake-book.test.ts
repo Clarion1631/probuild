@@ -112,6 +112,12 @@ interface Recorder {
     events: any[];
     expenseUpdates: any[];
     existingExpense: any;
+    /**
+     * The world the IN-TRANSACTION phase invariant reads (round 17, item 5):
+     * the job's status and whether the cost code is still active. A test that
+     * models an archive, a deactivation or a deleted job moves these.
+     */
+    state: { existingExpense: any; projectStatus: string; costCodeActive: boolean };
 }
 
 function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
@@ -122,7 +128,13 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
     const expenseUpdates: any[] = [];
     const events: any[] = [];
     // Set by a test to model a Purchase that is ALREADY booked.
-    const state: { existingExpense: any } = { existingExpense: null };
+    const state: { existingExpense: any; projectStatus: string; costCodeActive: boolean } = {
+        existingExpense: null,
+        // What the phase invariant reads back for this job and code. A test
+        // that models an archive, a deactivation or a deleted job moves these.
+        projectStatus: "In Progress",
+        costCodeActive: true,
+    };
 
     const tx = {
         project: {
@@ -179,7 +191,25 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
             },
         },
         // The fill takes the shared per-expense advisory lock first.
-        $queryRawUnsafe: async () => [{ lock_result: null }],
+        // The phase invariant asks its questions in SQL, on THIS transaction
+        // (round 17, item 5). The fake answers them from the same injected
+        // `isCostCodeAllowed` rule every test already sets, so a test writes
+        // one rule and both the pre-send checks and the in-transaction one obey
+        // it. Locks return whatever; only the three reads matter.
+        $queryRawUnsafe: async (query: string, ...args: any[]) => {
+            if (/FROM "Project" WHERE id/.test(query) && /status/.test(query)) {
+                return [{ id: args[0], status: state.projectStatus }];
+            }
+            if (/FROM "CostCode" WHERE id/.test(query)) {
+                return state.costCodeActive
+                    ? [{ id: args[0], code: "03-PLUMB", isActive: true }]
+                    : [{ id: args[0], code: "03-PLUMB", isActive: false }];
+            }
+            if (/FROM "EstimateItem"/.test(query) && /LIMIT 1/.test(query)) {
+                return (await deps.isCostCodeAllowed(args[0], args[1])) ? [{ ok: 1 }] : [];
+            }
+            return [{ lock_result: null }];
+        },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
             updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },
@@ -206,6 +236,8 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
     };
     return {
         deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, expenseUpdates,
+        /** The world the in-transaction phase invariant reads. */
+        state,
         set existingExpense(value: any) { state.existingExpense = value; },
         get existingExpense() { return state.existingExpense; },
     };
@@ -1273,15 +1305,31 @@ test("the per-expense lock is taken BEFORE the read the fill decides from", asyn
         trace.push("read");
         return realFind(args);
     };
-    (rec.deps.db as any).$queryRawUnsafe = async (query: string) => {
-        trace.push(query.includes("FOR SHARE") ? "phase-share" : "lock");
-        return [{ lock_result: null }];
+    const realQuery = (rec.deps.db as any).$queryRawUnsafe;
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string, ...args: any[]) => {
+        trace.push(
+            query.includes("FOR SHARE") ? "phase-share"
+                : query.includes("pg_advisory_xact_lock") ? "lock"
+                : "phase-read",
+        );
+        return realQuery(query, ...args);
     };
     await bookReceipt(row(), rec.deps);
-    // The job's phase rows are share-locked first (round 16, item 2), then the
-    // id lookup, then the per-expense lock, then the read every decision is
-    // made from.
-    assert.deepEqual(trace.slice(0, 4), ["phase-share", "read", "lock", "read"]);
+    // The phase invariant runs FIRST — four share locks then its three reads
+    // (round 17, item 5) — and only then the id lookup, the per-expense lock,
+    // and the read every fill decision is made from.
+    assert.equal(trace[0], "phase-share", "nothing is read before the locks");
+    const advisoryAt = trace.indexOf("lock");
+    const idReadAt = trace.indexOf("read");
+    assert.ok(idReadAt >= 0 && advisoryAt > idReadAt, "the id lookup, then its lock");
+    assert.ok(
+        trace.lastIndexOf("read") > advisoryAt,
+        "and the decisive read happens INSIDE the per-expense lock",
+    );
+    assert.ok(
+        trace.slice(0, advisoryAt).filter(entry => entry === "phase-share").length >= 4,
+        "Project, Estimate, EstimateItem and CostCode are all held",
+    );
 });
 
 // ── an implausible OCR tax is flagged, never booked (round 15, item 1) ─────
@@ -1388,7 +1436,8 @@ test("a phase REMOVED between the read and the write parks, it does not book", a
     assert.equal(asked, 3, "asked again inside the transaction");
     assert.equal(result.outcome, "needs-review");
     if (result.outcome === "needs-review") {
-        assert.equal(result.reason, "phase-changed");
+        // The reason names the thing a person has to fix.
+        assert.equal(result.reason, "phase-changed:not-a-phase");
         assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
     }
     assert.equal(rec.expenses.length, 0, "no Expense was written");
@@ -1408,13 +1457,22 @@ test("the in-transaction check happens AFTER the phase rows are locked", async (
             return true;
         },
     });
-    (rec.deps.db as any).$queryRawUnsafe = async (query: string) => {
+    const passThrough = (rec.deps.db as any).$queryRawUnsafe;
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string, ...args: any[]) => {
         if (query.includes("FOR SHARE")) order.push("phase-share");
-        return [{ lock_result: null }];
+        return passThrough(query, ...args);
     };
     await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);
-    // ask (pre-send), ask (post-create), share-lock, ask (inside the tx)
-    assert.deepEqual(order, ["ask", "ask", "phase-share", "ask"]);
+    // ask (pre-send), ask (post-create), then the share locks, and only then
+    // the question that decides the write.
+    assert.deepEqual(order.slice(0, 2), ["ask", "ask"]);
+    const lastShare = order.lastIndexOf("phase-share");
+    assert.ok(lastShare > 1, "the locks come after the two stateless checks");
+    assert.equal(order[order.length - 1], "ask", "and the decisive question comes last");
+    assert.equal(
+        order.filter(entry => entry === "ask").length, 3,
+        "asked once more, inside the transaction",
+    );
 });
 
 test("a row with NO phase is not parked by this check", async () => {

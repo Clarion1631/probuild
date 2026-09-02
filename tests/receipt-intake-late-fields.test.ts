@@ -381,3 +381,54 @@ test("finalize authorizes the effective project on EVERY session call, before an
         assert.ok(gate < finalize.indexOf(write), `the gate precedes ${write}`);
     }
 });
+
+// ── installedAtCustomer is CAPTURED at publish time (round 17, item 3) ──────
+
+test("the finalize route reads installedAtCustomer and merges it as a captured field", () => {
+    // The merge rules below are only worth anything if the route actually hands
+    // the stored value in. It did not: the row read selected projectId and
+    // costCodeId only, so `mergeCapturedFields` saw no stored answer and a late
+    // `false` landed on a row that already said `true` — the one path that
+    // could silently overwrite a tax answer.
+    const select = FINALIZE.slice(FINALIZE.indexOf("const row = await prisma.receiptIntake.findUnique"));
+    const head = select.slice(0, select.indexOf("});"));
+    assert.match(head, /installedAtCustomer: true/, "the row read must select it");
+
+    const merge = FINALIZE.slice(FINALIZE.indexOf("mergeCapturedFields("));
+    const call = merge.slice(0, merge.indexOf("lateFields,"));
+    assert.match(call, /installedAtCustomer: row\.installedAtCustomer/, "and pass it to the merge");
+});
+
+test("a CONFLICTING answer at finalize is a 409, and publishes nothing", () => {
+    // Stored true, late false. This is the shape that decides how a purchase is
+    // taxed, so the publish must refuse rather than pick a winner.
+    const merged = mergeCapturedFields(
+        { projectId: "proj-a", costCodeId: null, installedAtCustomer: true },
+        { installedAtCustomer: false } as never,
+    );
+    assert.ok("status" in merged);
+    assert.equal(merged.status, 409);
+    assert.equal(merged.body.error, "late-fields-conflict");
+});
+
+test("the publish CAS carries installedAtCustomer, so a concurrent finalize loses", () => {
+    // Two finalizations of the same row: the first fills the tax answer, the
+    // second was validated against a row that did not have one. Without the
+    // captured value in the fence the second would publish over it and both
+    // would report success.
+    const merged = mergeCapturedFields(
+        { projectId: "proj-a", costCodeId: null, installedAtCustomer: null },
+        { installedAtCustomer: true } as never,
+    );
+    assert.ok(!("status" in merged));
+    assert.equal(
+        merged.guard.installedAtCustomer, null,
+        "fenced on the value this publish was validated against",
+    );
+    assert.deepEqual(merged.apply, { installedAtCustomer: true } as never);
+    // ...and the route applies that guard to the publishing update.
+    const commit = FINALIZE.slice(FINALIZE.indexOf("state: \"RECEIVED\""));
+    const fence = FINALIZE.slice(FINALIZE.indexOf("where: { id, ...publishFence(row)"));
+    assert.match(fence.slice(0, 120), /\.\.\.merged\.guard/, "the CAS includes every captured value");
+    assert.ok(commit.length > 0);
+});
