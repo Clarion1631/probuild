@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks } from "@/lib/quickbooks-payments";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -24,6 +24,8 @@ export const maxDuration = 120;
  *     Ensures every UNPAID milestone's QBO invoice accepts card + bank transfer
  *     (the canonical setting). Repairs invoices pushed under older toggles —
  *     e.g. the brief bank-only window on 6/11 — without touching paid ones.
+ *     Then finishes any row left `paylink-pending` by a pay-link timeout, on
+ *     both the milestone and the progress-billing rail.
  */
 export async function POST(req: Request) {
     // One budget for the whole request, whichever action it turns out to be.
@@ -185,6 +187,16 @@ export async function POST(req: Request) {
         }
     }
 
+    // Same pass, second repair: rows whose invoice IS linked but whose pay-link
+    // fetch timed out (marked `paylink-pending` by the milestone push / progress
+    // billing stage). Skipped when the options loop already hit the wall — the
+    // connection is shared, so there is nothing left to try.
+    let payLinks: Awaited<ReturnType<typeof sweepPendingPayLinks>> | null = null;
+    if (!abortedReason) {
+        payLinks = await sweepPendingPayLinks(tokens, deadline);
+        if (payLinks.reason) abortedReason = payLinks.reason;
+    }
+
     // `ok` reflects whether the sweep actually finished: a run that stopped
     // early has left work undone and must not read as a clean pass.
     return NextResponse.json({
@@ -192,6 +204,7 @@ export async function POST(req: Request) {
         checked: results.length,
         skipped,
         ...(abortedReason ? { reason: abortedReason, retry: true } : {}),
+        ...(payLinks ? { payLinks } : {}),
         results,
     });
 }

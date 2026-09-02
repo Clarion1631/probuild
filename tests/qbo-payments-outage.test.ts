@@ -1545,3 +1545,96 @@ test("a linked-but-paylink-pending row is a success, not a failure", async () =>
     const { isBlockedByAmbiguousCreate } = await import("../src/lib/quickbooks-payments");
     assert.equal(isBlockedByAmbiguousCreate({ qbSyncError: PAYLINK_PENDING_MARKER }), false);
 });
+
+// --- The paylink-pending sweep finishes what a timeout left behind ---
+
+/** In-memory PaymentSchedule/ProgressBilling pair for the sweep. */
+function makeSweepDb(milestones: any[], billings: any[]) {
+    const delegate = (rows: any[]) => ({
+        async findMany() {
+            return rows.map((r) => ({ ...r }));
+        },
+        async updateMany(args: any) {
+            const row = rows.find((r) => r.id === args.where.id);
+            if (!row) return { count: 0 };
+            const matches = Object.entries(args.where).every(([k, v]) => row[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(row, args.data);
+            return { count: 1 };
+        },
+    });
+    return { paymentSchedule: delegate(milestones), progressBilling: delegate(billings) };
+}
+
+test("the sweep finishes pay links on BOTH rails and clears the marker", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const billings = [{ id: "pb-1", code: "INV-1-P1", qbInvoiceId: "qb-2", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null }];
+    const db = makeSweepDb(milestones, billings);
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        readPayLink: async (_t, id) => `https://pay.example/${id}`,
+    });
+
+    assert.deepEqual(result, { checked: 2, repaired: 2, noLink: 0, skipped: 0 });
+    assert.equal(milestones[0].qbInvoiceLink, "https://pay.example/qb-1");
+    assert.equal(milestones[0].qbSyncError, null);
+    assert.equal(billings[0].qbInvoiceLink, "https://pay.example/qb-2");
+    assert.equal(billings[0].qbSyncError, null);
+});
+
+test("the sweep STOPS on a connection failure and leaves the rest pending", async () => {
+    // The 2026-09-01 shape: every invoice read answers 503. Clearing markers on
+    // that answer would lose the pay link for every row at once.
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const milestones = [
+        { id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } },
+        { id: "ps-2", qbInvoiceId: "qb-2", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-2" } },
+    ];
+    const db = makeSweepDb(milestones, []);
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        readPayLink: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/invoice/qb-1");
+        },
+    });
+
+    assert.equal(result.reason, "qbo-timeout");
+    assert.equal(result.repaired, 0);
+    assert.equal(result.skipped, 2, "both rows stay pending for the next run");
+    assert.equal(milestones[0].qbSyncError, PAYLINK_PENDING_MARKER);
+    assert.equal(milestones[1].qbSyncError, PAYLINK_PENDING_MARKER);
+});
+
+test("an invoice with no pay link clears the marker without inventing one", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const db = makeSweepDb(milestones, []);
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, { db, readPayLink: async () => null });
+
+    assert.equal(result.noLink, 1);
+    assert.equal(result.repaired, 0);
+    assert.equal(milestones[0].qbSyncError, null, "QuickBooks answered; there is nothing left to retry");
+    assert.equal(milestones[0].qbInvoiceLink, null);
+});
+
+test("a row that changed under the sweep is skipped, not overwritten", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const milestones: any[] = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
+    const db = makeSweepDb(milestones, []);
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        readPayLink: async () => {
+            // A concurrent unlink lands while the read is in flight.
+            milestones[0].qbInvoiceId = null;
+            milestones[0].qbSyncError = null;
+            return "https://pay.example/qb-1";
+        },
+    });
+    assert.equal(result.repaired, 0);
+    assert.equal(result.skipped, 1);
+    assert.equal(milestones[0].qbInvoiceLink, null, "the unlink wins");
+});

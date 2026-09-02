@@ -900,6 +900,28 @@ export async function createQBMilestoneInvoice(
     return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
 }
 
+/**
+ * Fetch the customer-facing payment link, distinguishing "QuickBooks answered,
+ * there is no link" from "QuickBooks did not answer".
+ *
+ * `getQBInvoicePaymentLink` below collapses both into null, which is fine for a
+ * caller that only wants a link if one is going spare — but fatal for the
+ * paylink-pending sweep: during the 2026-09-01 outage every invoice read
+ * answered 503, and a null-means-no-link sweep would have cleared every pending
+ * marker without ever fetching a link. This one throws instead, so the sweep
+ * stops on an outage and retries next run.
+ */
+export async function readQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
+    const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
+    const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
+        headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
+    });
+    if (!res.ok) throw await qboResponseError(res, "QB invoice payment link");
+    const data = await parseJsonOrNull(res);
+    return data?.Invoice?.InvoiceLink || null;
+}
+
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
 export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;

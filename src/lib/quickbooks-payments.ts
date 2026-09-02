@@ -41,6 +41,7 @@ import {
     ensureQBServiceItem,
     createQBMilestoneInvoice,
     getQBInvoicePaymentLink,
+    readQBInvoicePaymentLink,
     getQBInvoiceStatus,
     probeQBInvoice,
     getQBPayment,
@@ -292,6 +293,136 @@ export function isStaleInFlight(
     if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
     const at = row.updatedAt ? row.updatedAt.getTime() : 0;
     return now - at > CREATE_IN_FLIGHT_STALE_MS;
+}
+
+/** One row waiting for its pay link, from either rail. */
+export interface PayLinkPendingRow {
+    id: string;
+    qbInvoiceId: string;
+    code: string;
+}
+
+export interface PayLinkSweepDelegate {
+    findMany(args: any): Promise<any[]>;
+    updateMany(args: any): Promise<{ count: number }>;
+}
+
+export interface PayLinkSweepDb {
+    paymentSchedule: PayLinkSweepDelegate;
+    progressBilling: PayLinkSweepDelegate;
+}
+
+export interface PayLinkSweepResult {
+    checked: number;
+    /** A link was fetched and written. */
+    repaired: number;
+    /** QuickBooks answered, but this invoice has no payment link to offer. */
+    noLink: number;
+    /** Left for the next run — the sweep stopped, or the CAS lost. */
+    skipped: number;
+    reason?: string;
+}
+
+/** How many pending rows one sweep will look at, per rail. */
+export const PAYLINK_SWEEP_LIMIT = 100;
+
+/**
+ * Finish the work a pay-link timeout left behind, on BOTH rails.
+ *
+ * `pushMilestoneToQuickBooks` and `stageProgressBillingToQuickBooksCore` link
+ * the QBO invoice before fetching its pay link, so a timeout on that second
+ * read leaves a correct, linked row whose only missing piece is the convenience
+ * link — marked `paylink-pending`. This is what finishes it.
+ *
+ * Runs under the caller's route budget and stops on any connection-level
+ * failure, same rule as every other QBO loop here: the next row would fail the
+ * same way at full cost.
+ */
+export async function sweepPendingPayLinks(
+    tokens: QBTokens,
+    deadline?: RouteDeadline,
+    deps?: {
+        db?: PayLinkSweepDb;
+        readPayLink?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<string | null>;
+    },
+): Promise<PayLinkSweepResult> {
+    const db: PayLinkSweepDb = deps?.db ?? prisma;
+    const readPayLink = deps?.readPayLink ?? readQBInvoicePaymentLink;
+    const result: PayLinkSweepResult = { checked: 0, repaired: 0, noLink: 0, skipped: 0 };
+
+    const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
+    const [milestones, billings] = await Promise.all([
+        db.paymentSchedule.findMany({
+            where,
+            select: { id: true, qbInvoiceId: true, invoice: { select: { code: true } } },
+            take: PAYLINK_SWEEP_LIMIT,
+        }),
+        db.progressBilling.findMany({
+            where,
+            select: { id: true, qbInvoiceId: true, code: true },
+            take: PAYLINK_SWEEP_LIMIT,
+        }),
+    ]);
+
+    const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] = [
+        ...milestones.map((m: any) => ({
+            kind: "milestone" as const,
+            row: { id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id },
+        })),
+        ...billings.map((b: any) => ({
+            kind: "progressBilling" as const,
+            row: { id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code },
+        })),
+    ];
+
+    for (const [index, entry] of rows.entries()) {
+        if (isBudgetExhausted(deadline)) {
+            result.reason = "budget-exhausted";
+            result.skipped += rows.length - index;
+            break;
+        }
+        result.checked++;
+        let payLink: string | null;
+        try {
+            payLink = await readPayLink(tokens, entry.row.qbInvoiceId, deadline);
+        } catch (error) {
+            if (isQBBudgetExhaustedError(error)) {
+                result.reason = "budget-exhausted";
+                result.skipped += rows.length - index;
+                result.checked--;
+                break;
+            }
+            if (isQboConnectionFailure(error)) {
+                // Shared connection: the remaining rows would fail identically
+                // at a fresh 20s each. Stop and leave them pending.
+                result.reason = isQBTimeoutError(error) ? "qbo-timeout" : "qbo-unavailable";
+                result.skipped += rows.length - index;
+                result.checked--;
+                break;
+            }
+            // A per-invoice refusal (it was deleted in QuickBooks, say). Leave the
+            // marker: the row is still linked, and the invoice-probe sweep is what
+            // resolves a gone invoice, not this one.
+            result.skipped++;
+            continue;
+        }
+
+        const delegate = entry.kind === "milestone" ? db.paymentSchedule : db.progressBilling;
+        // CAS: only clear a marker we still own, on a row still pointing at the
+        // invoice we just read. A concurrent unlink/re-stage must win.
+        const cleared = await delegate.updateMany({
+            where: { id: entry.row.id, qbInvoiceId: entry.row.qbInvoiceId, qbSyncError: PAYLINK_PENDING_MARKER },
+            data: { qbSyncError: null, ...(payLink ? { qbInvoiceLink: payLink } : {}) },
+        });
+        if (cleared.count !== 1) {
+            result.skipped++;
+            continue;
+        }
+        if (payLink) result.repaired++;
+        else result.noLink++;
+    }
+
+    return result;
 }
 
 /** Raised when a send is refused because a previous attempt's outcome is unknown. */
