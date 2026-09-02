@@ -1335,3 +1335,97 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
     assert.deepEqual(seen[0], seen[1], "both legs share one budget");
     assert.equal(seen[0]!.budgetMs, 50_000);
 });
+
+
+// --- The REAL ensure helpers must honour the route budget ---
+
+test("the real vendor/customer ensures are bounded by the route budget", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError, QBTimeoutError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: ensureQBVendor/ensureQBCustomer make several QBO round trips
+    // of their own (exact-name query, prefix query, create, duplicate
+    // re-query). Those calls did not carry the budget, so a push could sit in
+    // the ensures until the platform killed the function. This drives the REAL
+    // helpers - nothing is replaced with a fake ensure - and only the network
+    // underneath them is slow.
+    const CEILING_MS = 60_000;
+    const CALL_MS = 400;
+    const calls: string[] = [];
+
+    const slowFetch = (async (url: string) => {
+        calls.push(String(url));
+        await new Promise(resolve => setTimeout(resolve, CALL_MS));
+        // Every lookup comes back empty, so the helpers walk their full path.
+        return new Response(JSON.stringify({ QueryResponse: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    // Enough budget for a few calls, nowhere near enough for the whole push.
+    const deadline = createRouteDeadline(2_200);
+    const started = Date.now();
+
+    const error = await withFetch(slowFetch, () =>
+        createQBReceiptPurchase(
+            TOKENS,
+            baseInput({ ...FILE_INPUT }),
+            // Only the database read is stubbed; every QBO call is real.
+            { listProjects: async () => [PROJECT] },
+            deadline,
+        ),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    const elapsed = Date.now() - started;
+
+    assert.ok(error, "the push must stop itself rather than run to the ceiling");
+    assert.ok(
+        isQBBudgetExhaustedError(error) || error instanceof QBTimeoutError,
+        `stopped for the wrong reason: ${error?.name}: ${error?.message}`,
+    );
+    // The point of the whole exercise: nowhere near the 60s route ceiling.
+    assert.ok(elapsed < CEILING_MS / 10, `ran ${elapsed}ms, which is not comfortably under ${CEILING_MS}ms`);
+    // Proof the real helpers were exercised: several distinct QBO round trips
+    // happened through qbTimedFetch before the budget cut them off.
+    assert.ok(calls.length >= 2, `expected several real QBO calls, saw ${calls.length}`);
+    // The customer ensure runs first, so that is where the budget bites here;
+    // both helpers are on the same clock and the assertion accepts either.
+    assert.ok(
+        calls.some(url => /Customer|Vendor/i.test(url)),
+        `a real ensure should have queried QBO: ${calls.join(", ")}`,
+    );
+    // And it stopped INSIDE the ensure rather than completing the whole push.
+    assert.equal(
+        calls.some(url => /purchase\?requestid/i.test(url)),
+        false,
+        "the books write must not have been reached",
+    );
+});
+
+test("an already-spent budget stops the real ensures before any QBO call", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    let calls = 0;
+    const countingFetch = (async () => {
+        calls++;
+        return new Response(JSON.stringify({ QueryResponse: {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    const error = await withFetch(countingFetch, () =>
+        createQBReceiptPurchase(
+            TOKENS,
+            baseInput({ ...FILE_INPUT }),
+            { listProjects: async () => [PROJECT] },
+            spent,
+        ),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(isQBBudgetExhaustedError(error), `got ${error?.name}: ${error?.message}`);
+    assert.equal(calls, 0, "not one QBO request may be issued on an exhausted budget");
+});

@@ -98,7 +98,8 @@ export async function ensureQBVendor(
     const prefix = trimmed.split(/\s+/)[0];
     const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
         tokens,
-        `SELECT Id, DisplayName FROM Vendor WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+        `SELECT Id, DisplayName FROM Vendor WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`,
+        deadline,
     );
     const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(trimmed));
     if (matches.length > 1) {
@@ -107,6 +108,7 @@ export async function ensureQBVendor(
     if (matches.length === 1) return matches[0].Id;
 
     const res = await qbFetch("/vendor", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({ DisplayName: trimmed }),
     });
@@ -115,7 +117,7 @@ export async function ensureQBVendor(
         if (err.includes("6240")) {
             // A concurrent create can win the race between our lookup and our
             // create — re-query once rather than assuming the duplicate is gone.
-            const requery = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`);
+            const requery = await qbQuery(tokens, `SELECT Id FROM Vendor WHERE DisplayName = '${escapeQBString(trimmed)}'`, deadline);
             if (requery.length > 0) return requery[0].Id;
             throw new QboVendorDuplicateError(trimmed);
         }
