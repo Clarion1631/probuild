@@ -1150,24 +1150,30 @@ export interface ComponentVersion {
     lineHash: string;
     /**
      * The expenses in the window: a count, and a hash of EVERY FIELD THE
-     * PLANNER READS — id, receipt presence, amount, date and vendor.
+     * PLANNER READS — id, receipt presence, amount, date, vendor, and the QBO
+     * purchase it was folded together with (see evidenceUnitKey).
      *
      * `Expense` HAS NO `updatedAt` COLUMN — only `createdAt` and `qbSyncedAt` —
      * so a timestamp cannot see the races that matter here: a bookkeeper
      * attaching a receipt to an EXISTING expense flips `hasReceipt` false→true,
-     * and a corrected amount, date or vendor changes which line it can answer.
-     * Every one of those changes the verdict for the whole component while
-     * leaving every timestamp on the row exactly where it was, so the fields
-     * themselves are the only usable fingerprint. Hashing identity alone was
-     * the same mistake one level down.
+     * a corrected amount, date or vendor changes which line it can answer, and
+     * a `qbPurchaseId` arriving or changing re-decides which intake it unit-folds
+     * with — evidenceUnitKey prefers it over `expenseId`, so a stale
+     * `qbPurchaseId` here could let the planned and re-read verdicts agree while
+     * disagreeing about which rows are actually one receipt. Every one of those
+     * changes the verdict for the whole component while leaving every timestamp
+     * on the row exactly where it was, so the fields themselves are the only
+     * usable fingerprint. Hashing identity alone was the same mistake one level
+     * down.
      */
     expenses: number;
     expenseHash: string;
     /**
      * The intakes in the window, hashed the same way and for the same reason:
      * `updatedAt` moves for edits we care about, but a hash of the fields the
-     * matcher actually reads (state, reason, total, date, vendor) is what
-     * proves the evidence set is unchanged rather than merely unbumped.
+     * matcher actually reads (state, reason, total, date, vendor, and the
+     * `expenseId`/`qbPurchaseId` pair evidenceUnitKey folds on) is what proves
+     * the evidence set is unchanged rather than merely unbumped.
      */
     intakeHash: string;
 }
@@ -1208,6 +1214,8 @@ export function componentVersionOf(input: {
         totalCents?: number | null;
         txnDate?: Date | string | null;
         vendor?: string | null;
+        expenseId?: string | null;
+        qbPurchaseId?: string | null;
     }>;
     lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null }>;
     expenses?: ReadonlyArray<{
@@ -1216,6 +1224,7 @@ export function componentVersionOf(input: {
         amountCents?: number | null;
         date?: Date | string | null;
         vendor?: string | null;
+        qbPurchaseId?: string | null;
     }>;
 }): ComponentVersion {
     const iso = (value: Date | string | null | undefined): string =>
@@ -1236,14 +1245,16 @@ export function componentVersionOf(input: {
         // changes the payee, which changes what matches.
         lineHash: fingerprint(lines.map(line => `${line.id}:${line.rawDescriptor ?? ""}`)),
         expenses: expenses.length,
-        // AMOUNT, DATE AND VENDOR too — they decide which line an expense can
-        // answer, so a correction to any of them changes the verdict.
+        // AMOUNT, DATE, VENDOR AND qbPurchaseId too — they decide which line an
+        // expense can answer and which intake it unit-folds with (see
+        // evidenceUnitKey), so a correction to any of them changes the verdict.
         expenseHash: fingerprint(expenses.map(expense => [
             expense.id,
             expense.hasReceipt ? 1 : 0,
             expense.amountCents ?? "",
             iso(expense.date),
             expense.vendor ?? "",
+            expense.qbPurchaseId ?? "",
         ].join(":"))),
         intakeHash: fingerprint(input.intakes.map(intake => [
             intake.id ?? "",
@@ -1252,6 +1263,8 @@ export function componentVersionOf(input: {
             intake.totalCents ?? "",
             iso(intake.txnDate),
             intake.vendor ?? "",
+            intake.expenseId ?? "",
+            intake.qbPurchaseId ?? "",
         ].join(":"))),
     };
 }

@@ -186,7 +186,7 @@ test("the line pass sends only its edge components through the walk", () => {
     assert.match(source, /componentTouchesBoundary\(/);
     // Two calls per page: the interior on the cheap query, the edge on the walk.
     assert.match(source, /\[interiorBatch, "window"\],\s*\n\s*\[boundaryBatch, "closure"\],/);
-    // And a failure in EITHER still stops the cursor.
+    // And a failure in EITHER still stops the cursor — so does contention.
     assert.match(source, /pageErrors \+= outcome\.summary\.errors;/);
-    assert.match(source, /if \(pageErrors > 0\) break;/);
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;/);
 });

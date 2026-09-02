@@ -132,9 +132,12 @@ test("an orphan-close failure stops the open-issue checkpoint", () => {
     assert.match(sweepSource, /openPass\.errors\+\+;\s*\n\s*pageErrors\+\+;/);
     assert.match(sweepSource, /pageErrors \+= outcome\.summary\.errors;/);
     // The break covers BOTH halves of the page, and comes before the advance.
-    const breakAt = sweepSource.indexOf("if (pageErrors > 0) break;");
+    // It also covers CONTENDED components (round-22 finding): a component that
+    // ran out of replans got no verdict, and advancing past its page would
+    // strand it just as surely as an error would.
+    const breakAt = sweepSource.indexOf("if (pageErrors > 0 || pageContended > 0) break;");
     const advanceAt = sweepSource.indexOf("openCursor = page[page.length - 1].id;");
-    assert.ok(breakAt > 0 && advanceAt > breakAt, "no checkpoint past a failure");
+    assert.ok(breakAt > 0 && advanceAt > breakAt, "no checkpoint past a failure or contention");
     // And the old shape — breaking only on the batch's errors — is gone.
     assert.doesNotMatch(sweepSource, /if \(outcome\.summary\.errors > 0\) break;\s*\n\s*\}\s*\n\s*openCursor =/);
 });

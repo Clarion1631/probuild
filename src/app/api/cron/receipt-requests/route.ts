@@ -922,7 +922,8 @@ async function processBatch(
                 updatedAt: row.updatedAt,
             })),
             // EVERY FIELD THE PLANNER READS, not just identity: an amount, date
-            // or vendor correction changes which line an expense can answer.
+            // or vendor correction changes which line an expense can answer,
+            // and qbPurchaseId decides which intake it unit-folds with.
             expenses: expenseRows
                 .filter(row => expenseInWindow(row.date))
                 .map(row => ({
@@ -931,6 +932,7 @@ async function processBatch(
                     amountCents: decimalStringToCents(row.amount.toString()),
                     date: row.date,
                     vendor: row.vendor,
+                    qbPurchaseId: row.qbPurchaseId,
                 })),
         });
 
@@ -983,6 +985,7 @@ async function processBatch(
                         select: {
                             id: true, updatedAt: true, state: true, stateReason: true,
                             totalCents: true, txnDate: true, vendor: true,
+                            expenseId: true, qbPurchaseId: true,
                         },
                     }),
                     lines: await tx.bankLine.findMany({
@@ -992,7 +995,7 @@ async function processBatch(
                     expenses: (await tx.expense.findMany({
                         where: { date: componentRange.timestamp },
                         select: {
-                            id: true, amount: true, date: true, vendor: true,
+                            id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
                             receiptUrl: true, receiptIntake: { select: { id: true } },
                         },
                     })).map(row => ({
@@ -1001,6 +1004,7 @@ async function processBatch(
                         amountCents: decimalStringToCents(row.amount.toString()),
                         date: row.date,
                         vendor: row.vendor,
+                        qbPurchaseId: row.qbPurchaseId,
                     })),
                 });
                 if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
@@ -1283,6 +1287,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // `?continue=1` could finish the pass and clear the cursor — stranding
         // that issue permanently, nagging with a target nothing can answer.
         let pageErrors = 0;
+        let pageContended = 0;
         for (const issue of orphaned) {
             try {
                 const details = detailsByKey.get(issue.targetKey) ?? {};
@@ -1325,11 +1330,14 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             openUndecided += outcome.undecided;
             openContended += outcome.contended;
             pageErrors += outcome.summary.errors;
+            pageContended += outcome.contended;
         }
 
         // Same rule as the line pass: never checkpoint past a failure — from
-        // EITHER half of this page.
-        if (pageErrors > 0) break;
+        // EITHER half of this page. A contended component was never reconciled
+        // (see processBatchWithReplan) — advancing past it strands the page it
+        // sat on just as surely as an error would.
+        if (pageErrors > 0 || pageContended > 0) break;
 
         openCursor = page[page.length - 1].id;
         await writeOpenCursor(openCursor);
@@ -1428,6 +1436,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         const boundaryBatch = batch.filter(row => boundaryLineIds.has(row.id));
         const interiorBatch = batch.filter(row => !boundaryLineIds.has(row.id));
         let pageErrors = 0;
+        let pageContended = 0;
         for (const [rows, mode] of [
             [interiorBatch, "window"],
             [boundaryBatch, "closure"],
@@ -1444,16 +1453,22 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             totals.errors += outcome.summary.errors;
             totals.failedTargets.push(...outcome.summary.failedTargets);
             pageErrors += outcome.summary.errors;
+            pageContended += outcome.contended;
         }
         batches++;
         linesSeen += batch.length;
 
-        // THE CURSOR STOPS AT THE FIRST FAILURE. Advancing past a target whose
-        // write threw is how a row that fails every night is never chased: the
-        // sweep would step over it forever and report a clean run. A failed
-        // batch keeps its cursor so the next invocation retries the same
-        // ground; the lifecycle writes are idempotent, so re-running is free.
-        if (pageErrors > 0) break;
+        // THE CURSOR STOPS AT THE FIRST FAILURE — OR AT UNRESOLVED CONTENTION.
+        // Advancing past a target whose write threw is how a row that fails
+        // every night is never chased: the sweep would step over it forever and
+        // report a clean run. A contended component (processBatchWithReplan
+        // exhausted its replans) was never reconciled either — it has no
+        // verdict, so checkpointing past its page persists a cursor beyond a
+        // page nothing was decided for, same as an error would. A failed or
+        // contended batch keeps its cursor so the next invocation retries the
+        // same ground; the lifecycle writes are idempotent, so re-running is
+        // free.
+        if (pageErrors > 0 || pageContended > 0) break;
 
         // The checkpoint is the last COMPONENT this page finished, so a resume
         // can never land in the middle of a competition set.

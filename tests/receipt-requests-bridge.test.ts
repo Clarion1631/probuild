@@ -322,9 +322,10 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     // Checkpoint after every page, so a killed run loses one page, not all.
     assert.match(source, /await writeCursor\(cursor\);/);
     // The cursor must NOT advance past a target whose write threw — from
-    // either half of the page (round-20 finding 3).
-    assert.match(source, /if \(pageErrors > 0\) break;/);
-    const breakAt = source.lastIndexOf("if (pageErrors > 0) break;");
+    // either half of the page (round-20 finding 3) — or past an unresolved
+    // contended component (round-22 finding: no replan ever reached a verdict).
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;/);
+    const breakAt = source.lastIndexOf("if (pageErrors > 0 || pageContended > 0) break;");
     const advanceAt = source.lastIndexOf("cursor = page[page.length - 1].key;");
     assert.ok(breakAt > 0 && advanceAt > breakAt, "the break must come BEFORE the cursor advances");
     // And errors make the run a 500.
@@ -523,9 +524,10 @@ test("open issues are paged with their OWN cursor and budget", () => {
         source.indexOf('const CURSOR_KEY'),
         "sharing one cursor would make each pass corrupt the other's resume point",
     );
-    // Same wall clock as the line pass, and it never checkpoints past a failure.
+    // Same wall clock as the line pass, and it never checkpoints past a failure
+    // or an unresolved contended component.
     assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
-    assert.match(source, /if \(pageErrors > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
+    assert.match(source, /if \(pageErrors > 0 \|\| pageContended > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
 });
 
 test("an issue whose BankLine is gone is CLOSED as target-missing", () => {
