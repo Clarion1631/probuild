@@ -602,25 +602,35 @@ test("the receipt bytes always ride along with the Purchase", async () => {
     assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
 });
 
-test("a void between the claim and the send ABORTS — QBO is never called", async () => {
+test("a void between the claim and the send stops it — QBO is never called", async () => {
     // Everything before the send takes real time (a project lookup, a file
     // download), and a human on the Receipts tab can void the row in that
     // window. QBO is read-only from here: a Purchase created for a cancelled
     // receipt cannot be taken back.
-    const { deps, purchaseCalls, intakeUpdates } = recorder({ readState: async () => "VOID" });
+    //
+    // The guard is the send fence itself, which CASes on `state = 'BOOKING'`
+    // AND the claim token in the same statement — so a void and a supersede are
+    // both caught at the last possible instant, rather than by a separate read
+    // taken slightly earlier. `markSendAttempted` returning false IS "somebody
+    // moved this row".
+    const { deps, purchaseCalls, intakeUpdates } = recorder({ markSendAttempted: async () => false });
     const result = await bookReceipt(row(), deps);
-    assert.equal(result.outcome, "aborted");
-    assert.match((result as { reason: string }).reason, /state-changed:VOID/);
+    assert.equal(result.outcome, "stale");
     assert.deepEqual(purchaseCalls, [], "nothing was sent");
     assert.deepEqual(intakeUpdates, [], "and nothing overwrote the human's decision");
 });
 
-test("a row that vanished mid-flight also aborts rather than booking", async () => {
-    const { deps, purchaseCalls } = recorder({ readState: async () => null });
-    const result = await bookReceipt(row(), deps);
-    assert.equal(result.outcome, "aborted");
-    assert.match((result as { reason: string }).reason, /state-changed:missing/);
-    assert.deepEqual(purchaseCalls, []);
+test("the send fence is checked at the LAST instant, not merely before the download", async () => {
+    // The window this closes is the one after every slow step: if the fence ran
+    // earlier, a void landing during the file download would still book.
+    const marks: string[] = [];
+    const { deps, purchaseCalls } = recorder({
+        markSendAttempted: async () => { marks.push("fenced"); return true; },
+        downloadBytes: async () => { marks.push("downloaded"); return { ok: true as const, bytes: Buffer.from("bytes") }; },
+    });
+    await bookReceipt(row(), deps);
+    assert.deepEqual(marks, ["downloaded", "fenced"], "the fence comes after the slow work");
+    assert.equal(purchaseCalls.length, 1);
 });
 
 test("the normal path is unaffected: still BOOKING means send", async () => {

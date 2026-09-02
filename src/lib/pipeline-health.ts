@@ -235,8 +235,13 @@ export function evaluatePipelineHealth(input: {
     /**
      * The nightly QBO register pull: whether it is switched on at all, and when
      * it last SUCCEEDED (not merely ran).
+     *
+     * Carries a probe status like every other read here. Without one, a
+     * database that would not answer produced `{enabled:false}` — which reads
+     * as "the pull is switched off", i.e. as HEALTH — and the one check that
+     * watches the chaser's whole input went quiet exactly when it was needed.
      */
-    bankPull: { enabled: boolean; lastSuccessAt: string | null };
+    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
     now: number;
@@ -254,6 +259,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
         ["uncertainCards", input.uncertainCards],
+        ["bankPull", input.bankPull],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -320,7 +326,10 @@ export function evaluatePipelineHealth(input: {
         if (stale) reasons.push("no-receipts-72h");
     }
 
-    if (input.bankPull.enabled) {
+    // Only when we actually READ it — a failed probe is already reported as
+    // probe-failed:bankPull, and inventing a staleness alarm on top of it would
+    // fire for the wrong reason and teach people to ignore both.
+    if (input.bankPull.status === "ok" && input.bankPull.enabled) {
         const at = input.bankPull.lastSuccessAt ? Date.parse(input.bankPull.lastSuccessAt) : null;
         // Never succeeded counts as stale. "We turned it on and it has never
         // worked" is the failure most worth catching, and a null that reads as
@@ -358,21 +367,20 @@ export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
  * reason, and the probe-failure reasons above already cover "we could not read
  * it". The flag itself is env, so it cannot fail.
  */
+/**
+ * The pull's last-success stamp. THROWS on a read failure rather than returning
+ * a cheerful default — it runs inside `runProbe` now, which is the thing that
+ * knows how to say "we could not read this" (`probe-failed:bankPull`) and how
+ * to give up on a hung database instead of holding the whole health check open.
+ */
 async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null }> {
     // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
     // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    try {
-        const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
-        return { enabled: true, lastSuccessAt: row?.value || null };
-    } catch {
-        // Could not READ it. The probe-failure reasons already cover "we do not
-        // know"; inventing a staleness alarm here would fire for the wrong
-        // reason and teach people to ignore it.
-        return { enabled: false, lastSuccessAt: null };
-    }
+    const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
+    return { enabled: true, lastSuccessAt: row?.value || null };
 }
 
 /** A probe that has not answered within this long is treated as failed. */
@@ -432,7 +440,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -584,6 +592,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             () => prisma.receiptRequestCard.count({ where: { status: "UNCERTAIN" } }),
             0,
         ),
+        // IN the Promise.all, and probed: it used to be an unprobed `await`
+        // after it, so a hung database held the whole health check open past
+        // every other probe's deadline and then answered "switched off".
+        probe<{ enabled: boolean; lastSuccessAt: string | null }>(
+            "bankPull",
+            readBankPullState,
+            { enabled: false, lastSuccessAt: null },
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -630,7 +646,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: uncertainCards.reason,
             count: uncertainCards.value,
         },
-        bankPull: await readBankPullState(),
+        bankPull: {
+            status: bankPull.status,
+            reason: bankPull.reason,
+            enabled: bankPull.value.enabled,
+            lastSuccessAt: bankPull.value.lastSuccessAt,
+        },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });

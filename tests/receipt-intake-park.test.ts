@@ -33,6 +33,7 @@ interface Row {
     dedupStrongKey: string | null;
     stateReason: string | null;
     claimedAt: Date | null;
+    claimToken: string | null;
     updatedAt: Date;
     duplicateOfId?: string | null;
 }
@@ -45,6 +46,7 @@ function row(over: Partial<Row> = {}): Row {
         dedupStrongKey: "strong:lowes:4600:2026-08-30",
         stateReason: null,
         claimedAt: null,
+        claimToken: null,
         updatedAt: new Date("2026-09-02T17:00:00Z"),
         ...over,
     };
@@ -265,4 +267,46 @@ test("every queue action CASes on updatedAt, and the page hands it over", () => 
     const tab = readFileSync(join(repoRoot, "src/app/automation/components/receipts/receipts-tab.tsx"), "utf8");
     const handed = tab.match(/expectedUpdatedAt=\{row\.updatedAt\}/g) ?? [];
     assert.ok(handed.length >= 8, `every action control needs it, saw ${handed.length}`);
+});
+
+// ── A park hands the row back (round-15 item 1) ────────────────────────────
+
+test("parking a row with an EXPIRED claim releases the dead token", () => {
+    // The fence lets this through — the lease ran out, the row is nobody's —
+    // but leaving the dead token behind makes every later "is anyone holding
+    // this?" read a claim that will never be released.
+    const expired = row({ claimedAt: new Date(NOW.getTime() - LEASE_MS - 60_000), claimToken: "worker-abc" });
+    const result = applyPlan(voidPlan(), expired);
+    assert.equal(result.applied, "release");
+    assert.equal(result.after.claimToken, null, "ownership goes back with the park");
+    assert.equal(result.after.claimedAt, null);
+});
+
+test("both park branches release it, so a post-send park is resolvable", () => {
+    // THE REGRESSION, end to end: expired claim -> park after a send ->
+    // resolveUnknownOrphan. That action's predicate requires `claimToken: null`,
+    // so before this the orphan the park had just created could never be
+    // resolved by anybody.
+    const plan = voidPlan();
+    for (const branch of [plan.release, plan.keep]) {
+        assert.equal(branch.data.claimToken, null);
+        assert.equal(branch.data.claimedAt, null);
+    }
+    const parked = applyPlan(plan, row({
+        sendAttempted: true,
+        claimedAt: new Date(NOW.getTime() - LEASE_MS - 60_000),
+        claimToken: "worker-abc",
+    }));
+    assert.equal(parked.applied, "keep", "a post-send park keeps the dedup key");
+    assert.equal(parked.after.claimToken, null, "and still hands the row back");
+    assert.equal(isPossibleOrphanReason(parked.after.stateReason), true);
+    // Which is exactly what resolveUnknownOrphan's predicate needs.
+    const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    const predicate = actions.slice(actions.indexOf("const orphanWhere = {"));
+    assert.match(predicate.slice(0, predicate.indexOf("};")), /claimToken: null/);
+});
+
+test("a LIVE claim is still refused — releasing is not the same as stealing", () => {
+    const live = row({ claimedAt: new Date(NOW.getTime() - 60_000), claimToken: "worker-abc" });
+    assert.equal(applyPlan(voidPlan(), live).applied, null, "the worker may be mid-send");
 });

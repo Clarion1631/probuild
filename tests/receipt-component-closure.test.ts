@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
     COMPETING_LINE_ADJACENCY_DAYS,
     ComponentTooLargeError,
+    competingLineFilter,
     groupCompetingLines,
     loadComponentToClosure,
 } from "../src/lib/receipt-requests";
@@ -103,4 +104,37 @@ test("the recompute walks to closure, and an abort leaves the chase OPEN", () =>
     assert.match(source, /if \(error instanceof ComponentTooLargeError\) \{[\s\S]{0,900}return \["MISSING_RECEIPT"\];/);
     // The loaded window is reduced to the component that holds the seed.
     assert.match(source, /groupCompetingLines\(loadedLines\)\.find\(group => group\.lineIds\.includes\(targetKey\)\)/);
+});
+
+// ── The open-issue pass walks too (round-15 item 2) ────────────────────────
+
+test("a chain longer than the fixed window is only found by the walk", async () => {
+    // 0 ↔ 4 ↔ 8 ↔ 12 again, but read against the OLD expansion: the fixed
+    // per-line query spans ±8 days, so the line at day 12 was outside it. The
+    // open-issue pass judged the first three as the whole competition set and
+    // handed a receipt to a line whose real competitor it never loaded.
+    const window = competingLineFilter({ amountCents: -4_600, postedDate: ymd(0) });
+    assert.equal(window.from, ymd(-8));
+    assert.equal(window.to, ymd(8), "the fixed window stops two hops out");
+
+    const { load } = loaderOver([0, 4, 8, 12]);
+    const walked = await loadComponentToClosure(ymd(0), load, { maxNodes: 200 });
+    assert.deepEqual(walked.map(r => r.id), ["bl-0", "bl-4", "bl-8", "bl-12"]);
+    // The line the fixed window missed, stated as such.
+    const missed = walked.filter(r => r.postedDate > window.to);
+    assert.deepEqual(missed.map(r => r.id), ["bl-12"]);
+});
+
+test("the open-issue pass asks for closure; the line pass keeps the window", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /cohortMode: "window" \| "closure" = "window",/);
+    // The open pass passes "closure" explicitly.
+    assert.match(source, /page\.map\(issue => \(\{ targetKey: issue\.targetKey \}\)\),[\s\S]{0,400}"closure",/);
+    // In closure mode the expansion is per line, through the same walk.
+    assert.match(source, /if \(cohortMode === "closure"\) \{[\s\S]{0,300}await loadCompetingComponent\(row\)/);
+    // An unloadable component costs that line its verdict — never a close.
+    assert.match(source, /judgeOnly\.delete\(row\.id\);/);
+    assert.match(source, /undecided: plan\.undecided\.length \+ unresolved\.length/);
+    // The line pass still uses the cheap query: its pages ARE components.
+    assert.match(source, /const cohortFilters = batch\.map\(row => competingLineFilter\(/);
 });

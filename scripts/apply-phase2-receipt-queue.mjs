@@ -169,7 +169,7 @@ export const statements = [
  * with NO default, where the DDL succeeds and every later INSERT fails at
  * runtime instead. `default: null` means "no default expected".
  */
-const expectedColumns = {
+export const expectedColumns = {
     BankLine: [
         { name: "sourceOfRecord", type: "text", nullable: false, default: "'STATEMENT'::text" },
     ],
@@ -179,6 +179,11 @@ const expectedColumns = {
         { name: "pacificDate", type: "text", nullable: false, default: null },
         { name: "itemsJson", type: "text", nullable: false, default: null },
         { name: "overflow", type: "integer", nullable: false, default: "0" },
+        // The DEFAULT is the load-bearing part: every card written before this
+        // column existed came from a completed scan, so `true` is the truthful
+        // backfill and there is no UPDATE pass. A nullable one would give the
+        // reader a third state ("unknown") that nothing knows how to render.
+        { name: "overflowExact", type: "boolean", nullable: false, default: "true" },
         { name: "claimedAt", type: "timestamp without time zone", nullable: true, default: null },
         { name: "claimToken", type: "text", nullable: true, default: null },
         { name: "status", type: "text", nullable: false, default: "'PENDING'::text" },

@@ -23,7 +23,8 @@ import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
 import { driveFileIdOf } from "./receipt-intake/book";
-import { parseChatDelivery } from "./receipt-request-cards";
+import { parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
+import { recordCardOnIssues } from "./receipt-card-history";
 import {
     ORPHAN_AUDIT_KIND,
     ORPHAN_RESOLUTIONS,
@@ -15786,6 +15787,16 @@ export async function resolveUnknownOrphan(
     return { success: true, stale: false as const };
 }
 
+/** The stored card snapshot, back into items. A malformed one records nothing. */
+function parseCardItems(itemsJson: string): CardItem[] {
+    try {
+        const parsed: unknown = JSON.parse(itemsJson);
+        return Array.isArray(parsed) ? (parsed as CardItem[]) : [];
+    } catch {
+        return [];
+    }
+}
+
 /**
  * Resolve a Chat card whose delivery was never confirmed (round-13 item 6).
  *
@@ -15833,29 +15844,56 @@ export async function resolveUncertainCard(
         };
     }
 
-    const result = await prisma.receiptRequestCard.updateMany({
-        where: { id: cardId, status: "UNCERTAIN", updatedAt: seenAt },
-        data: confirmed
-            ? {
-                status: "POSTED",
-                // The card IS out; `postedAt` is what stops any later run
-                // re-posting the day.
-                postedAt: new Date(),
-                // The bridge identities, so a reply in that thread resolves
-                // like any other card's.
-                threadName: confirmed.threadName,
-                messageName: confirmed.messageName,
-                lastError: null,
-                claimedAt: null,
-                claimToken: null,
-            }
-            : {
-                status: "PENDING",
-                lastError: "resend-requested",
-                // Ownership released, so the retry pass can claim it.
-                claimedAt: null,
-                claimToken: null,
-            },
+    const card = await prisma.receiptRequestCard.findUnique({
+        where: { id: cardId },
+        select: { itemsJson: true, pacificDate: true, owner: true },
+    });
+    const result = await prisma.$transaction(async tx => {
+        const written = await tx.receiptRequestCard.updateMany({
+            where: { id: cardId, status: "UNCERTAIN", updatedAt: seenAt },
+            data: confirmed
+                ? {
+                    status: "POSTED",
+                    // The card IS out; `postedAt` is what stops any later run
+                    // re-posting the day.
+                    postedAt: new Date(),
+                    // The bridge identities, so a reply in that thread resolves
+                    // like any other card's.
+                    threadName: confirmed.threadName,
+                    messageName: confirmed.messageName,
+                    lastError: null,
+                    claimedAt: null,
+                    claimToken: null,
+                }
+                : {
+                    status: "PENDING",
+                    lastError: "resend-requested",
+                    // Ownership released, so the retry pass can claim it.
+                    claimedAt: null,
+                    claimToken: null,
+                },
+        });
+
+        /**
+         * AND THE THREAD RECORD, in the same transaction.
+         *
+         * A card the cron posts writes one; a card an operator marks delivered
+         * used to write none — so the sweep and the bridge had nothing to
+         * resolve a reply against, and worse, the items still counted as NEVER
+         * CARDED. Never-carded-first ordering then put them at the front of
+         * tomorrow's card, and the crew was asked again for receipts they had
+         * already been asked for. Same claim, same trace, one writer.
+         */
+        if (written.count === 1 && confirmed && card) {
+            await recordCardOnIssues(
+                { items: parseCardItems(card.itemsJson), date: card.pacificDate, requestId: requestIdFor(card.owner, card.pacificDate) },
+                confirmed.threadName,
+                confirmed.messageName,
+                new Date(),
+                tx,
+            );
+        }
+        return written;
     });
     if (result.count === 0) {
         return { success: false, stale: true as const, reason: "That card changed underneath you — refresh." };

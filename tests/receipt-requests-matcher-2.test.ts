@@ -465,7 +465,8 @@ test("the sweep expands each page to its competing cohort before matching", () =
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /const cohortFilters = batch\.map\(row => competingLineFilter\(/);
     // COHORT, then EVIDENCE for the cohort's span, then DECIDE — in that order.
-    const cohortAt = source.indexOf("const cohortRows =");
+    // The window branch: the LINE pass still uses the cheap same-amount query.
+    const cohortAt = source.indexOf("const cohortFilters = batch.map(row => competingLineFilter(");
     // Searched AFTER the cohort: the recompute path has its own evidence load,
     // earlier in the file, and this test is about the BATCH path's ordering.
     const evidenceAt = source.indexOf("const \[expenseRows, intakeRows\] = await Promise.all([".replace(/\\/g, ""), cohortAt);

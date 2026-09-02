@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { BANK_LINE_SOURCES_OF_RECORD, statements, targetMatches } from "../scripts/apply-phase2-receipt-queue.mjs";
+import { BANK_LINE_SOURCES_OF_RECORD, expectedColumns, statements, targetMatches } from "../scripts/apply-phase2-receipt-queue.mjs";
 
 const migrationSql = readFileSync(
     path.join(__dirname, "..", "prisma", "migrations", "20260901120000_phase2_receipt_queue", "migration.sql"),
@@ -148,4 +148,35 @@ test("overflowExact ships with a TRUE default, so old cards keep their meaning",
     assert.ok(normalizedMigration.includes(wanted), "and so does the committed migration");
     // Prisma has to agree, or the client selects a column the DB may not have.
     assert.match(schemaPrisma, /overflowExact Boolean @default\(true\)/);
+});
+
+test("the verifier checks overflowExact's type, nullability AND default", () => {
+    // The script does not just run DDL — it reads information_schema back and
+    // refuses if the shape is wrong. A column missing from that list is applied
+    // and then never checked, which is how a NULLABLE or defaultless variant
+    // could reach production and read as verified.
+    const card = (expectedColumns as Record<string, Array<{ name: string; type: string; nullable: boolean; default: string | null }>>).ReceiptRequestCard;
+    const column = card.find(c => c.name === "overflowExact");
+    assert.ok(column, "overflowExact must be verified, not just created");
+    assert.equal(column.type, "boolean");
+    assert.equal(column.nullable, false, "a third state would be one nothing knows how to render");
+    assert.equal(column.default, "true", "old cards came from a completed scan, so true is the truthful backfill");
+
+    // And the DDL that creates it says exactly the same thing, in both paths.
+    const wanted = normalize(
+        `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "overflowExact" BOOLEAN NOT NULL DEFAULT true`,
+    );
+    assert.ok(statements.some(s => normalize(s) === wanted), "the apply script");
+    assert.ok(normalizedMigration.includes(wanted), "and the committed migration");
+
+    // Every column the script CREATES on this table is verified — no gaps.
+    const created = [...new Set(
+        statements
+            .filter(s => /ALTER TABLE "ReceiptRequestCard" ADD COLUMN/.test(s))
+            .map(s => /ADD COLUMN IF NOT EXISTS "([^"]+)"/.exec(s)?.[1])
+            .filter((name): name is string => !!name),
+    )];
+    for (const name of created) {
+        assert.ok(card.some(c => c.name === name), `${name} is created but never verified`);
+    }
 });

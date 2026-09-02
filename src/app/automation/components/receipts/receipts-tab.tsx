@@ -223,9 +223,14 @@ export function ReceiptsTab({
                                         </>
                                     )}
                                 </div>
-                                {/* Shown for BOTH kinds: a known id does not rule out a second
-                                    purchase, and an unknown one is otherwise a dead end. */}
-                                <UnknownOrphanControls intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
+                                {/* UNKNOWN-id rows only. A row that already has a purchase id is
+                                    resolved by "mark resolved" above, and the unknown-id action's
+                                    predicate excludes it (`postVoidQbPurchaseId: null`) — so
+                                    offering the control here would be offering a button that can
+                                    only ever refuse. */}
+                                {!row.postVoidQbPurchaseId && (
+                                    <UnknownOrphanControls intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
+                                )}
                             </div>
                         </RowShell>
                     ))}

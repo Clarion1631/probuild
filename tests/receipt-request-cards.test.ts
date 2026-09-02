@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { effectiveOwner } from "../src/lib/receipt-requests";
+import { appendCardRecord, effectiveOwner } from "../src/lib/receipt-requests";
 import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
@@ -17,6 +17,7 @@ import {
     postOwnerCard,
     requestIdFor,
     rebuildCardItems,
+    selectOwnerItems,
     serializeThreads,
     type CardCandidateIssue,
     type CardItem,
@@ -412,4 +413,55 @@ test("an uncertain card is surfaced, and resolving it is a CAS", () => {
     assert.match(tab, /<UncertainCardControls cardId=\{card\.id\} expectedUpdatedAt=\{card\.updatedAt\} \/>/);
     const filters = readFileSync(join(root, "src/app/automation/receipts-filters.ts"), "utf8");
     assert.match(filters, /"uncertain-cards": "Uncertain deliveries"/);
+});
+
+// ── A hand-resolved card leaves the same trace (round-15 item 3) ───────────
+
+test("recording a delivered card marks its items CARDED, so tomorrow deprioritises them", () => {
+    // The bug this closes: an operator marks an uncertain card delivered, no
+    // thread record is written, and the items still read as never carded. The
+    // never-carded-first ordering then puts them at the FRONT of tomorrow's
+    // card, and the crew is asked again for receipts they were already asked
+    // for — which is exactly how a chase list becomes noise.
+    const now = new Date("2026-08-20T15:00:00Z");
+    const details = appendCardRecord({}, {
+        threadName: "spaces/AAQAKhvMYtg/threads/xyz",
+        messageName: "spaces/AAQAKhvMYtg/messages/xyz.1",
+        n: 1,
+        date: "2026-08-20",
+        requestId: requestIdFor("CJ", "2026-08-20"),
+    }, now);
+    // This is what the next day's scan reads to decide `everCarded`.
+    assert.ok(Array.isArray(details.cards) && (details.cards as unknown[]).length === 1);
+    assert.ok(details.card, "and the latest-card slot the older readers use");
+
+    // Which changes the ordering: a carded item yields to one nobody has asked
+    // about yet.
+    const carded = issue({ id: "ri-carded", targetKey: "bl-carded", everCarded: true, postedDate: "2026-08-01" });
+    const fresh = issue({ id: "ri-fresh", targetKey: "bl-fresh", everCarded: false, postedDate: "2026-08-16" });
+    const { items } = selectOwnerItems([carded, fresh], "CJ");
+    assert.deepEqual(items.map(i => i.issueId), ["ri-fresh", "ri-carded"], "never-carded first, even though it is newer");
+});
+
+test("marking delivered writes the thread record in the SAME transaction", () => {
+    const actions = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/actions.ts"),
+        "utf8",
+    );
+    const fn = actions.slice(actions.indexOf("export async function resolveUncertainCard("));
+    const body = fn.slice(0, fn.indexOf("\n}"));
+    assert.match(body, /await prisma\.\$transaction\(async tx => \{/);
+    // The card write and the history write are both on `tx`.
+    assert.match(body, /const written = await tx\.receiptRequestCard\.updateMany\(/);
+    assert.match(body, /await recordCardOnIssues\([\s\S]{0,400}tx,\s*\n\s*\);/);
+    // Only on a COMMITTED delivered write — a resend leaves no thread record,
+    // because there is no thread.
+    assert.match(body, /if \(written\.count === 1 && confirmed && card\) \{/);
+    // ONE writer, shared with the cron.
+    const cron = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
+        "utf8",
+    );
+    assert.match(cron, /import \{ recordCardOnIssues \} from "@\/lib\/receipt-card-history";/);
+    assert.doesNotMatch(cron, /async function recordCardOnIssues\(/, "no second copy");
 });

@@ -54,6 +54,18 @@ export function planParkWrites(input: ParkInput): ParkPlan {
     const base = {
         state: input.targetState,
         nextRetryAt: null,
+        // AN EXPIRED CLAIM IS RELEASED BY THE PARK ITSELF, in the same write.
+        //
+        // The claim fence lets a park through when the worker's lease has run
+        // out — the row is nobody's — but it used to leave the dead token and
+        // timestamp sitting on the row. Everything downstream that asks "is
+        // anyone holding this?" then reads a claim that will never be released:
+        // most visibly `resolveUnknownOrphan`, whose predicate requires
+        // `claimToken: null`, so the orphan it just created could never be
+        // resolved. Parking IS finishing with the row, so ownership goes back
+        // here exactly as it does on the worker's own terminal transitions.
+        claimToken: null,
+        claimedAt: null,
         ...(input.extraData ?? {}),
     };
     const where = { id: input.id, state: input.expectedState, ...input.claimFence };

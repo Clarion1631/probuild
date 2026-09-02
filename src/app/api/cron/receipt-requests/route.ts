@@ -485,6 +485,20 @@ async function processBatch(
     resolvedIssueKeys: string[],
     detailsByKey: Map<string, Record<string, unknown>>,
     now: Date,
+    /**
+     * How to find each line's competitors.
+     *
+     * `"window"` — one wide same-amount query per line. Correct for the LINE
+     *   pass, whose batches are already whole components (`pageComponents` cut
+     *   the pages between them); the query is only there to catch a competitor
+     *   that fell outside the 60-day window.
+     * `"closure"` — walk the link rule to closure, per line. The OPEN-ISSUE
+     *   pass needs this: its page is an arbitrary set of old issues, not a
+     *   component, so a chain of same-amount charges reaching further than the
+     *   fixed span was matched as a FRAGMENT — a different answer from the one
+     *   the line pass reaches for the same rows.
+     */
+    cohortMode: "window" | "closure" = "window",
 ): Promise<{ summary: ReceiptRequestApplySummary; undecided: number }> {
     // THE LINES THIS BATCH IS ANSWERABLE FOR. The cohort query below drags in
     // neighbours so they can consume the evidence they are entitled to, but a
@@ -493,19 +507,41 @@ async function processBatch(
     // on one page and reopened on the next, night after night.
     const judgeOnly = new Set(batch.map(row => row.id));
     // 1. THE COHORT.
-    const cohortFilters = batch.map(row => competingLineFilter({
-        amountCents: row.amountCents,
-        postedDate: row.postedDate.toISOString().slice(0, 10),
-    }));
-    const cohortRows = cohortFilters.length === 0 ? [] : await prisma.bankLine.findMany({
-        where: {
-            OR: cohortFilters.map(f => ({
-                amountCents: f.amountCents,
-                postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
-            })),
-        },
-        select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-    });
+    const cohortRows: BatchLine[] = [];
+    const unresolved: string[] = [];
+    if (cohortMode === "closure") {
+        // PER LINE, TO CLOSURE. Each target brings its whole component, however
+        // far the chain reaches.
+        for (const row of batch) {
+            try {
+                for (const found of await loadCompetingComponent(row)) {
+                    cohortRows.push({ ...found, postedDate: new Date(`${found.postedDate}T00:00:00Z`) });
+                }
+            } catch (error) {
+                if (!(error instanceof ComponentTooLargeError)) throw error;
+                // Its competition set is unloadable, so it gets NO verdict —
+                // not a guess, and not a close. It stays open and reported.
+                console.error("[cron/receipt-requests] component too large; leaving the chase open", row.id, error.message);
+                judgeOnly.delete(row.id);
+                unresolved.push(row.id);
+            }
+        }
+    } else {
+        const cohortFilters = batch.map(row => competingLineFilter({
+            amountCents: row.amountCents,
+            postedDate: row.postedDate.toISOString().slice(0, 10),
+        }));
+        const found = cohortFilters.length === 0 ? [] : await prisma.bankLine.findMany({
+            where: {
+                OR: cohortFilters.map(f => ({
+                    amountCents: f.amountCents,
+                    postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
+                })),
+            },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        });
+        cohortRows.push(...found);
+    }
 
     // Open-issue lines are NOT bolted on here any more — they get their own
     // pass (see runSweep). Loading every one of them into every batch made each
@@ -619,7 +655,9 @@ async function processBatch(
         );
     });
 
-    return { summary, undecided: plan.undecided.length };
+    // A line whose component would not load is undecided too — the caller
+    // reports it, and the cursor does not step past it silently.
+    return { summary, undecided: plan.undecided.length + unresolved.length };
 }
 
 
@@ -829,6 +867,9 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
                 resolvedIssueKeys,
                 detailsByKey,
                 now,
+                // An arbitrary page of old issues is not a component. Walk each
+                // one's chain to closure or judge a fragment.
+                "closure",
             );
             openPass.opened += outcome.summary.opened;
             openPass.closed += outcome.summary.closed;

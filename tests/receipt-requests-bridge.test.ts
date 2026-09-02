@@ -223,8 +223,13 @@ test("the cards cron writes history through a CAS, never through the lifecycle",
     // used, and a comment must not fail the gate it documents.
     assert.doesNotMatch(source, /await evaluateReviewIssue\(/, "card history is not a lifecycle event");
     assert.doesNotMatch(source, /^import .*evaluateReviewIssue/m, "and the lifecycle is not even imported");
-    assert.match(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
-    assert.match(source, /if \(!issue \|\| issue\.clearedAt !== null\) continue;/);
+    // The writer moved to one shared module — the cron and the operator's
+    // "mark delivered" have to leave the SAME trace — and the CAS moved with it.
+    const writer = readFileSync(join(repoRoot, "src/lib/receipt-card-history.ts"), "utf8");
+    // A CALL, not the word: the module comment explains why it is not used.
+    assert.doesNotMatch(writer, /await evaluateReviewIssue\(/);
+    assert.match(writer, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    assert.match(writer, /if \(!issue \|\| issue\.clearedAt !== null\) \{ skipped\+\+; continue; \}/);
 });
 
 test("card history is written only AFTER a validated post", () => {
