@@ -11,7 +11,7 @@ import { RECEIPT_INTAKE_LIST_SELECT } from "@/lib/receipt-intake/queries";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
-import { ownerRank, type ReceiptFilters } from "./receipts-filters";
+import { missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
 
 /** Per-group display cap. Badge counts come from count queries, never from these. */
 export const RECEIPT_GROUP_TAKE = 100;
@@ -232,8 +232,12 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
     ]);
 
     const missingReceipts = issues
+        // An issue whose codes decode to [] is "cleared" as far as the
+        // lifecycle is concerned (decodeReasonCodes drops unknown codes) — it
+        // must not render as an open chase.
+        .filter(issue => decodeReasonCodes(issue.reasonCodes).length > 0)
         .map(toMissingReceiptRow)
-        .filter(row => filters.owner === null || row.owner === filters.owner)
+        .filter(row => missingReceiptMatchesFilters(row, filters))
         .sort((a, b) => ownerRank(a.owner) - ownerRank(b.owner) || (a.postedDate < b.postedDate ? 1 : -1));
 
     return {

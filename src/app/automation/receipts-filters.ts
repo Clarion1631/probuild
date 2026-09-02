@@ -65,16 +65,15 @@ export function groupIsVisible(group: ReceiptGroup, filters: ReceiptFilters): bo
 }
 
 /**
- * `projectId` narrows intake rows. A row with NO project still passes when no
- * project filter is set — "Needs job" is precisely the group of rows without
- * one, and a filter that hid them would make the group unusable.
+ * `owner` narrows missing-receipt rows; `projectId` never does, because a bank
+ * line has no job yet — applying the project filter here would silently empty
+ * the group whenever someone drilled into a job.
+ *
+ * Intake rows are narrowed by `projectId` in the QUERY instead of here, so the
+ * badge counts and the capped lists agree. There is deliberately no in-memory
+ * twin of that predicate: a second copy is how a list and its count start
+ * disagreeing.
  */
-export function intakeMatchesFilters<T extends { projectId: string | null }>(row: T, filters: ReceiptFilters): boolean {
-    if (filters.projectId !== null && row.projectId !== filters.projectId) return false;
-    return true;
-}
-
-/** `owner` narrows missing-receipt rows; `projectId` never does (a bank line has no job yet). */
 export function missingReceiptMatchesFilters<T extends { owner: string }>(row: T, filters: ReceiptFilters): boolean {
     if (filters.owner !== null && row.owner !== filters.owner) return false;
     return true;

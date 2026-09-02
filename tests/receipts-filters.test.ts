@@ -5,7 +5,6 @@ import {
     RECEIPT_GROUPS,
     RECEIPT_GROUP_LABELS,
     groupIsVisible,
-    intakeMatchesFilters,
     missingReceiptMatchesFilters,
     ownerRank,
     parseReceiptFilters,
@@ -45,17 +44,6 @@ test("groupIsVisible: no filter shows all, a filter shows exactly one", () => {
     const only = { group: "booking" as const, projectId: null, owner: null };
     assert.equal(groupIsVisible("booking", only), true);
     assert.equal(groupIsVisible("duplicates", only), false);
-});
-
-test("the project predicate never hides jobless rows unless a project is chosen", () => {
-    const none = { group: null, projectId: null, owner: null };
-    assert.equal(intakeMatchesFilters({ projectId: null }, none), true, "'Needs job' IS the jobless rows");
-    assert.equal(intakeMatchesFilters({ projectId: "p1" }, none), true);
-
-    const scoped = { group: null, projectId: "p1", owner: null };
-    assert.equal(intakeMatchesFilters({ projectId: "p1" }, scoped), true);
-    assert.equal(intakeMatchesFilters({ projectId: "p2" }, scoped), false);
-    assert.equal(intakeMatchesFilters({ projectId: null }, scoped), false);
 });
 
 test("the owner predicate narrows missing-receipt rows only", () => {
