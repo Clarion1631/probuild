@@ -1120,3 +1120,30 @@ test("an ordinary attach failure does NOT stop the rest", async () => {
     assert.equal(attempted.length, purchases.length, "a per-purchase problem is not an outage");
     assert.equal(result.attachmentsIncomplete, undefined);
 });
+
+
+// --- A transient attachment DOWNLOAD failure is classified, not generic ---
+
+test("the attachment download classifies its response like every other QBO call", async () => {
+    const { qboResponseError, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+    // attachQboReceipt reads the Expense row from the real prisma client before
+    // it ever reaches the download, so the end-to-end helper needs a database.
+    // What CHANGED is the classification of the download response, and that is
+    // exactly what this asserts - the same qboResponseError the helper now
+    // calls instead of `throw new Error(...)`.
+    //
+    // Codex gate: a bare Error made a 503 on the download indistinguishable
+    // from a 404, so the sync could not tell "this file is gone" from "QBO is
+    // down" and ground through the rest of the run either way. The
+    // stop-on-outage behaviour that depends on this is covered by
+    // "a connection-level attach failure stops the rest and marks the run
+    // incomplete" above.
+    for (const status of [408, 429, 500, 503]) {
+        const error = await qboResponseError(new Response("busy", { status }), "QBO attachment download");
+        assert.equal(isRetryableQboError(error), true, `status ${status} should be retryable`);
+    }
+    for (const status of [400, 403, 404]) {
+        const error = await qboResponseError(new Response("nope", { status }), "QBO attachment download");
+        assert.equal(qboHttpStatus(error), status, `status ${status} should stay terminal`);
+    }
+});

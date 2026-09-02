@@ -920,6 +920,37 @@ export const automationSettingCursorStore: PaymentsSyncCursorStore = {
     },
 };
 
+/**
+ * Rows this run has not looked at, given where it started, where it stopped,
+ * and whether it wrapped.
+ *
+ * Counting only `id > cursor` under-reported every capped run that resumed
+ * mid-collection: with the cursor at row 100 and the cap reached at row 199,
+ * rows 0-99 are equally unverified but sat before the cursor, so the run
+ * reported them as nothing left to do and called itself clean.
+ */
+async function countUnvisited(
+    count: (where: Record<string, unknown>) => Promise<number>,
+    state: { cursorId: string | null; originalCursor: string | null; wrapped: boolean },
+): Promise<number> {
+    const { cursorId, originalCursor, wrapped } = state;
+
+    if (wrapped) {
+        // Walking the head segment: the tail past the original cursor is done.
+        if (!originalCursor) return 0;
+        return count({
+            id: { ...(cursorId ? { gt: cursorId } : {}), lte: originalCursor },
+        });
+    }
+
+    // Still in the tail. Everything after where we stopped, PLUS the head
+    // segment we resumed past and never came back to.
+    const tail = await count(cursorId ? { id: { gt: cursorId } } : {});
+    if (!originalCursor) return tail;
+    const head = await count({ id: { lte: originalCursor } });
+    return tail + head;
+}
+
 /** One database page. Small enough to stay responsive, big enough to be cheap. */
 const PAYMENTS_SYNC_PAGE_SIZE = 100;
 /** Hard ceiling on rows per run, so one huge backlog cannot run past the cron's window. */
@@ -943,7 +974,18 @@ export async function forEachPendingPage<T extends { id: string }>(
      * process them twice (and could loop). Null means "no upper bound".
      */
     fetchPage: (cursorId: string | null, take: number, stopAfterId: string | null) => Promise<T[]>,
-    countRemaining: (cursorId: string | null) => Promise<number>,
+    /**
+     * How many rows this run has NOT visited. Takes the whole traversal state,
+     * not just the cursor: a run that resumed at C and stopped at D has left
+     * both (> D) AND (<= C) unvisited, and the head segment is invisible to a
+     * plain "after the cursor" count. After a wrap it is the reverse — the tail
+     * past C was already done, so only (> D and <= C) is left.
+     */
+    countRemaining: (state: {
+        cursorId: string | null;
+        originalCursor: string | null;
+        wrapped: boolean;
+    }) => Promise<number>,
     /** Returns the last row it actually completed — the furthest the cursor may move. */
     handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
     cursor?: { store: PaymentsSyncCursorStore; key: string },
@@ -1025,7 +1067,7 @@ export async function forEachPendingPage<T extends { id: string }>(
     // and an unknown amount of unverified payment work vanished from the
     // record. Not knowing is a failed run.
     try {
-        const remaining = await countRemaining(cursorId);
+        const remaining = await countRemaining({ cursorId, originalCursor: storedCursor, wrapped });
         if (remaining > 0) result.skipped += remaining;
     } catch (error) {
         result.runFailed = true;
@@ -1206,9 +1248,10 @@ async function runPaymentsSync(
             orderBy: { id: "asc" },
             take,
         }),
-        (cursorId) => prisma.paymentSchedule.count({
-            where: cursorId ? { ...pendingWhere, id: { gt: cursorId } } : pendingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.paymentSchedule.count({ where: { ...pendingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (schedule) => {
         result.checked++;
         {
@@ -1327,9 +1370,10 @@ async function runPaymentsSync(
             orderBy: { id: "asc" },
             take,
         }),
-        (cursorId) => prisma.progressBilling.count({
-            where: cursorId ? { ...billingWhere, id: { gt: cursorId } } : billingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.progressBilling.count({ where: { ...billingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (billing) => {
         {
             const probe = await qbo.probeInvoice(billing.qbInvoiceId!);

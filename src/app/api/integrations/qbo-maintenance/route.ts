@@ -26,6 +26,8 @@ export const maxDuration = 120;
  *     e.g. the brief bank-only window on 6/11 — without touching paid ones.
  */
 export async function POST(req: Request) {
+    // One budget for the whole request, whichever action it turns out to be.
+    const deadline = createRouteDeadline(100_000);
     const secret = process.env.RECEIPT_INGEST_SECRET;
     if (!secret || req.headers.get("x-ingest-key") !== secret) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
@@ -40,26 +42,37 @@ export async function POST(req: Request) {
 
     // ── Settle-loop QA + test cleanup actions (all idempotent, secret-gated) ──
     if (body.action === "test-settle" || body.action === "delete-qbo-payment" || body.action === "delete-qbo-invoice" || body.action === "sync-payments" || body.action === "test-team-notify") {
-        let tokens;
-        try {
-            tokens = await getFreshQBTokens();
-        } catch (e) {
-            if (e instanceof QBNotConnectedError) {
-                return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
+        // sync-payments does its OWN token refresh inside
+        // syncQuickBooksPayments, so refreshing here just spent a QBO round
+        // trip on a value that was then discarded. Skip it for that action.
+        let tokens: Awaited<ReturnType<typeof getFreshQBTokens>> | undefined;
+        if (body.action !== "sync-payments") {
+            try {
+                tokens = await getFreshQBTokens(deadline);
+            } catch (e) {
+                if (e instanceof QBNotConnectedError) {
+                    return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
+                }
+                if (isQBBudgetExhaustedError(e)) {
+                    return NextResponse.json({ ok: false, reason: "qbo-budget-exhausted", retry: true }, { status: 503 });
+                }
+                throw e;
             }
-            throw e;
         }
 
-        if (body.action === "test-settle") {
-            if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
-            const created = await createQBPaymentForInvoice(tokens, body.qbInvoiceId);
-            if (!created) return NextResponse.json({ ok: false, reason: "invoice-not-found-or-already-paid" });
-            return NextResponse.json({ ok: true, ...created });
-        }
+        // sync-payments never needed the refresh above and returns here; every
+        // branch past this point ran it, so `tokens` is defined.
         if (body.action === "sync-payments") {
             const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
-            const result = await syncQuickBooksPayments(undefined, { source: "manual" });
+            const result = await syncQuickBooksPayments(undefined, { source: "manual", deadline });
             return NextResponse.json({ ok: true, ...result });
+        }
+        const qbTokens = tokens!;
+        if (body.action === "test-settle") {
+            if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
+            const created = await createQBPaymentForInvoice(qbTokens, body.qbInvoiceId);
+            if (!created) return NextResponse.json({ ok: false, reason: "invoice-not-found-or-already-paid" });
+            return NextResponse.json({ ok: true, ...created });
         }
         if (body.action === "test-team-notify") {
             if (!body.paymentScheduleId) return NextResponse.json({ ok: false, reason: "paymentScheduleId required" }, { status: 400 });
@@ -69,12 +82,12 @@ export async function POST(req: Request) {
         }
         if (body.action === "delete-qbo-payment") {
             if (!body.qbPaymentId) return NextResponse.json({ ok: false, reason: "qbPaymentId required" }, { status: 400 });
-            const deleted = await deleteQBPayment(tokens, body.qbPaymentId);
+            const deleted = await deleteQBPayment(qbTokens, body.qbPaymentId);
             return NextResponse.json({ ok: deleted });
         }
         if (body.action === "delete-qbo-invoice") {
             if (!body.qbInvoiceId) return NextResponse.json({ ok: false, reason: "qbInvoiceId required" }, { status: 400 });
-            const deleted = await deleteQBInvoice(tokens, body.qbInvoiceId);
+            const deleted = await deleteQBInvoice(qbTokens, body.qbInvoiceId);
             return NextResponse.json({ ok: deleted });
         }
     }
@@ -96,10 +109,6 @@ export async function POST(req: Request) {
     if (body.action !== "sync-payment-options") {
         return NextResponse.json({ ok: false, reason: "unknown-action" }, { status: 400 });
     }
-
-    // 100s under the 120s ceiling, leaving room to return the partial result
-    // rather than being killed with nothing to show for the work already done.
-    const deadline = createRouteDeadline(100_000);
 
     let tokens;
     try {

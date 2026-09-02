@@ -3,9 +3,10 @@ import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments
 import {
     skippedAuditSummary,
     syncQboExpenses,
+    QBO_EXPENSE_SYNC_BUDGET_MS,
     type QboExpenseSyncResult,
 } from "@/lib/qbo-expense-sync";
-import type { QBTokens } from "@/lib/quickbooks";
+import { createRouteDeadline, type QBTokens, type RouteDeadline } from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
@@ -22,10 +23,10 @@ export interface QboExpenseSyncHandlerDependencies {
     getIngestSecret(): string | undefined;
     getCronSecret(): string | undefined;
     isCronEnabled(): boolean;
-    getFreshTokens(): Promise<QBTokens>;
+    getFreshTokens(deadline?: RouteDeadline): Promise<QBTokens>;
     syncExpenses(
         options: { since: Date; until?: Date; mode: SyncMode },
-        runtime: { tokens: QBTokens },
+        runtime: { tokens: QBTokens; deadline?: RouteDeadline },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
     isSyncPaused?: () => Promise<boolean>;
@@ -70,15 +71,31 @@ export function createQboExpenseSyncHandlers(
                 console.error("sync audit log failed", error instanceof Error ? error.name : "UnknownError");
             }
         };
+        // Started at handler ENTRY so ONE budget covers the whole request:
+        // the token refresh and the purchase reads are both QBO round trips on
+        // the same 300s ceiling, and a budget that began after the refresh let
+        // it run free.
+        const deadline = createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
         try {
-            const tokens = await dependencies.getFreshTokens();
-            const result = await dependencies.syncExpenses({ since, until, mode }, { tokens });
+            const tokens = await dependencies.getFreshTokens(deadline);
+            const result = await dependencies.syncExpenses({ since, until, mode }, { tokens, deadline });
+            // A run that gave up on attachment work did NOT finish. Recording
+            // it as "ok" would refresh the health check on the strength of work
+            // that never happened.
+            const incomplete = result.attachmentsIncomplete === true;
             await logEvent({
                 kind: "qbo-sync",
-                status: "ok",
+                status: incomplete ? "partial" : "ok",
+                reason: incomplete ? "attachments-incomplete" : undefined,
                 source,
                 detail: {
                     mode,
+                    ...(incomplete
+                        ? {
+                            attachmentsIncomplete: true,
+                            attachmentsSkipped: result.attachmentsSkipped ?? 0,
+                        }
+                        : {}),
                     since: since.toISOString().slice(0, 10),
                     ...(until ? { until: until.toISOString().slice(0, 10) } : {}),
                     imported: result.imported,
@@ -91,7 +108,7 @@ export function createQboExpenseSyncHandlers(
                 },
             });
             return NextResponse.json({
-                ok: true,
+                ok: !incomplete,
                 mode,
                 since: since.toISOString().slice(0, 10),
                 ...(until ? { until: until.toISOString().slice(0, 10) } : {}),

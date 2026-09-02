@@ -5,7 +5,7 @@
 // receiptUrl is ProBuild-owned metadata: this module only ever fills an EMPTY
 // receiptUrl (guarded update), so a manually uploaded receipt is never
 // overwritten by a later sync run.
-import { getQBPurchaseAttachables, qbTimedFetch, type QBTokens, type RouteDeadline } from "./quickbooks";
+import { getQBPurchaseAttachables, qbTimedFetch, qboResponseError, type QBTokens, type RouteDeadline } from "./quickbooks";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { prisma } from "./prisma";
 
@@ -53,7 +53,12 @@ export async function attachQboReceipt(
     // same run budget — a slow download is still time the sync cannot spend.
     const download = await qbTimedFetch(attachment.TempDownloadUri, { qbDeadline: deadline });
     if (!download.ok) {
-        throw new Error(`QBO attachment download failed: HTTP ${download.status}`);
+        // A bare Error made a 503 on the download indistinguishable from a 404,
+        // so the sync could not tell "this file is gone" from "QBO is down" and
+        // kept grinding through the rest of the run either way. Classify it at
+        // the boundary like every other QBO response: 408/429/5xx become
+        // QboRetryableError and stop the remaining attachment work.
+        throw await qboResponseError(download, `QBO attachment download for purchase ${qbPurchaseId}`);
     }
     const bytes = Buffer.from(await download.arrayBuffer());
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_ATTACHMENT_BYTES) {

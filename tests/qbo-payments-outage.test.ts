@@ -791,7 +791,7 @@ async function runPagedPass(
         emptyResult(),
         createRouteDeadline(30_000),
         async (cursorId, take) => after(cursorId).slice(0, take),
-        async (cursorId) => after(cursorId).length,
+        async ({ cursorId }) => after(cursorId).length,
         async (page) => {
             for (const row of page) seen.add(row.id);
             return { lastCompletedId: page[page.length - 1]?.id ?? null };
@@ -913,7 +913,7 @@ test("across consecutive runs, a mid-page outage loses no rows", async () => {
             result,
             createRouteDeadline(30_000),
             async (cursorId, take) => after(cursorId).slice(0, take),
-            async (cursorId) => after(cursorId).length,
+            async ({ cursorId }) => after(cursorId).length,
             (page) => runQboRowLoop(
                 page,
                 result,
@@ -1112,7 +1112,7 @@ test("every row is accounted for exactly once when an outage cuts a page short",
         result,
         createRouteDeadline(30_000),
         async (cursorId, take) => after(cursorId).slice(0, take),
-        async (cursorId) => after(cursorId).length,
+        async ({ cursorId }) => after(cursorId).length,
         (page) => runQboRowLoop(
             page,
             result,
@@ -1173,7 +1173,7 @@ async function walkWithBound(
         async (cursorId, take, stopAfterId) => sorted
             .filter(r => (cursorId === null || r.id > cursorId) && (stopAfterId === null || r.id <= stopAfterId))
             .slice(0, take),
-        async (cursorId) => sorted.filter(r => cursorId === null || r.id > cursorId).length,
+        async ({ cursorId }) => sorted.filter(r => cursorId === null || r.id > cursorId).length,
         async (page) => {
             for (const row of page) visits.push(row.id);
             return { lastCompletedId: page[page.length - 1]?.id ?? null };
@@ -1219,4 +1219,96 @@ test("a run that starts at the top still visits each row once", async () => {
     const visits: string[] = [];
     await walkWithBound(all, store, "k", 100, visits);
     assert.deepEqual(visits, all.map(r => r.id));
+});
+
+
+// --- A capped run counts the rows it never reached, on BOTH sides ---
+
+/** Real paging helper over an in-memory collection, with the real remaining-count rules. */
+async function walkCapped(
+    all: { id: string }[],
+    store: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<void> },
+    key: string,
+    maxRows: number,
+    result: ReturnType<typeof emptyResult>,
+    visits: string[],
+) {
+    const { forEachPendingPage } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const sorted = [...all].sort((a, b) => a.id.localeCompare(b.id));
+
+    await forEachPendingPage(
+        result,
+        createRouteDeadline(30_000),
+        async (cursorId, take, stopAfterId) => sorted
+            .filter(r => (cursorId === null || r.id > cursorId) && (stopAfterId === null || r.id <= stopAfterId))
+            .slice(0, take),
+        async ({ cursorId, originalCursor, wrapped }) => {
+            if (wrapped) {
+                if (!originalCursor) return 0;
+                return sorted.filter(r => (cursorId === null || r.id > cursorId) && r.id <= originalCursor).length;
+            }
+            const tail = sorted.filter(r => cursorId === null || r.id > cursorId).length;
+            const head = originalCursor ? sorted.filter(r => r.id <= originalCursor).length : 0;
+            return tail + head;
+        },
+        async (page) => {
+            for (const row of page) visits.push(row.id);
+            return { lastCompletedId: page[page.length - 1]?.id ?? null };
+        },
+        { store, key },
+        maxRows,
+    );
+}
+
+const idAt = (i: number) => `row-${String(i).padStart(3, "0")}`;
+
+test("hitting the cap mid-collection counts the UNVISITED HEAD as remaining too", async () => {
+    // Codex gate: with the cursor at row 100 and the cap reached at row 199,
+    // rows 0-99 are equally unverified but sat BEFORE the cursor, so an
+    // "after the cursor" count reported nothing left and the run called itself
+    // clean while 100 rows had not been looked at.
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    const all = Array.from({ length: 300 }, (_, i) => ({ id: idAt(i) }));
+    const { store } = memoryCursorStore();
+    await store.set("k", idAt(99)); // resume at row 100
+
+    const result = emptyResult();
+    const visits: string[] = [];
+    await walkCapped(all, store, "k", 100, result, visits);
+
+    assert.equal(visits.length, 100, "the cap is still honoured");
+    assert.equal(visits[0], idAt(100), "and it resumed where it left off");
+    // 100 unvisited after row 199, plus the 100 head rows it resumed past.
+    assert.equal(result.skipped, 200, `skipped was ${result.skipped}, expected 200`);
+    assert.equal(paymentsSyncRunStatus(result), "partial", "unvisited work is never a clean run");
+});
+
+test("after a wrap, the already-visited tail is excluded from remaining", async () => {
+    const all = Array.from({ length: 20 }, (_, i) => ({ id: idAt(i) }));
+    const { store } = memoryCursorStore();
+    await store.set("k", idAt(14)); // 5 in the tail, 15 in the head
+
+    const result = emptyResult();
+    const visits: string[] = [];
+    // Cap of 10: the 5-row tail, then a wrap into 5 head rows.
+    await walkCapped(all, store, "k", 10, result, visits);
+
+    assert.equal(visits.length, 10);
+    // Only the head rows still unvisited (10 of the 15) — the tail is done.
+    assert.equal(result.skipped, 10, `skipped was ${result.skipped}, expected 10`);
+    // Every row is accounted for exactly once.
+    assert.equal(visits.length + result.skipped, all.length);
+});
+
+test("a capped run that started at the top has no head to count", async () => {
+    const all = Array.from({ length: 50 }, (_, i) => ({ id: idAt(i) }));
+    const { store } = memoryCursorStore();
+    const result = emptyResult();
+    const visits: string[] = [];
+    await walkCapped(all, store, "k", 20, result, visits);
+
+    assert.equal(visits.length, 20);
+    assert.equal(result.skipped, 30, "just what is after the cursor");
+    assert.equal(visits.length + result.skipped, all.length);
 });

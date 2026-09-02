@@ -378,13 +378,24 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             "stuck",
             () => prisma.automationEvent.count({
                 where: {
-                    // attachment-failed is a TERMINAL failure that leaves a
-                    // booked Purchase with no receipt. It is not literally
-                    // "error", so it used to sail past this count and the digest
-                    // could still read "Pipeline OK" on the strength of one
-                    // other good receipt in the window.
-                    status: { in: ["error", ATTACHMENT_FAILED_STATUS] },
                     createdAt: { gte: since24h },
+                    OR: [
+                        // attachment-failed is a TERMINAL failure that leaves a
+                        // booked Purchase with no receipt. It is not literally
+                        // "error", so it used to sail past this count and the
+                        // digest could still read "Pipeline OK" on the strength
+                        // of one other good receipt in the window.
+                        { status: { in: ["error", ATTACHMENT_FAILED_STATUS] } },
+                        // A "partial" run left work undone, which is a problem
+                        // even though it is not a hard failure. The payments
+                        // sweep is excluded because it reports its own
+                        // payments-sync-partial reason from the latest run —
+                        // counting it here too would say the same thing twice.
+                        {
+                            status: "partial",
+                            kind: { not: PAYMENTS_SYNC_EVENT_KIND },
+                        },
+                    ],
                 },
             }),
             0,

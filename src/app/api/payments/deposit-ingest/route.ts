@@ -118,6 +118,11 @@ export async function POST(req: Request) {
     const unauthorized = requireDepositIngestAuth(req);
     if (unauthorized) return unauthorized;
 
+    // Started HERE, before the matching and DB work: those run on the same
+    // 60s ceiling as the QBO calls that follow, so a budget created later let
+    // everything ahead of it spend the ceiling for free.
+    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
+
     let raw: Record<string, unknown>;
     try {
         raw = await req.json();
@@ -304,8 +309,8 @@ export async function POST(req: Request) {
 
     try {
         if (row.status === "qbo_created") return await resumeFromQboCreated(row);
-        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row);
-        return await matchAndApply(row, payload);
+        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row, deadline);
+        return await matchAndApply(row, payload, deadline);
     } catch (e: any) {
         // Any exception that escapes this far is, by construction, one the QBO-crossing
         // steps (send, settle) didn't already handle internally — but re-read the row's
@@ -359,7 +364,7 @@ function requireDepositIngestAuth(req: Request): NextResponse | null {
 
 // ── Matching + apply ─────────────────────────────────────────────────────────
 
-async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Promise<NextResponse> {
+async function matchAndApply(row: DepositIngest, payload: NormalizedPayload, deadline: RouteDeadline): Promise<NextResponse> {
     let schedule: MatchedSchedule | null = null;
 
     if (row.paymentScheduleId) {
@@ -444,7 +449,7 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
     }
 
     return schedule.qbInvoiceId
-        ? await applyQboLinked(row, schedule, payload)
+        ? await applyQboLinked(row, schedule, payload, deadline)
         : await applyNonQbo(row, schedule, payload);
 }
 
@@ -486,8 +491,12 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
     return NextResponse.json({ ok: true, status: "applied", scheduleId: schedule.id, invoiceCode: schedule.invoiceCode });
 }
 
-async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
-    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
+async function applyQboLinked(
+    row: DepositIngest,
+    schedule: MatchedSchedule,
+    payload: NormalizedPayload,
+    deadline: RouteDeadline,
+): Promise<NextResponse> {
     const tokens = await getFreshQBTokens(deadline); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
 
     const built = await buildQBPaymentRequest(tokens, schedule.qbInvoiceId!, {
@@ -514,12 +523,11 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
     }, tokens, deadline);
 }
 
-async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
+async function resumeFromQboUnknown(row: DepositIngest, deadline: RouteDeadline): Promise<NextResponse> {
     const schedule = await loadMatchedSchedule(row.paymentScheduleId!);
     if (!schedule) return await finalizeReconcile(row, "reserved milestone no longer exists", {});
     const extracted = JSON.parse(row.extracted) as NormalizedPayload;
 
-    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
     let tokens: QBTokens;
     try {
         tokens = await getFreshQBTokens(deadline);
