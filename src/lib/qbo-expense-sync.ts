@@ -573,7 +573,8 @@ function qboExpenseUpdateData(
     write: QboExpenseWrite,
 ): Partial<QboExpenseWrite> {
     if ((existing.projectId ?? null) === null) return write;
-    const { projectId: _ignored, ...rest } = write;
+    const rest: Partial<QboExpenseWrite> = { ...write };
+    delete rest.projectId;
     return rest;
 }
 

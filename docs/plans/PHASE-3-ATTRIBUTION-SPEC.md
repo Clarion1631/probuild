@@ -270,6 +270,36 @@ File-level diff:
 - Gate on Phase 1 being deployed; until then ship (a)-(c) with the existing
   `/api/expenses` POST carrying `costCodeId` (§3.4 accepts it).
 
+### AS-BUILT (site side, 2026-09-01) — what the mobile PR can rely on
+
+The mobile repo was **not** touched by this PR. Everything the app needs now
+exists and is deployed with the site, so the mobile diff is purely client-side.
+
+Server contracts the app can call today:
+
+| what the app needs | endpoint / field | state |
+|---|---|---|
+| overhead project id (to default the toggle) | `GET /api/mobile/me` → `overheadProjectId` (new) | **done**, `src/app/api/mobile/me/route.ts` |
+| phase list for the picker | `GET /api/projects/[id]/cost-codes` + `/estimate-items` | already existed, already proxied (`src/proxy.ts`) |
+| no-photo expense WITH a phase | `POST /api/expenses` now accepts `costCodeId` | **done** — validated through `resolveCostCode` AND `isCostCodeAllowedForProject`, stored with `costCodeSource: "capture"`. Rejections are `{error, code}` with `COST_CODE_NOT_FOUND` / `COST_CODE_INACTIVE` / `PHASE_NOT_ON_PROJECT`, so the app can show a useful message |
+| photo expense through the pipeline | `POST /api/receipts/intake` accepts `projectId`, `costCodeId`, `installedAtCustomer` | **done** — `installedAtCustomer` is read from JSON (`true`/`false`) or multipart (`"true"`/`"false"`); anything else means "the caller did not say" |
+| the toggle's default | server-side `resolveInstalledAtCustomer` | **done** — an explicit value from the app always wins; silence defaults TRUE for a real job, FALSE for the overhead project, and NULL when there is no project. The app should still SHOW the toggle: the server default is a fallback, not a substitute for asking |
+
+Auth is unchanged: `/api/receipts/intake` is on the proxy's exact-match public
+bypass and calls `authenticateMobileOrSession` itself, so the crew Bearer token
+works with no proxy change.
+
+Remaining mobile-repo diff (a separate PR in `gtr-probuild-mobile`):
+- `apps/mobile/app/(tabs)/expenses.tsx` — (a) default the project dropdown to
+  the clocked-in job; (b) add the phase picker (`lib/phasePicker.ts` labels);
+  (c) add the "Installed at customer job" toggle, defaulted from
+  `overheadProjectId`; (d) when a PHOTO is attached, submit via
+  `api.receipts.intake` instead of the signed-upload + `/api/expenses` pair.
+- `apps/mobile/lib/api.ts` + `lib/api-types.ts` — add `receipts.intake(...)`
+  and the `overheadProjectId` field on the `/me` response type.
+- The `/api/expenses` no-photo path keeps working unchanged for older builds;
+  `costCodeId` is optional there on purpose, so a legacy app is never broken.
+
 ## 6. Backfill — `scripts/backfill-expense-attribution.mjs`
 
 One-shot, dry-run DEFAULT (`--apply` to write, `--csv <path>`), same shape and .env

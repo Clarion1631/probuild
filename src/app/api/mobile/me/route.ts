@@ -4,6 +4,7 @@ import { authenticateMobileOnly } from "@/lib/mobile-auth";
 import { getEffectivePermissions } from "@/lib/permissions";
 import { toNum } from "@/lib/prisma-helpers";
 import { mobileVisibleProjectWhere } from "@/lib/project-status";
+import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
 
 export const dynamic = "force-dynamic";
 
@@ -84,5 +85,12 @@ export async function GET(req: Request) {
         },
         permissions,
         assignedProjects,
+        // Phase 3 (spec §5c): the app defaults the receipt capture screen's
+        // "installed at customer job" toggle OFF for the Shop/overhead bucket
+        // and ON for a real job. It cannot know which project that is without
+        // being told, and hard-coding the id in the app would mean a re-release
+        // to change it. The server intake route applies the SAME default when
+        // the app stays silent — this is a UI hint, never the enforcement.
+        overheadProjectId: OVERHEAD_PROJECT_ID,
     });
 }
