@@ -364,8 +364,71 @@ export function remainderCsv(remainder, projectNameById) {
  * stub rather than the script.
  */
 export async function writeUnderExpenseLock(db, expenseId, run) {
+    return writeUnderAttributionLocks(db, { expenseId }, run);
+}
+
+/**
+ * SHARE-LOCK THE ROWS A DECISION IS DERIVED FROM, in one fixed order.
+ *
+ * `FOR SHARE` blocks anyone trying to UPDATE or DELETE these rows until this
+ * transaction commits, while letting other readers through. That is exactly the
+ * shape of the hazard: the expense's own row is protected by the per-expense
+ * advisory lock and by compare-and-set predicates, but the FACTS the write is
+ * derived from live on OTHER rows — the estimate whose `projectId` supplies the
+ * attribution, the estimate item whose `costCodeId` is copied, and the job's
+ * phase rows that decide whether a code is even allowed. A predicate can catch
+ * a row that moved BEFORE the write; it cannot stop it moving DURING the read
+ * sequence that decides what to write.
+ *
+ * Order is fixed and ids are sorted, so two runs of this script can never take
+ * the same locks in opposite orders. They are SHARED locks, so concurrent
+ * readers (including another backfill) do not block each other at all — only a
+ * writer of those exact rows waits, briefly.
+ */
+async function lockRowsForShare(tx, table, ids) {
+    const unique = [...new Set(ids.filter(Boolean))].sort();
+    if (!unique.length) return;
+    const params = unique.map((_, index) => `$${index + 1}`).join(", ");
+    await tx.$queryRawUnsafe(
+        `SELECT id FROM ${table} WHERE id IN (${params}) ORDER BY id FOR SHARE`,
+        ...unique,
+    );
+}
+
+/**
+ * The job's phase rows — the same universe `readAllowedCodes` reads, held still
+ * while it reads them. Without this, a phase deleted between the phase read and
+ * the write puts a code on a job that no longer has it.
+ */
+async function lockProjectPhaseRows(tx, projectId) {
+    if (!projectId) return;
+    await tx.$queryRawUnsafe(
+        `SELECT ei.id FROM "EstimateItem" ei
+           JOIN "Estimate" e ON e.id = ei."estimateId"
+          WHERE e."projectId" = $1 AND ei."costCodeId" IS NOT NULL
+          ORDER BY ei.id
+            FOR SHARE OF ei`,
+        projectId,
+    );
+}
+
+/**
+ * One transaction: the derived-from rows are share-locked FIRST, then the
+ * per-expense advisory lock, then the caller reads and writes. Locks before
+ * reads, always — a read taken before its lock describes a moment that the lock
+ * then fails to preserve.
+ *
+ * Falls back to a bare call when the injected client has no `$transaction`:
+ * some unit tests drive a plain stub, and requiring one there would test the
+ * stub rather than the script.
+ */
+export async function writeUnderAttributionLocks(db, locks, run) {
+    const { expenseId, estimateIds = [], estimateItemIds = [], phaseProjectId = null } = locks;
     if (typeof db.$transaction !== "function") return run(db);
     return db.$transaction(async tx => {
+        await lockRowsForShare(tx, '"Estimate"', estimateIds);
+        await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
+        await lockProjectPhaseRows(tx, phaseProjectId);
         await lockExpense(tx, expenseId);
         return run(tx);
     });
@@ -624,30 +687,41 @@ export async function runBackfill({
         byProject.get(key).ids.push(fill.id);
     }
     for (const { projectId, estimateId, ids } of byProject.values()) {
-        // BOTH halves of the derivation, re-asserted at write time.
+        // ONE EXPENSE PER TRANSACTION, under the same locks the cost pass uses.
         //
-        // `projectId: null` says nobody has attributed the row yet;
-        // `estimateId` says it is still hanging off the estimate this project
-        // was READ from. Without the second one, an expense re-pointed at a
-        // different estimate between the plan and the write would be stamped
-        // with the old estimate's project — a silent cross-job attribution
-        // performed by the very pass that exists to get attribution right.
-        const result = await db.expense.updateMany({
-            where: {
-                id: { in: ids }, projectId: null, estimateId,
-                // AND THE ESTIMATE STILL POINTS THERE. `estimateId` proves the
-                // row is on the same estimate; it says nothing about where that
-                // estimate now lives. An estimate moved to another project
-                // between the plan and this write would otherwise stamp every
-                // one of its expenses with the OLD project — a cross-job
-                // attribution performed by the pass whose whole job is getting
-                // attribution right. A relation filter makes it one statement,
-                // so there is no window between checking and writing.
-                estimate: { is: { projectId } },
-            },
-            data: { projectId },
-        });
-        projectIdsWritten += result.count;
+        // Batching the group into a single UPDATE was cheaper, but it could not
+        // take a per-expense lock (the ids differ) and it read the estimate only
+        // through the predicate. Now the estimate is share-locked for the whole
+        // decision, so it cannot move while the row is being written.
+        for (const id of ids) {
+            const result = await writeUnderAttributionLocks(
+                db,
+                { expenseId: id, estimateIds: [estimateId] },
+                // BOTH halves of the derivation, re-asserted at write time even
+                // though the locks are held: the lock stops the rows moving
+                // from here on, the predicate covers everything that happened
+                // between the plan and now, and a writer that takes no lock at
+                // all is still bound by it.
+                //
+                // `projectId: null` says nobody has attributed the row yet;
+                // `estimateId` says it is still hanging off the estimate this
+                // project was READ from; and the relation filter says that
+                // estimate still points at the project we are about to stamp.
+                // Without the last one, an estimate moved to another job
+                // between the plan and the write would stamp every one of its
+                // expenses with the OLD project — a cross-job attribution
+                // performed by the pass whose whole job is getting attribution
+                // right.
+                async tx => tx.expense.updateMany({
+                    where: {
+                        id, projectId: null, estimateId,
+                        estimate: { is: { projectId } },
+                    },
+                    data: { projectId },
+                }),
+            );
+            projectIdsWritten += result.count;
+        }
     }
 
     // COST-CODE WRITES RUN UNDER THE SHARED PER-EXPENSE LOCK, one row at a
@@ -667,7 +741,18 @@ export async function runBackfill({
     let costCodesWritten = 0;
     let costCodesSkipped = 0;
     for (const fill of plan.codeFills) {
-        const result = await writeUnderExpenseLock(db, fill.id, async tx => {
+        // The rows this decision is derived from, named from the PLAN — which
+        // is also what the re-read below is checked against, so a row that has
+        // since moved off them is skipped rather than written under locks that
+        // do not cover it.
+        const plannedEstimateId = fill.expense?.estimateId ?? null;
+        const plannedItemId = fill.expense?.itemId ?? null;
+        const result = await writeUnderAttributionLocks(db, {
+            expenseId: fill.id,
+            estimateIds: [plannedEstimateId],
+            estimateItemIds: [plannedItemId],
+            phaseProjectId: fill.expectedProjectId ?? null,
+        }, async tx => {
             // RE-READ UNDER THE LOCK, then re-plan against what is really
             // there.
             //
@@ -691,6 +776,20 @@ export async function runBackfill({
                 },
             });
             if (!current) return { count: 0 };
+            // THE LOCKS HAVE TO COVER THE ROWS THE ANSWER COMES FROM.
+            //
+            // They were taken from the plan's view of this expense. If the row
+            // has since been re-pointed at a different estimate or a different
+            // line item, the facts about to be re-read are ones nothing is
+            // holding still — so this is not the moment to write. Skipped and
+            // counted; a re-run plans it against the truth and locks the rows
+            // that truth actually rests on.
+            if (
+                (current.estimateId ?? null) !== plannedEstimateId ||
+                (current.itemId ?? null) !== plannedItemId
+            ) {
+                return { count: 0 };
+            }
 
             // RE-PLAN, don't re-use.
             //

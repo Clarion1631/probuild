@@ -476,7 +476,9 @@ test("apply writes both passes, each behind its own predicate", async () => {
 
     const projectWrite = stub.writes.find(w => "projectId" in w.data)!;
     assert.deepEqual(projectWrite.where, {
-        id: { in: ["e1"] },
+        // One expense per statement now: the group cannot share a per-expense
+        // lock, so it is written a row at a time under one.
+        id: "e1",
         projectId: null,
         // Both halves of the derivation, plus the join that proves the second
         // half is still true at write time.
@@ -740,10 +742,122 @@ test("each cost-code write takes the shared per-expense lock", async () => {
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async (_q: string, key: unknown) => { locks.push(key); return [{}]; };
+    (stub.db as any).$queryRawUnsafe = async (query: string, ...args: unknown[]) => {
+        if (query.includes("pg_advisory_xact_lock")) locks.push(args[0]);
+        return [{}];
+    };
 
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     assert.deepEqual(locks, ["expense:e1"], "one lock, namespaced per expense");
+});
+
+// ── the rows a decision is DERIVED from are held too (round 15, item 6) ────
+
+/** Records every lock statement in order, with the ids it named. */
+function lockTrace(stub: ReturnType<typeof createStub>) {
+    const trace: { kind: string; args: unknown[] }[] = [];
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async (query: string, ...args: unknown[]) => {
+        const kind = query.includes("pg_advisory_xact_lock") ? "expense-lock"
+            : query.includes('FROM "Estimate"') ? "estimate-share"
+            : query.includes('JOIN "Estimate"') ? "phase-share"
+            : query.includes('FROM "EstimateItem"') ? "item-share"
+            : "other";
+        trace.push({ kind, args });
+        return [{}];
+    };
+    return trace;
+}
+
+test("the cost fill share-locks the estimate, the item and the phase rows BEFORE the expense lock", async () => {
+    // A read taken before its lock describes a moment the lock then fails to
+    // preserve. The expense's own row is protected by the advisory lock and the
+    // CAS; the FACTS the answer comes from live on other rows.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i1", vendor: "Unknown Vendor", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    const trace = lockTrace(stub);
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+
+    const kinds = trace.map(entry => entry.kind);
+    const expenseLockAt = kinds.lastIndexOf("expense-lock");
+    assert.ok(expenseLockAt >= 0, "the per-expense lock is still taken");
+    const before = kinds.slice(0, expenseLockAt);
+    assert.ok(before.includes("estimate-share"), "the estimate is held");
+    assert.ok(before.includes("item-share"), "so is the item the code is copied from");
+    assert.ok(before.includes("phase-share"), "and the job's phase rows");
+    // FOR SHARE, not FOR UPDATE: two readers must not block each other.
+    assert.ok(trace.every(entry => !String(entry.kind).includes("update")));
+});
+
+test("the project fill share-locks the estimate its answer comes from", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" } })],
+        [],
+    );
+    const trace = lockTrace(stub);
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+
+    const kinds = trace.map(entry => entry.kind);
+    assert.deepEqual(
+        kinds,
+        ["estimate-share", "expense-lock"],
+        "the estimate first, then the row, then the write",
+    );
+    assert.deepEqual(trace[0].args, ["est-job-1"], "the estimate the project was read off");
+});
+
+test("an INTERLEAVED estimate move is refused: the write no-ops", async () => {
+    // Deterministic interleaving: the mover runs between the snapshot and the
+    // write, which is precisely the window the share lock closes in production
+    // and the predicate closes here. Either way the write must not land.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" } })],
+        [],
+    );
+    const sequence: string[] = [];
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
+        if (query.includes("FOR SHARE")) {
+            sequence.push("share-lock");
+            // The move lands JUST BEFORE the lock takes hold — the worst case,
+            // and the one the predicate has to catch on its own.
+            stub.rows[0].estimate = { projectId: "job-2" };
+        }
+        return [{}];
+    };
+
+    const result = await runBackfill({
+        db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+    });
+    assert.deepEqual(sequence, ["share-lock"], "the lock was attempted");
+    assert.equal(result.written.projectIds, 0, "and the stale answer was not written");
+    assert.equal(stub.rows[0].projectId ?? null, null);
+});
+
+test("an expense re-pointed at a DIFFERENT estimate is skipped by the cost fill", async () => {
+    // The locks were taken from the plan's view of this row. If it has since
+    // moved to another estimate, the facts about to be re-read are ones nothing
+    // is holding still, so this is not the moment to write.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    const snapshot = stub.db.expense.findMany;
+    stub.db.expense.findMany = async () => {
+        const rows = await snapshot();
+        stub.rows[0].estimateId = "est-somewhere-else";
+        return rows;
+    };
+
+    const result = await runBackfill({
+        db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+    });
+    assert.equal(result.written.costCodes, 0);
+    assert.equal(stub.rows[0].costCodeId ?? null, null);
 });
 
 test("a row that MOVED between the plan and the write is skipped, not coded", async () => {

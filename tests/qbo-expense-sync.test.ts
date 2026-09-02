@@ -1964,3 +1964,58 @@ test("deleting a MANUALLY classified purchase retires its provenance too", () =>
         assert.equal(await deactivateQboExpense(fake.client, removal), "unchanged");
     })();
 });
+
+test("a manual NO-TAX decision is a classification, and a gross change re-opens it", () => {
+    // Codex round 15, item 5. The bookkeeper looked at this receipt and decided
+    // it carries no sales tax: taxAmount null, no allocation, no
+    // installed-at-customer answer. Every other classification signal is
+    // absent, so without `taxSource` this row — a human's explicit answer, now
+    // describing a different gross — is the ONE row a re-sync says nothing
+    // about.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 412.1,
+            taxAmount: null, taxDeductibleBase: null, installedAtCustomer: null,
+            taxSource: "manual",
+        },
+        { ...WRITE, amount: 498.3 },
+    );
+    assert.equal(plan.data.needsTaxReview, true);
+    assert.ok(!("taxAmount" in plan.data), "their answer is kept, only re-opened");
+});
+
+test("an OCR no-tax row is NOT re-opened by a gross change", () => {
+    // The control. Nothing here is a human answer, so flagging it would bury
+    // the rows that are.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1", estimateId: "estimate-1",
+            amount: 412.1, taxAmount: null, taxDeductibleBase: null,
+            installedAtCustomer: null, taxSource: "ocr",
+        },
+        { ...WRITE, amount: 498.3 },
+    );
+    assert.ok(!("needsTaxReview" in plan.data));
+});
+
+test("the sync READS taxSource, or the rule above can never fire", () => {
+    // A rule that depends on a column nobody selected is a rule that does not
+    // exist. This is the wiring check the pure-function tests cannot make.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            amount: 125.5, taxAmount: null, taxDeductibleBase: null,
+            installedAtCustomer: null, taxSource: "manual", needsTaxReview: false,
+        } as any,
+    ]);
+    return (async () => {
+        assert.equal(
+            await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 300 }),
+            "updated",
+        );
+        const row = fake.rows.get("purchase-1") as any;
+        assert.equal(row.needsTaxReview, true, "the manual no-tax answer was re-opened");
+        assert.equal(row.taxSource, "manual", "and left standing");
+    })();
+});

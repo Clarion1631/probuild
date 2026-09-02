@@ -1280,3 +1280,50 @@ test("the per-expense lock is taken BEFORE the read the fill decides from", asyn
     // read (the id lookup) -> lock -> read (everything the fill decides from)
     assert.deepEqual(trace.slice(0, 3), ["read", "lock", "read"]);
 });
+
+// ── an implausible OCR tax is flagged, never booked (round 15, item 1) ─────
+
+test("$90 of tax on a $100 receipt is NOT booked as tax paid at source", () => {
+    // buildGroups only rejects tax >= total, which leaves a wide band of
+    // nonsense: this satisfies every check the pipeline had and would land on a
+    // state excise return as a $90 deduction nobody looked at.
+    const rec = recorder();
+    return bookReceipt(row({ totalCents: 10_000, taxCents: 9_000 }), rec.deps).then(result => {
+        assert.equal(result.outcome, "booked", "the Purchase is real; only the tax read is wrong");
+        const created = rec.expenses[0];
+        assert.equal(created.taxAmount, null, "nothing implausible reaches the report");
+        assert.equal(created.taxAtSource, false);
+        assert.equal(created.needsTaxReview, true, "a person is asked instead");
+        assert.equal(created.taxSource, "ocr", "a machine DID look — that is what needs replacing");
+        assert.match(created.description, /needs review/);
+        assert.doesNotMatch(created.description, /incl\. \$90/);
+    });
+});
+
+test("a believable tax on the same receipt is booked normally", () => {
+    // The control: same shape, a figure inside the bound.
+    const rec = recorder();
+    return bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps).then(() => {
+        const created = rec.expenses[0];
+        assert.equal(created.taxAmount, 9);
+        assert.equal(created.taxAtSource, true);
+        assert.equal(created.needsTaxReview, false);
+        assert.equal(created.taxSource, "ocr");
+    });
+});
+
+test("an implausible read FILLS nothing on an already-booked Purchase", () => {
+    // Worse here than on a new row: this one may already sit in a filing period
+    // somebody has reconciled.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row({ totalCents: 10_000, taxCents: 9_000 }), rec.deps).then(() => {
+        assert.equal(rec.existingExpense.taxAmount, null);
+        assert.equal(rec.existingExpense.taxAtSource, false);
+        assert.equal(rec.existingExpense.needsTaxReview, true);
+    });
+});

@@ -14,6 +14,8 @@ import {
     expenseForProjectWhere,
     expenseForProjectsWhere,
     expenseHasAnyProjectWhere,
+    isPlausibleReceiptTax,
+    maxPlausibleTaxAmount,
     notHumanCodedExpenseWhere,
     resolveExpenseCostCodeId,
     resolveExpenseProjectId,
@@ -207,4 +209,26 @@ test("an unattributed row labels as nothing at all", () => {
         resolveExpenseProjectLabel({ projectId: null, estimate: { projectId: null, project: null } }),
         { projectId: null, projectName: null },
     );
+});
+
+// ── the one tax plausibility bound (Codex round 15, item 1) ────────────────
+
+test("the tax bound is 12% of the gross, rounded to cents", () => {
+    assert.equal(maxPlausibleTaxAmount(100), 12);
+    assert.equal(maxPlausibleTaxAmount(207.74), 24.93);
+    assert.equal(maxPlausibleTaxAmount(0), 0, "no receipt, no allowance");
+    assert.equal(maxPlausibleTaxAmount(-5), 0);
+});
+
+test("zero is plausible, a transposed read is not", () => {
+    // "This receipt had no tax" is a real answer. $90 on a $100 receipt is a
+    // decimal point in the wrong place, and it is the case that reaches an
+    // excise return as a $90 deduction if nothing stops it.
+    assert.equal(isPlausibleReceiptTax(0, 100), true);
+    assert.equal(isPlausibleReceiptTax(9.5, 100), true);
+    assert.equal(isPlausibleReceiptTax(12, 100), true, "the bound itself is allowed");
+    assert.equal(isPlausibleReceiptTax(12.01, 100), false);
+    assert.equal(isPlausibleReceiptTax(90, 100), false);
+    assert.equal(isPlausibleReceiptTax(-1, 100), false);
+    assert.equal(isPlausibleReceiptTax(Number.NaN, 100), false);
 });

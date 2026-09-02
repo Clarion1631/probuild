@@ -7,7 +7,7 @@ import {
     QboManagedExpenseError,
     assertExpenseMutableOutsideQbo,
 } from "@/lib/qbo-expense-guard";
-import { resolveExpenseProjectId } from "@/lib/expense-attribution";
+import { isPlausibleReceiptTax, maxPlausibleTaxAmount, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
@@ -448,12 +448,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             nextInstalled = raw;
         }
 
-        // A CORRECTED TAX FIGURE, bounded by plausibility. WA's combined rate
-        // tops out around 10.6%; 12% is deliberately loose so a legitimate
-        // receipt is never refused, while a transposed OCR read (a $207 receipt
-        // "with" $207 of tax) still cannot reach a filing. Zero is allowed —
-        // "this receipt had no tax" is an answer a human is entitled to give.
-        const MAX_TAX_RATE = 0.12;
+        // A CORRECTED TAX FIGURE, bounded by plausibility — the SHARED bound
+        // (src/lib/expense-attribution.ts), because the booking pipeline judges
+        // an OCR read against the same number. Zero is allowed: "this receipt
+        // had no tax" is an answer a human is entitled to give.
         let nextTaxAmount: number | null = null;
         if (editsTaxAmount && body.taxAmount !== null) {
             const parsed = Number(body.taxAmount);
@@ -463,8 +461,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                     { status: 400 },
                 );
             }
-            const ceiling = Math.round(Number(expense.amount) * MAX_TAX_RATE * 100) / 100;
-            if (parsed > ceiling) {
+            const ceiling = maxPlausibleTaxAmount(Number(expense.amount));
+            if (!isPlausibleReceiptTax(parsed, Number(expense.amount))) {
                 return NextResponse.json(
                     { error: `That tax is implausible for a ${Number(expense.amount).toFixed(2)} receipt (max ${ceiling.toFixed(2)}, 12%).` },
                     { status: 400 },

@@ -20,6 +20,7 @@
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
+import { isPlausibleReceiptTax } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
@@ -593,6 +594,27 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    there is exactly one Purchase.
     const amountCents = expenseAmountCents(groups, row.totalCents);
     const taxApplied = appliedTaxCents(groups);
+
+    // AN IMPLAUSIBLE OCR TAX IS NOT A TAX FIGURE.
+    //
+    // `buildGroups` rejects a tax read on a check and one that is >= the total,
+    // which leaves a wide band of nonsense it accepts: $90 of tax on a $100
+    // receipt is a decimal-point or column misread, and it satisfies every
+    // check the pipeline had. Booked as `taxAtSource`, it goes on a state
+    // excise return as a $90 deduction nobody ever looked at.
+    //
+    // The bound is the SAME one the bookkeeper's PATCH enforces
+    // (isPlausibleReceiptTax) — the two writers of this column must not be able
+    // to disagree about what a believable figure is. The remedies differ
+    // because the situations do: PATCH refuses the request, while booking
+    // cannot refuse anything (the Purchase is already in QuickBooks). So the
+    // figure is stored as NULL, the row is flagged `needsTaxReview`, and the
+    // provenance still says "ocr" — a machine looked, and got an answer a
+    // person now has to replace. The raw read stays on `ReceiptIntake.taxCents`
+    // for audit, exactly as a rejected read does.
+    const taxIsPlausible = isPlausibleReceiptTax(taxApplied / 100, amountCents / 100);
+    const taxToStore = taxApplied > 0 && taxIsPlausible ? taxApplied / 100 : null;
+    const taxNeedsReview = taxApplied > 0 && !taxIsPlausible;
     // RE-VALIDATE THE PHASE AGAINST THE FINAL PROJECT.
     //
     // Both the captured code and the model's suggestion were resolved while the
@@ -783,9 +805,15 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             OR: [{ taxSource: null }, { taxSource: { not: "manual" } }],
                         },
                         data: {
-                            taxAmount: taxApplied / 100,
-                            taxAtSource: true,
+                            // Same bound as the create path above: an
+                            // implausible read fills NOTHING and asks for a
+                            // person instead. Writing it here would be worse
+                            // than on a new row — this row may already be in a
+                            // filing period somebody has reconciled.
+                            taxAmount: taxToStore,
+                            taxAtSource: taxToStore !== null,
                             taxSource: "ocr",
+                            ...(taxNeedsReview ? { needsTaxReview: true } : {}),
                         },
                     });
                 }
@@ -861,13 +889,18 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // NOT the PUT on that route — PUT is guarded by
                     // assertExpenseMutableOutsideQbo and every row booked here
                     // carries a qbPurchaseId.
-                    taxAmount: taxApplied > 0 ? taxApplied / 100 : null,
-                    taxAtSource: taxApplied > 0,
+                    taxAmount: taxToStore,
+                    taxAtSource: taxToStore !== null,
+                    // An implausible read is a question, not an answer: the row
+                    // waits for a person and the report skips it meanwhile.
+                    needsTaxReview: taxNeedsReview,
                     // Provenance for the tax columns. "ocr" is a re-readable
                     // guess; "manual" (written by the tax PATCH) is a person's
                     // answer, and this pipeline never writes over one. Null
-                    // when there was no tax to record, which leaves a later
-                    // bookkeeper free to answer without arguing with a machine.
+                    // only when there was no tax read at all, which leaves a
+                    // later bookkeeper free to answer without arguing with a
+                    // machine — an implausible read still counts as "a machine
+                    // looked", which is why it keeps "ocr".
                     taxSource: taxApplied > 0 ? "ocr" : null,
                     installedAtCustomer: row.installedAtCustomer,
                     amount: amountCents / 100,
@@ -886,7 +919,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     description:
                         `[Receipt intake] ${docRef}` +
                         phaseCheck.note +
-                        (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
+                        (taxToStore !== null ? ` · incl. $${taxToStore.toFixed(2)} sales tax` : "") +
+                        (taxNeedsReview ? " · tax read looks wrong, needs review" : "") +
                         ` · pending bookkeeper review`,
                 },
                 select: { id: true },

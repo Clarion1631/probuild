@@ -242,3 +242,39 @@ export function resolveExpenseProjectLabel(
         projectName: expense.estimate?.project?.name ?? null,
     };
 }
+
+
+/**
+ * THE ONE PLAUSIBILITY BOUND FOR A SALES-TAX FIGURE ON A RECEIPT.
+ *
+ * WA's combined rate tops out around 10.6%; 12% is deliberately loose so a
+ * legitimate receipt is never refused, while a transposed or misread figure
+ * (a $100 receipt "with" $90 of tax) cannot reach an excise return.
+ *
+ * It lives here because there are TWO writers of `Expense.taxAmount` and they
+ * must not be able to disagree: the bookkeeper's PATCH, which refuses an
+ * implausible figure outright, and the booking pipeline, which cannot refuse
+ * anything (the Purchase is already in QuickBooks) and instead stores NULL and
+ * flags the row for review. Same bound, different remedies.
+ *
+ * The rate is measured against the GROSS `Expense.amount`, which is what both
+ * writers hold; on any receipt this side of the bound the difference from a
+ * pre-tax basis is far smaller than the slack in the 12%.
+ */
+export const MAX_PLAUSIBLE_TAX_RATE = 0.12;
+
+/** The largest tax figure this receipt could plausibly carry, in dollars. */
+export function maxPlausibleTaxAmount(grossAmount: number): number {
+    if (!Number.isFinite(grossAmount) || grossAmount <= 0) return 0;
+    return Math.round(grossAmount * MAX_PLAUSIBLE_TAX_RATE * 100) / 100;
+}
+
+/**
+ * True when `taxAmount` is a believable amount of sales tax on `grossAmount`.
+ * Zero is plausible ("this receipt had no tax"); a negative one is not.
+ */
+export function isPlausibleReceiptTax(taxAmount: number, grossAmount: number): boolean {
+    if (!Number.isFinite(taxAmount) || taxAmount < 0) return false;
+    if (taxAmount === 0) return true;
+    return taxAmount <= maxPlausibleTaxAmount(grossAmount);
+}

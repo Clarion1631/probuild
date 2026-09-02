@@ -668,7 +668,11 @@ export function planQboExpenseUpdate(
         Partial<
             Pick<
                 ExistingQboExpense,
-                "amount" | "taxAmount" | "taxDeductibleBase" | "installedAtCustomer"
+                | "amount"
+                | "taxAmount"
+                | "taxDeductibleBase"
+                | "installedAtCustomer"
+                | "taxSource"
             >
         >,
     write: QboExpenseWrite,
@@ -747,12 +751,20 @@ export function planQboExpenseUpdate(
     // numbers still satisfy every CHECK, so nothing else would ever ask.
     //
     // "Classified" means a human's tax answer is on the row in any form —
-    // a tax amount, an installed-at-customer decision, or a hand allocation.
+    // a tax amount, an installed-at-customer decision, a hand allocation, or
+    // `taxSource: "manual"`. That last one is not redundant: a bookkeeper who
+    // decides a receipt carries NO tax leaves every one of the other three
+    // NULL, so without it the single most reviewable row — a human's explicit
+    // "no tax", now describing a different gross — is the one row a re-sync
+    // would say nothing about.
     // For those rows an amount change is a REVIEW, never a silent acceptance:
     // the classification is kept (it may well still be right) and the row is
     // flagged, which the report reads as "not until a person looks".
     const classified =
-        existingTax !== null || existingBase !== null || existing.installedAtCustomer != null;
+        existingTax !== null ||
+        existingBase !== null ||
+        existing.installedAtCustomer != null ||
+        existing.taxSource === "manual";
     const existingAmount =
         existing.amount === null || existing.amount === undefined ? null : Number(existing.amount);
     const amountMoved =
@@ -852,8 +864,11 @@ export async function upsertQboExpense(
                 taxDeductibleBase: true,
                 // Read for the classification test in planQboExpenseUpdate: a
                 // human's installed-at-customer answer counts as a tax
-                // classification even when no tax amount was recorded.
+                // classification even when no tax amount was recorded, and
+                // `taxSource: "manual"` counts even when NOTHING else is set
+                // (their answer was "this receipt has no tax").
                 installedAtCustomer: true,
+                taxSource: true,
                 amount: true,
                 vendor: true,
                 date: true,
@@ -912,7 +927,7 @@ export async function upsertQboExpense(
             select: {
                 id: true, qbSyncToken: true, estimateId: true, projectId: true,
                 updatedAt: true, taxAmount: true, taxDeductibleBase: true, amount: true,
-                installedAtCustomer: true,
+                installedAtCustomer: true, taxSource: true,
                 vendor: true, date: true, description: true, status: true,
             },
         });
