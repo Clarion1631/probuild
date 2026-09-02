@@ -418,6 +418,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // ordinary edits; a flagged one keeps its flag until it is given.
         const clearsReview = !expense.needsTaxReview || acknowledgesReview;
 
+        // A tax FIGURE, not merely a tax-shaped request: `taxSource` governs
+        // `taxAmount` and `taxDeductibleBase`, so only a non-null value for one
+        // of those is a person deciding what this column describes.
+        // `installedAtCustomer` is NOT one of them — its own value is its
+        // evidence (non-null means answered) and booking already refuses to
+        // touch it once it is set.
+        const stampsTaxProvenance =
+            (editsTaxAmount && body.taxAmount !== null) ||
+            (editsBase && body.taxDeductibleBase !== null);
+
         // `taxReviewAck` is not a column, so a request carrying nothing else
         // has no field to write. Told, not silently no-opped.
         if (!editsInstalled && !editsBase && !editsTaxAmount && !editsTaxAtSource && !editsCostCode) {
@@ -455,16 +465,33 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         let nextTaxAmount: number | null = null;
         if (editsTaxAmount && body.taxAmount !== null) {
             const parsed = Number(body.taxAmount);
-            if (!Number.isFinite(parsed) || parsed < 0) {
+            if (!Number.isFinite(parsed)) {
                 return NextResponse.json(
-                    { error: "taxAmount must be a number >= 0, or null." },
+                    { error: "taxAmount must be a number, or null." },
                     { status: 400 },
                 );
             }
-            const ceiling = maxPlausibleTaxAmount(Number(expense.amount));
-            if (!isPlausibleReceiptTax(parsed, Number(expense.amount))) {
+            const gross = Number(expense.amount);
+            const ceiling = maxPlausibleTaxAmount(gross);
+            // A REFUND'S TAX IS NEGATIVE. The rule is direction and magnitude,
+            // not positivity: a positive tax on a negative expense is a dropped
+            // minus sign, and it would ADD to a filing that should be reduced.
+            // Answered as a 400 with the reason, never as a constraint
+            // violation surfacing as a 500.
+            if (parsed !== 0 && Math.sign(parsed) !== Math.sign(gross)) {
                 return NextResponse.json(
-                    { error: `That tax is implausible for a ${Number(expense.amount).toFixed(2)} receipt (max ${ceiling.toFixed(2)}, 12%).` },
+                    {
+                        error: gross < 0
+                            ? "This is a refund, so its tax must be negative too (or zero)."
+                            : "Tax must be positive on a purchase (or zero).",
+                        code: "TAX_SIGN_MISMATCH",
+                    },
+                    { status: 400 },
+                );
+            }
+            if (!isPlausibleReceiptTax(parsed, gross)) {
+                return NextResponse.json(
+                    { error: `That tax is implausible for a ${gross.toFixed(2)} receipt (max ${ceiling.toFixed(2)} in magnitude, 12%).` },
                     { status: 400 },
                 );
             }
@@ -517,10 +544,15 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // `taxAtSource` asserts "tax was charged on this receipt"; with no tax
         // figure behind it, it is a claim about nothing and the report filters
         // it out anyway. Refuse the incoherent pair rather than storing it.
+        //
+        // ZERO, not "not positive": on a refund the tax is NEGATIVE and the
+        // claim is still true — tax was charged on the original purchase and is
+        // coming back. Testing `<= 0` here refused every credit whose tax a
+        // bookkeeper tried to record.
         const resultingAtSource = editsTaxAtSource
             ? (nextTaxAtSource as boolean)
             : Boolean(expense.taxAtSource);
-        if (resultingAtSource && resultingTax <= 0) {
+        if (resultingAtSource && resultingTax === 0) {
             return NextResponse.json(
                 { error: "taxAtSource can't be true with no tax amount on the receipt." },
                 { status: 400 },
@@ -605,14 +637,20 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                         // where the report sees a cleared row it has not been
                         // given the figures for.
                         ...(clearsReview ? { needsTaxReview: false } : {}),
-                        // WHO decided. Everything the intake pipeline writes is
-                        // "ocr" and re-readable; this is a person, and booking
-                        // must not write over it. It matters most in the case
-                        // that leaves no other trace: a bookkeeper deciding
-                        // there is NO tax on a receipt leaves a null taxAmount,
-                        // which without this column cannot be told from
-                        // "nobody has looked yet".
-                        taxSource: "manual",
+                        // PROVENANCE IS PER DECISION, AND `taxSource` COVERS
+                        // EXACTLY TWO COLUMNS: taxAmount and taxDeductibleBase.
+                        //
+                        // It is stamped only when this request actually carries
+                        // one of those FIGURES. Two consequences, both
+                        // deliberate:
+                        //   * answering only the installed-at-customer question
+                        //     does not claim a person supplied tax numbers, and
+                        //   * clearing the tax back to blank leaves the
+                        //     provenance alone, so a later OCR read may fill
+                        //     it — a blank is an absence, not a decision, and
+                        //     locking the column on an absence would freeze the
+                        //     row out of the pipeline forever.
+                        ...(stampsTaxProvenance ? { taxSource: "manual" } : {}),
                     }
                     : {}),
                 ...(editsCostCode

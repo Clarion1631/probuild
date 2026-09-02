@@ -1075,6 +1075,7 @@ test("the QBO core fires onExistingPurchase before it touches the attachment", (
     );
     // And the create hook is NOT fired on this path.
     assert.ok(!body.includes("onBeforeCreate"), "onBeforeCreate belongs to the create path only");
+});
 
 // ── the already-booked Purchase still needs its Phase 3 fields ─────────────
 
@@ -1190,10 +1191,10 @@ test("a bookkeeper's NO-TAX decision is not overwritten by an OCR re-read", asyn
     assert.equal(result.outcome, "booked");
     assert.equal(rec.existingExpense.taxAmount, null, "their answer stands");
     assert.equal(rec.existingExpense.taxSource, "manual");
-    assert.equal(
-        rec.existingExpense.installedAtCustomer, null,
-        "and the capture does not answer the excise question for them either",
-    );
+    // ...while the excise question, which they did NOT answer, is still filled
+    // from the capture. `taxSource` governs the tax figures only; the
+    // installed-at-customer answer is its own evidence (round 16, item 1).
+    assert.equal(rec.existingExpense.installedAtCustomer, true);
 });
 
 test("a legacy row with no provenance IS filled, and stamped ocr", async () => {
@@ -1272,13 +1273,15 @@ test("the per-expense lock is taken BEFORE the read the fill decides from", asyn
         trace.push("read");
         return realFind(args);
     };
-    (rec.deps.db as any).$queryRawUnsafe = async () => {
-        trace.push("lock");
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string) => {
+        trace.push(query.includes("FOR SHARE") ? "phase-share" : "lock");
         return [{ lock_result: null }];
     };
     await bookReceipt(row(), rec.deps);
-    // read (the id lookup) -> lock -> read (everything the fill decides from)
-    assert.deepEqual(trace.slice(0, 3), ["read", "lock", "read"]);
+    // The job's phase rows are share-locked first (round 16, item 2), then the
+    // id lookup, then the per-expense lock, then the read every decision is
+    // made from.
+    assert.deepEqual(trace.slice(0, 4), ["phase-share", "read", "lock", "read"]);
 });
 
 // ── an implausible OCR tax is flagged, never booked (round 15, item 1) ─────
@@ -1326,4 +1329,106 @@ test("an implausible read FILLS nothing on an already-booked Purchase", () => {
         assert.equal(rec.existingExpense.taxAtSource, false);
         assert.equal(rec.existingExpense.needsTaxReview, true);
     });
+});
+
+// ── the two provenances do not gate each other (round 16, item 1) ──────────
+
+test("an ANSWERED installedAtCustomer is never overwritten, whatever taxSource says", () => {
+    // Its own value is the evidence: non-null means a person answered. This is
+    // the "no" case, which is the one that costs money if it is flipped — a
+    // false reads as "not resold" and keeps the receipt off the excise return.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        installedAtCustomer: false, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row({ installedAtCustomer: true }), rec.deps).then(() => {
+        assert.equal(rec.existingExpense.installedAtCustomer, false, "their answer stands");
+    });
+});
+
+test("a manual TAX figure does not block the capture's excise answer", () => {
+    // The cross-field regression: `taxSource: "manual"` guards taxAmount and
+    // taxDeductibleBase. Letting it also guard installedAtCustomer meant a
+    // bookkeeper correcting a tax figure silently stopped every later capture
+    // from answering a question they never touched.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: 16.55, taxAtSource: true, taxSource: "manual",
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row(), rec.deps).then(() => {
+        assert.equal(rec.existingExpense.installedAtCustomer, true, "the capture answers it");
+        assert.equal(rec.existingExpense.taxAmount, 16.55, "and their figure is untouched");
+        assert.equal(rec.existingExpense.taxSource, "manual");
+    });
+});
+
+// ── the phase is held still across the money write (round 16, item 2) ──────
+
+test("a phase REMOVED between the read and the write parks, it does not book", async () => {
+    // Deterministic interleaving on the window that matters. The code was a
+    // phase of this job at both earlier checks; a person deletes it from the
+    // estimate while the booking transaction runs.
+    //
+    // Booking it would post money to a line the job no longer has. Booking it
+    // UNCODED would silently discard a phase a person captured. Neither is this
+    // pipeline's call, and the Purchase already exists — so the row parks.
+    let asked = 0;
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            asked += 1;
+            return asked < 3; // valid before the send and after it, gone by the write
+        },
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);
+
+    assert.equal(asked, 3, "asked again inside the transaction");
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "phase-changed");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    assert.equal(rec.expenses.length, 0, "no Expense was written");
+    assert.equal(
+        rec.intakeUpdates.filter((update: any) => update.state === "BOOKED").length, 0,
+        "and nothing was marked BOOKED",
+    );
+});
+
+test("the in-transaction check happens AFTER the phase rows are locked", async () => {
+    // Asking before the lock answers about a moment the lock then fails to
+    // preserve — the whole point of taking it.
+    const order: string[] = [];
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            order.push("ask");
+            return true;
+        },
+    });
+    (rec.deps.db as any).$queryRawUnsafe = async (query: string) => {
+        if (query.includes("FOR SHARE")) order.push("phase-share");
+        return [{ lock_result: null }];
+    };
+    await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);
+    // ask (pre-send), ask (post-create), share-lock, ask (inside the tx)
+    assert.deepEqual(order, ["ask", "ask", "phase-share", "ask"]);
+});
+
+test("a row with NO phase is not parked by this check", async () => {
+    // Nothing to revalidate, so the extra question is not even asked — and an
+    // uncoded receipt still books, exactly as before.
+    let asked = 0;
+    const rec = recorder({
+        isCostCodeAllowed: async () => {
+            asked += 1;
+            return false; // the captured code was never a phase of this job
+        },
+    });
+    const result = await bookReceipt(row({ costCodeId: "cc-from-another-job" }), rec.deps);
+    assert.equal(result.outcome, "booked", "it books UNCODED, as it always did");
+    assert.equal(asked, 2, "no third question once there is no code left to check");
+    assert.equal(rec.expenses[0].costCodeId, null);
 });

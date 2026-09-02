@@ -151,7 +151,17 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
 
 test("every statement is additive — nothing drops, renames, or rewrites data", () => {
     for (const statement of statements as string[]) {
-        assert.ok(!/\bDROP\b/i.test(statement), `destructive statement: ${statement}`);
+        // ONE exception, and it is not data: the tax CHECK is dropped and
+        // re-added by name so a database carrying the OLD definition (which
+        // refused every refund) is corrected rather than skipped. Nothing else
+        // may drop anything, and nothing may drop a table, column or index.
+        const isConstraintReplace =
+            /DROP CONSTRAINT IF EXISTS "Expense_taxAmount_check"/.test(statement);
+        assert.ok(
+            isConstraintReplace || !/\bDROP\b/i.test(statement),
+            `destructive statement: ${statement}`,
+        );
+        assert.ok(!/DROP (TABLE|COLUMN|INDEX)/i.test(statement), `destructive: ${statement}`);
         assert.ok(!/\bDELETE FROM\b/i.test(statement), `destructive statement: ${statement}`);
         assert.ok(!/\bTRUNCATE\b/i.test(statement), `destructive statement: ${statement}`);
     }
@@ -191,9 +201,23 @@ test("the re-anchor refuses a time zone it cannot safely interpolate", () => {
 });
 
 test("the tax-vs-gross CHECK is in both DDL paths and in the verifier", () => {
-    const guard = (statements as string[]).find(s => s.includes("Expense_taxAmount_check"));
+    const guard = (statements as string[]).find(
+        s => s.includes("Expense_taxAmount_check") && s.includes("ADD CONSTRAINT"),
+    );
     assert.ok(guard, "the script must carry it");
-    assert.match(guard!, /"taxAmount" <= "amount"/);
+    // Signed: the tax points the same way as the money and is never bigger.
+    assert.match(guard!, /sign\("taxAmount"\) = sign\("amount"\)/);
+    assert.match(guard!, /abs\("taxAmount"\) <= abs\("amount"\)/);
+    // ...and the old definition, which refused every refund, is REPLACED rather
+    // than left in place on a database that already has it.
+    const drop = (statements as string[]).find(
+        s => /DROP CONSTRAINT IF EXISTS "Expense_taxAmount_check"/.test(s),
+    );
+    assert.ok(drop, "the old definition is dropped first");
+    assert.ok(
+        (statements as string[]).indexOf(drop!) < (statements as string[]).indexOf(guard!),
+        "drop before add",
+    );
     assert.ok(
         normalizedMigration.includes(normalize(guard!).replace(/;$/, "")),
         "and the migration must carry the same statement",

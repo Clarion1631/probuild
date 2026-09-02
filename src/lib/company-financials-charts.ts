@@ -269,7 +269,8 @@ export async function getCompanyFinancialsChartData(
         overheadTimeEntries,
         unpaidSchedules,
         openRetainers,
-        allTimeJobExpenses,
+        allTimeDirectTotals,
+        allTimeLegacyTotals,
         timeZone,
     ] = await Promise.all([
         // Collected: paid schedules whose PARENT invoice isn't Draft (item 2),
@@ -344,24 +345,34 @@ export async function getCompanyFinancialsChartData(
             where: { projectId: { in: projectIds }, status: { in: RETAINER_STATUSES }, balanceDue: { gt: 0 } },
             select: { balanceDue: true, dueDate: true },
         }),
-        // All-time top-5 ranking universe.
+        // All-time top-5 ranking universe, AS TWO AGGREGATES.
         //
-        // This used to be a SQL `groupBy(["estimateId"])` plus an estimate ->
-        // project lookup, to avoid materializing every expense row. Phase 3
-        // made that WRONG rather than merely dated: grouping by estimateId
-        // resolves a row's job through its estimate, while the monthly spend
-        // series below resolves it through `resolveExpenseProjectId`. A
-        // re-attributed expense therefore ranked under its OLD job and was
-        // plotted under its new one — the same money in two different places in
-        // two charts on the same page.
+        // It was a SQL `groupBy(["estimateId"])`, which Phase 3 made wrong
+        // rather than merely dated: grouping by estimateId resolves a row's job
+        // through its estimate, while the monthly series below resolves it
+        // through `resolveExpenseProjectId`, so a re-attributed expense ranked
+        // under its OLD job and was plotted under its new one — the same money
+        // in two places on one page.
         //
-        // Neither `groupBy` nor a relation filter can express "projectId, or
-        // the estimate's projectId when it is null", so the rows are fetched
-        // and bucketed with the shared resolver. Scope is unchanged (all
-        // selectable jobs, all-time) and the select is three columns.
-        prisma.expense.findMany({
-            where: expenseForProjectsWhere(allJobIds),
-            select: { amount: true, projectId: true, estimate: { select: { projectId: true } } },
+        // The first fix fetched every expense row and bucketed them with the
+        // resolver. That was correct and unbounded: an all-time, all-jobs read
+        // that grows forever, to produce five numbers.
+        //
+        // The resolver's rule is a UNION of two disjoint sets — rows that carry
+        // a `projectId`, and legacy rows that do not and answer through their
+        // estimate — so it is expressible as two grouped sums with no overlap
+        // between them, merged in memory. `projectId: null` in the second
+        // predicate is what makes them disjoint, and it is the same precedence
+        // `resolveExpenseProjectId` applies row by row.
+        prisma.expense.groupBy({
+            by: ["projectId"],
+            where: { projectId: { in: allJobIds } },
+            _sum: { amount: true },
+        }),
+        prisma.expense.groupBy({
+            by: ["estimateId"],
+            where: { projectId: null, estimate: { projectId: { in: allJobIds } } },
+            _sum: { amount: true },
         }),
         resolveCompanyTimeZone(),
     ]);
@@ -444,13 +455,37 @@ export async function getCompanyFinancialsChartData(
     // Ranking universe is ALL selectable jobs (jobProjects), all-time, ignoring
     // the current date-range/project filters — this is what keeps a project's
     // color stable no matter how the filters change.
-    // Same resolver as the monthly series below — that agreement is the whole
-    // point, and it is what the regression test pins.
+    // Same precedence as the monthly series below — that agreement is the
+    // whole point, and it is what the regression test pins. Here it is spelled
+    // as the union of the two disjoint groups read above rather than as a
+    // per-row call, because five numbers do not justify loading the ledger.
     const allTimeTotals = new Map<string, number>();
-    for (const e of allTimeJobExpenses) {
-        const pid = resolveExpenseProjectId(e);
-        if (!pid) continue; // both sides can be null on this schema
-        allTimeTotals.set(pid, (allTimeTotals.get(pid) ?? 0) + Number(e.amount ?? 0));
+    const addAllTime = (projectId: string | null, amount: unknown) => {
+        if (!projectId) return; // both sides can be null on this schema
+        allTimeTotals.set(projectId, (allTimeTotals.get(projectId) ?? 0) + Number(amount ?? 0));
+    };
+    for (const group of allTimeDirectTotals) {
+        addAllTime(group.projectId ?? null, group._sum?.amount);
+    }
+    // The legacy half answers through its estimate, so the estimate ids it
+    // grouped by are resolved in ONE lookup. An estimate that has since lost
+    // its project contributes nothing, exactly as the row-by-row resolver
+    // returned null for it.
+    const legacyEstimateIds = allTimeLegacyTotals
+        .map((group) => group.estimateId)
+        .filter((id): id is string => Boolean(id));
+    const legacyProjectByEstimate = legacyEstimateIds.length
+        ? new Map(
+              (
+                  await prisma.estimate.findMany({
+                      where: { id: { in: legacyEstimateIds } },
+                      select: { id: true, projectId: true },
+                  })
+              ).map((estimate) => [estimate.id, estimate.projectId]),
+          )
+        : new Map<string, string | null>();
+    for (const group of allTimeLegacyTotals) {
+        addAllTime(legacyProjectByEstimate.get(group.estimateId ?? "") ?? null, group._sum?.amount);
     }
     const topProjectIds = [...allTimeTotals.entries()]
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) // tie-break by id: stable across reloads

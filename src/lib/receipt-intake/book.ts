@@ -21,7 +21,7 @@ import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
 import { isPlausibleReceiptTax } from "@/lib/expense-attribution";
-import { lockExpense } from "@/lib/expense-lock";
+import { lockExpense, lockProjectPhaseRowsForShare } from "@/lib/expense-lock";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -674,6 +674,24 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
         const booked = await deps.db.$transaction(async tx => {
+            // THE PHASE IS RE-ASKED HERE, UNDER A LOCK (Codex round 16, item 2).
+            //
+            // The two checks before this one both happened outside any
+            // transaction: one before the QBO create, one after it. Neither
+            // holds anything still, so a phase deleted from the job while this
+            // transaction runs would still be written into job cost.
+            //
+            // The phase rows are share-locked first, so from this point the
+            // answer cannot change under us; then the same question is asked
+            // again. A code that is no longer a phase of this job PARKS the
+            // row: booking it would post money to a line the job does not have,
+            // and booking it UNCODED would silently discard a phase a person
+            // captured. Neither is ours to decide, and the Purchase already
+            // exists, so a human is asked instead.
+            await lockProjectPhaseRowsForShare(tx as any, project.id);
+            if (costCodeId && !(await deps.isCostCodeAllowed(project.id, costCodeId))) {
+                throw new PhaseRemovedError();
+            }
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
             // and the insert would fail on that constraint anyway.
@@ -822,12 +840,18 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         where: {
                             id: existing.id,
                             projectId: expectedProjectId ?? row.projectId,
+                            // ITS OWN VALUE IS THE EVIDENCE.
+                            //
+                            // `installedAtCustomer` is a tri-state: non-null
+                            // MEANS a person answered, so `null` is both the
+                            // "unanswered" state and the entire guard. It is
+                            // deliberately not gated on `taxSource`, which
+                            // governs the two tax FIGURES: a receipt whose tax
+                            // a bookkeeper has not touched must still be able
+                            // to receive the capturer's installed-at-customer
+                            // answer, and a receipt whose tax they HAVE set
+                            // must not thereby block one.
                             installedAtCustomer: null,
-                            // Same reason as the tax fill: a bookkeeper's
-                            // classification is not something a capture may
-                            // revisit, and a NULL column needs the explicit
-                            // branch.
-                            OR: [{ taxSource: null }, { taxSource: { not: "manual" } }],
                         },
                         data: { installedAtCustomer: row.installedAtCustomer },
                     });
@@ -1024,6 +1048,16 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 releaseStrongKey: false,
             };
         }
+        // The phase went away underneath the write. A send WAS attempted, so
+        // the strong key stays claimed and the Purchase is not re-sent; a
+        // person re-phases the row and it books on the next pass.
+        if (error instanceof PhaseRemovedError) {
+            return {
+                outcome: "needs-review",
+                reason: "phase-changed",
+                releaseStrongKey: false,
+            };
+        }
         // The Purchase EXISTS at this point. Retrying is correct and safe: the
         // DocNumber lookup will find it and return alreadyExists:true — and the
         // key must be RETAINED, which is why this attempt's send flag is passed
@@ -1055,6 +1089,13 @@ function describe(error: unknown): string {
  * deliberate: it rolls the guarded fills back with it, so the row is never left
  * half-filled against a job it does not belong to.
  */
+class PhaseRemovedError extends Error {
+    constructor() {
+        super("the cost code stopped being a phase of this job while booking");
+        this.name = "PhaseRemovedError";
+    }
+}
+
 class AttributionConflictError extends Error {
     constructor() {
         super("the expense moved to another job while booking");

@@ -38,7 +38,15 @@ const SETTLED = {
 };
 
 const expenseCalls: any[] = [];
+const groupByCalls: any[] = [];
+const estimateCalls: any[] = [];
 
+/**
+ * The all-time ranking is read as TWO DISJOINT GROUPED SUMS — rows that carry a
+ * projectId, and legacy rows that answer through their estimate. The fixture's
+ * re-attributed row is in the first group under its REAL job (job-b), which is
+ * the whole point: an estimate-keyed group would have put it under job-a.
+ */
 const fakePrisma = {
     companySettings: {
         findUnique: async () => ({ timeZone: "America/Los_Angeles" }),
@@ -46,19 +54,33 @@ const fakePrisma = {
     paymentSchedule: { findMany: async () => [] },
     retainer: { findMany: async () => [] },
     timeEntry: { findMany: async () => [] },
-    estimate: { findMany: async () => [] },
+    estimate: {
+        findMany: async (args: any) => {
+            estimateCalls.push(args);
+            // The legacy group's estimate -> project lookup.
+            return [{ id: "est-legacy", projectId: "job-a" }];
+        },
+    },
     expense: {
         findMany: async (args: any) => {
             expenseCalls.push(args);
-            // Three expense reads, told apart by their select — the ranking one
-            // needs no date, the overhead one no project.
+            // Two expense row reads now, both date-ranged: in-range job spend
+            // and the overhead bucket, told apart by their select.
             const select = args.select ?? {};
-            if (!select.date) return [REATTRIBUTED, SETTLED]; // all-time ranking universe
             if (!select.projectId) return []; // overhead bucket
             return [REATTRIBUTED, SETTLED]; // in-range job spend
         },
-        groupBy: async () => {
-            throw new Error("groupBy must no longer be used: it cannot express the resolver's fallback");
+        groupBy: async (args: any) => {
+            groupByCalls.push(args);
+            if (args.by?.[0] === "projectId") {
+                return [
+                    { projectId: "job-b", _sum: { amount: 5000 } },
+                    { projectId: "job-a", _sum: { amount: 100 } },
+                ];
+            }
+            // The legacy half: no projectId of its own, answered through the
+            // estimate lookup above.
+            return [{ estimateId: "est-legacy", _sum: { amount: 25 } }];
         },
     },
 };
@@ -136,16 +158,77 @@ test("...and the monthly series puts the same dollars on the same job", async ()
     );
 });
 
-test("the ranking query is the shared both-ways predicate, not a relation-only filter", async () => {
+test("the ranking covers BOTH ways a row reaches a job, not just the relation", async () => {
+    // The predicate that matters is unchanged in meaning — a row counts if it
+    // carries the project OR if its estimate does — it is now expressed as two
+    // disjoint aggregates instead of one OR over materialized rows (round 16,
+    // item 4). A relation-only filter would silently drop every re-attributed
+    // row, which is exactly the bug this file exists for.
+    groupByCalls.length = 0;
     await load();
-    const ranking = expenseCalls.find(call => call.select && !call.select.date);
-    assert.ok(ranking, "the all-time ranking read must happen");
-    assert.deepEqual(ranking.where, {
-        OR: [
-            { projectId: { in: ["job-a", "job-b"] } },
-            { projectId: null, estimate: { projectId: { in: ["job-a", "job-b"] } } },
-        ],
+    const wheres = groupByCalls.map(call => JSON.stringify(call.where));
+    assert.deepEqual(wheres, [
+        JSON.stringify({ projectId: { in: ["job-a", "job-b"] } }),
+        JSON.stringify({ projectId: null, estimate: { projectId: { in: ["job-a", "job-b"] } } }),
+    ]);
+    // And the IN-RANGE series still reads the columns the resolver needs, so
+    // the two charts cannot drift apart again.
+    const series = expenseCalls.find(call => call.select?.projectId);
+    assert.equal(series.select.projectId, true);
+    assert.deepEqual(series.select.estimate, { select: { projectId: true } });
+});
+
+// ── the ranking is an AGGREGATE, not a row scan (Codex round 16, item 4) ───
+
+test("the all-time ranking materializes NO expense rows", async () => {
+    // Correct but unbounded is still unbounded: an all-time, all-jobs row fetch
+    // grows forever to produce five numbers. Every remaining `findMany` on
+    // Expense must therefore be date-bounded — the ranking has none, so if one
+    // shows up without a date filter the row scan is back.
+    expenseCalls.length = 0;
+    await load();
+    for (const call of expenseCalls) {
+        const where = JSON.stringify(call.where ?? {});
+        assert.match(
+            where + JSON.stringify(call ?? {}),
+            /date/,
+            `an unbounded expense row read came back: ${JSON.stringify(call.select)}`,
+        );
+    }
+    assert.ok(
+        expenseCalls.every(call => call.select?.date === true),
+        "every remaining row read is the in-range series or the overhead bucket",
+    );
+});
+
+test("the two grouped sums are DISJOINT, and in the resolver's precedence", async () => {
+    // Overlapping predicates would double-count a row; `projectId: null` on the
+    // second is what makes them a partition rather than two overlapping sets,
+    // and it is the same precedence resolveExpenseProjectId applies row by row.
+    groupByCalls.length = 0;
+    await load();
+    const direct = groupByCalls.find(call => call.by?.[0] === "projectId");
+    const legacy = groupByCalls.find(call => call.by?.[0] === "estimateId");
+    assert.ok(direct && legacy, "both halves are read");
+    assert.deepEqual(direct.where, { projectId: { in: ["job-a", "job-b"] } });
+    assert.deepEqual(legacy.where, {
+        projectId: null,
+        estimate: { projectId: { in: ["job-a", "job-b"] } },
     });
-    assert.equal(ranking.select.projectId, true);
-    assert.deepEqual(ranking.select.estimate, { select: { projectId: true } });
+    assert.deepEqual(direct._sum, { amount: true });
+    assert.deepEqual(legacy._sum, { amount: true });
+});
+
+test("the legacy half is folded in under its estimate's job", async () => {
+    // $25 of legacy spend on est-legacy (job-a) has to land on job-a, not be
+    // dropped and not be ranked under an estimate id.
+    estimateCalls.length = 0;
+    const data = await load();
+    assert.deepEqual(estimateCalls[0]?.where, { id: { in: ["est-legacy"] } });
+    // job-b: 5000, job-a: 100 + 25 — order unchanged, but the legacy dollars
+    // are counted.
+    assert.deepEqual(
+        data.spendByProject.series.map((entry: any) => entry.id),
+        ["job-b", "job-a", "other"],
+    );
 });

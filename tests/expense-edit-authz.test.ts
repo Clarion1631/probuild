@@ -213,14 +213,13 @@ test("PATCH reaches a QBO-managed row — the population the report is made of",
 
 test("PATCH touches NOTHING but the three ProBuild-only columns", async () => {
     await patch({ installedAtCustomer: true });
-    // `needsTaxReview` and `taxSource` ride along because answering IS
-    // clearing the flag and recording who answered — still nothing outside the
-    // ProBuild-only set.
+    // `needsTaxReview` rides along because answering IS clearing the flag.
+    // `taxSource` does NOT: it governs the two tax FIGURES, and this request
+    // carries neither (round 16, item 1).
     assert.deepEqual(
         Object.keys(updateArgs?.data ?? {}),
-        ["installedAtCustomer", "needsTaxReview", "taxSource"],
+        ["installedAtCustomer", "needsTaxReview"],
     );
-    assert.equal(updateArgs?.data.taxSource, "manual", "a person answered, and booking must not undo it");
     // A caller sending a QBO-synced field is told, not silently ignored.
     const res = await patch({ amount: "1.00" });
     assert.equal(res.status, 400);
@@ -638,4 +637,87 @@ test("a non-boolean taxReviewAck is refused", async () => {
     const res = await patch({ taxReviewAck: "yes", taxAmount: 1, taxDeductibleBase: 1 });
     assert.equal(res.status, 400);
     assert.match((await res.json()).error, /taxReviewAck/);
+});
+
+// ── signed expenses: refunds carry negative tax (Codex round 16, item 3) ───
+
+test("a -$50 refund accepts -$4 of tax", async () => {
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: null, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: -4, taxAtSource: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, -4);
+});
+
+test("...and refuses +$4 with a 400, not a constraint violation", async () => {
+    // A positive tax on a negative expense is a dropped minus sign. Caught in
+    // the handler, so the caller is told why — the database CHECK behind it
+    // would surface as a 500 with nothing to act on.
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: null, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: 4 });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_SIGN_MISMATCH");
+    assert.equal(updateArgs, null, "nothing is written");
+});
+
+test("a refund's tax is still bounded by magnitude", async () => {
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: -50, taxAmount: null, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    assert.equal((await patch({ taxAmount: -6 })).status, 200, "12% of $50");
+    updateArgs = null;
+    const tooBig = await patch({ taxAmount: -45 });
+    assert.equal(tooBig.status, 400);
+    assert.match((await tooBig.json()).error, /implausible/);
+    assert.equal(updateArgs, null);
+});
+
+test("a purchase still refuses a negative tax", async () => {
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: 207.74, taxAmount: null, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: -4 });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_SIGN_MISMATCH");
+});
+
+// ── provenance is per decision (Codex round 16, item 1) ────────────────────
+
+test("answering ONLY installedAtCustomer does not claim the tax figures", async () => {
+    // Stamping "manual" here would freeze the tax columns out of the pipeline
+    // on the strength of an answer to a different question.
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, undefined);
+});
+
+test("CLEARING the tax back to blank leaves the provenance alone", async () => {
+    // A blank is an absence, not a decision. Locking the column on it would
+    // stop OCR ever filling the figure again.
+    const res = await patch({ taxAmount: null, taxAtSource: false });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, null, "the clear still lands");
+    assert.equal(updateArgs?.data.taxSource, undefined, "but nobody claimed a figure");
+});
+
+test("supplying either FIGURE stamps manual", async () => {
+    await patch({ taxAmount: 16.55 });
+    assert.equal(updateArgs?.data.taxSource, "manual");
+    const afterAmount = updateArgs;
+    await patch({ taxDeductibleBase: 50 });
+    assert.notEqual(updateArgs, afterAmount, "a second write happened");
+    assert.equal(updateArgs?.data.taxSource, "manual");
+});
+
+test("a phase-only edit touches neither the flag nor the provenance", async () => {
+    await patch({ costCodeId: null });
+    assert.equal(updateArgs?.data.taxSource, undefined);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined);
 });

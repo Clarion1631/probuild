@@ -62,7 +62,7 @@ import {
     resolveExpenseProjectId,
 } from "../src/lib/expense-attribution";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
-import { lockExpense } from "../src/lib/expense-lock";
+import { lockExpense, lockProjectPhaseRowsForShare } from "../src/lib/expense-lock";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
 import { csvCell, csvNumber } from "../src/lib/csv-safe";
 
@@ -395,22 +395,9 @@ async function lockRowsForShare(tx, table, ids) {
     );
 }
 
-/**
- * The job's phase rows — the same universe `readAllowedCodes` reads, held still
- * while it reads them. Without this, a phase deleted between the phase read and
- * the write puts a code on a job that no longer has it.
- */
-async function lockProjectPhaseRows(tx, projectId) {
-    if (!projectId) return;
-    await tx.$queryRawUnsafe(
-        `SELECT ei.id FROM "EstimateItem" ei
-           JOIN "Estimate" e ON e.id = ei."estimateId"
-          WHERE e."projectId" = $1 AND ei."costCodeId" IS NOT NULL
-          ORDER BY ei.id
-            FOR SHARE OF ei`,
-        projectId,
-    );
-}
+// The job's phase rows are held by the SHARED helper in expense-lock.ts, which
+// the receipt booking takes too — one statement, one lock order, so the two
+// writers of a cost code cannot deadlock against each other.
 
 /**
  * One transaction: the derived-from rows are share-locked FIRST, then the
@@ -428,7 +415,7 @@ export async function writeUnderAttributionLocks(db, locks, run) {
     return db.$transaction(async tx => {
         await lockRowsForShare(tx, '"Estimate"', estimateIds);
         await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
-        await lockProjectPhaseRows(tx, phaseProjectId);
+        await lockProjectPhaseRowsForShare(tx, phaseProjectId);
         await lockExpense(tx, expenseId);
         return run(tx);
     });

@@ -213,11 +213,12 @@ test("an unattributed row labels as nothing at all", () => {
 
 // ── the one tax plausibility bound (Codex round 15, item 1) ────────────────
 
-test("the tax bound is 12% of the gross, rounded to cents", () => {
+test("the tax bound is 12% of the gross MAGNITUDE, rounded to cents", () => {
     assert.equal(maxPlausibleTaxAmount(100), 12);
     assert.equal(maxPlausibleTaxAmount(207.74), 24.93);
     assert.equal(maxPlausibleTaxAmount(0), 0, "no receipt, no allowance");
-    assert.equal(maxPlausibleTaxAmount(-5), 0);
+    // A refund is a negative expense; its allowance is the same size.
+    assert.equal(maxPlausibleTaxAmount(-100), 12);
 });
 
 test("zero is plausible, a transposed read is not", () => {
@@ -229,6 +230,18 @@ test("zero is plausible, a transposed read is not", () => {
     assert.equal(isPlausibleReceiptTax(12, 100), true, "the bound itself is allowed");
     assert.equal(isPlausibleReceiptTax(12.01, 100), false);
     assert.equal(isPlausibleReceiptTax(90, 100), false);
-    assert.equal(isPlausibleReceiptTax(-1, 100), false);
     assert.equal(isPlausibleReceiptTax(Number.NaN, 100), false);
+});
+
+test("a REFUND's tax is negative, and a positive one on it is refused", () => {
+    // A return or vendor credit is a negative expense and the tax comes back
+    // with it. Refusing that shape would push a bookkeeper into recording the
+    // credit as a positive, which the excise report then ADDS to a deduction it
+    // should be reducing.
+    assert.equal(isPlausibleReceiptTax(-4, -50), true, "-$4 of tax on a -$50 return");
+    assert.equal(isPlausibleReceiptTax(-6, -50), true, "12% of the magnitude");
+    assert.equal(isPlausibleReceiptTax(-6.01, -50), false, "and no further");
+    assert.equal(isPlausibleReceiptTax(4, -50), false, "a dropped minus sign");
+    assert.equal(isPlausibleReceiptTax(-4, 50), false, "and the same the other way");
+    assert.equal(isPlausibleReceiptTax(0, -50), true, "a credit can carry no tax");
 });

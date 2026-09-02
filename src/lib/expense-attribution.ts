@@ -260,21 +260,40 @@ export function resolveExpenseProjectLabel(
  * The rate is measured against the GROSS `Expense.amount`, which is what both
  * writers hold; on any receipt this side of the bound the difference from a
  * pre-tax basis is far smaller than the slack in the 12%.
+ *
+ * AMOUNTS ARE SIGNED. A refund, a return or a vendor credit is a NEGATIVE
+ * expense, and the tax on it comes back too: -$50 with -$4 of tax is an
+ * ordinary Lowe's return. Treating "negative" as "invalid" would have made
+ * every credit unclassifiable and pushed a bookkeeper into recording it as a
+ * positive, which the excise report would then ADD to the deduction instead of
+ * subtracting it. So the rule is about DIRECTION and MAGNITUDE, not about
+ * positivity: the tax must point the same way as the money, and it can never be
+ * larger than the money.
  */
 export const MAX_PLAUSIBLE_TAX_RATE = 0.12;
 
-/** The largest tax figure this receipt could plausibly carry, in dollars. */
+/**
+ * The largest tax figure this receipt could plausibly carry, as a MAGNITUDE.
+ * Compare it against `Math.abs(taxAmount)`; the sign is a separate rule.
+ */
 export function maxPlausibleTaxAmount(grossAmount: number): number {
-    if (!Number.isFinite(grossAmount) || grossAmount <= 0) return 0;
-    return Math.round(grossAmount * MAX_PLAUSIBLE_TAX_RATE * 100) / 100;
+    if (!Number.isFinite(grossAmount)) return 0;
+    return Math.round(Math.abs(grossAmount) * MAX_PLAUSIBLE_TAX_RATE * 100) / 100;
 }
 
 /**
  * True when `taxAmount` is a believable amount of sales tax on `grossAmount`.
- * Zero is plausible ("this receipt had no tax"); a negative one is not.
+ *
+ * Zero is always plausible ("this receipt had no tax"). Otherwise the tax must
+ * carry the SAME SIGN as the amount — a positive tax on a refund is either a
+ * dropped minus sign or a filing that claims a deduction for money that came
+ * back — and its magnitude must be within the 12% band. The `<= |amount|`
+ * half of the database CHECK is implied by that band and stated there too,
+ * where nothing enforces the band itself.
  */
 export function isPlausibleReceiptTax(taxAmount: number, grossAmount: number): boolean {
-    if (!Number.isFinite(taxAmount) || taxAmount < 0) return false;
+    if (!Number.isFinite(taxAmount) || !Number.isFinite(grossAmount)) return false;
     if (taxAmount === 0) return true;
-    return taxAmount <= maxPlausibleTaxAmount(grossAmount);
+    if (Math.sign(taxAmount) !== Math.sign(grossAmount)) return false;
+    return Math.abs(taxAmount) <= maxPlausibleTaxAmount(grossAmount);
 }

@@ -144,19 +144,23 @@ BEGIN
   END IF;
 END $$`,
 
-    // TAX CANNOT EXCEED THE GROSS (Codex round 6, item 2). The deduction base
-    // is `amount - taxAmount`, so a tax above the gross makes it NEGATIVE and
-    // the report subtracts money from the filing. The taxDeductibleBase CHECK
-    // does not cover it — a NULL allocation has nothing to violate.
-    `DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'Expense_taxAmount_check'
-                    AND conrelid = '"Expense"'::regclass) THEN
-    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAmount_check"
-      CHECK ("taxAmount" IS NULL
-             OR ("taxAmount" >= 0 AND "taxAmount" <= "amount"));
-  END IF;
-END $$`,
+    // TAX POINTS THE SAME WAY AS THE MONEY, AND IS NEVER BIGGER THAN IT
+    // (round 6 item 2; signed amounts, round 16 item 3). The deduction base is
+    // `amount - taxAmount`, so a tax above the gross makes it NEGATIVE and the
+    // report subtracts money from the filing; the taxDeductibleBase CHECK does
+    // not cover that, since a NULL allocation has nothing to violate.
+    //
+    // `amount` is SIGNED — a refund or vendor credit is a negative expense and
+    // its tax comes back with it. The first version refused every such row.
+    //
+    // DROPPED AND RE-ADDED BY NAME rather than skipped when present, so a
+    // database already carrying the old definition is corrected. Both
+    // statements are re-runnable.
+    `ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAmount_check"`,
+    `ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAmount_check"
+  CHECK ("taxAmount" IS NULL
+         OR "taxAmount" = 0
+         OR (sign("taxAmount") = sign("amount") AND abs("taxAmount") <= abs("amount")))`,
 
     // THE DEDUCTION INVARIANT, IN THE DATABASE (Codex round 5, item 4).
     // Enforced only by the API handler before this: read the amount, validate,
@@ -246,7 +250,14 @@ export const expectedCheckConstraints = [
     {
         name: "Expense_taxAmount_check",
         table: "Expense",
-        mustMatch: [/"taxAmount" IS NULL/, /"taxAmount" >= \(?0/, /"taxAmount" <= amount/],
+        mustMatch: [
+            /"taxAmount" IS NULL/,
+            /"taxAmount" = \(?0/,
+            // pg_get_constraintdef renders `amount` unquoted (all-lowercase,
+            // not a keyword) while the mixed-case column keeps its quotes.
+            /sign\("taxAmount"\) = sign\(amount\)/,
+            /abs\("taxAmount"\) <= abs\(amount\)/,
+        ],
     },
     {
         name: "Expense_taxDeductibleBase_check",
