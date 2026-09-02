@@ -162,7 +162,7 @@ test("evidence appears → close; evidence disappears → reopen at the next gen
     const store = inMemoryLifecycle();
     await run(store, []);
 
-    const matched: ReceiptEvidenceExpense[] = [{ id: "exp-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }];
+    const matched: ReceiptEvidenceExpense[] = [{ id: "exp-1", hasReceipt: true, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }];
     const closing = await run(store, matched);
     assert.equal(closing.closed, 1);
     const lowes = store.issues.get(`${RECEIPT_REQUEST_TARGET_TYPE}::bl-lowes`)!;

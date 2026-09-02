@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
     BANK_LINE_IDENTITY_LOCK,
     QBO_MINT_MIN_AGE_DAYS,
+    identityPayee,
     bankLineIdentityKey,
     planQboMint,
     planStatementAdoption,
@@ -391,5 +392,97 @@ test("both write paths take the SAME lock key, and plan inside it", () => {
         assert.ok(lockAt > 0, `${label} must take the shared identity lock`);
         const planAt = source.indexOf(planner);
         assert.ok(planAt > lockAt, `${label} must PLAN inside the lock, not before it`);
+    }
+});
+
+// ── One canonical identity across raw descriptors (Codex round-3 P0 3) ──────
+
+/**
+ * REAL-SHAPED descriptors, not matching ones. The earlier convergence tests
+ * passed only because their fixtures already agreed on the payee — the actual
+ * pull appends the QBO transaction type, so the two sides never matched in
+ * production and every adoption missed.
+ */
+const QBO_RAW = "LOWES #02516 Expense";
+const STATEMENT_RAW = "LOWES #02516 POS DEB C#8516 07/01/26";
+
+test("identityPayee collapses the real QBO and statement forms to ONE key", () => {
+    assert.equal(identityPayee(QBO_RAW), "LOWES #02516");
+    assert.equal(identityPayee(STATEMENT_RAW), "LOWES #02516");
+    assert.equal(identityPayee(QBO_RAW), identityPayee(STATEMENT_RAW));
+});
+
+test("identityPayee strips every appended QBO type, longest first", async t => {
+    const cases: Array<[string, string]> = [
+        ["ACME Expense", "ACME"],
+        ["ACME Check", "ACME"],
+        ["ACME Deposit", "ACME"],
+        ["ACME Transfer", "ACME"],
+        ["ACME Bill Payment", "ACME"],
+        ["ACME Journal Entry", "ACME"],
+        ["ACME Credit Card Credit", "ACME"],
+        ["WA DEPT OF REVENUE Sales Tax Payment", "WA DEPT OF REVENUE"],
+    ];
+    for (const [raw, expected] of cases) {
+        await t.test(raw, () => assert.equal(identityPayee(raw), expected));
+    }
+    // "SALES TAX PAYMENT" must not be eaten as a bare "PAYMENT".
+    assert.notEqual(identityPayee("WA DEPT OF REVENUE Sales Tax Payment"), "WA DEPT OF REVENUE SALES TAX");
+});
+
+test("identityPayee leaves a payee that merely CONTAINS a type word alone", () => {
+    assert.equal(identityPayee("EXPENSE REDUCTION ANALYSTS"), "EXPENSE REDUCTION ANALYSTS");
+    assert.equal(identityPayee("CHECKERS DRIVE IN"), "CHECKERS DRIVE IN");
+});
+
+test("an empty identity stays empty and can never match", () => {
+    assert.equal(identityPayee("C#8516 *****3255001"), "");
+    assert.equal(identityPayee(""), "");
+});
+
+test("CONVERGENCE with MISMATCHED raw descriptors: QBO first, statement second", () => {
+    // 1. The pull mints from the QBO row.
+    const observation = obs({ rawDescriptor: QBO_RAW, normalizedPayee: identityPayee(QBO_RAW) });
+    const mintPlan = planQboMint([observation], [], NOW);
+    assert.equal(mintPlan.mint.length, 1);
+    const minted = existing({ id: "bl-qbo", qbTxnId: "6625", sourceOfRecord: "QBO", normalizedPayee: identityPayee(QBO_RAW) });
+
+    // 2. The statement arrives with its OWN descriptor and must adopt it.
+    const adoption = planStatementAdoption(
+        [stmt({ normalizedPayee: identityPayee(STATEMENT_RAW) })],
+        [minted],
+        ACCOUNT,
+    );
+    assert.deepEqual([...adoption.adopt.entries()], [[0, "bl-qbo"]], "the twin this used to create is the bug");
+    assert.deepEqual(adoption.mint, []);
+});
+
+test("CONVERGENCE with MISMATCHED raw descriptors: statement first, QBO second", () => {
+    const statementLine = existing({ id: "bl-stmt", sourceOfRecord: "STATEMENT", normalizedPayee: identityPayee(STATEMENT_RAW) });
+    const observation = obs({ rawDescriptor: QBO_RAW, normalizedPayee: identityPayee(QBO_RAW) });
+    const plan = planQboMint([observation], [statementLine], NOW);
+    assert.equal(plan.mint.length, 0, "the pull must SEE the statement's line, not mint beside it");
+    assert.equal(plan.skipped.statementLineExists, 1);
+});
+
+test("adoption copies the statement's descriptor, so the card owner is not lost", () => {
+    // The QBO descriptor has no C#tail; the statement's is the only evidence of
+    // whose card it was. Leaving the QBO text behind left every adopted line
+    // owned by "office" and nobody was ever asked for the receipt.
+    const source = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    assert.match(source, /rawDescriptor: line\.rawDescriptor/);
+    assert.match(source, /normalizedPayee: line\.normalizedPayee/);
+    assert.match(source, /checkNumber: line\.checkNumber/);
+    // And it stays scoped to lines the statement actually adopted.
+    assert.match(source, /where: \{ id: bankLineId, sourceOfRecord: "QBO" \}/);
+});
+
+test("both write paths derive identity from the RAW descriptor, not a stored column", () => {
+    for (const file of [
+        "src/app/api/cron/bank-register-pull/route.ts",
+        "src/app/api/integrations/bank-ledger/ingest/route.ts",
+    ]) {
+        const source = readFileSync(join(repoRoot, file), "utf8");
+        assert.match(source, /identityPayee\(/, `${file} must use the shared identity function`);
     }
 });

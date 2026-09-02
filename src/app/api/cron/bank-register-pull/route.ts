@@ -12,7 +12,7 @@ import {
     type BankRegisterIngestResult,
 } from "@/lib/bank-register-pull";
 import { normalizePayee } from "@/lib/bank-ledger";
-import { BANK_LINE_IDENTITY_LOCK, planQboMint } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, identityPayee, planQboMint } from "@/lib/bank-line-mint";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
 import { bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
 
@@ -76,7 +76,9 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
             }),
             tx.bankLine.findMany({
                 where: { account, postedDate: { gte: since } },
-                select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
+                // rawDescriptor, not the stored normalizedPayee: the identity
+                // key is derived the same way on both sides or it is not one key.
+                select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
             }),
         ]);
 
@@ -87,7 +89,8 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                 postedDate: row.postedDate.toISOString().slice(0, 10),
                 amountCents: row.amountCents,
                 rawDescriptor: row.rawDescriptor,
-                normalizedPayee: normalizePayee(row.rawDescriptor),
+                // ONE identity function, both sides. See identityPayee.
+                normalizedPayee: identityPayee(row.rawDescriptor),
                 checkNumber: row.checkNumber,
                 bankLineId: row.bankLineId,
             })),
@@ -97,7 +100,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                 account: row.account,
                 postedDate: row.postedDate.toISOString().slice(0, 10),
                 amountCents: row.amountCents,
-                normalizedPayee: row.normalizedPayee,
+                normalizedPayee: identityPayee(row.rawDescriptor),
                 checkNumber: row.checkNumber,
                 sourceOfRecord: row.sourceOfRecord,
             })),
@@ -115,7 +118,10 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                     postedDate: new Date(`${observation.postedDate}T00:00:00Z`),
                     amountCents: observation.amountCents,
                     rawDescriptor: observation.rawDescriptor,
-                    normalizedPayee: observation.normalizedPayee,
+                    // STORED value keeps the conventional normalization, which
+                    // is what reconcileObservations and the rest of the ledger
+                    // read. `identityPayee` is a matching key, not a column.
+                    normalizedPayee: normalizePayee(observation.rawDescriptor),
                     checkNumber: observation.checkNumber,
                     state: "POSTED",
                     sourceOfRecord: "QBO",

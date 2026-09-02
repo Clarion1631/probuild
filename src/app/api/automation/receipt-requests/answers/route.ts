@@ -83,39 +83,67 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, ignored: true, reason: "not-a-signature" });
     }
 
-    const issue = await prisma.reviewIssue.findUnique({
-        where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
-        select: { id: true, version: true, displayDetails: true, clearedAt: true },
-    });
-    if (!issue) {
+    // RECORD FIRST, CLEAR ONLY IF IT COMMITTED.
+    //
+    // This used to clear the issue even when its details CAS lost — leaving a
+    // cleared issue with NO resolution, which the next nightly sweep read as
+    // "still unmatched" and reopened. The memo the owner signed changed
+    // nothing. So: read fresh, merge, write version-guarded, and retry ONCE
+    // from another fresh read if a concurrent writer moved the row. Only a
+    // committed resolution earns the clear.
+    let recorded: { targetKey: string } | null = null;
+    let alreadyCleared = false;
+    let missing = false;
+
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing; attempt++) {
+        const issue = await prisma.reviewIssue.findUnique({
+            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
+            select: { id: true, version: true, displayDetails: true, clearedAt: true },
+        });
+        if (!issue) { missing = true; break; }
+        if (issue.clearedAt !== null) {
+            // Already answered — a replayed record is a no-op, never a reopen.
+            alreadyCleared = true;
+            break;
+        }
+
+        // Merged from THIS read, not from anything older: a card record or a
+        // corrected amount written since must survive.
+        const details = parseMissingReceiptDetails(issue.displayDetails);
+        details.resolution = "memo-signed";
+        if (typeof body.pdf_url === "string" && body.pdf_url.length <= MAX_URL_LEN && isHttpsUrl(body.pdf_url)) {
+            details.pdfUrl = body.pdf_url;
+        }
+        if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
+        if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
+
+        const written = await prisma.reviewIssue.updateMany({
+            where: { id: issue.id, version: issue.version, clearedAt: null },
+            data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
+        });
+        if (written.count === 1) recorded = { targetKey: bankLineId };
+    }
+
+    if (missing) {
         return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
     }
-    if (issue.clearedAt !== null) {
-        // Already answered — a replayed record is a no-op, never a reopen.
+    if (alreadyCleared) {
         return NextResponse.json({ ok: true, alreadyCleared: true });
     }
-
-    const details = parseMissingReceiptDetails(issue.displayDetails);
-    details.resolution = "memo-signed";
-    if (typeof body.pdf_url === "string" && body.pdf_url.length <= MAX_URL_LEN && isHttpsUrl(body.pdf_url)) {
-        details.pdfUrl = body.pdf_url;
+    if (!recorded) {
+        // Two attempts both lost the race. Clearing now would silence the chase
+        // with nothing on the row to say why, and the next sweep would reopen
+        // it anyway. 409 so the forwarder retries — the record is idempotent.
+        return NextResponse.json(
+            { ok: false, reason: "resolution-not-recorded", targetKey: bankLineId },
+            { status: 409 },
+        );
     }
-    if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
-    if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
-
-    // TWO writes, in this order and for a reason: the lifecycle's "clear" step
-    // deliberately does NOT touch displayDetails (episode snapshots stay
-    // immutable), so recording the memo has to happen first, version-guarded.
-    // If that guard loses a race the clear still runs — silencing a chase whose
-    // memo is signed matters more than the link to the PDF, and the answer is
-    // honest about which parts landed.
-    const recorded = await prisma.reviewIssue.updateMany({
-        where: { id: issue.id, version: issue.version, clearedAt: null },
-        data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
-    });
 
     // Empty codes = lifecycle step 1 = clear, and it cancels any open episode.
+    // Reached only because the resolution is durably on the row, so a sweep
+    // that races this clear still sees the resolution and will not reopen.
     await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, bankLineId, [], null);
 
-    return NextResponse.json({ ok: true, cleared: true, memoRecorded: recorded.count === 1, targetKey: bankLineId });
+    return NextResponse.json({ ok: true, cleared: true, memoRecorded: true, targetKey: bankLineId });
 }

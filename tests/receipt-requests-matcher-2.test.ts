@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     appendCardRecord,
     evidenceUnitKey,
@@ -18,6 +21,7 @@ import {
  */
 
 const NOW = new Date("2026-08-20T09:00:00Z");
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const line = (over: Partial<ReceiptRequestBankLine> = {}): ReceiptRequestBankLine => ({
     id: "bl-1",
@@ -30,6 +34,7 @@ const line = (over: Partial<ReceiptRequestBankLine> = {}): ReceiptRequestBankLin
 
 const expense = (over: Partial<ReceiptEvidenceExpense> = {}): ReceiptEvidenceExpense => ({
     id: "exp-1",
+    hasReceipt: true,
     amountCents: 12_345,
     date: "2026-08-16",
     vendor: "Lowe's Home Improvement",
@@ -209,7 +214,7 @@ test("a booked intake and its Expense are ONE receipt, not two", () => {
     // the exact failure the one-to-one rule exists to prevent.
     const result = planReceiptRequests({
         bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
-        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", hasReceipt: true, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
         intakes: [{ id: "int-1", expenseId: "exp-1", qbPurchaseId: "QB-1", totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
         openIssueKeys: [],
         resolvedIssueKeys: [],
@@ -221,7 +226,7 @@ test("a booked intake and its Expense are ONE receipt, not two", () => {
 test("they fold on qbPurchaseId alone when the expense link is absent", () => {
     const result = planReceiptRequests({
         bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
-        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", hasReceipt: true, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
         intakes: [{ id: "int-1", expenseId: null, qbPurchaseId: "QB-1", totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
         openIssueKeys: [],
         resolvedIssueKeys: [],
@@ -234,7 +239,7 @@ test("an UNBOOKED intake and an unrelated expense stay two units", () => {
     // No shared identity — they really are two separate pieces of evidence.
     const result = planReceiptRequests({
         bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
-        expenses: [{ id: "exp-1", qbPurchaseId: null, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        expenses: [{ id: "exp-1", qbPurchaseId: null, hasReceipt: true, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
         intakes: [{ id: "int-1", expenseId: null, qbPurchaseId: null, totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "READ" }],
         openIssueKeys: [],
         resolvedIssueKeys: [],
@@ -256,11 +261,54 @@ test("evidenceUnitKey prefers the purchase id, then the expense link", () => {
 test("they fold on the expense link when neither has a purchase id", () => {
     const result = planReceiptRequests({
         bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
-        expenses: [{ id: "exp-1", qbPurchaseId: null, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        expenses: [{ id: "exp-1", qbPurchaseId: null, hasReceipt: true, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
         intakes: [{ id: "int-1", expenseId: "exp-1", qbPurchaseId: null, totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
         openIssueKeys: [],
         resolvedIssueKeys: [],
         now: NOW,
     });
     assert.equal(result.open.length, 1);
+});
+
+// ── Only real receipt evidence closes a chase (Codex round-3 P0 2) ──────────
+
+test("a QBO-synced Expense with no receipt does NOT close the chase", () => {
+    // The 4-hourly QBO sync creates an Expense for every finalized purchase,
+    // receipt or no receipt. Counting those as evidence closed precisely the
+    // cases this chaser exists to find.
+    const result = plan({
+        expenses: [expense({ hasReceipt: false, qbPurchaseId: "QB-1" })],
+        openIssueKeys: [],
+    });
+    assert.equal(result.open.length, 1, "a receiptless expense IS the missing receipt");
+});
+
+test("the same Expense WITH a receiptUrl closes it", () => {
+    const result = plan({ expenses: [expense({ hasReceipt: true })], openIssueKeys: ["bl-1"] });
+    assert.deepEqual(result.open, []);
+    assert.deepEqual(result.close, ["bl-1"]);
+});
+
+test("an open issue is NOT closed by a receiptless expense", () => {
+    const result = plan({ expenses: [expense({ hasReceipt: false })], openIssueKeys: ["bl-1"] });
+    assert.deepEqual(result.close, [], "closing here would silence a real gap");
+    assert.equal(result.open.length, 1);
+});
+
+test("a live ReceiptIntake still closes it on its own — an intake IS a receipt", () => {
+    const result = planReceiptRequests({
+        bankLines: [line()],
+        expenses: [expense({ hasReceipt: false })],
+        intakes: [{ id: "int-1", totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "READ" }],
+        openIssueKeys: ["bl-1"],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.deepEqual(result.close, ["bl-1"]);
+});
+
+test("the cron derives hasReceipt from receiptUrl OR a linked intake", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /hasReceipt: !!row\.receiptUrl \|\| row\.receiptIntake !== null/);
+    assert.match(source, /receiptIntake: \{ select: \{ id: true \} \}/);
 });

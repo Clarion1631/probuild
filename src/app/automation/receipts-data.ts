@@ -194,6 +194,58 @@ export function toMissingReceiptRow(issue: {
     };
 }
 
+/** Page size for the owner-filtered scan. */
+const ISSUE_SCAN_PAGE = 500;
+/** Absolute stop, so a pathological backlog cannot hang a page render. */
+const ISSUE_SCAN_MAX_PAGES = 40;
+
+/**
+ * Open missing-receipt issues, newest first, PAGED when an owner filter is set.
+ *
+ * Owner lives inside `displayDetails` — a TEXT column holding JSON — so it
+ * cannot be a SQL predicate (a jsonb cast raises on one malformed row and would
+ * take the whole tab down). Filtering a single 100-row page in memory therefore
+ * rendered "no missing receipts for Richard" whenever his oldest item sat
+ * outside the newest page: an empty queue that looked like good news.
+ *
+ * So an owner-filtered view keeps paging until it has a full display page for
+ * that owner or the queue is exhausted, exactly as the card scan does.
+ * Unfiltered, one page is the whole answer and nothing extra is read.
+ */
+async function scanMissingReceiptIssues(owner: string | null) {
+    const where = { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null };
+    const select = {
+        id: true, targetKey: true, version: true, reasonHash: true,
+        reasonCodes: true, acknowledgedCodes: true, displayDetails: true,
+    } as const;
+
+    if (owner === null) {
+        return prisma.reviewIssue.findMany({ where, orderBy: { firstObservedAt: "desc" }, take: RECEIPT_GROUP_TAKE, select });
+    }
+
+    type IssueRow = { id: string; targetKey: string; version: number; reasonHash: string; reasonCodes: string; acknowledgedCodes: string; displayDetails: string | null };
+    const matched: IssueRow[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < ISSUE_SCAN_MAX_PAGES && matched.length < RECEIPT_GROUP_TAKE; page++) {
+        const rows = await prisma.reviewIssue.findMany({
+            where,
+            orderBy: [{ firstObservedAt: "desc" }, { id: "desc" }],
+            take: ISSUE_SCAN_PAGE,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+            select,
+        });
+        if (rows.length === 0) break;
+        cursor = rows[rows.length - 1].id;
+        for (const row of rows) {
+            if (matched.length >= RECEIPT_GROUP_TAKE) break;
+            const details = parseMissingReceiptDetails(row.displayDetails);
+            if ((typeof details.owner === "string" ? details.owner : "unassigned") === owner) matched.push(row);
+        }
+        if (rows.length < ISSUE_SCAN_PAGE) break;
+    }
+    return matched;
+}
+
 /**
  * The six groups plus their badge counts. Counts come from count queries so a
  * capped list can never understate the size of a queue.
@@ -222,15 +274,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
         loadIntakes(bookingWhere),
         loadIntakes(bookedTodayWhere),
         loadIntakes(duplicatesWhere),
-        prisma.reviewIssue.findMany({
-            where: issueWhere,
-            orderBy: { firstObservedAt: "desc" },
-            take: RECEIPT_GROUP_TAKE,
-            select: {
-                id: true, targetKey: true, version: true, reasonHash: true,
-                reasonCodes: true, acknowledgedCodes: true, displayDetails: true,
-            },
-        }),
+        scanMissingReceiptIssues(filters.owner),
         prisma.receiptIntake.count({ where: needsJobWhere }),
         prisma.receiptIntake.count({ where: needsReviewWhere }),
         prisma.receiptIntake.count({ where: bookingWhere }),

@@ -114,6 +114,83 @@ export async function applyReceiptRequestPlan(
     return summary;
 }
 
+/**
+ * Re-derive one line's verdict from CURRENT data (Codex round-3 finding 5).
+ *
+ * Deliberately narrower than the batch: it sees only this line, so it cannot
+ * observe another line competing for the same receipt. That makes it slightly
+ * MORE likely to close than the batch would be — the safe direction on a retry
+ * path, since the next full sweep reopens anything it got wrong, whereas a
+ * wrongly-reapplied stale open nags a human tonight.
+ */
+async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
+    const [line, issue] = await Promise.all([
+        prisma.bankLine.findUnique({
+            where: { id: targetKey },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        }),
+        prisma.reviewIssue.findUnique({
+            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
+            select: { displayDetails: true },
+        }),
+    ]);
+    // A line that no longer exists cannot owe a receipt.
+    if (!line) return [];
+    // An answered issue is never re-asked.
+    if (hasResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null))) return [];
+
+    const from = new Date(line.postedDate.getTime() - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
+    const to = new Date(line.postedDate.getTime() + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
+    const [expenseRows, intakeRows] = await Promise.all([
+        prisma.expense.findMany({
+            where: { date: { gte: from, lte: to } },
+            select: {
+                id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
+                receiptUrl: true, receiptIntake: { select: { id: true } },
+            },
+        }),
+        prisma.receiptIntake.findMany({
+            where: { txnDate: { gte: from, lte: to }, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
+        }),
+    ]);
+
+    const plan = planReceiptRequests({
+        bankLines: [{
+            id: line.id,
+            postedDate: line.postedDate.toISOString().slice(0, 10),
+            amountCents: line.amountCents,
+            rawDescriptor: line.rawDescriptor,
+            checkNumber: line.checkNumber,
+        }],
+        expenses: expenseRows.flatMap(row => {
+            const cents = decimalStringToCents(row.amount.toString());
+            if (cents === null) return [];
+            return [{
+                id: row.id,
+                qbPurchaseId: row.qbPurchaseId,
+                hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+                amountCents: cents,
+                date: row.date ? row.date.toISOString().slice(0, 10) : null,
+                vendor: row.vendor,
+            }];
+        }),
+        intakes: intakeRows.map(row => ({
+            id: row.id,
+            expenseId: row.expenseId,
+            qbPurchaseId: row.qbPurchaseId,
+            totalCents: row.totalCents,
+            txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
+            vendor: row.vendor,
+            state: row.state,
+        })),
+        openIssueKeys: [targetKey],
+        resolvedIssueKeys: [],
+        now: new Date(),
+    });
+    return plan.open.length > 0 ? ["MISSING_RECEIPT"] : [];
+}
+
 /** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
 function ymdDaysBefore(now: Date, days: number): string {
     return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
@@ -176,7 +253,13 @@ export async function GET(request: Request) {
         }),
         prisma.expense.findMany({
             where: evidenceDateWhere,
-            select: { id: true, amount: true, date: true, vendor: true, qbPurchaseId: true },
+            select: {
+                id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
+                receiptUrl: true,
+                // A linked intake IS a receipt: the row only exists because a
+                // document was uploaded and read.
+                receiptIntake: { select: { id: true } },
+            },
         }),
         prisma.receiptIntake.findMany({
             where: { ...intakeDateWhere, state: { notIn: [...DEAD_INTAKE_STATES] } },
@@ -200,7 +283,14 @@ export async function GET(request: Request) {
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
-            return [{ id: row.id, qbPurchaseId: row.qbPurchaseId, amountCents: cents, date: row.date ? row.date.toISOString().slice(0, 10) : null, vendor: row.vendor }];
+            return [{
+                id: row.id,
+                qbPurchaseId: row.qbPurchaseId,
+                hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+                amountCents: cents,
+                date: row.date ? row.date.toISOString().slice(0, 10) : null,
+                vendor: row.vendor,
+            }];
         }),
         intakes: intakeRows.map(row => ({
             id: row.id,
@@ -243,8 +333,22 @@ export async function GET(request: Request) {
             targetKey,
             codes,
             displayDetails ? mergeReceiptRequestDetails(freshDetails, displayDetails) : null,
-            // Delivery is the per-owner digest, never the per-issue drainer.
-            { episodeStatus: "SUPPRESSED" },
+            {
+                // Delivery is the per-owner digest, never the per-issue drainer.
+                episodeStatus: "SUPPRESSED",
+                // RECOMPUTE ON OCC RETRY, never reapply the snapshot.
+                //
+                // The advisory claim above is transaction-scoped and released
+                // before any work, so two sweeps CAN overlap. A version
+                // conflict means someone else just committed to this exact row
+                // — replaying our minutes-old verdict could let a stale OPEN
+                // win over a newer CLOSE, or write details back over a
+                // signature that landed in between. This re-derives the verdict
+                // for this ONE line from current data instead. Returning []
+                // routes through the lifecycle's clear step, which does not
+                // touch displayDetails, so a concurrent resolution survives.
+                recomputeCodes: () => recomputeCodesFor(targetKey),
+            },
         );
     });
 

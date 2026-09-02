@@ -845,12 +845,16 @@ test("a void that lands AFTER the send parks the orphaned Purchase for a human",
     // The pre-send re-read narrows this window but cannot close it: QuickBooks
     // takes real time to answer, and the money exists the moment it does. QBO
     // is read-only from this pipeline, so nothing here can take it back.
-    const { deps, purchaseCalls, intakeUpdates, events } = recorder({}, { intakeStillBooking: false });
+    const { deps, purchaseCalls, intakeUpdates, events, expenses } = recorder({}, { intakeStillBooking: false });
     const result = await bookReceipt(row(), deps);
 
     assert.equal(result.outcome, "booked-after-void");
     assert.equal((result as { qbPurchaseId: string }).qbPurchaseId, "QB-1");
     assert.equal(purchaseCalls.length, 1, "the send did happen — that is the whole problem");
+
+    // BOTH TABLES. The Expense create used to run before the fence, so a void
+    // still polluted job costs with a purchase somebody had cancelled.
+    assert.deepEqual(expenses, [], "no Expense may be written for a voided row");
 
     const parked = intakeUpdates.find(u => u.stateReason === "booked-after-void");
     assert.ok(parked, "the row must record what happened");
@@ -863,11 +867,13 @@ test("a void that lands AFTER the send parks the orphaned Purchase for a human",
     assert.ok(events.some(e => e.status === "booked-after-void"), "and it must be auditable");
 });
 
-test("the fence does not fire on the normal path", async () => {
-    const { deps, intakeUpdates } = recorder();
+test("the fence does not fire on the normal path — and the Expense IS written", async () => {
+    const { deps, intakeUpdates, expenses } = recorder();
     const result = await bookReceipt(row(), deps);
     assert.equal(result.outcome, "booked");
+    assert.equal(expenses.length, 1);
     assert.ok(intakeUpdates.some(u => u.state === "BOOKED"));
+    assert.ok(intakeUpdates.some(u => u.expenseId), "and linked back onto the intake");
     assert.ok(!intakeUpdates.some(u => u.stateReason === "booked-after-void"));
 });
 

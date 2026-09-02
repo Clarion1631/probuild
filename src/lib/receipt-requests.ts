@@ -61,6 +61,17 @@ export interface ReceiptEvidenceExpense {
      * fold it together with the ReceiptIntake that created it — see
      * evidenceUnitKey. */
     qbPurchaseId?: string | null;
+    /**
+     * Does this Expense actually PROVE a receipt exists?
+     *
+     * The 4-hourly QBO sync creates an Expense for every finalized purchase,
+     * receipt or no receipt. Counting those as evidence closed exactly the
+     * cases this chaser exists to find: a card charge that reached QuickBooks
+     * and never got its receipt would silently satisfy its own bank line. Only
+     * an Expense carrying a `receiptUrl`, or one linked to a ReceiptIntake
+     * (which is a receipt by construction), is evidence.
+     */
+    hasReceipt: boolean;
     /** POSITIVE cents (an Expense's amount is a magnitude, not a signed posting). */
     amountCents: number;
     /** YYYY-MM-DD, or null when the expense has no date. */
@@ -307,7 +318,9 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     // the one-to-one rule this was supposed to enforce. They are folded by
     // whichever identity they share (expenseId, then qbPurchaseId).
     const evidence: EvidenceRow[] = dedupeEvidenceUnits([
-        ...input.expenses.map(e => ({
+        // An Expense with no receipt behind it is not evidence — it is the
+        // thing being looked for. See ReceiptEvidenceExpense.hasReceipt.
+        ...input.expenses.filter(e => e.hasReceipt).map(e => ({
             id: `expense:${e.id}`,
             // An Expense's own id IS the expense link the intake points at.
             unit: evidenceUnitKey({ expenseId: e.id, qbPurchaseId: e.qbPurchaseId }) ?? `expense:${e.id}`,

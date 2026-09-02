@@ -59,6 +59,7 @@
  * An empty normalizedPayee is NOT an identity (bank-ledger's rule) and never
  * mints and never adopts.
  */
+import { normalizePayee } from "./bank-ledger";
 
 /**
  * How old a QBO row must be before it may mint. QuickBooks shows pending and
@@ -76,6 +77,36 @@ export const QBO_MINT_MIN_AGE_DAYS = 2;
  * locking at all.
  */
 export const BANK_LINE_IDENTITY_LOCK = "bank-line-identity";
+
+/**
+ * QuickBooks transaction-type words the register pull APPENDS to the payee.
+ *
+ * `registerRowToIngestLine` builds "LOWES #02516 Expense" so two otherwise
+ * identical GL rows stay distinguishable. The bank statement for the same
+ * charge normalizes to "LOWES #02516". Exact-identity matching then missed
+ * every time — reconcile found nothing, adoption found nothing, and minting
+ * produced a twin for a transaction the statement had already recorded. The
+ * convergence tests passed only because their fixtures used matching payees.
+ *
+ * Longest-first, so "SALES TAX PAYMENT" is not eaten as "PAYMENT".
+ */
+const QBO_TYPE_SUFFIX =
+    /\s+(?:SALES TAX PAYMENT|CREDIT CARD (?:CREDIT|EXPENSE|PURCHASE|REFUND)|BILL PAYMENT|JOURNAL ENTRY|REFUND RECEIPT|VENDOR CREDIT|CASH PURCHASE|EXPENDITURE|DEPOSIT|TRANSFER|PURCHASE|PAYMENT|EXPENSE|REFUND|CREDIT|CHECK|BILL)$/;
+
+/**
+ * THE identity payee. Both sides of every comparison run this, and that
+ * symmetry is the point — not the specific words stripped.
+ *
+ * It is `normalizePayee` (rail markers, card refs, phones, dates, long refs)
+ * plus the appended QBO type. A statement descriptor ending in one of those
+ * words loses it too, which is harmless precisely BECAUSE both sides are
+ * treated identically: they still land on the same key. Identity also carries
+ * account, date, amount and check number, so a slightly shorter payee cannot
+ * collapse two genuinely different transactions on its own.
+ */
+export function identityPayee(rawDescriptor: string): string {
+    return normalizePayee(rawDescriptor ?? "").replace(QBO_TYPE_SUFFIX, "").trim();
+}
 
 export interface MintCandidateObservation {
     id: string;

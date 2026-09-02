@@ -10,7 +10,7 @@ import {
     isValidCalendarDate,
     isSafeCents,
 } from "@/lib/bank-ledger";
-import { BANK_LINE_IDENTITY_LOCK, planStatementAdoption } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, identityPayee, planStatementAdoption } from "@/lib/bank-line-mint";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -479,14 +479,14 @@ const handlers = createBankLedgerIngestHandlers({
                         sourceOfRecord: "QBO",
                         postedDate: { gte: new Date(input.periodStart), lte: new Date(input.periodEnd) },
                     },
-                    select: { id: true, account: true, postedDate: true, amountCents: true, normalizedPayee: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
                 });
                 const adoptionPlan = planStatementAdoption(
                     input.lines.map(line => ({
                         sequence: line.sequence,
                         postedDate: line.postedDate,
                         amountCents: line.amountCents,
-                        normalizedPayee: line.normalizedPayee,
+                        normalizedPayee: identityPayee(line.rawDescriptor),
                         checkNumber: line.checkNumber,
                     })),
                     adoptable.map(row => ({
@@ -495,7 +495,8 @@ const handlers = createBankLedgerIngestHandlers({
                         account: row.account,
                         postedDate: row.postedDate.toISOString().slice(0, 10),
                         amountCents: row.amountCents,
-                        normalizedPayee: row.normalizedPayee,
+                        // ONE identity function, both sides. See identityPayee.
+                        normalizedPayee: identityPayee(row.rawDescriptor),
                         checkNumber: row.checkNumber,
                         sourceOfRecord: row.sourceOfRecord,
                     })),
@@ -553,10 +554,27 @@ const handlers = createBankLedgerIngestHandlers({
                 // descriptor the statement is authoritative for.
                 const adoptedIds = [...adoptionPlan.adopt.values()];
                 if (adoptedIds.length > 0) {
-                    await tx.bankLine.updateMany({
-                        where: { id: { in: adoptedIds }, sourceOfRecord: "QBO" },
-                        data: { sourceOfRecord: "STATEMENT" },
-                    });
+                    // THE STATEMENT'S DESCRIPTOR WINS, per line, not just the
+                    // flag. The QBO descriptor is "LOWES #02516 Expense"; the
+                    // statement's carries "C#8516" — the ONLY evidence of whose
+                    // card it was. Flipping sourceOfRecord while leaving the
+                    // QBO text behind left every adopted line owned by
+                    // "office", so nobody was ever asked for the receipt.
+                    // `amountCents` is untouched (immutable by trigger, and
+                    // identical by construction — it is part of the match key).
+                    for (const [sequence, bankLineId] of adoptionPlan.adopt) {
+                        const line = input.lines.find(l => l.sequence === sequence);
+                        if (!line) continue;
+                        await tx.bankLine.updateMany({
+                            where: { id: bankLineId, sourceOfRecord: "QBO" },
+                            data: {
+                                sourceOfRecord: "STATEMENT",
+                                rawDescriptor: line.rawDescriptor,
+                                normalizedPayee: line.normalizedPayee,
+                                checkNumber: line.checkNumber,
+                            },
+                        });
+                    }
                 }
 
                 await tx.bankLineObservation.createMany({

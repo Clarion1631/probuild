@@ -156,3 +156,43 @@ test("no Phase 2 module imports a mail helper — nothing here ever emails a PDF
         assert.equal(/\bsendNotification\s*\(/.test(source), false, `${file} must not call sendNotification`);
     }
 });
+
+test("the answers route never clears an issue whose resolution did not commit", () => {
+    // It used to clear regardless of its CAS result, leaving a cleared issue
+    // with NO resolution — which the next sweep read as "still unmatched" and
+    // reopened. The memo the owner signed changed nothing.
+    const source = readFileSync(join(repoRoot, "src/app/api/automation/receipt-requests/answers/route.ts"), "utf8");
+
+    // Retry ONCE from a fresh read, not a reapplied snapshot.
+    assert.match(source, /for \(let attempt = 0; attempt < 2/);
+    assert.match(source, /const issue = await prisma\.reviewIssue\.findUnique\(/);
+    assert.match(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+
+    // The clear is UNREACHABLE unless the write committed.
+    const notRecordedAt = source.indexOf("if (!recorded) {");
+    const clearAt = source.indexOf("await evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, bankLineId, [], null);");
+    assert.ok(notRecordedAt > 0 && clearAt > notRecordedAt, "the guard must precede the clear");
+    assert.match(source, /reason: "resolution-not-recorded"/);
+    assert.match(source, /status: 409/);
+});
+
+test("the sweep recomputes source truth on an OCC retry instead of reapplying a snapshot", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /recomputeCodes: \(\) => recomputeCodesFor\(targetKey\)/);
+    // The recompute reads the line and the evidence again, and honours a
+    // resolution that landed since.
+    assert.match(source, /async function recomputeCodesFor\(targetKey: string\)/);
+    assert.match(source, /if \(hasResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\)\)\) return \[\];/);
+});
+
+test("the missing-receipt loader pages when an owner filter is set", () => {
+    // Filtering one 100-row page in memory rendered "nothing for Richard"
+    // whenever his oldest item sat outside the newest page — an empty queue
+    // that read as good news.
+    const source = readFileSync(join(repoRoot, "src/app/automation/receipts-data.ts"), "utf8");
+    assert.match(source, /async function scanMissingReceiptIssues\(owner: string \| null\)/);
+    assert.match(source, /matched\.length < RECEIPT_GROUP_TAKE/);
+    assert.match(source, /cursor: \{ id: cursor \}, skip: 1/);
+    // Unfiltered stays a single page — no extra reads for the common case.
+    assert.match(source, /if \(owner === null\) \{\s*\n\s*return prisma\.reviewIssue\.findMany\(\{ where, orderBy: \{ firstObservedAt: "desc" \}, take: RECEIPT_GROUP_TAKE, select \}\);/);
+});

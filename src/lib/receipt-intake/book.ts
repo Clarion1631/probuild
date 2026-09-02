@@ -645,6 +645,43 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
         const expenseId = await deps.db.$transaction(async tx => {
+            // THE FENCE COMES FIRST, and that ordering is the whole point.
+            //
+            // It used to run after the Expense was created, which meant a void
+            // landing during the QBO round trip still committed an Expense —
+            // polluting job costs with a purchase somebody had explicitly
+            // cancelled. The intake CAS is now the transaction's first write,
+            // and the Expense is created ONLY if it succeeded, in the same
+            // transaction. Losing the CAS creates nothing.
+            const claimed = await tx.receiptIntake.updateMany({
+                where: { id: row.id, state: "BOOKING" },
+                data: {
+                    state: "BOOKED",
+                    stateReason: null,
+                    qbPurchaseId: result.qbPurchaseId,
+                    bookedAt: now,
+                    lastError: null,
+                    nextRetryAt: null,
+                },
+            });
+            if (claimed.count === 0) {
+                // The money EXISTS in QuickBooks and nothing here can take it
+                // back (QBO is read-only from this pipeline). Record the
+                // Purchase id where a human will see it — deliberately NOT
+                // `qbPurchaseId`, which means "this row is booked", and this
+                // row is not. The queue surfaces "booked-after-void" so
+                // somebody voids it in QBO by hand. No Expense is written.
+                await tx.receiptIntake.update({
+                    where: { id: row.id },
+                    data: {
+                        postVoidQbPurchaseId: result.qbPurchaseId,
+                        stateReason: "booked-after-void",
+                        nextRetryAt: null,
+                    },
+                });
+                return null;
+            }
+
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
             // and the insert would fail on that constraint anyway.
