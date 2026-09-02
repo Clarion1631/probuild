@@ -105,6 +105,12 @@ model ReceiptIntake {
   // than its lease, and judging it on row age parked receipts whose own upload
   // link was still live. Null on rows that never had a signed URL.
   uploadUrlExpiresAt DateTime?
+  // Bumped every time a signed upload URL is issued, and EMBEDDED IN THE PATH
+  // that URL points at (`receipts/intake/<id>.v<n>.<ext>`). /start claims the
+  // new lease in ONE checked update before it signs anything; every park,
+  // publish and reject fences on the version it observed. That is what makes a
+  // sweep verdict about v1 land on nothing once the client has resumed on v2.
+  uploadLeaseVersion Int       @default(0)
   fileName    String?
   mimeType    String
   fileSize    Int
@@ -164,6 +170,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
   "storagePath" TEXT NOT NULL, "fileName" TEXT, "mimeType" TEXT NOT NULL,
   "fileSize" INTEGER NOT NULL, "fileSha256" TEXT NOT NULL,
   "expectedSha256" TEXT, "uploadUrlExpiresAt" TIMESTAMP(3),
+  "uploadLeaseVersion" INTEGER NOT NULL DEFAULT 0,
   "vendor" TEXT, "txnDate" DATE, "totalCents" INTEGER, "taxCents" INTEGER,
   "docType" TEXT, "refNumber" TEXT, "memo" TEXT, "readJson" TEXT, "readAt" TIMESTAMP(3),
   "dedupStrongKey" TEXT, "dedupWeakKey" TEXT, "duplicateOfId" TEXT,

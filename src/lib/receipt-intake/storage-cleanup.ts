@@ -98,6 +98,7 @@ export interface RejectTxClient {
     automationEvent: { create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }> };
     receiptIntake: {
         deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
+        findUnique(args: { where: { id: string } }): Promise<Record<string, unknown> | null>;
     };
 }
 
@@ -113,6 +114,8 @@ export interface RejectFence {
     state: string;
     stateReason: string | null;
     storagePath: string;
+    /** The upload lease the caller inspected. A newer one means a newer file. */
+    uploadLeaseVersion: number;
 }
 export interface RejectClient {
     $transaction<T>(fn: (tx: RejectTxClient) => Promise<T>): Promise<T>;
@@ -122,6 +125,14 @@ export async function rejectRowAndQueueCleanup(
     row: RejectFence,
     reason: string,
     db: RejectClient = prisma as unknown as RejectClient,
+    /**
+     * Re-checked against a FRESH read inside the transaction. The caller spent
+     * a storage round trip deciding this row was unacceptable; anything that
+     * changed in the meantime (a resumed upload lease, a re-park) has to be
+     * judged on the row as it is NOW, not as it was when the decision started.
+     * Return a reason to abort, or null to proceed.
+     */
+    verify: (fresh: Record<string, unknown>) => string | null = () => null,
 ): Promise<{ ok: true; eventId: string } | { ok: false }> {
     try {
         const eventId = await db.$transaction(async tx => {
@@ -148,6 +159,12 @@ export async function rejectRowAndQueueCleanup(
             // "Already gone" is deliberately NOT treated as success: an absent
             // row is a row somebody else accounted for, and queueing its path
             // for deletion here is how a live object gets swept.
+            // RE-READ INSIDE THE TRANSACTION, and let the caller judge it.
+            const fresh = await tx.receiptIntake.findUnique({ where: { id: row.id } });
+            if (!fresh) throw new RejectFenceLost(row.id);
+            const objection = verify(fresh);
+            if (objection) throw new RejectFenceLost(`${row.id}: ${objection}`);
+
             const { count } = await tx.receiptIntake.deleteMany({
                 where: {
                     id: row.id,
@@ -155,6 +172,10 @@ export async function rejectRowAndQueueCleanup(
                     stateReason: row.stateReason,
                     claimToken: null,
                     storagePath: row.storagePath,
+                    // The lease the caller INSPECTED. A resumed /start bumps
+                    // this and re-points the row at a new path, so a sweep
+                    // that decided on the old upload deletes nothing.
+                    uploadLeaseVersion: row.uploadLeaseVersion,
                 },
             });
             if (count !== 1) throw new RejectFenceLost(row.id);

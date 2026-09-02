@@ -40,7 +40,12 @@ const parked = (over: Row = {}): Row => ({
     state: "STAGING",
     stateReason: null,
     claimToken: null,
-    storagePath: "receipts/intake/row-1.bin",
+    storagePath: "receipts/intake/row-1.v1.bin",
+    // The upload lease this decision was reached about. A resumed /start bumps
+    // it, which is what makes a stale verdict land on nothing.
+    uploadLeaseVersion: 1,
+    uploadUrlExpiresAt: null,
+    createdAt: new Date("2026-09-01T00:00:00.000Z"),
     ...over,
 });
 
@@ -69,6 +74,7 @@ function client(rows: Row[], onTx?: (store: Store) => void): { db: RejectClient;
                     },
                 },
                 receiptIntake: {
+                    findUnique: async ({ where }) => staged.find(row => row.id === where.id) ?? null,
                     deleteMany: async ({ where }) => {
                         const matches = staged.filter(row =>
                             Object.entries(where).every(([k, v]) => row[k] === v));
@@ -94,7 +100,7 @@ test("a reject deletes the row and queues the object in ONE transaction", async 
     assert.deepEqual(store.rows, [], "the row is gone");
     assert.equal(store.events.length, 1, "and exactly one cleanup is queued");
     assert.equal(store.events[0].data.status, "pending");
-    assert.match(String(store.events[0].data.detail), /receipts\/intake\/row-1\.bin/);
+    assert.match(String(store.events[0].data.detail), /receipts\/intake\/row-1\.v1\.bin/);
 });
 
 test("PUBLISH vs REJECT: a row published mid-reject is not deleted, and nothing is queued", async () => {
@@ -296,4 +302,91 @@ test("nothing destructive happens while the upload lease is live", () => {
         1,
         "only the sha-mismatch park inside the ok branch waits",
     );
+});
+
+// ── RESUME vs REJECT: the upload lease version decides (round-14 item 1) ───
+
+test("a client that RESUMES its upload mid-sweep is not rejected for the old one", async () => {
+    // The real interleaving: the sweep reads a stale STAGING row, spends a
+    // storage round trip on the object the client abandoned, and decides to
+    // reject. In that window /start hands the client a fresh URL — a new lease
+    // version, a new path, a live expiry. Without the version in the fence the
+    // sweep deletes the row (and queues its object) for a receipt that is
+    // actively being uploaded, and the forwarder is told nothing.
+    const observed = parked({ uploadLeaseVersion: 1, storagePath: "receipts/intake/row-1.v1.bin" });
+    const { db, store } = client([observed], s => {
+        s.rows = [parked({
+            uploadLeaseVersion: 2,
+            storagePath: "receipts/intake/row-1.v2.bin",
+            uploadUrlExpiresAt: new Date(Date.now() + 60 * 60_000),
+        })];
+    });
+
+    const dropped = await rejectRowAndQueueCleanup(observed as never, "unsupported-file-type", db);
+    assert.equal(dropped.ok, false, "the fence lost to the newer lease");
+    assert.equal(store.committed, false);
+    assert.deepEqual(store.events, [], "the v1 object is not queued for deletion by this pass");
+    assert.equal(store.rows.length, 1, "and the row survives");
+    assert.equal(store.rows[0].uploadLeaseVersion, 2);
+});
+
+test("a lease that came back to life inside the transaction aborts the reject", async () => {
+    // The version alone cannot see this one: /start refreshed the EXPIRY on the
+    // same lease. The verifier runs on a row re-read inside the transaction,
+    // which is the only place that is true.
+    const observed = parked();
+    const { db, store } = client([observed], s => {
+        s.rows = [parked({ uploadUrlExpiresAt: new Date(Date.now() + 60 * 60_000) })];
+    });
+    const dropped = await rejectRowAndQueueCleanup(
+        observed as never,
+        "unsupported-file-type",
+        db,
+        fresh => (fresh.uploadUrlExpiresAt as Date | null) &&
+            (fresh.uploadUrlExpiresAt as Date).getTime() > Date.now()
+            ? "upload-lease-active"
+            : null,
+    );
+    assert.equal(dropped.ok, false);
+    assert.deepEqual(store.events, []);
+    assert.equal(store.rows.length, 1);
+});
+
+test("an unchanged lease still rejects — the control", async () => {
+    const observed = parked();
+    const { db, store } = client([observed]);
+    const dropped = await rejectRowAndQueueCleanup(observed as never, "unsupported-file-type", db, () => null);
+    assert.equal(dropped.ok, true);
+    assert.deepEqual(store.rows, []);
+    assert.equal(store.events.length, 1);
+});
+
+test("the sweeper and /start both fence on the lease version", () => {
+    const start = readFileSync(
+        path.join(ROOT, "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    );
+    // /start claims the new lease BEFORE it signs anything: the version, the
+    // expiry and the path move in ONE checked update, and a lost update is a
+    // 409 rather than a URL for a row somebody else has moved on.
+    assert.equal((start.match(/uploadLeaseVersion: nextLease/g) ?? []).length, 2, "resume and re-arm");
+    assert.equal((start.match(/const nextLease = existing\.uploadLeaseVersion \+ 1/g) ?? []).length, 2);
+    for (const branch of ["const rearmed = await signUpload(retryPath)", "const resumed = await signUpload(resumePath)"]) {
+        const at = start.indexOf(branch);
+        assert.ok(at > 0, branch);
+        const update = start.lastIndexOf("await prisma.receiptIntake.updateMany(", at);
+        assert.ok(update > 0 && update < at, `${branch}: the row moves before the URL is signed`);
+    }
+    assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 2, "a lost claim is a 409 on both");
+
+    // Every destructive sweeper write carries the version it observed.
+    const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
+    const body = fn.slice(0, fn.indexOf("loadPhases:"));
+    assert.equal(
+        (body.match(/uploadLeaseVersion: row\.uploadLeaseVersion/g) ?? []).length,
+        4,
+        "the two parks, the publish commit and the reject",
+    );
+    // ...and the reject also re-reads the row inside the transaction.
+    assert.match(body, /fresh => uploadLeaseActive\(/);
 });

@@ -8,7 +8,7 @@ import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
-import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
+import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
 import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -130,7 +130,9 @@ export async function POST(req: Request) {
     if (badPhase) return NextResponse.json(badPhase.body, { status: badPhase.status });
 
     const id = randomUUID();
-    const storagePath = `receipts/intake/${id}.${ext}`;
+    // Lease 1 from the outset: the version is part of the path, so there is no
+    // "version 0" object to confuse with a resumed upload later.
+    const storagePath = uploadPathFor(id, 1, ext);
 
     let created: { id: string; sourceRef: string; state: string };
     try {
@@ -160,6 +162,7 @@ export async function POST(req: Request) {
                 // works, so nothing may declare the object missing or reject
                 // the row for what is at that path.
                 uploadUrlExpiresAt: uploadLeaseExpiry(),
+                uploadLeaseVersion: 1,
             },
             select: { id: true, sourceRef: true, state: true },
         });
@@ -172,6 +175,7 @@ export async function POST(req: Request) {
                 select: {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
+                    uploadLeaseVersion: true,
                 },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
@@ -198,21 +202,23 @@ export async function POST(req: Request) {
             const recoverable = existing.state !== "STAGING"
                 && finalizeDisposition(existing) === "publish";
             if (recoverable) {
-                const retryPath = `receipts/intake/${existing.id}.${ext}`;
-                const rearmed = await signUpload(retryPath);
-                if (!rearmed) {
-                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-                }
-                // Fenced on the EXACT park, same rule as every other publish
-                // path: losing it means somebody moved the row while we were
-                // signing, and re-arming it then would point a live row at an
-                // empty path.
+                // THE ROW MOVES FIRST, THEN THE URL IS SIGNED.
+                //
+                // The claim on the lease is made in ONE checked update: the
+                // version goes up, the expiry is refreshed, and the row is
+                // re-pointed at the path that version names. Signing first and
+                // writing after left a window where a sweep could reject the
+                // row for the OLD upload while a URL for the new one was
+                // already in the client's hands.
+                const nextLease = existing.uploadLeaseVersion + 1;
+                const retryPath = uploadPathFor(existing.id, nextLease, ext);
                 const { count } = await prisma.receiptIntake.updateMany({
                     where: { id: existing.id, ...publishFence(existing) },
                     data: {
                         storagePath: retryPath,
                         expectedSha256,
                         uploadUrlExpiresAt: uploadLeaseExpiry(),
+                        uploadLeaseVersion: nextLease,
                         // The stored hash is what /finalize verifies against.
                         // Whatever was recorded describes bytes that are gone
                         // or were never right.
@@ -234,8 +240,11 @@ export async function POST(req: Request) {
                         { status: 409 },
                     );
                 }
-                // A different declared type means a different extension, so the
-                // old object (if any) is now unreferenced.
+                const rearmed = await signUpload(retryPath);
+                if (!rearmed) {
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                }
+                // The previous lease's object (if any) is unreferenced now.
                 if (retryPath !== existing.storagePath) {
                     await deleteObjectOrRecord(existing.storagePath, "start-rearmed-repath");
                 }
@@ -278,15 +287,41 @@ export async function POST(req: Request) {
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
                 );
             }
-            const resumed = await signUpload(existing.storagePath);
-            if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-            // A RESUMED url is a new lease. Without this the sweeper still
-            // judged the row by its original createdAt and could park (or
-            // reject) it while the URL just handed out was live.
-            await prisma.receiptIntake.updateMany({
-                where: { id: existing.id, state: "STAGING" },
-                data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
+            // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one
+            // checked update. Without the version bump the sweep and the client
+            // are talking about the same path, so a sweep that started before
+            // this call could still reject the upload it is now waiting for.
+            const nextLease = existing.uploadLeaseVersion + 1;
+            const resumePath = uploadPathFor(existing.id, nextLease, ext);
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: {
+                    id: existing.id,
+                    state: "STAGING",
+                    uploadLeaseVersion: existing.uploadLeaseVersion,
+                },
+                data: {
+                    storagePath: resumePath,
+                    uploadLeaseVersion: nextLease,
+                    uploadUrlExpiresAt: uploadLeaseExpiry(),
+                },
             });
+            if (count === 0) {
+                return NextResponse.json(
+                    {
+                        ok: false,
+                        error: "publish-conflict",
+                        reason: "this row changed while a new upload URL was being issued; retry",
+                        retryable: true,
+                        existingId: existing.id,
+                    },
+                    { status: 409 },
+                );
+            }
+            const resumed = await signUpload(resumePath);
+            if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+            if (resumePath !== existing.storagePath) {
+                await deleteObjectOrRecord(existing.storagePath, "start-resumed-repath");
+            }
             return NextResponse.json({
                 ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
             });

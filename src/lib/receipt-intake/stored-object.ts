@@ -209,6 +209,12 @@ export const RECOVERABLE_PARK_REASONS = ["file-missing", "sha-mismatch"];
 export interface ObservedRow {
     state: string;
     stateReason: string | null;
+    /**
+     * The upload lease this decision was made against. A resumed or re-armed
+     * /start bumps it, so a sweep that decided on v1 writes nothing once the
+     * client is on v2 — the row it judged does not exist any more.
+     */
+    uploadLeaseVersion: number;
 }
 
 /** What a finalize may do with the row it just read. */
@@ -238,6 +244,17 @@ export function publishFence(row: ObservedRow): {
     state: string;
     stateReason: string | null;
     claimToken: null;
+    uploadLeaseVersion: number;
 } {
-    return { state: row.state, stateReason: row.stateReason, claimToken: null };
+    return {
+        state: row.state,
+        stateReason: row.stateReason,
+        claimToken: null,
+        uploadLeaseVersion: row.uploadLeaseVersion,
+    };
+}
+
+/** Where the bytes for one upload lease live. The version is IN the path. */
+export function uploadPathFor(rowId: string, leaseVersion: number, ext: string): string {
+    return `receipts/intake/${rowId}.v${leaseVersion}.${ext}`;
 }

@@ -317,6 +317,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 select: {
                     id: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
+                    uploadLeaseVersion: true,
                 },
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
@@ -366,7 +367,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // row already gone from STAGING.
                         if (leaseLive) { leaseActive++; continue; }
                         await prisma.receiptIntake.updateMany({
-                            where: { id: row.id, state: "STAGING" },
+                            // Fenced on the lease this verdict was reached
+                            // about: a resumed /start bumps it, and the bytes
+                            // that mismatched belong to an upload nobody is
+                            // waiting for any more.
+                            where: {
+                                id: row.id,
+                                state: "STAGING",
+                                uploadLeaseVersion: row.uploadLeaseVersion,
+                            },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
                         });
                         parked++;
@@ -382,7 +391,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         seal: sealObject,
                         commit: async (canonicalPath, values) => {
                             const { count } = await prisma.receiptIntake.updateMany({
-                                where: { id: row.id, state: "STAGING" },
+                                where: {
+                                    id: row.id,
+                                    state: "STAGING",
+                                    uploadLeaseVersion: row.uploadLeaseVersion,
+                                },
                                 data: {
                                     state: "RECEIVED",
                                     nextRetryAt: null,
@@ -409,7 +422,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // queue. Wait until the URL cannot possibly land any more.
                     if (leaseLive) { leaseActive++; continue; }
                     await prisma.receiptIntake.updateMany({
-                        where: { id: row.id, state: "STAGING" },
+                        where: {
+                            id: row.id,
+                            state: "STAGING",
+                            uploadLeaseVersion: row.uploadLeaseVersion,
+                        },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
                     });
                     parked++;
@@ -433,8 +450,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         state: "STAGING",
                         stateReason: row.stateReason,
                         storagePath: row.storagePath,
+                        uploadLeaseVersion: row.uploadLeaseVersion,
                     },
                     check.reason,
+                    undefined,
+                    // DECIDED ON A ROW RE-READ INSIDE THE TRANSACTION.
+                    //
+                    // Between the inspection above and this delete a client can
+                    // resume its upload: /start bumps the lease and hands out a
+                    // fresh URL. The fence catches the version, and this catches
+                    // the case the fence cannot see — a lease that is live again
+                    // — so a receipt in flight is never deleted for what its
+                    // previous attempt left at the path.
+                    fresh => uploadLeaseActive(fresh as { uploadUrlExpiresAt: Date | null; createdAt: Date })
+                        ? "upload-lease-active"
+                        : null,
                 );
                 // FENCE LOST: somebody else owns this row now. Touch NOTHING —
                 // above all not the object, which the winner may be using.

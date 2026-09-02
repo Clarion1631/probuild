@@ -308,35 +308,35 @@ test("the sweeper's two parks are the ones /finalize recovers from", () => {
 // ── Which parks a re-upload may clear, and the fence it publishes under ─────
 
 test("only the two SWEEPER parks are recoverable; a human's park is not", () => {
-    assert.equal(finalizeDisposition({ state: "STAGING", stateReason: null }), "publish");
+    assert.equal(finalizeDisposition({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 }), "publish");
     for (const reason of RECOVERABLE_PARK_REASONS) {
-        assert.equal(finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }), "publish", reason);
+        assert.equal(finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason, uploadLeaseVersion: 1 }), "publish", reason);
     }
     // Everything else parked for review is somebody's decision. Republishing it
     // drags the row back to RECEIVED and re-reads it, discarding that decision.
     for (const reason of ["vendor-mismatch", "weak-dup:row-9", "qbo-fault:6210", "amount-mismatch", null]) {
         assert.equal(
-            finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }),
+            finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason, uploadLeaseVersion: 1 }),
             "not-recoverable",
             String(reason),
         );
     }
     // And a row that already moved on is simply settled — not an error.
     for (const state of ["RECEIVED", "READ", "BOOKING", "BOOKED", "ARCHIVED", "DUPLICATE"]) {
-        assert.equal(finalizeDisposition({ state, stateReason: null }), "settled", state);
+        assert.equal(finalizeDisposition({ state, stateReason: null, uploadLeaseVersion: 1 }), "settled", state);
     }
 });
 
 test("the publish fence pins the exact state, the exact reason and an unclaimed row", () => {
-    assert.deepEqual(publishFence({ state: "NEEDS_REVIEW", stateReason: "file-missing" }), {
+    assert.deepEqual(publishFence({ state: "NEEDS_REVIEW", stateReason: "file-missing", uploadLeaseVersion: 1 }), {
         state: "NEEDS_REVIEW",
         stateReason: "file-missing",
-        claimToken: null,
+        claimToken: null, uploadLeaseVersion: 1,
     });
-    assert.deepEqual(publishFence({ state: "STAGING", stateReason: null }), {
+    assert.deepEqual(publishFence({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 }), {
         state: "STAGING",
         stateReason: null,
-        claimToken: null,
+        claimToken: null, uploadLeaseVersion: 1,
     });
 });
 
@@ -362,9 +362,13 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
     // would reset a reason it never looked at back to RECEIVED — discarding the
     // newer decision and republishing a row somebody else now owns.
     const store = rowStore({
-        id: "row-1", state: "NEEDS_REVIEW", stateReason: "file-missing", claimToken: null,
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "file-missing", claimToken: null, uploadLeaseVersion: 1,
     });
-    const observed = { state: store.get().state as string, stateReason: store.get().stateReason as string };
+    const observed = {
+        state: store.get().state as string,
+        stateReason: store.get().stateReason as string,
+        uploadLeaseVersion: store.get().uploadLeaseVersion as number,
+    };
     assert.equal(finalizeDisposition(observed), "publish", "it was recoverable when we read it");
     const fence = publishFence(observed);
 
@@ -392,9 +396,9 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
 
 test("RACE: a worker claim taken during sealing also loses the publish", async () => {
     const store = rowStore({
-        id: "row-1", state: "STAGING", stateReason: null, claimToken: null,
+        id: "row-1", state: "STAGING", stateReason: null, claimToken: null, uploadLeaseVersion: 1,
     });
-    const fence = publishFence({ state: "STAGING", stateReason: null });
+    const fence = publishFence({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
         seal: async (_u: string, canonical: string) => {
             store.set({ claimToken: "sweeper-1" });
@@ -409,12 +413,12 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
 
 test("an unchanged row still publishes — the control", async () => {
     const store = rowStore({
-        id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null,
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null, uploadLeaseVersion: 1,
     });
-    const fence = publishFence({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch" });
+    const fence = publishFence({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch", uploadLeaseVersion: 1 });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
         seal: async (_u: string, canonical: string) => canonical,
-        commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null }),
+        commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null, uploadLeaseVersion: 1 }),
         dropUpload: async () => {},
     } as never);
     assert.equal(outcome?.published, true);

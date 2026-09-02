@@ -464,6 +464,7 @@ async function respondToSourceRefConflict(
         select: {
             id: true, state: true, source: true, sourceRef: true, projectId: true,
             dryRun: true, fileSha256: true, createdById: true, storagePath: true, stateReason: true,
+            uploadLeaseVersion: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete

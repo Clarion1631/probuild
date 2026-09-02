@@ -145,7 +145,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         select: {
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
-            fileSha256: true, expectedSha256: true,
+            fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
@@ -257,6 +257,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 state: row.state,
                 stateReason: row.stateReason,
                 storagePath: row.storagePath,
+                uploadLeaseVersion: row.uploadLeaseVersion,
             },
             check.reason,
         );

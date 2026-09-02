@@ -3059,6 +3059,13 @@ model ReceiptIntake {
   /// parking it on row age declared a receipt missing while its own upload link
   /// was live. Null on rows that never had a signed URL (the single-shot path).
   uploadUrlExpiresAt DateTime?
+  /// Bumped every time a signed upload URL is issued for this row, and embedded
+  /// in the path that URL points at. It is what makes "the upload the sweeper
+  /// looked at" and "the upload the client is doing now" different things: a
+  /// resumed /start moves the row to v2 while a sweep is still deciding about
+  /// v1, and every destructive write fences on the version it observed, so the
+  /// sweep's verdict lands on nothing.
+  uploadLeaseVersion Int       @default(0)
 
   // read results (cents, like AutomationEvent)
   vendor     String?
