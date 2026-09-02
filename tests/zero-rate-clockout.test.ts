@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     isSalariedOwner,
+    ZERO_RATE_REVIEW_NOTE,
     ZERO_RATE_WORKER_MESSAGE,
     zeroRateBlocks,
     zeroRateManagerMessage,
@@ -38,6 +39,29 @@ test("the rule BLOCKS BY DEFAULT and exempts only the salaried", () => {
     assert.equal(zeroRateBlocks({ role: "FIELD_CREW", hourlyRate: 0.01 }), false, "a real rate settles it");
     // A missing/NaN rate is not a rate either.
     assert.equal(zeroRateBlocks({ role: "FIELD_CREW", hourlyRate: Number.NaN }), true);
+});
+
+test("the STORED payType beats the role and the env list, both ways", () => {
+    // The column is the answer a human gave; the env list is a fallback that
+    // fails open by construction (an absent email looks exactly like "hourly").
+    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "tim@example.com", payType: "SALARY", hourlyRate: 0 }), false);
+    assert.equal(
+        zeroRateBlocks({ role: "ADMIN", email: "boss@example.com", payType: "HOURLY", hourlyRate: 0 }),
+        true,
+        "an explicit HOURLY overrides the salaried-by-role default"
+    );
+    assert.equal(
+        zeroRateBlocks({ role: "MANAGER", email: "cj@goldentouchremodeling.com", payType: "HOURLY", hourlyRate: 0 }),
+        true,
+        "and it overrides the env list too"
+    );
+});
+
+test("EMPLOYEE is a legacy role and is hourly", () => {
+    // It is absent from ROLE_LABELS/ROLES so nothing creates one today, but it
+    // is still a live branch in access-rules.ts, so rows can carry it.
+    assert.equal(zeroRateBlocks({ role: "EMPLOYEE", hourlyRate: 0 }), true);
+    assert.equal(isSalariedOwner({ role: "EMPLOYEE", email: "old@example.com" }), false);
 });
 
 test("a role nobody has heard of FAILS CLOSED — the allowlist version failed open", () => {
@@ -63,9 +87,10 @@ function deps(options: {
     selfRate?: number;
     ownerId?: string;
     selfEmail?: string;
-    ownerRates?: { hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string };
+    ownerPayType?: string | null;
+    ownerRates?: { hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string; payType: string | null };
 }) {
-    const updateCalls: Array<{ id: string }> = [];
+    const updateCalls: Array<{ id: string; data: Record<string, unknown> }> = [];
     const entry: ClockOutTimeEntryRow = {
         id: "te1",
         userId: options.ownerId ?? "u1",
@@ -82,6 +107,7 @@ function deps(options: {
                 id: "u1",
                 role: options.selfRole ?? "FIELD_CREW",
                 email: options.selfEmail ?? "worker@example.com",
+                payType: options.ownerPayType ?? null,
                 hourlyRate: options.selfRate ?? 0,
                 burdenRate: 0,
             },
@@ -89,12 +115,12 @@ function deps(options: {
         findTimeEntry: async () => entry,
         findProjectIsLogistics: async () => false,
         findOwnerRates: async () =>
-            options.ownerRates ?? { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com" },
+            options.ownerRates ?? { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com", payType: options.ownerPayType ?? null },
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
         closeTimeEntry: async (id, userId, data) => {
-            updateCalls.push({ id });
+            updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },
         loadLockedPeriods: async () => [],
@@ -120,21 +146,29 @@ test("a $0-rate worker clocking themselves out gets 422 ZERO_RATE_BLOCKED and st
     assert.equal(updateCalls.length, 0, "the punch must stay OPEN — no time is lost");
 });
 
-test("a manager closing someone else's $0-rate punch gets the manager-facing message", async () => {
+test("a MANAGER closing someone else's $0-rate punch is ALLOWED, and flagged", async () => {
+    // Blocking the office too created a punch nobody could close: past
+    // MAX_SHIFT_HOURS every path refuses it and nothing sweeps a stranded punch.
+    // So the close goes through and carries a review flag that the payroll
+    // export then refuses to run past.
     const { dependencies, updateCalls } = deps({
         selfRole: "MANAGER",
         selfRate: 45,
         ownerId: "owner-1",
-        ownerRates: { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com" },
+        ownerRates: { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com", payType: "HOURLY" },
     });
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());
-    assert.equal(res.status, 422);
-    const body = await res.json();
-    assert.equal(body.code, "ZERO_RATE_BLOCKED");
-    assert.equal(body.error, zeroRateManagerMessage("Tim Brennan"));
-    assert.match(body.error, /Team Members/);
-    assert.equal(updateCalls.length, 0);
+    assert.equal(res.status, 200, "the office must always have a way to close a stranded punch");
+    assert.equal(updateCalls.length, 1);
+    const data = updateCalls[0].data;
+    assert.equal(data.needsReview, true);
+    assert.match(String(data.reviewReason), new RegExp(ZERO_RATE_REVIEW_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(data.laborCost, 0, "the $0 cost is real — the flag is what stops it being silent");
+});
+
+test("the manager-facing message still exists for the surfaces that show it", () => {
+    assert.match(zeroRateManagerMessage("Tim Brennan"), /Team Members/);
 });
 
 test("an ADMIN owner at $0 is exempt and clocks out normally", async () => {
@@ -170,7 +204,11 @@ test("the PATCH edit path still mirrors the block, and only on an OPEN -> CLOSED
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
     );
-    assert.match(source, /if \(closingOpenEntry && zeroRateBlocks\(/);
+    assert.match(source, /closingOpenEntry &&[\s\S]{0,20}zeroRateBlocks\(/);
     assert.match(source, /email: owner\.email/, "the manager mirror must pass the email, or a salaried manager is blocked");
-    assert.match(source, /zeroRateBlockedResponse\(\{ closerIsOwner: isOwner, ownerName: owner\.name \}\)/);
+    assert.match(source, /payType: owner\.payType/, "and the stored payType, which beats both");
+    // Owner-only refusal, and a flag on the manager path — the same shape the
+    // PUT tests above exercise for real.
+    assert.match(source, /if \(zeroRate && isOwner\)/);
+    assert.match(source, /appendZeroRateReview\(/);
 });

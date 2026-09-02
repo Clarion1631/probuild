@@ -48,12 +48,46 @@ function period(overrides: Partial<LockedPeriodRow> = {}): LockedPeriodRow {
 const INSIDE = new Date("2026-08-20T15:00:00.000Z");
 const AFTER = new Date("2026-09-02T15:00:00.000Z");
 
-test("the range is half-open: periodStart is inside, periodEnd is not", () => {
+test("the lock covers the whole WORKWEEKS the period touches, not just the period", () => {
     const periods = [period()];
+    // The fixture period is Mon 2026-08-17 .. Mon 2026-08-31, so it is already
+    // whole Mon-Sun weeks: the envelope and the period coincide here.
     assert.ok(lockedPeriodFor(periods, PERIOD_START), "the first instant of the period is locked");
     assert.equal(lockedPeriodFor(periods, new Date(PERIOD_END.getTime() - 1))?.id, "pp1");
-    assert.equal(lockedPeriodFor(periods, PERIOD_END), null, "periodEnd belongs to the NEXT period");
+    assert.equal(lockedPeriodFor(periods, PERIOD_END), null, "the next week is not frozen");
     assert.equal(lockedPeriodFor(periods, new Date(PERIOD_START.getTime() - 1)), null);
+});
+
+test("a punch on the SUNDAY before a Monday-start locked period is frozen too", () => {
+    // Overtime is a property of the workweek. Sunday 2026-08-16 is in the
+    // Mon 2026-08-10 week, which does NOT overlap the period — untouched.
+    // But a period that opens mid-week drags its own week in: shift the period
+    // to start Wednesday and the Sunday/Monday before it become editable-no-more.
+    const midWeek = period({
+        periodStart: new Date("2026-08-19T07:00:00.000Z"), // Wed
+        periodEnd: new Date("2026-08-31T07:00:00.000Z"),
+    });
+    const mondayBefore = new Date("2026-08-17T15:00:00.000Z");
+    const sundayBefore = new Date("2026-08-16T15:00:00.000Z");
+    assert.equal(lockedPeriodFor([midWeek], mondayBefore)?.id, "pp1", "same workweek as the period start");
+    assert.equal(
+        lockedPeriodFor([midWeek], sundayBefore),
+        null,
+        "the PREVIOUS Mon-Sun week does not decide this period's overtime"
+    );
+    // And the trailing partial week: the period ends Mon 08-31, so the week of
+    // 08-24 is fully inside. A punch on Sun 08-30 is inside the period anyway;
+    // the interesting case is a period ending MID-week.
+    const midWeekEnd = period({
+        periodStart: new Date("2026-08-17T07:00:00.000Z"),
+        periodEnd: new Date("2026-08-27T07:00:00.000Z"), // Thu
+    });
+    const fridayAfter = new Date("2026-08-28T15:00:00.000Z");
+    assert.equal(
+        lockedPeriodFor([midWeekEnd], fridayAfter)?.id,
+        "pp1",
+        "a punch in the trailing partial week still moves the locked period's OT split"
+    );
 });
 
 test("a period row with lockedAt null does not lock anything (that is what unlock leaves behind)", () => {
@@ -101,10 +135,10 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         reviewReason: null,
     };
     const dependencies: ClockOutDependencies = {
-        authenticate: async () => ({ ok: true, user: { id: "u1", role: "FIELD_CREW", email: "u1@example.com", hourlyRate: 20, burdenRate: 5 } }),
+        authenticate: async () => ({ ok: true, user: { id: "u1", role: "FIELD_CREW", email: "u1@example.com", payType: "HOURLY", hourlyRate: 20, burdenRate: 5 } }),
         findTimeEntry: async () => entry,
         findProjectIsLogistics: async () => false,
-        findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com" }),
+        findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" }),
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},

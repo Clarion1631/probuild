@@ -28,7 +28,9 @@ test("every active staff role may file — this used to be ADMIN-only", () => {
     for (const role of BUG_WIDGET_ROLES) {
         assert.deepEqual(authorizeBugWidgetUser({ role, status: "ACTIVATED" }), { ok: true }, role);
     }
-    assert.deepEqual(BUG_WIDGET_ROLES, ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
+    // EMPLOYEE is a legacy role value that prod rows can still carry; somebody
+    // stuck on one must still be able to report the bug that is blocking them.
+    assert.deepEqual(BUG_WIDGET_ROLES, ["ADMIN", "MANAGER", "FIELD_CREW", "EMPLOYEE", "FINANCE"]);
 });
 
 test("no authenticated user is 401; a disabled or pending account is 403", () => {

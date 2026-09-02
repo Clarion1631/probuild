@@ -31,11 +31,15 @@ function loaded(blocking: BlockingEntry[] = []): LoadedGustoExport {
         blocking,
         periodStart: new Date("2026-08-17T07:00:00.000Z"),
         periodEnd: new Date("2026-08-31T07:00:00.000Z"),
+        envelopeStart: new Date("2026-08-17T07:00:00.000Z"),
+        envelopeEnd: new Date("2026-08-31T07:00:00.000Z"),
         timeZone: "America/Los_Angeles",
         summaryCsv: SUMMARY,
         detailCsv: DETAIL,
         exportHash: "deadbeef",
         period: null,
+        overlappingLocks: [],
+        locked: false,
     };
 }
 

@@ -35,11 +35,11 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 const TZ = "America/Los_Angeles";
 
-const alice: ExportUser = { id: "u-alice", name: "Alice Field", email: "alice@example.com" };
+const alice: ExportUser = { id: "u-alice", name: "Alice Field", email: "alice@example.com", payType: "HOURLY" };
 // Matches the DEFAULT salaried list in src/lib/payroll-config.ts.
-const cj: ExportUser = { id: "u-cj", name: "CJ Manager", email: "cj@goldentouchremodeling.com" };
-const zoe: ExportUser = { id: "u-zoe", name: "Zoe Zero", email: "zoe@example.com" };
-const dana: ExportUser = { id: "u-dana", name: "Dana Danger", email: "dana@example.com" };
+const cj: ExportUser = { id: "u-cj", name: "CJ Manager", email: "cj@goldentouchremodeling.com", payType: "SALARY" };
+const zoe: ExportUser = { id: "u-zoe", name: "Zoe Zero", email: "zoe@example.com", payType: "HOURLY" };
+const dana: ExportUser = { id: "u-dana", name: "Dana Danger", email: "dana@example.com", payType: "HOURLY" };
 
 let seq = 0;
 type EntryOverrides = Omit<Partial<ExportEntry>, "startTime"> & {
@@ -221,6 +221,64 @@ test("open, flagged, zero-hour and unsettled-meal entries all block; outside the
     assert.equal(blocking[0].userLabel, "Alice Field");
 });
 
+test("a worker with no payType blocks the export — guessing is a wrong paycheque either way", () => {
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-18"), durationHours: 8 })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+    assert.equal(result.blocking[0].userLabel, "New Hire");
+});
+
+test("a payType-less worker with NO hours in the period does not block it", () => {
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        // Same workweek, before the period — fetched for the 40h threshold only.
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-14"), durationHours: 8 })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking, [], "only people actually being paid for this period need an answer");
+});
+
+test("readiness looks at the whole workweek ENVELOPE, not just the period", () => {
+    // Period ends Thu 2026-08-27; the trailing partial week runs to Sun 08-30.
+    // An open punch on Fri 08-28 is outside the period but inside the week, and
+    // it still decides how much of the period's time is overtime.
+    const periodEnd = new Date("2026-08-27T07:00:00.000Z");
+    const envelopeEnd = new Date("2026-08-31T07:00:00.000Z");
+    const entries = [
+        entry({ userId: alice.id, id: "in-period", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: alice.id, id: "open-after", startTime: at8am("2026-08-28"), durationHours: 0, endTime: null }),
+    ];
+    const withEnvelope = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd,
+        timeZone: TZ,
+        envelopeStart: PERIOD_START,
+        envelopeEnd,
+    });
+    assert.deepEqual(withEnvelope.blocking.map((row) => row.id), ["open-after"]);
+
+    // Without the envelope the same open punch is invisible — the bug.
+    const withoutEnvelope = buildGustoExport({
+        entries,
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd,
+        timeZone: TZ,
+    });
+    assert.deepEqual(withoutEnvelope.blocking, []);
+});
+
 test("a zero-hour entry is dropped from the totals — which is why blocking has to catch it", () => {
     const entries = [entry({ userId: alice.id, id: "zero-1", startTime: at8am("2026-08-20"), durationHours: 0 })];
     const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });
@@ -300,7 +358,7 @@ test("formula leads in free text are defused, and quoting alone would not have d
 });
 
 test("a leading minus in a NAME is defused", () => {
-    const weird: ExportUser = { id: "u-x", name: "-Bob", email: "bob@example.com" };
+    const weird: ExportUser = { id: "u-x", name: "-Bob", email: "bob@example.com", payType: "HOURLY" };
     const result = buildGustoExport({
         entries: [entry({ userId: weird.id, startTime: at8am("2026-08-17"), durationHours: 8 })],
         users: [weird],
