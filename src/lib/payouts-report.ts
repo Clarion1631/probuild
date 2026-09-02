@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { expenseForProjectWhere } from "@/lib/expense-attribution";
+import { expenseForProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
 import {
     formatLocalDateString,
     defaultMonthRange,
@@ -71,7 +71,12 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
                         : {}),
                 },
                 include: {
-                    estimate: { select: { project: { select: { id: true, name: true } } } },
+                    // BOTH sides, so the row can be LABELLED by the same
+                    // project the filter above selected it by. Labelling off
+                    // the estimate while filtering on the resolver would list a
+                    // re-attributed expense under the job it used to be on.
+                    project: { select: { id: true, name: true } },
+                    estimate: { select: { projectId: true, project: { select: { id: true, name: true } } } },
                     purchaseOrder: { select: { code: true } },
                 },
                 orderBy: { date: "desc" },
@@ -106,8 +111,8 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
             vendorName: exp.vendor ?? "Unknown Vendor",
             type: "Expense",
             amount: Number(exp.amount),
-            projectName: exp.estimate.project?.name ?? "No Project",
-            projectId: exp.estimate.project?.id ?? null,
+            projectName: exp.project?.name ?? exp.estimate.project?.name ?? "No Project",
+            projectId: resolveExpenseProjectId(exp),
             reference: exp.purchaseOrder?.code ?? null,
         });
     }

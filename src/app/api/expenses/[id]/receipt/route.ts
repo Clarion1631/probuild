@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { resolveExpenseProjectId } from "@/lib/expense-attribution";
 import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
@@ -30,12 +31,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
         const expense = await prisma.expense.findUnique({
             where: { id },
-            select: { id: true, estimate: { select: { projectId: true } } },
+            select: { id: true, projectId: true, estimate: { select: { projectId: true } } },
         });
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
-        // Fail closed: an expense whose estimate has no project cannot be
+        // Fail closed: an expense with no resolvable project cannot be
         // authorized against project access, so nobody uploads to it.
-        const projectId = expense.estimate?.projectId;
+        //
+        // Resolved, not read off the estimate: a re-attributed expense belongs
+        // to the project its `projectId` names, and authorizing it against the
+        // job it USED to be on would both admit the wrong people and lock out
+        // the crew who now own it.
+        const projectId = resolveExpenseProjectId(expense);
         if (!projectId || !canAccessProject(user, projectId)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
