@@ -97,7 +97,10 @@ interface Harness {
     reads: number;
     books: number;
     applied: ReadPatch[];
-    states: { id: string; state: string; reason: string | null; patch?: Partial<ReadPatch> }[];
+    states: {
+        id: string; state: string; reason: string | null;
+        patch?: Partial<ReadPatch>; ownership?: { state: string; claimToken: string | null };
+    }[];
     promoted: string[];
     finished: { id: string; claimToken: string | null; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
@@ -108,12 +111,15 @@ interface Harness {
     cleanupCalls: number;
     bookBudgets: number[];
     clock: number;
+    sendReads: string[];
+    persistedSendAttempted?: boolean;
 }
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
         retried: [], claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
+        sendReads: [],
         boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
@@ -130,11 +136,20 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         // Defaults to what the row already carries: the interesting case is the
         // one that overrides it, where a late assignment landed mid-pass.
         refreshProjectId: async rowId => rows.find(r => r.id === rowId)?.projectId ?? null,
+        // The PERSISTED flag. Defaults to what the row carries, so only the
+        // tests about the reload have to think about it.
+        sendAttemptedNow: async rowId => {
+            h.sendReads.push(rowId);
+            return h.persistedSendAttempted ?? rows.find(r => r.id === rowId)?.sendAttempted ?? false;
+        },
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { owned: true, strongOwner: null }; },
         findWeakHit: async () => null,
-        applyState: async (id, state, reason, patch) => { h.states.push({ id, state, reason, patch }); return true; },
+        applyState: async (id, state, reason, patch, ownership) => {
+            h.states.push({ id, state, reason, patch, ownership });
+            return true;
+        },
         finishRouting: async (id, claimToken, stateReason) => {
             h.finished.push({ id, claimToken, stateReason });
         },
@@ -223,9 +238,12 @@ test("a document that does not reach READ never claims the strong key", async ()
         read: async () => ({ ...goodRead, read: { ...goodRead.read, docType: "multi" } }) as ReadOutcome,
     });
     await runIntakeWorker(h.deps);
-    assert.equal(h.applied[0].state, "NEEDS_REVIEW");
-    assert.equal(h.applied[0].stateReason, "multi-doc");
-    assert.equal(h.applied[0].dedupStrongKey, null);
+    // Through applyState, which RELEASES the claim in the same write — not
+    // applyRead, which keeps the lease because routing continues under it.
+    assert.deepEqual(h.applied, [], "no lease-keeping write for a finished row");
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    assert.equal(h.states[0].reason, "multi-doc");
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
 });
 
 test("a service outage costs no attempt: the row is deferred and counts ONE busy pass", async () => {
@@ -655,8 +673,8 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
         await runIntakeWorker(h.deps);
         // The tax note rides along with whatever state routing picked — a
         // document can be both a bad tax read and a refund.
-        assert.ok(h.applied[0].stateReason?.startsWith(reason), `${reason}: ${h.applied[0].stateReason}`);
-        assert.equal(h.applied[0].dedupStrongKey, null, reason);
+        assert.ok(h.states[0].reason?.startsWith(reason), `${reason}: ${h.states[0].reason}`);
+        assert.equal(h.states[0].patch?.dedupStrongKey, null, reason);
         assert.equal(weakCalls, 0, `${reason}: dedup is not consulted at all`);
     }
 });
@@ -783,8 +801,8 @@ test("a missing or unknown doc_type is NEVER treated as a receipt", async () => 
         });
         const summary = await runIntakeWorker(h.deps);
         assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 }, JSON.stringify(docType));
-        assert.equal(h.applied[0].stateReason, "unknown-doc-type", JSON.stringify(docType));
-        assert.equal(h.applied[0].dedupStrongKey, null, "and it claims no key");
+        assert.equal(h.states[0].reason, "unknown-doc-type", JSON.stringify(docType));
+        assert.equal(h.states[0].patch?.dedupStrongKey, null, "and it claims no key");
     }
 });
 
@@ -1060,10 +1078,11 @@ test("losing the row aborts each mutation path instead of clobbering a successor
     // a time-based lease cannot express this, because both hold the same id.
     const lost = { owned: false as const };
 
-    // applyRead at the document-level gate.
+    // applyState at the document-level gate (a terminal outcome, so it is the
+    // releasing write that carries it, not applyRead).
     const gate = harness([workerRow()], {
         read: async () => ({ ok: true, read: { ...goodRead.read, docType: "multi" } }) as ReadOutcome,
-        applyRead: async () => ({ ...lost, strongOwner: null }),
+        applyState: async () => false,
     });
     assert.deepEqual((await runIntakeWorker(gate.deps)).byState, { STALE: 1 });
 
@@ -1190,4 +1209,109 @@ test("/start stamps a lease on EVERY url it issues", () => {
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
     assert.equal(signed, 3, "and those are all the places a URL is issued");
+});
+
+// ── A finished row hands the claim back, whatever finished it ─────────────
+
+test("EVERY early terminal outcome releases the claim in the same write", async () => {
+    // The hole: these four were written by applyRead, which deliberately KEEPS
+    // the lease because routing normally continues under it. For an outcome
+    // that ends the row there is no "afterwards" — so the row sat finished and
+    // still owned, which the health probe reads as claimed and every fenced
+    // write misses.
+    const outcomes: Array<[string, Partial<WorkerDependencies>, string]> = [
+        ["multi-document", {
+            read: async () => ({ ...goodRead, read: { ...goodRead.read, docType: "multi" } }) as ReadOutcome,
+        }, "NEEDS_REVIEW"],
+        ["non-receipt", {
+            read: async () => ({ ...goodRead, read: { ...goodRead.read, docType: "non_receipt" } }) as ReadOutcome,
+        }, "NON_RECEIPT"],
+        ["zero or refund", {
+            read: async () => ({ ...goodRead, read: { ...goodRead.read, totalAmount: "0.00" } }) as ReadOutcome,
+        }, "NEEDS_REVIEW"],
+    ];
+    for (const [label, overrides, expected] of outcomes) {
+        const h = harness([workerRow()], overrides);
+        const summary = await runIntakeWorker(h.deps);
+        assert.deepEqual(summary.byState, { [expected]: 1 }, label);
+        assert.deepEqual(h.applied, [], `${label}: nothing kept the lease`);
+        assert.equal(h.states.length, 1, label);
+        // Fenced on the row's OWN state and token — which is what makes the
+        // release atomic with the transition rather than a second write.
+        assert.deepEqual(h.states[0].ownership, { state: "RECEIVED", claimToken: "claim-1" }, label);
+        assert.deepEqual(h.finished, [], `${label}: finishRouting is for READ only`);
+    }
+
+    // The no-job park takes the same road.
+    const noJob = harness([workerRow({ projectId: null })], { refreshProjectId: async () => null });
+    assert.deepEqual((await runIntakeWorker(noJob.deps)).byState, { NEEDS_JOB: 1 });
+    assert.deepEqual(noJob.applied, [], "no-project is terminal too");
+    assert.deepEqual(noJob.states[0].ownership, { state: "RECEIVED", claimToken: "claim-1" });
+});
+
+test("a terminal write that LOSES its fence reports STALE and nothing else", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ...goodRead, read: { ...goodRead.read, docType: "multi" } }) as ReadOutcome,
+        applyState: async () => false,
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { STALE: 1 });
+    assert.deepEqual(h.finished, []);
+});
+
+test("the ONE write that keeps the lease can only ever say RECEIVED", () => {
+    // Enforced by the type (`patch: ReadPatch & { state: "RECEIVED" }`), so a
+    // terminal state cannot be routed back through applyRead by accident. This
+    // asserts the contract is still written down where the compiler reads it.
+    const worker = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/worker.ts"),
+        "utf8",
+    );
+    assert.match(worker, /patch: ReadPatch & \{ state: "RECEIVED" \}/);
+    assert.match(worker, /THE ONE WRITE THAT KEEPS THE CLAIM/);
+});
+
+// ── A park after a send must never hand the key back (round-14 A) ──────────
+
+test("a park decided AFTER a send reads the PERSISTED flag, not the claim snapshot", async () => {
+    // The hole: everything after the QBO create — the post-create phase check,
+    // the Expense commit, a pool timeout — could throw out to the worker's
+    // generic handler, which parked the row from the snapshot it claimed with.
+    // That snapshot says "nothing sent", so the dedup key went back for a row
+    // with a Purchase in the real books, and the next submission of the same
+    // receipt booked it a second time.
+    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        book: async () => { throw new Error("connection reset after the create"); },
+    });
+    h.persistedSendAttempted = true; // markSendAttempted got there first
+    await runIntakeWorker(h.deps);
+
+    assert.deepEqual(h.sendReads, ["row-1"], "the flag was re-read");
+    assert.equal(h.states.length, 1);
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    assert.ok(
+        !("dedupStrongKey" in (h.states[0].patch ?? {})),
+        "the key is RETAINED: a Purchase may exist",
+    );
+});
+
+test("a park with nothing ever sent still releases the key", async () => {
+    // The control. Holding a key against a booking that never happened sends
+    // the corrected resubmission to a human for no reason.
+    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        book: async () => { throw new Error("connection reset"); },
+    });
+    h.persistedSendAttempted = false;
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+});
+
+test("an unreadable send flag RETAINS the key", async () => {
+    // Retaining costs a review item; releasing wrongly costs a second Purchase.
+    const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        book: async () => { throw new Error("boom"); },
+        sendAttemptedNow: async () => { throw new Error("db is down"); },
+    });
+    await runIntakeWorker(h.deps);
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
 });

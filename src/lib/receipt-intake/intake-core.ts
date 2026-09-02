@@ -27,8 +27,27 @@ export const MAX_INLINE_UPLOAD_BYTES = 4 * 1024 * 1024;
  */
 export const MAX_INLINE_JSON_BYTES = 3 * 1024 * 1024;
 
+/**
+ * QuickBooks refuses an attachment over 8 MiB, and a receipt that cannot be
+ * attached is worse than one that was never accepted: the Purchase is created,
+ * the file is not on it, and the books look complete. THIS is therefore the
+ * ceiling for the whole pipeline, not just for the booking step.
+ *
+ * It used to be 15 MiB at the door and 8 MiB at the books, and everything in
+ * between was accepted, stored, read by the model, and then parked
+ * `unsupported-attachment:size` — after a human had already been told we had
+ * it. One number, enforced at every layer that can enforce anything:
+ *
+ *   * the bucket's own file_size_limit (the only place a signed-URL write can
+ *     be refused at all — see bucket.ts / apply-receipt-intake.mjs),
+ *   * /start, on the size the client declares,
+ *   * inspectStoredObject, on the object's metadata and then on its bytes,
+ *   * attachmentBlocker, as the last preflight before the Purchase.
+ */
+export const QBO_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
+
 /** The real ceiling for a stored receipt, enforced on the object itself. */
-export const MAX_STORED_BYTES = 15 * 1024 * 1024;
+export const MAX_STORED_BYTES = QBO_ATTACHMENT_MAX_BYTES;
 
 /** Sources a shared-secret forwarder may declare. */
 export const MACHINE_SOURCES = new Set(["drive", "email", "chat"]);
@@ -106,16 +125,22 @@ export const MAX_SOURCE_REF_BYTES = 512;
  * the QuickBooks DocNumber seed, so a junk tail becomes a junk DocNumber and
  * two junk tails sharing a 21-character prefix collide in the books.
  *
- * Each pattern describes the id the forwarder actually holds:
- *   drive — a Drive file id.
- *   email — `<messageId>/<attachmentIndex>`: one message can carry several
- *           receipts, and each attachment is its own document.
- *   chat  — a Chat message resource name, optionally naming the attachment.
+ * The shapes are the ones the Apps Script forwarder actually sends (see the
+ * `sourceRef` doc on the Prisma model), NOT a superset invented here — a
+ * validator that accepts more than production sends is a validator that would
+ * have accepted the bug it exists to stop:
+ *   drive — `drive:<fileId>`: the Drive file id, which is also the QuickBooks
+ *           DocNumber seed for these rows.
+ *   email — `email:<gmailMsgId>:<sha16>`: one message can carry several
+ *           receipts, so the message id alone is not an identity; the 16-hex
+ *           content hash distinguishes them.
+ *   chat  — `chat:<messageResourceName>:<idx>`: a Chat message resource name
+ *           (`spaces/<space>/messages/<message>`) plus the attachment index.
  */
 export const SOURCE_REF_PATTERNS: Record<string, RegExp> = {
     drive: /^[A-Za-z0-9_-]{10,128}$/,
-    email: /^[A-Za-z0-9_.+=~-]{1,256}\/\d{1,4}$/,
-    chat: /^spaces\/[A-Za-z0-9_-]{1,128}\/messages\/[A-Za-z0-9_.=-]{1,256}(?:\/attachments\/[A-Za-z0-9_.=-]{1,256})?$/,
+    email: /^[A-Za-z0-9_.+=~-]{1,256}:[0-9a-f]{16}$/,
+    chat: /^spaces\/[A-Za-z0-9_-]{1,128}\/messages\/[A-Za-z0-9_.=-]{1,256}:\d{1,4}$/,
 };
 
 export type SourceRefCheck = { ok: true } | { ok: false; reason: string };

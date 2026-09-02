@@ -71,16 +71,64 @@ test("the partial unique index is identical in both, predicate included", () => 
     assert.ok(expected.includes(`where "dedupstrongkey" is not null and "state" not in('duplicate','void')`));
 });
 
+/**
+ * The CHECK constraint's actual SEMANTICS: the ordered state list, and whether
+ * the block converges (replaces a stale definition) or merely creates.
+ *
+ * Token-presence — "does this file mention 'BOOKED' somewhere" — passed happily
+ * while the two files did DIFFERENT things with the constraint they both
+ * mention, which is exactly how they drifted.
+ */
+function checkSemantics(sql: string) {
+    const body = sql.slice(sql.indexOf("ReceiptIntake_state_check"));
+    return {
+        states: Array.from(body.matchAll(/'([A-Z_]{4,})'/g), m => m[1])
+            .filter(token => (RECEIPT_INTAKE_STATES as string[]).includes(token)),
+        converges: /DROP CONSTRAINT "ReceiptIntake_state_check"/.test(body)
+            && /IS DISTINCT FROM wanted_def/.test(body),
+        scoped: /conrelid = '"ReceiptIntake"'::regclass/.test(body),
+    };
+}
+
 test("both files declare the SAME closed state set, and it matches the runtime one", () => {
     // A state the CHECK constraint rejects but the code can produce is a
     // guaranteed 500 on a document nobody can then see.
     assert.deepEqual([...RUNTIME_STATES].sort(), [...RECEIPT_INTAKE_STATES].sort());
     const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
     assert.ok(check, "the script must add the state CHECK constraint");
-    for (const state of RECEIPT_INTAKE_STATES) {
-        assert.ok(check.includes(`'${state}'`), `apply script CHECK is missing ${state}`);
-        assert.ok(migrationSql.includes(`'${state}'`), `migration.sql CHECK is missing ${state}`);
+
+    const fromScript = checkSemantics(check!);
+    const fromMigration = checkSemantics(migrationSql);
+
+    // SEMANTIC PARITY, not "both mention the word".
+    assert.deepEqual(fromScript.states, fromMigration.states, "the same states, in the same order");
+    assert.deepEqual(
+        [...new Set(fromScript.states)].sort(),
+        [...RECEIPT_INTAKE_STATES].sort(),
+        "and it is the whole closed set",
+    );
+});
+
+test("BOTH paths converge on the wanted definition; neither only creates-if-absent", () => {
+    // A database that already carried an older state list kept it forever under
+    // "create only when absent", while the apply script corrected it in
+    // production — the same repo describing two different tables depending on
+    // which path built them.
+    const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"))!;
+    for (const [label, semantics] of [
+        ["apply script", checkSemantics(check)],
+        ["migration.sql", checkSemantics(migrationSql)],
+    ] as const) {
+        assert.equal(semantics.converges, true, `${label} replaces a stale definition`);
+        assert.equal(semantics.scoped, true, `${label} scopes the lookup to this table`);
     }
+    // And they agree on WHAT the wanted definition is, character for character:
+    // this string is compared against pg_get_constraintdef, so a single
+    // character of difference means one path replaces the constraint on every
+    // run while the other leaves it alone.
+    const wanted = (sql: string) => /wanted_def\s+TEXT\s*:=\s*('(?:[^']|'')*')/.exec(sql)?.[1] ?? null;
+    assert.ok(wanted(check), "the apply script declares a wanted definition");
+    assert.equal(wanted(check), wanted(migrationSql));
 });
 
 test("every FK and index in the script also exists in the migration", () => {
@@ -273,7 +321,21 @@ test("the bucket policy in the script matches the one the code writes through", 
         "the accepted formats and the bucket's allow-list are the same list",
     );
     assert.equal(RECEIPT_BUCKET_POLICY.public, false);
-    assert.equal(RECEIPT_BUCKET_FILE_SIZE_LIMIT, 15 * 1024 * 1024);
+
+    // ONE CEILING, and it is QuickBooks': a bucket that accepts more than QBO
+    // will attach stores receipts that are guaranteed to strand — the Purchase
+    // is created, the file is not on it, and the books look complete. The
+    // intake door, the bucket, the object check and the booking preflight are
+    // all the same number.
+    const { QBO_ATTACHMENT_MAX_BYTES, MAX_STORED_BYTES } =
+        await import("../src/lib/receipt-intake/intake-core");
+    const { attachmentBlocker } = await import("../src/lib/receipt-intake/book");
+    assert.equal(RECEIPT_BUCKET_FILE_SIZE_LIMIT, 8 * 1024 * 1024);
+    assert.equal(QBO_ATTACHMENT_MAX_BYTES, RECEIPT_BUCKET_FILE_SIZE_LIMIT);
+    assert.equal(MAX_STORED_BYTES, RECEIPT_BUCKET_FILE_SIZE_LIMIT);
+    // The booking preflight agrees at the boundary, in both directions.
+    assert.equal(attachmentBlocker("image/png", MAX_STORED_BYTES), null);
+    assert.equal(attachmentBlocker("image/png", MAX_STORED_BYTES + 1), `size:${MAX_STORED_BYTES + 1}`);
 });
 
 test("a missing bucket is CREATED private, with both limits", async () => {

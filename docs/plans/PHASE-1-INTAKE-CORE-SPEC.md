@@ -224,7 +224,7 @@ missing bucket policy is invisible until a 400 MB object is already stored.
   `threadName?`) or JSON `{fileBase64, mimeType, fileName?, source, sourceRef?, projectId?,
   costCodeId?, threadName?}`. `source` in mobile|email|drive|chat|web. Machine callers MUST
   send `sourceRef`; session/Bearer callers get `web:<uuid>` / `mobile:<uuid>` minted
-  server-side. Max 15 MB. Accept pdf/jpeg/png/heic/webp/gif/txt; sniff magic bytes for
+  server-side. Max 8 MiB (QuickBooks' attachment ceiling). Accept pdf/jpeg/png/heic/webp/gif; sniff magic bytes for
   images the way `receipts/parse` does (route.ts:37).
 - **Behavior**: sha256 the bytes; create the row (catch P2002 on `sourceRef` and return the
   existing row with `{ok:true, alreadyReceived:true}`); upload to `SECURE_BUCKET` at
@@ -487,11 +487,11 @@ fine.
 |---|---|---|
 | `POST /api/receipts/intake` (JSON) | **3 MiB raw** | base64 inflates by 4/3, so 3 MiB encodes to ~4 MiB and fits the serverless body cap. 4 MiB raw would be a ~5.4 MiB request that dies at the edge with a 413 this code never sees. |
 | `POST /api/receipts/intake` (multipart) | **4 MiB** | bytes are sent as-is. |
-| two-step (`/start` + signed URL + `/finalize`) | **15 MiB** | the bytes never pass through this server. |
+| two-step (`/start` + signed URL + `/finalize`) | **8 MiB** | the bytes never pass through this server. The ceiling is QuickBooks' own attachment limit: anything larger is a receipt that would be stored, read, and then stranded `unsupported-attachment:size` after we had already told the sender we had it. One constant, `QBO_ATTACHMENT_MAX_BYTES` in `intake-core.ts`. |
 
 Both inline ceilings answer with a 413 naming the two-step path.
 
-**The 15 MiB ceiling is set on the Supabase bucket as well as in code.** The signed upload
+**The 8 MiB ceiling is set on the Supabase bucket as well as in code.** The signed upload
 URL bypasses this server entirely, so application code cannot stop the write — it can only
 refuse the object afterwards, by which time the bytes are already paid for and sitting in
 the bucket. Set it where the write happens:
@@ -599,7 +599,7 @@ through this server at all:
 3. `POST /api/receipts/intake/{id}/finalize` with `{sha256?}` -> publishes `STAGING` ->
    `RECEIVED`. The server re-reads the object and derives the mime, the size and the sha
    FROM STORAGE; a declared `sha256` is checked against that and a mismatch is a 409. Over
-   15 MB or an unreadable format deletes the row and refuses.
+   8 MiB or an unreadable format deletes the row and refuses.
 
 Both paths share `decideSource` (provenance and idempotency), so a session/Bearer caller can
 never choose `source` or `sourceRef` on either, and `uploadId` is scoped to the authenticated

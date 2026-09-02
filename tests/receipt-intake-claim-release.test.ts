@@ -126,3 +126,25 @@ test("every fenced write CASes on the OWNERSHIP it was handed, not on the id alo
     }
     assert.match(route, /const owns = \{ id: rowId, state: "BOOKING", claimToken \} as const;/);
 });
+
+test("applyRead is the ONE lease-keeping write, and it can only say RECEIVED", () => {
+    // The scanner above skips it, because its `data` carries no state literal —
+    // it spreads a patch. So it is asserted directly instead: routing continues
+    // under this lease, which is the whole reason it keeps it, and the compiler
+    // is what stops a TERMINAL state being routed back through it.
+    const worker = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/worker.ts"),
+        "utf8",
+    );
+    assert.match(worker, /patch: ReadPatch & \{ state: "RECEIVED" \}/);
+
+    const fn = route.slice(route.indexOf("applyRead: async"));
+    const body = fn.slice(0, fn.indexOf("findWeakHit:"));
+    assert.match(body, /where: \{ id: rowId, state: ownership\.state, claimToken: ownership\.claimToken \}/,
+        "still fenced on ownership like every other write");
+    assert.ok(!/RELEASE_CLAIM/.test(body), "and deliberately does NOT release: routing is not finished");
+    assert.match(body, /nextRetryAt is deliberately/, "with the reason written down at the write itself");
+
+    // Every TERMINAL outcome goes through applyState, which does release.
+    assert.match(worker, /const owned = await deps\.applyState\(row\.id, gate\.state, note\(gate\.stateReason\)/);
+});

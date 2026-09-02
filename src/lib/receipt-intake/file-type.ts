@@ -26,7 +26,8 @@ export const EXT_BY_MIME: Record<string, string> = {
 /** The formats a caller may be told to send. Single source for the 415 body. */
 export const ACCEPTED_MIME_TYPES = Object.keys(EXT_BY_MIME);
 
-export const MAX_INTAKE_BYTES = 15 * 1024 * 1024;
+/** @deprecated Unused — the one ceiling is MAX_STORED_BYTES in intake-core.ts. */
+export const MAX_INTAKE_BYTES = 8 * 1024 * 1024;
 
 /** ISO-BMFF major brands stored as image/heic (still + HEVC sequence brands). */
 export const HEIC_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "msf1"]);

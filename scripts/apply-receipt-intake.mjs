@@ -327,7 +327,11 @@ const expectedPartialIndexes = [{
 // the wrong limit is a hard failure — silently "fixing" a limit somebody set
 // deliberately is how a 400 MB upload becomes possible again next quarter.
 export const RECEIPT_BUCKET = "receipt-intake";
-export const RECEIPT_BUCKET_FILE_SIZE_LIMIT = 15 * 1024 * 1024;
+// The SAME ceiling QuickBooks will attach at (MAX_STORED_BYTES /
+// QBO_ATTACHMENT_MAX_BYTES in src/lib/receipt-intake/intake-core.ts, asserted
+// equal by tests/apply-receipt-intake.test.ts). A bucket that accepts more than
+// QBO can attach stores receipts that are guaranteed to strand.
+export const RECEIPT_BUCKET_FILE_SIZE_LIMIT = 8 * 1024 * 1024;
 // EXACTLY the list src/lib/receipt-intake/file-type.ts accepts (asserted by
 // tests/apply-receipt-intake.test.ts). A bucket that allows more than the code
 // does lets an unreadable file be stored; one that allows less rejects uploads
@@ -430,7 +434,7 @@ async function applyBucket() {
     const key = process.env.SUPABASE_SERVICE_KEY;
     if (!baseUrl || !key) {
         console.error("REFUSING: SUPABASE_URL and SUPABASE_SERVICE_KEY are required to provision the receipts bucket.");
-        console.error("  The bucket carries the 15 MiB and MIME limits that the signed-upload path cannot enforce anywhere else.");
+        console.error("  The bucket carries the 8 MiB and MIME limits that the signed-upload path cannot enforce anywhere else.");
         process.exit(1);
     }
     const outcome = await ensureReceiptBucket(baseUrl, key);

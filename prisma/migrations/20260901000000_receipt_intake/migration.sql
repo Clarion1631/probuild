@@ -83,13 +83,30 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 CREATE INDEX IF NOT EXISTS "ReceiptIntake_costCodeId_idx" ON "ReceiptIntake"("costCodeId");
 CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdById_idx" ON "ReceiptIntake"("createdById");
 
+-- CONVERGENT, exactly like scripts/apply-receipt-intake.mjs: a constraint that
+-- exists with a STALE definition is replaced, not left alone. "Create only when
+-- absent" is what let the two diverge — a database that already carried an
+-- older state list (one without SHADOW_QUARANTINE, say) kept it forever here
+-- while the apply script corrected it in production, so the same repo described
+-- two different tables depending on which path built them.
 DO $$
+DECLARE current_def TEXT;
+        wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''SHADOW_DONE''::text, ''SHADOW_QUARANTINE''::text])))';
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'ReceiptIntake_state_check'
-          AND conrelid = '"ReceiptIntake"'::regclass
-    ) THEN
+    SELECT pg_get_constraintdef(oid) INTO current_def
+      FROM pg_constraint
+     WHERE conname = 'ReceiptIntake_state_check'
+       AND conrelid = '"ReceiptIntake"'::regclass;
+
+    IF current_def IS NULL THEN
+        ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
+            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
+                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
+                               'SHADOW_DONE', 'SHADOW_QUARANTINE'));
+    ELSIF current_def IS DISTINCT FROM wanted_def THEN
+        -- One statement each, in the SAME transaction as everything else here,
+        -- so the table is never briefly unconstrained.
+        ALTER TABLE "ReceiptIntake" DROP CONSTRAINT "ReceiptIntake_state_check";
         ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
             CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                                'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',

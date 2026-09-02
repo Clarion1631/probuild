@@ -1,4 +1,5 @@
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { isReceiptUrlRef, resolveReceiptUrl } from "./receipt-intake/receipt-url";
 
 /**
  * Private bucket for documents that carry legal or PII weight: e-signatures, executed
@@ -98,6 +99,7 @@ export function parseOwnStorageUrl(
 /**
  * Turn a stored document reference into something a browser can load.
  *
+ * - receipt ref     → short-lived signed URL against the receipts bucket
  * - secure ref      → short-lived signed URL against the private bucket
  * - data: URL       → returned unchanged (legacy inline signatures still render)
  * - absolute URL    → returned unchanged (legacy public-bucket object, still served)
@@ -111,6 +113,11 @@ export async function resolveDocUrl(
     ttlSeconds: number = DEFAULT_SIGNED_URL_TTL_SECONDS,
 ): Promise<string | null> {
     if (!stored) return null;
+
+    // `receipt-intake://<bucket>/<path>` — what the receipt pipeline writes to
+    // Expense.receiptUrl. Handled here so EVERY existing reader resolves it,
+    // rather than each one learning a second scheme.
+    if (isReceiptUrlRef(stored)) return await resolveReceiptUrl(stored, ttlSeconds);
 
     const securePath = secureRefPath(stored);
     if (securePath) {

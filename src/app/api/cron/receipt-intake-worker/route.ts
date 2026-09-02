@@ -761,6 +761,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         // call. A late job assignment landing in that window must not be routed
         // over: NEEDS_JOB for a receipt that HAS a job sends a human looking for
         // a problem that no longer exists.
+        sendAttemptedNow: async rowId => {
+            const row = await prisma.receiptIntake.findUnique({
+                where: { id: rowId },
+                select: { sendAttempted: true },
+            });
+            // A row that vanished, or a read that returned nothing, is answered
+            // "a send may have happened": retaining the key costs a review, and
+            // releasing it wrongly costs a second Purchase.
+            return row?.sendAttempted ?? true;
+        },
+
         refreshProjectId: async rowId => {
             const row = await prisma.receiptIntake.findUnique({
                 where: { id: rowId },

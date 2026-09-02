@@ -1055,6 +1055,63 @@ test.describe("round-9 intake contracts", () => {
         expect((await unproven.json()).error).toBe("sourceRef-conflict");
     });
 
+    test("the PRODUCTION sourceRef formats are accepted by both endpoints", async ({ request }) => {
+        // Exactly what the Apps Script forwarder sends. A validator that
+        // accepted more than production sends would have accepted the bug it
+        // exists to stop; one that accepts LESS breaks the forwarder silently,
+        // so both shapes are driven through both doors.
+        const stamp = Date.now();
+        const emailRef = `email:1993f0a3c9c4d0${stamp % 100}:0f1e2d3c4b5a6978`;
+        const chatRef = `chat:spaces/AAQANF47osY/messages/e2e.${stamp}:0`;
+
+        const inline = await postIntake(request, JSON.stringify({
+            source: "email", sourceRef: emailRef,
+            fileBase64: PNG_BASE64, mimeType: "image/png", fileName: "e.png",
+        }));
+        expect(inline.res.status()).toBe(200);
+        minted.push(inline.body.id);
+
+        const started = await request.post(`${INTAKE_PATH}/start`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "chat", sourceRef: chatRef, mimeType: "image/png",
+                sha256: createHash("sha256").update(Buffer.from(PNG_BASE64, "base64")).digest("hex"),
+            }),
+            maxRedirects: 0,
+        });
+        expect(started.status()).toBe(200);
+        minted.push((await started.json()).id);
+    });
+
+    test("a namespace with no id, and an oversized one, are refused at both doors", async ({ request }) => {
+        // `drive:` with an empty tail was a valid, unique, PERMANENT idempotency
+        // key: every later empty-tail forward collided with it and was told
+        // "already received", so real receipts were dropped.
+        const bad: Array<[string, string]> = [
+            ["drive:", "invalid-sourceRef"],
+            [`drive:${"a".repeat(600)}`, "sourceRef-too-long"],
+            ["drive:short", "invalid-sourceRef"],
+        ];
+        for (const [sourceRef, reason] of bad) {
+            const inline = await postIntake(request, intakeBody({ sourceRef }));
+            expect(inline.res.status(), sourceRef).toBe(400);
+            expect(inline.body.reason, sourceRef).toBe(reason);
+
+            const started = await request.post(`${INTAKE_PATH}/start`, {
+                headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+                data: JSON.stringify({
+                    source: "drive", sourceRef, mimeType: "image/png", sha256: "a".repeat(64),
+                }),
+                maxRedirects: 0,
+            });
+            expect(started.status(), sourceRef).toBe(400);
+            expect((await started.json()).reason, sourceRef).toBe(reason);
+        }
+        // And nothing was created for any of them.
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: { startsWith: "drive:a" } } });
+        expect(rows).toHaveLength(0);
+    });
+
     test("a text receipt is refused with a 415 that says what to send instead", async ({ request }) => {
         // QuickBooks cannot attach a .txt, so accepting one meant reading it and
         // then stranding it unbookable mid-pipeline.

@@ -18,7 +18,8 @@
  * (tests/receipt-intake-book.test.ts). No module mocking — CI is Node 20.
  */
 import { matchCostCode } from "@/lib/project-match";
-import { receiptObjectRef } from "./bucket";
+import { receiptUrlRef } from "./receipt-url";
+import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -87,17 +88,22 @@ export interface BookableRow {
  * for a file it cannot take, and `bookReceipt` marked that BOOKED. The result is
  * a Purchase in the real books with no receipt attached — the one failure a
  * bookkeeper cannot spot later, because the Purchase looks complete and nothing
- * flags it. Every accepted .txt receipt hit this, as did anything between our
- * 15 MB intake ceiling and QBO's 8 MB attachment ceiling.
+ * flags it. Every accepted .txt receipt hit this, as did anything between the
+ * old 15 MiB intake ceiling and QBO's 8 MiB attachment ceiling — which is why
+ * the two are now ONE constant.
  *
  * If either constant changes over there, this must change with it; the test
  * asserts the two ceilings against each other so the gap cannot silently widen.
+ *
+ * The SIZE half is no longer a mirror at all: intake-core exports the one
+ * ceiling and every layer (bucket policy, /start, inspectStoredObject, this
+ * preflight) uses it, so a file that reaches here can always be attached.
  */
 const QBO_ATTACHABLE_MIMES = new Set([
     "image/jpeg", "image/png", "image/gif", "image/webp",
     "image/heic", "image/heif", "application/pdf",
 ]);
-const MAX_QBO_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_QBO_ATTACHMENT_BYTES = QBO_ATTACHMENT_MAX_BYTES;
 
 /**
  * Can QuickBooks take this file at all? Deterministic, so it is answered BEFORE
@@ -404,7 +410,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     const bytes = download.bytes;
 
     // RE-CHECKED after the download, which is the slowest thing before the
-    // send. A 15 MB object over a slow link can eat the whole runway that the
+    // send. An 8 MiB object over a slow link can eat the whole runway that the
     // entry check just approved.
     if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
 
@@ -589,23 +595,35 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // that can take seconds, and the answer that matters is the one true when
     // the money is recorded — a project reassignment that lands in between must
     // not be written into job cost.
-    const phaseCheck = await resolvePhase(row, project.id, deps);
-    if (phaseCheck.costCodeId !== phaseBeforeSend.costCodeId) {
-        console.warn(
-            "[receipt-intake] phase changed across the QBO create",
-            JSON.stringify({ rowId: row.id, before: phaseBeforeSend.costCodeId, after: phaseCheck.costCodeId }),
-        );
-    }
-    const costCodeId = phaseCheck.costCodeId;
-    const driveFileId = driveFileIdOf(row);
-    const receiptUrl = driveFileId
-        ? `https://drive.google.com/file/d/${driveFileId}/view`
-        : receiptObjectRef(row.storagePath);
-    const docRef = isCheck
-        ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
-        : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
-
+    // EVERYTHING FROM HERE IS POST-SEND, so it is all inside the try.
+    //
+    // The phase re-check is a database round trip, and it used to sit OUTSIDE
+    // the protected block. A throw there — a pool timeout, a dropped
+    // connection — escaped bookReceipt entirely, so the worker's generic error
+    // handler parked the row from the snapshot it claimed with, and that
+    // snapshot says `sendAttempted: false`. The key was then released for a row
+    // that has a Purchase in the real books, and the next submission of the
+    // same receipt books it a second time.
     try {
+        const phaseCheck = await resolvePhase(row, project.id, deps);
+        if (phaseCheck.costCodeId !== phaseBeforeSend.costCodeId) {
+            console.warn(
+                "[receipt-intake] phase changed across the QBO create",
+                JSON.stringify({ rowId: row.id, before: phaseBeforeSend.costCodeId, after: phaseCheck.costCodeId }),
+            );
+        }
+        const costCodeId = phaseCheck.costCodeId;
+        const driveFileId = driveFileIdOf(row);
+        const receiptUrl = driveFileId
+            ? `https://drive.google.com/file/d/${driveFileId}/view`
+            // A STABLE reference, not a signed URL: the column outlives any link
+            // we could mint here (ten minutes later it is dead), and every reader
+            // mints its own from this — see resolveReceiptUrl.
+            : receiptUrlRef(row.storagePath);
+        const docRef = isCheck
+            ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
+            : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
+
         const expenseId = await deps.db.$transaction(async tx => {
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
@@ -682,7 +700,14 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // to reconcile against the Purchase.
             taxCents: taxApplied,
             detail: {
-                fileId,
+                // `fileId` means a DRIVE file id — logAutomationEvent copies it
+                // into the typed `driveFileId` column, which the cutover reads
+                // to decide whether v1 already booked a document. Emitting an
+                // intake cuid there filled that column with ids no Drive query
+                // can ever match, and quietly widened what "v1 booked this"
+                // could mean. Non-Drive rows carry their id in `intakeId`,
+                // which every row has anyway.
+                ...(driveFileId ? { fileId: driveFileId } : {}),
                 qbPurchaseId: result.qbPurchaseId,
                 intakeId: row.id,
                 expenseId,

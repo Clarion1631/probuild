@@ -244,7 +244,10 @@ test("provenance rules are shared by BOTH upload paths", async () => {
     // The inline body cap is well under the stored cap, which is the whole
     // reason the two-step path exists.
     assert.ok(MAX_INLINE_UPLOAD_BYTES < MAX_STORED_BYTES);
-    assert.equal(MAX_STORED_BYTES, 15 * 1024 * 1024);
+    // The stored ceiling is QuickBooks' attachment ceiling — see
+    // tests/apply-receipt-intake.test.ts, which ties it to the bucket policy
+    // and the booking preflight.
+    assert.equal(MAX_STORED_BYTES, 8 * 1024 * 1024);
 });
 
 // ── Two secrets, two blast radii (Phase 3 gate, c) ─────────────────────────
@@ -501,19 +504,26 @@ test("a sourceRef must carry a real id for its source, not just the prefix", asy
     assert.deepEqual(validateSourceRef("drive", "drive:1AbCdEfGhIjKlMnOp_qR"), { ok: true });
     assert.deepEqual(validateSourceRef("drive", "drive:short"), { ok: false, reason: "invalid-sourceRef" });
     assert.deepEqual(validateSourceRef("drive", "drive:has spaces here"), { ok: false, reason: "invalid-sourceRef" });
-    assert.deepEqual(validateSourceRef("email", "email:CADnq=abc123def/0"), { ok: true });
+    // THE PRODUCTION FORMATS, exactly as the Apps Script forwarder sends them.
+    assert.deepEqual(validateSourceRef("email", "email:1993f0a3c9c4d0d2:0f1e2d3c4b5a6978"), { ok: true });
     assert.deepEqual(
-        validateSourceRef("email", "email:CADnq=abc123def"),
+        validateSourceRef("email", "email:1993f0a3c9c4d0d2"),
         { ok: false, reason: "invalid-sourceRef" },
-        "one message can carry several receipts; the attachment index is part of the identity",
+        "one message can carry several receipts; the content hash is part of the identity",
+    );
+    assert.deepEqual(
+        validateSourceRef("email", "email:1993f0a3c9c4d0d2:NOTHEX0123456789"),
+        { ok: false, reason: "invalid-sourceRef" },
+        "the tail is a sha16, not free text",
+    );
+    assert.deepEqual(
+        validateSourceRef("chat", "chat:spaces/AAQANF47osY/messages/abc.def:0"),
+        { ok: true },
     );
     assert.deepEqual(
         validateSourceRef("chat", "chat:spaces/AAQANF47osY/messages/abc.def"),
-        { ok: true },
-    );
-    assert.deepEqual(
-        validateSourceRef("chat", "chat:spaces/AAQANF47osY/messages/abc.def/attachments/ATT.1"),
-        { ok: true },
+        { ok: false, reason: "invalid-sourceRef" },
+        "the attachment index is part of the identity",
     );
     assert.deepEqual(
         validateSourceRef("chat", "chat:AAQANF47osY"),

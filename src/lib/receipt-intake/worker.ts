@@ -163,6 +163,21 @@ export interface WorkerDependencies {
      */
     refreshProjectId: (rowId: string) => Promise<string | null>;
     /**
+     * The PERSISTED send flag, re-read at park time.
+     *
+     * `row.sendAttempted` is the value this pass CLAIMED with, so it is stale
+     * the moment the booking marks a send — and the booking marks it precisely
+     * so the fact survives a process that dies mid-create. A park decided on
+     * the snapshot released the dedup key of a row that has a Purchase in the
+     * real books, and the next submission of the same receipt booked it twice.
+     *
+     * Failing to read it means RETAINING the key: holding one against a
+     * booking that did not happen sends a resubmission to a human, and that is
+     * a queue item. Releasing one against a booking that did happen is a
+     * duplicate payment.
+     */
+    sendAttemptedNow: (rowId: string) => Promise<boolean>;
+    /**
      * Tagged, and VERIFIED: the bytes must hash to what the row recorded at
      * finalize. A sha stored once and never re-checked proves nothing about
      * what is being read now.
@@ -177,10 +192,18 @@ export interface WorkerDependencies {
      * CAS'd on {id, state, claimToken} like every other mutation. `owned:false`
      * means this worker lost the row mid-pass and must abort — writing on would
      * clobber whatever its successor has since decided.
+     *
+     * THE ONE WRITE THAT KEEPS THE CLAIM, and the type says so: its state is
+     * pinned to "RECEIVED" because routing is not finished when it lands — the
+     * strong claim, the weak net and the publish all still have to happen under
+     * this same lease. Every TERMINAL outcome goes through applyState instead,
+     * which releases ownership in the same fenced write. Writing a terminal
+     * state here would leave a finished row holding a claim, and a row that is
+     * done but still owned is a row nothing will touch again.
      */
     applyRead: (
         rowId: string,
-        patch: ReadPatch,
+        patch: ReadPatch & { state: "RECEIVED" },
         ownership: Ownership,
     ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
     findWeakHit: (rowId: string, weakKey: string) => Promise<{ id: string } | null>;
@@ -710,14 +733,24 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // A multi-doc, a non-receipt, or a $0/negative misread must never hold
         // a dedup key — it would quarantine the real receipt that arrives next
         // (:531 and the v3.6 rationale).
-        const gated = await deps.applyRead(row.id, {
+        //
+        // Via applyState, NOT applyRead: this row is FINISHED — nothing else in
+        // this pass will touch it — so the write that parks it must also hand
+        // the claim back, atomically. applyRead deliberately keeps the lease
+        // (routing continues under it), which for a terminal outcome left a
+        // done row owned by a pass that had moved on: invisible to the health
+        // probe as anything but "claimed", and untouchable by every fenced
+        // write until the lease aged out.
+        //
+        // Safe to swap: the unique-violation path applyRead exists for cannot
+        // fire here, because a gated row claims no strong key at all.
+        const owned = await deps.applyState(row.id, gate.state, note(gate.stateReason), {
             ...base,
             state: gate.state,
-            stateReason: note(gate.stateReason),
             dedupStrongKey: null,
             duplicateOfId: gate.duplicateOfId,
         }, ownershipOf(row));
-        return gated.owned ? gate.state : "STALE";
+        return owned ? gate.state : "STALE";
     }
 
     // The strong claim IS the partial unique index: a rejection is the hit.
@@ -798,7 +831,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
  * against nothing.
  *
  * `sendAttempted` is the PERSISTED flag — markSendAttempted writes it before
- * the create precisely so this decision survives a process that died mid-send.
+ * the create precisely so this decision survives a process that died mid-send,
+ * and it is RE-READ here rather than taken from the row this pass claimed. A
+ * failure anywhere after the send (the post-create phase check, the Expense
+ * commit, a pool timeout) reaches this function with a snapshot that still says
+ * "nothing sent", and releasing the key on that is a duplicate payment.
  */
 async function parkTerminal(
     row: WorkerRow,
@@ -806,7 +843,9 @@ async function parkTerminal(
     reason: string,
     patch?: Partial<ReadPatch>,
 ): Promise<string> {
-    const release = row.sendAttempted ? {} : { dedupStrongKey: null };
+    // Re-read, never the claim-time snapshot: see sendAttemptedNow.
+    const sent = row.sendAttempted || await deps.sendAttemptedNow(row.id).catch(() => true);
+    const release = sent ? {} : { dedupStrongKey: null };
     const owned = await deps
         .applyState(row.id, "NEEDS_REVIEW", reason, { ...(patch ?? {}), ...release }, ownershipOf(row))
         .catch(() => false);

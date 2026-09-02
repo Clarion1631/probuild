@@ -507,7 +507,7 @@ async function respondToSourceRefConflict(
     // have. The state a row happens to be parked in says nothing about whether
     // its bytes exist.
     // Metadata, not a download: this runs on every replay, and the object may
-    // be 15 MB. A TRANSIENT answer is not evidence of absence — healing on it
+    // be 8 MiB. A TRANSIENT answer is not evidence of absence — healing on it
     // would overwrite a document that is really there — so it is answered 503
     // and the forwarder retries with its copy intact.
     const present = await receiptObjectSize(existing.storagePath);

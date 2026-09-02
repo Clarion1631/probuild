@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isReceiptUrlRef, resolveReceiptUrl } from "@/lib/receipt-intake/receipt-url";
 import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI } from "@google/genai";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
@@ -599,11 +600,24 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: false, reason: "no-stored-copy" });
     }
 
+    // A receipt this pipeline booked is a STORED REFERENCE, not a link — it is
+    // resolved to a short-lived signed URL here rather than being fetched as
+    // written. Everything else keeps the old contract exactly.
+    const receiptUrl = isReceiptUrlRef(expense.receiptUrl)
+        ? await resolveReceiptUrl(expense.receiptUrl)
+        : expense.receiptUrl;
+    if (!receiptUrl) {
+        return NextResponse.json({ ok: false, reason: "no-stored-copy" });
+    }
+
     // SSRF sink check: receiptUrl is written only by our sync/upload code,
     // but this fetch enforces the invariant anyway — the URL must point at
-    // OUR Supabase public storage, no redirects followed.
-    const storagePrefix = `${(process.env.SUPABASE_URL ?? "").replace(/\/$/, "")}/storage/v1/object/public/`;
-    if (!process.env.SUPABASE_URL || !expense.receiptUrl.startsWith(storagePrefix)) {
+    // OUR Supabase storage, no redirects followed. Public objects carry the
+    // `/public/` segment; a signed one carries `/sign/`, so both prefixes are
+    // named explicitly rather than loosened to the storage root.
+    const storageRoot = `${(process.env.SUPABASE_URL ?? "").replace(/\/$/, "")}/storage/v1/object/`;
+    const allowed = [`${storageRoot}public/`, `${storageRoot}sign/`];
+    if (!process.env.SUPABASE_URL || !allowed.some(prefix => receiptUrl.startsWith(prefix))) {
         console.error("ai-review refused non-storage receiptUrl");
         return NextResponse.json({ ok: false, reason: "receipt-url-untrusted" }, { status: 409 });
     }
@@ -620,7 +634,7 @@ export async function POST(request: Request) {
     inFlightDocs.add(dedupeKey);
 
     try {
-        const fileRes = await fetch(expense.receiptUrl, { redirect: "error", signal: AbortSignal.timeout(20_000) });
+        const fileRes = await fetch(receiptUrl, { redirect: "error", signal: AbortSignal.timeout(20_000) });
         if (!fileRes.ok) {
             return NextResponse.json({ ok: false, reason: "receipt-fetch-failed" }, { status: 502 });
         }

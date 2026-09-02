@@ -241,11 +241,31 @@ test("an explicitly chosen cost code beats the model's suggestion", async () => 
     assert.equal(r.expenses[0].costCodeId, "cc-chosen");
 });
 
-test("a non-drive row books under its intake id and stores the secure ref", async () => {
+test("a non-drive row books under its intake id and stores a resolvable reference", async () => {
     const r = recorder();
     await bookReceipt(row({ source: "mobile", sourceRef: "mobile:abc", id: "intake-9" }), r.deps);
+    // The QBO identity still needs SOMETHING unique, and the intake id is it.
     assert.equal(r.purchaseCalls[0].fileId, "intake-9");
-    assert.equal(r.expenses[0].receiptUrl, "receipt-intake:receipts/intake/intake-1.jpg");
+    // The Expense holds a stable reference — not a signed URL that expires, and
+    // not a bare path that says nothing about which bucket it is in.
+    assert.equal(r.expenses[0].receiptUrl, "receipt-intake://receipt-intake/receipts/intake/intake-1.jpg");
+});
+
+test("the audit event calls a DRIVE id fileId, and everything else intakeId", async () => {
+    // `fileId` is dual-written into the typed `driveFileId` column, which the
+    // cutover queries to decide whether v1 already booked a document. An intake
+    // cuid there fills it with ids no Drive query can ever match.
+    const mobile = recorder();
+    await bookReceipt(row({ source: "mobile", sourceRef: "mobile:abc", id: "intake-9" }), mobile.deps);
+    const mobileDetail = mobile.events[0].detail as Record<string, unknown>;
+    assert.ok(!("fileId" in mobileDetail), "no Drive file exists for this row");
+    assert.equal(mobileDetail.intakeId, "intake-9");
+
+    const drive = recorder();
+    await bookReceipt(row({ source: "drive", sourceRef: "drive:FILE9", id: "intake-9" }), drive.deps);
+    const driveDetail = drive.events[0].detail as Record<string, unknown>;
+    assert.equal(driveDetail.fileId, "FILE9", "a real Drive id, not the intake row id");
+    assert.equal(driveDetail.intakeId, "intake-9", "and the row id is still carried");
 });
 
 test("a project with no estimate is terminal, spends NO attempt, and RELEASES the strong key", async () => {
