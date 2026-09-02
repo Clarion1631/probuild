@@ -50,6 +50,43 @@ test("the bypass is exact-match — nothing else under /api/automation inherits 
     }
 });
 
+test("every bypassed machine endpoint refuses a Server Action dispatch", async () => {
+    const { isMachineOnlyBypass, isPublicProxyBypass } = await loadProxy();
+    for (const path of [
+        "/api/automation/receipt-requests/threads",
+        "/api/automation/receipt-requests/threads/",
+        "/api/automation/receipt-requests/answers",
+        "/api/automation/receipt-requests/answers/",
+        // Phase 1's endpoints carry the identical hole; the fix is shared.
+        "/api/receipts/intake",
+        "/api/receipts/intake/",
+        "/api/receipts/intake/abc123/archived",
+        "/api/office-tasks/ingest",
+    ]) {
+        assert.equal(isMachineOnlyBypass(path), true, path);
+        // Every one must ALSO be on the bypass — otherwise this guard is
+        // protecting a path the proxy was never waving through anyway.
+        assert.equal(isPublicProxyBypass(path), true, `${path} must be a bypass path`);
+    }
+});
+
+test("the Server-Action refusal is exact-match — it neither over- nor under-reaches", async () => {
+    const { isMachineOnlyBypass } = await loadProxy();
+    for (const path of [
+        "/api/receipts/intake/abc123",
+        "/api/receipts/intake/abc123/archived/extra",
+        "/api/office-tasks/ingest/extra",
+        "/api/office-tasks",
+        "/api/automation/receipt-requests",
+        "/api/automation/receipt-requests/threads/extra",
+        // Genuinely anonymous-action surfaces keep their bypass.
+        "/portal/projects/abc",
+        "/share/room/tok",
+    ]) {
+        assert.equal(isMachineOnlyBypass(path), false, path);
+    }
+});
+
 test("no Phase 2 module imports a mail helper — nothing here ever emails a PDF", () => {
     const files = [
         "src/lib/receipt-requests.ts",
