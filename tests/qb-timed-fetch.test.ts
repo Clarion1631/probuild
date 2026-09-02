@@ -13,7 +13,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { qbTimedFetch, QBTimeoutError } from "../src/lib/quickbooks";
+import { qbTimedFetch, QBTimeoutError, parseJsonOrNull } from "../src/lib/quickbooks";
 
 let server: Server;
 let base: string;
@@ -36,6 +36,11 @@ before(async () => {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.write('{"partial":');
             held.push(() => res.destroy());
+            return;
+        }
+        if (req.url?.startsWith("/v3/company/garbage")) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end("not json at all");
             return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -294,4 +299,26 @@ test("fractional and sub-1ms timeouts never reach AbortSignal.timeout", async ()
     );
     assert.ok(error instanceof QBTimeoutError);
     assert.match(error.message, /150ms/);
+});
+
+
+// ─── parseJsonOrNull ────────────────────────────────────────────────────────
+
+test("parseJsonOrNull returns the parsed body on success", async () => {
+    const res = await qbTimedFetch(`${base}/v3/company/query`, {}, 5_000);
+    assert.deepEqual(await parseJsonOrNull(res), { ok: true, path: "/v3/company/query" });
+});
+
+test("parseJsonOrNull swallows a genuine parse error", async () => {
+    const res = await qbTimedFetch(`${base}/v3/company/garbage`, {}, 5_000);
+    assert.equal(await parseJsonOrNull(res), null);
+});
+
+test("parseJsonOrNull RETHROWS a body-read timeout instead of reporting an empty body", async () => {
+    // The trap this replaces: `.json().catch(() => null)` turned an outage into
+    // "QBO returned no body", which callers reported as a generic failure — and
+    // on the attachment path could even read as a successful upload.
+    const res = await qbTimedFetch(`${base}/v3/company/stall-body`, {}, 150);
+    const error = await parseJsonOrNull(res).then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
 });

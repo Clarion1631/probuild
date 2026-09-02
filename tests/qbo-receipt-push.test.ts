@@ -67,6 +67,10 @@ interface DepsOverrides {
     projects?: QboReceiptProjectCandidate[];
     uploadAttachment?: QboReceiptPushDependencies["uploadAttachment"];
     accountRows?: (query: string) => Array<Record<string, unknown>>;
+    /** Rows returned for the "SELECT * FROM attachable ..." existence check. */
+    attachableRows?: Array<Record<string, unknown>>;
+    /** Lets a test make the attachable lookup itself fail. */
+    attachableQueryImpl?: () => Promise<Array<Record<string, unknown>>>;
 }
 
 function createDeps(overrides: DepsOverrides = {}) {
@@ -81,6 +85,10 @@ function createDeps(overrides: DepsOverrides = {}) {
             calls.queries.push(query);
             if (/FROM Account/i.test(query)) {
                 return (overrides.accountRows?.(query) ?? defaultAccountRow(query)) as never[];
+            }
+            if (/FROM attachable/i.test(query)) {
+                if (overrides.attachableQueryImpl) return (await overrides.attachableQueryImpl()) as never[];
+                return (overrides.attachableRows ?? []) as never[];
             }
             return (overrides.existingRows ?? []) as never[];
         },
@@ -119,6 +127,8 @@ test("createQBReceiptPurchase short-circuits when the DocNumber and marker both 
         qbPurchaseId: "purchase-99",
         docNumber: input.fileId.slice(0, 21),
         alreadyExists: true,
+        // No file in this input, so there is nothing to attach.
+        attachment: "skipped",
     });
     assert.equal(calls.creates.length, 0);
     assert.equal(calls.vendorCalls.length, 0);
@@ -459,7 +469,7 @@ function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependenc
         getFreshTokens: overrides.getFreshTokens ?? (async () => TOKENS),
         createPurchase:
             overrides.createPurchase ??
-            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true })),
+            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const })),
         // Stub the audit logger: unit tests must never touch the real Prisma client.
         logEvent: overrides.logEvent ?? (() => {}),
         // Same for the pause switch — the real read fails CLOSED (paused) with no DB.
@@ -480,7 +490,7 @@ test("route POST forwards tax:true only as an explicit boolean — string \"true
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
         },
     });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -795,7 +805,7 @@ test("route POST forwards overheadCategory only as a string", async () => {
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
         },
     });
     for (const overheadCategory of ["Meals", 42]) {
@@ -813,4 +823,146 @@ test("route POST forwards overheadCategory only as a string", async () => {
     }
     assert.equal(inputs[0].overheadCategory, "Meals");
     assert.equal(inputs[1].overheadCategory, undefined);
+});
+
+// ─── Lost-response recovery: attaching to an existing Purchase ───────────────
+
+const FILE_INPUT = {
+    fileBase64: Buffer.from("pretend-jpeg-bytes").toString("base64"),
+    fileContentType: "image/jpeg",
+    fileName: "receipt.jpg",
+};
+
+/** An Attachable row as QBO returns it, linked to the given purchase. */
+function attachableRow(purchaseId: string, fileName: string) {
+    return {
+        Id: "att-1",
+        FileName: fileName,
+        AttachableRef: [{ EntityRef: { value: purchaseId, type: "Purchase" } }],
+    };
+}
+
+test("already-exists uploads the receipt when the lost first attempt never attached it", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const uploads: Array<{ purchaseId: string; fileName: string }> = [];
+    const { deps, calls } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableRows: [], // QBO has the Purchase but no file on it
+        uploadAttachment: async (_t, purchaseId, file) => {
+            uploads.push({ purchaseId, fileName: file.fileName });
+            return "attached";
+        },
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.deepEqual(result, {
+        ok: true,
+        qbPurchaseId: "99",
+        docNumber: input.fileId.slice(0, 21),
+        alreadyExists: true,
+        attachment: "attached",
+    });
+    // Still idempotent on the books: no second Purchase.
+    assert.equal(calls.creates.length, 0);
+    assert.deepEqual(uploads, [{ purchaseId: "99", fileName: "receipt.jpg" }]);
+});
+
+test("already-exists does NOT re-upload when the deterministic filename is already attached", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    let uploadCount = 0;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableRows: [attachableRow("99", "receipt.jpg")],
+        uploadAttachment: async () => {
+            uploadCount += 1;
+            return "attached";
+        },
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "already-attached");
+    assert.equal(uploadCount, 0, "an existing attachment must never be duplicated");
+});
+
+test("already-exists ignores an Attachable that belongs to a different entity type", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        // Same id + filename, but linked to an Invoice — entity ids are only
+        // unique per type, so this must not count as our receipt.
+        attachableRows: [{
+            Id: "att-1",
+            FileName: "receipt.jpg",
+            AttachableRef: [{ EntityRef: { value: "99", type: "Invoice" } }],
+        }],
+        uploadAttachment: async () => "attached",
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
+});
+
+test("already-exists reports a failed attachment lookup without failing the push", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new Error("QBO down");
+        },
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+    // The books entry exists and must still be reported ok.
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "failed:Error");
+});
+
+test("an attachment upload that times out is reported failed:QBTimeoutError, never attached", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // Both paths must classify it the same way: fresh create...
+    const fresh = createDeps({
+        uploadAttachment: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
+        },
+    });
+    const freshResult = await createQBReceiptPurchase(TOKENS, input, fresh.deps);
+    assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:QBTimeoutError");
+
+    // ...and the already-exists recovery path.
+    const existing = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableRows: [],
+        uploadAttachment: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
+        },
+    });
+    const existingResult = await createQBReceiptPurchase(TOKENS, input, existing.deps);
+    assert.equal(existingResult.ok && existingResult.alreadyExists && existingResult.attachment, "failed:QBTimeoutError");
+});
+
+test("a purchase create that times out surfaces as 503 qbo-timeout at the route", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    // parseJsonOrNull rethrows a body-read timeout instead of swallowing it as
+    // "no Purchase body", so the route can classify it as a retryable outage.
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/purchase");
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-timeout" });
 });

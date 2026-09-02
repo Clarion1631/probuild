@@ -29,7 +29,9 @@ import {
     ensureQBCustomer,
     QB_API_BASE,
     qbTimedFetch,
+    parseJsonOrNull,
     type QBTokens,
+    type QBAttachable,
 } from "./quickbooks";
 
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
@@ -97,7 +99,7 @@ export async function ensureQBVendor(tokens: QBTokens, name: string): Promise<st
         }
         throw new Error(`QB vendor create failed: ${err}`);
     }
-    const data = await res.json().catch(() => null);
+    const data = await parseJsonOrNull(res);
     if (!data?.Vendor?.Id) {
         const faultCode = data?.Fault?.Error?.[0]?.code;
         if (data?.Fault) {
@@ -153,11 +155,14 @@ export interface CreateQBReceiptPurchaseInput {
     overheadCategory?: string;
 }
 
-/** "attached" | "skipped" | "failed:<short reason>" — a failure never fails the Purchase create. */
-export type ReceiptAttachmentStatus = "attached" | "skipped" | `failed:${string}`;
+/**
+ * "attached" | "already-attached" | "skipped" | "failed:<short reason>" — a
+ * failure never fails the Purchase create.
+ */
+export type ReceiptAttachmentStatus = "attached" | "already-attached" | "skipped" | `failed:${string}`;
 
 export type CreateQBReceiptPurchaseResult =
-    | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: true }
+    | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: true; attachment: ReceiptAttachmentStatus }
     | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: false; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "project-not-matched"; projectName: string }
     | { ok: false; reason: "docnumber-conflict"; docNumber: string }
@@ -268,7 +273,7 @@ async function defaultQbCreatePurchase(
         }
         throw new Error(`QB purchase create failed: ${text}`);
     }
-    const data = await res.json().catch(() => null);
+    const data = await parseJsonOrNull(res);
     // Intuit documents that a 200 response can still carry a Fault body.
     if (!data?.Purchase?.Id) {
         const faultCode = data?.Fault?.Error?.[0]?.code;
@@ -293,13 +298,22 @@ async function defaultListInProgressProjects(): Promise<QboReceiptProjectCandida
  * created by the time this runs — callers must still treat a thrown error as
  * a non-fatal "failed:<reason>".
  */
+/**
+ * The Attachable FileName we upload under. Deterministic for a given receipt,
+ * which is what lets a later run recognise its own upload instead of adding a
+ * duplicate. Strips CR/LF/quotes so the name can't break out of the multipart
+ * header line.
+ */
+export function attachmentFileName(rawFileName: string | undefined): string {
+    return (rawFileName || "receipt").replace(/[\r\n"]/g, "") || "receipt";
+}
+
 async function defaultUploadAttachment(
     tokens: QBTokens,
     purchaseId: string,
     file: { base64: string; contentType: string; fileName: string },
 ): Promise<ReceiptAttachmentStatus> {
-    // Strip CR/LF/quotes so the name can't break out of the multipart header line.
-    const safeFileName = file.fileName.replace(/[\r\n"]/g, "") || "receipt";
+    const safeFileName = attachmentFileName(file.fileName);
     const fileBytes = Buffer.from(file.base64, "base64");
     const metadata = {
         AttachableRef: [{ EntityRef: { value: purchaseId, type: "Purchase" } }],
@@ -334,10 +348,74 @@ async function defaultUploadAttachment(
         body,
     });
     if (!res.ok) return `failed:${res.status}`;
-    const data = await res.json().catch(() => null);
+    const data = await parseJsonOrNull(res);
     const fault = data?.AttachableResponse?.[0]?.Fault;
     if (fault) return "failed:fault";
     return "attached";
+}
+
+/**
+ * The upload arguments for a receipt, or null when there is nothing uploadable
+ * (no file, unsupported content type, corrupt base64, oversized). Shared by the
+ * fresh-create and already-exists paths so both compute the SAME deterministic
+ * FileName — that is what makes the existence check below meaningful.
+ */
+function planAttachmentUpload(
+    input: CreateQBReceiptPurchaseInput,
+): { base64: string; contentType: string; fileName: string } | null {
+    if (!input.fileBase64) return null;
+    const contentType = normalizeAttachableContentType(input.fileContentType || "");
+    if (!contentType) return null;
+    if (!isValidBase64(input.fileBase64)) return null;
+    if (Buffer.byteLength(input.fileBase64, "base64") > MAX_ATTACHMENT_BYTES) return null;
+    return { base64: input.fileBase64, contentType, fileName: attachmentFileName(input.fileName) };
+}
+
+/**
+ * Attach the receipt to a Purchase that already exists.
+ *
+ * Reached when the DocNumber lookup finds our own earlier Purchase — most
+ * often because the FIRST attempt's response was lost after QBO had already
+ * committed it (a timeout, or the function being killed). That attempt never
+ * got to upload the file, and the old early return meant no later attempt ever
+ * would either: the receipt stayed in QBO with no image, forever.
+ *
+ * Idempotent by deterministic FileName: if an Attachable for this Purchase
+ * already carries the name we would upload under, this is a no-op. Never
+ * throws — the books entry exists and must not be undone by an image problem.
+ */
+async function ensureAttachmentOnExistingPurchase(
+    tokens: QBTokens,
+    purchaseId: string,
+    input: CreateQBReceiptPurchaseInput,
+    qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
+    uploadAttachment: QboReceiptPushDependencies["uploadAttachment"],
+): Promise<ReceiptAttachmentStatus> {
+    const plan = planAttachmentUpload(input);
+    if (!plan) return "skipped";
+    // QBO transaction ids are numeric; refuse anything else rather than escape it.
+    if (!/^\d+$/.test(purchaseId)) return "skipped";
+
+    try {
+        const rows = await qbQueryFn<QBAttachable>(
+            tokens,
+            `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+        );
+        // Entity ids are only unique per entity type, so a value-only query can
+        // surface attachments from other transaction types — keep Purchase links.
+        const alreadyAttached = (rows ?? []).some(
+            row =>
+                row?.AttachableRef?.some(
+                    ref =>
+                        ref.EntityRef?.value === purchaseId &&
+                        /^purchase$/i.test(ref.EntityRef?.type ?? ""),
+                ) && (row.FileName ?? "") === plan.fileName,
+        );
+        if (alreadyAttached) return "already-attached";
+        return await uploadAttachment(tokens, purchaseId, plan);
+    } catch (error) {
+        return `failed:${error instanceof Error ? error.name : "error"}`;
+    }
 }
 
 /**
@@ -488,7 +566,20 @@ export async function createQBReceiptPurchase(
         if (existing.length > 1 || !(existing[0].PrivateNote ?? "").includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
-        return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true };
+        // The Purchase exists, but that does NOT mean the receipt file made it
+        // across. The common way to reach this branch is a first attempt whose
+        // Purchase response was lost (timeout/kill) AFTER QBO committed it —
+        // and the old code returned here without ever reaching the upload
+        // below, so that receipt was stranded with no image, permanently:
+        // every retry took this same early return. Re-check and fill the gap.
+        const attachment = await ensureAttachmentOnExistingPurchase(
+            tokens,
+            existing[0].Id,
+            input,
+            qbQueryFn,
+            uploadAttachment,
+        );
+        return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true, attachment };
     }
 
     const projects = await listProjects();
@@ -624,22 +715,12 @@ export async function createQBReceiptPurchase(
     const created = await qbCreateFn(tokens, payload, requestId);
 
     let attachment: ReceiptAttachmentStatus = "skipped";
-    if (input.fileBase64) {
-        const contentType = normalizeAttachableContentType(input.fileContentType || "");
-        if (
-            contentType &&
-            isValidBase64(input.fileBase64) &&
-            Buffer.byteLength(input.fileBase64, "base64") <= MAX_ATTACHMENT_BYTES
-        ) {
-            try {
-                attachment = await uploadAttachment(tokens, created.id, {
-                    base64: input.fileBase64,
-                    contentType,
-                    fileName: input.fileName || "receipt",
-                });
-            } catch (error) {
-                attachment = `failed:${error instanceof Error ? error.name : "error"}`;
-            }
+    const plan = planAttachmentUpload(input);
+    if (plan) {
+        try {
+            attachment = await uploadAttachment(tokens, created.id, plan);
+        } catch (error) {
+            attachment = `failed:${error instanceof Error ? error.name : "error"}`;
         }
     }
 

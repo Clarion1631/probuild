@@ -383,6 +383,28 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise
     return key ? response[key] : [];
 }
 
+/**
+ * Read a QBO JSON body, tolerating a malformed/empty one — WITHOUT swallowing
+ * a timeout.
+ *
+ * `res.json().catch(() => null)` is the shape this replaces, and it was a trap:
+ * the deadline can fire during the body read, so that catch turned a real
+ * QBTimeoutError into "QBO returned no body" and the caller reported a generic
+ * failure (500) instead of the retryable outage it was. Worse, on the
+ * attachment path it could report a successful "attached" for an upload whose
+ * response never arrived.
+ *
+ * Only genuine parse/decode errors resolve to null. A timeout is rethrown.
+ */
+export async function parseJsonOrNull<T = any>(res: Response): Promise<T | null> {
+    try {
+        return (await res.json()) as T;
+    } catch (error) {
+        if (error instanceof QBTimeoutError) throw error;
+        return null;
+    }
+}
+
 export function escapeQBString(s: string): string {
     // Backslash MUST be escaped before the apostrophe escape, or an input
     // ending in a literal backslash (e.g. "Smith\\") would have its escaped
@@ -780,7 +802,7 @@ export async function sendQBPaymentCreateRequest(
         body: requestBody,
     });
     if (!res.ok) throw new Error(`QB payment create failed: ${await res.text()}`);
-    const data = await res.json().catch(() => null);
+    const data = await parseJsonOrNull(res);
     const p = data?.Payment;
     if (!p?.Id) throw new Error("QB payment create returned no Payment body");
     return { paymentId: String(p.Id), amount: Number(p.TotalAmt ?? 0) };
@@ -877,7 +899,7 @@ export async function appendQBInvoiceCustomerMemo(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
     const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
     if (!read.ok) return { ok: false, error: `Could not read QuickBooks invoice (${read.status})` };
-    const invoice = (await read.json().catch(() => null))?.Invoice;
+    const invoice = (await parseJsonOrNull(read))?.Invoice;
     if (!invoice?.SyncToken) return { ok: false, error: "QuickBooks invoice response was incomplete" };
 
     const current = String(invoice.CustomerMemo?.value ?? "").trim();
@@ -1188,6 +1210,6 @@ export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendT
         },
     });
     if (!res.ok) return { ok: false as const, status: res.status, error: await res.text() };
-    const data = await res.json().catch(() => ({}));
+    const data = (await parseJsonOrNull(res)) ?? {};
     return { ok: true as const, status: res.status, emailStatus: data.Invoice?.EmailStatus ?? null };
 }

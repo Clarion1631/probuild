@@ -238,9 +238,12 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                         // The QBO deep link needs the purchase id (fileId is
                         // already baked into `detail` by pushEventFromOutcome).
                         ...(result.ok ? { qbPurchaseId: result.qbPurchaseId } : {}),
-                        // Attachment evidence AT BOOKING TIME (fresh creates only —
-                        // already-exists responses don't re-report it).
-                        ...(result.ok && !result.alreadyExists ? { attachment: result.attachment } : {}),
+                        // Attachment evidence, now reported on BOTH ok branches:
+                        // an already-exists response re-checks the Attachable and
+                        // uploads if the first attempt's response was lost, so its
+                        // outcome ("already-attached", "attached", "failed:...")
+                        // is real evidence rather than a repeat of booking time.
+                        ...(result.ok ? { attachment: result.attachment } : {}),
                     },
                 );
                 await logEvent(event);
