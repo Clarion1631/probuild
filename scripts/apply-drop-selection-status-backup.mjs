@@ -38,6 +38,7 @@
 // database in step is the point of the change.
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -49,18 +50,28 @@ function resolveDatabaseUrl() {
   throw new Error("DATABASE_URL not found in env or .env files");
 }
 
-const prisma = new PrismaClient({
-  datasources: { db: { url: resolveDatabaseUrl() } },
-});
-
 const statements = [`DROP TABLE IF EXISTS "_SelectionProposalStatusBackup"`];
 
-try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("applied:", sql);
+async function main() {
+  const prisma = new PrismaClient({
+    datasources: { db: { url: resolveDatabaseUrl() } },
+  });
+
+  try {
+    for (const sql of statements) {
+      await prisma.$executeRawUnsafe(sql);
+      console.log("applied:", sql);
+    }
+    console.log("_SelectionProposalStatusBackup dropped.");
+  } finally {
+    await prisma.$disconnect();
   }
-  console.log("_SelectionProposalStatusBackup dropped.");
-} finally {
-  await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }

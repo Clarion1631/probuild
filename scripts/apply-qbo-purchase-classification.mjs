@@ -12,6 +12,7 @@
 //   node scripts/apply-qbo-purchase-classification.mjs
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -22,10 +23,6 @@ function resolveDatabaseUrl() {
   }
   throw new Error("DATABASE_URL not found in env or .env files");
 }
-
-const prisma = new PrismaClient({
-  datasources: { db: { url: resolveDatabaseUrl() } },
-});
 
 const statements = [
   `CREATE TABLE IF NOT EXISTS "QboPurchaseClassification" (
@@ -67,27 +64,41 @@ const statements = [
   `ALTER TABLE "QboPurchaseClassification" ENABLE ROW LEVEL SECURITY`,
 ];
 
-try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("applied:", sql.split("\n")[0].trim());
-  }
-  const updatedAtColumns = await prisma.$queryRawUnsafe(
-    `SELECT column_default
+async function main() {
+  const prisma = new PrismaClient({
+    datasources: { db: { url: resolveDatabaseUrl() } },
+  });
+
+  try {
+    for (const sql of statements) {
+      await prisma.$executeRawUnsafe(sql);
+      console.log("applied:", sql.split("\n")[0].trim());
+    }
+    const updatedAtColumns = await prisma.$queryRawUnsafe(
+      `SELECT column_default
        FROM information_schema.columns
       WHERE table_schema = current_schema()
         AND table_name = 'QboPurchaseClassification'
         AND column_name = 'updatedAt'`,
-  );
-  const updatedAtDefault = updatedAtColumns[0]?.column_default ?? null;
-  if (!updatedAtDefault) {
-    throw new Error('QboPurchaseClassification.updatedAt default was not persisted');
+    );
+    const updatedAtDefault = updatedAtColumns[0]?.column_default ?? null;
+    if (!updatedAtDefault) {
+      throw new Error('QboPurchaseClassification.updatedAt default was not persisted');
+    }
+    console.log("verified: QboPurchaseClassification.updatedAt default:", updatedAtDefault);
+    console.log("QboPurchaseClassification schema applied successfully.");
+  } catch (error) {
+    console.error("Migration failed:", error);
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
   }
-  console.log("verified: QboPurchaseClassification.updatedAt default:", updatedAtDefault);
-  console.log("QboPurchaseClassification schema applied successfully.");
-} catch (error) {
-  console.error("Migration failed:", error);
-  process.exitCode = 1;
-} finally {
-  await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }

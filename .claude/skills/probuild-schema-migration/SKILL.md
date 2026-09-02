@@ -208,6 +208,8 @@ See <https://supabase.com/docs/guides/database/connecting-to-postgres> and
 
 If the branch will deploy, also add a `scripts/apply-<name>.mjs` (additive, idempotent — `IF NOT EXISTS`, guarded FKs) and run it against prod **before** deploying. See the `deploy-probuild` skill.
 
+Every apply script must be **inert on import**: dotenv loading, `new PrismaClient(...)`, and all DDL live inside `async function main()`, invoked only behind `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)`. `tests/apply-scripts-inert-on-import.test.ts` (in `npm run test:unit`) imports every `scripts/apply-*.mjs` in a scrubbed child process and fails if one opens a connection or has side effects at module scope. Reason: on 2026-09-02 an `import` of `apply-payroll-phase5.mjs`, done only to look at its exports, ran the whole migration against production. Never import an apply script to inspect it — read it as text.
+
 ## Connection gotcha
 
 `DATABASE_URL` must include `?pgbouncer=true` — Supabase transaction pooler (port 6543) plus Prisma requires it. Without it you get `42P05 prepared statement already exists` and the site goes down.

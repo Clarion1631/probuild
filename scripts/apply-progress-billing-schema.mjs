@@ -14,6 +14,7 @@
 //  path in this project; psql / prisma db push / migrate dev do not work here.)
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -24,10 +25,6 @@ function resolveDatabaseUrl() {
   }
   throw new Error("DATABASE_URL not found in env or .env files");
 }
-
-const prisma = new PrismaClient({
-  datasources: { db: { url: resolveDatabaseUrl() } },
-});
 
 const statements = [
   `ALTER TABLE "Estimate" ADD COLUMN IF NOT EXISTS "taxInclusiveMilestones" BOOLEAN NOT NULL DEFAULT true`,
@@ -98,12 +95,26 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS "ProgressBillingLine_scheduleId_idx" ON "ProgressBillingLine" ("scheduleId")`,
 ];
 
-try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("applied:", sql.split("\n")[0]);
+async function main() {
+  const prisma = new PrismaClient({
+    datasources: { db: { url: resolveDatabaseUrl() } },
+  });
+
+  try {
+    for (const sql of statements) {
+      await prisma.$executeRawUnsafe(sql);
+      console.log("applied:", sql.split("\n")[0]);
+    }
+    console.log("Progress billing schema applied successfully.");
+  } finally {
+    await prisma.$disconnect();
   }
-  console.log("Progress billing schema applied successfully.");
-} finally {
-  await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }

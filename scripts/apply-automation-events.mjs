@@ -8,6 +8,7 @@
 // Apply BEFORE deploying the build that selects this table (P2022 otherwise).
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -18,10 +19,6 @@ function resolveDatabaseUrl() {
   }
   throw new Error("DATABASE_URL not found in env or .env files");
 }
-
-const prisma = new PrismaClient({
-  datasources: { db: { url: resolveDatabaseUrl() } },
-});
 
 const statements = [
   `CREATE TABLE IF NOT EXISTS "AutomationEvent" (
@@ -61,9 +58,23 @@ const statements = [
   `ALTER TABLE "AutomationSetting" ENABLE ROW LEVEL SECURITY`,
 ];
 
-for (const sql of statements) {
-  console.log(sql.split("\n")[0].trim() + " ...");
-  await prisma.$executeRawUnsafe(sql);
+async function main() {
+  const prisma = new PrismaClient({
+    datasources: { db: { url: resolveDatabaseUrl() } },
+  });
+
+  for (const sql of statements) {
+    console.log(sql.split("\n")[0].trim() + " ...");
+    await prisma.$executeRawUnsafe(sql);
+  }
+  console.log("AutomationEvent schema applied.");
+  await prisma.$disconnect();
 }
-console.log("AutomationEvent schema applied.");
-await prisma.$disconnect();
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

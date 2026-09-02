@@ -7,6 +7,7 @@
 //  path in this project; psql / prisma db push / migrate dev do not work here.)
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function resolveDatabaseUrl() {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
@@ -17,8 +18,6 @@ function resolveDatabaseUrl() {
   }
   throw new Error("DATABASE_URL not found in env or .env files");
 }
-
-const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } });
 
 const statements = [
   `ALTER TABLE "Contract"
@@ -31,15 +30,27 @@ const statements = [
      ADD COLUMN IF NOT EXISTS "requireContractCountersign" BOOLEAN NOT NULL DEFAULT false`,
 ];
 
-try {
-  for (const sql of statements) {
-    await prisma.$executeRawUnsafe(sql);
-    console.log("✔ applied:", sql.split("\n")[0]);
+async function main() {
+  const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } });
+
+  try {
+    for (const sql of statements) {
+      await prisma.$executeRawUnsafe(sql);
+      console.log("✔ applied:", sql.split("\n")[0]);
+    }
+    console.log("Done.");
+  } catch (e) {
+    console.error("Migration failed:", e);
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
   }
-  console.log("Done.");
-} catch (e) {
-  console.error("Migration failed:", e);
-  process.exitCode = 1;
-} finally {
-  await prisma.$disconnect();
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }
