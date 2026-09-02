@@ -596,12 +596,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const acknowledgesReview = body.taxReviewAck === true;
         if (acknowledgesReview) {
             const gross = Number(expense.amount);
+            // STRICT TYPE, not `Number(value)`. After JSON parsing, a real
+            // figure is `typeof "number"` — `Number(false)`, `Number("")`,
+            // and `Number([])` are all `0` too, and none of those is a
+            // person answering the review with zero tax.
             const coherent = (value: unknown) => {
-                const parsed = Number(value);
+                if (typeof value !== "number") return false;
                 return (
-                    Number.isFinite(parsed) &&
-                    (parsed === 0 || Math.sign(parsed) === Math.sign(gross)) &&
-                    Math.abs(parsed) <= Math.abs(gross)
+                    Number.isFinite(value) &&
+                    (value === 0 || Math.sign(value) === Math.sign(gross)) &&
+                    Math.abs(value) <= Math.abs(gross)
                 );
             };
             // "I do not know" is not an answer to a review, and clearing the
@@ -708,13 +712,15 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // had no tax" is an answer a human is entitled to give.
         let nextTaxAmount: number | null = null;
         if (editsTaxAmount && body.taxAmount !== null) {
-            const parsed = Number(body.taxAmount);
-            if (!Number.isFinite(parsed)) {
+            // STRICT TYPE, not `Number(body.taxAmount)` — a certified tax
+            // figure is not `Number(false)` or `Number("")` landing on 0.
+            if (typeof body.taxAmount !== "number" || !Number.isFinite(body.taxAmount)) {
                 return NextResponse.json(
                     { error: "taxAmount must be a finite number, or null." },
                     { status: 400 },
                 );
             }
+            const parsed = body.taxAmount;
             const gross = Number(expense.amount);
             const ceiling = maxPlausibleTaxAmount(gross);
             // A REFUND'S TAX IS NEGATIVE. The rule is direction and magnitude,
@@ -744,15 +750,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         let nextBase: number | null = null;
         if (editsBase && body.taxDeductibleBase !== null) {
-            const parsed = Number(body.taxDeductibleBase);
-            // NaN and Infinity included: `Number("")` is 0 and
-            // `Number("abc")` is NaN, and neither is a deduction.
-            if (!Number.isFinite(parsed)) {
+            // STRICT TYPE, not `Number(body.taxDeductibleBase)`: `Number(false)`
+            // and `Number("")` are both `0`, and neither is a person entering a
+            // deduction of zero.
+            if (typeof body.taxDeductibleBase !== "number" || !Number.isFinite(body.taxDeductibleBase)) {
                 return NextResponse.json(
                     { error: "taxDeductibleBase must be a finite number, or null." },
                     { status: 400 },
                 );
             }
+            const parsed = body.taxDeductibleBase;
             // Signed, like the amount it is a portion of: the resold part of a
             // -$50 return is negative too. A base pointing the other way is a
             // dropped minus sign, and it would ADD to a filing that should be
@@ -807,6 +814,17 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         let nextCostCodeId: string | null = null;
         if (editsCostCode) {
+            // STRICT TYPE. `has("costCodeId")` only proves the key is
+            // present — the value can still be a number, boolean, array, or
+            // object, and treating every one of those as "clear the cost
+            // code" would silently strip a real attribution off a bad
+            // request instead of rejecting it.
+            if (body.costCodeId !== null && typeof body.costCodeId !== "string") {
+                return NextResponse.json(
+                    { error: "costCodeId must be a string, or null." },
+                    { status: 400 },
+                );
+            }
             nextCostCodeId =
                 typeof body.costCodeId === "string" && body.costCodeId.trim()
                     ? body.costCodeId.trim()

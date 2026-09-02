@@ -484,6 +484,18 @@ test("no single tax field clears the flag on its own", async () => {
     assert.equal(updateArgs?.data.needsTaxReview, false);
 });
 
+test("a non-string, non-null costCodeId is refused, not silently cleared", async () => {
+    // `typeof body.costCodeId === "string"` used to fall through to `null`
+    // for any other type — a number, a boolean, an array, an object — which
+    // silently stripped a real attribution off a malformed request instead
+    // of rejecting it.
+    for (const value of [123, false, [], {}, ["cc-frame"]]) {
+        const res = await patch({ costCodeId: value as unknown as string });
+        assert.equal(res.status, 400, `costCodeId: ${JSON.stringify(value)}`);
+        assert.equal(updateArgs, null, `costCodeId: ${JSON.stringify(value)} must not write`);
+    }
+});
+
 // ── the item link is judged on the RESOLVED job (item 4) ───────────────────
 
 test("a re-attributed expense may take an item from its NEW job", async () => {
@@ -1027,6 +1039,29 @@ test("NaN and Infinity are refused for both figures", async () => {
         const base = await patch({ taxDeductibleBase: value });
         assert.equal(base.status, 400, `taxDeductibleBase: ${value}`);
     }
+});
+
+test("JSON values that coerce to zero are refused, not silently booked as $0", async () => {
+    // `Number(false)`, `Number("")` and `Number([])` are all `0` — a real
+    // person entering zero tax sends the NUMBER 0, not one of these. Coercing
+    // them would certify a figure nobody actually answered.
+    for (const value of [false, "", [], {}, true, [16.55]]) {
+        const tax = await patch({ taxAmount: value as unknown as number });
+        assert.equal(tax.status, 400, `taxAmount: ${JSON.stringify(value)}`);
+        assert.equal(updateArgs, null, `taxAmount: ${JSON.stringify(value)} must not write`);
+        const base = await patch({ taxDeductibleBase: value as unknown as number });
+        assert.equal(base.status, 400, `taxDeductibleBase: ${JSON.stringify(value)}`);
+        assert.equal(updateArgs, null, `taxDeductibleBase: ${JSON.stringify(value)} must not write`);
+    }
+});
+
+test("a review acknowledgement rejects a non-number figure the same way", async () => {
+    // The `coherent()` check inside the ack path had the same `Number(value)`
+    // hole — `false` and `""` are both "coherent" once coerced to 0.
+    storedExpense = { ...storedExpense, needsTaxReview: true };
+    const res = await patch({ taxReviewAck: true, taxAmount: false as unknown as number, taxDeductibleBase: 50 });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
 });
 
 // ── a fallback-attributed row can change jobs mid-request (round 19, item 3) ─

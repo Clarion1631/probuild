@@ -352,14 +352,17 @@ return. As built:
   as the whole pre-tax total; nothing new is added to them.
 * **`Expense.needsTaxReview` is cleared only by an explicit acknowledgement.** A re-sync
   that moves the gross on a classified row raises it, and the report skips flagged rows.
-  Clearing it requires `taxReviewAck: true` AND the `taxAmount` key in the same request —
-  either a coherent figure (→ `"manual"`) or an explicit `null` meaning "this receipt has
-  no sales tax" (→ `"manual-none"`). A request that OMITS `taxAmount` is a 400: it has
-  nothing to certify. `taxDeductibleBase` is optional (blank is computed, as above) and
-  `installedAtCustomer` is optional (a null reads as "unanswered" and cannot overstate a
-  deduction). A partial correction without the ack is still accepted; it just leaves the
-  flag standing, because the flag means the WHOLE classification is in doubt rather than
-  whichever field the request happens to touch.
+  Clearing it requires `taxReviewAck: true` AND, on a flagged row, BOTH the `taxAmount`
+  AND `taxDeductibleBase` keys in the same request — each either a coherent figure (→
+  `"manual"` for `taxAmount`) or an explicit `null` (→ `"manual-none"` for `taxAmount`; for
+  `taxDeductibleBase`, null means "the whole pre-tax total", as above). The flag means the
+  WHOLE classification is in doubt, and the two figures are the whole classification, so
+  certifying one while staying silent about the other is the half-answer the flag exists to
+  prevent — a request that omits either key on a flagged row is a 400: it has nothing to
+  certify. On an UNFLAGGED row (an ack sent alongside an ordinary edit, with nothing to
+  clear), only `taxAmount` is required. `installedAtCustomer` is always optional (a null
+  reads as "unanswered" and cannot overstate a deduction). A partial correction without the
+  ack is still accepted; it just leaves the flag standing.
 * **`ReceiptIntake.costCodeSource` records WHO captured a phase**: `"user"` (a signed-in
   person, through the app or the mobile capture screen) or `"machine"` (a shared-secret
   forwarder resolving it from a Drive folder or a mail rule). Booking copies the
