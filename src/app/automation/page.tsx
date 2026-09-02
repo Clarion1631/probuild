@@ -53,6 +53,9 @@ import { matchReceiptJourney, type ReceiptJourneyMatch, type ReceiptJourneyIndex
 import { toSerializedJourney } from "./components/register/serialize-journey";
 import { fetchCheckImagePanelData, type CheckImagePanelRow } from "./check-images-data";
 import { CheckImagesPanel } from "./components/check-images-panel";
+import { fetchReceiptQueue, fetchJobOptions } from "./receipts-data";
+import { parseReceiptFilters } from "./receipts-filters";
+import { ReceiptsTab } from "./components/receipts/receipts-tab";
 
 export const dynamic = "force-dynamic";
 
@@ -60,6 +63,7 @@ export const dynamic = "force-dynamic";
 
 type RangeKey = "30" | "60" | "90";
 type TypeFilter = "all" | "in" | "out";
+type TabKey = "register" | "receipts";
 
 function parseFilters(sp: Record<string, string | string[] | undefined>) {
     const range: RangeKey = sp.range === "60" || sp.range === "90" ? sp.range : "30";
@@ -68,7 +72,24 @@ function parseFilters(sp: Record<string, string | string[] | undefined>) {
     // Deep link for the future Chat card's link button (plan §3/§5 step 9):
     // ?focus=<qbTxnId> expands that row and scrolls it into view on load.
     const focus = typeof sp.focus === "string" && sp.focus ? sp.focus : null;
-    return { range, type, reviewOnly, focus };
+    // ?tab=receipts swaps the register for the receipt queue (Phase 2 §2).
+    // Anything unrecognized falls back to the register.
+    const tab: TabKey = sp.tab === "receipts" ? "receipts" : "register";
+    return { range, type, reviewOnly, focus, tab };
+}
+
+function TabLink({ href, active, children }: { href: string; active: boolean; children: ReactNode }) {
+    return (
+        <a
+            href={href}
+            aria-current={active ? "page" : undefined}
+            className={`inline-flex items-center px-4 py-1.5 text-sm font-semibold rounded-lg transition ${
+                active ? "bg-hui-primary text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
+            }`}
+        >
+            {children}
+        </a>
+    );
 }
 
 function FilterChip({ href, active, children }: { href: string; active: boolean; children: ReactNode }) {
@@ -152,7 +173,14 @@ export default async function AutomationPage(props: {
 
     const isAdmin = isAdminOrManager(user);
     const sp = await props.searchParams;
-    const { range, type, reviewOnly, focus } = parseFilters(sp);
+    const { range, type, reviewOnly, focus, tab } = parseFilters(sp);
+
+    // Receipts tab (Phase 2 §2). Rendered as its own branch so none of the
+    // register's QBO/merge/journey fetches run for it — and so the register's
+    // JSX below is untouched when tab=register.
+    if (tab === "receipts") {
+        return <ReceiptsTabBranch sp={sp} />;
+    }
     // Captured ONCE, server-side, and threaded through every component that
     // needs "now" (stale-receipt detection) — calling Date.now() again
     // inside a client component would read a different clock value on
@@ -508,6 +536,10 @@ export default async function AutomationPage(props: {
             <div className="flex items-start justify-between gap-4 flex-wrap">
                 <div>
                     <h1 className="text-xl font-bold text-hui-textMain">Automation</h1>
+                    <div className="flex gap-2 mt-3 mb-2">
+                        <TabLink href="/automation" active>Register</TabLink>
+                        <TabLink href="/automation?tab=receipts" active={false}>Receipts</TabLink>
+                    </div>
                     <p className="text-sm text-hui-textMuted mt-1 max-w-3xl">
                         QuickBooks WTB account register — posted QuickBooks entries affecting account 154, fetched at{" "}
                         <span title={new Date(fetchedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
@@ -783,6 +815,67 @@ export default async function AutomationPage(props: {
                     now={nowMs}
                 />
             )}
+        </div>
+    );
+}
+
+/**
+ * The Receipts queue branch of /automation.
+ *
+ * Auth is already enforced by the caller (the same `financialReports` gate the
+ * register runs behind) — this is a private helper of that component, never a
+ * route of its own.
+ *
+ * Degrades honestly, exactly like the register's own sections: a failed load
+ * renders an "unavailable" card instead of hitting the route error boundary.
+ */
+async function ReceiptsTabBranch({ sp }: { sp: Record<string, string | string[] | undefined> }) {
+    const filters = parseReceiptFilters(sp);
+
+    function receiptFilterHref(overrides: { group?: string; owner?: string }) {
+        const params = new URLSearchParams();
+        params.set("tab", "receipts");
+        const nextGroup = overrides.group ?? filters.group ?? "";
+        const nextOwner = overrides.owner ?? filters.owner ?? "";
+        if (nextGroup) params.set("group", nextGroup);
+        if (nextOwner) params.set("owner", nextOwner);
+        if (filters.projectId) params.set("projectId", filters.projectId);
+        return `/automation?${params.toString()}`;
+    }
+
+    // Only DATA is computed inside the try — JSX construction is lazy, so
+    // building elements in here couldn't catch their render errors anyway
+    // (the same convention the register half of this file follows).
+    let queue: Awaited<ReturnType<typeof fetchReceiptQueue>> | null = null;
+    let jobs: Awaited<ReturnType<typeof fetchJobOptions>> = [];
+    try {
+        [queue, jobs] = await Promise.all([fetchReceiptQueue(filters), fetchJobOptions()]);
+    } catch (error) {
+        console.error("receipt queue fetch failed", error instanceof Error ? error.message : "UnknownError");
+    }
+
+    const body: ReactNode = queue
+        ? <ReceiptsTab queue={queue} filters={filters} jobs={jobs} filterHref={receiptFilterHref} />
+        : (
+            <div className="hui-card p-5 text-sm text-hui-textMuted">
+                The receipt queue couldn&apos;t be loaded right now — the register is still available.
+            </div>
+        );
+
+    return (
+        <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
+            <div>
+                <h1 className="text-xl font-bold text-hui-textMain">Automation</h1>
+                <p className="text-sm text-hui-textMuted mt-1 max-w-3xl">
+                    Every receipt in flight, and every bank charge still missing one. Setting a job here hands the receipt
+                    back to the pipeline — nothing on this page writes to QuickBooks directly.
+                </p>
+                <div className="flex gap-2 mt-3">
+                    <TabLink href="/automation" active={false}>Register</TabLink>
+                    <TabLink href="/automation?tab=receipts" active>Receipts</TabLink>
+                </div>
+            </div>
+            {body}
         </div>
     );
 }

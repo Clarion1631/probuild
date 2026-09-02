@@ -15168,3 +15168,153 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
     revalidatePath("/manager/time-entries");
     return { success: true };
 }
+
+// ── Receipt intake queue (the /automation Receipts tab, Phase 2 §2) ──────────
+
+/**
+ * Every action below is guarded twice, and both guards matter:
+ *
+ *   1. The SAME permission the register is gated by (`financialReports`) — a
+ *      "use server" export is a live POST endpoint whether or not any UI links
+ *      to it (the dead-server-actions lesson), so the gate lives in the action,
+ *      not in the page that renders the button.
+ *   2. A compare-and-swap on `state`. The 5-minute intake worker is moving
+ *      these same rows; an unguarded update would silently overwrite whatever
+ *      it just decided. `updateMany({ where: { id, state: expected } })`
+ *      returning 0 means the view was stale — that is surfaced as an error the
+ *      UI toasts, NEVER as a silent no-op that looks like it worked.
+ *
+ * None of these calls QuickBooks inline. The queue's only job is to change what
+ * the worker will do on its next pass.
+ */
+async function assertReceiptQueueAccess() {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (!hasPermission(user, "financialReports")) throw new Error("Forbidden");
+    return user;
+}
+
+class StaleReceiptIntakeError extends Error {
+    constructor() {
+        super("This receipt changed underneath you — refresh and try again.");
+        this.name = "StaleReceiptIntakeError";
+    }
+}
+
+function revalidateReceiptQueue() {
+    revalidatePath("/automation");
+}
+
+/**
+ * Assign a job (and optionally a cost code) and hand the row back to the
+ * worker at `READ`. Deliberately NOT `BOOKING`: routing owns dedup, and
+ * jumping the row straight to booking would skip the weak/strong duplicate
+ * checks that stand between a re-uploaded receipt and a double purchase.
+ */
+export async function setReceiptIntakeJob(id: string, projectId: string, costCodeId?: string | null) {
+    const user = await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (typeof projectId !== "string" || !projectId) throw new Error("projectId is required");
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+    if (!project) throw new Error("That job no longer exists");
+    if (costCodeId) {
+        const costCode = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
+        if (!costCode) throw new Error("That cost code no longer exists");
+    }
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: { in: ["NEEDS_JOB", "NEEDS_REVIEW"] } },
+        data: {
+            projectId,
+            ...(costCodeId ? { costCodeId } : {}),
+            state: "READ",
+            stateReason: null,
+            lastError: null,
+            nextRetryAt: null,
+        },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** Park a row as a duplicate of another. `duplicateOfId` must be a real, different row. */
+export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (typeof duplicateOfId !== "string" || !duplicateOfId) throw new Error("duplicateOfId is required");
+    if (id === duplicateOfId) throw new Error("A receipt can't be a duplicate of itself");
+
+    const original = await prisma.receiptIntake.findUnique({ where: { id: duplicateOfId }, select: { id: true } });
+    if (!original) throw new Error("That original receipt no longer exists");
+
+    const result = await prisma.receiptIntake.updateMany({
+        // A BOOKED row is money history — it is never reclassified from here.
+        where: { id, state: { notIn: ["BOOKED", "ARCHIVED", "VOID"] } },
+        data: {
+            state: "DUPLICATE",
+            duplicateOfId,
+            stateReason: `manual-dup:${duplicateOfId}`,
+            nextRetryAt: null,
+            // Parked without ever reaching QuickBooks, so the strong key goes
+            // back — same rule as book.ts, or a corrected re-send of this
+            // receipt would be quarantined against a row that never booked.
+            dedupStrongKey: null,
+        },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** "Not a duplicate" — back to READ so routing and dedup run again from scratch. */
+export async function unmarkReceiptIntakeDuplicate(id: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: "DUPLICATE" },
+        data: { state: "READ", duplicateOfId: null, stateReason: null, lastError: null, nextRetryAt: null },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/** Void anything that hasn't booked. A BOOKED/ARCHIVED row is refused outright. */
+export async function voidReceiptIntake(id: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: { notIn: ["BOOKED", "ARCHIVED"] } },
+        data: { state: "VOID", stateReason: "voided-by-user", nextRetryAt: null, dedupStrongKey: null },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/**
+ * "Retry now": clear the error and make the row due. The 5-minute worker picks
+ * it up on its next pass — this never calls QuickBooks inline, so a stuck QBO
+ * can't turn a button click into a 30-second page hang.
+ *
+ * `attempts` is deliberately NOT reset: the retry ceiling exists so a
+ * permanently-broken document stops hammering QBO, and a human clicking retry
+ * shouldn't silently remove that ceiling.
+ */
+export async function retryReceiptIntake(id: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: { in: ["BOOKING", "NEEDS_REVIEW"] } },
+        data: { lastError: null, nextRetryAt: new Date() },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
