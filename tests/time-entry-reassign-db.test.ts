@@ -37,8 +37,12 @@ async function seed(db: PrismaClient, tag: string): Promise<Seeded> {
             name
         );
     }
+    // Client has NO updatedAt column, and `initials` is NOT NULL with no default.
+    // I wrote this INSERT from the shape of the neighbouring Project insert
+    // instead of from the schema, so it named a column that does not exist and
+    // omitted one that is required.
     await db.$executeRawUnsafe(
-        `INSERT INTO "Client" ("id","name","updatedAt") VALUES ($1,'Reassign Test',now())`,
+        `INSERT INTO "Client" ("id","name","initials") VALUES ($1,'Reassign Test','RT')`,
         clientId
     );
     await db.$executeRawUnsafe(
