@@ -202,6 +202,32 @@ function asQbTimeout(error: unknown, context: TimeoutContext): unknown {
 }
 
 /**
+ * Normalize every failure that crosses the QBO network boundary.
+ *
+ * Our own deadline becomes QBTimeoutError; a caller's abort stays exactly as it
+ * was; anything else that `fetch` THREW is a transport failure (DNS, TLS,
+ * connection reset — Node surfaces these as a bare `TypeError: fetch failed`)
+ * and becomes QboRetryableError.
+ *
+ * That last case is why this exists: an un-normalized TypeError is neither a
+ * timeout nor a retryable error, so a looping caller could not recognise it as
+ * connection-level and kept dialling a QuickBooks that was clearly unreachable.
+ * Classifying it HERE means every QBO call gets it, not just the ones someone
+ * remembered to wrap.
+ */
+function asQboBoundaryError(error: unknown, context: TimeoutContext): unknown {
+    const translated = asQbTimeout(error, context);
+    if (isQBTimeoutError(translated)) return translated;
+    // A caller cancelling its own request is not a QBO failure.
+    if (context.race.winner() && context.race.winner() !== context.timeoutSignal) return translated;
+    if (translated instanceof Error && translated.name === "AbortError") return translated;
+    if (isRetryableQboError(translated)) return translated;
+    return new QboRetryableError(
+        `QuickBooks request failed: ${translated instanceof Error ? translated.message : "network error"} (${safePath(context.url)})`,
+    );
+}
+
+/**
  * The deadline governs the WHOLE exchange, not just the headers.
  *
  * `fetch` resolves as soon as response headers arrive; the body is streamed
@@ -232,7 +258,9 @@ function wrapResponseBodyTimeouts(response: Response, context: TimeoutContext): 
                     try {
                         return await original.apply(target, args);
                     } catch (error) {
-                        throw asQbTimeout(error, context);
+                        // Same normalization as the header phase: a body that
+                        // dies mid-stream is a transport failure, not a verdict.
+                        throw asQboBoundaryError(error, context);
                     }
                 };
             }
@@ -283,7 +311,7 @@ export async function qbTimedFetch(
     try {
         response = await fetch(url, { ...init, signal: race.signal });
     } catch (error) {
-        throw asQbTimeout(error, context);
+        throw asQboBoundaryError(error, context);
     }
     return wrapResponseBodyTimeouts(response, context);
 }
@@ -743,9 +771,11 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
     if (res.status === 400 && /"code"\s*:\s*"610"|Object Not Found/i.test(body)) {
         return { state: "notFound" };
     }
-    // 429 and 5xx are QBO telling us it cannot serve requests right now; the
-    // next row would hit the same wall, so they count as connection-level too.
-    if (res.status === 429 || res.status >= 500) {
+    // 429/5xx: QBO cannot serve requests right now. 401/403: the credential
+    // itself is bad, and it is the SAME credential for every remaining row, so
+    // working through them would produce identical failures at full cost.
+    // All of these are connection-level.
+    if (res.status === 429 || res.status >= 500 || res.status === 401 || res.status === 403) {
         return { state: "error", status: res.status, connectionFailed: true };
     }
     return { state: "error", status: res.status };

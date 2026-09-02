@@ -879,8 +879,12 @@ export async function syncQuickBooksPayments(
                         probe.status,
                     );
                 }
-                // Ordinary transient error — leave untouched and retry next run.
-                return;
+                // Any other probe failure leaves this milestone UNVERIFIED. It
+                // used to return silently, so a run that checked nothing could
+                // still finish with zero errors and emit status "ok" — a green
+                // heartbeat for work that never happened. Record it as a row
+                // error (the run becomes "partial") and move on.
+                throw new Error(`QBO invoice probe failed (status ${probe.status})`);
             }
 
             if (probe.state === "voided" || probe.state === "notFound") {
@@ -969,7 +973,8 @@ export async function syncQuickBooksPayments(
                         probe.status,
                     );
                 }
-                return; // ordinary transient — retry next run
+                // Same rule as the milestone loop: unverified is not "fine".
+                throw new Error(`QBO invoice probe failed (status ${probe.status})`);
             }
             if (probe.state === "voided" || probe.state === "notFound") {
                 result.errors.push(`${billing.invoice.code}/${billing.code}: QBO invoice ${probe.state}`);

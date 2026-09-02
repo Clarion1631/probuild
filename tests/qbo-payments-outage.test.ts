@@ -55,14 +55,43 @@ test("a thrown network error is a connection failure too", async () => {
     assert.equal(probe.state === "error" && probe.timedOut, false);
 });
 
-test("429 and 5xx are connection failures; an ordinary 401 is not", async () => {
-    for (const status of [429, 500, 503]) {
+test("429/5xx AND 401/403 are connection failures; a plain 400 is not", async () => {
+    // Codex gate: 401 used to be an "ordinary" error the loop skipped past. But
+    // the credential is the SAME for every remaining row, so the next 199 rows
+    // fail identically at full cost — that is connection-level by definition.
+    for (const status of [429, 500, 503, 401, 403]) {
         const probe = await withFetch(async () => json(status, { Fault: {} }), () => probeQBInvoice(TOKENS, "1"));
         assert.equal(probe.state === "error" && probe.connectionFailed, true, `status ${status}`);
     }
-    const unauthorized = await withFetch(async () => json(401, { Fault: {} }), () => probeQBInvoice(TOKENS, "1"));
-    assert.equal(unauthorized.state, "error");
-    assert.equal(unauthorized.state === "error" && unauthorized.connectionFailed, undefined);
+    const badRequest = await withFetch(async () => json(400, { Fault: {} }), () => probeQBInvoice(TOKENS, "1"));
+    assert.equal(badRequest.state, "error");
+    assert.equal(badRequest.state === "error" && badRequest.connectionFailed, undefined);
+});
+
+test("a raw fetch TypeError is normalized at the QBO boundary", async () => {
+    // Codex gate: getQBPayment translated 429/5xx but let a bare
+    // `TypeError: fetch failed` (DNS/TLS/reset) escape unclassified, so the
+    // loop did not recognise it as connection-level and kept dialling.
+    const { getQBPayment, isQboConnectionFailure } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        (async () => {
+            throw new TypeError("fetch failed");
+        }) as unknown as typeof fetch,
+        () => getQBPayment(TOKENS, "p1"),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error instanceof Error, "a network failure must not resolve to null");
+    assert.equal(isQboConnectionFailure(error), true, `not classified: ${error?.name}`);
+});
+
+test("a raw network TypeError on the invoice probe is connection-level too", async () => {
+    const probe = await withFetch(
+        (async () => {
+            throw new TypeError("fetch failed");
+        }) as unknown as typeof fetch,
+        () => probeQBInvoice(TOKENS, "1"),
+    );
+    assert.equal(probe.state === "error" && probe.connectionFailed, true);
 });
 
 test("a healthy invoice is unaffected by the new classification", async () => {
@@ -173,20 +202,42 @@ test("a PAYMENT-DETAIL timeout aborts the run too, not just the probe", async ()
     assert.equal(result.abortedOnQboOutage, true);
 });
 
-test("an ordinary per-row error does NOT stop the run", async () => {
+test("an ordinary per-row probe failure is RECORDED and the run continues", async () => {
+    // Codex gate: this used to assert the failed row produced NO error, which
+    // meant a run could check nothing and still emit status "ok" - a green
+    // heartbeat for work that never happened. An unverified milestone is an
+    // incomplete run, so it must be recorded.
     const result = emptyResult();
     const seen: string[] = [];
     const { client, calls } = fakeQbo({
         probe: (id) => (id === "2"
-            ? { state: "error", status: 401 }
+            ? { state: "error", status: 400 }
             : { state: "ok", balance: 0, total: 10, paymentTxnIds: [] }),
     });
-    await runQboRowLoop(rows(4), result, rowHandler(client, result), (row) => seen.push(row.id), "milestones");
+    const handler = async (row: { id: string; qbInvoiceId: string }) => {
+        result.checked++;
+        const probe = await client.probeInvoice(row.qbInvoiceId);
+        if (probe.state === "error") {
+            if (probe.connectionFailed) throw new QboRetryableError("probe failed", probe.status);
+            throw new Error(`QBO invoice probe failed (status ${probe.status})`);
+        }
+    };
+    await runQboRowLoop(rows(4), result, handler, (row) => seen.push(row.id), "milestones");
 
-    assert.equal(calls.probes.length, 4);
+    assert.equal(calls.probes.length, 4, "a non-shared failure must not abort the run");
     assert.equal(result.skipped, 0);
     assert.equal(result.abortedOnQboOutage, false);
-    assert.equal(seen.length, 0, "a transient probe error is not a row error");
+    assert.deepEqual(seen, ["s1"], "the unverified row is recorded as an error");
+});
+
+test("a 401 on any probe aborts the run - the credential is shared", async () => {
+    const result = emptyResult();
+    const { client, calls } = fakeQbo({ probe: () => ({ state: "error", status: 401, connectionFailed: true }) });
+    await runQboRowLoop(rows(120), result, rowHandler(client, result), () => {}, "milestones");
+
+    assert.equal(calls.probes.length, 1, "the next 119 rows would fail identically");
+    assert.equal(result.skipped, 119);
+    assert.equal(result.abortedOnQboOutage, true);
 });
 
 test("a settle failure is recorded per row and the run continues", async () => {

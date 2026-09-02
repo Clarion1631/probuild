@@ -38,6 +38,13 @@ export interface TimestampProbe {
     status: ProbeStatus;
     reason?: ProbeFailure;
     at: string | null;
+    /**
+     * For the payments heartbeat: the recorded status of the run this
+     * timestamp came from ("ok" or "partial"). A partial run counts for
+     * FRESHNESS (the cron did run) but is reported as a problem in its own
+     * right, so repeated partial runs cannot sit green behind a 26h window.
+     */
+    runStatus?: string | null;
 }
 
 export interface CountsProbe {
@@ -136,6 +143,11 @@ export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
  * hourly job that has stopped running.
  */
 export const PAYMENTS_SYNC_CRON_SOURCE = "cron";
+/**
+ * Run statuses that prove the cron is alive. A "partial" run did execute, so
+ * it counts for freshness — and is then flagged separately, immediately.
+ */
+export const PAYMENTS_SYNC_HEARTBEAT_STATUSES = ["ok", "partial"];
 /** The cron runs hourly; 26h leaves room for a couple of missed runs and DST. */
 export const PAYMENTS_SYNC_STALE_HOURS = 26;
 
@@ -194,6 +206,12 @@ export function evaluatePipelineHealth(input: {
         const at = input.lastPaymentsSync.at ? Date.parse(input.lastPaymentsSync.at) : null;
         const stale = at === null || Number.isNaN(at) || input.now - at > PAYMENTS_SYNC_STALE_HOURS * HOUR_MS;
         if (stale) reasons.push("payments-sync-stale");
+        // A run that skipped rows or hit errors did NOT verify those payments.
+        // It proves the cron is alive, so it counts for freshness — but it must
+        // be reported the same day, not hidden inside the 26h staleness window
+        // (repeated partial runs could otherwise stay green until tomorrow's
+        // digest, or indefinitely).
+        else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -292,20 +310,21 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 )?.createdAt ?? null,
             null,
         ),
-        probe<Date | null>(
+        probe<{ createdAt: Date; status: string } | null>(
             "lastPaymentsSync",
             async () =>
-                (
-                    await prisma.automationEvent.findFirst({
-                        where: {
-                            kind: PAYMENTS_SYNC_EVENT_KIND,
-                            status: "ok",
-                            source: PAYMENTS_SYNC_CRON_SOURCE,
-                        },
-                        orderBy: { createdAt: "desc" },
-                        select: { createdAt: true },
-                    })
-                )?.createdAt ?? null,
+                (await prisma.automationEvent.findFirst({
+                    // "partial" counts for freshness (the cron ran) and is then
+                    // reported on its own; only a hard "error" is excluded,
+                    // since `stuck` already surfaces those.
+                    where: {
+                        kind: PAYMENTS_SYNC_EVENT_KIND,
+                        status: { in: PAYMENTS_SYNC_HEARTBEAT_STATUSES },
+                        source: PAYMENTS_SYNC_CRON_SOURCE,
+                    },
+                    orderBy: { createdAt: "desc" },
+                    select: { createdAt: true, status: true },
+                })) ?? null,
             null,
         ),
         probe<Array<{ status: string; _count: { _all: number } }>>(
@@ -352,7 +371,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         lastPaymentsSync: {
             status: lastPaymentsSync.status,
             reason: lastPaymentsSync.reason,
-            at: lastPaymentsSync.value?.toISOString() ?? null,
+            at: lastPaymentsSync.value?.createdAt.toISOString() ?? null,
+            runStatus: lastPaymentsSync.value?.status ?? null,
         },
         receipts24h: { status: receiptRows.status, reason: receiptRows.reason, counts },
         bank: {
@@ -411,7 +431,7 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         `Intuit status: ${health.intuit.indicator}${health.intuit.description ? ` (${health.intuit.description})` : ""}${health.intuit.status === "error" ? " [status page unreachable]" : ""}`,
         `Last QBO purchase sync: ${ago(health.qbo.lastPurchaseSync, now)}`,
         `Last receipt booked: ${ago(health.qbo.lastReceiptPush, now)}`,
-        `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}`,
+        `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}${health.qbo.lastPaymentsSync.runStatus === "partial" ? " [incomplete run]" : ""}`,
         `Receipts (24h): ${receiptsLine}`,
         `Bank ledger through: ${
             health.bank.status === "error"

@@ -379,3 +379,55 @@ test("a recovery that actually uploaded the file counts as a booking", async () 
     assert.equal(detailOf("skipped").includes(RECOVERED_BOOKING_DETAIL), false);
     assert.equal(detailOf("failed:400").includes(RECOVERED_BOOKING_DETAIL), false);
 });
+
+
+// --- A partial run must not hide behind the 26h window ---
+
+test("the latest run being PARTIAL is reported immediately, not in 26h", async () => {
+    const { PAYMENTS_SYNC_HEARTBEAT_STATUSES } = await import("../src/lib/pipeline-health");
+    // Codex gate: health read only the last "ok" event and counted only
+    // "error" ones, so repeated hourly partial runs could leave the digest
+    // green for up to 26 hours - or until the next day's digest.
+    assert.deepEqual(PAYMENTS_SYNC_HEARTBEAT_STATUSES, ["ok", "partial"]);
+
+    const v = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(1 * HOUR), runStatus: "partial" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["payments-sync-partial"]);
+});
+
+test("a partial run still counts as a heartbeat, so it is not ALSO stale", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(1 * HOUR), runStatus: "partial" },
+    }));
+    assert.equal(v.reasons.includes("payments-sync-stale"), false);
+});
+
+test("a stale partial run reports staleness, not double-reasons", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(40 * HOUR), runStatus: "partial" },
+    }));
+    assert.deepEqual(v.reasons, ["payments-sync-stale"]);
+});
+
+test("an ok run reports nothing", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(1 * HOUR), runStatus: "ok" },
+    }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("the digest flags an incomplete payments run in the body", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["payments-sync-partial"],
+        qbo: {
+            lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+            lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "partial" },
+        },
+    }));
+    assert.match(text, /Last payments sync: .*\[incomplete run\]/);
+    assert.match(text, /Needs attention: payments-sync-partial/);
+});
