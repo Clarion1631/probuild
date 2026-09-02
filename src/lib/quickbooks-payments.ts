@@ -16,9 +16,27 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
+import { logAutomationEvent } from "./automation-events";
+import { createHash } from "node:crypto";
 import {
     type QBTokens,
     refreshQBToken,
+    isQBTimeoutError,
+    isQBBudgetExhaustedError,
+    createRouteDeadline,
+    remainingBudgetMs,
+    qboRequestId,
+    isBudgetExhausted,
+    type RouteDeadline,
+    qbQuery,
+    escapeQBString,
+    isQboConnectionFailure,
+    isQboMalformedResponseError,
+    qboHttpStatus,
+    QBTokenStrandedError,
+    isQBTokenStrandedError,
+    QboRetryableError,
+    type QBInvoiceProbe,
     ensureQBCustomer,
     ensureQBServiceItem,
     createQBMilestoneInvoice,
@@ -31,6 +49,18 @@ import {
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
 
+/**
+ * Intuit rotated the refresh token but we could not store the replacement.
+ * Distinct from a refresh failure: the OLD token is already spent, so there is
+ * no safe fallback and the connection needs human attention.
+ */
+export class QBTokenPersistenceError extends Error {
+    name = "QBTokenPersistenceError";
+    constructor() {
+        super("QuickBooks token was rotated but could not be saved; reconnect QuickBooks");
+    }
+}
+
 export class QBNotConnectedError extends Error {
     constructor() {
         super("QuickBooks is not connected (Settings → Integrations → QuickBooks)");
@@ -39,7 +69,7 @@ export class QBNotConnectedError extends Error {
 }
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
-export async function getFreshQBTokens(): Promise<QBTokens> {
+export async function getFreshQBTokens(deadline?: RouteDeadline): Promise<QBTokens> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts. The mock
     // replaces the NETWORK, not the CONNECTION STATE: with no connected settings row
     // it still throws QBNotConnectedError, so fail-closed specs (e.g.
@@ -54,14 +84,82 @@ export async function getFreshQBTokens(): Promise<QBTokens> {
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
     }
+    return refreshTokensOrFallBack(
+        { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId },
+        (token) => refreshQBToken(token, deadline),
+    );
+}
+
+/**
+ * The refresh + fallback policy, split out so the CATCH can be tested without a
+ * database (only the network boundary is injectable; the defaults here are the
+ * real ones getFreshQBTokens uses).
+ *
+ * A refresh that fails for an ordinary reason may still leave the OLD access
+ * token usable, so that fallback stays. A TIMEOUT is different and must
+ * propagate: swallowing it handed the caller a possibly-stale token and let it
+ * spend another full QBO deadline on the next request, which is how a QBO
+ * outage still ate the route's whole 60s ceiling — exactly the hang the
+ * per-request deadline was added to stop. The caller turns it into a 503.
+ */
+export async function refreshTokensOrFallBack(
+    qb: { accessToken: string; refreshToken: string; realmId: string },
+    refresh: typeof refreshQBToken = refreshQBToken,
+    save: typeof saveQBSettings = saveQBSettings,
+): Promise<QBTokens> {
+    let fresh: { accessToken: string; refreshToken: string };
     try {
-        const fresh = await refreshQBToken(qb.refreshToken);
-        await saveQBSettings({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
-        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
-    } catch {
-        // Refresh can fail transiently; the old access token may still be valid.
+        fresh = await refresh(qb.refreshToken);
+    } catch (error) {
+        if (isQBTimeoutError(error)) throw error;
+
+        // Falling back is only safe when Intuit EXPLICITLY rejected the
+        // exchange — a 400/401 (invalid_grant and friends) means it processed
+        // the request and refused, so nothing rotated and the stored access
+        // token may still be good.
+        //
+        // Everything else is ambiguous and must strand: a 5xx says Intuit
+        // broke somewhere in its own pipeline and may well have rotated before
+        // failing, and a reset socket, TLS failure, truncated or malformed body
+        // says we never learned the outcome at all. Treating those as "refused"
+        // hands back a pair that could already be spent, reporting a healthy
+        // connection sitting on a dead token.
+        const status = qboHttpStatus(error);
+        const explicitlyRejected = status === 400 || status === 401;
+        if (!explicitlyRejected) {
+            throw new QBTokenStrandedError(
+                status !== null ? `HTTP ${status}` : error instanceof Error ? error.name : "transport failure",
+            );
+        }
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
+
+    // A 200 that omits either token is the same ambiguity wearing a different
+    // hat: something rotated, and we did not receive what replaced it.
+    const usable = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+    if (!usable(fresh.accessToken) || !usable(fresh.refreshToken)) {
+        throw new QBTokenStrandedError("refresh response was missing a token");
+    }
+
+    // A SAVE failure is a different animal and must never share the catch
+    // above. By this point Intuit has already rotated: the old refresh token is
+    // spent, so returning the stale pair would report a healthy connection
+    // while quietly stranding the integration until someone reconnects by hand.
+    // Retry once (a transient DB blip is the common case), then surface it.
+    try {
+        await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+    } catch (first) {
+        try {
+            await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+        } catch {
+            console.error(
+                "QBO token rotated but could NOT be persisted — reconnect QuickBooks if the next refresh fails",
+                first instanceof Error ? first.name : "UnknownError",
+            );
+            throw new QBTokenPersistenceError();
+        }
+    }
+    return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
 }
 
 /**
@@ -96,6 +194,12 @@ export async function claimQBInvoiceUnlink(
             // true even when the QBO invoice behind it is voided and re-staged.
             qbSyncedAt: null,
             qbSyncError: null,
+            // Cleared so the NEXT send mints a fresh issuance key and gets a
+            // genuinely new invoice. Keeping it would make the re-send an
+            // "ambiguous retry" of a link that no longer exists, and Intuit
+            // would hand back the invoice we just unlinked.
+            qbIssuanceKey: null,
+            qbIssuancePayloadHash: null,
         },
     });
     return cleared.count === 1;
@@ -103,14 +207,18 @@ export async function claimQBInvoiceUnlink(
 
 // Exported for stageProgressBillingToQuickBooksCore (src/lib/progress-billing.ts),
 // which needs the same customer/item resolution pushMilestoneToQuickBooks uses.
-export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
+export async function resolveCustomerAndItem(
+    tokens: QBTokens,
+    clientId: string,
+    deadline?: RouteDeadline,
+): Promise<{ customerId: string; itemId: string }> {
     const client = await prisma.client.findUnique({
         where: { id: clientId },
         select: { id: true, name: true, email: true, qbCustomerId: true },
     });
     if (!client) throw new Error("Client not found");
 
-    const customerId = await ensureQBCustomer(tokens, client);
+    const customerId = await ensureQBCustomer(tokens, client, deadline);
     if (customerId !== client.qbCustomerId) {
         await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
     }
@@ -118,7 +226,7 @@ export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string)
     const qb = await getQBSettings();
     let itemId = qb.serviceItemId;
     if (!itemId) {
-        itemId = await ensureQBServiceItem(tokens);
+        itemId = await ensureQBServiceItem(tokens, deadline);
         await saveQBSettings({ serviceItemId: itemId });
     }
     return { customerId, itemId };
@@ -134,7 +242,249 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
-export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passedTokens?: QBTokens): Promise<MilestonePushResult> {
+/** Reserved for the compensating delete, independent of the push's own budget. */
+export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
+/**
+ * Default budget when a caller passes none. Under a 60s route ceiling, and it
+ * leaves MILESTONE_CLEANUP_BUDGET_MS of headroom for the compensating delete
+ * that may follow. An unbudgeted push was the remaining way to run to the
+ * platform's ceiling and be killed between the invoice create and the link.
+ */
+export const MILESTONE_PUSH_BUDGET_MS = 45_000;
+/** Never spend the last slice of the route: leave the platform room to respond. */
+export const PLATFORM_RESERVE_MS = 2_000;
+
+/**
+ * How long compensation may take, measured when it BEGINS.
+ *
+ * Never additive: the old form added the cleanup window to whatever the route
+ * had left, which could push the total past the platform ceiling — the exact
+ * thing the budget exists to prevent. It is the SMALLER of the standard
+ * cleanup window and the route's real remaining headroom, minus a reserve so
+ * the function can still return a response.
+ */
+export function compensationWindowMs(routeRemainingMs: number): number {
+    if (!Number.isFinite(routeRemainingMs)) return MILESTONE_CLEANUP_BUDGET_MS;
+    const usable = Math.floor(routeRemainingMs) - PLATFORM_RESERVE_MS;
+    // Below the floor there is no useful window left; give the delete the
+    // minimum a call needs rather than a negative or absurd deadline.
+    if (usable <= 1_000) return 1_000;
+    return Math.min(MILESTONE_CLEANUP_BUDGET_MS, usable);
+}
+
+/**
+ * The per-issuance idempotency seed, minted before the first QBO call.
+ *
+ * Keying on the row id de-duplicated a retry but could not express a
+ * RE-ISSUE: after an unlink, the next send reused the same key and Intuit
+ * returned the ORIGINAL (now stale or deleted) invoice instead of creating a
+ * new one. A stored key that is minted on send and cleared on unlink separates
+ * "same attempt, don't duplicate" from "new issuance, please create".
+ *
+ * The CAS write is what makes it safe under concurrency: two pushes racing the
+ * same milestone cannot mint two keys, so they cannot create two invoices.
+ */
+/**
+ * Canonical hash of what we are asking QuickBooks to bill.
+ *
+ * Field equality on the RETURNED invoice catches drift QBO echoes back, but
+ * QBO does not echo everything: a line description edit, or a tax split that
+ * keeps the same grand total, come back looking identical. Hashing the payload
+ * we SENT closes that: same key + same hash is genuinely the same bill; same
+ * key + different hash means the milestone changed under an ambiguous retry.
+ *
+ * Ordering is fixed and nulls are explicit, so "no due date" hashes
+ * differently from "due date removed since" only when it actually differs.
+ */
+export function issuancePayloadHash(payload: {
+    customerId: string;
+    docNumber: string;
+    dueDate: string | null;
+    lineDescriptions: string[];
+    preTaxAmount: number;
+    taxAmount: number;
+    taxCode: string | null;
+    privateNote: string | null;
+}): string {
+    const canonical = JSON.stringify([
+        ["customerId", payload.customerId],
+        ["docNumber", payload.docNumber],
+        ["dueDate", payload.dueDate],
+        ["lineDescriptions", payload.lineDescriptions],
+        ["preTaxAmount", Number(payload.preTaxAmount).toFixed(2)],
+        ["taxAmount", Number(payload.taxAmount).toFixed(2)],
+        ["taxCode", payload.taxCode],
+        ["privateNote", payload.privateNote],
+    ]);
+    return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * True when a stored issuance can be reused for this payload. A stored hash
+ * that differs means the bill changed; a MISSING stored hash (a row minted
+ * before this column existed) is treated as reusable — refusing every legacy
+ * row would strand them.
+ */
+export function issuanceMatchesPayload(storedHash: string | null, currentHash: string): boolean {
+    if (!storedHash) return true;
+    return storedHash === currentHash;
+}
+
+export async function ensureIssuanceKey(
+    model: { findUnique: Function; updateMany: Function },
+    id: string,
+    existing: string | null,
+    payloadHash: string,
+    storedHash: string | null = null,
+): Promise<{ key: string; reused: boolean }> {
+    if (existing) {
+        // An ambiguous retry. Reuse ONLY if it is still the same bill — a
+        // stored hash that differs means the milestone changed under us, and
+        // the invoice Intuit would hand back describes the old one.
+        if (!issuanceMatchesPayload(storedHash, payloadHash)) {
+            throw new IssuancePayloadChangedError(id);
+        }
+        return { key: existing, reused: true };
+    }
+    const minted = qboRequestId(`${id}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
+    const claimed = await model.updateMany({
+        where: { id, qbIssuanceKey: null },
+        data: { qbIssuanceKey: minted, qbIssuancePayloadHash: payloadHash },
+    });
+    if (claimed.count === 1) return { key: minted, reused: false };
+    // Someone else minted first; use theirs so both attempts share one key —
+    // but only if they were billing the same thing.
+    const row = await model.findUnique({
+        where: { id },
+        select: { qbIssuanceKey: true, qbIssuancePayloadHash: true },
+    });
+    if (!row?.qbIssuanceKey) return { key: minted, reused: false };
+    if (!issuanceMatchesPayload(row.qbIssuancePayloadHash ?? null, payloadHash)) {
+        throw new IssuancePayloadChangedError(id);
+    }
+    return { key: row.qbIssuanceKey, reused: true };
+}
+
+/** QuickBooks could not be reached, so remote state is unknown and nothing was changed. */
+export class QBRemoteStateUnknownError extends Error {
+    name = "QBRemoteStateUnknownError";
+    constructor(detail: string) {
+        super(`QuickBooks could not be reached to confirm the invoice state (${detail}); nothing was changed. Try again once QuickBooks responds.`);
+    }
+}
+
+/**
+ * Clear the issuance identity, but only if the row is still the one we staged.
+ *
+ * Called after a CONFIRMED delete/void. The CAS matters: without it, a
+ * concurrent push that had already minted a fresh key and created a new
+ * invoice would have its identity wiped by this cleanup, and the next retry
+ * would create a THIRD invoice.
+ */
+export async function clearIssuanceIfUnlinked(
+    model: { updateMany: Function },
+    id: string,
+    expectedKey: string | null,
+): Promise<boolean> {
+    if (!expectedKey) return false;
+    const cleared = await model.updateMany({
+        where: { id, qbInvoiceId: null, qbIssuanceKey: expectedKey },
+        data: { qbIssuanceKey: null, qbIssuancePayloadHash: null },
+    });
+    return cleared.count === 1;
+}
+
+/**
+ * An issuance whose payload changed while its invoice state is unknown.
+ *
+ * The dangerous shape: an ambiguous create (request landed, response lost)
+ * followed by an edit. The stored key says "an invoice may exist"; the changed
+ * hash says "but not for this bill". Minting blindly could double-bill;
+ * reusing blindly could link an invoice describing the old amount. So ASK
+ * QuickBooks whether the invoice exists.
+ *
+ *  - found     -> link it and let the normal drift check park it for a human
+ *  - not found -> the issuance is proven unsent; clear it and mint fresh
+ *  - unknown   -> refuse, change nothing
+ */
+export async function reconcileStrandedIssuance(
+    tokens: QBTokens,
+    args: { docNumber: string; marker: string },
+    deadline?: RouteDeadline,
+): Promise<{ state: "found"; qbInvoiceId: string } | { state: "not-found" }> {
+    let rows: Array<{ Id?: string; PrivateNote?: string }>;
+    try {
+        rows = await qbQuery<{ Id?: string; PrivateNote?: string }>(
+            tokens,
+            `SELECT Id, PrivateNote FROM Invoice WHERE DocNumber = '${escapeQBString(args.docNumber)}'`,
+            deadline,
+        );
+    } catch (error) {
+        // Unknown is NOT "not found". Guessing either way risks a duplicate
+        // bill or a stranded invoice, so change nothing and say so.
+        throw new QBRemoteStateUnknownError(error instanceof Error ? error.name : "query failed");
+    }
+    // DocNumber alone can collide across re-issues; the private-note marker is
+    // what proves this invoice is the one this issuance created.
+    const mine = rows.find(row => (row.PrivateNote ?? "").includes(args.marker)) ?? rows[0];
+    if (mine?.Id) return { state: "found", qbInvoiceId: String(mine.Id) };
+    return { state: "not-found" };
+}
+
+/** The stored issuance describes a different bill than the one being sent now. */
+export class IssuancePayloadChangedError extends Error {
+    name = "IssuancePayloadChangedError";
+    constructor(id: string) {
+        super(`The billing details changed since this QuickBooks invoice was first staged (${id}); re-issue instead of retrying.`);
+    }
+}
+
+/**
+ * Does what QuickBooks returned still describe the thing we meant to bill?
+ *
+ * On an ambiguous retry Intuit hands back the invoice it created the FIRST
+ * time, which may predate an edit or a reorder. Every expected field must be
+ * present AND equal — a MISSING field is a mismatch, not a pass, because "we
+ * could not check" is not "it matches".
+ */
+export function reconcileIssuedInvoice(
+    returned: { total: number; customerId: string | null; dueDate: string | null; docNumber: string | null },
+    expected: { amount: number; customerId: string; dueDate: string | null; docNumber: string },
+): string[] {
+    const drift: string[] = [];
+    if (!Number.isFinite(returned.total) || Math.abs(returned.total - expected.amount) > 0.05) {
+        drift.push(`amount ProBuild ${expected.amount} vs QBO ${returned.total}`);
+    }
+    if (!returned.customerId || returned.customerId !== expected.customerId) {
+        drift.push(`customer ProBuild ${expected.customerId} vs QBO ${returned.customerId ?? "missing"}`);
+    }
+    if (!returned.docNumber || returned.docNumber !== expected.docNumber) {
+        drift.push(`docNumber ProBuild ${expected.docNumber} vs QBO ${returned.docNumber ?? "missing"}`);
+    }
+    if (expected.dueDate) {
+        if (!returned.dueDate || returned.dueDate !== expected.dueDate) {
+            drift.push(`due date ProBuild ${expected.dueDate} vs QBO ${returned.dueDate ?? "missing"}`);
+        }
+    }
+    return drift;
+}
+
+export async function pushMilestoneToQuickBooks(
+    paymentScheduleId: string,
+    passedTokens?: QBTokens,
+    /**
+     * Whole-push budget. This is six serial QBO calls on a bad day — refresh,
+     * customer, service item, invoice create, payment link, status — plus a
+     * compensating delete if the link write fails. Individually bounded is not
+     * enough; without a shared budget the SUM still runs past the caller's
+     * ceiling, and being killed between the invoice create and the DB write is
+     * exactly how an orphaned QBO invoice happens.
+     */
+    deadline?: RouteDeadline,
+): Promise<MilestonePushResult> {
+    // A caller that passes nothing still gets a bound: unbudgeted was the last
+    // way to reach the platform ceiling and be killed between create and link.
+    const pushDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS);
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentScheduleId },
         include: {
@@ -166,11 +516,11 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         );
     }
 
-    const tokens = passedTokens ?? await getFreshQBTokens();
+    const tokens = passedTokens ?? await getFreshQBTokens(pushDeadline);
 
     if (schedule.qbInvoiceId) {
-        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId));
-        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId);
+        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, pushDeadline));
+        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId, pushDeadline);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
         // A reachable invoice (status read back) clears any stale voided/notFound flag.
         const clearFlag = !!status && !!schedule.qbSyncError;
@@ -187,7 +537,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     }
 
     const invoice = schedule.invoice;
-    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
+    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, pushDeadline);
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
@@ -213,26 +563,129 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
-    const { qbId, total } = await createQBMilestoneInvoice(tokens, {
+    const description = `${projectName} — ${schedule.name}`;
+    const privateNote = `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`;
+    // Hashed BEFORE the create, from what we are about to send — a retry that
+    // hashes differently is billing something else and must not reuse the key.
+    const payloadHash = issuancePayloadHash({
+        customerId,
         docNumber,
+        dueDate: schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null,
+        lineDescriptions: [description],
+        preTaxAmount: tax ? tax.preTaxAmount : amount,
+        taxAmount: tax ? tax.taxAmount : 0,
+        taxCode: tax ? "TAX" : null,
+        privateNote,
+    });
+    const privateNoteMarker = `ProBuild ${invoice.code} · ${schedule.name}`;
+    let issuanceKey: string;
+    try {
+        ({ key: issuanceKey } = await ensureIssuanceKey(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            schedule.qbIssuanceKey ?? null,
+            payloadHash,
+            schedule.qbIssuancePayloadHash ?? null,
+        ));
+    } catch (error) {
+        if (!(error instanceof IssuancePayloadChangedError)) throw error;
+        // An ambiguous create followed by an edit: the stored key says an
+        // invoice MAY exist, the changed hash says it is not for this bill.
+        // Minting blindly could double-bill; reusing blindly could link an
+        // invoice describing the old amount. Ask QuickBooks which it is.
+        const remote = await reconcileStrandedIssuance(
+            tokens,
+            { docNumber, marker: privateNoteMarker },
+            pushDeadline,
+        );
+        if (remote.state === "found") {
+            // It exists. Link it so it is never orphaned, then let the normal
+            // drift check park it for a human — it bills the OLD amount.
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: null },
+                data: { qbInvoiceId: remote.qbInvoiceId, qbSyncError: "invoice-drift" },
+            });
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: "invoice-drift",
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, qbInvoiceId: remote.qbInvoiceId, cause: "stranded-issuance" },
+            });
+            throw new Error(
+                `QuickBooks already holds invoice ${docNumber} (id ${remote.qbInvoiceId}) from an earlier attempt, and this milestone has changed since. ` +
+                `Review it in QuickBooks before re-sending.`,
+            );
+        }
+        // Proven unsent: clear the stale identity and mint fresh.
+        await clearIssuanceIfUnlinked(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            schedule.qbIssuanceKey ?? null,
+        );
+        ({ key: issuanceKey } = await ensureIssuanceKey(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            null,
+            payloadHash,
+            null,
+        ));
+    }
+
+    const created = await createQBMilestoneInvoice(tokens, {
+        docNumber,
+        // Per-ISSUANCE, not per-row: an unlink clears it so the next send mints
+        // a new one and gets a genuinely new invoice.
+        idempotencyKey: issuanceKey,
         customerId,
         itemId,
-        description: `${projectName} — ${schedule.name}`,
+        description,
         amount,
         tax,
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
-        privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
-    });
+        privateNote,
+    }, pushDeadline);
 
-    // QBO Automated Sales Tax can recalculate on top of what we send — verify the
-    // grand total still equals the milestone. A drift means the client would be
-    // asked for a different amount than ProBuild expects; flag it loudly.
-    if (Math.abs(total - amount) > 0.05) {
-        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+    const { qbId, total } = created;
+
+    // The requestid makes a retry safe from DUPLICATION, not from DRIFT: on an
+    // ambiguous retry Intuit returns the invoice it created the FIRST time, and
+    // the milestone may have been edited or reordered since. Linking that
+    // silently would bill the client the old amount, or attach an invoice made
+    // for a different customer. Reconcile before linking; park on a mismatch.
+    const driftReasons = reconcileIssuedInvoice(created, {
+        amount,
+        customerId,
+        dueDate: schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null,
+        docNumber,
+    });
+    if (driftReasons.length > 0) {
+        // Deliberately NOT deleted: it may be a real invoice a client has
+        // already seen. Flag the milestone so a human reconciles it.
+        console.error(
+            `[quickbooks-payments] invoice drift on ${docNumber} (QBO id ${qbId}): ${driftReasons.join("; ")}`,
+        );
+        await prisma.paymentSchedule.updateMany({
+            where: { id: schedule.id, qbInvoiceId: null },
+            data: { qbSyncError: "invoice-drift" },
+        }).catch(() => {});
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "invoice-drift",
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, drift: driftReasons },
+        });
+        throw new Error(
+            `QuickBooks returned an invoice that no longer matches this milestone (${driftReasons.join("; ")}). ` +
+            `Review QuickBooks invoice ${docNumber} (id ${qbId}) before retrying.`,
+        );
     }
 
-    const payLink = await getQBInvoicePaymentLink(tokens, qbId);
+    const payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
 
     // Conditional link write: the milestone was read as unlinked and unpaid at
     // the top, but this function does several remote calls in between — a manual
@@ -274,9 +727,47 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         });
     }));
     if (linked.count !== 1) {
-        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
+        // Losing the claim does not prove the milestone changed. The commonest
+        // cause is a CONCURRENT push that linked this very invoice first —
+        // both attempts share one issuance key, so Intuit returned the same
+        // invoice to both. Deleting it here would tear down the winner's work
+        // and leave the milestone pointing at a QBO invoice that no longer
+        // exists. Re-read before compensating.
+        const current = await prisma.paymentSchedule.findUnique({
+            where: { id: schedule.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        });
+        if (current?.qbInvoiceId === qbId) {
+            return { qbInvoiceId: qbId, payLink: current.qbInvoiceLink ?? payLink, qbTotal: total };
+        }
+        // The compensation clock starts HERE, when compensation begins — not at
+        // entry, where it would have been ticking down through every call that
+        // preceded it and could already be spent by the time it is needed. It
+        // is also capped by what the ROUTE has left, so cleanup cannot itself
+        // overrun the platform ceiling: reserve whichever is smaller.
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
+        const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
+        if (compensated) {
+            // The invoice is provably gone, so the identity that produced it
+            // must be released or the next send would reuse the key and ask
+            // Intuit for an invoice that no longer exists. CAS-guarded: a
+            // concurrent push that already minted a fresh key keeps it.
+            await clearIssuanceIfUnlinked(prisma.paymentSchedule as never, schedule.id, issuanceKey);
+        }
         if (!compensated) {
+            // Even the reserved budget is gone (or the delete was refused).
+            // Record the orphan durably so the maintenance sweep can resolve
+            // it; a console line is not a work queue.
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: "invoice-orphan-check",
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, docNumber },
+            });
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
+
             throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
         }
         throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
@@ -639,56 +1130,473 @@ export interface QBPaymentSyncResult {
     // separate counter from `settled` (which counts individual milestones)
     // since one progress billing can carry several milestone lines.
     progressBillingsSettled: number;
+    /**
+     * Rows we deliberately did not probe because QBO had already stopped
+     * answering this run. Non-zero means the run is INCOMPLETE, not clean —
+     * every skipped row is simply retried next run.
+     */
+    skipped: number;
+    /** True when the run stopped early on a connection-level QBO failure. */
+    abortedOnQboOutage: boolean;
+    /**
+     * True when the run did not complete its work for ANY reason — a QBO
+     * outage mid-loop, or a preflight failure (not connected, settings store
+     * unreadable, refresh failed). The audit event's status keys off THIS, not
+     * off the outage flag alone: a run that never got tokens did no work, and
+     * recording it as "ok" made the digest blind to a dead money rail.
+     */
+    runFailed: boolean;
+    /** Short machine reason for `runFailed` — goes on the audit event. */
+    failureReason?: string;
+}
+
+/**
+ * The per-row loop both passes share, extracted so the abort rule is ONE piece
+ * of real code that a test can drive with fake rows and a fake QBO client.
+ *
+ * The rule: any connection-level failure (our deadline, a thrown network
+ * error, or QBO answering 429/5xx) from ANY QBO sub-call in the row — the
+ * invoice probe, the payment-detail read, anything added later — stops the run.
+ * Continuing would spend a fresh 20s deadline per row against the same wall,
+ * which is exactly how six timeouts consumed the cron's 120s ceiling. Ordinary
+ * per-row failures (a business error, a DB conflict) are recorded and the loop
+ * carries on.
+ */
+export async function runQboRowLoop<T extends { id: string }>(
+    rows: T[],
+    result: QBPaymentSyncResult,
+    handleRow: (row: T) => Promise<void>,
+    onRowError: (row: T, error: unknown) => void,
+    skippedLabel: string,
+    deadline?: RouteDeadline,
+    /**
+     * When paginating, the caller counts what is left straight from the
+     * database AFTER this page's cursor — which already includes this page's
+     * unprocessed tail. Adding it here too counted those rows twice. Standalone
+     * callers keep the tally; `forEachPendingPage` opts out and owns the count.
+     */
+    countSkipped: boolean = true,
+): Promise<{ lastCompletedId: string | null; skippedInPage: number }> {
+    // The id of the last row this loop actually finished with. The cursor may
+    // only advance to HERE: jumping to the end of the page after a mid-page
+    // outage would step straight over every row the outage cut short, and they
+    // would not be looked at again until the cursor wrapped all the way round.
+    let lastCompletedId: string | null = null;
+    let skippedInPage = 0;
+    const skip = (count: number) => {
+        skippedInPage += count;
+        if (countSkipped) result.skipped += count;
+    };
+
+    for (const [index, row] of rows.entries()) {
+        // A previous pass already hit the wall — the connection is shared, so
+        // there is nothing to gain by trying again here.
+        if (result.abortedOnQboOutage) {
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
+        }
+        // Checked before EVERY row: a row costs several serial QBO calls, so
+        // starting one with seconds left is how a run gets killed mid-write
+        // instead of returning a result someone can act on.
+        if (isBudgetExhausted(deadline)) {
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
+        }
+        try {
+            await handleRow(row);
+            lastCompletedId = row.id;
+        } catch (error) {
+            // Out of time is not a QBO fault: stop cleanly, count the rest as
+            // skipped (making the run partial), and let the next run continue.
+            if (isQBBudgetExhaustedError(error)) {
+                skip(rows.length - index);
+                return { lastCompletedId, skippedInPage };
+            }
+            if (isQboConnectionFailure(error)) {
+                result.abortedOnQboOutage = true;
+                result.runFailed = true;
+                result.failureReason = "qbo-unavailable";
+                result.errors.push(
+                    `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
+                );
+                skip(rows.length - index - 1);
+                return { lastCompletedId, skippedInPage };
+            }
+            // A row-level failure is recorded and the run continues, so this
+            // row IS finished as far as the cursor is concerned — leaving the
+            // cursor behind it would retry the same bad row forever.
+            onRowError(row, error);
+            lastCompletedId = row.id;
+        }
+    }
+    return { lastCompletedId, skippedInPage };
 }
 
 /**
  * Poll QuickBooks for settled milestone invoices and record them in ProBuild.
  * Safe to run repeatedly (cron + on-view). Never throws on a single bad row.
  */
-export async function syncQuickBooksPayments(scope?: { invoiceId?: string; projectId?: string }): Promise<QBPaymentSyncResult> {
-    const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0 };
+/**
+ * The QBO calls the sync loop makes per row. Injectable so a test can drive the
+ * REAL loop (abort rule, skip accounting, settle sequencing) against a fake
+ * QuickBooks instead of re-implementing the decision in the test.
+ */
+export interface PaymentsSyncQboClient {
+    probeInvoice(qbInvoiceId: string): Promise<QBInvoiceProbe>;
+    getPayment(paymentId: string): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null>;
+    /**
+     * One cheap authenticated read, used only to prove the connection works on
+     * a run with no rows to sync. Throws if QuickBooks is not actually usable.
+     */
+    verifyConnection(): Promise<void>;
+}
 
-    const pending = await prisma.paymentSchedule.findMany({
-        where: {
-            status: "Pending",
-            qbInvoiceId: { not: null },
-            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
-            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
-        },
-        select: {
-            id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
-            invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
-        },
-        take: 100,
-    });
+/**
+ * The cron's route ceiling is 120s; stopping at 100s leaves room to write the
+ * audit event and return a result instead of being killed mid-run.
+ */
+export const PAYMENTS_SYNC_BUDGET_MS = 100_000;
+
+export interface SyncQuickBooksPaymentsOptions {
+    /**
+     * Who triggered this run. Only "cron" counts as the hourly heartbeat the
+     * health check watches — an on-view refresh must never be able to stand in
+     * for it, or a dead cron looks alive.
+     */
+    source?: "cron" | "view" | "manual";
+    /** Test seam; defaults to the real QBO calls. */
+    qboClient?: PaymentsSyncQboClient;
+    /** Whole-run time budget; defaults to PAYMENTS_SYNC_BUDGET_MS. */
+    deadline?: RouteDeadline;
+    /** Where the resume cursors live; defaults to the AutomationSetting table. */
+    cursorStore?: PaymentsSyncCursorStore;
+}
+
+/**
+ * Where the last run stopped, per collection, so the next one CONTINUES rather
+ * than restarting.
+ *
+ * Ordering by id made each run deterministic, but every run still began at the
+ * same end: with more pending rows than one run's budget, the rows past the cap
+ * were re-skipped forever and never verified. Persisting the cursor turns the
+ * cap into a rolling window over the whole set. Wrapping to the start on
+ * exhaustion keeps it a cycle rather than a dead end.
+ */
+export const PAYMENTS_CURSOR_KEYS = {
+    milestones: "qbo-payments-sync.cursor.milestones",
+    billings: "qbo-payments-sync.cursor.billings",
+} as const;
+/** Which collection goes first; flipped each run so neither can starve the other. */
+export const PAYMENTS_ORDER_KEY = "qbo-payments-sync.order";
+
+export interface PaymentsSyncCursorStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+
+/** AutomationSetting-backed cursor store. Never throws: a cursor is an optimisation. */
+export const automationSettingCursorStore: PaymentsSyncCursorStore = {
+    async get(key) {
+        try {
+            const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+            return row?.value ?? null;
+        } catch {
+            return null;
+        }
+    },
+    async set(key, value) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key },
+                create: { key, value },
+                update: { value },
+            });
+        } catch {
+            // A lost cursor costs one restart from the top, never correctness.
+        }
+    },
+};
+
+/**
+ * Rows this run has not looked at, given where it started, where it stopped,
+ * and whether it wrapped.
+ *
+ * Counting only `id > cursor` under-reported every capped run that resumed
+ * mid-collection: with the cursor at row 100 and the cap reached at row 199,
+ * rows 0-99 are equally unverified but sat before the cursor, so the run
+ * reported them as nothing left to do and called itself clean.
+ */
+async function countUnvisited(
+    count: (where: Record<string, unknown>) => Promise<number>,
+    state: { cursorId: string | null; originalCursor: string | null; wrapped: boolean },
+): Promise<number> {
+    const { cursorId, originalCursor, wrapped } = state;
+
+    if (wrapped) {
+        // Walking the head segment: the tail past the original cursor is done.
+        if (!originalCursor) return 0;
+        return count({
+            id: { ...(cursorId ? { gt: cursorId } : {}), lte: originalCursor },
+        });
+    }
+
+    // Still in the tail. Everything after where we stopped, PLUS the head
+    // segment we resumed past and never came back to.
+    const tail = await count(cursorId ? { id: { gt: cursorId } } : {});
+    if (!originalCursor) return tail;
+    const head = await count({ id: { lte: originalCursor } });
+    return tail + head;
+}
+
+/** One database page. Small enough to stay responsive, big enough to be cheap. */
+const PAYMENTS_SYNC_PAGE_SIZE = 100;
+/** Hard ceiling on rows per run, so one huge backlog cannot run past the cron's window. */
+const PAYMENTS_SYNC_MAX_ROWS = 500;
+/**
+ * Walk a pending collection in stable id order, a page at a time.
+ *
+ * The old queries took an unordered first 100 and stopped: rows past the cap
+ * were neither checked nor counted as skipped, so the run reported a clean
+ * "ok" while work was silently left undone — and with no ORDER BY, Postgres was
+ * free to hand back the SAME first 100 every hour, starving later rows forever.
+ * Ordering by id makes the walk deterministic, and anything we do not reach is
+ * counted as skipped so the run is honestly reported as partial.
+ */
+export async function forEachPendingPage<T extends { id: string }>(
+    result: QBPaymentSyncResult,
+    deadline: RouteDeadline,
+    /**
+     * `stopAfterId` bounds the WRAPPED pass: rows with an id greater than it
+     * were already visited earlier in this same run, so re-fetching them would
+     * process them twice (and could loop). Null means "no upper bound".
+     */
+    fetchPage: (cursorId: string | null, take: number, stopAfterId: string | null) => Promise<T[]>,
+    /**
+     * How many rows this run has NOT visited. Takes the whole traversal state,
+     * not just the cursor: a run that resumed at C and stopped at D has left
+     * both (> D) AND (<= C) unvisited, and the head segment is invisible to a
+     * plain "after the cursor" count. After a wrap it is the reverse — the tail
+     * past C was already done, so only (> D and <= C) is left.
+     */
+    countRemaining: (state: {
+        cursorId: string | null;
+        originalCursor: string | null;
+        wrapped: boolean;
+    }) => Promise<number>,
+    /** Returns the last row it actually completed — the furthest the cursor may move. */
+    handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
+    cursor?: { store: PaymentsSyncCursorStore; key: string },
+    maxRows: number = PAYMENTS_SYNC_MAX_ROWS,
+): Promise<void> {
+    // Resume where the last run stopped. A run that finishes the tail wraps
+    // back to the start, so the window rolls over the whole collection instead
+    // of stalling at whichever rows happen to sort last.
+    const storedCursor = cursor ? await cursor.store.get(cursor.key) : null;
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursorId: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
+    // Wrapping exists to reach the rows BEFORE a resume point. A run that
+    // already started at the top has no such rows, so wrapping there would
+    // just re-walk everything it had only now finished — the guard has to be
+    // "did this run resume?", not "is the cursor non-null?" (which is true of
+    // any run that processed a page).
+    const startedFromCursor = cursorId !== null;
+    let processed = 0;
+    let wrapped = false;
+
+    const saveCursor = async (value: string | null) => {
+        if (cursor) await cursor.store.set(cursor.key, value ?? "");
+    };
+
+    while (true) {
+        if (result.abortedOnQboOutage) break;
+        if (processed >= maxRows) break;
+        if (isBudgetExhausted(deadline)) break;
+
+        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, maxRows - processed);
+        // After wrapping, the run is walking the rows BEFORE where it started;
+        // it must stop at that point or it would revisit the ones it has
+        // already done this run.
+        const page = await fetchPage(cursorId, take, wrapped ? storedCursor : null);
+
+        if (page.length === 0) {
+            // End of the collection. If we started mid-way, wrap once and keep
+            // going with whatever budget is left; the rows before the old
+            // cursor are exactly the ones a fixed start would never reach.
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null); // fully drained: next run starts at the top
+            return;
+        }
+
+        const { lastCompletedId } = await handlePage(page);
+        processed += page.length;
+        // Only past what finished. On a clean page this is the page tail; on a
+        // page an outage cut short it is wherever the loop actually got to, so
+        // the next run resumes at the first unverified row rather than after it.
+        if (lastCompletedId !== null) {
+            cursorId = lastCompletedId;
+            await saveCursor(cursorId);
+        }
+
+        // A short page means we reached the end of the collection.
+        if (page.length < take) {
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null);
+            return;
+        }
+    }
+
+    // Stopped early. Count what is genuinely left AFTER the cursor rather than
+    // subtracting from a stale total — rows settled during this run have
+    // already dropped out of the pending set.
+    //
+    // If that count FAILS we do not know how much was left. Defaulting to 0
+    // was the worst possible answer: skipped stayed 0, the run reported "ok",
+    // and an unknown amount of unverified payment work vanished from the
+    // record. Not knowing is a failed run.
+    try {
+        const remaining = await countRemaining({ cursorId, originalCursor: storedCursor, wrapped });
+        if (remaining > 0) result.skipped += remaining;
+    } catch (error) {
+        result.runFailed = true;
+        result.failureReason = "count-failed";
+        result.errors.push(
+            `Could not count remaining rows: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+    }
+}
+
+export async function syncQuickBooksPayments(
+    scope?: { invoiceId?: string; projectId?: string },
+    options?: SyncQuickBooksPaymentsOptions,
+): Promise<QBPaymentSyncResult> {
+    // Exactly one audit event per invocation, whatever happens.
+    //
+    // The event used to be written at each return point, so any path that did
+    // not reach one — a Prisma failure in the pagination queries, a bug in the
+    // loop — returned or threw with NO event at all. The health check reads
+    // those events, so a crashing cron looked exactly like a cron that had
+    // never been deployed: silent. try/finally makes the record unconditional,
+    // and `recorded` keeps it to one.
+    const runState = { recorded: false };
+    try {
+        return await runPaymentsSync(scope, options, runState);
+    } catch (error) {
+        // A DB/pagination exception is still a failed RUN and must be visible.
+        if (!runState.recorded) {
+            runState.recorded = true;
+            await recordPaymentsSyncEvent(
+                {
+                    checked: 0, settled: 0, partiallyPaid: 0, progressBillingsSettled: 0,
+                    skipped: 0, abortedOnQboOutage: false,
+                    runFailed: true,
+                    failureReason: "run-crashed",
+                    errors: [error instanceof Error ? error.message : "payments sync threw"],
+                },
+                options?.source,
+            ).catch(() => {});
+        }
+        throw error;
+    }
+}
+
+async function runPaymentsSync(
+    scope: { invoiceId?: string; projectId?: string } | undefined,
+    options: SyncQuickBooksPaymentsOptions | undefined,
+    runState: { recorded: boolean },
+): Promise<QBPaymentSyncResult> {
+    const result: QBPaymentSyncResult = {
+        checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0,
+        skipped: 0, abortedOnQboOutage: false, runFailed: false,
+    };
+    const routeDeadline = options?.deadline ?? createRouteDeadline(PAYMENTS_SYNC_BUDGET_MS);
+
+    const pendingWhere = {
+        status: "Pending",
+        qbInvoiceId: { not: null },
+        ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+        ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
+    };
+    const pendingRowCount = await prisma.paymentSchedule.count({ where: pendingWhere });
 
     // Progress billings (src/lib/progress-billing.ts) staged/sent to QuickBooks
     // — a second, independent pass over the same QBO connection. Milestones
     // billed through a ProgressBilling are NOT in `pending` above (billing
     // them there doesn't touch PaymentSchedule.qbInvoiceId), so this pass is
     // the only place they get settled from a QuickBooks payment.
-    const pendingBillings = await prisma.progressBilling.findMany({
-        where: {
-            qbInvoiceId: { not: null },
-            status: { in: ["Staged", "Sent"] },
-            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
-            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
-        },
-        select: {
-            id: true, invoiceId: true, qbInvoiceId: true, code: true,
-            lines: { select: { scheduleId: true } },
-            invoice: { select: { code: true, estimateId: true } },
-        },
-        take: 100,
-    });
+    const billingWhere = {
+        qbInvoiceId: { not: null },
+        status: { in: ["Staged", "Sent"] },
+        ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+        ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
+    };
+    const billingRowCount = await prisma.progressBilling.count({ where: billingWhere });
 
-    if (pending.length === 0 && pendingBillings.length === 0) return result;
-
+    // Tokens FIRST, even with nothing to do. Recording "ok" before proving we
+    // can talk to QuickBooks let a disconnected or expired integration emit a
+    // fresh successful heartbeat every hour, forever — the health check would
+    // read a perfectly alive money rail that could not have synced anything.
     let tokens: QBTokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(routeDeadline);
     } catch (e) {
         result.errors.push(e instanceof Error ? e.message : "QB tokens unavailable");
+        // ANY preflight failure means the run did no work — not connected, the
+        // settings store unreadable, a refresh that failed or timed out. All of
+        // them must record status=error: banking them as "ok" is precisely what
+        // made the digest blind to a dead money rail.
+        const preflight = classifyPreflightFailure(e);
+        result.runFailed = true;
+        result.failureReason = preflight.reason;
+        result.abortedOnQboOutage = preflight.abortedOnQboOutage;
+        // Nothing was checked, so everything we loaded counts as skipped.
+        result.skipped = pendingRowCount + billingRowCount;
+        runState.recorded = true;
+        await recordPaymentsSyncEvent(result, options?.source);
+        return result;
+    }
+
+    const qbo: PaymentsSyncQboClient = options?.qboClient ?? {
+        // Every call is capped by what is LEFT of the run budget, not just by
+        // its own timeout — six legal 20s calls would otherwise still run past
+        // the cron's ceiling.
+        probeInvoice: (qbInvoiceId) => probeQBInvoice(tokens, qbInvoiceId, routeDeadline),
+        getPayment: (paymentId) => getQBPayment(tokens, paymentId, routeDeadline),
+        // CompanyInfo is the cheapest authenticated read in the API.
+        verifyConnection: async () => {
+            await qbQuery(tokens, "SELECT * FROM CompanyInfo", routeDeadline);
+        },
+    };
+
+    // Nothing to sync. Holding tokens is NOT proof the rail works: a
+    // non-timeout refresh failure falls back to the stale pair, and stale
+    // credentials, a wrong realm, or revoked accounting access all still
+    // produce a token object. Without an actual API call this run would record
+    // a fresh "ok" every hour forever while nothing could ever sync. One cheap
+    // authenticated read settles it.
+    if (pendingRowCount === 0 && billingRowCount === 0) {
+        try {
+            await qbo.verifyConnection();
+        } catch (error) {
+            const verdict = classifyPreflightFailure(error);
+            result.runFailed = true;
+            result.failureReason = verdict.reason;
+            result.abortedOnQboOutage = verdict.abortedOnQboOutage;
+            result.errors.push(
+                `QuickBooks connectivity check failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            );
+        }
+        runState.recorded = true;
+        await recordPaymentsSyncEvent(result, options?.source);
         return result;
     }
 
@@ -696,12 +1604,71 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
-    for (const schedule of pending) {
+    // A SCOPED run (the on-view refresh for one invoice or project) is not a
+    // sweep: it looks at a handful of rows the user is staring at. Letting it
+    // read the shared cursor would make it skip the very row it was asked
+    // about, and letting it WRITE one would move the cron's resume point to
+    // wherever that user happened to be looking — silently starving everything
+    // after it. Only the unscoped cron sweep carries cursors.
+    const isSweep = !scope?.invoiceId && !scope?.projectId;
+    const cursorStore = options?.cursorStore ?? automationSettingCursorStore;
+    const milestoneCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones }
+        : undefined;
+    const billingCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings }
+        : undefined;
+
+    const milestoneSelect = {
+        id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
+        invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
+    } as const;
+
+    const runMilestonePass = () => forEachPendingPage(
+        result,
+        routeDeadline,
+        (cursorId, take, stopAfterId) => prisma.paymentSchedule.findMany({
+            where: {
+                ...pendingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
+            select: milestoneSelect,
+            // Stable key: without it Postgres may return the same first page
+            // every run and starve everything behind it.
+            orderBy: { id: "asc" },
+            take,
+        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.paymentSchedule.count({ where: { ...pendingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
+        (page) => runQboRowLoop(page, result, async (schedule) => {
         result.checked++;
-        try {
-            const probe = await probeQBInvoice(tokens, schedule.qbInvoiceId!);
-            // Transient error (token/429/5xx/network) — leave untouched and retry next run.
-            if (probe.state === "error") continue;
+        {
+            const probe = await qbo.probeInvoice(schedule.qbInvoiceId!);
+            if (probe.state === "error") {
+                // A connection-level failure becomes a throw so the shared loop
+                // applies one abort rule to every QBO sub-call in this row.
+                if (probe.connectionFailed) {
+                    throw new QboRetryableError(
+                        `QB invoice probe failed (${probe.timedOut ? "timeout" : `status ${probe.status}`})`,
+                        probe.status,
+                    );
+                }
+                // Any other probe failure leaves this milestone UNVERIFIED. It
+                // used to return silently, so a run that checked nothing could
+                // still finish with zero errors and emit status "ok" — a green
+                // heartbeat for work that never happened. Record it as a row
+                // error (the run becomes "partial") and move on.
+                throw new Error(`QBO invoice probe failed (status ${probe.status})`);
+            }
 
             if (probe.state === "voided" || probe.state === "notFound") {
                 // The QBO invoice is gone/voided: it can never settle. Flag so the UI can
@@ -736,20 +1703,17 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                     }).catch(() => {});
                 }
                 result.errors.push(`${schedule.invoice.code}/${schedule.name}: QBO invoice ${probe.state}`);
-                continue;
+                return;
             }
 
             // probe.state === "ok"
             if (probe.total > 0 && probe.balance <= 0) {
                 // Fully settled in QuickBooks (online payment OR a check Vanessa applied)
                 const paymentId = probe.paymentTxnIds[0] || null;
-                let paidAt = new Date();
-                let referenceNumber: string | null = null;
-                if (paymentId) {
-                    const p = await getQBPayment(tokens, paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p?.referenceNumber || null;
-                }
+                // Same abort rule as the probe: a timeout/401/403/408/429/5xx
+                // inside resolvePaymentDate throws and stops the run rather
+                // than costing another full deadline on every remaining row.
+                const { paidAt, referenceNumber } = await resolveSettlementDate(qbo, paymentId);
                 const recorded = await settleMilestoneFromQBPayment({
                     paymentScheduleId: schedule.id,
                     invoiceId: schedule.invoiceId,
@@ -764,10 +1728,12 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
             } else if (probe.balance < probe.total) {
                 result.partiallyPaid++;
             }
-        } catch (e) {
-            result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
         }
-    }
+    }, (schedule, e) => {
+            result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }, "milestones", routeDeadline, false),
+        milestoneCursor,
+    );
 
     // ── Progress billings ───────────────────────────────────────────────────
     // Same probe → settle shape as the milestone loop above, but claims ONE
@@ -776,32 +1742,89 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
     // (custom/change-order lines were materialized into a real PaymentSchedule
     // at billing-creation time — see createProgressBillingCore — so every line
     // has a scheduleId and settles like any other milestone; no special case).
-    for (const billing of pendingBillings) {
-        try {
-            const probe = await probeQBInvoice(tokens, billing.qbInvoiceId!);
-            if (probe.state === "error") continue; // transient — retry next run
+    const billingSelect = {
+        id: true, invoiceId: true, qbInvoiceId: true, code: true,
+        lines: { select: { scheduleId: true } },
+        invoice: { select: { code: true, estimateId: true } },
+    } as const;
+
+    const runBillingPass = () => forEachPendingPage(
+        result,
+        routeDeadline,
+        (cursorId, take, stopAfterId) => prisma.progressBilling.findMany({
+            where: {
+                ...billingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
+            select: billingSelect,
+            orderBy: { id: "asc" },
+            take,
+        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.progressBilling.count({ where: { ...billingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
+        (page) => runQboRowLoop(page, result, async (billing) => {
+        {
+            const probe = await qbo.probeInvoice(billing.qbInvoiceId!);
+            if (probe.state === "error") {
+                if (probe.connectionFailed) {
+                    throw new QboRetryableError(
+                        `QB invoice probe failed (${probe.timedOut ? "timeout" : `status ${probe.status}`})`,
+                        probe.status,
+                    );
+                }
+                // Same rule as the milestone loop: unverified is not "fine".
+                throw new Error(`QBO invoice probe failed (status ${probe.status})`);
+            }
             if (probe.state === "voided" || probe.state === "notFound") {
                 result.errors.push(`${billing.invoice.code}/${billing.code}: QBO invoice ${probe.state}`);
-                continue;
+                return;
             }
             // probe.state === "ok"
             if (probe.total > 0 && probe.balance <= 0) {
                 const paymentId = probe.paymentTxnIds[0] || null;
-                let paidAt = new Date();
-                let referenceNumber: string | null = null;
-                if (paymentId) {
-                    const p = await getQBPayment(tokens, paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p?.referenceNumber || null;
-                }
+                const { paidAt, referenceNumber } = await resolveSettlementDate(qbo, paymentId);
                 const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });
                 if (settled) result.progressBillingsSettled++;
             } else if (probe.balance < probe.total) {
                 result.partiallyPaid++;
             }
-        } catch (e) {
-            result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
         }
+    }, (billing, e) => {
+            result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }, "progress billings", routeDeadline, false),
+        billingCursor,
+    );
+
+    // Alternate which collection goes first. Whichever runs second only gets
+    // the budget the first one left, so a fixed order lets a busy milestone
+    // queue starve progress billings indefinitely (and vice versa). Flipping
+    // each run guarantees both sides get to go first half the time.
+    //
+    // Sweep-only, for the same reason as the cursors: an on-view refresh must
+    // not rotate the cron's order, or a burst of them could pin the sweep to
+    // one collection.
+    let billingsFirst = false;
+    if (isSweep) {
+        const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
+        billingsFirst = lastOrder !== "billings-first";
+        await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+    }
+
+    if (billingsFirst) {
+        await runBillingPass();
+        await runMilestonePass();
+    } else {
+        await runMilestonePass();
+        await runBillingPass();
     }
 
     if (newlyFlagged.length > 0) {
@@ -809,5 +1832,120 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
         await notifyQBSyncIssues(newlyFlagged);
     }
 
+    runState.recorded = true;
+    await recordPaymentsSyncEvent(result, options?.source);
     return result;
+}
+
+/** Reason recorded when a settlement is refused for want of an authoritative date. */
+export const PAYMENT_DATE_MISSING = "payment-date-missing";
+
+/**
+ * The authoritative payment date, or refuse to settle.
+ *
+ * `paidAt` used to default to `new Date()` and was only replaced when a
+ * txnDate happened to be present, so an invoice with no linked payment id, a
+ * payment carrying a null/garbage txnDate, or an unreadable payment record all
+ * settled REAL milestones stamped with today — wrong money data, and it fires
+ * the mirror/notification side effects on the way out. There is no safe
+ * fallback for "when was this paid": leave the row Pending (the run becomes
+ * partial) and let a later run settle it with a real date.
+ */
+export async function resolveSettlementDate(
+    qbo: PaymentsSyncQboClient,
+    paymentId: string | null,
+): Promise<{ paidAt: Date; referenceNumber: string | null }> {
+    if (!paymentId) {
+        throw new Error(`QBO invoice is fully paid but carries no linked payment; ${PAYMENT_DATE_MISSING}`);
+    }
+    const payment = await qbo.getPayment(paymentId);
+    if (!payment) {
+        throw new Error(`QBO payment ${paymentId} could not be read; ${PAYMENT_DATE_MISSING}`);
+    }
+    if (!payment.txnDate) {
+        throw new Error(`QBO payment ${paymentId} has no TxnDate; ${PAYMENT_DATE_MISSING}`);
+    }
+    const paidAt = new Date(`${payment.txnDate}T12:00:00Z`);
+    if (Number.isNaN(paidAt.getTime())) {
+        throw new Error(`QBO payment ${paymentId} has an unparseable TxnDate "${payment.txnDate}"; ${PAYMENT_DATE_MISSING}`);
+    }
+    return { paidAt, referenceNumber: payment.referenceNumber || null };
+}
+
+/**
+ * Why a run never got off the ground. EVERY branch here is a failed run: the
+ * sync did no work, so recording it as "ok" would tell the digest the money
+ * rail is healthy when it is not. Only the connection-level branch also counts
+ * as an outage (the flag that stops further QBO calls).
+ */
+export function classifyPreflightFailure(error: unknown): { reason: string; abortedOnQboOutage: boolean } {
+    if (isQboConnectionFailure(error)) {
+        return { reason: "qbo-unavailable", abortedOnQboOutage: true };
+    }
+    if (error instanceof QBNotConnectedError || (error instanceof Error && error.name === "QBNotConnectedError")) {
+        return { reason: "quickbooks-not-connected", abortedOnQboOutage: false };
+    }
+    if (error instanceof QBTokenPersistenceError || (error instanceof Error && error.name === "QBTokenPersistenceError")) {
+        return { reason: "token-not-persisted", abortedOnQboOutage: false };
+    }
+    if (isQBTokenStrandedError(error)) {
+        return { reason: "token-rotation-ambiguous", abortedOnQboOutage: false };
+    }
+    // Settings-store read failures, a rejected refresh, anything else.
+    return { reason: "token-fetch-failed", abortedOnQboOutage: false };
+}
+
+/**
+ * The audit status for a finished run.
+ *
+ * "ok" is reserved for a run that actually completed ALL its work. A run that
+ * skipped rows or hit row-level errors did NOT verify those milestones, so
+ * calling it "ok" refreshed the health heartbeat on the strength of work that
+ * never happened — the digest would read green while payments went unchecked.
+ * Those runs are "partial": visible and heartbeat-ineligible, but not counted
+ * as hard errors, so one stubborn row does not read like a QBO outage.
+ */
+export function paymentsSyncRunStatus(result: QBPaymentSyncResult): "ok" | "partial" | "error" {
+    if (result.runFailed) return "error";
+    if (result.skipped > 0 || result.errors.length > 0) return "partial";
+    return "ok";
+}
+
+/** The AutomationEvent kind the payments cron writes once per run. */
+export const QBO_PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+
+/**
+ * One audit row per payments-sync run, so an outage on this rail is VISIBLE.
+ *
+ * Before this, a QBO outage during the payments cron left no trace anywhere a
+ * human or the morning digest would look: the run returned a tidy result object
+ * to a cron log nobody reads. The pipeline health check counts these errors and
+ * reports the last successful run, so a stalled money rail turns the digest red
+ * instead of staying silent. Fire-and-forget, like every other automation
+ * event — the audit row must never fail the sync it describes.
+ */
+async function recordPaymentsSyncEvent(
+    result: Omit<QBPaymentSyncResult, "runFailed"> & { runFailed: boolean },
+    source: SyncQuickBooksPaymentsOptions["source"],
+): Promise<void> {
+    const status = paymentsSyncRunStatus(result);
+    await logAutomationEvent({
+        kind: QBO_PAYMENTS_SYNC_EVENT_KIND,
+        status,
+        reason: result.failureReason ?? (status === "partial" ? "incomplete-run" : undefined),
+        // Only a real cron run may claim to be the heartbeat. An on-view or
+        // manual refresh is recorded under its own source (or none) so it can
+        // never mask an hourly job that has stopped running.
+        source,
+        detail: {
+            runFailed: result.runFailed,
+            errorCount: result.errors.length,
+            checked: result.checked,
+            settled: result.settled,
+            partiallyPaid: result.partiallyPaid,
+            progressBillingsSettled: result.progressBillingsSettled,
+            skipped: result.skipped,
+            errors: result.errors.slice(0, 5),
+        },
+    });
 }

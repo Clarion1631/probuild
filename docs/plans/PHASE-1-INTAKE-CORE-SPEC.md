@@ -1,0 +1,403 @@
+# Phase 1: Intake Core — Implementation Spec
+
+Date: 2026-09-01. Parent plan: `docs/plans/RECEIPT-PIPELINE-V2-PLAN.md` (Phase 1 row).
+Planner output for the executor: build exactly this; do not guess.
+
+**Concurrency note:** another agent is editing `src/lib/quickbooks.ts` and
+`src/app/api/integrations/qbo-receipts/create/route.ts` (adding fetch timeouts). Do NOT
+modify either file. `QBTimeoutError` already exists in `src/lib/quickbooks.ts` (~line 31)
+— import it. Reuse `createQBReceiptPurchase` from `src/lib/qbo-receipt-push.ts` by direct
+import; never copy its logic and never call the HTTP route from the worker.
+
+## Verified code facts
+
+- The one QBO write core is `createQBReceiptPurchase(tokens, input, deps?)` in
+  `src/lib/qbo-receipt-push.ts` (~462). Idempotency = DocNumber `input.fileId.slice(0,21)`
+  + PrivateNote marker `[gtr-file:<fileId>]` + QBO requestid. Result union (~158):
+  `ok:true {qbPurchaseId, alreadyExists}` | `ok:false {reason}`. Terminal error classes:
+  `QboPurchaseFaultError`, `QboAccountConfigError`, `QboVendorDuplicateError`.
+- `Expense` (prisma/schema.prisma:580) REQUIRES `estimateId` (FK, cascade); `qbPurchaseId`
+  is `@unique`; has `costCodeId?`, `receiptUrl?`, `vendor?`, `date?`, `status` default "Pending".
+  No Drive-file-id column on Expense; `AutomationEvent.driveFileId` exists (:2440).
+- v1 ingest precedent: `src/app/api/integrations/receipt-ingest/route.ts` resolves the
+  "primary estimate" as the project's latest (`orderBy createdAt desc, take 1`, line 69) and
+  matches projects/cost codes via `matchProjectByName` / `matchCostCode` (`src/lib/project-match.ts`).
+- Gemini: no shared lib helper; callers hit `generativelanguage.googleapis.com` REST with
+  `GEMINI_API_KEY`. Current working text model is `"gemini-3.5-flash"`
+  (`src/lib/daily-log-task-match.ts:26`). The Apps Script model list
+  (`qbo-clasp/runReceiptAutomation.js:115`) is stale (2.5-era) — do not port it verbatim.
+- Storage: `getSupabase()` + `STORAGE_BUCKET="project-files"` (PUBLIC) in `src/lib/supabase.ts`;
+  `SECURE_BUCKET="secure-docs"` (PRIVATE) + `secure:` ref scheme + `resolveDocUrl()` /
+  `downloadDocBytes()` in `src/lib/secure-storage.ts`. Receipts go in the private bucket.
+- Server-side Drive access exists (`src/lib/lead-drive.ts`) but uses a NextAuth Google OAuth
+  refresh token (user identity), not a service account. No service-account Drive credential
+  exists anywhere in `src/`.
+- Apps Script dedup (`qbo-clasp/runReceiptAutomation.js`): strong key `date|ref` (:1558, built
+  only when the OCR date is valid AND `refLooksReal_` :1581 passes), weak key
+  `canonicalVendor|date|amount|"amt"` (:1598), `VENDOR_ALIASES` (:1609), `sanitize()` (:1478),
+  `cleanMoney()` (:1519), placeholder list (:1578). Gemini prompt: :1099–1133. Tax-split group
+  building: `qbo-clasp/sendToQBOviaAPI.js:129–178`.
+- Mobile auth: `authenticateMobileOrSession(req)` in `src/lib/mobile-auth.ts`. Proxy
+  (`src/proxy.ts`): Bearer passes only for `MOBILE_AUTHENTICATED_ROUTE_PATTERNS`; machine
+  endpoints with their own shared secret use the exact-match public bypass (precedent:
+  `api/office-tasks/ingest`, :47–50). `/api/integrations/*` and `/api/cron/*` are excluded
+  from the proxy matcher entirely (:228).
+- Cron auth convention (fail closed): `src/app/api/cron/drain-notifications/route.ts:15–19`.
+  pgbouncer forbids session advisory locks (`src/lib/review-alert-rollout.ts:8`); use
+  `pg_try_advisory_xact_lock` inside a short claim transaction (pattern:
+  `src/lib/qbo-expense-sync.ts:572`, `src/app/api/automation/sync-now/route.ts`).
+
+## 1. Goals and acceptance criteria
+
+1. **Schema**: `ReceiptIntake` live in prod and in `prisma/migrations/`.
+   Verify: `node scripts/apply-receipt-intake.mjs` twice (second run all "already exists");
+   CI `migrations` job green; `prisma generate` + `npx tsc --noEmit` clean.
+2. **Intake endpoint** `POST /api/receipts/intake` accepts session, mobile Bearer, and
+   `x-receipt-intake-secret`; idempotent on `sourceRef`.
+   Verify: e2e API test posts the same payload twice → same `id`, one DB row; no-auth AND
+   bogus-session-cookie requests both 401 (getclients-auth-gate lesson).
+3. **Reader** `readReceipt()` ports the v3.6 prompt + phase suggestion + `tax_amount` +
+   `doc_type` multi/non_receipt. Verify: node:test with an injected fetch asserts the prompt
+   carries the load-bearing sentences (final-amount rule, never-estimate-tax rule, multi
+   rule) and that responses parse into `ReadResult`.
+4. **Dedup + routing** ports the Apps Script keys faithfully. Verify: fixture table (§9)
+   and `routeState` truth table pass under node:test.
+5. **Booking** creates the QBO Purchase via `createQBReceiptPurchase`, then the `Expense`,
+   sets `qbPurchaseId`; retry queue with backoff. Verify: node:test with injected fake
+   `createPurchase` covers success, terminal fault → NEEDS_REVIEW, `QBTimeoutError` → retry
+   per backoff table; project-without-estimate → NEEDS_REVIEW reason `no-estimate`.
+6. **Cron** `/api/cron/receipt-intake-worker` every 5 min, ≤10 rows/run, non-overlapping.
+   Verify: `vercel.json` entry; claim-query unit test (two sequential claims never return
+   the same row); manual `curl -H "Authorization: Bearer $CRON_SECRET"` on prod returns
+   `{processed, byState}`.
+7. **Dry-run shadow mode** default ON: rows read+dedup+route but never book. Verify: with
+   `RECEIPT_INTAKE_DRYRUN` unset, worker test proves zero `createPurchase` calls and zero
+   Expense rows.
+8. **Build**: `npm run build` 0 errors; Codex review of the money path before merge.
+
+## 2. Schema
+
+Repo convention: `state` is a `String` with a SQL CHECK, not a Prisma enum (matches
+`BankLine.state`, `Expense.status`). Prisma model (add to `prisma/schema.prisma`):
+
+```prisma
+model ReceiptIntake {
+  id        String  @id @default(cuid())
+  source    String  // mobile | email | drive | chat | web
+  sourceRef String  @unique // "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" | "chat:<messageName>:<n>" | "web:<uuid>"
+  state     String  @default("RECEIVED") // RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT
+  dryRun    Boolean @default(true)
+  stateReason String? // no-estimate | multi-doc | zero-total | weak-dup:<id> | strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries | push-disabled | push-paused
+
+  projectId  String?
+  project    Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  costCodeId String?
+  costCode   CostCode? @relation(fields: [costCodeId], references: [id])
+  suggestedCostCodeId String?
+  suggestedConfidence Float?
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  // file (Supabase secure-docs, private)
+  storagePath String  // receipts/intake/<id>.<ext> in SECURE_BUCKET
+  fileName    String?
+  mimeType    String
+  fileSize    Int
+  fileSha256  String
+
+  // read results (cents, like AutomationEvent)
+  vendor     String?
+  txnDate    DateTime? @db.Date
+  totalCents Int?
+  taxCents   Int?
+  docType    String?   // receipt | check | multi | non_receipt
+  refNumber  String?   // cleaned invoice #, or "Check<num>" for checks
+  memo       String?
+  readJson   String?   // raw Gemini JSON, audit only
+  readAt     DateTime?
+
+  // dedup
+  dedupStrongKey String?
+  dedupWeakKey   String?
+  duplicateOfId  String?
+
+  // booking + archive
+  qbPurchaseId       String?
+  expenseId          String?  @unique
+  archiveDriveFileId String?
+  attempts    Int       @default(0)
+  lastError   String?
+  nextRetryAt DateTime?
+  bookedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // NOTE: a partial UNIQUE index on dedupStrongKey (WHERE state NOT IN
+  // ('DUPLICATE','VOID') AND dedupStrongKey IS NOT NULL) exists in SQL only —
+  // Prisma cannot represent partial indexes and silently drops them (CLAUDE.md,
+  // baseline notes). Keep this comment; never regenerate it away.
+  @@index([state, nextRetryAt])
+  @@index([projectId])
+  @@index([dedupWeakKey])
+  @@index([createdAt])
+}
+```
+
+Add back-relations `receiptIntakes ReceiptIntake[]` on `Project`, `CostCode`, `User`.
+
+`scripts/apply-receipt-intake.mjs` (additive, idempotent, `$executeRawUnsafe` over the
+pooler — same shape as prior `scripts/apply-*.mjs`) and byte-identical DDL in
+`prisma/migrations/<ts>_receipt_intake/migration.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
+  "id" TEXT PRIMARY KEY, "source" TEXT NOT NULL, "sourceRef" TEXT NOT NULL,
+  "state" TEXT NOT NULL DEFAULT 'RECEIVED', "dryRun" BOOLEAN NOT NULL DEFAULT true,
+  "stateReason" TEXT, "projectId" TEXT, "costCodeId" TEXT, "suggestedCostCodeId" TEXT,
+  "suggestedConfidence" DOUBLE PRECISION, "createdById" TEXT,
+  "storagePath" TEXT NOT NULL, "fileName" TEXT, "mimeType" TEXT NOT NULL,
+  "fileSize" INTEGER NOT NULL, "fileSha256" TEXT NOT NULL,
+  "vendor" TEXT, "txnDate" DATE, "totalCents" INTEGER, "taxCents" INTEGER,
+  "docType" TEXT, "refNumber" TEXT, "memo" TEXT, "readJson" TEXT, "readAt" TIMESTAMP(3),
+  "dedupStrongKey" TEXT, "dedupWeakKey" TEXT, "duplicateOfId" TEXT,
+  "qbPurchaseId" TEXT, "expenseId" TEXT, "archiveDriveFileId" TEXT,
+  "attempts" INTEGER NOT NULL DEFAULT 0, "lastError" TEXT, "nextRetryAt" TIMESTAMP(3),
+  "bookedAt" TIMESTAMP(3),
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL,
+  CONSTRAINT "ReceiptIntake_state_check" CHECK ("state" IN ('RECEIVED','READ','NEEDS_JOB',
+    'NEEDS_REVIEW','BOOKING','BOOKED','ARCHIVED','DUPLICATE','VOID','NON_RECEIPT'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_dedupStrongKey_active_key"
+  ON "ReceiptIntake"("dedupStrongKey")
+  WHERE "dedupStrongKey" IS NOT NULL AND "state" NOT IN ('DUPLICATE','VOID');
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_state_nextRetryAt_idx" ON "ReceiptIntake"("state","nextRetryAt");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_projectId_idx" ON "ReceiptIntake"("projectId");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_dedupWeakKey_idx" ON "ReceiptIntake"("dedupWeakKey");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("createdAt");
+-- FKs guarded with DO $$ ... IF NOT EXISTS (pg_constraint) blocks, per prior apply scripts:
+--   projectId  -> "Project"(id)  ON DELETE SET NULL
+--   costCodeId -> "CostCode"(id)
+--   createdById-> "User"(id)     ON DELETE SET NULL
+--   expenseId  -> "Expense"(id)  ON DELETE SET NULL
+```
+
+Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
+
+## 3. Endpoint contracts
+
+### POST /api/receipts/intake  (new file `src/app/api/receipts/intake/route.ts`)
+- **Proxy**: add exact-match `/api/receipts/intake` to the public bypass set in
+  `src/proxy.ts` (precedent + comment style of `api/office-tasks/ingest`: machine callers
+  need a clean 401, not a /login redirect; exact match only, no descendants). The handler
+  is then the sole auth boundary and MUST fail closed.
+- **Auth, in order**: (1) `x-receipt-intake-secret` header equals env
+  `RECEIPT_INTAKE_SECRET` — 401 when the env var is unset (never fail open; a NEW secret,
+  not `RECEIPT_INGEST_SECRET`, so v1 and v2 rotate independently); else
+  (2) `authenticateMobileOrSession(req)`; else 401.
+- **Body**: multipart (`file`, `source`, `projectId?`, `costCodeId?`, `sourceRef?`,
+  `threadName?`) or JSON `{fileBase64, mimeType, fileName?, source, sourceRef?, projectId?,
+  costCodeId?, threadName?}`. `source` in mobile|email|drive|chat|web. Machine callers MUST
+  send `sourceRef`; session/Bearer callers get `web:<uuid>` / `mobile:<uuid>` minted
+  server-side. Max 15 MB. Accept pdf/jpeg/png/heic/webp/gif/txt; sniff magic bytes for
+  images the way `receipts/parse` does (route.ts:37).
+- **Behavior**: sha256 the bytes; create the row (catch P2002 on `sourceRef` and return the
+  existing row with `{ok:true, alreadyReceived:true}`); upload to `SECURE_BUCKET` at
+  `receipts/intake/<id>.<ext>`; state RECEIVED; `dryRun` = (env `RECEIPT_INTAKE_DRYRUN`
+  is not "false"). When a session/Bearer user supplies `projectId`, check
+  `userCanAccessProject` and set `createdById`. Return 200 with the serialized row
+  (id, state, sourceRef, projectId). No Gemini call here — sub-second, fire-and-forget safe.
+- Deterministic bad input (missing file, bad source, oversize, bad mime) → 400 JSON.
+
+### GET /api/receipts/intake?state=&projectId=&take=  (same route file)
+- Staff only: session or Bearer user with role ADMIN | MANAGER | FINANCE, else 403 (proxy
+  bypass means the handler enforces this itself).
+- Rows newest-first (`take` max 200, default 50), fields = the row minus `readJson`. Keep
+  the select in one exported function (mirroring `src/app/automation/register-data.ts`
+  style) so the Phase 2 `/automation` Receipts tab reuses it unchanged.
+
+### POST /api/receipts/intake/[id]/archived  (secret-auth only)
+- Body `{driveFileId}`. Sets `archiveDriveFileId`, state BOOKED → ARCHIVED. Used by the
+  nightly Apps Script mirror (§6). 404 for unknown id; 409 if state is not BOOKED.
+
+## 4. Worker library — `src/lib/receipt-intake/*.ts` (pure core, I/O at the edges)
+
+- **`keys.ts`** (pure; port verbatim from `runReceiptAutomation.js`): `sanitize` (:1478),
+  `cleanMoney` (:1519), `normalizeDateStr`/`isValidDate`, `refLooksReal` (:1581 with the
+  :1578 placeholder list verbatim), `VENDOR_ALIASES` (:1609 verbatim), `canonicalVendor`
+  (:1615), and `dedupKeys(read) -> {strong: string|null, weak: string}`:
+  - strong = `dateStr + "|" + ref.toLowerCase()` ONLY when the date was read off the
+    document and is valid AND the ref passes `refLooksReal` (checks test `checkNum` and use
+    `"Check"+checkNum`; receipts use the cleaned invoice; `NoInv` / `CheckNoNum` give
+    null). Vendor and amount stay OUT of the key — v3.6 rationale at :1545–1557.
+  - weak = `canonicalVendor(vendor) + "|" + dateStr + "|" + amount + "|amt"` where amount
+    is the `cleanMoney` 2-dp string; built for EVERY document.
+  - Fallback date when unreadable = the intake row's `createdAt` date (v1 used the Drive
+    upload date — same semantic).
+- **`read.ts`**: `readReceipt(fileBytes, mime, projectPhases) -> ReadResult`. REST to
+  `generativelanguage.googleapis.com/v1beta/models/<m>:generateContent` with
+  `responseMimeType "application/json"`; models `["gemini-3.5-flash",
+  "gemini-flash-latest"]` with the Apps Script retry discipline: 429/503 backs off up to 5
+  tries then falls to the next model; 404 falls to the next model; a decisive failure
+  (valid HTTP, unusable JSON) returns `{decisive:true}` so callers never burn retries on a
+  hopeless document (:1143–1184 rationale). Prompt = :1099–1133 VERBATIM (A/B/C roles,
+  multi rule, final-amount-paid rule, tax never-estimate rule, empty-string-for-unreadable
+  rule), plus ONE appended section: the project's active cost codes as a phase list
+  (code — name per line) and one extra output field `"suggested_phase"` restricted to that
+  list or empty. The v1 extraction fields must stay byte-identical.
+  `ReadResult = {docType, vendor, date, invoice, checkNumber, memo, totalAmount, taxAmount,
+  suggestedPhaseCode, raw}`. `text/plain` files go in as a text part (v1 :1093).
+- **`route-state.ts`** (pure): `routeState(read, dedupHits, hasProject)`:
+  | condition (first match wins) | state |
+  |---|---|
+  | docType "multi" | NEEDS_REVIEW `multi-doc` |
+  | docType "non_receipt" | NON_RECEIPT |
+  | total "0.00" (unreadable-total rule, :531) | NEEDS_REVIEW `zero-total` |
+  | no projectId | NEEDS_JOB |
+  | strong hit, same totalCents | DUPLICATE (+`duplicateOfId`) |
+  | strong hit, different total | NEEDS_REVIEW `strong-dup-amount-mismatch:<id>` |
+  | weak hit (another live row, different id) | NEEDS_REVIEW `weak-dup:<id>` |
+  | otherwise | READ |
+  The strong-key CLAIM is the partial unique index: the read step UPDATEs the row with its
+  keys and treats a unique violation as the hit signal, then loads the owner row to compare
+  totals — the database replaces the Apps Script Properties lock. Weak hits are a plain
+  query (same `dedupWeakKey`, different id, state not in DUPLICATE/VOID/NON_RECEIPT) and
+  always route to a human (:1591–1596).
+- **`book.ts`**: `bookReceipt(row)`:
+  1. Guards: `QBO_RECEIPT_PUSH_ENABLED === "true"` and not
+     `isPaused(PAUSE_KEYS.receiptPush)` — the same two switches the qbo-receipts/create
+     route checks. Off/paused: stay BOOKING, `stateReason` push-disabled|push-paused,
+     `nextRetryAt` +1h, attempts NOT incremented.
+  2. Estimate = project's latest (`orderBy createdAt desc, take 1`, the receipt-ingest
+     rule); none: NEEDS_REVIEW `no-estimate` (terminal, no attempt spent).
+  3. Groups (port `sendToQBOviaAPI.js:129–178`): docType receipt, job project, and
+     `0 < taxCents < totalCents` gives two groups
+     `[{category:"Receipt (pre-tax)", amount:(total-tax)/100},
+       {category:"Sales tax", amount:tax/100, tax:true}]`; otherwise one full-total group.
+     Checks never split tax (:148).
+  4. `createQBReceiptPurchase(await getFreshQBTokens(), input)` with `fileId` = the Drive
+     fileId when source=drive (keeps DocNumber idempotency continuous with any v1 booking
+     of the same file), else the intake `id`; `fileBase64` via
+     `downloadDocBytes(storagePath)`; `projectName` = project.name.
+  5. On `ok:true`, one transaction: create `Expense` (estimateId; costCodeId = chosen, else
+     `matchCostCode(suggestedPhaseCode)`; amount = pre-tax amount when tax was split, else
+     total — mirrors the QBO COGS line; vendor; date=txnDate; status "Pending"; receiptUrl
+     = Drive view URL when a Drive fileId is known, else the `secure:` ref; qbPurchaseId)
+     and set the row BOOKED {qbPurchaseId, expenseId, bookedAt}. Also log one
+     `AutomationEvent {kind:"receipt-push", source:"intake-worker"}` so the /automation
+     register keeps seeing v2 bookings. `alreadyExists:true` results book the same way
+     (idempotent re-drive after a lost response).
+  6. Failure classification: `QboPurchaseFaultError` / `QboAccountConfigError` /
+     `QboVendorDuplicateError` / any `result.ok:false` reason are TERMINAL: NEEDS_REVIEW
+     with the reason (4xx class, never retried). `QBTimeoutError`, `QBNotConnectedError`,
+     network/fetch errors, QBO 429/5xx, DB errors are RETRYABLE: attempts+1, lastError,
+     `nextRetryAt = now + backoff(attempts)`; backoff = attempts 1 gives 5m, 2 gives 15m,
+     3 gives 1h, 4+ gives 6h; attempts > 20: NEEDS_REVIEW `max-retries`.
+
+## 5. Cron — `src/app/api/cron/receipt-intake-worker/route.ts`
+
+- `vercel.json`: `{"path": "/api/cron/receipt-intake-worker", "schedule": "*/5 * * * *"}`.
+- `export const maxDuration = 60; export const dynamic = "force-dynamic";` Auth = the
+  fail-closed drain-notifications pattern (Bearer CRON_SECRET; 401 when unset on Vercel).
+- Claim step (overlap safety under pgbouncer — session advisory locks are unusable, see
+  review-alert-rollout.ts:8): one SHORT transaction:
+  `SELECT pg_try_advisory_xact_lock(hashtextextended('receipt-intake-worker', 0))` — if
+  false, return `{skipped:"already-running"}`; else select up to 10 ids where
+  `state IN ('RECEIVED','READ','BOOKING') AND (nextRetryAt IS NULL OR nextRetryAt <= now())`
+  ordered by createdAt, and UPDATE their `nextRetryAt = now() + interval '10 minutes'`
+  (the claim). Process OUTSIDE the transaction: RECEIVED rows get read+dedup+route (dry-run
+  rows park at READ / NEEDS_* / DUPLICATE); READ rows with `dryRun=false` move to BOOKING;
+  BOOKING rows get `bookReceipt`. If two runs ever interleave anyway, the bumped
+  `nextRetryAt` keeps each row single-claimed and QBO DocNumber idempotency backstops the
+  booking itself.
+
+## 6. Archive decision
+
+**Recommendation: (b) Supabase-only now + nightly Apps Script mirror.** Reasons: (1) no
+service account or Drive-writer credential exists in ProBuild — option (a) needs Justin to
+provision one and share `Processed Receipts/` with it (a Workspace-admin human step);
+(2) the Apps Script project already owns working Drive auth and the archive-naming code —
+a ~50-line `mirrorBookedReceipts()` (Apps Script PR) polls
+`GET /api/receipts/intake?state=BOOKED` with the shared secret, downloads each file via a
+short-lived signed URL, writes `Processed Receipts/YYYY/MM/` with the v1 filename
+convention `<Project>_<date>_<vendor>_<ref>_$<total>.<ext>` (keys.ts sanitize rules), then
+POSTs `/api/receipts/intake/<id>/archived {driveFileId}`; (3) Drive stays the archive
+Marge uses, byte-identical to today. Cost: the archive copy lags up to a day — acceptable
+because job cost (`Expense`) and QBO no longer wait on it. Revisit a native Drive copy in
+Phase 6 if the mirror proves flaky.
+
+## 7. Forwarder contracts (Apps Script side — separate PR in qbo-clasp, spec only)
+
+All gated on Script Property `V2_FORWARD === "true"`; all send `x-receipt-intake-secret`.
+- `runReceiptAutomation`: on picking up a job-folder file, POST JSON
+  `{source:"drive", sourceRef:"drive:"+fileId, projectId: resolved from the folder name,
+  fileBase64, mimeType, fileName}`.
+- `pullReceiptEmails`: `{source:"email", sourceRef:"email:"+messageId+":"+sha16(bytes), ...}`.
+- `sweepChatReceipts`: `{source:"chat", sourceRef:"chat:"+messageName+":"+idx, threadName, ...}`.
+- Non-200: leave the file in place and retry next run (intake idempotency makes replays safe).
+- Shadow-week wrinkle: during shadow the forwarder COPIES bytes to intake and leaves the
+  original for v1 to process as usual. The move-to-`_Forwarded` branch (which hides the
+  file from v1) activates only under a second property `V2_LIVE === "true"` at cutover.
+
+## 8. Shadow-week gate
+
+- `RECEIPT_INTAKE_DRYRUN` unset/true: every row gets `dryRun=true` — reader, dedup, and
+  routing all run; booking never does (goal 7 test proves it). No QBO write, no Expense.
+- Daily comparison (checker or scratchpad script): v1 truth = that day's files in
+  `Processed Receipts/YYYY/MM/` (filenames encode project/date/vendor/ref/total) vs
+  `SELECT "sourceRef", vendor, "txnDate", "totalCents", "refNumber", state
+   FROM "ReceiptIntake" WHERE "createdAt" >= <day>`. Match on the weak-key triple
+  (canonicalVendor, date, amount).
+- Gate to call Phase 1 done: 5 consecutive days where every archived v1 file has a v2 row
+  agreeing on vendor/date/total with state READ (or DUPLICATE when v1 also quarantined),
+  and zero v2 rows stuck in RECEIVED for more than an hour.
+- Cutover (Justin's explicit call): set `RECEIPT_INTAKE_DRYRUN=false` and `V2_LIVE=true`.
+
+## 9. Tests (node:test in `test/receipt-intake/*.test.mjs`; NO mock.module — CI is Node 20)
+
+- `keys.test.mjs` — fixtures from real August archive filenames
+  (I:\My Drive\Expenses\Processed Receipts\2026\August); expected keys per the ported rules:
+  | file (project_date_vendor_ref_$total) | strong | weak |
+  |---|---|---|
+  | Berg_ADU_2026-08-03_Lowes_82766_$364.98 | 2026-08-03(pipe)82766 | lowes(pipe)2026-08-03(pipe)364.98(pipe)amt |
+  | Berg_ADU_2026-08-03_Lowes_Home_Improvement_99908_$277.19 | 2026-08-03(pipe)99908 | lowes(pipe)...(pipe)277.19(pipe)amt — alias collapses the vendor variants |
+  | Berg_ADU_2026-08-04_WINLOCK_HARDWARE_12_$14.50 | null (ref "12" under 3 chars) | winlockhardware(pipe)2026-08-04(pipe)14.50(pipe)amt |
+  | Berg_ADU_2026-08-04_WINLOCK_HARDWARE_4_$16.17 | null | winlockhardware(pipe)2026-08-04(pipe)16.17(pipe)amt |
+  | Berg_ADU_2026-08-07_CRC_-_WEST_VAN_260807091421373F2A9_$91.50 | 2026-08-07(pipe)260807091421373f2a9 | assert actual canonicalVendor output for a non-alias vendor |
+  | Berg_ADU_2026-08-09_Amazon.com_113-9992333-7801840_$248.27 | 2026-08-09(pipe)113-9992333-7801840 | amazon(pipe)...(pipe)248.27(pipe)amt |
+  | Berg_ADU_2026-08-10_Grover_Electric_Plumbing_Supply_NoInv_$22.57 | null (NoInv) | groverelectricplumbingsupply(pipe)...(pipe)22.57(pipe)amt |
+  | Berg_ADU_2026-08-14_LOWES_HOME_CENTERS_LLC_58302_$304.23 | 2026-08-14(pipe)58302 | lowes(pipe)2026-08-14(pipe)304.23(pipe)amt |
+  Plus placeholder-ref cases: "NA 000" null, "0000" null, "INV-95870" real (:1571–1580).
+- `route-state.test.mjs` — the full section-4 truth table (multi, non_receipt, zero-total,
+  no-project, strong-same, strong-diff, weak, clean).
+- `backoff.test.mjs` — attempts 1..4 give [5m,15m,1h,6h], 10 gives 6h, 21 gives
+  NEEDS_REVIEW max-retries; QBTimeoutError classed retryable; QboPurchaseFaultError terminal.
+- `book.test.mjs` — dependency-injected `createPurchase`/prisma-shaped stubs (function
+  injection, never module mocks): success creates the Expense with the correct amount and
+  tax split; no-estimate short-circuits without an attempt; disabled/paused spends no attempt.
+- e2e (Playwright, CI postgres): `e2e/receipt-intake.spec.ts` — idempotent POST (same
+  sourceRef twice, one row, same id), 401 matrix (no auth, bogus session cookie, wrong
+  secret, secret-env-unset), GET requires a staff role. Teardown deletes created rows
+  (docs/TESTING.md rule).
+
+## 10. Risks and open questions for Justin (max 5)
+
+1. **Public-bypass route**: `/api/receipts/intake` bypasses the proxy, so the handler is
+   the only gate. Mitigated by the fail-closed secret check + the 401 e2e matrix; Codex
+   must review the auth block specifically. (Risk to watch, no decision needed.)
+2. **Expense.amount = pre-tax when tax is split** (mirrors the QBO COGS line under the
+   reseller-permit rule in sendToQBOviaAPI.js). Confirm pre-tax is the job-cost number you
+   want feeding variance reports.
+3. **Archive via nightly Apps Script mirror** (§6) instead of a Drive service account —
+   confirm, or provision a service account now if same-hour archiving matters to Marge.
+4. **HEIC**: stored and read fine (Gemini accepts image/heic), but the Phase 2 queue page
+   cannot preview HEIC natively in most browsers. OK to defer conversion?
+5. **Non-Drive booking identity** uses the intake cuid as the QBO DocNumber (21-char
+   slice). A truncation collision is backstopped by the PrivateNote marker check in
+   `createQBReceiptPurchase` (it fails as docnumber-conflict rather than mis-attaching).
+   Accepting that; flag if you want a dedicated short id instead.
+
+HUMAN DECISION REQUIRED only before cutover (questions 2–3); the build and the shadow week
+can start under the recommendations above.

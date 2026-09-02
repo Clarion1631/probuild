@@ -8,11 +8,23 @@ import { toNum } from "@/lib/prisma-helpers";
 import { recordPaymentCore } from "@/lib/payment-record-core";
 import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
-import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
+import {
+    buildQBPaymentRequest,
+    sendQBPaymentCreateRequest,
+    createRouteDeadline,
+    type QBTokens,
+    type RouteDeadline,
+} from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+// 60, not 30: this route does real QBO work (token refresh, invoice read,
+// payment create) and 30s left no headroom for the serial sequence. The
+// DEPOSIT_INGEST_BUDGET_MS below is what actually stops it running long —
+// the ceiling is only the backstop behind it.
+export const maxDuration = 60;
+/** Whole-request budget, under the 60s ceiling. */
+export const DEPOSIT_INGEST_BUDGET_MS = 50_000;
 
 /**
  * Deposit auto-apply pipeline (Phase B1). The GTR receipt bot classifies an
@@ -105,6 +117,11 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
     const unauthorized = requireDepositIngestAuth(req);
     if (unauthorized) return unauthorized;
+
+    // Started HERE, before the matching and DB work: those run on the same
+    // 60s ceiling as the QBO calls that follow, so a budget created later let
+    // everything ahead of it spend the ceiling for free.
+    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
 
     let raw: Record<string, unknown>;
     try {
@@ -292,8 +309,8 @@ export async function POST(req: Request) {
 
     try {
         if (row.status === "qbo_created") return await resumeFromQboCreated(row);
-        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row);
-        return await matchAndApply(row, payload);
+        if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row, deadline);
+        return await matchAndApply(row, payload, deadline);
     } catch (e: any) {
         // Any exception that escapes this far is, by construction, one the QBO-crossing
         // steps (send, settle) didn't already handle internally — but re-read the row's
@@ -347,7 +364,7 @@ function requireDepositIngestAuth(req: Request): NextResponse | null {
 
 // ── Matching + apply ─────────────────────────────────────────────────────────
 
-async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Promise<NextResponse> {
+async function matchAndApply(row: DepositIngest, payload: NormalizedPayload, deadline: RouteDeadline): Promise<NextResponse> {
     let schedule: MatchedSchedule | null = null;
 
     if (row.paymentScheduleId) {
@@ -432,7 +449,7 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
     }
 
     return schedule.qbInvoiceId
-        ? await applyQboLinked(row, schedule, payload)
+        ? await applyQboLinked(row, schedule, payload, deadline)
         : await applyNonQbo(row, schedule, payload);
 }
 
@@ -474,14 +491,19 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
     return NextResponse.json({ ok: true, status: "applied", scheduleId: schedule.id, invoiceCode: schedule.invoiceCode });
 }
 
-async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
-    const tokens = await getFreshQBTokens(); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
+async function applyQboLinked(
+    row: DepositIngest,
+    schedule: MatchedSchedule,
+    payload: NormalizedPayload,
+    deadline: RouteDeadline,
+): Promise<NextResponse> {
+    const tokens = await getFreshQBTokens(deadline); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
 
     const built = await buildQBPaymentRequest(tokens, schedule.qbInvoiceId!, {
         amount: payload.amount,
         txnDate: payload.checkDate!,
         paymentRefNum: payload.checkNumber!,
-    });
+    }, deadline);
     if (!built.ok) {
         throw new Error(`QuickBooks guard failed (${built.reason}) for invoice ${schedule.invoiceCode}`);
     }
@@ -494,19 +516,21 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
     });
 
     const requestId = depositRequestId(payload.fileId);
+    // Same budget as the refresh and the invoice read above: the send is the
+    // third serial QBO call in this request, and it is the one that moves money.
     return await sendAndSettle(row.id, schedule, {
         checkDate: payload.checkDate!, checkNumber: payload.checkNumber!, requestId, requestBody: built.requestBody,
-    }, tokens);
+    }, tokens, deadline);
 }
 
-async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
+async function resumeFromQboUnknown(row: DepositIngest, deadline: RouteDeadline): Promise<NextResponse> {
     const schedule = await loadMatchedSchedule(row.paymentScheduleId!);
     if (!schedule) return await finalizeReconcile(row, "reserved milestone no longer exists", {});
     const extracted = JSON.parse(row.extracted) as NormalizedPayload;
 
     let tokens: QBTokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(deadline);
     } catch (e: any) {
         // Stay qbo_unknown — a brief QB outage doesn't downgrade the state (the
         // original send may or may not have gone through).
@@ -520,7 +544,7 @@ async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
     const requestId = depositRequestId(extracted.fileId);
     return await sendAndSettle(row.id, schedule, {
         checkDate: extracted.checkDate!, checkNumber: extracted.checkNumber!, requestId, requestBody: row.qbRequestPayload!,
-    }, tokens);
+    }, tokens, deadline);
 }
 
 async function resumeFromQboCreated(row: DepositIngest): Promise<NextResponse> {
@@ -537,10 +561,11 @@ async function sendAndSettle(
     schedule: MatchedSchedule,
     ctx: { checkDate: string; checkNumber: string; requestId: string; requestBody: string },
     tokens: QBTokens,
+    deadline?: RouteDeadline,
 ): Promise<NextResponse> {
     let paymentId: string;
     try {
-        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId);
+        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId, deadline);
         paymentId = sent.paymentId;
     } catch (e: any) {
         // Response lost/timed out — stay qbo_unknown. The row already holds the exact

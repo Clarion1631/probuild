@@ -5,7 +5,7 @@
 // receiptUrl is ProBuild-owned metadata: this module only ever fills an EMPTY
 // receiptUrl (guarded update), so a manually uploaded receipt is never
 // overwritten by a later sync run.
-import { getQBPurchaseAttachables, type QBTokens } from "./quickbooks";
+import { getQBPurchaseAttachables, qbTimedFetch, qboResponseError, type QBTokens, type RouteDeadline } from "./quickbooks";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { prisma } from "./prisma";
 
@@ -17,11 +17,26 @@ export type QboReceiptAttachResult =
     | "no-expense"
     | "already-linked"
     | "no-attachment"
+    /**
+     * QBO HAD a usable-looking attachment for this purchase and we still could
+     * not store it — no download URL on the candidate, or a body that came back
+     * empty/oversized. Distinct from "no-attachment" (QuickBooks simply has no
+     * receipt here, which is the normal case for most purchases and is not a
+     * failure) so a run can report the difference instead of counting every
+     * receipt-less purchase as broken.
+     */
+    | "attachment-unavailable"
     | "storage-unavailable";
+
+/** Outcomes that mean a receipt SHOULD have been stored and was not. */
+export function isAttachmentFailure(result: QboReceiptAttachResult): boolean {
+    return result === "attachment-unavailable" || result === "storage-unavailable";
+}
 
 export async function attachQboReceipt(
     tokens: QBTokens,
     qbPurchaseId: string,
+    deadline?: RouteDeadline,
 ): Promise<QboReceiptAttachResult> {
     const expense = await prisma.expense.findUnique({
         where: { qbPurchaseId },
@@ -33,7 +48,7 @@ export async function attachQboReceipt(
     const supabase = getSupabase();
     if (!supabase) return "storage-unavailable";
 
-    const attachables = await getQBPurchaseAttachables(tokens, qbPurchaseId);
+    const attachables = await getQBPurchaseAttachables(tokens, qbPurchaseId, deadline);
     const candidates = attachables
         .filter(a => a.TempDownloadUri && ALLOWED_CONTENT.test(a.ContentType ?? ""))
         .filter(a => (a.Size ?? 0) <= MAX_ATTACHMENT_BYTES)
@@ -46,15 +61,32 @@ export async function attachQboReceipt(
             return (right.Size ?? 0) - (left.Size ?? 0);
         });
     const attachment = candidates[0];
-    if (!attachment?.TempDownloadUri) return "no-attachment";
+    if (!attachment) {
+        // Nothing usable. Distinguish "QuickBooks has no receipt here" (the
+        // normal case for most purchases, not a failure) from "QuickBooks HAS
+        // attachments and we could not get at any of them" — the latter is a
+        // receipt that should exist in ProBuild and does not.
+        return attachables.length > 0 ? "attachment-unavailable" : "no-attachment";
+    }
+    // A candidate that survived the filters but carries no download URL is an
+    // anomaly, not an absence: there IS a receipt and we cannot fetch it.
+    if (!attachment.TempDownloadUri) return "attachment-unavailable";
 
-    const download = await fetch(attachment.TempDownloadUri);
+    // QBO-issued temp URL: same unbounded-hang risk as the API itself, and the
+    // same run budget — a slow download is still time the sync cannot spend.
+    const download = await qbTimedFetch(attachment.TempDownloadUri, { qbDeadline: deadline });
     if (!download.ok) {
-        throw new Error(`QBO attachment download failed: HTTP ${download.status}`);
+        // A bare Error made a 503 on the download indistinguishable from a 404,
+        // so the sync could not tell "this file is gone" from "QBO is down" and
+        // kept grinding through the rest of the run either way. Classify it at
+        // the boundary like every other QBO response: 408/429/5xx become
+        // QboRetryableError and stop the remaining attachment work.
+        throw await qboResponseError(download, `QBO attachment download for purchase ${qbPurchaseId}`);
     }
     const bytes = Buffer.from(await download.arrayBuffer());
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_ATTACHMENT_BYTES) {
-        return "no-attachment";
+        // The file exists in QBO but what came back is unusable.
+        return "attachment-unavailable";
     }
 
     const safeName = (attachment.FileName ?? "receipt").replace(/[^a-zA-Z0-9._-]/g, "_");

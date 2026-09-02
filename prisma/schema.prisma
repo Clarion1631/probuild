@@ -697,6 +697,17 @@ model PaymentSchedule {
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
   qbInvoiceId     String?
+  /// Per-issuance idempotency seed for the QuickBooks invoice send. Minted
+  /// before the first QBO call and cleared on unlink, so a RETRY reuses it
+  /// (Intuit returns the original invoice) while a RE-ISSUE mints a new one
+  /// and gets a genuinely new invoice. Keying on the row id could not tell
+  /// those apart.
+  qbIssuanceKey   String?
+  /// sha256 of the canonical billing payload this issuance was created from.
+  /// An ambiguous retry compares it: same key + same hash means "this is the
+  /// same bill, reuse the invoice"; same key + different hash means the
+  /// milestone changed under us and the returned invoice must not be linked.
+  qbIssuancePayloadHash String?
   qbInvoiceLink   String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId     String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt      DateTime?
@@ -793,6 +804,17 @@ model ProgressBilling {
   taxAmount       Decimal               @default(0)
   total           Decimal               @default(0) // subtotal + taxAmount
   qbInvoiceId     String?
+  /// Per-issuance idempotency seed for the QuickBooks invoice send. Minted
+  /// before the first QBO call and cleared on unlink, so a RETRY reuses it
+  /// (Intuit returns the original invoice) while a RE-ISSUE mints a new one
+  /// and gets a genuinely new invoice. Keying on the row id could not tell
+  /// those apart.
+  qbIssuanceKey   String?
+  /// sha256 of the canonical billing payload this issuance was created from.
+  /// An ambiguous retry compares it: same key + same hash means "this is the
+  /// same bill, reuse the invoice"; same key + different hash means the
+  /// milestone changed under us and the returned invoice must not be linked.
+  qbIssuancePayloadHash String?
   qbInvoiceLink   String?
   qbInvoiceSentAt DateTime?
   qbPaymentId     String?

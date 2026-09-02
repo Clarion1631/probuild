@@ -2414,8 +2414,9 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     const deposit = pendingMilestones[0] || null;
     if (deposit) {
         try {
-            const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            const { pushMilestoneToQuickBooks, MILESTONE_PUSH_BUDGET_MS } = await import("./quickbooks-payments");
+            const { createRouteDeadline } = await import("./quickbooks");
+            const pushed = await pushMilestoneToQuickBooks(deposit.id, undefined, createRouteDeadline(MILESTONE_PUSH_BUDGET_MS));
             payLink = pushed.payLink;
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
@@ -3737,8 +3738,9 @@ export async function updateMonthlyOverhead(amount: number) {
 export async function createQBPaymentLink(paymentId: string) {
     await assertInvoicePermission();
     try {
-        const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-        const res = await pushMilestoneToQuickBooks(paymentId);
+        const { pushMilestoneToQuickBooks, MILESTONE_PUSH_BUDGET_MS } = await import("./quickbooks-payments");
+        const { createRouteDeadline } = await import("./quickbooks");
+        const res = await pushMilestoneToQuickBooks(paymentId, undefined, createRouteDeadline(MILESTONE_PUSH_BUDGET_MS));
         const schedule = await prisma.paymentSchedule.findUnique({
             where: { id: paymentId },
             select: { invoiceId: true, invoice: { select: { projectId: true } } },
@@ -3756,7 +3758,7 @@ export async function createQBPaymentLink(paymentId: string) {
 export async function refreshQBPayments(invoiceId: string) {
     await assertInvoicePermission();
     const { syncQuickBooksPayments } = await import("./quickbooks-payments");
-    const result = await syncQuickBooksPayments({ invoiceId });
+    const result = await syncQuickBooksPayments({ invoiceId }, { source: "view" });
     if (result.settled > 0) {
         const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
         if (inv) {
@@ -3781,7 +3783,6 @@ export async function refreshQBPayments(invoiceId: string) {
  */
 export async function breakQBInvoiceLink(
     paymentId: string,
-    opts?: { deleteInQBO?: boolean },
 ): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
     await assertInvoicePermission();
 
@@ -3803,6 +3804,52 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
+    // Remote state FIRST, local clear second.
+    //
+    // The old order cleared the link and then optionally (default OFF) tried a
+    // delete, so the normal path left a live, collectible invoice in
+    // QuickBooks that ProBuild no longer knew about — the client could still
+    // pay it, and nothing in ProBuild would ever reconcile it. Unlinking is
+    // only safe once the remote invoice is provably gone.
+    const { getFreshQBTokens, QBRemoteStateUnknownError } = await import("./quickbooks-payments");
+    const { readQBInvoice, deleteQBInvoice, createRouteDeadline, isQboConnectionFailure } =
+        await import("./quickbooks");
+
+    const deadline = createRouteDeadline(30_000);
+    let remoteGone: boolean;
+    try {
+        const tokens = await getFreshQBTokens(deadline);
+        // 404 -> null: already gone, nothing to delete.
+        const existing = await readQBInvoice(tokens, schedule.qbInvoiceId, deadline);
+        if (!existing) {
+            remoteGone = true;
+        } else if (existing.total === 0 && existing.balance === 0) {
+            // Voided in QuickBooks: it can never be collected, so it is safe
+            // to unlink without deleting the audit record.
+            remoteGone = true;
+        } else {
+            remoteGone = await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);
+        }
+    } catch (error) {
+        if (error instanceof QBRemoteStateUnknownError || isQboConnectionFailure(error)) {
+            return {
+                success: false,
+                error: "QuickBooks could not be reached to confirm this invoice, so nothing was changed. Try again once QuickBooks responds.",
+            };
+        }
+        return {
+            success: false,
+            error: `QuickBooks could not confirm this invoice (${error instanceof Error ? error.message : "unknown error"}); nothing was changed.`,
+        };
+    }
+
+    if (!remoteGone) {
+        return {
+            success: false,
+            error: "The QuickBooks invoice could not be deleted (it may have a linked payment). Resolve it in QuickBooks first — ProBuild was not changed.",
+        };
+    }
+
     // Claim the unlink atomically via the shared helper (also used by
     // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
     const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
@@ -3811,20 +3858,7 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
 
-    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
-    // Default OFF — we never issue a destructive QBO write unless asked.
-    let warning: string | undefined;
-    if (opts?.deleteInQBO === true) {
-        try {
-            const { getFreshQBTokens } = await import("./quickbooks-payments");
-            const { deleteQBInvoice } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
-            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
-        } catch {
-            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
-        }
-    }
+    const warning: string | undefined = undefined;
 
     revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
     revalidatePath(`/invoices`);
