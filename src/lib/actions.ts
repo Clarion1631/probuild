@@ -15204,22 +15204,25 @@ class StaleReceiptIntakeError extends Error {
 }
 
 /**
- * The worker's lease, expressed as a where-clause.
+ * The worker's OWNERSHIP, expressed as a where-clause.
  *
- * The 5-minute worker CLAIMS a row by pushing `nextRetryAt` into the future
- * (CLAIM_LEASE_MINUTES, receipt-intake/worker.ts). A row inside that window is
- * being processed RIGHT NOW — possibly already downloading the file for a
- * QuickBooks send — and a human write against it is a race we lose silently.
- * `nextRetryAt` null or in the past means nobody holds it.
+ * The 5-minute worker claims a row by writing `claimToken` + `claimedAt`. That
+ * is ownership. `nextRetryAt` is SCHEDULING — when the worker should next look
+ * at the row — and fencing on it (the previous shape) conflated the two: a row
+ * merely waiting out its retry backoff could not be voided, while a row
+ * genuinely mid-send looked free the instant its backoff elapsed.
  *
- * This fails CLOSED: a row in retry backoff also carries a future
- * `nextRetryAt`, so an action against it is refused too. That is the right
- * trade — the user gets a "try again in a minute" they can act on instead of an
- * edit that may or may not have survived. The worker's own state CAS is the
- * second line of defence, not a substitute for this one.
+ * A claim older than the lease belongs to a run that died and is not honoured.
  */
+const WORKER_CLAIM_LEASE_MS = 10 * 60_000;
+
 function notClaimedByWorker(now: Date): Prisma.ReceiptIntakeWhereInput {
-    return { OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }] };
+    return {
+        OR: [
+            { claimedAt: null },
+            { claimedAt: { lt: new Date(now.getTime() - WORKER_CLAIM_LEASE_MS) } },
+        ],
+    };
 }
 
 const WORKER_BUSY_MESSAGE = "The pipeline is working on this receipt right now — try again in a minute.";
@@ -15232,10 +15235,12 @@ const WORKER_BUSY_MESSAGE = "The pipeline is working on this receipt right now �
 async function receiptIntakeWriteFailure(id: string, allowedStates: readonly string[], now: Date): Promise<never> {
     const current = await prisma.receiptIntake.findUnique({
         where: { id },
-        select: { state: true, nextRetryAt: true },
+        select: { state: true, claimedAt: true },
     });
     if (!current) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
-    if (allowedStates.includes(current.state) && current.nextRetryAt && current.nextRetryAt > now) {
+    const claimLive = current.claimedAt !== null
+        && current.claimedAt.getTime() > now.getTime() - WORKER_CLAIM_LEASE_MS;
+    if (allowedStates.includes(current.state) && claimLive) {
         throw new StaleReceiptIntakeError(WORKER_BUSY_MESSAGE);
     }
     throw new StaleReceiptIntakeError();
@@ -15382,11 +15387,14 @@ export async function retryReceiptIntake(id: string) {
         data: {
             // RECEIVED re-reads the document; BOOKING resumes at the send.
             state: target,
+            // Scheduling only. Ownership is claimToken/claimedAt and belongs to
+            // the worker; clearing a live claim here would let two runs process
+            // the same row.
+            nextRetryAt: now,
             // The reason described a failure that is now being retried; leaving
             // it would make the row look parked while it is actually in flight.
             stateReason: null,
             lastError: null,
-            nextRetryAt: now,
         },
     });
     if (result.count === 0) await receiptIntakeWriteFailure(id, [current.state], now);
@@ -15409,20 +15417,33 @@ export async function resolveOrphanedQbPurchase(id: string) {
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
-        select: { postVoidQbPurchaseId: true },
+        select: { state: true, stateReason: true, postVoidQbPurchaseId: true },
     });
-    if (!row?.postVoidQbPurchaseId) throw new StaleReceiptIntakeError("Nothing to resolve on this receipt — refresh.");
+    if (!row?.postVoidQbPurchaseId) {
+        return { success: false, stale: true as const, reason: "Nothing to resolve on this receipt — refresh." };
+    }
 
+    // APPENDED, never overwritten. `stateReason` already carries why the row is
+    // where it is ("booked-after-void", a dup reference, a QBO fault); replacing
+    // it to record the cleanup would destroy the only note saying how the row
+    // got into this state in the first place.
+    const note = `orphan-purchase-resolved:${row.postVoidQbPurchaseId}`;
+    const stateReason = row.stateReason && !row.stateReason.includes(note)
+        ? `${row.stateReason}; ${note}`.slice(0, 400)
+        : (row.stateReason ?? note);
+
+    // CAS on BOTH the state and the purchase id: the worker can move the state
+    // and a second tab can resolve the same row, and either means the view this
+    // click came from is stale.
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
-        data: {
-            postVoidQbPurchaseId: null,
-            stateReason: `orphan-purchase-resolved:${row.postVoidQbPurchaseId}`,
-        },
+        where: { id, state: row.state, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
+        data: { postVoidQbPurchaseId: null, stateReason },
     });
-    if (result.count === 0) throw new StaleReceiptIntakeError();
+    if (result.count === 0) {
+        return { success: false, stale: true as const, reason: "This receipt changed underneath you — refresh and try again." };
+    }
     revalidateReceiptQueue();
-    return { success: true };
+    return { success: true, stale: false as const };
 }
 
 /**

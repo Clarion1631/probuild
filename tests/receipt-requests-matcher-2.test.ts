@@ -118,16 +118,17 @@ test("a shared legal suffix is not merchant identity", async t => {
 test("a resolved issue is answered evidence — it never reopens", () => {
     // The line is still unmatched, so without this it reopens every night and
     // the memo the owner signed to stop the nagging stops nothing.
-    assert.deepEqual(plan({ resolvedIssueKeys: ["bl-1"] }), { open: [], close: [] });
+    assert.deepEqual(plan({ resolvedIssueKeys: ["bl-1"] }), { open: [], close: [], undecided: [] });
 });
 
 test("clearing the resolution puts the line back in the chase", () => {
     assert.equal(plan({ resolvedIssueKeys: [] }).open.length, 1);
 });
 
-test("a resolved line is not reopened even when it also carries an open issue", () => {
-    const result = plan({ resolvedIssueKeys: ["bl-1"], openIssueKeys: ["bl-1"] });
-    assert.deepEqual(result, { open: [], close: [] });
+test("a resolved line is never REOPENED, whatever its issue state", () => {
+    for (const openIssueKeys of [[], ["bl-1"]]) {
+        assert.deepEqual(plan({ resolvedIssueKeys: ["bl-1"], openIssueKeys }).open, [], JSON.stringify(openIssueKeys));
+    }
 });
 
 test("mergeReceiptRequestDetails keeps answers and refreshes facts", () => {
@@ -400,9 +401,10 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /orderBy: \[\{ postedDate: "asc" \}, \{ id: "asc" \}\]/,
         "newest-first silently abandoned older candidates behind the cap");
-    assert.match(source, /const resumeFrom = await readCursor\(\);/);
-    assert.match(source, /cursor: \{ id: resumeFrom \}, skip: 1/);
-    assert.match(source, /await writeCursor\(batchWasFull \? lastId : null\);/);
+    assert.match(source, /let cursor = await readCursor\(\);/);
+    assert.match(source, /cursor: \{ id: cursor \}, skip: 1/);
+    // Checkpointed after EVERY batch, so a run that dies loses one batch.
+    assert.match(source, /cursor = batch\[batch\.length - 1\]\.id;\s*\n\s*await writeCursor\(cursor\);/);
 });
 
 // ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────
@@ -442,10 +444,77 @@ test("the cohort holds across a MAX_BANK_LINES-sized gap", () => {
 
 test("the sweep expands each page to its competing cohort before matching", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /const cohortFilters = windowLines\.map\(row => competingLineFilter\(/);
-    // And the cohort is merged in before planReceiptRequests is called.
-    // lastIndexOf: recomputeCodesFor calls the matcher too, earlier in the file.
+    assert.match(source, /const cohortFilters = batch\.map\(row => competingLineFilter\(/);
+    // COHORT, then EVIDENCE for the cohort's span, then DECIDE — in that order.
     const cohortAt = source.indexOf("const cohortRows =");
-    const planAt = source.lastIndexOf("const plan = planReceiptRequests(");
-    assert.ok(cohortAt > 0 && planAt > cohortAt, "the cohort must be merged in BEFORE the sweep's match");
+    const evidenceAt = source.indexOf("const \[expenseRows, intakeRows\] = await Promise.all([".replace(/\\/g, ""));
+    const planAt = source.indexOf("const plan = planReceiptRequests({", cohortAt);
+    assert.ok(cohortAt > 0 && evidenceAt > cohortAt, "evidence must be loaded AFTER the cohort is known");
+    assert.ok(planAt > evidenceAt, "and the decision comes last");
+    // The loaded window is declared, so the matcher can decline to judge
+    // anything it falls outside.
+    assert.match(source, /evidenceLoadedFrom: from\.toISOString\(\)\.slice\(0, 10\)/);
+});
+
+// ── No decision without a fully-loaded evidence window (round-6 item 8) ─────
+
+test("a line whose evidence window was not fully loaded emits NO decision", () => {
+    // "No receipt found" must never be able to mean "we did not look". Judging
+    // a line against evidence the caller never loaded opens a chase for a
+    // charge that is perfectly well documented.
+    const result = planReceiptRequests({
+        bankLines: [line({ id: "bl-edge", postedDate: "2026-08-16" })],
+        expenses: [],
+        intakes: [],
+        openIssueKeys: [],
+        resolvedIssueKeys: [],
+        // The line needs 08-14..08-18; only 08-15 onward was loaded.
+        evidenceLoadedFrom: "2026-08-15",
+        evidenceLoadedTo: "2026-08-30",
+        now: NOW,
+    });
+    assert.deepEqual(result.open, [], "not opened");
+    assert.deepEqual(result.close, [], "and not closed either");
+    assert.deepEqual(result.undecided, ["bl-edge"], "reported, so the cursor cannot skip it");
+});
+
+test("the boundary is EXACT: window fully covered decides, one day short does not", () => {
+    const judge = (from: string, to: string) => planReceiptRequests({
+        bankLines: [line({ id: "bl-edge", postedDate: "2026-08-16" })],
+        expenses: [], intakes: [], openIssueKeys: [], resolvedIssueKeys: [],
+        evidenceLoadedFrom: from, evidenceLoadedTo: to, now: NOW,
+    });
+
+    // Exactly ±2 days is enough.
+    const covered = judge("2026-08-14", "2026-08-18");
+    assert.deepEqual(covered.undecided, []);
+    assert.equal(covered.open.length, 1);
+
+    // One day short on either side is not.
+    assert.deepEqual(judge("2026-08-15", "2026-08-18").undecided, ["bl-edge"]);
+    assert.deepEqual(judge("2026-08-14", "2026-08-17").undecided, ["bl-edge"]);
+});
+
+test("omitting the bounds means 'everything was loaded'", () => {
+    // Callers that genuinely load every row must not be forced to declare it.
+    const result = plan();
+    assert.deepEqual(result.undecided, []);
+    assert.equal(result.open.length, 1);
+});
+
+test("an undecided line is not counted as satisfied — its evidence stays free", () => {
+    // The undecided line must not silently consume the receipt its neighbour
+    // needs, or skipping it would corrupt the neighbour's verdict too.
+    const result = planReceiptRequests({
+        bankLines: [
+            line({ id: "bl-edge", postedDate: "2026-08-16" }),
+            line({ id: "bl-ok", postedDate: "2026-08-20" }),
+        ],
+        expenses: [expense({ date: "2026-08-20" })],
+        intakes: [], openIssueKeys: ["bl-ok"], resolvedIssueKeys: [],
+        evidenceLoadedFrom: "2026-08-17", evidenceLoadedTo: "2026-08-30",
+        now: new Date("2026-08-25T09:00:00Z"),
+    });
+    assert.deepEqual(result.undecided, ["bl-edge"]);
+    assert.deepEqual(result.close, ["bl-ok"], "the in-window line still gets its receipt");
 });

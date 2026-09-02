@@ -114,7 +114,7 @@ test("disjoint payee tokens with equal amount+date never match — the Chevron/C
 test("a credit line is ignored, and closes an issue it already had", async t => {
     await t.test("no issue → nothing at all", () => {
         const result = plan({ bankLines: [line({ amountCents: 4_500 })] });
-        assert.deepEqual(result, { open: [], close: [] });
+        assert.deepEqual(result, { open: [], close: [], undecided: [] });
     });
     await t.test("issue open → close", () => {
         const result = plan({ bankLines: [line({ amountCents: 4_500 })], openIssueKeys: ["bl-1"] });
@@ -124,7 +124,7 @@ test("a credit line is ignored, and closes an issue it already had", async t => 
 
 test("a debit 2 days old is inside the grace window", () => {
     const result = plan({ bankLines: [line({ postedDate: "2026-08-18" })] });
-    assert.deepEqual(result, { open: [], close: [] });
+    assert.deepEqual(result, { open: [], close: [], undecided: [] });
     // ...and exactly 3 days old is not.
     assert.equal(plan({ bankLines: [line({ postedDate: "2026-08-17" })] }).open.length, 1);
 });

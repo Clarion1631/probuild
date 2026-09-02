@@ -130,7 +130,7 @@ test("two consecutive runs over identical input produce zero new issues and zero
     const store = inMemoryLifecycle();
 
     const first = await run(store, []);
-    assert.deepEqual(first, { opened: 2, closed: 0, touched: 0, skipped: 0 });
+    assert.deepEqual(first, { opened: 2, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] });
     assert.equal(store.issues.size, 2, "the exempt loan payment never opens an issue");
     assert.equal(store.episodes.length, 2);
 
@@ -203,7 +203,7 @@ test("a corrected displayDetails reaches the row without opening a new generatio
     assert.equal(store.episodes.length, 2, "no new episode for a display-only change");
 });
 
-test("one failing target never abandons the rest of the sweep", async () => {
+test("a failing target is RETAINED as an error, and the rest still run", async () => {
     const plan = planReceiptRequests({ bankLines: LINES, expenses: [], intakes: [], openIssueKeys: [], now: NOW });
     const seen: string[] = [];
     const summary = await applyReceiptRequestPlan(plan, async targetKey => {
@@ -214,7 +214,12 @@ test("one failing target never abandons the rest of the sweep", async () => {
     // Oldest charge first — the matcher's own deterministic order, not the
     // caller's input order (that is what makes evidence assignment stable).
     assert.deepEqual(seen, ["bl-depot", "bl-lowes"]);
-    assert.deepEqual(summary, { opened: 1, closed: 0, touched: 0, skipped: 1 });
+    // A THROW is an error, not a skip. Folding the two together is how a night
+    // where every write failed reported "0 errors, all quiet", and the caller
+    // needs `failedTargets` to know not to advance its cursor past them.
+    assert.deepEqual(summary, {
+        opened: 1, closed: 0, touched: 0, skipped: 0, errors: 1, failedTargets: ["bl-lowes"],
+    });
 });
 
 test("a memo signed DURING the sweep is not un-answered by it", async () => {

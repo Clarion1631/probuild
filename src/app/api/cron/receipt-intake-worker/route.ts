@@ -261,13 +261,17 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             }
         }
 
+        const claimCutoff = new Date(now.getTime() - LEASE_MS);
         const due = await tx.receiptIntake.findMany({
             where: {
                 // STAGING is absent on purpose: the row exists but its object
                 // does not, so claiming it would park a good receipt as
                 // "file-missing". sweepStaleStaging is what watches those.
                 state: { in: ["RECEIVED", "READ", "BOOKING"] },
+                // DUE (scheduling) and UNOWNED (or the owner's lease expired).
+                // Two separate questions, asked separately.
                 OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+                AND: [{ OR: [{ claimedAt: null }, { claimedAt: { lt: claimCutoff } }] }],
                 ...NOT_DRY_RUN_PARKED,
             },
             orderBy: { createdAt: "asc" },

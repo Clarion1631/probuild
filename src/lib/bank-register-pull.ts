@@ -190,7 +190,14 @@ export interface BankRegisterPullDependencies {
     /** Posts one batch through the bank-ledger ingest path (source QBO_REGISTER). */
     ingest(account: string, lines: BankRegisterIngestLine[]): Promise<BankRegisterIngestResult>;
     /** Runs the reconcile step for the account. Errors here never fail the pull. */
-    reconcile(account: string): Promise<{ linked: number; proposed: number } | null>;
+    reconcile(account: string): Promise<{
+        linked: number;
+        proposed: number;
+        /** Chunks whose transaction rolled back. Their links did NOT persist. */
+        chunkErrors?: number;
+        /** Links this invocation never attempted, because it hit its own cap. */
+        remaining?: number;
+    } | null>;
     /**
      * Mints canonical BankLines from still-unlinked QBO observations
      * (Justin decision 3). Optional and OFF by default: the caller only
@@ -227,7 +234,7 @@ export interface BankRegisterPullSummary {
      * a no-op for them.
      */
     conflictQbTxnIds?: string[];
-    reconciled?: { linked: number; proposed: number } | null;
+    reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number } | null;
     minted?: { minted: number; skipped: Record<string, number> } | null;
 }
 
@@ -252,8 +259,12 @@ export async function runBankRegisterPull(
     const fetched = await dependencies.fetchRows(startDate, endDate);
     const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
 
+    // A STALE fetch is QuickBooks not answering: the rows are a cached copy from
+    // an earlier run, so "we pulled the register" is not true of this one. It
+    // used to be a display flag only, and a night where QBO was down reported
+    // success.
     const summary: BankRegisterPullSummary = {
-        ok: true,
+        ok: !fetched.stale,
         account,
         startDate,
         endDate,
@@ -264,6 +275,7 @@ export async function runBankRegisterPull(
         collapsed,
         inserted: 0,
         existing: 0,
+        ...(fetched.stale ? { error: "qbo-stale-cache" } : {}),
     };
     // Divergent repeats inside the fetch are already a conflict, and the run is
     // already failed — but the NON-conflicting lines still post. They are good
@@ -296,7 +308,20 @@ export async function runBankRegisterPull(
     // evidence, and linking it is what unblocks receipt matching. A reconcile
     // failure is reported, never thrown — the observations are already stored.
     try {
-        summary.reconciled = await dependencies.reconcile(account);
+        const reconciled = await dependencies.reconcile(account);
+        summary.reconciled = reconciled;
+        // PARTIAL WORK IS NOT SUCCESS. `chunkErrors` means a chunk's whole
+        // transaction rolled back, and `remaining` means links were never
+        // attempted — both leave observations unlinked, which is exactly the
+        // state that starves the matcher. Reporting 200 here meant the run
+        // looked clean while the ledger was still incomplete.
+        if (reconciled && (reconciled.chunkErrors ?? 0) > 0) {
+            summary.ok = false;
+            summary.error = summary.error ?? "reconcile-chunk-errors";
+        } else if (reconciled && (reconciled.remaining ?? 0) > 0) {
+            summary.ok = false;
+            summary.error = summary.error ?? "reconcile-incomplete";
+        }
     } catch (error) {
         summary.reconciled = null;
         // A reconcile failure is not cosmetic: unlinked observations are what

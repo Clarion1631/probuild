@@ -342,13 +342,18 @@ export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
  * it". The flag itself is env, so it cannot fail.
  */
 async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null }> {
-    const enabled = process.env.BANK_LINE_MINT_FROM_QBO === "true"
-        || process.env.BANK_REGISTER_PULL_ENABLED === "true";
-    if (!enabled) return { enabled: false, lastSuccessAt: null };
+    // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
+    // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
+    // not the pull — so with minting off (its shipped default) the pull could
+    // be dead for weeks and health stayed green. The pull is scheduled in
+    // vercel.json unconditionally, so it is expected to run unconditionally.
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
         return { enabled: true, lastSuccessAt: row?.value || null };
     } catch {
+        // Could not READ it. The probe-failure reasons already cover "we do not
+        // know"; inventing a staleness alarm here would fire for the wrong
+        // reason and teach people to ignore it.
         return { enabled: false, lastSuccessAt: null };
     }
 }

@@ -287,3 +287,91 @@ test("the retry pass is scheduled two hours after the morning card", () => {
     assert.equal(first.schedule, "30 14 * * 1-5");
     assert.equal(retry.schedule, "30 16 * * 1-5", "two hours later, weekdays only");
 });
+
+test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const BATCH_SIZE = 200;/);
+    assert.match(source, /const RUN_BUDGET_MS = 45_000;/);
+    assert.match(source, /while \(Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
+    // Checkpoint after every batch, so a killed run loses one batch, not all.
+    assert.match(source, /await writeCursor\(cursor\);/);
+    // The cursor must NOT advance past a target whose write threw.
+    assert.match(source, /if \(outcome\.summary\.errors > 0\) break;/);
+    const breakAt = source.indexOf("if (outcome.summary.errors > 0) break;");
+    const advanceAt = source.indexOf("cursor = batch[batch.length - 1].id;");
+    assert.ok(breakAt > 0 && advanceAt > breakAt, "the break must come BEFORE the cursor advances");
+    // And errors make the run a 500.
+    assert.match(source, /ok: totals\.errors === 0/);
+    assert.match(source, /status: result\.ok \? 200 : 500/);
+});
+
+test("the sweep runs every 15 minutes so a backlog drains across invocations", () => {
+    const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
+        crons: Array<{ path: string; schedule: string }>;
+    };
+    const sweep = vercel.crons.find(c => c.path === "/api/cron/receipt-requests");
+    assert.ok(sweep);
+    assert.equal(sweep.schedule, "*/15 * * * *");
+});
+
+test("worker OWNERSHIP is a claim token, not the retry schedule", () => {
+    const worker = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
+    // The claim writes ownership and leaves scheduling alone.
+    assert.match(worker, /data: \{ claimToken, claimedAt: now \}/);
+    assert.doesNotMatch(worker, /data: \{ nextRetryAt: new Date\(now\.getTime\(\) \+ LEASE_MS\) \}/);
+    // Due AND unowned are two separate questions.
+    assert.match(worker, /claimedAt: null \}, \{ claimedAt: \{ lt: claimCutoff \} \}/);
+    // And the claim is released when the worker is done with the row.
+    assert.match(worker, /claimToken: null, claimedAt: null/);
+
+    const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    // The queue actions fence on the CLAIM, never on nextRetryAt.
+    assert.match(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,220}claimedAt: null/);
+    assert.doesNotMatch(actions, /function notClaimedByWorker\(now: Date\)[\s\S]{0,220}nextRetryAt/);
+    // "Retry now" is scheduling.
+    assert.match(actions, /\/\/ Scheduling only\. Ownership is claimToken\/claimedAt/);
+});
+
+test("resolveOrphanedQbPurchase CASes and APPENDS rather than overwriting", () => {
+    const source = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    assert.match(source, /where: \{ id, state: row\.state, postVoidQbPurchaseId: row\.postVoidQbPurchaseId \}/);
+    assert.match(source, /`\$\{row\.stateReason\}; \$\{note\}`/, "the existing reason must survive");
+    assert.match(source, /stale: true as const/, "a lost race is a stale verdict, not a retryable error");
+});
+
+test("minting and adoption run in bounded transactions with explicit timeouts", () => {
+    const pull = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(pull, /const MINT_BATCH_SIZE = 200;/);
+    assert.match(pull, /const MINT_TX_TIMEOUT_MS = 20_000;/);
+    assert.match(pull, /\}, \{ timeout: MINT_TX_TIMEOUT_MS \}\);/);
+    // The identity lock is taken PER BATCH, inside the loop.
+    const loopAt = pull.indexOf("for (let batch = 0; batch < MINT_MAX_BATCHES; batch++)");
+    const lockAt = pull.indexOf("pg_advisory_xact_lock", loopAt);
+    assert.ok(loopAt > 0 && lockAt > loopAt, "the lock belongs inside the batch loop");
+
+    const ingest = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    assert.match(ingest, /timeout: STATEMENT_TX_TIMEOUT_MS/);
+});
+
+test("the bank pull fails on a stale fetch, chunk errors, or unattempted links", () => {
+    const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
+    assert.match(lib, /ok: !fetched\.stale/);
+    assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-chunk-errors";/);
+    assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-incomplete";/);
+    // The last-success stamp is only written for a fully successful run.
+    const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(route, /if \(summary\.ok\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+});
+
+test("health enablement is the cron's existence, not an undocumented env var", () => {
+    const health = readFileSync(join(repoRoot, "src/lib/pipeline-health.ts"), "utf8");
+    // Matches a READ of the env, not the word — the comment explaining why the
+    // flag is not used must not fail the gate it documents.
+    assert.doesNotMatch(health, /process\.env\.BANK_LINE_MINT_FROM_QBO/, "that flag controls MINTING, not the pull");
+    assert.doesNotMatch(health, /process\.env\.BANK_REGISTER_PULL_ENABLED/);
+    assert.match(health, /return \{ enabled: true, lastSuccessAt: row\?\.value \|\| null \};/);
+    const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
+        crons: Array<{ path: string }>;
+    };
+    assert.ok(vercel.crons.some(c => c.path === "/api/cron/bank-register-pull"), "which is true because the cron is scheduled");
+});

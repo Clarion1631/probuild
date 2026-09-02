@@ -77,6 +77,13 @@ export async function GET(request: Request) {
 /** How far back a mint pass looks for still-unlinked QBO observations. */
 const MINT_LOOKBACK_DAYS = 45;
 
+/** Rows per mint transaction. Small enough to commit well inside the timeout. */
+const MINT_BATCH_SIZE = 200;
+/** Explicit, because Prisma's interactive-transaction default is 5s. */
+const MINT_TX_TIMEOUT_MS = 20_000;
+/** Bounds one invocation; the nightly cron picks up whatever is left. */
+const MINT_MAX_BATCHES = 10;
+
 /**
  * Mint canonical BankLines from QBO observations that reconcile could not link
  * (Justin, decision 3). Gated by `BANK_LINE_MINT_FROM_QBO` at the call site.
@@ -90,87 +97,90 @@ const MINT_LOOKBACK_DAYS = 45;
  */
 async function mintFromQbo(account: string): Promise<{ minted: number; skipped: Record<string, number> }> {
     const since = new Date(Date.now() - MINT_LOOKBACK_DAYS * 86_400_000);
+    let minted = 0;
+    const skipped: Record<string, number> = {};
 
-    // ONE transaction: take the identity lock, THEN read, THEN plan, THEN
-    // write. Planning outside the lock is the bug this shape exists to prevent
-    // — two runs would both read the same gap and both mint into it. The lock
-    // is transaction-scoped because pgbouncer forbids session locks
-    // (review-alert-rollout.ts), and the statement ingest takes the SAME key.
-    return prisma.$transaction(async tx => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
+    // BOUNDED BATCHES, each its own transaction. One transaction for the whole
+    // run held the identity lock for as long as the mint took and kept an
+    // interactive transaction open across hundreds of writes — on a pgbouncer
+    // pool that is exactly the shape that hits Prisma's default 5s timeout and
+    // rolls the entire night back. Now each batch takes the lock, plans inside
+    // it, writes at most MINT_BATCH_SIZE rows, and commits; the next batch
+    // re-reads the world, so nothing is planned against stale state.
+    for (let batch = 0; batch < MINT_MAX_BATCHES; batch++) {
+        const result = await prisma.$transaction(async tx => {
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
 
-        const [observations, existingLines] = await Promise.all([
-            tx.bankLineObservation.findMany({
-                where: { source: "QBO_REGISTER", account, postedDate: { gte: since } },
-                select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
-            }),
-            tx.bankLine.findMany({
-                where: { account, postedDate: { gte: since } },
-                // rawDescriptor, not the stored normalizedPayee: the identity
-                // key is derived the same way on both sides or it is not one key.
-                select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
-            }),
-        ]);
+            const [observations, existingLines] = await Promise.all([
+                tx.bankLineObservation.findMany({
+                    where: { source: "QBO_REGISTER", account, postedDate: { gte: since } },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, bankLineId: true },
+                }),
+                tx.bankLine.findMany({
+                    where: { account, postedDate: { gte: since } },
+                    select: { id: true, account: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true, sourceOfRecord: true, qbTxnId: true },
+                }),
+            ]);
 
-        const plan = planQboMint(
-            observations.map(row => ({
-                id: row.id,
-                account: row.account,
-                postedDate: row.postedDate.toISOString().slice(0, 10),
-                amountCents: row.amountCents,
-                rawDescriptor: row.rawDescriptor,
-                // ONE identity function, both sides. See identityPayee.
-                normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
-                checkNumber: row.checkNumber,
-                bankLineId: row.bankLineId,
-            })),
-            existingLines.map(row => ({
-                id: row.id,
-                qbTxnId: row.qbTxnId,
-                account: row.account,
-                postedDate: row.postedDate.toISOString().slice(0, 10),
-                amountCents: row.amountCents,
-                normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
-                checkNumber: row.checkNumber,
-                sourceOfRecord: row.sourceOfRecord,
-            })),
-            new Date(),
-        );
+            const plan = planQboMint(
+                observations.map(row => ({
+                    id: row.id,
+                    account: row.account,
+                    postedDate: row.postedDate.toISOString().slice(0, 10),
+                    amountCents: row.amountCents,
+                    rawDescriptor: row.rawDescriptor,
+                    normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
+                    checkNumber: row.checkNumber,
+                    bankLineId: row.bankLineId,
+                })),
+                existingLines.map(row => ({
+                    id: row.id,
+                    qbTxnId: row.qbTxnId,
+                    account: row.account,
+                    postedDate: row.postedDate.toISOString().slice(0, 10),
+                    amountCents: row.amountCents,
+                    normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
+                    checkNumber: row.checkNumber,
+                    sourceOfRecord: row.sourceOfRecord,
+                })),
+                new Date(),
+            );
 
-        // LINKED observations are loaded too (not filtered out in SQL as
-        // before), because the cardinality count needs to know which existing
-        // lines are already spoken for.
-        let minted = 0;
-        for (const observation of plan.mint) {
-            const line = await tx.bankLine.create({
-                data: {
-                    account: observation.account,
-                    postedDate: new Date(`${observation.postedDate}T00:00:00Z`),
-                    amountCents: observation.amountCents,
-                    rawDescriptor: observation.rawDescriptor,
-                    // STORED value keeps the conventional normalization, which
-                    // is what reconcileObservations and the rest of the ledger
-                    // read. `identityPayee` is a matching key, not a column.
-                    normalizedPayee: observation.normalizedPayee,
-                    checkNumber: observation.checkNumber,
-                    state: "POSTED",
-                    sourceOfRecord: "QBO",
-                },
-            });
-            // Guarded even under the lock: reconcile does NOT take this lock
-            // (it only links, never mints), so it can still claim the
-            // observation. Losing that race must roll the new line back with
-            // it rather than leave an orphan.
-            const linked = await tx.bankLineObservation.updateMany({
-                where: { id: observation.id, bankLineId: null },
-                data: { bankLineId: line.id },
-            });
-            if (linked.count === 0) throw new ObservationClaimedError();
-            minted++;
-        }
+            const slice = plan.mint.slice(0, MINT_BATCH_SIZE);
+            let mintedHere = 0;
+            for (const observation of slice) {
+                const line = await tx.bankLine.create({
+                    data: {
+                        account: observation.account,
+                        postedDate: new Date(`${observation.postedDate}T00:00:00Z`),
+                        amountCents: observation.amountCents,
+                        rawDescriptor: observation.rawDescriptor,
+                        normalizedPayee: observation.normalizedPayee,
+                        checkNumber: observation.checkNumber,
+                        state: "POSTED",
+                        sourceOfRecord: "QBO",
+                    },
+                });
+                // Guarded even under the lock: reconcile does not take this lock
+                // (it only links, never mints), so it can still claim the
+                // observation. Losing that race must roll the new line back with
+                // it rather than leave an orphan.
+                const linked = await tx.bankLineObservation.updateMany({
+                    where: { id: observation.id, bankLineId: null },
+                    data: { bankLineId: line.id },
+                });
+                if (linked.count === 0) throw new ObservationClaimedError();
+                mintedHere++;
+            }
+            return { mintedHere, skipped: plan.skipped, more: plan.mint.length > slice.length };
+        }, { timeout: MINT_TX_TIMEOUT_MS });
 
-        return { minted, skipped: { ...plan.skipped } };
-    });
+        minted += result.mintedHere;
+        for (const [key, value] of Object.entries(result.skipped)) skipped[key] = value;
+        if (!result.more) break;
+    }
+
+    return { minted, skipped };
 }
 
 class ObservationClaimedError extends Error {}
@@ -196,7 +206,14 @@ async function runPull() {
 
         reconcile: async (account: string) => {
             const result = await bankLedgerReconcileHandlers.runReconcile(account);
-            return { linked: result.linked, proposed: result.proposed };
+            return {
+                linked: result.linked,
+                proposed: result.proposed,
+                // Surfaced, not swallowed: a rolled-back chunk and un-attempted
+                // links both leave observations unlinked.
+                chunkErrors: result.chunkErrors.length,
+                remaining: result.remaining,
+            };
         },
 
         // Justin, decision 3: the QBO bank feed is bank truth. OFF by default —

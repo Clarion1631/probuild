@@ -69,6 +69,9 @@ export const maxDuration = 120;
 // meant up to 40,000 serial inserts per request — see createStatementImport,
 // now bulk-inserted).
 const MAX_LINES_PER_REQUEST = 5000;
+
+/** One statement is one transaction; give it a budget the default 5s is not. */
+const STATEMENT_TX_TIMEOUT_MS = 20_000;
 const VALID_SOURCES = new Set(["STATEMENT", "QBO_REGISTER"]);
 const MAX_ACCOUNT_LEN = 64;
 const MAX_DESCRIPTOR_LEN = 500;
@@ -594,6 +597,14 @@ const handlers = createBankLedgerIngestHandlers({
                 });
 
                 return { statementImportId: statementImport.id, inserted: input.lines.length, adopted: adoptedIds.length };
+            }, {
+                // EXPLICIT, because Prisma's interactive-transaction default is
+                // 5s and this one holds the identity lock across the adoption
+                // read, two bulk inserts and a per-adopted-line update. A
+                // statement is bounded (MAX_LINES_PER_REQUEST) so one
+                // transaction is right here — but it needs a real budget, not
+                // the default that silently rolls a good import back.
+                timeout: STATEMENT_TX_TIMEOUT_MS,
             });
         } catch (error) {
             if (isUniqueConstraintError(error)) throw new StatementImportRaceError();

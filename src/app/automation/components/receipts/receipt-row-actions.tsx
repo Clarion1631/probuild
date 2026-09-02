@@ -140,7 +140,19 @@ export function MarkDuplicateControl({ intakeId }: { intakeId: string }) {
 }
 
 export function ResolveOrphanButton({ intakeId, qbPurchaseId }: { intakeId: string; qbPurchaseId: string }) {
-    const { pending, run } = useAction("Marked resolved");
+    const [pending, startTransition] = useTransition();
+    // This action RETURNS a stale verdict rather than throwing one, so a lost
+    // race reads as "refresh", not "that didn't work — try again". Retrying a
+    // stale click just loses the same race.
+    const run = () => startTransition(async () => {
+        try {
+            const result = await resolveOrphanedQbPurchase(intakeId);
+            if (result.success) toast.success("Marked resolved");
+            else toast.error(result.reason ?? "This receipt changed underneath you — refresh.");
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "That didn't work — try again");
+        }
+    });
     return (
         <button
             type="button"
@@ -150,7 +162,7 @@ export function ResolveOrphanButton({ intakeId, qbPurchaseId }: { intakeId: stri
                 if (!window.confirm(
                     `Have you voided purchase ${qbPurchaseId} in QuickBooks? This only records that you did — it does not change QuickBooks.`,
                 )) return;
-                run(() => resolveOrphanedQbPurchase(intakeId));
+                run();
             }}
         >
             Voided in QuickBooks

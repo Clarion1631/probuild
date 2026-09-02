@@ -107,10 +107,28 @@ export interface MissingReceiptDisplayDetails {
 export interface ReceiptRequestPlan {
     open: Array<{ targetKey: string; displayDetails: MissingReceiptDisplayDetails }>;
     close: string[];
+    /**
+     * Lines deliberately left undecided because their evidence window was not
+     * fully loaded. Reported, not hidden: a caller that sees these knows its
+     * window was too narrow, and the cursor must not advance past them.
+     */
+    undecided: string[];
 }
 
 export interface ReceiptRequestInput {
     bankLines: readonly ReceiptRequestBankLine[];
+    /**
+     * The date range, inclusive, over which `expenses` and `intakes` are
+     * COMPLETE — normally the cohort's full span widened by the match window.
+     *
+     * A line whose ±2-day evidence window falls outside this range emits NO
+     * decision at all. Judging it would be judging it against evidence the
+     * caller never loaded: "no receipt found" would mean "we did not look",
+     * and that opens a chase for a charge that is perfectly well documented.
+     * Omit it only when the caller genuinely loaded every row.
+     */
+    evidenceLoadedFrom?: string | null;
+    evidenceLoadedTo?: string | null;
     expenses: readonly ReceiptEvidenceExpense[];
     intakes: readonly ReceiptEvidenceIntake[];
     /** targetKeys of bank-line issues that are currently OPEN (clearedAt null). */
@@ -367,6 +385,7 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
 export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestPlan {
     const open: ReceiptRequestPlan["open"] = [];
     const close: string[] = [];
+    const undecided: string[] = [];
     const openKeys = new Set(input.openIssueKeys);
     const resolvedKeys = new Set(input.resolvedIssueKeys ?? []);
     const todayDay = dayNumber(toYmd(input.now));
@@ -401,6 +420,20 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
 
     // Oldest charge first, id breaking the tie: the assignment below depends on
     // the order lines are visited, so it must not depend on query order.
+    const loadedFrom = input.evidenceLoadedFrom ? dayNumber(input.evidenceLoadedFrom) : null;
+    const loadedTo = input.evidenceLoadedTo ? dayNumber(input.evidenceLoadedTo) : null;
+
+    /**
+     * True when this line's whole ±2-day evidence window sits inside what the
+     * caller actually loaded. Absent bounds mean "everything was loaded".
+     */
+    const evidenceIsComplete = (postedDay: number): boolean => {
+        if (loadedFrom === null && loadedTo === null) return true;
+        if (loadedFrom !== null && postedDay - RECEIPT_MATCH_DATE_SLOP_DAYS < loadedFrom) return false;
+        if (loadedTo !== null && postedDay + RECEIPT_MATCH_DATE_SLOP_DAYS > loadedTo) return false;
+        return true;
+    };
+
     const orderedLines = [...input.bankLines].sort((a, b) =>
         (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
@@ -408,11 +441,21 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         const closeIfOpen = () => { if (openKeys.has(line.id)) close.push(line.id); };
 
         // A RESOLVED issue is answered evidence, not an open question. A signed
-        // memo is the receipt when no merchant receipt exists, so the line
-        // stays unmatched forever — without this it would re-open every single
-        // night, which is precisely the nag the memo was signed to stop. It
-        // reopens only when a human explicitly clears the resolution.
-        if (resolvedKeys.has(line.id)) continue;
+        // memo is the receipt when no merchant receipt exists, so the line stays
+        // unmatched forever — without this it would re-open every night, which
+        // is precisely the nag the memo was signed to stop.
+        //
+        // It CLOSES rather than being skipped. The answers route records the
+        // resolution and then clears the issue in two steps; a crash between
+        // them (or a 409 on the clear) leaves a resolved-but-open issue that
+        // nothing else would ever finish. Skipping it left that row nagging
+        // forever with a signed memo attached to it. The sweep completes the
+        // job it finds half-done, which is the only place that recovery can
+        // live. It reopens only when a human clears the resolution.
+        if (resolvedKeys.has(line.id)) {
+            closeIfOpen();
+            continue;
+        }
 
         // Money in and policy-exempt rails drop out here — including a credit
         // that later reversed a charge we were already chasing.
@@ -433,6 +476,15 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         // this young cannot have an issue in the first place.
         const lineDay = dayNumber(line.postedDate);
         if (lineDay === null || todayDay === null || todayDay - lineDay < RECEIPT_REQUEST_GRACE_DAYS) {
+            continue;
+        }
+
+        // NO DECISION on a line we could not fully look for evidence for. It is
+        // neither opened nor closed: the next run, with the right window
+        // loaded, decides. Silence beats a confident wrong answer here — the
+        // wrong answer is a chase for a receipt that already exists.
+        if (!evidenceIsComplete(lineDay)) {
+            undecided.push(line.id);
             continue;
         }
 
@@ -466,7 +518,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         });
     }
 
-    return { open, close };
+    return { open, close, undecided };
 }
 
 /**

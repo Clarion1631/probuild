@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
@@ -47,16 +46,25 @@ export const maxDuration = 60;
  * (pgbouncer forbids session-scoped advisory locks).
  */
 
-const CLAIM_LOCK_KEY = "receipt-requests";
+
 
 /** How far back the sweep looks for chaseable debits. */
 export const LOOKBACK_DAYS = 60;
 
 /**
- * How many lines ONE run processes. Not a silent ceiling: what does not fit is
- * resumed from a durable cursor on the next run (see readCursor).
+ * Lines per BATCH. Small on purpose: the cursor is checkpointed after each one,
+ * so a run that dies mid-sweep loses at most this much progress, and the
+ * cohort/evidence queries for a batch stay a size Postgres can answer fast.
  */
-const MAX_BANK_LINES = 2_000;
+const BATCH_SIZE = 200;
+
+/**
+ * Wall-clock budget for one invocation. `maxDuration` is 60s; stopping at 45
+ * leaves room to checkpoint the cursor and return a real answer instead of
+ * being killed mid-write with nothing recorded. The cron runs every 15 minutes,
+ * so a backlog drains over several invocations rather than in one heroic run.
+ */
+const RUN_BUDGET_MS = 45_000;
 
 /**
  * How long one run owns the sweep. Longer than a maxDuration=60 run can
@@ -95,7 +103,16 @@ export interface ReceiptRequestApplySummary {
     opened: number;
     closed: number;
     touched: number;
+    /** Decisions the lifecycle declined to act on (a genuine no-op). */
     skipped: number;
+    /**
+     * Targets whose write THREW. Counted as errors, never folded into
+     * `skipped` — a failure and a no-op look identical in a count, and folding
+     * them together is how a broken night reported "0 errors, all quiet".
+     */
+    errors: number;
+    /** The targets behind `errors`. The cursor must not advance past these. */
+    failedTargets: string[];
 }
 
 export type EvaluateFn = (
@@ -109,14 +126,19 @@ export type EvaluateFn = (
  * "two runs, zero new issues" promise is testable against the REAL lifecycle
  * with an in-memory client, rather than asserted from the source text.
  *
- * A single target's failure is reported, not thrown: one bad row must not
- * abandon the rest of the night's sweep.
+ * A single target's failure does not abandon the rest of the night's sweep —
+ * but it IS retained. It is reported in `failedTargets`, counted in `errors`,
+ * and the caller must neither advance its cursor past it nor call the run a
+ * success. Previously a throw was swallowed into `skipped` and the cursor moved
+ * on regardless, so a row that failed every night was silently never chased.
  */
 export async function applyReceiptRequestPlan(
     plan: ReceiptRequestPlan,
     evaluate: EvaluateFn,
 ): Promise<ReceiptRequestApplySummary> {
-    const summary: ReceiptRequestApplySummary = { opened: 0, closed: 0, touched: 0, skipped: 0 };
+    const summary: ReceiptRequestApplySummary = {
+        opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
+    };
 
     for (const item of plan.open) {
         try {
@@ -125,7 +147,8 @@ export async function applyReceiptRequestPlan(
             else if (decision.action === "noop") summary.skipped++;
             else summary.touched++;
         } catch (error) {
-            summary.skipped++;
+            summary.errors++;
+            summary.failedTargets.push(item.targetKey);
             console.error("[cron/receipt-requests] open failed", item.targetKey, error instanceof Error ? error.message : "UnknownError");
         }
     }
@@ -136,7 +159,8 @@ export async function applyReceiptRequestPlan(
             if (decision.action === "clear") summary.closed++;
             else summary.skipped++;
         } catch (error) {
-            summary.skipped++;
+            summary.errors++;
+            summary.failedTargets.push(targetKey);
             console.error("[cron/receipt-requests] close failed", targetKey, error instanceof Error ? error.message : "UnknownError");
         }
     }
@@ -235,6 +259,11 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
             vendor: row.vendor,
             state: row.state,
         })),
+        // The cohort query below loaded exactly [from, to], so declare it: a
+        // line whose window pokes outside that emits no decision rather than a
+        // guess (item 8).
+        evidenceLoadedFrom: competing.from,
+        evidenceLoadedTo: competing.to,
         openIssueKeys: siblingIssues.filter(i => i.clearedAt === null).map(i => i.targetKey),
         resolvedIssueKeys: siblingIssues
             .filter(i => hasResolution(parseMissingReceiptDetails(i.displayDetails)))
@@ -246,110 +275,36 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     return plan.open.some(o => o.targetKey === targetKey) ? ["MISSING_RECEIPT"] : [];
 }
 
-/** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
-function ymdDaysBefore(now: Date, days: number): string {
-    return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
+
+interface BatchLine {
+    id: string;
+    postedDate: Date;
+    amountCents: number;
+    rawDescriptor: string;
+    checkNumber: string | null;
 }
 
-export async function GET(request: Request) {
-    if (!isCronAuthorized(request)) {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-    const now = new Date();
-    // A DURABLE lease, held for the whole reconciliation. The old advisory
-    // claim released before any work began and excluded nothing.
-    const leaseToken = randomUUID();
-    if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
-        return NextResponse.json({ ok: true, skipped: "already-running" });
-    }
-    try {
-        return await runSweep(now);
-    } finally {
-        await releaseLease(LEASE_KEY, leaseToken);
-    }
-}
-
-async function runSweep(now: Date) {
-    const windowStart = ymdDaysBefore(now, LOOKBACK_DAYS);
-    const windowEnd = now.toISOString().slice(0, 10);
-    // Evidence is searched ±2 days around the window, because that is the
-    // widest date disagreement the matcher will accept.
-    const evidenceStart = new Date(`${ymdDaysBefore(now, LOOKBACK_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS)}T00:00:00Z`);
-    const evidenceEnd = new Date(`${ymdDaysBefore(now, -RECEIPT_MATCH_DATE_SLOP_DAYS)}T00:00:00Z`);
-
-    // Every bank-line issue, open OR cleared. The open ones say what may need
-    // closing; the cleared ones carry resolutions that must not be re-asked.
-    const allIssues = await prisma.reviewIssue.findMany({
-        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
-        select: { targetKey: true, clearedAt: true, displayDetails: true },
-    });
-    const openIssues = allIssues.filter(issue => issue.clearedAt === null);
-    const resolvedIssueKeys = allIssues
-        .filter(issue => hasResolution(parseMissingReceiptDetails(issue.displayDetails)))
-        .map(issue => issue.targetKey);
-
-    // Dates the evidence search must cover no matter how old: an open issue's
-    // bank line may be far outside the lookback, and the receipt that finally
-    // answers it is dated near THAT line, not near today (item 8).
-    const openIssueLineRows = openIssues.length === 0 ? [] : await prisma.bankLine.findMany({
-        where: { id: { in: openIssues.map(issue => issue.targetKey) } },
-        select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-    });
-    const openIssueDateRanges = openIssueLineRows.map(row => {
-        const day = row.postedDate.getTime();
-        return {
-            gte: new Date(day - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000),
-            lte: new Date(day + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000),
-        };
-    });
-    const evidenceDateWhere = openIssueDateRanges.length === 0
-        ? { date: { gte: evidenceStart, lte: evidenceEnd } }
-        : { OR: [{ date: { gte: evidenceStart, lte: evidenceEnd } }, ...openIssueDateRanges.map(range => ({ date: range }))] };
-    const intakeDateWhere = openIssueDateRanges.length === 0
-        ? { txnDate: { gte: evidenceStart, lte: evidenceEnd } }
-        : { OR: [{ txnDate: { gte: evidenceStart, lte: evidenceEnd } }, ...openIssueDateRanges.map(range => ({ txnDate: range }))] };
-
-    // OLDEST-FIRST, FROM A DURABLE CURSOR. `take: MAX_BANK_LINES` ordered
-    // newest-first silently abandoned candidates: an older never-seen line sat
-    // behind the cap until it aged out of the window entirely, so "one issue
-    // per unmatched debit" was quietly false. This resumes where the last run
-    // stopped and processes the oldest work first; if the batch fills, the
-    // cursor persists and the next run continues rather than starting over.
-    const resumeFrom = await readCursor();
-    const [windowLines, expenseRows, intakeRows] = await Promise.all([
-        prisma.bankLine.findMany({
-            where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
-            orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-            take: MAX_BANK_LINES,
-            ...(resumeFrom ? { cursor: { id: resumeFrom }, skip: 1 } : {}),
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-        }),
-        prisma.expense.findMany({
-            where: evidenceDateWhere,
-            select: {
-                id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
-                receiptUrl: true,
-                // A linked intake IS a receipt: the row only exists because a
-                // document was uploaded and read.
-                receiptIntake: { select: { id: true } },
-            },
-        }),
-        prisma.receiptIntake.findMany({
-            where: { ...intakeDateWhere, state: { notIn: [...DEAD_INTAKE_STATES] } },
-            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
-        }),
-    ]);
-
-    // THE COMPLETE COHORT, not just this page.
-    //
-    // Paging split competing lines across runs: a receipt allocated to a line
-    // on page 1 was invisible on page 2, so the same receipt satisfied a second
-    // charge and that charge's chase was closed for good. Allocation is a
-    // property of every line sharing an identity, so the page is EXPANDED to
-    // include its cohort — same amount, within twice the match window — before
-    // the matcher ever runs. Extra lines are harmless: each still gets its own
-    // correct verdict, and re-emitting an unchanged one is a lifecycle touch.
-    const cohortFilters = windowLines.map(row => competingLineFilter({
+/**
+ * One batch: build the COHORT, load evidence for the cohort's full span, then
+ * decide. In that order, and the order is the point.
+ *
+ * Deciding before the evidence is in — or with a window narrower than the lines
+ * being judged — means "no receipt found" can only mean "we did not look", and
+ * that opens a chase for a charge that is perfectly well documented. So the
+ * cohort is resolved first (every line that could claim the same evidence,
+ * regardless of which page it fell on), the evidence query is widened to that
+ * cohort's whole date span ±2 days, and `evidenceLoadedFrom/To` tells the
+ * matcher exactly what was loaded so it can decline to judge anything outside.
+ */
+async function processBatch(
+    batch: BatchLine[],
+    openIssues: Array<{ targetKey: string }>,
+    resolvedIssueKeys: string[],
+    detailsByKey: Map<string, Record<string, unknown>>,
+    now: Date,
+): Promise<{ summary: ReceiptRequestApplySummary; undecided: number }> {
+    // 1. THE COHORT.
+    const cohortFilters = batch.map(row => competingLineFilter({
         amountCents: row.amountCents,
         postedDate: row.postedDate.toISOString().slice(0, 10),
     }));
@@ -363,14 +318,42 @@ async function runSweep(now: Date) {
         select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
     });
 
-    // De-duplicate: a line can arrive from the page, its cohort, and the
-    // open-issue set all at once.
-    const bankLineRows = [...new Map(
-        [...windowLines, ...cohortRows, ...openIssueLineRows].map(row => [row.id, row]),
-    ).values()];
+    // Open-issue lines join the cohort whatever their age: a line the matcher
+    // cannot see is a line it can never CLOSE.
+    const openIssueLineRows = openIssues.length === 0 ? [] : await prisma.bankLine.findMany({
+        where: { id: { in: openIssues.map(issue => issue.targetKey) } },
+        select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+    });
 
+    const lines = [...new Map(
+        [...batch, ...cohortRows, ...openIssueLineRows].map(row => [row.id, row]),
+    ).values()];
+    if (lines.length === 0) {
+        return { summary: { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] }, undecided: 0 };
+    }
+
+    // 2. EVIDENCE FOR THE COHORT'S FULL SPAN, widened by the match window.
+    const days = lines.map(row => row.postedDate.getTime());
+    const from = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
+    const to = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
+
+    const [expenseRows, intakeRows] = await Promise.all([
+        prisma.expense.findMany({
+            where: { date: { gte: from, lte: to } },
+            select: {
+                id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
+                receiptUrl: true, receiptIntake: { select: { id: true } },
+            },
+        }),
+        prisma.receiptIntake.findMany({
+            where: { txnDate: { gte: from, lte: to }, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
+        }),
+    ]);
+
+    // 3. DECIDE.
     const plan = planReceiptRequests({
-        bankLines: bankLineRows.map(row => ({
+        bankLines: lines.map(row => ({
             id: row.id,
             postedDate: row.postedDate.toISOString().slice(0, 10),
             amountCents: row.amountCents,
@@ -402,25 +385,22 @@ async function runSweep(now: Date) {
         })),
         openIssueKeys: openIssues.map(row => row.targetKey),
         resolvedIssueKeys,
+        evidenceLoadedFrom: from.toISOString().slice(0, 10),
+        evidenceLoadedTo: to.toISOString().slice(0, 10),
         now,
     });
 
-    // displayDetails is MERGED, never replaced, and merged from a FRESH read
-    // taken per issue rather than from the run-start snapshot.
-    //
-    // The sweep loads everything up front and then works through it. A memo
-    // signed while that loop is running (the answers endpoint writes the
-    // resolution and clears the issue) would be invisible to a snapshot taken
-    // minutes earlier — so the reopen would go through and the merge would
-    // write the STALE details back over the resolution, un-answering something
-    // a human just answered. Re-reading immediately before each write closes
-    // that window; `evaluateReviewIssue` then applies its own OCC on top.
     const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
+        // FRESH READ before each write. The sweep can run for minutes; a memo
+        // signed in that window would otherwise be un-answered by a merge from
+        // the run-start snapshot.
         const fresh = await prisma.reviewIssue.findUnique({
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
             select: { displayDetails: true, clearedAt: true },
         });
-        const freshDetails = parseMissingReceiptDetails(fresh?.displayDetails ?? null);
+        const freshDetails = fresh
+            ? parseMissingReceiptDetails(fresh.displayDetails)
+            : detailsByKey.get(targetKey) ?? {};
 
         // A resolution that appeared since the snapshot: do not reopen.
         if (codes.length > 0 && hasResolution(freshDetails)) {
@@ -435,40 +415,134 @@ async function runSweep(now: Date) {
             {
                 // Delivery is the per-owner digest, never the per-issue drainer.
                 episodeStatus: "SUPPRESSED",
-                // RECOMPUTE ON OCC RETRY, never reapply the snapshot.
-                //
-                // The advisory claim above is transaction-scoped and released
-                // before any work, so two sweeps CAN overlap. A version
-                // conflict means someone else just committed to this exact row
-                // — replaying our minutes-old verdict could let a stale OPEN
-                // win over a newer CLOSE, or write details back over a
-                // signature that landed in between. This re-derives the verdict
-                // for this ONE line from current data instead. Returning []
-                // routes through the lifecycle's clear step, which does not
-                // touch displayDetails, so a concurrent resolution survives.
+                // On an OCC retry, re-derive from the COMPLETE competing set
+                // rather than replaying a stale verdict.
                 recomputeCodes: () => recomputeCodesFor(targetKey),
             },
         );
     });
 
-    // A FULL batch means there is more behind it: remember where we stopped.
-    // A short batch means the window is exhausted, so the next run starts over
-    // from the oldest line — which is what re-checks everything for closes.
-    const batchWasFull = windowLines.length === MAX_BANK_LINES;
-    const lastId = windowLines.length > 0 ? windowLines[windowLines.length - 1].id : null;
-    await writeCursor(batchWasFull ? lastId : null);
+    return { summary, undecided: plan.undecided.length };
+}
+
+/** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
+function ymdDaysBefore(now: Date, days: number): string {
+    return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
+}
+
+export async function GET(request: Request) {
+    if (!isCronAuthorized(request)) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    const now = new Date();
+    // A DURABLE lease, held for the whole reconciliation. The old advisory
+    // claim released before any work began and excluded nothing.
+    const leaseToken = randomUUID();
+    if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
+        return NextResponse.json({ ok: true, skipped: "already-running" });
+    }
+    try {
+        return await runSweep(now);
+    } finally {
+        await releaseLease(LEASE_KEY, leaseToken);
+    }
+}
+
+async function runSweep(now: Date) {
+    const windowStart = ymdDaysBefore(now, LOOKBACK_DAYS);
+    const windowEnd = now.toISOString().slice(0, 10);
+
+    // Every bank-line issue, open OR cleared. The open ones say what may need
+    // closing; the cleared ones carry resolutions that must not be re-asked.
+    const allIssues = await prisma.reviewIssue.findMany({
+        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
+        select: { targetKey: true, clearedAt: true, displayDetails: true },
+    });
+    const openIssues = allIssues.filter(issue => issue.clearedAt === null);
+    // ONE query for every issue in the sweep, parsed once and reused by every
+    // batch — the bulk half of the lifecycle work. The per-issue FRESH read
+    // before each write stays: it is what stops a memo signed mid-run from
+    // being un-answered, and no amount of bulking is worth losing that.
+    const detailsByKey = new Map(
+        allIssues.map(issue => [issue.targetKey, parseMissingReceiptDetails(issue.displayDetails)]),
+    );
+    const resolvedIssueKeys = allIssues
+        .filter(issue => hasResolution(parseMissingReceiptDetails(issue.displayDetails)))
+        .map(issue => issue.targetKey);
+
+    // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
+    //
+    // One 2,000-line pass could not finish inside maxDuration on a real
+    // backlog, and being killed mid-pass wrote no cursor at all — so the next
+    // run started from the same place and died at the same point, forever. Now
+    // each batch is small, the cursor is checkpointed after every one, and the
+    // run exits cleanly when the budget is spent. The 15-minute schedule drains
+    // whatever is left.
+    const startedAt = Date.now();
+    let cursor = await readCursor();
+    const totals: ReceiptRequestApplySummary = {
+        opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
+    };
+    let batches = 0;
+    let linesSeen = 0;
+    let undecided = 0;
+    let exhausted = false;
+
+    while (Date.now() - startedAt < RUN_BUDGET_MS) {
+        const batch = await prisma.bankLine.findMany({
+            where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
+            orderBy: [{ postedDate: "asc" }, { id: "asc" }],
+            take: BATCH_SIZE,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        });
+        if (batch.length === 0) { exhausted = true; break; }
+
+        const outcome = await processBatch(batch, openIssues, resolvedIssueKeys, detailsByKey, now);
+        batches++;
+        linesSeen += batch.length;
+        undecided += outcome.undecided;
+        totals.opened += outcome.summary.opened;
+        totals.closed += outcome.summary.closed;
+        totals.touched += outcome.summary.touched;
+        totals.skipped += outcome.summary.skipped;
+        totals.errors += outcome.summary.errors;
+        totals.failedTargets.push(...outcome.summary.failedTargets);
+
+        // THE CURSOR STOPS AT THE FIRST FAILURE. Advancing past a target whose
+        // write threw is how a row that fails every night is never chased: the
+        // sweep would step over it forever and report a clean run. A failed
+        // batch keeps its cursor so the next invocation retries the same
+        // ground; the lifecycle writes are idempotent, so re-running is free.
+        if (outcome.summary.errors > 0) break;
+
+        cursor = batch[batch.length - 1].id;
+        await writeCursor(cursor);
+        if (batch.length < BATCH_SIZE) { exhausted = true; break; }
+    }
+
+    // A finished sweep starts over from the oldest line next time — that pass
+    // is what re-checks everything for CLOSES.
+    if (exhausted && totals.errors === 0) await writeCursor(null);
 
     const result = {
-        ok: true,
+        ok: totals.errors === 0,
         window: { start: windowStart, end: windowEnd },
-        resumedFrom: resumeFrom,
-        moreToProcess: batchWasFull,
-        bankLines: bankLineRows.length,
-        candidates: plan.open.length,
-        ...summary,
+        batches,
+        bankLines: linesSeen,
+        undecided,
+        exhausted,
+        moreToProcess: !exhausted,
+        cursor,
+        elapsedMs: Date.now() - startedAt,
+        ...totals,
     };
-    if (summary.opened > 0 || summary.closed > 0) {
+    if (totals.errors > 0) {
+        console.error("[cron/receipt-requests]", JSON.stringify(result));
+    } else if (totals.opened > 0 || totals.closed > 0) {
         console.log("[cron/receipt-requests]", JSON.stringify(result));
     }
-    return NextResponse.json(result);
+    // 500 when anything failed, so the platform surfaces it. Whatever committed
+    // stays committed and the cursor did not move past the failure.
+    return NextResponse.json(result, { status: result.ok ? 200 : 500 });
 }
