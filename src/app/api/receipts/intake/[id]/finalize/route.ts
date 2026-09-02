@@ -12,6 +12,7 @@ import {
     sealAndPublish,
 } from "@/lib/receipt-intake/stored-object";
 import {
+    authorizeEffectiveProject,
     authorizePhase,
     mergeCapturedFields,
     reconcileLateFields,
@@ -57,31 +58,38 @@ async function applyLateFields(
             });
             return count;
         },
-        authorize: projectId => authorizeLateFields(auth, projectId, lateFields),
+        authorize: projectId => authorizeFinalization(auth, projectId, lateFields),
     });
     return denial ? NextResponse.json(denial.body, { status: denial.status }) : null;
 }
 
 /**
- * A caller may only attach a job it can actually reach, and only a phase that
- * belongs to that job.
+ * A caller may only finalize against a job it can actually reach, and may only
+ * attach a phase that belongs to that job.
  *
  * Without the first check any authenticated user could file a receipt against
- * any project by id. Without the second, a cost code from another job rides
- * into the Expense and every variance report reads it as overspend on a line
- * nobody budgeted.
+ * any project by id — and, before this authorized the EFFECTIVE project rather
+ * than only a supplied one, a user whose access had been revoked could still
+ * publish and phase their existing row on that job simply by not mentioning it.
+ * Without the second, a cost code from another job rides into the Expense and
+ * every variance report reads it as overspend on a line nobody budgeted.
  */
-async function authorizeLateFields(
+async function authorizeFinalization(
     auth: Extract<IntakeAuth, { ok: true }>,
     rowProjectId: string | null,
     lateFields: LateFields,
 ): Promise<Denial | null> {
     const projectId = lateFields.projectId ?? rowProjectId;
 
-    if (lateFields.projectId && auth.via === "session") {
-        if (!(await userCanAccessProject(auth.user, lateFields.projectId))) {
-            return { status: 403, body: { ok: false, reason: "forbidden" } };
-        }
+    // EVERY session call, not just the ones carrying a project. The shared
+    // secret is a trusted forwarder with no user to scope by.
+    if (auth.via === "session") {
+        const forbidden = await authorizeEffectiveProject(
+            rowProjectId,
+            lateFields.projectId ?? null,
+            candidate => userCanAccessProject(auth.user, candidate),
+        );
+        if (forbidden) return forbidden;
     }
 
     // Same rule, same implementation, as /start applies to a phase supplied
@@ -152,7 +160,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!maySee) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
 
     // Authorize the late fields BEFORE anything is written or published.
-    const denied = await authorizeLateFields(auth, row.projectId, lateFields);
+    const denied = await authorizeFinalization(auth, row.projectId, lateFields);
     if (denied) return NextResponse.json(denied.body, { status: denied.status });
 
     // A LATE finalize on a row the sweeper already parked file-missing is a
@@ -276,7 +284,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // AND THE RESULTING TUPLE IS VALIDATED, not the supplied half of it.
     //
-    // authorizeLateFields above only saw what this REQUEST carried. A finalize
+    // authorizeFinalization above only saw what this REQUEST carried. A finalize
     // that sends projectId=B against a phase captured for job A supplies a
     // project that is fine on its own and a phase it never mentions — and the
     // row ends up filed under B's job with A's phase. The check has to be on

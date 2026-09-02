@@ -263,3 +263,36 @@ export function mergeCapturedFields(
         from: { projectId: project.from, costCodeId: phase.from },
     };
 }
+
+/**
+ * The project this finalization actually touches — checked on EVERY session
+ * call, not only when the request supplies a new one.
+ *
+ * The old rule authorized `lateFields.projectId` and nothing else, so access was
+ * only ever re-checked when the caller happened to send a project. A user whose
+ * access to a job had been revoked could still finalize (publish) their existing
+ * row on that job, and still attach a phase to it, because the request named no
+ * project at all — the row already had one. Revocation has to bite on the
+ * EFFECTIVE project: what the row will hold when this call is done.
+ *
+ * A row with no project either way is nothing to authorize: there is no job to
+ * be revoked from. Ownership of the row itself is a separate check.
+ */
+export async function authorizeEffectiveProject(
+    storedProjectId: string | null,
+    lateProjectId: string | null,
+    canAccessProject: (projectId: string) => Promise<boolean>,
+): Promise<Denial | null> {
+    const effective = lateProjectId ?? storedProjectId;
+    if (!effective) return null;
+    if (await canAccessProject(effective)) return null;
+    return {
+        status: 403,
+        body: {
+            ok: false,
+            reason: "forbidden",
+            error: "project-forbidden",
+            projectId: effective,
+        },
+    };
+}

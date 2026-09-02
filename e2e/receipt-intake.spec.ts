@@ -1085,6 +1085,45 @@ test.describe("round-10 finalize authorization and recovery", () => {
         expect((await res.json()).error).toBe("cost-code-without-project");
     });
 
+    test("a user with no access to the row's OWN job cannot finalize it", async ({ playwright, request }) => {
+        // Revocation has to bite on the project the ROW holds, not only on one
+        // the request supplies. Before this, a user whose access was revoked
+        // could still publish their existing row on that job — and attach a
+        // phase to it — simply by not mentioning the project.
+        const created = await postIntake(request, intakeBody({
+            sourceRef: `${REF_PREFIX}revoked`, projectId: "e2e-scope-oos-project",
+        }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+
+        // The row is THEIRS (so the ownership check passes and this test is
+        // about project access, not about a guessed id), on a job
+        // contract-staff has no ProjectAccess for.
+        const owner = await prisma.user.findUnique({ where: { email: "contract-staff@test.local" } });
+        expect(owner, "contract-staff fixture must exist").toBeTruthy();
+        await prisma.receiptIntake.update({ where: { id }, data: { createdById: owner!.id } });
+
+        const employee = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: "e2e/.auth/contract-user.json",
+        });
+        const res = await employee.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json" },
+            // No projectId in the body: the row already has one, and that is
+            // the whole point of the case.
+            data: JSON.stringify({ costCodeId: "e2e-mob-cc-demo" }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(403);
+        expect((await res.json()).error).toBe("project-forbidden");
+        // NOTHING written: the gate runs before any late field is applied.
+        const after = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(after?.costCodeId).toBeNull();
+        expect(after?.projectId).toBe("e2e-scope-oos-project");
+        await employee.dispose();
+    });
+
     test("a cost code that is not a phase of THIS job is refused", async ({ request }) => {
         // The row has a job, and the phase is not one of its phases. Neither
         // half is malformed — the PAIR is wrong, and letting it through files

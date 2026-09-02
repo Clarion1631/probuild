@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
+    authorizeEffectiveProject,
     authorizePhase,
     mergeCapturedFields,
     reconcileLateFields,
@@ -316,4 +317,67 @@ test("losing the publish CAS on a STAGING row is a conflict, NOT alreadyFinalize
     assert.match(body, /current\.state === "STAGING"/);
     assert.match(body, /publish-conflict/);
     assert.match(body, /status: 409/);
+});
+
+// ── Revocation has to bite on the row's OWN project (Phase 3 gate) ──────────
+
+test("a revoked user is refused on the project the ROW already holds", async () => {
+    // The hole: access was only re-checked when the request supplied a project.
+    // A user whose access to a job was revoked could still finalize — publish —
+    // their existing row on that job, and still attach a phase to it, simply by
+    // not mentioning the project the row already had.
+    const looked: string[] = [];
+    const denial = await authorizeEffectiveProject("proj-a", null, async id => {
+        looked.push(id);
+        return false;
+    });
+    assert.deepEqual(looked, ["proj-a"], "the STORED project is what gets checked");
+    assert.equal(denial?.status, 403);
+    assert.equal(denial?.body.error, "project-forbidden");
+    assert.equal(denial?.body.projectId, "proj-a");
+});
+
+test("a user who still has access passes, and a supplied project wins", async () => {
+    assert.equal(await authorizeEffectiveProject("proj-a", null, async () => true), null);
+
+    // The effective project is what the row will HOLD: a supplied one replaces
+    // the stored one, so that is the one to authorize.
+    const looked: string[] = [];
+    assert.equal(
+        await authorizeEffectiveProject("proj-a", "proj-b", async id => { looked.push(id); return true; }),
+        null,
+    );
+    assert.deepEqual(looked, ["proj-b"]);
+});
+
+test("no project either way is nothing to authorize — and no lookup", async () => {
+    let looked = 0;
+    assert.equal(
+        await authorizeEffectiveProject(null, null, async () => { looked++; return false; }),
+        null,
+    );
+    assert.equal(looked, 0, "there is no job to be revoked from");
+});
+
+test("finalize authorizes the effective project on EVERY session call, before any write", () => {
+    const finalize = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    // Unconditional for a session caller — NOT gated on the request carrying a
+    // project, which is exactly what let a revoked user through.
+    assert.match(
+        finalize,
+        /if \(auth\.via === "session"\) \{\s*\r?\n\s*const forbidden = await authorizeEffectiveProject\(/,
+    );
+    assert.ok(
+        !/if \(lateFields\.projectId && auth\.via === "session"\)/.test(finalize),
+        "the supplied-project-only check is gone",
+    );
+    // And it runs before anything can be written or published.
+    const gate = finalize.indexOf("const denied = await authorizeFinalization(auth, row.projectId");
+    assert.notEqual(gate, -1);
+    for (const write of ["await applyLateFields(", "await sealAndPublish(", "rejectRowAndQueueCleanup("]) {
+        assert.ok(gate < finalize.indexOf(write), `the gate precedes ${write}`);
+    }
 });
