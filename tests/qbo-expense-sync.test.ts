@@ -1102,7 +1102,7 @@ test("a connection-level attach failure stops the rest and marks the run incompl
     assert.ok(result.imported >= 1, "the import itself is unaffected");
 });
 
-test("an ordinary attach failure does NOT stop the rest", async () => {
+test("an ordinary attach failure does not stop the rest, but IS counted", async () => {
     const fake = createFakePrisma();
     const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }];
     const attempted: string[] = [];
@@ -1118,7 +1118,11 @@ test("an ordinary attach failure does NOT stop the rest", async () => {
     const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies as never);
 
     assert.equal(attempted.length, purchases.length, "a per-purchase problem is not an outage");
-    assert.equal(result.attachmentsIncomplete, undefined);
+    // Codex gate: this used to assert attachmentsIncomplete stayed undefined,
+    // codifying a false green — a whole run of receipts that never landed
+    // reported a perfectly clean sync. The run continues, but it is honest.
+    assert.equal(result.attachmentsIncomplete, true);
+    assert.equal(result.attachmentsSkipped, purchases.length);
 });
 
 
@@ -1146,4 +1150,29 @@ test("the attachment download classifies its response like every other QBO call"
         const error = await qboResponseError(new Response("nope", { status }), "QBO attachment download");
         assert.equal(qboHttpStatus(error), status, `status ${status} should stay terminal`);
     }
+});
+
+
+test("a receipt QBO HAS but we cannot store is counted, while a purchase with no receipt is not", async () => {
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }];
+
+    // "no-attachment" is the normal case for most purchases and must NOT make
+    // the run partial; "attachment-unavailable" means there IS a receipt we
+    // failed to store, and must.
+    const clean = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async () => "no-attachment",
+    };
+    const cleanResult = await syncQboExpenses({ since: new Date("2026-01-01") }, clean as never);
+    assert.equal(cleanResult.attachmentsIncomplete, undefined, "no receipt in QBO is not a failure");
+
+    const fake2 = createFakePrisma();
+    const unavailable = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake2.client, write)),
+        attachReceipt: async () => "attachment-unavailable",
+    };
+    const unavailableResult = await syncQboExpenses({ since: new Date("2026-01-01") }, unavailable as never);
+    assert.equal(unavailableResult.attachmentsIncomplete, true, "a receipt we could not store is");
+    assert.ok((unavailableResult.attachmentsSkipped ?? 0) >= 1);
 });

@@ -787,12 +787,12 @@ export async function ensureQBCustomer(
 const QB_SERVICE_ITEM_NAME = "Construction Services";
 
 /** Find or create the Service item used for all ProBuild invoice lines. */
-export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
-    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`);
+export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDeadline): Promise<string> {
+    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`, deadline);
     if (items.length > 0) return items[0].Id;
 
     // Need an income account to hang the item on — prefer an existing Income account.
-    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`);
+    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`, deadline);
     let incomeAccountId: string;
     if (accounts.length > 0) {
         incomeAccountId = accounts[0].Id;
@@ -879,9 +879,10 @@ export async function createQBMilestoneInvoice(
 }
 
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
-export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string): Promise<string | null> {
+export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
     const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
         headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
     });
     if (!res.ok) return null;
@@ -896,8 +897,8 @@ export interface QBInvoiceStatus {
 }
 
 /** Read a QBO invoice's balance + linked payment transactions. */
-export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string): Promise<QBInvoiceStatus | null> {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<QBInvoiceStatus | null> {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!res.ok) return null;
     const data = await res.json();
     const inv = data.Invoice;
@@ -1186,12 +1187,13 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Prom
 }
 
 /** Hard-delete an invoice (test cleanup). Fails in QBO if payments are still linked. */
-export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<boolean> {
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<boolean> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv) return false;
     const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/invoice?operation=delete&minorversion=73`,
         {
+            qbDeadline: deadline,
             method: "POST",
             headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json", "Content-Type": "application/json" },
             body: JSON.stringify({ Id: qbInvoiceId, SyncToken: inv.syncToken }),
@@ -1335,6 +1337,7 @@ export async function getQBPurchasesSince(
 export async function getQBPurchaseChangesSince(
     tokens: QBTokens,
     since: Date,
+    deadline?: RouteDeadline,
 ): Promise<any[]> {
     if (!Number.isFinite(since.getTime())) {
         throw new Error("QBO Purchase CDC requires a valid since date");
@@ -1348,6 +1351,7 @@ export async function getQBPurchaseChangesSince(
     const response = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
         {
+            qbDeadline: deadline,
             headers: {
                 Authorization: `Bearer ${tokens.accessToken}`,
                 Accept: "application/json",

@@ -341,16 +341,20 @@ export async function readQboPurchasesForImport(
     tokens: QBTokens,
     since: Date,
     until?: Date,
+    deadline?: RouteDeadline,
 ): Promise<QboPurchaseReadResult> {
-    const rows = await getQBPurchasesSince(tokens, since, until);
+    // getQBPurchasesSince pages internally; the budget goes with it so a long
+    // backfill stops between pages instead of at the platform's ceiling.
+    const rows = await getQBPurchasesSince(tokens, since, until, deadline);
     return normalizeQboPurchaseRows(rows);
 }
 
 export async function readQboPurchaseChangesForImport(
     tokens: QBTokens,
     since: Date,
+    deadline?: RouteDeadline,
 ): Promise<QboPurchaseReadResult> {
-    const rows = await getQBPurchaseChangesSince(tokens, since);
+    const rows = await getQBPurchaseChangesSince(tokens, since, deadline);
     return normalizeQboPurchaseRows(rows);
 }
 
@@ -757,18 +761,23 @@ function classifyPurchaseOutcome(
 }
 
 export interface QboExpenseSyncDependencies {
-    getTokens(): Promise<QBTokens>;
+    getTokens(deadline?: RouteDeadline): Promise<QBTokens>;
     readPurchases(
         tokens: QBTokens,
         since: Date,
         mode: "incremental" | "backfill",
         until?: Date,
+        deadline?: RouteDeadline,
     ): Promise<QboPurchaseReadResult>;
     listProjects(): Promise<QboExpenseProjectCandidate[]>;
     upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
     deactivateExpense(write: QboExpenseRemovalWrite): Promise<QboExpenseRemovalResult>;
     /** Optional: copy the QBO receipt attachment into ProBuild storage for this purchase. */
-    attachReceipt?(tokens: QBTokens, qbPurchaseId: string, deadline?: RouteDeadline): Promise<void>;
+    /**
+     * Resolves with the outcome so the caller can count failures; a THROW is a
+     * connection-level failure that stops the remaining attachment work.
+     */
+    attachReceipt?(tokens: QBTokens, qbPurchaseId: string, deadline?: RouteDeadline): Promise<unknown>;
     upsertPurchaseClassification(write: QboPurchaseClassificationWrite): Promise<void>;
     now(): Date;
 }
@@ -837,10 +846,10 @@ async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
 function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
     return {
         getTokens: getFreshQBTokens,
-        readPurchases: (tokens, since, mode, until) =>
+        readPurchases: (tokens, since, mode, until, deadline) =>
             mode === "incremental"
-                ? readQboPurchaseChangesForImport(tokens, since)
-                : readQboPurchasesForImport(tokens, since, until),
+                ? readQboPurchaseChangesForImport(tokens, since, deadline)
+                : readQboPurchasesForImport(tokens, since, until, deadline),
         listProjects: listInProgressProjects,
         upsertExpense: write =>
             upsertQboExpense(
@@ -854,7 +863,7 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
             ),
         attachReceipt: async (tokens, qbPurchaseId, deadline) => {
             const { attachQboReceipt } = await import("./qbo-receipt-attachments");
-            await attachQboReceipt(tokens, qbPurchaseId, deadline);
+            return await attachQboReceipt(tokens, qbPurchaseId, deadline);
         },
         upsertPurchaseClassification: write =>
             upsertQboPurchaseClassification(
@@ -937,13 +946,14 @@ export async function syncQboExpenses(
         }
     }
 
-    const tokens = runtime.tokens ?? await dependencies.getTokens();
     // 280s under the route's 300s ceiling, leaving room to persist what was
-    // imported and report the outcome instead of being killed mid-sync.
+    // imported and report the outcome instead of being killed mid-sync. Set
+    // BEFORE the token fetch so the refresh spends the same budget.
     const deadline = runtime.deadline ?? createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
+    const tokens = runtime.tokens ?? await dependencies.getTokens(deadline);
     const mode = options.mode ?? "backfill";
     const [purchaseRead, projects] = await Promise.all([
-        dependencies.readPurchases(tokens, options.since, mode, options.until),
+        dependencies.readPurchases(tokens, options.since, mode, options.until, deadline),
         dependencies.listProjects(),
     ]);
     const result: QboExpenseSyncResult = {
@@ -1016,6 +1026,10 @@ export async function syncQboExpenses(
     const overheadEstimateId =
         overheadTarget?.kind === "matched" ? overheadTarget.estimateId : null;
 
+    // Set only by a connection-level failure or an exhausted budget: those
+    // make every further attempt pointless. Ordinary failures are counted but
+    // never stop the sweep.
+    let stopAttachments = false;
     const attachReceipt = async (qbPurchaseId: string) => {
         // Attempt for every processed purchase: the helper exits after one
         // indexed read when a receipt is already linked, and retrying here is
@@ -1023,19 +1037,34 @@ export async function syncQboExpenses(
         if (!dependencies.attachReceipt) return;
         // Once QBO has stopped answering, every further attachment costs a full
         // deadline to learn the same thing. Stop, and count what we gave up on.
-        if (result.attachmentsIncomplete) {
+        // Keyed on a CONNECTION-level stop, not on the failure counter: an
+        // ordinary per-purchase failure marks the run incomplete but must not
+        // abandon the receipts after it.
+        if (stopAttachments) {
             result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
             return;
         }
         if (isBudgetExhausted(deadline)) {
+            stopAttachments = true;
             result.attachmentsIncomplete = true;
             result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
             return;
         }
         try {
-            await dependencies.attachReceipt(tokens, qbPurchaseId, deadline);
+            const outcome = await dependencies.attachReceipt(tokens, qbPurchaseId, deadline);
+            // A receipt QBO HAS and we could not store is a failure, even
+            // though nothing threw. Counting only thrown errors let a run of
+            // unusable downloads report a perfectly clean sync — false green
+            // over exactly the receipts a human needs to know about.
+            const { isAttachmentFailure } = await import("./qbo-receipt-attachments");
+            if (typeof outcome === "string" && isAttachmentFailure(outcome as never)) {
+                result.attachmentsIncomplete = true;
+                result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
+                console.error("QBO receipt attach unavailable", qbPurchaseId, outcome);
+            }
         } catch (error) {
             if (isQboConnectionFailure(error) || isQBBudgetExhaustedError(error)) {
+                stopAttachments = true;
                 result.attachmentsIncomplete = true;
                 result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
                 console.error(
@@ -1044,6 +1073,10 @@ export async function syncQboExpenses(
                 );
                 return;
             }
+            // Any other throw (a failed Supabase upload, a missing public
+            // URL, a 4xx download) is still a receipt that did not land.
+            result.attachmentsIncomplete = true;
+            result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
             console.error(
                 "QBO receipt attach failed",
                 qbPurchaseId,

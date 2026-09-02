@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, isAdminOrManager } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
-import { skippedAuditSummary, syncQboExpenses } from "@/lib/qbo-expense-sync";
+import { skippedAuditSummary, syncQboExpenses, QBO_EXPENSE_SYNC_BUDGET_MS } from "@/lib/qbo-expense-sync";
+import { createRouteDeadline } from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
@@ -39,7 +40,10 @@ export async function POST() {
     const since = new Date(Date.now() - lookbackDays() * 86_400_000);
     const source = `manual:${user.id}`;
     try {
-        const tokens = await getFreshQBTokens();
+        // At entry, before the refresh: the refresh is itself a QBO round trip
+        // on this route's ceiling.
+        const deadline = createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
+        const tokens = await getFreshQBTokens(deadline);
         const result = await syncQboExpenses(
             {
                 since,
@@ -55,9 +59,12 @@ export async function POST() {
             deactivated: result.removed,
             skipped: result.skipped.length,
         };
+        // A run that could not land every receipt did not finish cleanly.
+        const incomplete = result.attachmentsIncomplete === true;
         await logAutomationEvent({
             kind: "qbo-sync",
-            status: "ok",
+            status: incomplete ? "partial" : "ok",
+            reason: incomplete ? "attachments-incomplete" : undefined,
             source,
             detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });

@@ -17,7 +17,21 @@ export type QboReceiptAttachResult =
     | "no-expense"
     | "already-linked"
     | "no-attachment"
+    /**
+     * QBO HAD a usable-looking attachment for this purchase and we still could
+     * not store it — no download URL on the candidate, or a body that came back
+     * empty/oversized. Distinct from "no-attachment" (QuickBooks simply has no
+     * receipt here, which is the normal case for most purchases and is not a
+     * failure) so a run can report the difference instead of counting every
+     * receipt-less purchase as broken.
+     */
+    | "attachment-unavailable"
     | "storage-unavailable";
+
+/** Outcomes that mean a receipt SHOULD have been stored and was not. */
+export function isAttachmentFailure(result: QboReceiptAttachResult): boolean {
+    return result === "attachment-unavailable" || result === "storage-unavailable";
+}
 
 export async function attachQboReceipt(
     tokens: QBTokens,
@@ -47,7 +61,10 @@ export async function attachQboReceipt(
             return (right.Size ?? 0) - (left.Size ?? 0);
         });
     const attachment = candidates[0];
-    if (!attachment?.TempDownloadUri) return "no-attachment";
+    if (!attachment) return "no-attachment"; // QBO has no receipt for this purchase
+    // A candidate that survived the filters but carries no download URL is an
+    // anomaly, not an absence: there IS a receipt and we cannot fetch it.
+    if (!attachment.TempDownloadUri) return "attachment-unavailable";
 
     // QBO-issued temp URL: same unbounded-hang risk as the API itself, and the
     // same run budget — a slow download is still time the sync cannot spend.
@@ -62,7 +79,8 @@ export async function attachQboReceipt(
     }
     const bytes = Buffer.from(await download.arrayBuffer());
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_ATTACHMENT_BYTES) {
-        return "no-attachment";
+        // The file exists in QBO but what came back is unusable.
+        return "attachment-unavailable";
     }
 
     const safeName = (attachment.FileName ?? "receipt").replace(/[^a-zA-Z0-9._-]/g, "_");

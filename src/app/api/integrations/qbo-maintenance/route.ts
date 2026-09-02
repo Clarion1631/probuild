@@ -99,7 +99,7 @@ export async function POST(req: Request) {
         }
         const { pushMilestoneToQuickBooks } = await import("@/lib/quickbooks-payments");
         try {
-            const res = await pushMilestoneToQuickBooks(body.paymentScheduleId);
+            const res = await pushMilestoneToQuickBooks(body.paymentScheduleId, undefined, deadline);
             return NextResponse.json({ ok: true, ...res });
         } catch (e) {
             return NextResponse.json({ ok: false, reason: e instanceof Error ? e.message.slice(0, 300) : "push failed" }, { status: 500 });

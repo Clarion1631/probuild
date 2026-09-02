@@ -197,14 +197,18 @@ export async function claimQBInvoiceUnlink(
 
 // Exported for stageProgressBillingToQuickBooksCore (src/lib/progress-billing.ts),
 // which needs the same customer/item resolution pushMilestoneToQuickBooks uses.
-export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
+export async function resolveCustomerAndItem(
+    tokens: QBTokens,
+    clientId: string,
+    deadline?: RouteDeadline,
+): Promise<{ customerId: string; itemId: string }> {
     const client = await prisma.client.findUnique({
         where: { id: clientId },
         select: { id: true, name: true, email: true, qbCustomerId: true },
     });
     if (!client) throw new Error("Client not found");
 
-    const customerId = await ensureQBCustomer(tokens, client);
+    const customerId = await ensureQBCustomer(tokens, client, deadline);
     if (customerId !== client.qbCustomerId) {
         await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
     }
@@ -212,7 +216,7 @@ export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string)
     const qb = await getQBSettings();
     let itemId = qb.serviceItemId;
     if (!itemId) {
-        itemId = await ensureQBServiceItem(tokens);
+        itemId = await ensureQBServiceItem(tokens, deadline);
         await saveQBSettings({ serviceItemId: itemId });
     }
     return { customerId, itemId };
@@ -228,7 +232,19 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
-export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passedTokens?: QBTokens): Promise<MilestonePushResult> {
+export async function pushMilestoneToQuickBooks(
+    paymentScheduleId: string,
+    passedTokens?: QBTokens,
+    /**
+     * Whole-push budget. This is six serial QBO calls on a bad day — refresh,
+     * customer, service item, invoice create, payment link, status — plus a
+     * compensating delete if the link write fails. Individually bounded is not
+     * enough; without a shared budget the SUM still runs past the caller's
+     * ceiling, and being killed between the invoice create and the DB write is
+     * exactly how an orphaned QBO invoice happens.
+     */
+    deadline?: RouteDeadline,
+): Promise<MilestonePushResult> {
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentScheduleId },
         include: {
@@ -260,11 +276,11 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         );
     }
 
-    const tokens = passedTokens ?? await getFreshQBTokens();
+    const tokens = passedTokens ?? await getFreshQBTokens(deadline);
 
     if (schedule.qbInvoiceId) {
-        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId));
-        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId);
+        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, deadline));
+        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId, deadline);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
         // A reachable invoice (status read back) clears any stale voided/notFound flag.
         const clearFlag = !!status && !!schedule.qbSyncError;
@@ -281,7 +297,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     }
 
     const invoice = schedule.invoice;
-    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
+    const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, deadline);
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
@@ -326,7 +342,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
     }
 
-    const payLink = await getQBInvoicePaymentLink(tokens, qbId);
+    const payLink = await getQBInvoicePaymentLink(tokens, qbId, deadline);
 
     // Conditional link write: the milestone was read as unlinked and unpaid at
     // the top, but this function does several remote calls in between — a manual
@@ -368,7 +384,9 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         });
     }));
     if (linked.count !== 1) {
-        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
+        // The compensating delete runs even on an exhausted budget: leaving an
+        // orphaned QBO invoice behind is worse than one more call.
+        const compensated = await deleteQBInvoice(tokens, qbId, deadline).catch(() => false);
         if (!compensated) {
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
             throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
