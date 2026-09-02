@@ -3,11 +3,11 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
-import { SECURE_BUCKET, removeSecureDoc, toSecureRef } from "@/lib/secure-storage";
+import { SECURE_BUCKET } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
-import { authenticateIntake, STAFF_READ_ROLES } from "@/lib/receipt-intake/intake-auth";
+import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { EXT_BY_MIME, MAX_INTAKE_BYTES, sniffMime } from "@/lib/receipt-intake/file-type";
-import { listReceiptIntakes, serializeReceiptIntake } from "@/lib/receipt-intake/queries";
+import { ARCHIVE_READABLE_STATES, listReceiptIntakes, serializeReceiptIntake } from "@/lib/receipt-intake/queries";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -26,12 +26,25 @@ export const maxDuration = 30;
  * handler is the sole auth boundary — see src/lib/receipt-intake/intake-auth.ts.
  *
  * Shadow-week gate: `dryRun` is captured PER ROW at intake time from
- * RECEIPT_INTAKE_DRYRUN (default ON). A row created during the shadow week
- * stays dry-run even if the env flips later — flipping the switch must not
- * retroactively book a backlog nobody reviewed.
+ * RECEIPT_INTAKE_DRYRUN (default ON), so the flag a row was accepted under is
+ * a fact about that row rather than about whenever the worker next looks at
+ * it. At CUTOVER the worker's one-shot `requeueDryRunParked` deliberately
+ * flips the parked backlog to live in a single statement — see
+ * src/lib/receipt-intake/worker.ts. That is the ONLY thing that changes a
+ * row's dryRun after intake.
  */
 
-const VALID_SOURCES = new Set(["mobile", "email", "drive", "chat", "web"]);
+/**
+ * Sources a SHARED-SECRET forwarder may declare. A human caller can never pick
+ * one of these: `source` is provenance, and a browser asserting "this came from
+ * the Drive folder" is a claim it has no standing to make. It also feeds
+ * booking identity — `drive` rows book under the Drive fileId so the DocNumber
+ * stays continuous with v1 — so a forged `source` could aim a Purchase at
+ * another document's idempotency key.
+ */
+const MACHINE_SOURCES = new Set(["drive", "email", "chat"]);
+/** Minted server-side from the authenticated caller, never read off the body. */
+const USER_SOURCES = new Set(["mobile", "web"]);
 
 interface ParsedBody {
     bytes: Buffer;
@@ -109,20 +122,34 @@ export async function POST(req: Request) {
     const parsed = await parseBody(req);
     if (parsed instanceof NextResponse) return parsed;
 
-    if (!VALID_SOURCES.has(parsed.source)) return bad("invalid-source");
-
     const mimeType = sniffMime(parsed.bytes, parsed.declaredMime);
     if (!mimeType) return bad("unsupported-file-type");
 
-    // A machine caller OWNS its idempotency key — it is the only thing that
-    // makes a forwarder replay free. A human upload has no natural key, so one
-    // is minted; two taps of the button are two documents, which is correct.
-    let sourceRef = parsed.sourceRef;
+    // PROVENANCE AND IDENTITY ARE NOT CALLER INPUT for a human.
+    //
+    // A shared-secret forwarder owns both: its `sourceRef` is the only reason a
+    // replay is free, and its `source` is a fact it genuinely knows (which
+    // folder, which mailbox). A session or Bearer caller knows neither. Letting
+    // one pass `source: "drive"` plus a chosen `sourceRef` would let it claim
+    // another document's idempotency key — and `drive` rows book under the
+    // Drive fileId, so that key is what a QBO DocNumber is derived from.
+    let source: string;
+    let sourceRef: string;
     if (auth.via === "secret") {
-        if (!sourceRef) return bad("missing-sourceRef");
+        if (!MACHINE_SOURCES.has(parsed.source)) return bad("invalid-source");
+        if (!parsed.sourceRef) return bad("missing-sourceRef");
+        source = parsed.source;
+        sourceRef = parsed.sourceRef;
     } else {
-        sourceRef = sourceRef ?? `${parsed.source === "mobile" ? "mobile" : "web"}:${randomUUID()}`;
+        source = auth.userVia === "mobile-jwt" ? "mobile" : "web";
+        // Reject rather than silently ignore: a client that thinks it set the
+        // key would otherwise believe its retries were idempotent when every
+        // one of them creates a new document.
+        if (parsed.sourceRef) return bad("sourceRef-not-allowed");
+        if (parsed.source && parsed.source !== source) return bad("invalid-source");
+        sourceRef = `${source}:${randomUUID()}`;
     }
+    if (!USER_SOURCES.has(source) && !MACHINE_SOURCES.has(source)) return bad("invalid-source");
 
     // A session/Bearer caller may only file against a project they can reach.
     // The secret caller is a trusted forwarder resolving the project from the
@@ -137,24 +164,26 @@ export async function POST(req: Request) {
     const storagePath = `receipts/intake/${id}.${ext}`;
     const fileSha256 = createHash("sha256").update(parsed.bytes).digest("hex");
 
-    const supabase = getSupabase();
-    if (!supabase) {
-        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-    }
-    const upload = await supabase.storage
-        .from(SECURE_BUCKET)
-        .upload(storagePath, parsed.bytes, { contentType: mimeType, upsert: false });
-    if (upload.error) {
-        console.error("[receipts/intake] upload failed", upload.error.message);
-        return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
-    }
-
+    // ROW FIRST, THEN THE OBJECT.
+    //
+    // Uploading first meant a replayed `sourceRef` had already written a second
+    // object into the private bucket before the insert failed, and the cleanup
+    // was best-effort. Worse, it made the two cases indistinguishable: a genuine
+    // forwarder retry and a REUSED sourceRef carrying different bytes both
+    // landed on the same P2002 and both got a cheerful 200, so a second, real
+    // receipt could be swallowed by the first one's row and never booked.
+    //
+    // Inserting first turns the unique index into the decision point, with
+    // `fileSha256` as the evidence: same bytes is a replay (200, the row you
+    // already have), different bytes is a caller bug (409) — and in the 409
+    // case storage is never touched at all.
+    let created: { id: string; state: string; sourceRef: string; projectId: string | null; dryRun: boolean };
     try {
-        const row = await prisma.receiptIntake.create({
+        created = await prisma.receiptIntake.create({
             data: {
                 id,
-                source: parsed.source,
-                sourceRef: sourceRef!,
+                source,
+                sourceRef,
                 state: "RECEIVED",
                 // Captured per row, never read from env again after this point.
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
@@ -173,30 +202,94 @@ export async function POST(req: Request) {
             },
             select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
         });
-        return NextResponse.json({ ok: true, ...row });
     } catch (error) {
-        // The forwarder replayed a document we already hold. Return the row it
-        // already has — a non-200 here would make it retry forever.
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-            await removeSecureDoc(toSecureRef(storagePath)).catch(() => { /* best effort */ });
-            const existing = await prisma.receiptIntake.findUnique({
-                where: { sourceRef: sourceRef! },
-                select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
-            });
-            if (existing) return NextResponse.json({ ok: true, alreadyReceived: true, ...existing });
+            return respondToSourceRefConflict(auth, sourceRef, fileSha256);
         }
         // A projectId/costCodeId that doesn't exist is the CALLER's mistake, so
         // it must be a deterministic 400 — a 500 would make a forwarder retry a
         // payload that can never succeed.
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
-            await removeSecureDoc(toSecureRef(storagePath)).catch(() => { /* best effort */ });
             return bad("unknown-project-or-cost-code");
         }
-        // Never orphan the object: the row that would have pointed at it does
-        // not exist.
-        await removeSecureDoc(toSecureRef(storagePath)).catch(() => { /* best effort */ });
         throw error;
     }
+
+    const supabase = getSupabase();
+    if (!supabase) {
+        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+    }
+    const upload = await supabase.storage
+        .from(SECURE_BUCKET)
+        .upload(storagePath, parsed.bytes, { contentType: mimeType, upsert: false });
+    if (upload.error) {
+        // Delete the row so the caller's retry is a clean insert rather than a
+        // sourceRef conflict against a row pointing at an object that is not
+        // there. The worker would otherwise park it "file-missing".
+        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        console.error("[receipts/intake] upload failed", upload.error.message);
+        return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
+    }
+
+    return NextResponse.json({ ok: true, ...created });
+}
+
+/**
+ * The sourceRef is already taken. Two very different situations:
+ *
+ *  - SAME bytes  -> the forwarder replayed. Return the row it already has; a
+ *    non-200 would make it retry forever.
+ *  - OTHER bytes -> the caller reused a key for a DIFFERENT document. Answering
+ *    200 would tell it the new receipt was accepted when nothing was stored,
+ *    and that receipt would never be booked. 409, and storage stays untouched.
+ *
+ * Who may see the existing row is a separate question (a minted `web:<uuid>`
+ * can only collide by accident, but a secret-authenticated caller that guessed
+ * a ref must not be able to enumerate other people's rows): only the row's own
+ * creator or a bookkeeping role gets fields back.
+ */
+async function respondToSourceRefConflict(
+    auth: Extract<IntakeAuth, { ok: true }>,
+    sourceRef: string,
+    fileSha256: string,
+): Promise<NextResponse> {
+    const existing = await prisma.receiptIntake.findUnique({
+        where: { sourceRef },
+        select: {
+            id: true, state: true, sourceRef: true, projectId: true,
+            dryRun: true, fileSha256: true, createdById: true,
+        },
+    });
+    // The row vanished between the failed insert and this read (a delete
+    // racing us). Tell the caller to retry rather than inventing an answer.
+    if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
+
+    if (existing.fileSha256 !== fileSha256) {
+        return NextResponse.json(
+            { ok: false, error: "sourceRef-conflict", existingId: existing.id },
+            { status: 409 },
+        );
+    }
+
+    const maySee =
+        auth.via === "secret" ||
+        existing.createdById === auth.user.id ||
+        STAFF_READ_ROLES.includes(auth.user.role);
+    if (!maySee) {
+        // No fields at all: an id or a state would still confirm the row exists.
+        return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
+    }
+
+    return NextResponse.json({
+        ok: true,
+        alreadyReceived: true,
+        id: existing.id,
+        state: existing.state,
+        sourceRef: existing.sourceRef,
+        projectId: existing.projectId,
+        dryRun: existing.dryRun,
+    });
 }
 
 /**
@@ -213,10 +306,24 @@ export async function GET(req: Request) {
     }
 
     const url = new URL(req.url);
+    const state = url.searchParams.get("state");
+
+    // The secret caller is the archive mirror and nothing else. It reads only
+    // the two states it acts on, and only the columns it needs — see
+    // RECEIPT_INTAKE_ARCHIVE_SELECT. Staff sessions are unaffected.
+    const archiveOnly = auth.via === "secret";
+    if (archiveOnly && (!state || !ARCHIVE_READABLE_STATES.has(state))) {
+        return NextResponse.json(
+            { ok: false, reason: "state-not-allowed", allowed: [...ARCHIVE_READABLE_STATES] },
+            { status: 400 },
+        );
+    }
+
     const rows = await listReceiptIntakes({
-        state: url.searchParams.get("state"),
-        projectId: url.searchParams.get("projectId"),
+        state,
+        projectId: archiveOnly ? null : url.searchParams.get("projectId"),
         take: url.searchParams.get("take") ? Number(url.searchParams.get("take")) : null,
+        archiveOnly,
     });
     return NextResponse.json({ ok: true, rows: rows.map(serializeReceiptIntake) });
 }

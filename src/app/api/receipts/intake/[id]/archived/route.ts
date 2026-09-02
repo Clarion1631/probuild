@@ -40,9 +40,27 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
-        select: { id: true, state: true },
+        select: { id: true, state: true, archiveDriveFileId: true },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // IDEMPOTENT REPLAY. The mirror POSTs after writing the Drive file, so a
+    // lost response leaves it holding a file it cannot confirm. Re-sending the
+    // SAME driveFileId is the correct retry and must succeed — answering 409
+    // would make the script treat its own successful archive as a failure and
+    // either re-copy the file or alert a human about nothing.
+    // A DIFFERENT driveFileId on an archived row is not a replay: two Drive
+    // copies exist and somebody has to say which one counts.
+    if (row.state === "ARCHIVED") {
+        if (row.archiveDriveFileId === driveFileId) {
+            return NextResponse.json({ ok: true, id, state: "ARCHIVED", archiveDriveFileId: driveFileId, alreadyArchived: true });
+        }
+        return NextResponse.json(
+            { ok: false, reason: "already-archived", archiveDriveFileId: row.archiveDriveFileId },
+            { status: 409 },
+        );
+    }
+
     if (row.state !== "BOOKED") {
         return NextResponse.json({ ok: false, reason: "not-booked", state: row.state }, { status: 409 });
     }

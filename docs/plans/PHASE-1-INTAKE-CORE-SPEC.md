@@ -282,8 +282,9 @@ Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
      of the same file), else the intake `id`; `fileBase64` via
      `downloadDocBytes(storagePath)`; `projectName` = project.name.
   5. On `ok:true`, one transaction: create `Expense` (estimateId; costCodeId = chosen, else
-     `matchCostCode(suggestedPhaseCode)`; amount = pre-tax amount when tax was split, else
-     total — mirrors the QBO COGS line; vendor; date=txnDate; status "Pending"; receiptUrl
+     `matchCostCode(suggestedPhaseCode)`; **amount = the GROSS total paid, tax INCLUDED**
+     (Justin, 2026-09-01 — this REPLACES the "pre-tax" rule this line used to state; see
+     the as-built note in §7); vendor; date=txnDate; status "Pending"; receiptUrl
      = Drive view URL when a Drive fileId is known, else the `secure:` ref; qbPurchaseId)
      and set the row BOOKED {qbPurchaseId, expenseId, bookedAt}. Also log one
      `AutomationEvent {kind:"receipt-push", source:"intake-worker"}` so the /automation
@@ -374,6 +375,65 @@ against is the one above, with these six clarifications from the build:
    `test/receipt-intake/*.test.mjs`. That is the repo's existing convention (every other
    suite is there and wired into `npm run test:unit`); the rule that mattered — no
    `mock.module`, function injection only, because CI pins Node 20 — is followed.
+
+### Round-1 review changes (2026-09-01)
+
+**DECISION (Justin, overrides §4.5): `Expense.amount` is the GROSS total paid, tax
+included.** The QBO Purchase still splits the sales tax onto its own reclaimable account —
+that is unchanged and it is what the reseller-permit filing reads. But `Expense` has no tax
+column, and the expenses already imported from QuickBooks (`lib/qbo-expense-sync.ts`)
+record the gross line total, so booking pre-tax here would put two meanings of `amount` in
+one table and silently under-count every receipt this pipeline touched. `ReceiptIntake.taxCents`
+keeps the split; Phase 3 adds `Expense.taxAmount` and can derive the pre-tax figure without
+re-reading a single document.
+
+Also changed, all with tests:
+
+- **Dry-run rows are excluded from the claim, not skipped inside it.** The batch is ten
+  rows; after a couple of shadow days the ten oldest were all parked ones, so no NEW receipt
+  was ever reached and the queue looked healthy while processing nothing. A one-shot
+  `requeueDryRunParked` on the first live pass un-parks the backlog (and flips `dryRun` in
+  the same statement, or the rows would re-park forever). This is the one thing that changes
+  a row's `dryRun` after intake.
+- **Read budget: 25s per row, 2 retries per model at 1s/3s.** The Apps Script's 5 retries at
+  2s..32s suits a 6-minute trigger, not a 60-second function shared by ten rows. The worker
+  also stops TAKING new rows once 40s of its 60s are gone. Exhaustion returns AI_UNAVAILABLE,
+  which never spends `attempts` — but `busyPasses` now counts them and parks the row after 20
+  (v3.4), so an endless outage still ends in front of a human.
+- **`sourceRef` reuse is decided on `fileSha256`.** The row is inserted BEFORE the upload, so
+  the unique index is the decision point: same bytes is a replay (200, the existing row),
+  different bytes is 409 `sourceRef-conflict` and storage is never touched. Previously both
+  cases got a 200 and a second, real receipt could be swallowed.
+- **Vendor is not part of the strong KEY, but it is part of the CONFIRMATION.** The v3.6
+  vendor-less key stands; a same-total hit whose canonical vendor differs now routes to
+  NEEDS_REVIEW `vendor-mismatch:<id>` rather than DUPLICATE.
+- **Negative and zero totals** route to NEEDS_REVIEW `refund-or-zero` (replacing
+  `zero-total`) and claim no key.
+- **A second weak-dedup check runs INSIDE the READ→BOOKING transaction**, the last instant
+  before money moves. The claim advisory lock is one global constant so only one batch runs
+  at a time.
+- **A NEEDS_REVIEW park RELEASES the strong key unless a QBO send was attempted** (v3.5
+  rule): otherwise the key is held by a document that never became a purchase, and a
+  corrected re-send is quarantined against nothing.
+- **Transient throws (storage, Prisma, network) retry on the normal backoff.** Only the
+  classified QBO fault types are terminal. `MAX_BOOK_ATTEMPTS` is now `>=`, so it means 20
+  attempts in total.
+- **Non-secret callers cannot choose `source` or `sourceRef`** — the server mints both from
+  the auth kind; anything else is a 400. Only shared-secret callers may declare
+  drive/email/chat. An existing row's fields come back only to its creator or a bookkeeping
+  role.
+- **The shared-secret GET is limited to `state=BOOKED|ARCHIVED`** and a minimal field set
+  (no error text, hashes, or user ids).
+- Archive callback is idempotent for an identical retry (200), 409 only for a DIFFERENT
+  Drive file id. HEIC sniffing accepts `hevc`/`hevx`; `mif1`/`heif` store as image/heif.
+  P2002 resolves the owner by `dedupStrongKey` instead of string-matching Prisma's `meta`
+  (which is empty for a partial index on some engine builds). The apply script matches
+  `--expect-host` exactly and verifies the index is UNIQUE with the exact predicate.
+
+**Left as-is, deliberately:** the pre-existing asset-suffix proxy bypass (not introduced
+here); multipart buffering before the size check (the platform body limit applies first);
+PDFs carrying embedded JavaScript (never opened server-side — the bytes go to Gemini and to
+QBO as an attachment).
 
 Two things a human must do before this can leave shadow mode:
 

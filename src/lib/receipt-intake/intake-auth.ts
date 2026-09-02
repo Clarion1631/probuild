@@ -23,8 +23,9 @@ import type { User } from "@prisma/client";
 export const RECEIPT_INTAKE_SECRET_HEADER = "x-receipt-intake-secret";
 
 export type IntakeAuth =
-    | { ok: true; via: "secret"; user: null }
-    | { ok: true; via: "session"; user: User }
+    | { ok: true; via: "secret"; user: null; userVia: null }
+    /** `userVia` distinguishes the crew app from a browser — the route mints `source` from it. */
+    | { ok: true; via: "session"; user: User; userVia: "mobile-jwt" | "next-auth" }
     | { ok: false; response: NextResponse };
 
 /** Constant-time compare over fixed-length digests, so header length leaks nothing. */
@@ -49,7 +50,7 @@ export async function authenticateIntake(req: Request): Promise<IntakeAuth> {
     const provided = req.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
     if (provided !== null) {
         if (secretMatches(provided, process.env.RECEIPT_INTAKE_SECRET)) {
-            return { ok: true, via: "secret", user: null };
+            return { ok: true, via: "secret", user: null, userVia: null };
         }
         return { ok: false, response: unauthorized() };
     }
@@ -62,7 +63,7 @@ export async function authenticateIntake(req: Request): Promise<IntakeAuth> {
             response: NextResponse.json({ ok: false, reason: "unauthorized" }, { status: auth.status }),
         };
     }
-    return { ok: true, via: "session", user: auth.user };
+    return { ok: true, via: "session", user: auth.user, userVia: auth.via };
 }
 
 export const STAFF_READ_ROLES = ["ADMIN", "MANAGER", "FINANCE"];

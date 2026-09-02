@@ -35,10 +35,18 @@ const REF_PREFIX = "drive:e2e-intake-";
 const FILE_ID = `${Date.now()}-a`;
 const SOURCE_REF = `${REF_PREFIX}${FILE_ID}`;
 
+// Rows created with a SERVER-minted sourceRef (web:<uuid>) can't be found by
+// the prefix, so they are tracked explicitly for teardown.
+const minted: string[] = [];
+
 // A real 1x1 PNG: the endpoint decides the stored mime on the BYTES, so a
 // placeholder string would be refused (which is itself asserted below).
 const PNG_BASE64 =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// A DIFFERENT 1x1 PNG (black, not white). Same format, different bytes — which
+// is the whole point of the sourceRef-conflict case below.
+const OTHER_PNG_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
 function intakeBody(overrides: Record<string, unknown> = {}) {
     return JSON.stringify({
@@ -76,6 +84,7 @@ test.beforeAll(async () => {
 
 test.afterAll(async () => {
     await prisma.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: REF_PREFIX } } });
+    if (minted.length) await prisma.receiptIntake.deleteMany({ where: { id: { in: minted } } });
     await prisma.$disconnect();
 });
 
@@ -172,6 +181,65 @@ test.describe("intake POST", () => {
         expect(body.reason).toBe("missing-sourceRef");
     });
 
+    test("reusing a sourceRef for DIFFERENT bytes is 409, and stores nothing", async ({ request }) => {
+        // The dangerous case: answering 200 would tell the forwarder its NEW
+        // receipt was accepted when nothing was stored, and that receipt would
+        // never be booked.
+        const ref = `${REF_PREFIX}sha-conflict`;
+        const first = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(first.res.status()).toBe(200);
+
+        const second = await postIntake(request, intakeBody({ sourceRef: ref, fileBase64: OTHER_PNG_BASE64 }));
+        expect(second.res.status()).toBe(409);
+        expect(second.body).toMatchObject({ error: "sourceRef-conflict", existingId: first.body.id });
+
+        // Exactly one row, still pointing at the ORIGINAL bytes.
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: ref } });
+        expect(rows).toHaveLength(1);
+        expect(rows[0].id).toBe(first.body.id);
+
+        // And the row's stored object is the one the FIRST request wrote — the
+        // conflicting call must never touch storage.
+        expect(rows[0].storagePath).toBe(`receipts/intake/${first.body.id}.png`);
+    });
+
+    test("a session caller may not choose its own source or sourceRef", async ({ request }) => {
+        // `source` is provenance and it feeds booking identity: a `drive` row
+        // books under the Drive fileId, so a forged source could aim a QBO
+        // DocNumber at another document's idempotency key.
+        const forgedRef = await postIntake(request, JSON.stringify({
+            source: "web", sourceRef: `${REF_PREFIX}forged`, fileBase64: PNG_BASE64, mimeType: "image/png",
+        }), {});
+        expect(forgedRef.res.status()).toBe(400);
+        expect(forgedRef.body.reason).toBe("sourceRef-not-allowed");
+
+        const forgedSource = await postIntake(request, JSON.stringify({
+            source: "drive", fileBase64: PNG_BASE64, mimeType: "image/png",
+        }), {});
+        expect(forgedSource.res.status()).toBe(400);
+        expect(forgedSource.body.reason).toBe("invalid-source");
+    });
+
+    test("a session upload gets a server-minted web: sourceRef", async ({ request }) => {
+        const res = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json" },
+            data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", fileName: "web.png" }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(200);
+        const body = await res.json();
+        expect(body.sourceRef).toMatch(/^web:[0-9a-f-]{36}$/);
+        minted.push(body.id);
+    });
+
+    test("a secret caller may not declare a USER source", async ({ request }) => {
+        const { res, body } = await postIntake(request, intakeBody({
+            source: "web", sourceRef: `${REF_PREFIX}websecret`,
+        }));
+        expect(res.status()).toBe(400);
+        expect(body.reason).toBe("invalid-source");
+    });
+
     test("deterministic bad input is a 400, not a 500 the forwarder retries forever", async ({ request }) => {
         const cases: [string, string][] = [
             [intakeBody({ source: "carrier-pigeon", sourceRef: `${REF_PREFIX}src` }), "invalid-source"],
@@ -208,7 +276,17 @@ test.describe("intake GET", () => {
         expect(body.rows[0]).not.toHaveProperty("readJson");
     });
 
-    test("the archive mirror can poll with the shared secret", async ({ playwright }) => {
+    test("the archive mirror can poll BOOKED, and sees only what it needs", async ({ request, playwright }) => {
+        // Seed a BOOKED row so the field set is asserted against a real payload
+        // rather than an empty list.
+        const ref = `${REF_PREFIX}mirror`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        await prisma.receiptIntake.update({
+            where: { id: created.body.id },
+            data: { state: "BOOKED", vendor: "Lowes", totalCents: 36498, lastError: "should-not-be-visible" },
+        });
+
         const machine = await playwright.request.newContext({
             baseURL: "http://localhost:3000",
             storageState: { cookies: [], origins: [] },
@@ -218,6 +296,37 @@ test.describe("intake GET", () => {
             maxRedirects: 0,
         });
         expect(res.status()).toBe(200);
+        const body = await res.json();
+        const row = body.rows.find((r: any) => r.id === created.body.id);
+        expect(row).toBeTruthy();
+        expect(row.vendor).toBe("Lowes");
+        expect(row.totalCents).toBe(36498);
+        // Least privilege: a script that only copies files to Drive has no need
+        // for error text, content hashes, or who uploaded it.
+        for (const forbidden of ["lastError", "fileSha256", "createdById", "dedupWeakKey", "dedupStrongKey", "attempts", "readJson"]) {
+            expect(row, forbidden).not.toHaveProperty(forbidden);
+        }
+        await machine.dispose();
+    });
+
+    test("the shared secret cannot sweep any state it likes", async ({ playwright }) => {
+        const machine = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: { cookies: [], origins: [] },
+        });
+        for (const state of ["NEEDS_REVIEW", "RECEIVED", "READ", ""]) {
+            const res = await machine.get(`${INTAKE_PATH}${state ? `?state=${state}` : ""}`, {
+                headers: { "x-receipt-intake-secret": SECRET },
+                maxRedirects: 0,
+            });
+            expect(res.status(), state || "(no state)").toBe(400);
+        }
+        // ARCHIVED is allowed — the mirror re-checks what it already copied.
+        const archived = await machine.get(`${INTAKE_PATH}?state=ARCHIVED`, {
+            headers: { "x-receipt-intake-secret": SECRET },
+            maxRedirects: 0,
+        });
+        expect(archived.status()).toBe(200);
         await machine.dispose();
     });
 
@@ -283,15 +392,31 @@ test.describe("archive callback", () => {
         expect(notBooked.status()).toBe(409);
 
         await prisma.receiptIntake.update({ where: { id }, data: { state: "BOOKED" } });
-        const ok = await anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
+        const archive = (driveFileId: string) => anonymous.post(`${INTAKE_PATH}/${id}/archived`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: JSON.stringify({ driveFileId: "DRIVE1" }),
+            data: JSON.stringify({ driveFileId }),
             maxRedirects: 0,
         });
+
+        const ok = await archive("DRIVE1");
         expect(ok.status()).toBe(200);
         const row = await prisma.receiptIntake.findUnique({ where: { id } });
         expect(row?.state).toBe("ARCHIVED");
         expect(row?.archiveDriveFileId).toBe("DRIVE1");
+
+        // IDEMPOTENT REPLAY. The mirror POSTs after writing the Drive file, so a
+        // lost response leaves it holding a file it cannot confirm. Re-sending
+        // the same id is the correct retry: a 409 would make the script treat
+        // its own successful archive as a failure.
+        const replay = await archive("DRIVE1");
+        expect(replay.status()).toBe(200);
+        expect((await replay.json()).alreadyArchived).toBe(true);
+
+        // A DIFFERENT file id on an archived row is not a replay — two Drive
+        // copies exist and somebody has to say which one counts.
+        const conflicting = await archive("DRIVE2");
+        expect(conflicting.status()).toBe(409);
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.archiveDriveFileId).toBe("DRIVE1");
 
         await anonymous.dispose();
     });

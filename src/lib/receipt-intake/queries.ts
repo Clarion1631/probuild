@@ -47,6 +47,39 @@ export const RECEIPT_INTAKE_LIST_SELECT = {
     updatedAt: true,
 } as const;
 
+/**
+ * What the nightly Apps Script archive mirror is allowed to see.
+ *
+ * It is a machine holding a shared secret, and its whole job is "copy this file
+ * to Drive under the v1 filename". It has no need for `lastError`,
+ * `fileSha256`, `createdById`, `dedupWeakKey`, or the retry bookkeeping — and a
+ * leaked or over-shared secret should expose the least that still lets the
+ * mirror work. Least privilege applies to a script the same way it does to a
+ * user.
+ */
+export const RECEIPT_INTAKE_ARCHIVE_SELECT = {
+    id: true,
+    sourceRef: true,
+    storagePath: true,
+    fileName: true,
+    mimeType: true,
+    txnDate: true,
+    vendor: true,
+    totalCents: true,
+    refNumber: true,
+    projectId: true,
+    state: true,
+    archiveDriveFileId: true,
+    bookedAt: true,
+} as const;
+
+/**
+ * States the secret caller may query. The mirror archives what is BOOKED and
+ * re-checks what it already ARCHIVED; nothing else is its business, and a
+ * `state=NEEDS_REVIEW` sweep would hand it the whole error queue.
+ */
+export const ARCHIVE_READABLE_STATES = new Set(["BOOKED", "ARCHIVED"]);
+
 export const MAX_LIST_TAKE = 200;
 export const DEFAULT_LIST_TAKE = 50;
 
@@ -54,6 +87,8 @@ export interface ListReceiptIntakesArgs {
     state?: string | null;
     projectId?: string | null;
     take?: number | null;
+    /** Narrows the column set to RECEIPT_INTAKE_ARCHIVE_SELECT. */
+    archiveOnly?: boolean;
 }
 
 /** Newest first. `take` is clamped, never trusted from the query string. */
@@ -71,7 +106,7 @@ export async function listReceiptIntakes(args: ListReceiptIntakesArgs) {
         },
         orderBy: { createdAt: "desc" },
         take,
-        select: RECEIPT_INTAKE_LIST_SELECT,
+        select: args.archiveOnly ? RECEIPT_INTAKE_ARCHIVE_SELECT : RECEIPT_INTAKE_LIST_SELECT,
     });
 }
 
