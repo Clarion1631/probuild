@@ -96,6 +96,13 @@ function createStub(
         if ("projectId" in where && (row.projectId ?? null) !== where.projectId) return false;
         if ("costCodeId" in where && (row.costCodeId ?? null) !== where.costCodeId) return false;
         if ("estimateId" in where && row.estimateId !== where.estimateId) return false;
+        // The write-time JOIN. `estimateId` proves the row is on the same
+        // estimate; this proves the estimate still points at the project the
+        // plan read off it.
+        if (where.estimate) {
+            const want = (where.estimate as any).is?.projectId ?? null;
+            if (((row as any).estimate?.projectId ?? null) !== want) return false;
+        }
         // The row-version CAS. Dates compare by value, not identity.
         if ("updatedAt" in where) {
             const want = where.updatedAt as Date | null;
@@ -119,6 +126,9 @@ function createStub(
     return {
         writes,
         rows,
+        // Exposed so a test can change the item universe AFTER the plan has
+        // read it — the whole point of re-reading under the lock.
+        items,
         db: {
             project: {
                 async findMany() {
@@ -135,7 +145,18 @@ function createStub(
                 },
             },
             estimateItem: {
-                async findMany() { return items; },
+                // The write phase re-reads the phase list for ONE project,
+                // inside the lock, so the stub has to honour that filter — and
+                // serve whatever `items` says NOW, not a snapshot.
+                async findMany(args?: { where?: Record<string, any> }) {
+                    const wantProject = args?.where?.estimate?.projectId ?? null;
+                    if (!wantProject) return items;
+                    return items.filter(item => (item.estimate?.projectId ?? null) === wantProject);
+                },
+                async findUnique(args: { where: { id: string } }) {
+                    const item = items.find(candidate => candidate.id === args.where.id);
+                    return item ? { costCode: { isActive: true }, ...item } : null;
+                },
             },
             timeEntry: {
                 async findMany() { return []; },
@@ -457,8 +478,10 @@ test("apply writes both passes, each behind its own predicate", async () => {
     assert.deepEqual(projectWrite.where, {
         id: { in: ["e1"] },
         projectId: null,
-        // Both halves of the derivation.
+        // Both halves of the derivation, plus the join that proves the second
+        // half is still true at write time.
         estimateId: "est-job-1",
+        estimate: { is: { projectId: "job-1" } },
     });
 
     const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
@@ -917,4 +940,83 @@ test("an untouched row still codes normally through the re-plan", async () => {
     assert.equal(result.written.costCodes, 1);
     assert.equal(stub.rows[0].costCodeId, "cc-plumb");
     assert.equal(stub.rows[0].costCodeSource, "ai");
+});
+
+// ── the write re-reads what the plan assumed (Codex round 13, item 7) ───────
+
+test("an ESTIMATE moved to another job after the plan is not stamped with the old one", async () => {
+    // `estimateId` alone cannot catch this: the row never left its estimate,
+    // the estimate left the job. Without the write-time join every expense on
+    // that estimate would be attributed to the project it used to be on.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" } })],
+        [],
+    );
+    const snapshot = stub.db.expense.findMany;
+    stub.db.expense.findMany = async () => {
+        const rows = await snapshot();
+        // ...and now somebody re-points the estimate.
+        stub.rows[0].estimate = { projectId: "job-2" };
+        return rows;
+    };
+
+    const result = await runBackfill({
+        db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+    });
+    assert.equal(result.written.projectIds, 0, "nothing written on a stale derivation");
+    assert.equal(stub.rows[0].projectId ?? null, null);
+});
+
+test("an ITEM re-coded after the plan does not get the planned code written", async () => {
+    // The plan says cc-frame because that is what the linked item said when it
+    // was read. Under the lock the item says something else, so the planned
+    // write is an answer to a question nobody is asking any more.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i1", vendor: "Unknown Vendor" })],
+        [{ id: "i1", costCodeId: "cc-frame", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    // The plan reads the item universe TWICE (the link map, then the phase
+    // list). Both must see the old code; the re-code lands after that, before
+    // the write phase re-reads this one item under the lock.
+    const readItems = stub.db.estimateItem.findMany;
+    let itemReads = 0;
+    stub.db.estimateItem.findMany = async (args?: any) => {
+        const rows = (await readItems(args)).map((item: any) => ({ ...item }));
+        itemReads += 1;
+        if (itemReads === 2) stub.items[0].costCodeId = "cc-plumb";
+        return rows;
+    };
+
+    const result = await runBackfill({
+        db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+    });
+    assert.equal(result.written.costCodes, 0, "the planned code is void");
+    assert.equal(stub.rows[0].costCodeId ?? null, null, "and nothing else was guessed in its place");
+});
+
+test("a phase REMOVED from the job after the plan blocks the write", async () => {
+    // The vendor rule still says cc-plumb. The job no longer has that phase, so
+    // writing it would put money on a phase the job does not have — the exact
+    // check the plan made, made again against the truth.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    // Removed AFTER the plan has read the phase list, so the plan genuinely
+    // decides cc-plumb and only the write-phase re-read can catch it. (Removing
+    // it earlier would make this pass for the wrong reason: nothing planned.)
+    const readItems = stub.db.estimateItem.findMany;
+    let itemReads = 0;
+    stub.db.estimateItem.findMany = async (args?: any) => {
+        const rows = (await readItems(args)).map((item: any) => ({ ...item }));
+        itemReads += 1;
+        if (itemReads === 2) stub.items.length = 0;
+        return rows;
+    };
+
+    const result = await runBackfill({
+        db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+    });
+    assert.equal(result.written.costCodes, 0);
+    assert.equal(stub.rows[0].costCodeId ?? null, null);
 });

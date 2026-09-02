@@ -459,6 +459,54 @@ export async function runBackfill({
         allowedCodesByProject.get(projectId).add(row.costCodeId);
     }
 
+    // ROW-SCOPED RE-READS, for the write phase only.
+    //
+    // The two maps above are a SNAPSHOT taken before a loop that can run for
+    // minutes. Re-planning under the lock (below) proved the row itself had not
+    // moved, but it was still re-planned against those stale maps — so a phase
+    // deleted from the job, an estimate moved to another project, or an item
+    // re-coded after the snapshot would all be invisible, and the pass would
+    // write a code that was correct only in the past.
+    //
+    // These read the same things the snapshot did, `PHASE_ELIGIBLE_ESTIMATE_WHERE`
+    // and all, but for ONE project and ONE item, inside the transaction that is
+    // about to write.
+    const readAllowedCodes = async (tx, projectId) => {
+        const fresh = new Map();
+        if (!projectId) return fresh;
+        const rows = await tx.estimateItem.findMany({
+            where: {
+                costCodeId: { not: null },
+                costCode: { isActive: true },
+                estimate: { ...PHASE_ELIGIBLE_ESTIMATE_WHERE, projectId },
+            },
+            select: { costCodeId: true },
+        });
+        fresh.set(projectId, new Set(rows.map(r => r.costCodeId).filter(Boolean)));
+        return fresh;
+    };
+    const readItem = async (tx, itemId) => {
+        const fresh = new Map();
+        if (!itemId) return fresh;
+        const row = await tx.estimateItem.findUnique({
+            where: { id: itemId },
+            select: {
+                id: true, costCodeId: true, estimateId: true,
+                costCode: { select: { isActive: true } },
+                estimate: { select: { projectId: true } },
+            },
+        });
+        // An item whose code was cleared, or whose code was deactivated, is no
+        // longer a source of one — the same rule the snapshot query applies.
+        if (!row?.costCodeId || row.costCode?.isActive === false) return fresh;
+        fresh.set(row.id, {
+            costCodeId: row.costCodeId,
+            estimateId: row.estimateId,
+            projectId: row.estimate?.projectId ?? null,
+        });
+        return fresh;
+    };
+
     const plan = planBackfill({
         expenses, items, costCodeIdByCode, scopedProjectIds, allowedCodesByProject,
     });
@@ -585,7 +633,18 @@ export async function runBackfill({
         // with the old estimate's project — a silent cross-job attribution
         // performed by the very pass that exists to get attribution right.
         const result = await db.expense.updateMany({
-            where: { id: { in: ids }, projectId: null, estimateId },
+            where: {
+                id: { in: ids }, projectId: null, estimateId,
+                // AND THE ESTIMATE STILL POINTS THERE. `estimateId` proves the
+                // row is on the same estimate; it says nothing about where that
+                // estimate now lives. An estimate moved to another project
+                // between the plan and this write would otherwise stamp every
+                // one of its expenses with the OLD project — a cross-job
+                // attribution performed by the pass whose whole job is getting
+                // attribution right. A relation filter makes it one statement,
+                // so there is no window between checking and writing.
+                estimate: { is: { projectId } },
+            },
             data: { projectId },
         });
         projectIdsWritten += result.count;
@@ -644,12 +703,20 @@ export async function runBackfill({
             //
             // `planBackfill` is the single copy of the rules, so it is run
             // again over this one row rather than re-implemented here.
+            // The item link and the phase list, RE-READ for this row inside
+            // the lock — not the minutes-old snapshot. See readItem /
+            // readAllowedCodes above.
+            const resolvedProjectId = current.projectId ?? current.estimate?.projectId ?? null;
+            const [freshItems, freshAllowed] = await Promise.all([
+                readItem(tx, current.itemId),
+                readAllowedCodes(tx, resolvedProjectId),
+            ]);
             const replanned = planBackfill({
                 expenses: [current],
-                items,
+                items: freshItems,
                 costCodeIdByCode,
                 scopedProjectIds,
-                allowedCodesByProject,
+                allowedCodesByProject: freshAllowed,
             });
             const fresh = replanned.codeFills[0];
             // No longer codeable at all, or codeable as something else — either
