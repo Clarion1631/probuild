@@ -26,7 +26,10 @@ model User {
   /// import and by a manual hourlyRate/burdenRate edit. Null means "never
   /// confirmed since this column shipped", which the Payroll rates panel
   /// shows in red. It is not a rate-change log; it is a staleness marker.
-  lastRateSyncAt            DateTime?
+  /// Timestamptz to match the migration and every other timestamp added by
+  /// Phase 5 — a bare DateTime maps to TIMESTAMP(3), which the
+  /// migrations-reproduce-production check correctly flags as drift.
+  lastRateSyncAt            DateTime?                @db.Timestamptz(6)
   mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
   showOnDispatch            Boolean                  @default(false) // Appears on the dispatch board bench/grid. Owner-controlled on Company → Team members.
   pinCode                   String? // Used for mobile app quick login
