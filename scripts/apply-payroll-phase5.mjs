@@ -122,6 +122,11 @@ export const EXPECTED_OBJECTS = [
     { kind: "rls", table: "PayrollPeriod", policies: 0 },
     { kind: "rls", table: "User", policies: 0 },
     { kind: "rls", table: "HelpSubmissionQuota", policies: 0 },
+    // Adversarial review: these two were missing RLS/REVOKE entirely, so a
+    // leaked anon/authenticated Supabase key could read raw payroll hours and
+    // crew help reports straight through PostgREST.
+    { kind: "rls", table: "TimeEntry", policies: 0 },
+    { kind: "rls", table: "HelpRequest", policies: 0 },
 ];
 
 /** Collapse whitespace so a catalog definition can be compared to a written one. */
@@ -417,6 +422,24 @@ const STATEMENTS = [
         END IF;
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
             REVOKE ALL ON TABLE "HelpSubmissionQuota" FROM authenticated;
+        END IF;
+     END $$`,
+    // Adversarial review: RLS/REVOKE were applied above to PayrollPeriod, User
+    // and HelpSubmissionQuota but NOT to TimeEntry or HelpRequest — a leaked
+    // anon/authenticated Supabase key could read raw payroll hours and crew
+    // help reports straight through PostgREST. Prisma connects as the table
+    // owner, so the app is unaffected.
+    `ALTER TABLE "TimeEntry" ENABLE ROW LEVEL SECURITY`,
+    `ALTER TABLE "HelpRequest" ENABLE ROW LEVEL SECURITY`,
+    `DO $$
+     BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON TABLE "TimeEntry" FROM anon;
+            REVOKE ALL ON TABLE "HelpRequest" FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON TABLE "TimeEntry" FROM authenticated;
+            REVOKE ALL ON TABLE "HelpRequest" FROM authenticated;
         END IF;
      END $$`,
 ];

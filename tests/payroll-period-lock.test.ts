@@ -486,7 +486,49 @@ test("settlement itself refuses a day inside a locked period", async () => {
     await assertDayUnlockedInTx(tx, "2026-09-10", "America/Los_Angeles");
 });
 
-test("a day key means the zone it was DERIVED in — reading it in another zone misses the lock", async () => {
+test("settlement is blocked for a west-of-LA locked period even though LA midnight falls before its envelope", async () => {
+    // The regression this guards: assertDayUnlockedInTx used to test only the
+    // SETTLEMENT DAY'S OPENING INSTANT (LA midnight) against the locked
+    // envelope. HST_LOCKED is locked in Pacific/Honolulu (UTC-10, no DST) —
+    // Mon 2026-08-17 00:00 HST .. Mon 2026-08-31 00:00 HST, i.e.
+    // [2026-08-17T10:00:00Z, 2026-08-31T10:00:00Z).
+    //
+    // Settlement always runs with dayKey "2026-08-17" read in
+    // COMPANY_TIME_ZONE (America/Los_Angeles, per wa-breaks-db.ts): LA
+    // midnight for that key is 2026-08-17T07:00:00Z — three hours BEFORE the
+    // Honolulu envelope starts. The OLD single-instant check therefore read
+    // the day as free and let settlement rewrite entries later that same LA
+    // day (e.g. 11:00Z-15:00Z), which DO fall inside the locked Honolulu
+    // envelope. The fix checks the WHOLE LA day [07:00Z, next 07:00Z) for any
+    // overlap with the envelope, not just its first instant.
+    const { assertDayUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
+    const tx = {
+        $executeRawUnsafe: async () => 0,
+        $queryRawUnsafe: async () => [],
+        payrollPeriod: { findMany: async () => [HST_LOCKED] },
+    };
+
+    // Control: the OLD instant-only rule really would have missed this — the
+    // single midnight instant sits outside the envelope.
+    assert.equal(
+        lockedPeriodFor([HST_LOCKED], new Date("2026-08-17T07:00:00.000Z"), { timeZone: "America/Los_Angeles" }),
+        null,
+        "control: LA midnight alone is NOT inside the Honolulu envelope"
+    );
+
+    // The fixed guard, given the SAME dayKey and zone settlement actually
+    // uses, refuses — the day overlaps the locked envelope even though its
+    // opening instant does not.
+    await assert.rejects(
+        () => assertDayUnlockedInTx(tx, "2026-08-17", "America/Los_Angeles"),
+        (error: Error) => isPeriodLockedError(error)
+    );
+
+    // A day that shares no part with the envelope still settles normally.
+    await assertDayUnlockedInTx(tx, "2026-09-10", "America/Los_Angeles");
+});
+
+test("a day key means the zone it was DERIVED in — a wrong zone reads the WRONG 24h window even when it still refuses", async () => {
     // Every dayKey that reaches settlement comes out of toCompanyDayKey, which
     // is hardcoded to COMPANY_TIME_ZONE, and settlement selects the rows it
     // rewrites with that same helper. This test is what makes the coupling
@@ -495,7 +537,7 @@ test("a day key means the zone it was DERIVED in — reading it in another zone 
     const { COMPANY_TIME_ZONE } = await import("../src/lib/company-day");
     // A real locked period carries the zone it was locked in, so ITS envelope
     // does not move when the company zone changes — only the caller's reading
-    // of the day key does. That asymmetry is the whole bug.
+    // of the day key does.
     const tx = {
         $executeRawUnsafe: async () => 0,
         $queryRawUnsafe: async () => [],
@@ -507,11 +549,23 @@ test("a day key means the zone it was DERIVED in — reading it in another zone 
         () => assertDayUnlockedInTx(tx, "2026-08-17", COMPANY_TIME_ZONE),
         (error: Error) => isPeriodLockedError(error)
     );
-    // The same key read as New York midnight is 04:00Z — three hours BEFORE the
-    // period starts, so the guard says the day is free. Nothing is wrong with
-    // assertDayUnlockedInTx here; this is the divergence that makes passing it
-    // a configurable zone, while the rows are keyed on a hardcoded one, unsafe.
-    await assertDayUnlockedInTx(tx, "2026-08-17", "America/New_York");
+    // The same key read as New York midnight opens a window three hours
+    // EARLIER (04:00Z, not 07:00Z) — the WRONG 24h window for the rows
+    // settlement will actually select and rewrite (those come out of
+    // toCompanyDayKey, hardcoded to COMPANY_TIME_ZONE). Since the
+    // whole-settlement-day overlap check (assertDayUnlockedInTx / see the
+    // Honolulu regression below) widened the comparison from a single
+    // instant to the full [dayStart, dayEnd), this particular wrong window
+    // still straddles the true envelope's start and so still refuses — a
+    // safe accident of window width, not proof the zone argument is
+    // optional. It is still the WRONG day: for a zone offset wide enough to
+    // clear the 24h window (not realistic between US zones, but the reason
+    // wa-breaks-db.ts hardcodes COMPANY_TIME_ZONE rather than trusting a
+    // caller-supplied one), the same call would silently miss.
+    await assert.rejects(
+        () => assertDayUnlockedInTx(tx, "2026-08-17", "America/New_York"),
+        (error: Error) => isPeriodLockedError(error)
+    );
 });
 
 test("settlement stays locked out of an LA-day after the company zone is switched east", async () => {

@@ -223,6 +223,10 @@
       "forced": false
     },
     {
+      "name": "HelpRequest",
+      "forced": false
+    },
+    {
       "name": "HelpSubmissionQuota",
       "forced": false
     },
@@ -296,6 +300,10 @@
     },
     {
       "name": "TaskPunchItem",
+      "forced": false
+    },
+    {
+      "name": "TimeEntry",
       "forced": false
     },
     {

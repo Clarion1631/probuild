@@ -179,11 +179,15 @@ test("the object list carries DEFINITIONS, not just names", async () => {
     assert.equal(fks.length, 2);
     for (const fk of fks) assert.equal(fk.onDelete, "r");
 
-    // All three protected tables, RLS on, zero policies (that IS the deny-all).
+    // All five protected tables, RLS on, zero policies (that IS the deny-all).
+    // TimeEntry and HelpRequest were the adversarial-review finding: RLS shipped
+    // for PayrollPeriod/User/HelpSubmissionQuota but not for these two, leaving
+    // raw payroll hours and crew help reports reachable by a leaked
+    // anon/authenticated Supabase key through PostgREST.
     const rls = EXPECTED_OBJECTS.filter((o: { kind: string }) => o.kind === "rls");
     assert.deepEqual(
         rls.map((o: { table?: string }) => o.table).sort(),
-        ["HelpSubmissionQuota", "PayrollPeriod", "User"]
+        ["HelpRequest", "HelpSubmissionQuota", "PayrollPeriod", "TimeEntry", "User"]
     );
     for (const table of rls) assert.equal(table.policies, 0);
 

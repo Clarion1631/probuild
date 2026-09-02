@@ -222,6 +222,30 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------
+-- Adversarial review: RLS/REVOKE were applied to PayrollPeriod, User and
+-- HelpSubmissionQuota above, but NOT to TimeEntry or HelpRequest. Under
+-- Supabase's standard public-schema grants, a leaked anon/authenticated key
+-- can read both tables straight through PostgREST, bypassing the export
+-- authorization this phase adds and every help-route control — exposing raw
+-- payroll hours/pay-code rows and crew help reports. Prisma connects as the
+-- table owner, so the app is unaffected; this only closes the PostgREST door.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "TimeEntry" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "HelpRequest" ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+     REVOKE ALL ON TABLE "TimeEntry" FROM anon;
+     REVOKE ALL ON TABLE "HelpRequest" FROM anon;
+   END IF;
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+     REVOKE ALL ON TABLE "TimeEntry" FROM authenticated;
+     REVOKE ALL ON TABLE "HelpRequest" FROM authenticated;
+   END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- Review round 16, item 2: TimeEntry no longer cascades from User or Project.
 --
 -- 'c' is CASCADE in pg_constraint.confdeltype, 'r' is RESTRICT. Re-running this

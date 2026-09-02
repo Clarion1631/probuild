@@ -72,7 +72,7 @@
 
 import { NextResponse } from "next/server";
 import { COMPANY_TIME_ZONE } from "./company-day";
-import { dayKeyInTimeZone, addDaysToKey } from "./tz-date";
+import { dayKeyInTimeZone, addDaysToKey, startOfDateInTimeZone } from "./tz-date";
 import { payrollLockEnvelope, type PayrollWeekStart } from "./payroll-config";
 
 export type LockedPeriodRow = {
@@ -172,7 +172,9 @@ export async function acquirePayrollLockCreationLock(tx: PayrollTxClient): Promi
  * transaction as the write that triggered it.
  *
  * `dayKey` is interpreted in the caller's zone; a locked period is still
- * evaluated in the zone it was locked in (see lockedPeriodFor).
+ * evaluated in the zone it was locked in (see lockedPeriodForDay). The check
+ * covers the WHOLE settlement day, not just its opening instant — see
+ * lockedPeriodForDay for why a single-instant check is unsound here.
  *
  * MUST be called before the wa-breaks day advisory lock is taken — payroll
  * lock first, always (see the LOCK ORDER note in the header).
@@ -187,8 +189,7 @@ export async function assertDayUnlockedInTx(
     await acquirePayrollWriteLock(tx);
     const periods = await loadLockedPeriodsTx(tx);
     if (periods.length === 0) return;
-    const { startOfDateInTimeZone } = await import("./tz-date");
-    const period = lockedPeriodFor(periods, startOfDateInTimeZone(dayKey, timeZone), { timeZone, ...options });
+    const period = lockedPeriodForDay(periods, dayKey, timeZone, options);
     if (period) throw new PeriodLockedError(period);
 }
 
@@ -369,6 +370,41 @@ export function lockedPeriodFor(
             period.timeZone || fallbackZone
         );
         if (at >= envelope.start.getTime() && at < envelope.end.getTime()) return period;
+    }
+    return null;
+}
+
+/**
+ * The LOCKED period whose envelope overlaps ANY part of the given SETTLEMENT
+ * DAY — midnight to midnight in `timeZone`, i.e. [dayStart, dayEnd) — not just
+ * the day's opening instant.
+ *
+ * assertDayUnlockedInTx used to test only startOfDateInTimeZone(dayKey), a
+ * single instant, against lockedPeriodFor. That is sound for a punch (which
+ * really is one instant) but not for a settlement day, which spans 24 hours.
+ * A period locked in a zone WEST of the caller's zone can start its envelope
+ * AFTER the caller's midnight but still before the caller's day ends: reading
+ * a dayKey's midnight in Los Angeles lands three hours before the same day's
+ * midnight in Pacific/Honolulu, so the instant check saw the LA day as free
+ * while settlement went on to rewrite entries later that same LA day that DO
+ * fall inside the Honolulu-locked envelope. Two half-open intervals overlap
+ * when start1 < end2 AND start2 < end1 — that is the whole rule here.
+ */
+export function lockedPeriodForDay(
+    periods: LockedPeriodRow[],
+    dayKey: string,
+    timeZone: string,
+    options: { weekStart?: PayrollWeekStart } = {}
+): LockedPeriodRow | null {
+    void options;
+    if (!dayKey) return null;
+    const dayStartMs = startOfDateInTimeZone(dayKey, timeZone).getTime();
+    const dayEndMs = startOfDateInTimeZone(addDaysToKey(dayKey, 1), timeZone).getTime();
+    for (const period of periods) {
+        if (!period.lockedAt) continue;
+        // The caller's zone is only a FALLBACK — see lockedPeriodFor.
+        const envelope = payrollLockEnvelope(period.periodStart, period.periodEnd, period.timeZone || timeZone);
+        if (dayStartMs < envelope.end.getTime() && envelope.start.getTime() < dayEndMs) return period;
     }
     return null;
 }
