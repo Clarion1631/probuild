@@ -1,4 +1,8 @@
 import { prisma } from "./prisma";
+import { resolveCostCode } from "./cost-coding";
+import { prismaCostCodingDataSource } from "./cost-coding-db";
+import { isCostCodeAllowedForProject } from "./project-phases";
+import { prismaPhaseDataSource } from "./project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
@@ -163,6 +167,31 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
     }
 
+    // A cost code arriving here used to be stored verbatim and stamped
+    // "manual" — permanently outranking every automated pass — without anyone
+    // checking it belonged to this job. "The cost code exists" is not a
+    // permission (src/lib/cost-coding.ts SCOPE note): both checks, or a form
+    // post can pin another project's phase onto this expense forever.
+    let costCodeId = data.costCodeId || null;
+    let costTypeId = data.costTypeId || null;
+    if (costCodeId) {
+        const resolved = await resolveCostCode(prismaCostCodingDataSource, { costCodeId });
+        if (!resolved.ok) throw new Error(resolved.error);
+        const onProject = await isCostCodeAllowedForProject(
+            prismaPhaseDataSource,
+            estimate.projectId,
+            resolved.costCodeId,
+        );
+        if (!onProject) {
+            throw new Error("That cost code isn't one of this project's phases.");
+        }
+        costCodeId = resolved.costCodeId;
+        // Only an estimate item knows whether the money is Labor or Material,
+        // so an explicit code carries no cost type of its own — keep the
+        // caller's when it gave one, rather than inventing a guess.
+        costTypeId = costTypeId ?? resolved.costTypeId;
+    }
+
     let receiptUrl = data.receiptUrl?.trim() || null;
     if (data.receiptFileId) {
         const receipt = await prisma.projectFile.findUnique({
@@ -188,12 +217,12 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
             // above (including the change-order cross-check).
             projectId: estimate.projectId,
             itemId: data.itemId || null,
-            costCodeId: data.costCodeId || null,
-            costTypeId: data.costTypeId || null,
+            costCodeId,
+            costTypeId,
             // Every caller of this core is a human picking a code in a web form
             // or a CO flow, so a code here is "manual" and is off limits to the
             // sync and the backfill.
-            costCodeSource: data.costCodeId ? "manual" : null,
+            costCodeSource: costCodeId ? "manual" : null,
             amount: dollars(data.amount),
             vendor: data.vendor?.trim() || null,
             date: expenseDate,

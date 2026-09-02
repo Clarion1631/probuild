@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
 
 export const dynamic = "force-dynamic";
@@ -78,10 +80,12 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "project-has-no-estimate", projectId: project.id });
     }
 
-    const costCodes = await prisma.costCode.findMany({
-        where: { isActive: true },
-        select: { id: true, code: true, name: true },
-    });
+    // The PROJECT's phases, not every active company code. Matching a Gemini
+    // category string against the whole company list let a Drive import book a
+    // phase that exists only on some other job — and this path writes the code
+    // straight onto the expense.
+    const costCodes = (await resolveProjectPhaseCodes(prismaPhaseDataSource, project.id))
+        .map((phase) => ({ id: phase.id, code: phase.code, name: phase.name }));
 
     const isCheck = String(body.docType || "receipt").toLowerCase() === "check";
     const docRef = isCheck

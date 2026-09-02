@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
+import { canAccessProject, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import {
     QboManagedExpenseError,
     assertExpenseMutableOutsideQbo,
@@ -39,8 +40,19 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
 
 export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
-        const session = await getServerSession(authOptions);
-        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        // AUTHORIZATION, not merely authentication. This route checked only
+        // that SOMEBODY was signed in, so any authenticated user who knew an
+        // expense id could rewrite it — and once it started accepting
+        // `installedAtCustomer` and `taxDeductibleBase`, that meant editing the
+        // numbers on a state excise return. The POST on this resource has
+        // always resolved the project and checked access; the PUT now does the
+        // same, plus the `timeClock` permission that /projects/[id]/time-expenses
+        // and deleteExpenses already require to touch an expense at all.
+        const user = await getCurrentUserWithPermissions();
+        if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        if (!hasPermission(user, "timeClock")) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
 
         const id = (await params).id;
         if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
@@ -51,18 +63,41 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 qbPurchaseId: true,
                 amount: true,
                 taxAmount: true,
+                taxDeductibleBase: true,
+                estimateId: true,
                 projectId: true,
                 estimate: { select: { projectId: true } },
             },
         });
         assertExpenseMutableOutsideQbo(expense);
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
+
+        // Fail CLOSED on an unattributable row: with no project there is no
+        // scope to authorize against, so nobody may edit it here.
+        const resolvedProjectId = resolveExpenseProjectId(expense);
+        if (!resolvedProjectId || !canAccessProject(user, resolvedProjectId)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+
         const body = await req.json();
 
+        // #5: an item link must belong to THIS expense's job. Checking only
+        // that the id exists let an edit point the expense at a line item on
+        // another project — which then feeds the item->costCode fallback and
+        // silently books the phase of a different job.
         if (body.itemId) {
-            const itemExists = await prisma.estimateItem.findUnique({ where: { id: body.itemId }, select: { id: true } });
+            const itemExists = await prisma.estimateItem.findFirst({
+                where: {
+                    id: body.itemId,
+                    OR: [
+                        { estimateId: expense.estimateId },
+                        { estimate: { projectId: resolvedProjectId } },
+                    ],
+                },
+                select: { id: true },
+            });
             if (!itemExists) {
-                return NextResponse.json({ error: "This cost code is unsaved. Please click 'Save' on the Estimate first before moving an expense to it." }, { status: 400 });
+                return NextResponse.json({ error: "That line item isn't on this project's estimates. Save the Estimate on the web first, or pick a line item from this job." }, { status: 400 });
             }
         }
 
@@ -75,7 +110,6 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const editsCostCode = Object.prototype.hasOwnProperty.call(body, "costCodeId");
         const nextCostCodeId: string | null =
             typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
-        const resolvedProjectId = resolveExpenseProjectId(expense);
         if (editsCostCode && nextCostCodeId) {
             // BOTH checks, per the SCOPE note on resolveCostCode: existence and
             // active-ness are ATTRIBUTION, "this code belongs to this job" is
@@ -147,25 +181,45 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                     { status: 400 },
                 );
             }
-            // Validated against the amount this request LEAVES on the row, not
-            // the one it started with — a PUT that lowers the amount and sets a
-            // base in the same call must not be able to slip past by being
-            // checked against the old, larger figure.
-            const nextAmount =
-                body.amount !== undefined && body.amount !== null
-                    ? Number(body.amount)
-                    : Number(expense.amount);
-            const tax = Number(expense.taxAmount ?? 0);
-            const ceiling = Math.round((nextAmount - tax) * 100) / 100;
-            if (!Number.isFinite(ceiling) || parsed > ceiling) {
+            nextBase = parsed;
+        }
+
+        // Only the money permission may move numbers that land on a tax return.
+        // `timeClock` above is "may edit this expense"; this is "may decide what
+        // the company deducts", and they are not the same authority.
+        if ((editsInstalled || editsBase) && !hasPermission(user, "financialReports")) {
+            return NextResponse.json(
+                { error: "Editing tax-deduction fields requires the Financial Reports permission." },
+                { status: 403 },
+            );
+        }
+
+        // THE INVARIANT IS ABOUT THE RESULTING ROW, not about this request's
+        // fields. Validating only when `taxDeductibleBase` was sent meant a PUT
+        // that merely LOWERED `amount` could leave an existing base above the
+        // new pre-tax total — the same impossible state, reached by the other
+        // door. So the whole row is re-checked whenever any input to the
+        // invariant moves.
+        const resultingAmount =
+            body.amount !== undefined && body.amount !== null
+                ? Number(body.amount)
+                : Number(expense.amount);
+        const resultingTax = Number(expense.taxAmount ?? 0);
+        const resultingBase = editsBase
+            ? nextBase
+            : (expense.taxDeductibleBase === null ? null : Number(expense.taxDeductibleBase));
+        if (resultingBase !== null) {
+            const ceiling = Math.round((resultingAmount - resultingTax) * 100) / 100;
+            if (!Number.isFinite(ceiling) || resultingBase > ceiling) {
                 return NextResponse.json(
                     {
-                        error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).`,
+                        error: editsBase
+                            ? `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).`
+                            : `This amount would leave a deduction base of ${resultingBase.toFixed(2)} above the pre-tax total (${ceiling.toFixed(2)}). Clear or lower the deduction base first.`,
                     },
                     { status: 400 },
                 );
             }
-            nextBase = parsed;
         }
 
         const updatedExpense = await prisma.expense.update({

@@ -183,10 +183,24 @@ export function planBackfill({
         // regex was. Same rule the clock-in route enforces via
         // isCostCodeAllowedForProject — applied here too, because an automated
         // write has less standing to invent a phase than a human does, not more.
-        const allowed = allowedCodesByProject.get(resolvedProjectId);
-        if (costCodeId && allowed && !allowed.has(costCodeId)) {
-            add(expense, "phase-not-on-project");
-            continue;
+        //
+        // FAILS CLOSED. An earlier version wrote `allowed && !allowed.has(...)`,
+        // which skipped the rejection entirely when the map had no entry for
+        // the project — and it has no entry in exactly one case: the job has no
+        // coded estimate items at all, i.e. the job whose phases we know the
+        // LEAST about. That is the one where a global code match is most likely
+        // to be wrong, so it now needs a positive answer, not the absence of a
+        // negative one.
+        if (costCodeId) {
+            const allowed = allowedCodesByProject.get(resolvedProjectId);
+            if (!allowed || allowed.size === 0) {
+                add(expense, "no-phases");
+                continue;
+            }
+            if (!allowed.has(costCodeId)) {
+                add(expense, "phase-not-on-project");
+                continue;
+            }
         }
         if (suggestion && costCodeId && suggestion.confidence >= MIN_CONFIDENCE) {
             codeFills.push({

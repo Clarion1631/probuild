@@ -267,9 +267,10 @@ File-level diff:
   (`/api/projects/[id]/cost-codes` + `/api/projects/[id]/estimate-items` — already in the
   site proxy allowlist, src/proxy.ts:25) and `lib/phasePicker.ts` labels
   (`phaseCodeLabel`); optional but encouraged (inline nudge), never blocking;
-  (c) add an "Installed at customer job" toggle — default TRUE for a real job, FALSE when
-  the selected project is Shop/overhead (the app needs the overhead project id; expose it
-  on the config/session payload the app already loads — executor picks the carrier);
+  (c) add an "Installed at customer job" toggle. **SUPERSEDED — see the as-built note
+  below.** This line originally said "default TRUE for a real job, FALSE when the selected
+  project is Shop/overhead". That default was REMOVED: the toggle now starts UNSET and the
+  app must send an explicit answer (or nothing at all);
   (d) when a PHOTO is attached, submit via a new `api.receipts.intake` →
   `POST /api/receipts/intake` (JSON `fileBase64`, `source:"mobile"`, `projectId`,
   `costCodeId?`, `installedAtCustomer`) instead of the signed-upload + `/api/expenses`
@@ -295,17 +296,37 @@ Server contracts the app can call today:
 | phase list for the picker | `GET /api/projects/[id]/cost-codes` + `/estimate-items` | already existed, already proxied (`src/proxy.ts`) |
 | no-photo expense WITH a phase | `POST /api/expenses` now accepts `costCodeId` | **done** — validated through `resolveCostCode` AND `isCostCodeAllowedForProject`, stored with `costCodeSource: "capture"`. Rejections are `{error, code}` with `COST_CODE_NOT_FOUND` / `COST_CODE_INACTIVE` / `PHASE_NOT_ON_PROJECT`, so the app can show a useful message |
 | photo expense through the pipeline | `POST /api/receipts/intake` accepts `projectId`, `costCodeId`, `installedAtCustomer` | **done** — `installedAtCustomer` is read from JSON (`true`/`false`) or multipart (`"true"`/`"false"`); anything else means "the caller did not say" |
-| the toggle's default | server-side `resolveInstalledAtCustomer` | **done** — an explicit value from the app always wins; silence defaults TRUE for a real job, FALSE for the overhead project, and NULL when there is no project. The app should still SHOW the toggle: the server default is a fallback, not a substitute for asking |
+| the toggle's answer | server-side `resolveInstalledAtCustomer` (`src/lib/expense-attribution.ts`) | **done, and it has NO DEFAULT** — silence stays NULL on every source, including a receipt filed against a real job. See the tax-position note below. The app MUST show the toggle and send a real answer; there is no server-side fallback to lean on |
 
 Auth is unchanged: `/api/receipts/intake` is on the proxy's exact-match public
 bypass and calls `authenticateMobileOrSession` itself, so the crew Bearer token
 works with no proxy change.
 
+**TAX POSITION — `installedAtCustomer` has no default (Codex round 2, PR #442).**
+An earlier build of this branch defaulted it to TRUE for any non-overhead project, exactly
+as §5c above originally specified. That was wrong in the one direction a tax figure must
+never fail in: WAC 458-20-102(12)(b) allows the cost of the articles actually RESOLD, and a
+receipt coded to a live job is just as likely to be consumables, tools, fuel, dump fees or a
+service. Defaulting it turned "nobody looked at this" into a deduction claimed on a state
+return. As built:
+
+* silence is `NULL` on every source — mobile, web, Drive, email, chat;
+* `/reports/tax-paid-at-source` counts ONLY an explicit `true`;
+* `Expense.taxDeductibleBase` (added in this PR) holds the resold portion of a MIXED
+  receipt, and the report uses it in place of the pre-tax total when it is set;
+* the correction path is `PUT /api/expenses/[id]`, which accepts `installedAtCustomer` and
+  `taxDeductibleBase` (validated `0 ≤ base ≤ amount − taxAmount` against the ROW the request
+  leaves behind) and requires the `financialReports` permission on top of project access.
+
+The mobile PR must therefore ship the toggle as a real three-state question, not as a
+pre-answered switch, and `overheadProjectId` on `/api/mobile/me` is now only a UI hint for
+which way to lean the copy — it no longer decides anything.
+
 Remaining mobile-repo diff (a separate PR in `gtr-probuild-mobile`):
 - `apps/mobile/app/(tabs)/expenses.tsx` — (a) default the project dropdown to
   the clocked-in job; (b) add the phase picker (`lib/phasePicker.ts` labels);
-  (c) add the "Installed at customer job" toggle, defaulted from
-  `overheadProjectId`; (d) when a PHOTO is attached, submit via
+  (c) add the "Installed at customer job" toggle — UNSET by default, never
+  pre-answered (see the tax-position note below); (d) when a PHOTO is attached, submit via
   `api.receipts.intake` instead of the signed-upload + `/api/expenses` pair.
 - `apps/mobile/lib/api.ts` + `lib/api-types.ts` — add `receipts.intake(...)`
   and the `overheadProjectId` field on the `/me` response type.
@@ -340,7 +361,8 @@ Re-run after `--apply` must report 0 changes (backfill-estimate-item-cost-codes 
 - Gate: the `financialReports` permission (`src/lib/permissions.ts:110,173`) — same check
   pattern as the sibling reports pages.
 - Data: expenses where `taxAtSource = true AND installedAtCustomer = true AND
-  taxAmount > 0`, grouped by month (from `date`, company timezone) × project
+  taxAmount > 0` (all three POSITIVE — a NULL `installedAtCustomer` is "nobody said" and is
+  never claimed), grouped by month (from `date`, company timezone) × project
   (`resolveExpenseProjectId`), summing `taxAmount`. Columns: Month, Job, Receipts (count),
   Taxable amount (Σ `amount` — see risk 1), Tax paid at source (Σ `taxAmount`). Month and
   grand totals. Period filter, default current quarter. CSV export mirroring the existing

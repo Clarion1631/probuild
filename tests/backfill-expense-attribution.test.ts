@@ -54,6 +54,17 @@ function expense(overrides: Partial<StubExpense> = {}): StubExpense {
 
 const NO_ITEMS = new Map<string, StubItem>();
 
+/**
+ * The jobs' own phases. Required for a suggestion to be written at all — the
+ * check fails CLOSED, so a test that omits this is asserting the refusal path.
+ */
+const ALL_PHASES = new Map([
+    ["job-1", new Set(["cc-plumb", "cc-frame"])],
+    ["job-2", new Set(["cc-plumb", "cc-frame"])],
+    ["job-closed", new Set(["cc-plumb", "cc-frame"])],
+    ["overhead-project", new Set(["cc-plumb", "cc-frame"])],
+]);
+
 const COST_CODE_IDS = new Map([
     ["03-PLUMB", "cc-plumb"],
     ["02-FRAME", "cc-frame"],
@@ -254,6 +265,7 @@ test("a dangling itemId falls through to the rules rather than being skipped", (
         items: NO_ITEMS,
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
     });
     assert.equal(plan.codeFills.length, 1);
     assert.equal(plan.codeFills[0].costCodeSource, "ai");
@@ -292,6 +304,7 @@ test("the overhead bucket and closed jobs are out of the suggester's scope", () 
         items: NO_ITEMS,
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
     });
     assert.deepEqual(plan.codeFills.map(f => f.id), ["active"]);
     assert.deepEqual(plan.remainder.map(e => e.id).sort(), ["closed", "overhead"]);
@@ -334,6 +347,7 @@ test("the projected 'after' applies the plan without touching the database", () 
         items: NO_ITEMS,
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
     });
     assert.equal(measureCoverage(rows).attributed, 0);
     assert.equal(measureCoverage(projectedRows(rows, plan.codeFills)).attributed, 400);
@@ -377,10 +391,13 @@ test("the remainder CSV neutralizes formulas — vendor names here are OCR outpu
 // ── the run ─────────────────────────────────────────────────────────────────
 
 test("a dry run makes ZERO write calls", async () => {
-    const stub = createStub([
-        expense({ id: "e1", vendor: "Summit Plumbing" }),
-        expense({ id: "e2", projectId: null, estimate: { projectId: "job-1" } }),
-    ]);
+    const stub = createStub(
+        [
+            expense({ id: "e1", vendor: "Summit Plumbing" }),
+            expense({ id: "e2", projectId: null, estimate: { projectId: "job-1" } }),
+        ],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
     const result = await runBackfill({ db: stub.db, apply: false, log: () => {}, overheadProjectId: OVERHEAD_ID });
     assert.equal(stub.writes.length, 0, "dry run is the default and it must be inert");
     assert.equal(result.written.projectIds, 0);
@@ -482,6 +499,28 @@ test("a suggested phase the JOB does not have is refused", () => {
     });
     assert.deepEqual(plan.codeFills, []);
     assert.equal(plan.remainder[0].reason, "phase-not-on-project");
+});
+
+test("a project with NO mapped phases fails CLOSED", () => {
+    // The map has no entry for a job with no coded estimate items — i.e. the
+    // job whose phases we know the LEAST about, and the one where a globally
+    // matched code is most likely to be wrong. An earlier version treated the
+    // missing entry as "no opinion" and wrote the code anyway.
+    for (const allowedCodesByProject of [
+        new Map<string, Set<string>>(),
+        new Map([["job-1", new Set<string>()]]),
+        undefined,
+    ]) {
+        const plan = planBackfill({
+            expenses: [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" })],
+            items: NO_ITEMS,
+            costCodeIdByCode: COST_CODE_IDS,
+            scopedProjectIds: ["job-1"],
+            ...(allowedCodesByProject ? { allowedCodesByProject } : {}),
+        });
+        assert.deepEqual(plan.codeFills, [], "nothing may be written without a positive answer");
+        assert.equal(plan.remainder[0].reason, "no-phases");
+    }
 });
 
 test("a suggested phase the job DOES have is accepted", () => {
