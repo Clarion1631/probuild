@@ -12,11 +12,14 @@ import {
 import { QBTimeoutError, type QBTokens } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
-// Two QB deadlines (token refresh + purchase create, 20s each by default)
-// plus the DB work fit inside this comfortably. Before qbTimedFetch existed,
-// an Intuit outage held the function open for the full 60s and returned
-// nothing — the point of the lower ceiling is that we now fail long before it.
-export const maxDuration = 30;
+// Stays at 60. A single push does a lot of SERIAL QBO work on a healthy day —
+// project/vendor/customer lookups, the customer and vendor ensures, the
+// account-identity verify, the Purchase create, then the attachment upload —
+// and the token refresh alone is allowed 45s. Trimming the ceiling would start
+// killing legitimately slow pushes. The fix for the outage case is the
+// per-request deadline in qbTimedFetch, which now fails fast on its own; the
+// ceiling is only the backstop behind it.
+export const maxDuration = 60;
 
 /**
  * Receipt bot -> QBO Purchase creation. Replaces the Apps Script's
