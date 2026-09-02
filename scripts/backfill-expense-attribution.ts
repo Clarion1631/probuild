@@ -96,9 +96,20 @@ const pct = (part, whole) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%
  * counted cross-job dollars as covered, which is the one direction this
  * metric must not flatter.
  *
- * The returned map is keyed by item id but populated ONLY with items whose
- * project matches the expense set being measured.
+ * KEYED BY `projectId:itemId`, not by item id alone (Codex round 21, item 4).
+ *
+ * A bare item-id key made the map say "item I resolves to code C" as a global
+ * fact, and it is not one: the entry is admitted only after checking that the
+ * link does not cross jobs, and then any OTHER row pointing at item I — a
+ * corrupt cross-job expense on a different project, exactly the row the scoping
+ * exists to exclude — read the same entry back and was counted as covered. The
+ * compound key makes the scope part of the lookup rather than part of a check
+ * done once, so a false positive is unrepresentable rather than merely avoided.
  */
+export function coverageKey(projectId, itemId) {
+    return projectId && itemId ? `${projectId}:${itemId}` : null;
+}
+
 export function scopedItemCostCodes(rows, items, allowedCodesByProject) {
     const scoped = new Map();
     for (const row of rows) {
@@ -111,7 +122,7 @@ export function scopedItemCostCodes(rows, items, allowedCodesByProject) {
         if (!projectId || item.projectId !== projectId) continue;
         const allowed = allowedCodesByProject.get(projectId);
         if (!allowed || !allowed.has(item.costCodeId)) continue;
-        scoped.set(row.itemId, item.costCodeId);
+        scoped.set(coverageKey(projectId, row.itemId), item.costCodeId);
     }
     return scoped;
 }
@@ -129,8 +140,13 @@ export function measureCoverage(rows, itemCostCodeById = new Map()) {
         // unattributed BEFORE, then copying that same code counted as new
         // coverage AFTER. The headline was measuring the backfill's activity,
         // not the report's coverage.
+        //
+        // The item half is looked up under the row's OWN job, so a row pointing
+        // at another job's line item resolves to nothing here — which is what
+        // the variance report itself does with it.
+        const key = coverageKey(resolveExpenseProjectId(row), row.itemId ?? null);
         const resolved = resolveExpenseCostCodeId(
-            { costCodeId: row.costCodeId ?? null, itemId: row.itemId ?? null },
+            { costCodeId: row.costCodeId ?? null, itemId: key },
             itemCostCodeById,
         );
         if (resolved) {
@@ -642,7 +658,9 @@ export async function runBackfill({
     );
     const laborRows = timeEntries.map(t => ({
         costCodeId: resolveExpenseCostCodeId(
-            { costCodeId: t.costCodeId, itemId: t.estimateItemId },
+            // Same compound key the map was built with — a time entry pointing
+            // at another job's item must not read that job's entry back.
+            { costCodeId: t.costCodeId, itemId: coverageKey(t.projectId, t.estimateItemId) },
             laborItems,
         ),
         amount: num(t.laborCost) + num(t.burdenCost),

@@ -23,6 +23,8 @@ import {
     expectedConstraints,
     expectedIndexes,
     pickCompanyTimeZone,
+    postDeployStatements,
+    PROJECT_ID_BACKFILL,
     reanchorSql,
     statements,
     targetMatches,
@@ -274,12 +276,19 @@ test("the DDL runs inside ONE transaction", () => {
         path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
         "utf8",
     );
-    const run = script.slice(script.indexOf("for (const sql of [...statements"));
+    const loopAt = script.indexOf("for (const sql of toRun)");
+    assert.ok(loopAt > 0, "the run loop is still there");
+    const run = script.slice(loopAt);
     assert.match(script, /await prisma\.\$transaction\(async tx =>/);
     assert.match(run, /await tx\.\$executeRawUnsafe\(sql\)/, "inside the transaction, not outside it");
     assert.ok(
-        script.indexOf("$transaction(async tx =>") < script.indexOf("for (const sql of [...statements"),
+        script.indexOf("$transaction(async tx =>") < loopAt,
         "the loop is INSIDE the transaction",
+    );
+    // ...and --post-deploy is the same loop, not a second one that could drift.
+    assert.equal(
+        script.split("for (const sql of toRun)").length - 1, 1,
+        "one loop, whichever set it is given",
     );
 });
 
@@ -371,4 +380,37 @@ test("ReceiptIntake.costCodeSource ships behind the same guard as the other two"
     const guarded = (statements as string[]).find(s => s.includes("ReceiptIntake"));
     assert.match(guarded!, /"costCodeSource" TEXT/);
     assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT/);
+});
+
+// ── the post-deploy re-run (Codex round 21, item 3) ────────────────────────
+
+test("the post-deploy set is a SUBSET of the main run, never a second copy", () => {
+    // Two copies of a backfill are two things that can drift, and the one that
+    // drifts is the one nobody runs on the day it matters.
+    const main = [...(statements as string[]), reanchorSql("America/Los_Angeles")];
+    for (const sql of postDeployStatements("America/Los_Angeles")) {
+        assert.ok(main.includes(sql), `not part of the main run:\n  ${sql}`);
+    }
+});
+
+test("both post-deploy statements are idempotent BY PREDICATE", () => {
+    // The whole reason a second pass is safe. The projectId fill only ever
+    // touches a NULL, and the date re-anchor only ever touches a row that has
+    // never been anchored AND is still sitting at UTC midnight — which is
+    // exactly the shape the OLD build writes while it drains.
+    const [projectFill, reanchor] = postDeployStatements("America/Los_Angeles");
+    assert.match(projectFill, /"projectId" IS NULL/);
+    assert.match(reanchor, /"attributionAnchoredAt" IS NULL/);
+    assert.match(reanchor, /"date"::time = TIME '00:00:00'/);
+});
+
+test("the live-write gap is documented where the statement is, not only in a PR", () => {
+    const script = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    assert.match(script, /POST-DEPLOY: re-run this section/);
+    assert.match(script, /--post-deploy/, "and the mode that re-runs it exists");
+    // The backfill itself is the exported constant the mode reuses.
+    assert.match(PROJECT_ID_BACKFILL, /UPDATE "Expense" e SET "projectId"/);
 });

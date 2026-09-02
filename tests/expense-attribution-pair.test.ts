@@ -14,6 +14,8 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
 import {
     itemBelongsToEstimateTx,
     lockEstimateAttribution,
@@ -104,4 +106,102 @@ test("the item check locks the row it answers about", async () => {
     await itemBelongsToEstimateTx(tx, "i", "e");
     assert.match(queries[0], /FROM "EstimateItem"/);
     assert.match(queries[0], /FOR SHARE/);
+});
+
+// ── the tripwire: every writer of the pair re-reads it under lock ──────────
+
+/**
+ * The `data: { … }` payload of a write, extracted by matching BRACES rather
+ * than by a character budget.
+ *
+ * A fixed window is what makes this kind of scan lie: billing-core's
+ * `expense.updateMany` writes `{ invoiceId, invoicedAt }` and a 1,500-character
+ * window from its `data:` runs straight past the closing brace into the next
+ * statement, where `projectId` appears for an unrelated reason. Reading the
+ * actual object is the difference between "a writer of this column" and "a file
+ * that mentions it nearby".
+ */
+function firstDataPayload(source: string, from: number): string | null {
+    const open = /data:\s*\{/g;
+    open.lastIndex = from;
+    const match = open.exec(source);
+    if (!match) return null;
+    let depth = 0;
+    for (let index = match.index + match[0].length - 1; index < source.length; index += 1) {
+        if (source[index] === "{") depth += 1;
+        else if (source[index] === "}") {
+            depth -= 1;
+            if (depth === 0) return source.slice(match.index, index + 1);
+        }
+    }
+    return null;
+}
+
+/**
+ * A file that writes `projectId` onto an Expense.
+ *
+ * Same reasoning as `writesAnExpenseCostCode` in
+ * tests/expense-writer-phase-guard.test.ts: scoped to the STATEMENT rather
+ * than the file, so a `select: { projectId: true }` or a `where` predicate
+ * elsewhere in the same file cannot be mistaken for a write.
+ */
+function writesAnExpenseProjectId(source: string): boolean {
+    const writes = /(?:prisma|tx|transaction|client)\.expense\.(?:create|update|updateMany)\s*\(/g;
+    for (let match = writes.exec(source); match; match = writes.exec(source)) {
+        const payload = firstDataPayload(source, match.index);
+        if (!payload) continue;
+        // The property as a WRITTEN value — `projectId: x` or the shorthand
+        // `projectId,` — never `projectId: true`, which is a select.
+        if (/(^|[\s,{])projectId(\s*:\s*(?!true\b)|\s*[,}])/.test(payload)) return true;
+    }
+    return false;
+}
+
+function walk(dir: string, out: string[] = []): string[] {
+    for (const entry of readdirSync(dir)) {
+        const full = path.join(dir, entry);
+        if (statSync(full).isDirectory()) walk(full, out);
+        else if (full.endsWith(".ts") || full.endsWith(".tsx")) out.push(full);
+    }
+    return out;
+}
+
+const ROOT = path.resolve(__dirname, "..");
+
+test("every writer of Expense.projectId re-reads the pair under lock", () => {
+    // A TRIPWIRE, not a proof: it fails when a NEW writer appears that stamps a
+    // project from a value read before its transaction — which is exactly how
+    // four of them shipped (Codex round 21, item 1). The behaviour is covered
+    // by the per-writer interleaving tests.
+    const offenders: string[] = [];
+    for (const file of walk(path.join(ROOT, "src"))) {
+        const source = readFileSync(file, "utf8");
+        if (!writesAnExpenseProjectId(source)) continue;
+        if (source.includes("lockEstimateAttribution")) continue;
+        offenders.push(path.relative(ROOT, file).split(path.sep).join("/"));
+    }
+    assert.deepEqual(
+        offenders,
+        [],
+        "these stamp a job onto an Expense without re-reading the estimate under lock:\n  " +
+            offenders.join("\n  "),
+    );
+});
+
+test("the writers we know about are actually in the scanned set", () => {
+    // A tripwire that scans nothing passes forever.
+    const expected = [
+        "src/app/api/expenses/route.ts",
+        "src/app/api/integrations/receipt-ingest/route.ts",
+        "src/app/api/receipts/parse/route.ts",
+        "src/lib/time-expense-core.ts",
+        "src/lib/receipt-intake/book.ts",
+        "src/lib/qbo-expense-sync.ts",
+    ];
+    const scanned = walk(path.join(ROOT, "src"))
+        .filter(file => writesAnExpenseProjectId(readFileSync(file, "utf8")))
+        .map(file => path.relative(ROOT, file).split(path.sep).join("/"));
+    for (const writer of expected) {
+        assert.ok(scanned.includes(writer), `${writer} is no longer detected as an attribution writer`);
+    }
 });

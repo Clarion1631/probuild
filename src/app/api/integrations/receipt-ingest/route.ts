@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
@@ -127,19 +128,33 @@ export async function POST(req: Request) {
         // (or no longer) a phase of this job is dropped rather than posted,
         // with the same warning an unmatched category already produces.
         const ingested = await prisma.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). `estimateId` was
+            // the project's latest estimate as of a query taken before the
+            // phase lookup, the date resolution and every earlier group in this
+            // loop. An estimate moved to another job in that window would be
+            // written next to the OLD project — one expense on two jobs, which
+            // no report can be right about. The group is skipped rather than
+            // guessed at; the Drive file stays unarchived and re-sends.
+            const pair = await lockEstimateAttribution(raw, estimateId);
+            if (!pair || pair.projectId !== project.id) return { moved: true as const };
             let phaseId = costCode?.id ?? null;
             if (phaseId) {
+                // Asked about the LOCKED job, like everything else past this
+                // point. It equals `project.id` by the check above; naming the
+                // locked value keeps that true if the check ever moves.
                 const verdict = await assertPhaseOfProjectTx(
-                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
-                    project.id,
+                    raw,
+                    pair.projectId,
                     phaseId,
                 );
                 if (!verdict.ok) phaseId = null;
             }
             await tx.expense.create({
             data: {
-                estimateId,
-                projectId: project.id,
+                // ONE PAIR, from one locked read.
+                estimateId: pair.estimateId,
+                projectId: pair.projectId,
                 costCodeId: phaseId,
                 // The category came from the Apps Script's Gemini read, not
                 // from a person — "ai", never "capture", so nothing downstream
@@ -159,9 +174,15 @@ export async function POST(req: Request) {
                     ` · pending bookkeeper review`,
                 },
             });
-            return phaseId;
+            return { moved: false as const, phaseId };
         });
-        if (costCode && ingested === null) {
+        if (ingested.moved) {
+            warnings.push(
+                `This job's estimate moved to another job while the receipt was being imported — "${group.category}" was not created`,
+            );
+            continue;
+        }
+        if (costCode && ingested.phaseId === null) {
             warnings.push(
                 `"${group.category}" matched ${costCode.code}, which is not a phase of this job — expense created without one`,
             );

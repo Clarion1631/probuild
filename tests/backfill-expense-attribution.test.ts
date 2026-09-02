@@ -671,13 +671,36 @@ test("coverage counts an item-resolvable row as ALREADY attributed", () => {
     // improvement twice: the row read as unattributed BEFORE, then copying the
     // very same code from its item read as new coverage AFTER. The headline was
     // measuring the backfill's activity, not the report's coverage.
-    const items = new Map<string, string | null>([["item-1", "cc-frame"]]);
-    const rows = [{ costCodeId: null, itemId: "item-1", amount: 400 }];
+    // Keyed by `projectId:itemId` — the map says "item I resolves to code C
+    // ON JOB J", never as a global fact (round 21, item 4).
+    const items = new Map<string, string | null>([["job-1:item-1", "cc-frame"]]);
+    const rows = [{ projectId: "job-1", costCodeId: null, itemId: "item-1", amount: 400 }];
 
     assert.equal(measureCoverage(rows, items).attributed, 400, "the item already resolves it");
     assert.equal(measureCoverage(rows, items).unattributed, 0);
     // ...and without the item universe it looks like a gap, which is the bug.
     assert.equal(measureCoverage(rows).attributed, 0);
+});
+
+test("coverage credit does NOT leak to a corrupt row on another job", () => {
+    // Codex round 21, item 4. `scopedItemCostCodes` checked the cross-job gate
+    // when it ADMITTED an entry and then stored it under the bare item id, so
+    // any other row pointing at that item read the same entry back — including
+    // the cross-job row the gate exists to exclude. The scope has to be part of
+    // the LOOKUP, not part of a check made once.
+    const legitimate = expense({ id: "ok", projectId: "job-1", itemId: "item-1", amount: 100 });
+    const corrupt = expense({ id: "bad", projectId: "job-2", itemId: "item-1", amount: 900 });
+    const items = new Map([
+        ["item-1", { costCodeId: "cc-frame", estimateId: "est-1", projectId: "job-1" }],
+    ]);
+    const scoped = scopedItemCostCodes([legitimate, corrupt], items, ALL_PHASES);
+
+    assert.deepEqual([...scoped.keys()], ["job-1:item-1"], "one entry, and it names its job");
+
+    const coverage = measureCoverage([legitimate, corrupt], scoped);
+    assert.equal(coverage.attributed, 100, "only the row whose own job owns the item");
+    assert.equal(coverage.unattributed, 900, "the cross-job dollars stay a gap");
+    assert.equal(coverage.codedCount, 1);
 });
 
 test("coverage still counts a genuinely uncoded row as a gap", () => {
@@ -702,8 +725,8 @@ test("coverage keeps CROSS-JOB item dollars unattributed", () => {
     ]);
     const scoped = scopedItemCostCodes(rows, items, ALL_PHASES);
 
-    assert.equal(scoped.has("item-own"), true, "the same-job link counts");
-    assert.equal(scoped.has("item-elsewhere"), false, "the cross-job link does not");
+    assert.equal(scoped.has("job-1:item-own"), true, "the same-job link counts");
+    assert.equal(scoped.has("job-1:item-elsewhere"), false, "the cross-job link does not");
 
     const coverage = measureCoverage(rows, scoped);
     assert.equal(coverage.attributed, 300);
@@ -736,13 +759,16 @@ test("LABOR item dollars from another job stay unattributed too", () => {
     ]);
     const scoped = scopedItemCostCodes(entries, items, ALL_PHASES);
 
-    assert.equal(scoped.has("item-own"), true);
-    assert.equal(scoped.has("item-elsewhere"), false, "another job's item is not this job's coverage");
+    assert.equal(scoped.has("job-1:item-own"), true);
+    assert.equal(
+        scoped.has("job-1:item-elsewhere"), false,
+        "another job's item is not this job's coverage",
+    );
 
     const labor = measureCoverage(
         [
-            { costCodeId: null, itemId: "item-elsewhere", amount: 900 },
-            { costCodeId: null, itemId: "item-own", amount: 100 },
+            { projectId: "job-1", costCodeId: null, itemId: "item-elsewhere", amount: 900 },
+            { projectId: "job-1", costCodeId: null, itemId: "item-own", amount: 100 },
         ],
         scoped,
     );

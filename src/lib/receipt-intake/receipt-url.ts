@@ -88,3 +88,30 @@ export async function resolveReceiptUrl(
     if (!moved || moved === parsed.path) return null;
     return await deps.sign(moved, ttlSeconds).catch(() => null);
 }
+
+/**
+ * Resolve `receiptUrl` on a LIST of expense rows, in place of the raw column.
+ *
+ * ONE COPY, because there are two doors onto the same tab: the page's initial
+ * server render and the client refresh after a save. The refresh returned the
+ * raw column, so every `receipt-intake://…` receipt stopped opening the moment
+ * a bookkeeper edited a tax figure — the row was there, the link was a scheme
+ * the browser has never heard of.
+ *
+ * Legacy absolute URLs and data URLs come back unchanged; a reference that
+ * cannot be resolved comes back null, which the tab renders as "no receipt".
+ */
+export async function resolveReceiptUrls<T extends { receiptUrl: string | null }>(
+    expenses: T[],
+    ttlSeconds: number = RECEIPT_URL_TTL_SECONDS,
+    deps: ReceiptUrlDeps = defaultDeps,
+): Promise<T[]> {
+    return await Promise.all(
+        expenses.map(async expense => ({
+            ...expense,
+            receiptUrl: isReceiptUrlRef(expense.receiptUrl)
+                ? await resolveReceiptUrl(expense.receiptUrl, ttlSeconds, deps)
+                : expense.receiptUrl,
+        })),
+    );
+}

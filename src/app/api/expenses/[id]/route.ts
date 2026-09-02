@@ -10,6 +10,7 @@ import {
 import {
     expenseStillOnProjectWhere,
     isPlausibleReceiptTax,
+    itemBelongsToProjectTx,
     maxPlausibleTaxAmount,
     resolveExpenseProjectId,
     resolveExpenseProjectUnderLock,
@@ -156,6 +157,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // the estimate belongs to the job it left, so that branch admitted
         // exactly the cross-job link the check exists to stop. The resolved
         // project is the only authority.
+        //
+        // This one is the FAST FAIL, and it holds nothing: `resolvedProjectId`
+        // is a pre-transaction read. The answer that counts is re-asked under
+        // the same lock as the write (`itemBelongsToProjectTx`, below).
         if (body.itemId) {
             const itemExists = await prisma.estimateItem.findFirst({
                 where: {
@@ -314,14 +319,32 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
                 return { expense: null, phaseRejected: null, denied: "forbidden" } as const;
             }
+            // BOTH RE-CHECKS ANSWER ABOUT `lockedProjectId` (round 21, item 2).
+            //
+            // They used to be asked about `resolveExpenseProjectId(expense)` —
+            // the value read BEFORE the transaction, which is the one thing the
+            // locked re-resolve exists to distrust. A fallback-attributed row
+            // whose estimate moved would have its phase validated against the
+            // job it left and its item link validated against that job's
+            // estimates, then written onto the job it joined.
             if (editsCostCode && nextCostCodeId) {
                 const verdict = await assertPhaseOfProjectTx(
                     tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
-                    resolveExpenseProjectId(expense),
+                    lockedProjectId,
                     nextCostCodeId,
                 );
                 if (!verdict.ok) {
                     return { expense: null, phaseRejected: verdict.reason, denied: null } as const;
+                }
+            }
+            if (body.itemId) {
+                const onThisJob = await itemBelongsToProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    body.itemId,
+                    lockedProjectId,
+                );
+                if (!onThisJob) {
+                    return { expense: null, phaseRejected: null, denied: "item" } as const;
                 }
             }
             const written = await tx.expense.updateMany({
@@ -353,6 +376,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         });
         if (legacyWrite.denied === "forbidden") {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (legacyWrite.denied === "item") {
+            return NextResponse.json(
+                { error: "That line item isn't on this project's estimates. Save the Estimate on the web first, or pick a line item from this job." },
+                { status: 400 },
+            );
         }
         if (legacyWrite.denied) {
             return NextResponse.json(

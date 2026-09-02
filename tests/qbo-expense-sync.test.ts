@@ -571,8 +571,20 @@ type StoredExpense = Omit<QboExpenseWrite, "status"> & {
     costCodeConfidence?: number | null;
 };
 
-function createFakePrisma(initial: StoredExpense[] = []) {
+/**
+ * The estimate table, because the upsert now re-reads the attribution PAIR
+ * under a lock rather than trusting the matcher's pre-transaction answer
+ * (Codex round 21, item 1). `estimateProjects` scripts the interleaving: seed
+ * an entry to move an estimate to another job, or `null` to un-project it.
+ * Anything unseeded is on `project-1`, which is where every WRITE points.
+ */
+function createFakePrisma(
+    initial: StoredExpense[] = [],
+    estimateProjects: Map<string, string | null> = new Map(),
+) {
     const rows = new Map(initial.map((row) => [row.qbPurchaseId, { ...row }]));
+    const estimateProjectOf = (estimateId: string) =>
+        estimateProjects.has(estimateId) ? estimateProjects.get(estimateId)! : "project-1";
     const expense = {
         async findUnique(args: { where: { qbPurchaseId: string } }) {
             return rows.get(args.where.qbPurchaseId) ?? null;
@@ -637,7 +649,14 @@ function createFakePrisma(initial: StoredExpense[] = []) {
                 // have.
                 let heldByThisTransaction = false;
                 const transactionLock = {
-                    async $queryRawUnsafe() {
+                    async $queryRawUnsafe(query: string, ...args: unknown[]) {
+                        // The estimate reads `lockEstimateAttribution` makes.
+                        // The FOR SHARE row lock returns nothing; the read
+                        // after it answers.
+                        if (/FROM "Estimate" WHERE id/.test(query)) {
+                            if (/FOR SHARE/.test(query)) return [];
+                            return [{ projectId: estimateProjectOf(args[0] as string) }];
+                        }
                         if (heldByThisTransaction) return [{ pg_advisory_xact_lock: null }];
                         heldByThisTransaction = true;
                         const previous = lockTail;
@@ -1155,6 +1174,72 @@ test("a re-attributed row settles to unchanged instead of updating forever", asy
     assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
     assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
     assert.equal(fake.rows.get("purchase-1")?.projectId, "moved-by-hand");
+});
+
+// ── the pair is re-read under lock, at write time (round 21, item 1) ────────
+
+test("an estimate MOVED mid-sync is imported onto its new job, not the matcher's", async () => {
+    // The matcher resolved estimate-1 -> project-1, then wrote a
+    // classification row and made a QBO round trip. If the estimate joined
+    // another job in that window, persisting `write.projectId` next to
+    // `write.estimateId` puts one expense on two jobs at once —
+    // `resolveExpenseProjectId` says project-1, every join through the
+    // estimate says project-moved, and no report can be right about it.
+    const fake = createFakePrisma([], new Map([["estimate-1", "project-moved"]]));
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.projectId, "project-moved", "the LOCKED read is the authority");
+    assert.equal(row?.estimateId, "estimate-1");
+});
+
+test("an estimate that lost its project imports UNattributed, never half a pair", async () => {
+    // Writing project-1 beside an estimate that is on no job at all is the
+    // same split, reached the other way. Null is the honest answer: the row is
+    // a reportable gap a bookkeeper can close.
+    const fake = createFakePrisma([], new Map([["estimate-1", null]]));
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
+    assert.equal(fake.rows.get("purchase-1")?.projectId, null);
+});
+
+test("the catch-up FILL follows the estimate too, not the matcher's project", async () => {
+    // The legacy fill path had the same shape: `plan.fill` carried the
+    // matcher's projectId, and the row it lands on is the one the pre-Phase-3
+    // sync left with projectId NULL.
+    const fake = createFakePrisma(
+        [{ ...WRITE, id: "expense-1", projectId: null, receiptUrl: null }],
+        new Map([["estimate-1", "project-moved"]]),
+    );
+    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.projectId, "project-moved");
+    assert.equal(row?.estimateId, "estimate-1", "the pair moves together or not at all");
+});
+
+test("a fill onto a project-less estimate writes the estimate alone, not a stale job", async () => {
+    const fake = createFakePrisma(
+        [{ ...WRITE, id: "expense-1", projectId: null, estimateId: "estimate-old", receiptUrl: null }],
+        new Map([["estimate-1", null]]),
+    );
+    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    const row = fake.rows.get("purchase-1");
+    assert.equal(row?.projectId, null, "no job to attribute against");
+    assert.equal(row?.estimateId, "estimate-1");
+});
+
+test("an ALREADY-attributed row is untouched by the locked re-read", async () => {
+    // The re-read is part of the FILL, and the fill only ever runs under a
+    // `projectId IS NULL` predicate. A bookkeeper's re-attribution must not be
+    // dragged back to the estimate's job.
+    const fake = createFakePrisma(
+        [{ ...WRITE, id: "expense-1", projectId: "moved-by-hand", receiptUrl: null }],
+        new Map([["estimate-1", "project-moved"]]),
+    );
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 200 }),
+        "updated",
+    );
+    assert.equal(fake.rows.get("purchase-1")?.projectId, "moved-by-hand");
+    assert.equal(fake.rows.get("purchase-1")?.amount, 200);
 });
 
 test("deactivation never touches the attribution columns", async () => {

@@ -953,13 +953,35 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 }
             }
 
-            const expense = existing ?? await tx.expense.create({
-                data: {
+            // THE PAIR, RE-READ UNDER LOCK (round 21, item 1).
+            //
+            // `estimateId` was the project's newest estimate as of a query
+            // taken before the QBO Purchase round trip. The fill path above
+            // already re-reads it; the CREATE path wrote `row.projectId`
+            // alongside an estimate nobody had looked at since, so an estimate
+            // moved to another job in that window produced a brand new expense
+            // on two jobs at once — the exact shape the fill path refuses.
+            //
+            // A disagreement is not something to guess at: the Purchase exists,
+            // so the row parks as an attribution conflict and a person decides.
+            let expense: { id: string };
+            if (existing) {
+                expense = existing;
+            } else {
+                const pair = await lockEstimateAttribution(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
                     estimateId,
-                    // Phase 3: the job the capturer (or the Drive folder) named.
-                    // `estimateId` above is DERIVED from it — the project is the
-                    // fact, the estimate is the lookup.
-                    projectId: row.projectId,
+                );
+                if (!pair || pair.projectId !== row.projectId) {
+                    throw new AttributionConflictError();
+                }
+                expense = await tx.expense.create({
+                data: {
+                    // ONE PAIR, from one locked read: the job the capturer (or
+                    // the Drive folder) named, and the estimate that still
+                    // belongs to it.
+                    estimateId: pair.estimateId,
+                    projectId: pair.projectId,
                     costCodeId,
                     costCodeSource,
                     costCodeConfidence,
@@ -1021,7 +1043,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         ` · pending bookkeeper review`,
                 },
                 select: { id: true },
-            });
+                });
+            }
             // CAS again inside the commit. If the row was re-claimed between
             // the create and here, this transaction rolls back — including the
             // Expense — and the successor retries: QBO's DocNumber idempotency

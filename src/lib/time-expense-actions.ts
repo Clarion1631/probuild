@@ -19,7 +19,7 @@ import {
 } from "@/lib/time-expense-core";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
-import { isReceiptUrlRef, resolveReceiptUrl } from "@/lib/receipt-intake/receipt-url";
+import { resolveReceiptUrls } from "@/lib/receipt-intake/receipt-url";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 
@@ -366,7 +366,7 @@ export async function getTimeEntries(projectId: string) {
 export async function getExpenses(projectId: string) {
     await assertTimeExpenseProjectAccess(projectId);
 
-    return prisma.expense.findMany({
+    const expenses = await prisma.expense.findMany({
         where: expenseForProjectWhere(projectId),
         include: {
             costCode: { select: { id: true, name: true, code: true } },
@@ -376,6 +376,12 @@ export async function getExpenses(projectId: string) {
         },
         orderBy: { createdAt: "desc" },
     });
+    // THE SAME RESOLUTION THE PAGE'S FIRST RENDER DOES.
+    //
+    // This is the tab's REFRESH path — it runs after a tax save, a delete, a
+    // change-order tag — and it returned the raw column, so every receipt the
+    // pipeline booked lost its link the moment anything was edited.
+    return await resolveReceiptUrls(expenses);
 }
 
 // ─── Combined Data Fetching ───────────────────────────────────
@@ -406,13 +412,9 @@ export async function getTimeExpenseData(projectId: string) {
     // `receiptUrl` is a stored REFERENCE for anything the receipt pipeline
     // booked (`receipt-intake://…`), not a link — the tab renders it as an
     // href, so it is resolved to a short-lived signed URL here. Legacy absolute
-    // URLs and data URLs come back unchanged.
-    const expenses = await Promise.all(expenseRows.map(async expense => ({
-        ...expense,
-        receiptUrl: isReceiptUrlRef(expense.receiptUrl)
-            ? await resolveReceiptUrl(expense.receiptUrl)
-            : expense.receiptUrl,
-    })));
+    // URLs and data URLs come back unchanged. Shared with `getExpenses`, which
+    // is the same tab's refresh path.
+    const expenses = await resolveReceiptUrls(expenseRows);
 
     const costCodes = await prisma.costCode.findMany({
         where: { isActive: true },

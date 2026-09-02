@@ -18,6 +18,7 @@ import {
     parseReceiptUrl,
     receiptUrlRef,
     resolveReceiptUrl,
+    resolveReceiptUrls,
 } from "../src/lib/receipt-intake/receipt-url";
 import { RECEIPT_BUCKET } from "../src/lib/receipt-intake/bucket";
 
@@ -115,10 +116,21 @@ test("every reader resolves the reference: the booker writes it, resolveDocUrl r
     const storage = readFileSync(path.join(root, "src/lib/secure-storage.ts"), "utf8");
     assert.match(storage, /if \(isReceiptUrlRef\(stored\)\) return await resolveReceiptUrl\(stored, ttlSeconds\)/);
 
-    // The two readers that do NOT go through it.
+    // The two readers that do NOT go through it. The expenses tab has TWO
+    // doors — the page's first render and the client refresh after a save —
+    // and they must share one resolver, or the refresh hands the browser a
+    // `receipt-intake://` string and every receipt link dies on the first edit
+    // (round 21, item 5).
     const tab = readFileSync(path.join(root, "src/lib/time-expense-actions.ts"), "utf8");
-    assert.match(tab, /isReceiptUrlRef\(expense\.receiptUrl\)/);
-    assert.match(tab, /await resolveReceiptUrl\(expense\.receiptUrl\)/);
+    assert.match(tab, /import \{ resolveReceiptUrls \}/);
+    assert.equal(
+        tab.split("await resolveReceiptUrls(").length - 1, 2,
+        "BOTH readers go through it — the first render and the refresh",
+    );
+    assert.ok(
+        !/isReceiptUrlRef/.test(tab),
+        "and neither hand-rolls the conversion any more",
+    );
 
     const aiReview = readFileSync(path.join(root, "src/app/api/automation/ai-review/route.ts"), "utf8");
     assert.match(aiReview, /const receiptUrl = isReceiptUrlRef\(expense\.receiptUrl\)/);
@@ -127,4 +139,37 @@ test("every reader resolves the reference: the booker writes it, resolveDocUrl r
     assert.match(aiReview, /storageRoot\}sign\//);
     assert.match(aiReview, /allowed\.some\(prefix => receiptUrl\.startsWith\(prefix\)\)/);
     assert.match(aiReview, /fetch\(receiptUrl, \{ redirect: "error"/);
+});
+
+// ── the shared list resolver (round 21, item 5) ────────────────────────────
+
+test("resolveReceiptUrls converts references and leaves everything else alone", async () => {
+    const rows = [
+        { id: "a", receiptUrl: REF },
+        { id: "b", receiptUrl: "https://drive.test/legacy.png" },
+        { id: "c", receiptUrl: null },
+    ];
+    const out = await resolveReceiptUrls(rows, 600, {
+        sign: async (storagePath: string) => `https://signed.test/${storagePath}`,
+        currentPath: async () => null,
+    });
+    assert.equal(out[0].receiptUrl, `https://signed.test/${PATH}`);
+    assert.equal(out[1].receiptUrl, "https://drive.test/legacy.png", "a legacy link is untouched");
+    assert.equal(out[2].receiptUrl, null);
+    // The rest of the row survives — this replaces one field, it is not a
+    // projection.
+    assert.deepEqual(out.map(row => row.id), ["a", "b", "c"]);
+});
+
+test("one unresolvable receipt does not take the list down", async () => {
+    const out = await resolveReceiptUrls(
+        [{ id: "a", receiptUrl: REF }, { id: "b", receiptUrl: null }],
+        600,
+        {
+            sign: async () => { throw new Error("storage is down"); },
+            currentPath: async () => { throw new Error("db is down"); },
+        },
+    );
+    assert.equal(out[0].receiptUrl, null, "renders as 'no receipt', never a throw");
+    assert.equal(out.length, 2);
 });

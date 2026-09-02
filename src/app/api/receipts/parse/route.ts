@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
+import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 const RECEIPT_PROMPT = `You are an AI receipt parser for a construction company.
@@ -270,7 +271,17 @@ export async function POST(req: NextRequest) {
         // mobile UI can show the right toast (vs silently assuming success).
         let expenseCreated = false;
         let expenseId: string | undefined;
-        let expenseSkipReason: "no-project" | "forbidden" | "no-estimate" | "incomplete-parse" | undefined;
+        let expenseSkipReason:
+            | "no-project"
+            | "forbidden"
+            | "no-estimate"
+            | "incomplete-parse"
+            // The estimate this parse resolved left the job while the model was
+            // reading the image. Nothing is written — see the locked re-read
+            // below — and the caller is told plainly rather than shown a row on
+            // a job nobody chose.
+            | "estimate-moved"
+            | undefined;
 
         if (!projectId) {
             expenseSkipReason = "no-project";
@@ -288,30 +299,48 @@ export async function POST(req: NextRequest) {
                 expenseSkipReason = "no-estimate";
             } else {
                 const confidence = ((parsed.confidence as number || 0) * 100).toFixed(0);
-                const expense = await prisma.expense.create({
-                    data: {
-                        estimateId: estimate.id,
-                        // Phase 3: the caller named the project and access was
-                        // checked three lines up — stamp it rather than making
-                        // every reader re-derive it through the estimate.
-                        // Cost code stays null: this parse reads vendor/total/
-                        // date, never a phase.
-                        projectId,
-                        description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
-                        amount: parsed.total as number,
-                        // A COMPANY CALENDAR DAY, like every other writer. The
-                        // model returns a bare "2026-07-01", and `new Date()` on
-                        // that is UTC midnight — which reads as 30 June in
-                        // Pacific and files the receipt in the wrong quarter.
-                        date: typeof parsed.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
-                            ? dateOnlyInTimeZone(parsed.date, await resolveCompanyTimeZone())
-                            : (parsed.date ? new Date(parsed.date as string) : new Date()),
-                        vendor: parsed.vendor as string,
-                        status: "Pending",
-                    },
+                // A COMPANY CALENDAR DAY, like every other writer. The model
+                // returns a bare "2026-07-01", and `new Date()` on that is UTC
+                // midnight — which reads as 30 June in Pacific and files the
+                // receipt in the wrong quarter. Resolved BEFORE the transaction
+                // so a settings read never holds the estimate lock open.
+                const expenseDate =
+                    typeof parsed.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
+                        ? dateOnlyInTimeZone(parsed.date, await resolveCompanyTimeZone())
+                        : (parsed.date ? new Date(parsed.date as string) : new Date());
+                // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). The estimate
+                // was picked before an image upload, an access check and a
+                // model call; if it moved to another job in that window,
+                // writing `projectId` next to it would put the expense on two
+                // jobs at once. Nothing is created on a disagreement — this is
+                // a convenience row and a wrong one costs more than none.
+                const expense = await prisma.$transaction(async tx => {
+                    const pair = await lockEstimateAttribution(
+                        tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                        estimate.id,
+                    );
+                    if (!pair || pair.projectId !== projectId) return null;
+                    return tx.expense.create({
+                        data: {
+                            // ONE PAIR, from one locked read. Cost code stays
+                            // null: this parse reads vendor/total/date, never a
+                            // phase.
+                            estimateId: pair.estimateId,
+                            projectId: pair.projectId,
+                            description: `[AI ${confidence}%] ${parsed.vendor} receipt — pending bookkeeper review`,
+                            amount: parsed.total as number,
+                            date: expenseDate,
+                            vendor: parsed.vendor as string,
+                            status: "Pending",
+                        },
+                    });
                 });
-                expenseCreated = true;
-                expenseId = expense.id;
+                if (!expense) {
+                    expenseSkipReason = "estimate-moved";
+                } else {
+                    expenseCreated = true;
+                    expenseId = expense.id;
+                }
             }
         }
 

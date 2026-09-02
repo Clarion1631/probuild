@@ -25,6 +25,17 @@ let currentUser: FakeUser | null;
 let storedExpense: Record<string, unknown> | null;
 let updateArgs: { where: unknown; data: Record<string, unknown> } | null;
 let estimateItems: { id: string; estimateId: string; projectId: string | null }[];
+/**
+ * What the LOCKED estimate read answers, when a test wants it to disagree with
+ * the pre-transaction one (round 21, item 2). `undefined` means "the same
+ * fixture the pre-read saw", which is every other test.
+ */
+let lockedEstimateProject: string | null | undefined;
+/** Every project the phase invariant was asked about, in order. */
+let phaseProjectIds: string[];
+/** Company cost codes, and which job carries each as a phase. Empty by default. */
+let costCodes: { id: string; code: string; isActive: boolean }[];
+let phaseItems: { projectId: string; costCodeId: string }[];
 
 const fakePrisma: any = {
     // The tax PATCH writes inside a transaction that first takes the shared
@@ -32,8 +43,21 @@ const fakePrisma: any = {
     $transaction: async (fn: any) => fn(fakePrisma),
     // The locked re-resolve reads the ESTIMATE's project through raw SQL, so
     // the fake answers that one from the same fixture the resolver would see.
-    $queryRawUnsafe: async (query: string) => {
+    $queryRawUnsafe: async (query: string, ...args: any[]) => {
+        // The locked item check (round 21, item 2): "is this item on ANY
+        // estimate of THAT job", asked on the transaction that writes the
+        // link, about the project the locked re-resolve returned.
+        if (/FROM "EstimateItem" item/.test(query)) {
+            const [itemId, projectId] = args as string[];
+            const item = estimateItems.find(candidate => candidate.id === itemId);
+            return item && item.projectId === projectId ? [{ id: itemId }] : [];
+        }
+        if (/FROM "Project" WHERE id/.test(query) && /status/.test(query)) {
+            phaseProjectIds.push(args[0] as string);
+            return [{ id: args[0], status: "In Progress" }];
+        }
         if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
+            if (lockedEstimateProject !== undefined) return [{ projectId: lockedEstimateProject }];
             const row = storedExpense as Record<string, any> | null;
             return [{ projectId: row?.estimate?.projectId ?? null }];
         }
@@ -79,8 +103,38 @@ const fakePrisma: any = {
             const item = estimateItems.find(candidate => candidate.id === args.where.id);
             return item ? { id: item.id } : null;
         },
+        // The PRE-transaction phase gate reads a job's phases through
+        // prismaPhaseDataSource. Empty by default, so a test that says nothing
+        // about phases still gets the old "no code is a phase" behaviour.
+        findMany: async (args: { where: Record<string, any> }) => {
+            const projectId = args.where?.estimate?.projectId;
+            return phaseItems
+                .filter(phase => phase.projectId === projectId)
+                .map(phase => ({
+                    costCode: {
+                        id: phase.costCodeId,
+                        code: phase.costCodeId,
+                        name: phase.costCodeId,
+                        description: null,
+                        isActive: true,
+                    },
+                }));
+        },
     },
-    costCode: { findUnique: async () => null },
+    project: {
+        findUnique: async (args: { where: { id: string } }) => ({
+            id: args.where.id,
+            status: "In Progress",
+        }),
+    },
+    costCode: {
+        findUnique: async (args: { where: { id?: string; code?: string } }) => {
+            const found = costCodes.find(candidate =>
+                args.where.id ? candidate.id === args.where.id : candidate.code === args.where.code,
+            );
+            return found ? { ...found, name: found.code, description: null } : null;
+        },
+    },
 };
 
 type Handler = (req: any, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
@@ -143,6 +197,10 @@ beforeEach(() => {
         { id: "item-own", estimateId: "est-job-1", projectId: "job-1" },
         { id: "item-elsewhere", estimateId: "est-job-2", projectId: "job-2" },
     ];
+    lockedEstimateProject = undefined;
+    phaseProjectIds = [];
+    costCodes = [];
+    phaseItems = [];
 });
 
 function call(body: Record<string, unknown>) {
@@ -1104,4 +1162,76 @@ test("...and the same from MANUAL-NONE", async () => {
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxSource, null);
     assert.equal(updateArgs?.data.taxDeductibleBase, null);
+});
+
+// ── both re-checks answer about the LOCKED job (round 21, item 2) ───────────
+
+test("the phase is validated against the job the LOCK found, not the pre-read one", async () => {
+    // A fallback-attributed row (no projectId of its own) resolves through its
+    // estimate, and the estimate can move between the authorization and the
+    // write. The route re-resolves under lock and then validated the phase
+    // against the value it had read BEFORE the transaction — the one thing the
+    // re-resolve exists to distrust.
+    storedExpense = {
+        ...storedExpense,
+        projectId: null,
+        estimateId: "est-job-1",
+        estimate: { projectId: "job-1" },
+    };
+    lockedEstimateProject = "job-2";
+    currentUser = {
+        id: "u1", role: "MANAGER",
+        permissions: { timeClock: true, financialReports: true },
+        projectIds: ["job-1", "job-2"],
+    };
+    // The PRE-transaction gate passes: cc-frame really is a phase of job-1,
+    // which is the job the route read before it took the lock. That is the
+    // point — a stale check that says yes is the one that gets through.
+    costCodes = [{ id: "cc-frame", code: "02-FRAME", isActive: true }];
+    phaseItems = [{ projectId: "job-1", costCodeId: "cc-frame" }];
+    await call({ costCodeId: "cc-frame" });
+    assert.deepEqual(
+        phaseProjectIds, ["job-2"],
+        "asked about the job it is on now, never the job it left",
+    );
+});
+
+test("the item link is re-checked against the LOCKED job", async () => {
+    // Same staleness, the other column: the pre-transaction check passed
+    // against job-1's estimates, and the row is written onto job-2.
+    storedExpense = {
+        ...storedExpense,
+        projectId: null,
+        estimateId: "est-job-1",
+        estimate: { projectId: "job-1" },
+    };
+    lockedEstimateProject = "job-2";
+    currentUser = {
+        id: "u1", role: "MANAGER",
+        permissions: { timeClock: true, financialReports: true },
+        projectIds: ["job-1", "job-2"],
+    };
+    const res = await call({ itemId: "item-own" });
+    assert.equal(res.status, 400, "item-own is on job-1, and the row is now on job-2");
+    assert.equal(updateArgs, null, "nothing was written");
+});
+
+test("...and the SAME request succeeds when nothing moved", async () => {
+    // The control. Without it the test above passes on a route that refuses
+    // every itemId — the 400 has to come from the disagreement, not from the
+    // locked check being unsatisfiable.
+    storedExpense = {
+        ...storedExpense,
+        projectId: null,
+        estimateId: "est-job-1",
+        estimate: { projectId: "job-1" },
+    };
+    lockedEstimateProject = "job-1";
+    currentUser = {
+        id: "u1", role: "MANAGER",
+        permissions: { timeClock: true, financialReports: true },
+        projectIds: ["job-1", "job-2"],
+    };
+    assert.equal((await call({ itemId: "item-own" })).status, 200);
+    assert.equal(updateArgs?.data.itemId, "item-own");
 });

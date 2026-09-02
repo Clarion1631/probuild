@@ -18,6 +18,11 @@
 //
 //   node scripts/apply-expense-attribution.mjs --yes --expect-db <name> --expect-host <host>
 //
+// AND AGAIN, WITH --post-deploy, once the new build is live: the old build
+// keeps writing NULL-projectId, UTC-midnight rows until it drains, and those
+// arrive after the pre-deploy backfill has passed. See the POST-DEPLOY note
+// above `PROJECT_ID_BACKFILL`.
+//
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
 // something, and a database NAME alone doesn't prove which SERVER it's on.
@@ -118,6 +123,41 @@ export function reanchorSql(timeZone) {
    AND "attributionAnchoredAt" IS NULL
    AND "date"::time = TIME '00:00:00'`;
 }
+
+/**
+ * -- POST-DEPLOY: re-run this section
+ *
+ * THE LIVE-WRITE GAP (Codex round 21, item 3).
+ *
+ * This script runs BEFORE the new build deploys — it has to, or every page
+ * selecting the new columns throws P2022. That ordering leaves a window: while
+ * the OLD build is still serving, it keeps creating expenses, and it does not
+ * know about `projectId` or about the company-calendar-day date rule. Rows
+ * arriving in that window land with `projectId` NULL and a UTC-midnight date,
+ * AFTER both backfills have already passed over the table.
+ *
+ * Nothing in a single pre-deploy run can close that — the writes have not
+ * happened yet. So the resolution is to run this section AGAIN once the new
+ * build is live and the old one is drained:
+ *
+ *   node scripts/apply-expense-attribution.mjs --post-deploy --yes \
+ *     --expect-db <name> --expect-host <host>
+ *
+ * Both statements are idempotent BY PREDICATE, so the second pass is safe and
+ * touches only the stragglers:
+ *
+ *   * the projectId fill matches `"projectId" IS NULL`, which is exactly the
+ *     set the old build was still producing, and
+ *   * the date re-anchor matches `"attributionAnchoredAt" IS NULL` AND a
+ *     time-of-day of 00:00, which is exactly the shape the old build wrote.
+ *
+ * A re-run reporting 0 rows on both is the proof the gap is closed, and it is
+ * the same check a second run of the whole script has always made.
+ */
+export const PROJECT_ID_BACKFILL =
+    `UPDATE "Expense" e SET "projectId" = est."projectId"
+     FROM "Estimate" est
+     WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL`;
 
 export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
@@ -259,9 +299,8 @@ END $$`,
     // those were written by time-expense-core, which has always used the shared
     // parser.
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
-    `UPDATE "Expense" e SET "projectId" = est."projectId"
-     FROM "Estimate" est
-     WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL`,
+    // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it.
+    PROJECT_ID_BACKFILL,
 
     // ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
     // merge order: if Phase 1 has not landed in the target database yet, these
@@ -275,6 +314,17 @@ END $$`,
        END IF;
      END $$`,
 ];
+
+/**
+ * The re-runnable half: the two statements marked POST-DEPLOY above.
+ *
+ * Both are already in the main run — this is a SUBSET, never a second copy, so
+ * the two can never say different things (asserted in
+ * tests/apply-expense-attribution.test.ts).
+ */
+export function postDeployStatements(timeZone) {
+    return [PROJECT_ID_BACKFILL, reanchorSql(timeZone)];
+}
 
 export const expectedColumns = {
     Expense: [
@@ -395,8 +445,19 @@ async function main() {
         // The timeout is generous because a backfill over the Expense table on
         // a cold connection is not a five-second operation, and the default
         // would roll the whole thing back for being slow.
+        // --post-deploy runs ONLY the two backfills, for the live-write gap
+        // documented above PROJECT_ID_BACKFILL. The DDL is skipped because it
+        // has already run; re-running it would be harmless but the point of
+        // this mode is to be an obviously-narrow second pass.
+        const postDeployOnly = process.argv.includes("--post-deploy");
+        const toRun = postDeployOnly
+            ? postDeployStatements(companyTimeZone)
+            : [...statements, reanchorSql(companyTimeZone)];
+        if (postDeployOnly) {
+            console.log("--post-deploy: running the two backfills only (see PROJECT_ID_BACKFILL).");
+        }
         await prisma.$transaction(async tx => {
-            for (const sql of [...statements, reanchorSql(companyTimeZone)]) {
+            for (const sql of toRun) {
                 const label = sql.replace(/\s+/g, " ").slice(0, 84);
                 process.stdout.write(`  ${label} ... `);
                 const affected = await tx.$executeRawUnsafe(sql);

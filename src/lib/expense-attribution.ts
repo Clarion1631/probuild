@@ -457,3 +457,33 @@ export async function itemBelongsToEstimateTx(
     )) as unknown[];
     return Boolean(rows?.length);
 }
+
+/**
+ * Is this line item on ANY estimate of that job? Asked under lock, on the
+ * transaction that writes the link.
+ *
+ * The estimate-scoped question above is not this one. An edit path re-points an
+ * expense's `itemId` and the only authority is the RESOLVED project — for a
+ * re-attributed row the estimate belongs to the job it left, so scoping to the
+ * estimate would admit exactly the cross-job link the check exists to stop.
+ *
+ * Both rows are locked, because the link can be broken from either end: the
+ * item can be re-parented onto another estimate, and the estimate can be moved
+ * to another job.
+ */
+export async function itemBelongsToProjectTx(
+    tx: ExpenseTxClient,
+    itemId: string,
+    projectId: string,
+): Promise<boolean> {
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT item.id
+           FROM "EstimateItem" item
+           JOIN "Estimate" est ON est.id = item."estimateId"
+          WHERE item.id = $1 AND est."projectId" = $2
+            FOR SHARE OF item, est`,
+        itemId,
+        projectId,
+    )) as unknown[];
+    return Boolean(rows?.length);
+}

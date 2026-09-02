@@ -1225,6 +1225,49 @@ test("a Purchase already on ANOTHER job parks instead of booking", async () => {
     }
 });
 
+// ── the CREATE path re-reads the pair too (round 21, item 1) ───────────────
+
+test("a NEW expense is created from the LOCKED pair, not the pre-transaction one", async () => {
+    // The estimate was chosen before the QBO Purchase round trip. This is the
+    // control: nothing moved, so the pair is written unchanged.
+    const rec = recorder();
+    await bookReceipt(row(), rec.deps);
+    assert.equal(rec.expenses[0].projectId, "proj-1");
+    assert.equal(rec.expenses[0].estimateId, "est-1");
+});
+
+test("an estimate MOVED before the create parks instead of splitting the job", async () => {
+    // The fill path already refused this shape; the create path wrote
+    // `row.projectId` beside an estimate nobody had looked at since it was
+    // picked, producing a brand-new expense on two jobs at once.
+    const rec = recorder();
+    rec.state.estimateProjectId = "another-job";
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "attribution-conflict");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    assert.equal(rec.expenses.length, 0, "nothing was written on either job");
+    assert.equal(
+        rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
+        "and the row is not marked booked",
+    );
+});
+
+test("an estimate that lost its project before the create parks too", async () => {
+    // Half a pair is the same bug reached the other way: `projectId` set, the
+    // estimate on no job at all.
+    const rec = recorder();
+    rec.state.estimateProjectId = null;
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "attribution-conflict");
+    }
+    assert.equal(rec.expenses.length, 0);
+});
+
 // ── tax provenance and the post-fill attribution check (round 13, 4 and 5) ──
 
 test("a bookkeeper's NO-TAX decision is not overwritten by an OCR re-read", async () => {
@@ -1478,7 +1521,13 @@ test("the in-transaction check happens AFTER the phase rows are locked", async (
     });
     const passThrough = (rec.deps.db as any).$queryRawUnsafe;
     (rec.deps.db as any).$queryRawUnsafe = async (query: string, ...args: any[]) => {
-        if (query.includes("FOR SHARE")) order.push("phase-share");
+        // The PHASE locks specifically. The attribution pair takes its own
+        // FOR SHARE on the estimate at the create site (round 21, item 1),
+        // which is a different question and must not be counted as one of
+        // these.
+        if (query.includes("FOR SHARE") && !/FROM "Estimate" WHERE id = \$1 FOR SHARE/.test(query)) {
+            order.push("phase-share");
+        }
         return passThrough(query, ...args);
     };
     await bookReceipt(row({ costCodeId: "cc-demo" }), rec.deps);

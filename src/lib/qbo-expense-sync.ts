@@ -9,6 +9,7 @@ import {
     HUMAN_COST_CODE_SOURCES,
     HUMAN_TAX_SOURCES,
     expenseStillOnProjectWhere,
+    lockEstimateAttribution,
     notHumanCodedExpenseWhere,
     resolveExpenseProjectId,
     resolveExpenseProjectUnderLock,
@@ -907,7 +908,23 @@ export async function upsertQboExpense(
             return "unchanged";
         }
         if (!existing) {
-            await transaction.expense.create({ data: write });
+            // THE PAIR, RE-READ UNDER LOCK (round 21, item 1).
+            //
+            // `write.projectId` and `write.estimateId` were decided by the
+            // matcher, before a classification write and a QBO round trip. An
+            // estimate moved to another job in that window would be inserted
+            // alongside the OLD project — one expense claiming two jobs, which
+            // `resolveExpenseProjectId` and every join through the estimate
+            // answer differently.
+            //
+            // The estimate row is the only thing that can say which job it is
+            // on right now, so the locked answer wins over the matcher's. A
+            // project-less estimate leaves the row unattributed rather than
+            // stamped with a job it has left: half a pair is the bug.
+            const pair = await lockEstimateAttribution(transaction, write.estimateId);
+            await transaction.expense.create({
+                data: { ...write, projectId: pair?.projectId ?? null },
+            });
             return "imported";
         }
 
@@ -925,9 +942,16 @@ export async function upsertQboExpense(
         // re-attribution survives. projectId and estimateId land together or
         // neither does.
         if (plan.fill !== null) {
+            // Same locked re-read as the create path. The plan decided WHETHER
+            // to fill from what the row holds; only the estimate row can say
+            // WHICH job it is on at this instant, and writing the matcher's
+            // stale answer is how a catch-up fill lands a split-job row.
+            const pair = await lockEstimateAttribution(transaction, plan.fill.estimateId);
             await transaction.expense.updateMany({
                 where: { id: existing.id, projectId: null },
-                data: plan.fill,
+                data: pair
+                    ? { projectId: pair.projectId, estimateId: pair.estimateId }
+                    : { estimateId: plan.fill.estimateId },
             });
         }
         // CAS when the client supports it: a tax correction committing between
