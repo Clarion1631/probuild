@@ -25,7 +25,17 @@ let currentUser: FakeUser | null;
 let storedExpense: Record<string, unknown> | null;
 let deleteArgs: unknown;
 
-const fakePrisma = {
+const fakePrisma: any = {
+    // The delete now runs in a transaction that re-resolves a fallback-
+    // attributed row's job from the LOCKED estimate (round 20, item 4).
+    $transaction: async (fn: any) => fn(fakePrisma),
+    $queryRawUnsafe: async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
+            const row = storedExpense as Record<string, any> | null;
+            return [{ projectId: row?.estimate?.projectId ?? null }];
+        }
+        return [{}];
+    },
     expense: {
         findUnique: async () => storedExpense,
         deleteMany: async (args: unknown) => {
@@ -80,6 +90,7 @@ beforeEach(() => {
         invoiceId: null,
         invoicedAt: null,
         projectId: "job-1",
+        estimateId: "est-job-2",
         estimate: { projectId: "job-2" },
     };
     deleteArgs = null;
@@ -96,8 +107,13 @@ async function attempt(projectId: string): Promise<string | null> {
 
 test("the job the expense is ON can delete it", async () => {
     assert.equal(await attempt("job-1"), null);
+    // The predicate carries the job the actor was authorized against (round 20,
+    // item 4), so a row that moves in the gap matches nothing.
     assert.deepEqual(deleteArgs, {
-        where: { id: "e1", qbPurchaseId: null, invoiceId: null, invoicedAt: null },
+        where: {
+            id: "e1", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+            projectId: "job-1",
+        },
     });
 });
 
@@ -119,6 +135,28 @@ test("an unattributed expense falls back to its estimate's job", async () => {
     storedExpense = { ...storedExpense, projectId: null };
     currentUser = { id: "u4", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-2"] };
     assert.equal(await attempt("job-2"), null);
+    // ...and the estimate is pinned in the predicate, so a re-point loses.
+    assert.deepEqual((deleteArgs as any).where.estimate, { is: { projectId: "job-2" } });
+});
+
+test("an estimate re-pointed under a fallback DELETE is refused", async () => {
+    // The locked read is the first thing that can see the move; the actor was
+    // authorized for job-2 and the row now belongs to somebody else.
+    storedExpense = { ...storedExpense, projectId: null };
+    currentUser = { id: "u7", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-2"] };
+    const original = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
+            return [{ projectId: "job-3" }];
+        }
+        return [{}];
+    };
+    try {
+        assert.equal(await attempt("job-2"), "Forbidden");
+        assert.equal(deleteArgs, null, "nothing is destroyed under a stale permission");
+    } finally {
+        fakePrisma.$queryRawUnsafe = original;
+    }
 });
 
 test("a row with no job at all cannot be deleted here", async () => {

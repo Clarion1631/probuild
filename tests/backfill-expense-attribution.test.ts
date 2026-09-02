@@ -55,6 +55,19 @@ function expense(overrides: Partial<StubExpense> = {}): StubExpense {
     };
 }
 
+/**
+ * The write phase now re-asserts `CostCode.isActive` under its own lock (round
+ * 20, item 5), so every raw-SQL stub has to answer that read. Active unless a
+ * test says otherwise.
+ */
+let costCodeActive = true;
+function activeCode(query: string) {
+    if (/FROM "CostCode"/.test(query) && /"isActive"/.test(query)) {
+        return [{ isActive: costCodeActive }];
+    }
+    return [{}];
+}
+
 const NO_ITEMS = new Map<string, StubItem>();
 
 /**
@@ -130,6 +143,10 @@ function createStub(
         // read it — the whole point of re-reading under the lock.
         items,
         db: {
+            // Present even on the no-transaction stub: the write phase asks
+            // whether the cost code is still active, and a stub that cannot
+            // answer would make the guard pass by accident.
+            async $queryRawUnsafe(query: string) { return activeCode(query); },
             project: {
                 async findMany() {
                     return [
@@ -744,7 +761,7 @@ test("each cost-code write takes the shared per-expense lock", async () => {
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
     (stub.db as any).$queryRawUnsafe = async (query: string, ...args: unknown[]) => {
         if (query.includes("pg_advisory_xact_lock")) locks.push(args[0]);
-        return [{}];
+        return activeCode(query);
     };
 
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
@@ -764,7 +781,7 @@ function lockTrace(stub: ReturnType<typeof createStub>) {
             : query.includes('FROM "EstimateItem"') ? "item-share"
             : "other";
         trace.push({ kind, args });
-        return [{}];
+        return activeCode(query);
     };
     return trace;
 }
@@ -825,7 +842,7 @@ test("an INTERLEAVED estimate move is refused: the write no-ops", async () => {
             // and the one the predicate has to catch on its own.
             stub.rows[0].estimate = { projectId: "job-2" };
         }
-        return [{}];
+        return activeCode(query);
     };
 
     const result = await runBackfill({
@@ -845,7 +862,7 @@ test("an expense re-pointed at a DIFFERENT estimate is skipped by the cost fill"
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    (stub.db as any).$queryRawUnsafe = async (query: string) => activeCode(query);
     const snapshot = stub.db.expense.findMany;
     stub.db.expense.findMany = async () => {
         const rows = await snapshot();
@@ -870,7 +887,7 @@ test("a row that MOVED between the plan and the write is skipped, not coded", as
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    (stub.db as any).$queryRawUnsafe = async (query: string) => activeCode(query);
 
     // Someone edits the row after findMany handed it to the planner.
     const realUpdateMany = stub.db.expense.updateMany;
@@ -894,7 +911,7 @@ test("the CAS names the row version the plan was computed from", async () => {
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    (stub.db as any).$queryRawUnsafe = async (query: string) => activeCode(query);
 
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
@@ -916,7 +933,7 @@ test("a row the PROJECT pass just filled is re-read, not exempted", async () => 
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    (stub.db as any).$queryRawUnsafe = async (query: string) => activeCode(query);
     // Model the real column: pass (a)'s write bumps the version.
     const realUpdateMany = stub.db.expense.updateMany;
     (stub.db.expense as any).updateMany = async (args: any) => {
@@ -947,11 +964,11 @@ test("a row that became human-coded after the plan is skipped on the re-read", a
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => {
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
         // The PATCH lands while this row is being locked.
         stub.rows[0].costCodeId = "cc-human";
         stub.rows[0].costCodeSource = "manual";
-        return [{}];
+        return activeCode(query);
     };
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
@@ -969,9 +986,9 @@ test("a row re-attributed after the plan is skipped on the re-read", async () =>
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => {
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
         stub.rows[0].projectId = "job-elsewhere";
-        return [{}];
+        return activeCode(query);
     };
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
@@ -1013,11 +1030,11 @@ test("a vendor edited before the re-read changes the answer, so nothing is writt
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => {
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
         // The edit lands while the row is being locked, i.e. BEFORE the re-read.
         stub.rows[0].vendor = "General Hardware";
         stub.rows[0].description = "misc supplies";
-        return [{}];
+        return activeCode(query);
     };
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
@@ -1031,10 +1048,10 @@ test("a vendor edit that points at a DIFFERENT phase is refused, not applied", a
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => {
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
         // Now the rules would say FRAMING, not plumbing.
         stub.rows[0].vendor = "Parr Lumber";
-        return [{}];
+        return activeCode(query);
     };
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
@@ -1048,7 +1065,7 @@ test("an untouched row still codes normally through the re-plan", async () => {
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
-    (stub.db as any).$queryRawUnsafe = async () => [{}];
+    (stub.db as any).$queryRawUnsafe = async (query: string) => activeCode(query);
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     assert.equal(result.written.costCodes, 1);
@@ -1133,4 +1150,52 @@ test("a phase REMOVED from the job after the plan blocks the write", async () =>
     });
     assert.equal(result.written.costCodes, 0);
     assert.equal(stub.rows[0].costCodeId ?? null, null);
+});
+
+// ── a code retired mid-run is not written (Codex round 20, item 5) ─────────
+
+test("a cost code DEACTIVATED before the write is skipped", async () => {
+    // `isActive` is a company-wide switch, so locking the job's phase rows did
+    // not hold it. Retiring a code is the company saying "stop putting money
+    // here", and this pass is the one writer with no human behind it.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    costCodeActive = true;
+    (stub.db as any).$queryRawUnsafe = async (query: string) => {
+        if (/FOR SHARE/.test(query) && /FROM "CostCode"/.test(query)) {
+            // Retired as the lock is taken — the last moment it can be, and the
+            // one a pre-transaction check would miss.
+            costCodeActive = false;
+        }
+        return activeCode(query);
+    };
+
+    try {
+        const result = await runBackfill({
+            db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
+        });
+        assert.equal(result.written.costCodes, 0, "a retired code is not an answer");
+        assert.equal(stub.rows[0].costCodeId ?? null, null);
+    } finally {
+        costCodeActive = true;
+    }
+});
+
+test("the candidate code is share-locked, not just the job's phase rows", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    const locks: string[] = [];
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async (query: string, ...args: unknown[]) => {
+        if (/FOR SHARE/.test(query)) locks.push(String(query.match(/FROM "(\w+)"/)?.[1]));
+        return activeCode(query);
+    };
+
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.ok(locks.includes("CostCode"), "the code itself is held for the write");
 });

@@ -21,6 +21,7 @@ import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
 import { isPlausibleReceiptTax, taxNotHumanDecidedWhere } from "@/lib/expense-attribution";
+import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
@@ -736,6 +737,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     select: {
                         id: true,
                         projectId: true,
+                        // The other half of the attribution pair. A fill that
+                        // writes one without the other leaves the row on two
+                        // jobs at once.
+                        estimateId: true,
                         costCodeId: true,
                         costCodeSource: true,
                         taxAmount: true,
@@ -799,10 +804,34 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // about.
                 const expectedProjectId = existing.projectId ?? null;
 
+                // THE ATTRIBUTION IS FILLED AS A PAIR, OR NOT AT ALL
+                // (round 20, item 3).
+                //
+                // This wrote `projectId` alone onto a row whose `estimateId`
+                // belongs to whatever estimate v1 (or a crash) left there. If
+                // that estimate is on another job, the result is an expense
+                // claiming two jobs at once — `resolveExpenseProjectId` prefers
+                // the column, every join through the estimate says otherwise,
+                // and no report can be right about it.
+                //
+                // So the estimate this booking resolved is locked, its project
+                // re-read, and BOTH columns move together. A disagreement that
+                // cannot be resolved is not something to guess at: the row
+                // parks and a person decides.
                 if (!existing.projectId && row.projectId) {
+                    const pair = await lockEstimateAttribution(
+                        tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                        estimateId,
+                    );
+                    if (!pair || pair.projectId !== row.projectId) {
+                        throw new AttributionConflictError();
+                    }
+                    // The existing row may hang off a DIFFERENT estimate; both
+                    // columns are written from the one locked read so the pair
+                    // is consistent whichever it was.
                     await tx.expense.updateMany({
                         where: { id: existing.id, projectId: null },
-                        data: { projectId: row.projectId },
+                        data: { projectId: pair.projectId, estimateId: pair.estimateId },
                     });
                 }
                 if (costCodeId) {

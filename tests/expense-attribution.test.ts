@@ -263,19 +263,19 @@ test("taxIsAtSource is true for any non-zero figure, either direction", () => {
     assert.equal(taxIsAtSource(Number.NaN), false);
 });
 
-test("the tax & phase modal derives the flag from the figure, not from its sign", () => {
-    // The modal is the only writer a bookkeeper touches directly. It computed
-    // `(parsedTax ?? 0) > 0`, so saving a refund's -$4 of tax silently stored
-    // taxAtSource=false and dropped the row out of the excise report — on both
-    // the ordinary save and the review acknowledgement.
+test("the tax & phase modal does not send taxAtSource at all", () => {
+    // Round 20, item 1 settled this the other way: the modal used to compute
+    // the flag (badly — `(parsedTax ?? 0) > 0` dropped every refund), then
+    // computed it correctly through the shared rule, and now does not compute
+    // it at all. The server derives it from the figure and REFUSES the field,
+    // because two writers for one truth is how they came to disagree.
     const modal = readFileSync(
         path.join(__dirname, "..", "src/app/projects/[id]/time-expenses/TaxPhaseModal.tsx"),
         "utf8",
     );
-    const assignments = [...modal.matchAll(/body\.taxAtSource = ([^;]+);/g)].map(m => m[1].trim());
-    assert.equal(assignments.length, 2, "the ordinary save and the ack both set it");
-    for (const assignment of assignments) {
-        assert.equal(assignment, "taxIsAtSource(parsedTax)", "both go through the shared rule");
-    }
-    assert.ok(!/taxAtSource[^;]*>\s*0/.test(modal), "no positive-only copy survives");
+    assert.ok(
+        !/body\.taxAtSource\s*=/.test(modal),
+        "the client must not set a derived column",
+    );
+    assert.ok(!/taxAtSource[^;]*>\s*0/.test(modal), "and no positive-only copy survives");
 });

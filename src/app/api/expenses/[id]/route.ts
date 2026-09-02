@@ -455,7 +455,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // `amount` here is either confused or probing; either way it must be
         // told, not silently ignored.
         const allowed = new Set([
-            "installedAtCustomer", "taxDeductibleBase", "taxAmount", "taxAtSource", "costCodeId",
+            "installedAtCustomer", "taxDeductibleBase", "taxAmount", "costCodeId",
             // Not a column: which of the two things a NULL taxAmount means.
             // `taxKnown: false` is "I do not know what the tax was", which is
             // the state the pipeline starts in; `taxKnown: true` alongside a
@@ -465,6 +465,30 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             // row" acknowledgement. See the needsTaxReview rule below.
             "taxReviewAck",
         ]);
+
+
+        // `taxAtSource` IS DERIVED, NEVER SUPPLIED (round 20, item 1).
+        //
+        // It is not an independent fact: "tax was charged on this receipt" is
+        // true exactly when there is a tax figure on the row. Accepting it from
+        // a client meant two writers for one truth, and every combination they
+        // could disagree in — `taxAtSource: true` with no amount (a claim about
+        // nothing, which the report would have counted had the amount ever
+        // arrived) and `taxAtSource: false` with $16.55 of tax (a deduction
+        // silently dropped from the filing).
+        //
+        // Refused rather than ignored: a caller that sends it believes it is
+        // setting something, and a silent drop looks like agreement.
+        if (has("taxAtSource")) {
+            return NextResponse.json(
+                {
+                    error: "taxAtSource is derived from taxAmount and cannot be set directly.",
+                    code: "TAX_AT_SOURCE_DERIVED",
+                },
+                { status: 400 },
+            );
+        }
+
         const rejected = Object.keys(body).filter(key => !allowed.has(key));
         if (rejected.length) {
             return NextResponse.json(
@@ -479,7 +503,6 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const editsInstalled = has("installedAtCustomer");
         const editsBase = has("taxDeductibleBase");
         const editsTaxAmount = has("taxAmount");
-        const editsTaxAtSource = has("taxAtSource");
         const editsCostCode = has("costCodeId");
 
         // CLEARING A REVIEW FLAG IS ITS OWN DECISION.
@@ -606,21 +629,28 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // `installedAtCustomer` is NOT one of these — its own value is its
         // evidence (non-null means answered) and booking already refuses to
         // touch it once it is set.
-        // "I do not know" leaves the provenance where it was — null or "ocr" —
-        // so a later read may still fill the figure. Only the other two
-        // outcomes are decisions.
+        // "I DO NOT KNOW" IS A RETRACTION, not a no-op (round 20, item 2).
+        //
+        // It leaves no human answer standing: a row that said "manual" ($16.55)
+        // or "manual-none" ("there is no tax") and is now marked unknown has to
+        // come all the way back to null, or the pipeline stays locked out of a
+        // receipt whose figures nobody is claiming any more — the row would sit
+        // with a human provenance and no human answer behind it, and no
+        // automated read would ever be allowed to fill it.
+        //
+        // So it clears the provenance AND both figures together.
         const stampsTaxProvenance = (editsTaxAmount || editsBase) && !taxIsUnknown;
         const nextTaxSource =
             editsTaxAmount && body.taxAmount === null ? "manual-none" : "manual";
 
         // `taxReviewAck` is not a column, so a request carrying nothing else
         // has no field to write. Told, not silently no-opped.
-        if (!editsInstalled && !editsBase && !editsTaxAmount && !editsTaxAtSource && !editsCostCode) {
+        if (!editsInstalled && !editsBase && !editsTaxAmount && !editsCostCode) {
             return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
         }
 
         // The money permission governs anything that lands on a tax return.
-        if ((editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource)
+        if ((editsInstalled || editsBase || editsTaxAmount)
             && !hasPermission(user, "financialReports")) {
             return NextResponse.json(
                 { error: "Editing tax-deduction fields requires the Financial Reports permission." },
@@ -683,17 +713,6 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             nextTaxAmount = parsed;
         }
 
-        let nextTaxAtSource: boolean | null = null;
-        if (editsTaxAtSource) {
-            if (typeof body.taxAtSource !== "boolean") {
-                return NextResponse.json(
-                    { error: "taxAtSource must be true or false." },
-                    { status: 400 },
-                );
-            }
-            nextTaxAtSource = body.taxAtSource;
-        }
-
         let nextBase: number | null = null;
         if (editsBase && body.taxDeductibleBase !== null) {
             const parsed = Number(body.taxDeductibleBase);
@@ -749,31 +768,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             }
         }
 
-        // `taxAtSource` asserts "tax was charged on this receipt"; with no tax
-        // figure behind it, it is a claim about nothing and the report filters
-        // it out anyway. Refuse the incoherent pair rather than storing it.
-        //
-        // ZERO, not "not positive": on a refund the tax is NEGATIVE and the
-        // claim is still true — tax was charged on the original purchase and is
-        // coming back. Testing `<= 0` here refused every credit whose tax a
-        // bookkeeper tried to record.
-        // DERIVED WHEN THE REQUEST DOES NOT SAY. `taxAtSource` is the fact that
-        // tax was charged, and it follows the figure — so a request that
-        // changes the figure and stays silent about the flag gets the flag that
-        // matches, rather than a 400 about a pair it never asserted. A caller
-        // that DOES assert both still has to make them agree.
-        const derivesAtSource = editsTaxAmount && !editsTaxAtSource;
-        const resultingAtSource = editsTaxAtSource
-            ? (nextTaxAtSource as boolean)
-            : derivesAtSource
-                ? taxIsAtSource(nextTaxAmount)
-                : Boolean(expense.taxAtSource);
-        if (resultingAtSource && resultingTax === 0) {
-            return NextResponse.json(
-                { error: "taxAtSource can't be true with no tax amount on the receipt." },
-                { status: 400 },
-            );
-        }
+        // The flag follows the figure, computed from the row this request
+        // LEAVES BEHIND. Signed: a refund's tax is negative and the fact — tax
+        // was charged, and is coming back — is just as true.
+        const derivesAtSource = editsTaxAmount || taxIsUnknown;
+        const resultingAtSource = derivesAtSource
+            ? taxIsAtSource(nextTaxAmount)
+            : Boolean(expense.taxAtSource);
 
         let nextCostCodeId: string | null = null;
         if (editsCostCode) {
@@ -858,20 +859,20 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         const data = {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
-                ...(writesBase
-                    ? { taxDeductibleBase: computedBase !== null ? computedBase : nextBase }
-                    : {}),
-                ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
-                ...(editsTaxAtSource
-                    ? { taxAtSource: nextTaxAtSource as boolean }
-                    : derivesAtSource
-                        ? { taxAtSource: resultingAtSource }
+                ...(taxIsUnknown
+                    // Both figures and the provenance, in one statement: a
+                    // half-retracted row is exactly the shape this is fixing.
+                    ? { taxDeductibleBase: null, taxSource: null }
+                    : writesBase
+                        ? { taxDeductibleBase: computedBase !== null ? computedBase : nextBase }
                         : {}),
+                ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
+                ...(derivesAtSource ? { taxAtSource: resultingAtSource } : {}),
                 // A human just answered, so the row is no longer awaiting one.
                 // Cleared in the SAME write as the answer: two statements would
                 // leave a window where the report sees an answered row it still
                 // refuses to count.
-                ...(editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource
+                ...(editsInstalled || editsBase || editsTaxAmount
                     ? {
                         // Only when the answer that justifies clearing it came
                         // with the request. Written in the SAME statement as

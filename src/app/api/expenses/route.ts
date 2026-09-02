@@ -6,6 +6,7 @@ import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { itemBelongsToEstimateTx, lockEstimateAttribution } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
@@ -162,21 +163,36 @@ export async function POST(req: NextRequest) {
         // and the insert would still be stamped onto a brand new row — as
         // "capture", which no automated pass may then correct.
         const created = await prisma.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE PAIR, RE-READ UNDER LOCK (round 20, item 3). Everything above
+            // resolved the estimate's project and then did other work; an
+            // estimate moved in that window would be inserted alongside the OLD
+            // project, putting one expense on two jobs at once.
+            const pair = await lockEstimateAttribution(raw, estimateId);
+            if (!pair) return { expense: null, phaseRejected: null, conflict: "no-project" } as const;
+            if (pair.projectId !== projectId) {
+                // The access check above was answered about a different job.
+                return { expense: null, phaseRejected: null, conflict: "moved" } as const;
+            }
+            if (itemId && !(await itemBelongsToEstimateTx(raw, itemId, estimateId))) {
+                return { expense: null, phaseRejected: null, conflict: "item" } as const;
+            }
             if (costCodeId) {
                 const verdict = await assertPhaseOfProjectTx(
                     tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
                     projectId,
                     costCodeId,
                 );
-                if (!verdict.ok) return { expense: null, phaseRejected: verdict.reason } as const;
+                if (!verdict.ok) {
+                    return { expense: null, phaseRejected: verdict.reason, conflict: null } as const;
+                }
             }
             const expense = await tx.expense.create({
                 data: {
-                estimateId,
-                // Phase 3: born with its job. Resolved above in both branches
-                // (derived from the estimate on the web path, checked against
-                // the caller's access on the mobile path).
-                projectId,
+                // ONE PAIR, from one locked read: the estimate and the job it
+                // belongs to, as they are at THIS moment.
+                estimateId: pair.estimateId,
+                projectId: pair.projectId,
                 itemId: itemId || null,
                 costCodeId,
                 costTypeId,
@@ -191,8 +207,19 @@ export async function POST(req: NextRequest) {
                 status: "Pending",
                 },
             });
-            return { expense, phaseRejected: null } as const;
+            return { expense, phaseRejected: null, conflict: null } as const;
         });
+        if (created.conflict) {
+            return NextResponse.json(
+                {
+                    error: created.conflict === "item"
+                        ? "That line item is no longer on this estimate."
+                        : "This estimate moved to another job. Reopen the page and try again.",
+                    code: created.conflict === "item" ? "ITEM_NOT_ON_ESTIMATE" : "ESTIMATE_REATTRIBUTED",
+                },
+                { status: 409 },
+            );
+        }
         if (created.phaseRejected) {
             return NextResponse.json(
                 {

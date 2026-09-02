@@ -215,6 +215,19 @@ END $$`,
     // then UPDATE. A QBO re-sync changing `amount` between those two statements
     // leaves a row the tax report TRUSTS verbatim. Prisma cannot express a
     // CHECK, so it is hand-written here and in prisma-blind-spots.json.
+    // `taxAtSource` IS DERIVED, AND THE DATABASE SAYS SO (round 20, item 1).
+    // It was a second writable column saying what `taxAmount` already says, so
+    // the two could disagree: `true` with no amount is a claim about nothing,
+    // `false` with a figure is a deduction dropped from the filing. Normalised
+    // first — a CHECK cannot be added to a table that already violates it —
+    // then constrained. Both statements are re-runnable.
+    `UPDATE "Expense"
+   SET "taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)
+ WHERE "taxAtSource" <> ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)`,
+    `ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check"`,
+    `ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
+  CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0))`,
+
     // SIGNED, for the same reason the tax check is: the resold portion of a
     // return is negative. `base >= 0` made every credit unallocatable.
     // Dropped and re-added by name so an old definition is corrected.
@@ -295,6 +308,14 @@ export const expectedConstraints = [
 ];
 
 export const expectedCheckConstraints = [
+    {
+        name: "Expense_taxAtSource_check",
+        table: "Expense",
+        mustMatch: [
+            /"taxAtSource" = \(?"taxAmount" IS NOT NULL/,
+            /"taxAmount" <> \(?0/,
+        ],
+    },
     {
         name: "Expense_taxAmount_check",
         table: "Expense",

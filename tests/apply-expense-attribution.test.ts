@@ -157,7 +157,7 @@ test("every statement is additive — nothing drops, renames, or rewrites data",
         // refused every refund) is corrected rather than skipped. Nothing else
         // may drop anything, and nothing may drop a table, column or index.
         const isConstraintReplace =
-            /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase)_check"/.test(statement);
+            /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase|taxAtSource)_check"/.test(statement);
         assert.ok(
             isConstraintReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,

@@ -116,10 +116,9 @@ export default function TaxPhaseModal({
             // WHICH BLANK this is. Only sent alongside the amount, because on
             // its own it is not an edit.
             if (parsedTax === null) body.taxKnown = taxKnown;
-            // `taxAtSource` is the factual "tax was charged here"; it follows
-            // the figure rather than being a second thing to get wrong. SIGNED:
-            // a return carries negative tax and the fact still holds.
-            body.taxAtSource = taxIsAtSource(parsedTax);
+            // `taxAtSource` is NOT sent: it is derived server-side from the
+            // figure, and the route refuses it outright (round 20, item 1).
+            // Two writers for one truth is how they came to disagree.
         }
         const nextBase = base.trim() === "" ? null : Number(base);
         if (nextBase !== expense.taxDeductibleBase) body.taxDeductibleBase = nextBase;
@@ -138,7 +137,6 @@ export default function TaxPhaseModal({
             // flagged row, because the flag is about the whole classification.
             body.taxAmount = parsedTax;
             if (parsedTax === null) body.taxKnown = taxKnown;
-            body.taxAtSource = taxIsAtSource(parsedTax);
             body.taxDeductibleBase = nextBase;
         }
 

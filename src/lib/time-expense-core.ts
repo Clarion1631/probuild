@@ -3,8 +3,14 @@ import { resolveCostCode } from "./cost-coding";
 import { prismaCostCodingDataSource } from "./cost-coding-db";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { assertPhaseOfProjectTx } from "./phase-invariant";
+import {
+    expenseStillOnProjectWhere,
+    itemBelongsToEstimateTx,
+    lockEstimateAttribution,
+    resolveExpenseProjectId,
+    resolveExpenseProjectUnderLock,
+} from "./expense-attribution";
 import { prismaPhaseDataSource } from "./project-phases-db";
-import { resolveExpenseProjectId } from "./expense-attribution";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
@@ -217,6 +223,19 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
     // locks the four tables it rests on and reads them on the transaction that
     // inserts the row.
     return prisma.$transaction(async tx => {
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // THE PAIR, RE-READ UNDER LOCK (round 20, item 3): same reason as the
+        // POST route. The estimate's project was resolved before the cost-code
+        // and receipt-file lookups; writing it now without re-reading can put
+        // an expense on a job its own estimate has left.
+        const pair = await lockEstimateAttribution(raw, estimateId);
+        if (!pair) throw new Error("Estimate must belong to a project");
+        if (pair.projectId !== estimate.projectId) {
+            throw new Error("This estimate moved to another job while the expense was being created");
+        }
+        if (data.itemId && !(await itemBelongsToEstimateTx(raw, data.itemId, estimateId))) {
+            throw new Error("Line item must belong to the resolved estimate");
+        }
         if (costCodeId) {
             const verdict = await assertPhaseOfProjectTx(
                 tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
@@ -227,10 +246,9 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
         return tx.expense.create({
             data: {
-            estimateId,
-            // Phase 3: the estimate's project, already resolved and validated
-            // above (including the change-order cross-check).
-            projectId: estimate.projectId,
+            // ONE PAIR, from one locked read.
+            estimateId: pair.estimateId,
+            projectId: pair.projectId,
             itemId: data.itemId || null,
             costCodeId,
             costTypeId,
@@ -284,6 +302,7 @@ export async function tagExpensesToChangeOrderCore(
             id: true,
             qbPurchaseId: true,
             projectId: true,
+            estimateId: true,
             estimate: { select: { projectId: true } },
             invoiceId: true,
             invoicedAt: true,
@@ -299,14 +318,36 @@ export async function tagExpensesToChangeOrderCore(
     }
     for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
-    const result = await prisma.expense.updateMany({
-        where: {
-            id: { in: input.ids },
-            qbPurchaseId: null,
-            invoiceId: null,
-            invoicedAt: null,
-        },
-        data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
+    // ONE ROW PER STATEMENT, under a locked re-resolve (round 20, item 4).
+    //
+    // Tagging an expense to a change order says "this money belongs to that
+    // job's CO". The rows were checked against the CO's project and then
+    // updated as a set, with nothing holding the answer still — so a
+    // fallback-attributed row whose estimate moved got billed to a change order
+    // on a job it had already left.
+    //
+    // A row that moved is skipped, not fatal: the count tells the caller.
+    let updated = 0;
+    await prisma.$transaction(async tx => {
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        for (const row of rows) {
+            const locked = await resolveExpenseProjectUnderLock(raw, {
+                projectId: row.projectId,
+                estimateId: row.estimateId,
+            });
+            if (locked !== changeOrder.projectId) continue;
+            const { count } = await tx.expense.updateMany({
+                where: {
+                    id: row.id,
+                    qbPurchaseId: null,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    ...expenseStillOnProjectWhere(row, locked),
+                },
+                data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
+            });
+            updated += count;
+        }
     });
-    return { updated: result.count };
+    return { updated };
 }

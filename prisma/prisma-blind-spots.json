@@ -90,6 +90,11 @@
       "def": "CHECK (((((\"leadId\" IS NOT NULL))::integer + ((\"projectId\" IS NOT NULL))::integer) = 1))"
     },
     {
+      "name": "Expense_taxAtSource_check",
+      "table": "\"Expense\"",
+      "def": "CHECK ((\"taxAtSource\" = ((\"taxAmount\" IS NOT NULL) AND (\"taxAmount\" <> (0)::numeric))))"
+    },
+    {
       "name": "Expense_taxAmount_check",
       "table": "\"Expense\"",
       "def": "CHECK (((\"taxAmount\" IS NULL) OR (\"taxAmount\" = (0)::numeric) OR ((sign(\"taxAmount\") = sign(amount)) AND (abs(\"taxAmount\") <= abs(amount)))))"

@@ -135,6 +135,24 @@ ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
          OR (sign("taxDeductibleBase") = sign("amount")
              AND abs("taxDeductibleBase") <= abs("amount" - COALESCE("taxAmount", 0))));
 
+-- `taxAtSource` IS DERIVED, AND THE DATABASE SAYS SO (round 20, item 1).
+--
+-- "Tax was charged on this receipt" is true exactly when the row carries a tax
+-- figure. It was a second, independently writable column saying the same thing,
+-- so the two could disagree — `taxAtSource: true` with no amount is a claim
+-- about nothing, and `false` with $16.55 on the row is a deduction silently
+-- dropped from the excise return. Every writer now derives it; this makes a
+-- disagreement unrepresentable rather than merely uncommon.
+--
+-- NORMALISED FIRST, then constrained: a CHECK cannot be added to a table that
+-- already violates it, and both statements are re-runnable.
+UPDATE "Expense"
+   SET "taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)
+ WHERE "taxAtSource" <> ("taxAmount" IS NOT NULL AND "taxAmount" <> 0);
+ALTER TABLE "Expense" DROP CONSTRAINT IF EXISTS "Expense_taxAtSource_check";
+ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
+  CHECK ("taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0));
+
 UPDATE "Expense" e SET "projectId" = est."projectId"
 FROM "Estimate" est
 WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL;

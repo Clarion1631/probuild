@@ -411,15 +411,41 @@ async function lockRowsForShare(tx, table, ids) {
  * stub rather than the script.
  */
 export async function writeUnderAttributionLocks(db, locks, run) {
-    const { expenseId, estimateIds = [], estimateItemIds = [], phaseProjectId = null } = locks;
+    const {
+        expenseId,
+        estimateIds = [],
+        estimateItemIds = [],
+        phaseProjectId = null,
+        costCodeId = null,
+    } = locks;
     if (typeof db.$transaction !== "function") return run(db);
     return db.$transaction(async tx => {
         await lockRowsForShare(tx, '"Estimate"', estimateIds);
         await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
         await lockPhaseRowsForShare(tx, phaseProjectId);
+        // THE CANDIDATE CODE ITSELF (round 20, item 5). `isActive` is a
+        // company-wide switch with nothing to do with this job's phase rows, so
+        // locking those did not hold it: a code retired while this pass ran was
+        // still written, by the one writer with no human behind it.
+        await lockRowsForShare(tx, '"CostCode"', [costCodeId]);
         await lockExpense(tx, expenseId);
         return run(tx);
     });
+}
+
+/**
+ * Is this cost code STILL active? Asked immediately before the update, on the
+ * transaction that holds it. Retiring a code is how the company says "stop
+ * putting money here", and an automated pass is exactly the writer that would
+ * otherwise keep doing it for the rest of the run.
+ */
+export async function costCodeStillActive(tx, costCodeId) {
+    if (!costCodeId) return false;
+    const rows = await tx.$queryRawUnsafe(
+        `SELECT "isActive" FROM "CostCode" WHERE id = $1`,
+        costCodeId,
+    );
+    return Boolean(rows?.[0]?.isActive);
 }
 
 export async function runBackfill({
@@ -740,6 +766,7 @@ export async function runBackfill({
             estimateIds: [plannedEstimateId],
             estimateItemIds: [plannedItemId],
             phaseProjectId: fill.expectedProjectId ?? null,
+            costCodeId: fill.costCodeId,
         }, async tx => {
             // RE-READ UNDER THE LOCK, then re-plan against what is really
             // there.
@@ -809,6 +836,10 @@ export async function runBackfill({
             // No longer codeable at all, or codeable as something else — either
             // way the planned write is void. A re-run will plan it properly.
             if (!fresh || fresh.costCodeId !== fill.costCodeId) return { count: 0 };
+            // A RETIRED CODE IS NOT AN ANSWER, however well the re-plan agrees
+            // with the plan. Asked here, under the lock taken above, so the
+            // answer cannot change between this line and the update below.
+            if (!(await costCodeStillActive(tx, fresh.costCodeId))) return { count: 0 };
 
             return tx.expense.updateMany({
             where: {

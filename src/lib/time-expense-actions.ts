@@ -3,7 +3,12 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { expenseForProjectWhere, resolveExpenseProjectId } from "@/lib/expense-attribution";
+import {
+    expenseForProjectWhere,
+    expenseStillOnProjectWhere,
+    resolveExpenseProjectId,
+    resolveExpenseProjectUnderLock,
+} from "@/lib/expense-attribution";
 import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import {
@@ -199,6 +204,7 @@ export async function deleteExpense(id: string, projectId: string) {
             invoiceId: true,
             invoicedAt: true,
             projectId: true,
+            estimateId: true,
             estimate: { select: { projectId: true } },
         },
     });
@@ -214,8 +220,29 @@ export async function deleteExpense(id: string, projectId: string) {
     assertExpenseMutableOutsideQbo(expense);
     if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
 
-    const deleted = await prisma.expense.deleteMany({
-        where: { id, qbPurchaseId: null, invoiceId: null, invoicedAt: null },
+    // AND AGAIN, UNDER LOCK (round 20, item 4). Same rule as the API DELETE:
+    // a row with no `projectId` of its own answers through its estimate, and
+    // somebody can move that estimate between the check above and this delete,
+    // destroying the row under a permission granted for a job it has left.
+    const deleted = await prisma.$transaction(async tx => {
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        const locked = await resolveExpenseProjectUnderLock(raw, {
+            projectId: expense.projectId,
+            estimateId: expense.estimateId,
+        });
+        if (!locked || locked !== projectId || !canAccessProject(user, locked)) {
+            throw new Error("Forbidden");
+        }
+        return tx.expense.deleteMany({
+            where: {
+                id,
+                qbPurchaseId: null,
+                invoiceId: null,
+                invoicedAt: null,
+                // The job the actor was authorized against, in the predicate.
+                ...expenseStillOnProjectWhere(expense, locked),
+            },
+        });
     });
     if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
 
@@ -237,6 +264,7 @@ export async function deleteExpenses(
             id: true,
             qbPurchaseId: true,
             projectId: true,
+            estimateId: true,
             invoiceId: true,
             invoicedAt: true,
             estimate: { select: { projectId: true } },
@@ -258,14 +286,36 @@ export async function deleteExpenses(
         allowed.map(e => e.resolvedProjectId).filter(Boolean) as string[]
     );
 
-    const result = await prisma.expense.deleteMany({
-        where: {
-            id: { in: allowedIds },
-            qbPurchaseId: null,
-            invoiceId: null,
-            invoicedAt: null,
-        },
+    // ONE ROW PER STATEMENT, each under its own locked re-resolve (round 20,
+    // item 4). A single `deleteMany` over the batch cannot carry a per-row
+    // attribution predicate, and these rows can be on different jobs, so a
+    // batch authorized row by row was then deleted as a set with nothing
+    // holding any of those answers still.
+    //
+    // A row that moved is skipped rather than fatal: the rest of the batch is a
+    // legitimate request, and the returned count says what actually happened.
+    let deletedCount = 0;
+    await prisma.$transaction(async tx => {
+        const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        for (const expense of allowed) {
+            const locked = await resolveExpenseProjectUnderLock(raw, {
+                projectId: expense.projectId,
+                estimateId: expense.estimateId,
+            });
+            if (!locked || !canAccessProject(user, locked)) continue;
+            const { count } = await tx.expense.deleteMany({
+                where: {
+                    id: expense.id,
+                    qbPurchaseId: null,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    ...expenseStillOnProjectWhere(expense, locked),
+                },
+            });
+            deletedCount += count;
+        }
     });
+    const result = { count: deletedCount };
 
     for (const projectId of projectIds) {
         revalidatePath(`/projects/${projectId}/time-expenses`);

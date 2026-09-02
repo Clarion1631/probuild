@@ -118,7 +118,12 @@ interface Recorder {
      * the job's status and whether the cost code is still active. A test that
      * models an archive, a deactivation or a deleted job moves these.
      */
-    state: { existingExpense: any; projectStatus: string; costCodeActive: boolean };
+    state: {
+        existingExpense: any;
+        projectStatus: string;
+        costCodeActive: boolean;
+        estimateProjectId: string | null;
+    };
 }
 
 function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
@@ -129,8 +134,16 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
     const expenseUpdates: any[] = [];
     const events: any[] = [];
     // Set by a test to model a Purchase that is ALREADY booked.
-    const state: { existingExpense: any; projectStatus: string; costCodeActive: boolean } = {
+    const state: {
+        existingExpense: any;
+        projectStatus: string;
+        costCodeActive: boolean;
+        estimateProjectId: string | null;
+    } = {
         existingExpense: null,
+        // What the locked estimate says its job is. A test that models a
+        // reassignment moves this.
+        estimateProjectId: "proj-1",
         // What the phase invariant reads back for this job and code. A test
         // that models an archive, a deactivation or a deleted job moves these.
         projectStatus: "In Progress",
@@ -198,6 +211,11 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         // one rule and both the pre-send checks and the in-transaction one obey
         // it. Locks return whatever; only the three reads matter.
         $queryRawUnsafe: async (query: string, ...args: any[]) => {
+            // The attribution PAIR is re-read from the locked estimate before
+            // the fill writes it (round 20, item 3).
+            if (/FROM "Estimate" WHERE id/.test(query) && /"projectId"/.test(query)) {
+                return [{ projectId: state.estimateProjectId }];
+            }
             if (/FROM "Project" WHERE id/.test(query) && /status/.test(query)) {
                 return [{ id: args[0], status: state.projectStatus }];
             }
@@ -1556,6 +1574,50 @@ test("an EXISTING receiptUrl is never replaced", () => {
             rec.existingExpense.receiptUrl,
             "https://drive.google.com/file/d/HAND-FIXED/view",
             "the existing link stands",
+        );
+    });
+});
+
+// ── the attribution is filled as a PAIR (Codex round 20, item 3) ───────────
+
+test("an alreadyExists row gets BOTH halves of the attribution", () => {
+    // Writing `projectId` alone onto a row whose `estimateId` came from v1 (or
+    // a crash) leaves an expense claiming two jobs: the column says one thing,
+    // every join through the estimate says another.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: null, estimateId: "est-legacy", costCodeId: null,
+        costCodeSource: null, taxAmount: null, taxAtSource: false, taxSource: null,
+        receiptUrl: null, installedAtCustomer: null, estimate: { projectId: null },
+    };
+    return bookReceipt(row(), rec.deps).then(result => {
+        assert.equal(result.outcome, "booked");
+        const fill = Object.assign({}, ...rec.expenseUpdates.map((u: any) => u.data));
+        assert.equal(fill.projectId, "proj-1");
+        assert.equal(fill.estimateId, "est-1", "the estimate this booking resolved");
+    });
+});
+
+test("an estimate REASSIGNED under the fill parks instead of half-writing", () => {
+    // The locked read is the first thing that can see the move. Filling
+    // `projectId` from the intake row while the estimate now belongs elsewhere
+    // is the two-jobs-at-once state, so nobody is booked.
+    const rec = recorder();
+    rec.state.estimateProjectId = "another-job";
+    rec.existingExpense = {
+        id: "expense-1", projectId: null, estimateId: "est-1", costCodeId: null,
+        costCodeSource: null, taxAmount: null, taxAtSource: false, taxSource: null,
+        receiptUrl: null, installedAtCustomer: null, estimate: { projectId: null },
+    };
+    return bookReceipt(row(), rec.deps).then(result => {
+        assert.equal(result.outcome, "needs-review");
+        if (result.outcome === "needs-review") {
+            assert.equal(result.reason, "attribution-conflict");
+            assert.equal(result.releaseStrongKey, false, "the Purchase exists");
+        }
+        assert.equal(
+            rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
+            "and nothing was marked BOOKED",
         );
     });
 });

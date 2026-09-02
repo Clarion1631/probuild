@@ -260,7 +260,7 @@ test("PATCH can supply the tax a rejected OCR read left behind", async () => {
     // nonsense read lands with none. Without this path the receipt could never
     // reach the filing report at all.
     storedExpense = { ...storedExpense, qbPurchaseId: "qb-1", taxAmount: null, taxAtSource: false };
-    const res = await patch({ taxAmount: 16.55, taxAtSource: true });
+    const res = await patch({ taxAmount: 16.55 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, 16.55);
     assert.equal(updateArgs?.data.taxAtSource, true);
@@ -279,10 +279,13 @@ test("PATCH refuses an implausible tax rather than storing it", async () => {
     assert.equal((await patch({ taxAmount: 0 })).status, 200, "zero tax is a real answer");
 });
 
-test("taxAtSource cannot claim tax that is not there", async () => {
+test("taxAtSource cannot claim tax that is not there — it cannot be claimed at all", async () => {
+    // Round 20, item 1: the pair is no longer expressible. The flag is derived
+    // from the figure, so "true with no tax" cannot be sent, let alone stored.
     storedExpense = { ...storedExpense, taxAmount: null, taxAtSource: false };
     assert.equal((await patch({ taxAtSource: true })).status, 400);
-    assert.equal((await patch({ taxAtSource: true, taxAmount: 10 })).status, 200);
+    assert.equal((await patch({ taxAmount: 10 })).status, 200);
+    assert.equal(updateArgs?.data.taxAtSource, true, "derived from the figure");
     assert.equal((await patch({ taxAtSource: "yes" })).status, 400);
 });
 
@@ -297,7 +300,7 @@ test("raising the tax re-checks an allocation this request never mentioned", asy
 test("the tax fields need financialReports too", async () => {
     currentUser = { id: "u6", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
     assert.equal((await patch({ taxAmount: 10 })).status, 403);
-    assert.equal((await patch({ taxAtSource: false })).status, 403);
+    assert.equal((await patch({ taxAmount: null, taxKnown: true })).status, 403);
 });
 
 // ── item 8: DELETE gets the same gate ──────────────────────────────────────
@@ -404,7 +407,7 @@ test("no single tax field clears the flag on its own", async () => {
     storedExpense = { ...storedExpense, needsTaxReview: true };
     for (const body of [
         { taxAmount: 10 },
-        { taxAtSource: false },
+        { taxAmount: null, taxKnown: true },
         { taxDeductibleBase: 50 },
         { installedAtCustomer: false },
     ]) {
@@ -707,9 +710,10 @@ test("a -$50 refund accepts -$4 of tax", async () => {
         ...(storedExpense as object),
         amount: -50, taxAmount: null, taxDeductibleBase: null,
     } as Record<string, unknown>;
-    const res = await patch({ taxAmount: -4, taxAtSource: true });
+    const res = await patch({ taxAmount: -4 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, -4);
+    assert.equal(updateArgs?.data.taxAtSource, true, "derived, not supplied");
 });
 
 test("...and refuses +$4 with a 400, not a constraint violation", async () => {
@@ -764,7 +768,7 @@ test("an EXPLICIT null tax is a manual 'no tax' decision, in its own state", asy
     // person's figure) and "manual-none" (a person's "there is no tax here").
     // The last is the one a null `taxAmount` cannot express on its own, which
     // is the entire reason the column exists.
-    const res = await patch({ taxAmount: null, taxAtSource: false });
+    const res = await patch({ taxAmount: null, taxKnown: true });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, null, "the clear lands");
     assert.equal(updateArgs?.data.taxSource, "manual-none");
@@ -871,7 +875,7 @@ test("a refund's base is bounded by the pre-tax MAGNITUDE", async () => {
 test("a BLANK base on an ordinary tax edit is stored, not left null", async () => {
     // "Null means the whole pre-tax total" is a rule every reader has to
     // remember; the server writes what the person meant instead.
-    const res = await patch({ taxAmount: 16.55, taxAtSource: true });
+    const res = await patch({ taxAmount: 16.55 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxDeductibleBase, 191.19);
 });
@@ -886,7 +890,7 @@ test("a REFUND's blank base is computed with the sign intact", async () => {
     storedExpense = {
         ...(storedExpense as object), amount: -50, taxAmount: null, taxDeductibleBase: null,
     } as Record<string, unknown>;
-    const res = await patch({ taxAmount: -4, taxAtSource: true });
+    const res = await patch({ taxAmount: -4 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxDeductibleBase, -46);
 });
@@ -919,9 +923,13 @@ test("'tax unknown' is not a decision: provenance and flag both stand", async ()
     const res = await patch({ taxAmount: null, taxKnown: false });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, null, "the figure is cleared");
-    assert.equal(updateArgs?.data.taxSource, undefined, "but nobody decided anything");
+    // Round 20, item 2 sharpened this: "unknown" is a RETRACTION, so it takes
+    // the provenance back to null rather than merely leaving it alone — a row
+    // with a human provenance and no human answer behind it is the state that
+    // locks the pipeline out forever.
+    assert.equal(updateArgs?.data.taxSource, null, "back to unreviewed");
     assert.equal(updateArgs?.data.needsTaxReview, undefined, "and the row still waits");
-    assert.equal(updateArgs?.data.taxDeductibleBase, undefined, "no base for an unpriced row");
+    assert.equal(updateArgs?.data.taxDeductibleBase, null, "no base for an unpriced row");
 });
 
 test("'tax unknown' cannot acknowledge a review", async () => {
@@ -1042,4 +1050,58 @@ test("a fallback-attributed DELETE is refused when the estimate moves", async ()
     } finally {
         fakePrisma.$queryRawUnsafe = original;
     }
+});
+
+// ── taxAtSource is DERIVED, never supplied (Codex round 20, item 1) ────────
+
+test("a request that SETS taxAtSource is refused, either way round", async () => {
+    // Two writers for one truth is how they came to disagree. Both directions
+    // are the same mistake: `true` with no amount is a claim about nothing,
+    // `false` with a figure is a deduction dropped from the filing.
+    for (const value of [true, false]) {
+        const res = await patch({ taxAmount: 16.55, taxAtSource: value });
+        assert.equal(res.status, 400, String(value));
+        assert.equal((await res.json()).code, "TAX_AT_SOURCE_DERIVED");
+        assert.equal(updateArgs, null as typeof updateArgs, "nothing is written");
+    }
+});
+
+test("the server derives the flag from the figure it stores", async () => {
+    await patch({ taxAmount: 16.55 });
+    assert.equal(updateArgs?.data.taxAtSource, true);
+
+    await patch({ taxAmount: null, taxKnown: true });
+    assert.equal(updateArgs?.data.taxAtSource, false, "no tax, no claim");
+
+    storedExpense = { ...(storedExpense as object), amount: -50 } as Record<string, unknown>;
+    await patch({ taxAmount: -4 });
+    assert.equal(updateArgs?.data.taxAtSource, true, "a refund's tax was still charged");
+});
+
+// ── "unknown" RETRACTS a human answer (Codex round 20, item 2) ─────────────
+
+test("marking a MANUAL row unknown clears the provenance and both figures", async () => {
+    // Otherwise the row keeps a human provenance with no human answer behind
+    // it, and no automated read is ever allowed to fill it again.
+    storedExpense = {
+        ...(storedExpense as object), taxSource: "manual",
+        taxAmount: 16.55, taxDeductibleBase: 191.19,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: null, taxKnown: false });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, null);
+    assert.equal(updateArgs?.data.taxDeductibleBase, null);
+    assert.equal(updateArgs?.data.taxSource, null, "back to unreviewed");
+    assert.equal(updateArgs?.data.taxAtSource, false);
+});
+
+test("...and the same from MANUAL-NONE", async () => {
+    storedExpense = {
+        ...(storedExpense as object), taxSource: "manual-none",
+        taxAmount: null, taxDeductibleBase: 207.74,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: null, taxKnown: false });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, null);
+    assert.equal(updateArgs?.data.taxDeductibleBase, null);
 });

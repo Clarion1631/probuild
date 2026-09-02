@@ -407,3 +407,53 @@ export function expenseStillOnProjectWhere(
         ? { projectId }
         : { projectId: null, estimate: { is: { projectId } } };
 }
+
+
+/**
+ * The attribution PAIR, re-read from a share-locked estimate.
+ *
+ * `projectId` and `estimateId` are the same fact said twice — the project is
+ * the answer, the estimate is where it came from — so a writer that reads them
+ * apart can persist a pair that never existed together. Every creator did:
+ * resolve the estimate's project, do a few hundred milliseconds of other work
+ * (a cost-code lookup, a QBO round trip), then insert both. An estimate moved
+ * to another job in that window produced a row stamped with the OLD project and
+ * the estimate that now belongs to a new one — an expense on two jobs at once,
+ * which the resolver cannot reconcile and no report can be right about.
+ *
+ * Locking the estimate FOR SHARE holds the pair still for the rest of the
+ * caller's transaction, and returning both together means the caller writes
+ * what it just read rather than what it read earlier.
+ *
+ * `null` means the estimate has no project — no scope to attribute against, and
+ * every caller must refuse rather than write half a pair.
+ */
+export async function lockEstimateAttribution(
+    tx: ExpenseTxClient,
+    estimateId: string,
+): Promise<{ estimateId: string; projectId: string } | null> {
+    await tx.$queryRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR SHARE`, estimateId);
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "projectId" FROM "Estimate" WHERE id = $1`,
+        estimateId,
+    )) as { projectId: string | null }[];
+    const projectId = rows?.[0]?.projectId ?? null;
+    return projectId ? { estimateId, projectId } : null;
+}
+
+/**
+ * Is this line item still on that estimate? Asked under the same lock, because
+ * a re-parented item is how a cost code from another job reaches an expense.
+ */
+export async function itemBelongsToEstimateTx(
+    tx: ExpenseTxClient,
+    itemId: string,
+    estimateId: string,
+): Promise<boolean> {
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT id FROM "EstimateItem" WHERE id = $1 AND "estimateId" = $2 FOR SHARE`,
+        itemId,
+        estimateId,
+    )) as unknown[];
+    return Boolean(rows?.length);
+}
