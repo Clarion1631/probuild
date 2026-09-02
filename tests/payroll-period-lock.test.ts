@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     assertPeriodUnlocked,
+    assertPeriodUnlockedOrThrow,
     lockedPeriodFor,
     periodLockedMessage,
     type LockedPeriodRow,
@@ -100,10 +101,10 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         reviewReason: null,
     };
     const dependencies: ClockOutDependencies = {
-        authenticate: async () => ({ ok: true, user: { id: "u1", role: "FIELD_CREW", hourlyRate: 20, burdenRate: 5 } }),
+        authenticate: async () => ({ ok: true, user: { id: "u1", role: "FIELD_CREW", email: "u1@example.com", hourlyRate: 20, burdenRate: 5 } }),
         findTimeEntry: async () => entry,
         findProjectIsLogistics: async () => false,
-        findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner" }),
+        findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com" }),
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
@@ -142,6 +143,76 @@ test("PUT clock-out succeeds once the period is unlocked", async () => {
 
 // ── Wiring tripwire for the two handlers that are not DI-factored ──────────
 
+/**
+ * The canonical list of writers that can change how many payroll hours a period
+ * holds. Every one of them must call a lock assertion. This is a TRIPWIRE, not
+ * a behavioural proof — it catches "somebody added a writer and forgot", which
+ * is the failure mode that actually happened (the first cut of this feature
+ * gated the three API routes and left four server actions wide open).
+ *
+ * If you add a TimeEntry writer that touches startTime, durationHours, or
+ * existence, add it here and gate it. If it only touches flags, notes, cost
+ * coding, change-order tags or billing stamps, it belongs in the exclusion
+ * comment in src/lib/payroll-period.ts instead.
+ */
+const GATED_WRITERS: Array<{ file: string; mustMatch: RegExp[] }> = [
+    {
+        file: "src/lib/time-expense-core.ts",
+        // createTimeEntryCore — the canonical manual create, and the reason
+        // gating it here covers createTimeEntry in time-expense-actions too.
+        mustMatch: [/assertPeriodUnlockedOrThrow\(\[startTime\]\)/],
+    },
+    {
+        file: "src/lib/time-expense-actions.ts",
+        mustMatch: [
+            /assertPeriodUnlockedOrThrow\(\[current\.startTime, startTime\]\)/, // updateTimeEntry
+            /assertPeriodUnlockedOrThrow\(\[entry\.startTime\]\)/, // deleteTimeEntry
+            /assertPeriodUnlockedOrThrow\(allowed\.map\(e => e\.startTime\)\)/, // deleteTimeEntries
+        ],
+    },
+    {
+        file: "src/app/projects/[id]/timeclock/actions.ts",
+        mustMatch: [
+            /assertPeriodUnlockedOrThrow\(\[startTime\]\)/, // createTimeEntry
+            /assertPeriodUnlockedOrThrow\(\[existing\.startTime, startTime\]\)/, // updateTimeEntry
+            /assertPeriodUnlockedOrThrow\(\[entry\.startTime\]\)/, // deleteTimeEntry
+        ],
+    },
+    {
+        file: "src/app/api/time-entries/route.ts",
+        mustMatch: [
+            /assertPeriodUnlocked\(\[entryStartTime\]\)/, // POST clock-in (client-supplied startTime)
+            /assertPeriodUnlocked\(\[existing\.startTime\], dependencies\.loadLockedPeriods\)/, // PUT clock-out
+        ],
+    },
+];
+
+test("every payroll-hours writer calls a lock assertion", () => {
+    for (const writer of GATED_WRITERS) {
+        const source = readFileSync(path.join(__dirname, "..", ...writer.file.split("/")), "utf8");
+        for (const pattern of writer.mustMatch) {
+            assert.match(source, pattern, `${writer.file} is missing ${pattern}`);
+        }
+    }
+});
+
+test("the PUT clock-out re-checks the lock immediately before the write", async () => {
+    // TOCTOU: the first check happens before several awaited round trips. A
+    // loader that answers "unlocked" and then "locked" simulates a lock taken in
+    // that window; the row must not be closed.
+    let call = 0;
+    const { dependencies, updateCalls } = clockOutDeps([]);
+    dependencies.loadLockedPeriods = async () => {
+        call += 1;
+        return call === 1 ? [] : [period()];
+    };
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq());
+    assert.ok(call >= 2, "the handler only checked once — the write window is unguarded");
+    assert.equal(res.status, 423);
+    assert.equal(updateCalls.length, 0, "the entry was closed into a period that had just been locked");
+});
+
 test("PATCH and DELETE on /api/time-entries/[id] both still call assertPeriodUnlocked", () => {
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
@@ -153,4 +224,25 @@ test("PATCH and DELETE on /api/time-entries/[id] both still call assertPeriodUnl
     const deleteHalf = source.slice(splitAt);
     assert.match(patchHalf, /assertPeriodUnlocked\(\[existing\.startTime, newStart\]\)/);
     assert.match(deleteHalf, /assertPeriodUnlocked\(\[existing\.startTime\]\)/);
+    // PATCH checks twice: once early (fail fast) and once immediately before the
+    // write, for the same TOCTOU reason the PUT test above exercises for real.
+    assert.equal(
+        (patchHalf.match(/assertPeriodUnlocked\(\[existing\.startTime, newStart\]\)/g) ?? []).length,
+        2,
+        "PATCH must re-check the lock immediately before prisma.timeEntry.update"
+    );
+});
+
+test("assertPeriodUnlockedOrThrow throws with the same message the routes return", async () => {
+    // Server actions have no response object; a returned value would be ignored
+    // by every caller, so the action variant must THROW.
+    await assert.rejects(
+        () => assertPeriodUnlockedOrThrow([INSIDE], async () => [period()]),
+        (error: Error) => {
+            assert.equal(error.message, periodLockedMessage(period()));
+            return true;
+        }
+    );
+    await assertPeriodUnlockedOrThrow([INSIDE], async () => [period({ lockedAt: null })]);
+    await assertPeriodUnlockedOrThrow([AFTER], async () => [period()]);
 });

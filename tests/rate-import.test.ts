@@ -39,11 +39,15 @@ test("csv reader handles quotes, doubled quotes, embedded commas and CRLF", () =
     ]);
 });
 
-test("rate values tolerate $ and thousands separators", () => {
+test("rate values tolerate $ and spaces but REFUSE commas", () => {
     assert.equal(parseRateValue("$28.50"), 28.5);
-    assert.equal(parseRateValue(" 1,200 "), 1200);
+    assert.equal(parseRateValue(" 30 "), 30);
     assert.equal(parseRateValue(""), null);
     assert.equal(parseRateValue("n/a"), null);
+    // Stripping the comma turned the European "28,50" into 2850 — a 100x pay
+    // rate that would have imported silently. Refuse and make a human look.
+    assert.equal(parseRateValue("28,50"), null);
+    assert.equal(parseRateValue(" 1,200 "), null);
 });
 
 test("a first/last name pair beats a single display-name column", () => {

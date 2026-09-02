@@ -43,7 +43,7 @@ function createDeps(overrides: {
     authOk?: boolean;
     entry?: ClockOutTimeEntryRow | null;
     isLogistics?: boolean;
-    ownerRates?: { hourlyRate: number; burdenRate: number; role: string; name: string | null } | null;
+    ownerRates?: { hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string } | null;
     /** Locked pay periods the PUT handler must refuse to write into (src/lib/payroll-period.ts). */
     lockedPeriods?: import("../src/lib/payroll-period").LockedPeriodRow[];
     /** Simulate a concurrent PUT winning the atomic close guard first. */
@@ -55,13 +55,13 @@ function createDeps(overrides: {
         authenticate: async () =>
             overrides.authOk === false
                 ? { ok: false, status: 401, error: "Unauthorized" }
-                : { ok: true, user: { id: "u1", role: overrides.role ?? "FIELD_CREW", hourlyRate: 20, burdenRate: 5 } },
+                : { ok: true, user: { id: "u1", role: overrides.role ?? "FIELD_CREW", email: "u1@example.com", hourlyRate: 20, burdenRate: 5 } },
         findTimeEntry: async () => (overrides.entry !== undefined ? overrides.entry : baseEntry()),
         findProjectIsLogistics: async () => overrides.isLogistics ?? false,
         findOwnerRates: async () =>
             overrides.ownerRates !== undefined
                 ? overrides.ownerRates
-                : { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner" },
+                : { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com" },
         loadLockedPeriods: async () => overrides.lockedPeriods ?? [],
         // No other entries on the day unless a test says so — the WA meal rule
         // (src/lib/wa-breaks.ts) then sees only the closing entry.
@@ -304,7 +304,7 @@ test("computes durationHours/laborCost/burdenCost from the OWNER's rates, not th
     const { dependencies, updateCalls } = createDeps({
         role: "MANAGER",
         entry: baseEntry({ userId: "owner-1", startTime: new Date("2026-08-10T15:00:00.000Z") }),
-        ownerRates: { hourlyRate: 50, burdenRate: 10, role: "FIELD_CREW", name: "Owner One" },
+        ownerRates: { hourlyRate: 50, burdenRate: 10, role: "FIELD_CREW", name: "Owner One", email: "owner1@example.com" },
     });
     // requester (u1, MANAGER) has hourlyRate 20/burdenRate 5 per createDeps default auth — must not be used.
     const { createClockOutHandler } = await routeModulePromise;
