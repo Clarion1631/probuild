@@ -30,15 +30,22 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL
 
 -- A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
 --
--- Added in three steps on purpose: nullable, backfilled, then NOT NULL. A
--- single `ADD COLUMN ... NOT NULL DEFAULT now()` would leave a DB-level default
--- that `updatedAt DateTime @updatedAt` does not declare, and CI's
--- "migrations reproduce production" check compares the two.
+-- Nullable, backfilled, DEFAULT, then NOT NULL — in that order, and the DEFAULT
+-- is not optional.
 --
--- Each statement is independently re-runnable: IF NOT EXISTS, a predicate-bound
--- UPDATE, and a SET NOT NULL that is a no-op once applied.
+-- This script runs against production BEFORE the build that knows about the
+-- column. For that window the OLD app is still inserting Expenses without it,
+-- and a NOT NULL column with no default would fail every one of those inserts:
+-- receipts, manual entries, the QBO sync. `now()` is what keeps the old code
+-- writing while the new column exists. Prisma declares the same default
+-- (`@default(now()) @updatedAt`), so CI's "migrations reproduce production"
+-- check still sees the two agree.
+--
+-- Every statement is independently re-runnable: IF NOT EXISTS, a
+-- predicate-bound UPDATE, and two ALTERs that are no-ops once applied.
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3);
 UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL;
+ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET DEFAULT now();
 ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");

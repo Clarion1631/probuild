@@ -203,3 +203,43 @@ test("the tax-vs-gross CHECK is in both DDL paths and in the verifier", () => {
     );
     assert.ok(verified, "and the post-run verification must assert it");
 });
+
+// ── updatedAt must survive the PRE-DEPLOY window (round 10, item 1) ────────
+
+test("updatedAt is added nullable, backfilled, defaulted, THEN made NOT NULL", () => {
+    // Order is the whole point. The script runs against production BEFORE the
+    // build that knows about the column, so the OLD app is still inserting
+    // Expenses without it — NOT NULL with no default would fail every receipt,
+    // manual entry and QBO-sync insert until the deploy landed.
+    const sql = (statements as string[]).filter(s => s.includes('"updatedAt"'));
+    assert.equal(sql.length, 4, "add, backfill, default, not-null");
+    assert.match(sql[0], /ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP\(3\)$/);
+    assert.ok(!/NOT NULL/.test(sql[0]), "it must land NULLABLE or the backfill cannot run");
+    assert.match(sql[1], /^UPDATE [\s\S]*SET "updatedAt" = COALESCE\("createdAt"/);
+    assert.match(sql[2], /SET DEFAULT now\(\)/);
+    assert.match(sql[3], /SET NOT NULL/);
+    // The default must be in place BEFORE NOT NULL, or an insert racing the two
+    // statements still fails.
+    assert.ok(
+        (statements as string[]).indexOf(sql[2]) < (statements as string[]).indexOf(sql[3]),
+        "DEFAULT has to precede NOT NULL",
+    );
+});
+
+test("every updatedAt statement is re-runnable, and matches the migration", () => {
+    const sql = (statements as string[]).filter(s => s.includes('"updatedAt"'));
+    // IF NOT EXISTS; a predicate-bound UPDATE; two idempotent ALTERs.
+    assert.match(sql[0], /IF NOT EXISTS/);
+    assert.match(sql[1], /WHERE "updatedAt" IS NULL/);
+    for (const statement of sql) {
+        assert.ok(
+            normalizedMigration.includes(normalize(statement).replace(/;$/, "")),
+            `migration.sql is missing:\n  ${statement}`,
+        );
+    }
+});
+
+test("Prisma declares the same default, so the migration check sees them agree", () => {
+    const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+    assert.match(schema, /updatedAt DateTime @default\(now\(\)\) @updatedAt/);
+});

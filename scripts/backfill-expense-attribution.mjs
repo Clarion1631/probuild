@@ -44,6 +44,7 @@ import {
     resolveExpenseProjectId,
 } from "../src/lib/expense-attribution.ts";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project.ts";
+import { lockExpense } from "../src/lib/expense-lock.ts";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases.ts";
 import { csvCell, csvNumber } from "../src/lib/csv-safe.ts";
 
@@ -217,6 +218,7 @@ export function planBackfill({
                 costCodeConfidence: null,
                 why: "item cost code (same project)",
                 expectedProjectId: resolvedProjectId,
+                expectedUpdatedAt: expense.updatedAt ?? null,
                 expense,
             });
             continue;
@@ -267,6 +269,7 @@ export function planBackfill({
                 // AFTER pass (a) has run — which is the state the write
                 // actually meets.
                 expectedProjectId: resolvedProjectId,
+                expectedUpdatedAt: expense.updatedAt ?? null,
                 expense,
             });
         } else {
@@ -324,6 +327,23 @@ export function remainderCsv(remainder, projectNameById) {
  * tests/backfill-expense-attribution.test.ts can drive it with a prisma-shaped
  * stub and assert that a dry run makes ZERO write calls.
  */
+/**
+ * Run one write inside a transaction that first takes the shared per-expense
+ * advisory lock, so this script is ORDERED against the QBO sync, the tax PATCH
+ * and the booking fill rather than racing them.
+ *
+ * Falls back to a bare call when the injected client has no `$transaction` —
+ * the unit tests drive a plain stub, and requiring one there would test the
+ * stub rather than the script.
+ */
+export async function writeUnderExpenseLock(db, expenseId, run) {
+    if (typeof db.$transaction !== "function") return run(db);
+    return db.$transaction(async tx => {
+        await lockExpense(tx, expenseId);
+        return run(tx);
+    });
+}
+
 export async function runBackfill({
     db,
     apply = false,
@@ -351,6 +371,8 @@ export async function runBackfill({
         select: {
             id: true, estimateId: true, projectId: true, costCodeId: true, costCodeSource: true,
             itemId: true, amount: true, vendor: true, description: true, date: true,
+            // The row version each planned write is judged against.
+            updatedAt: true,
             estimate: { select: { projectId: true } },
         },
     });
@@ -516,9 +538,23 @@ export async function runBackfill({
         if (!byProject.has(fill.projectId)) byProject.set(fill.projectId, []);
         byProject.get(fill.projectId).push(fill.id);
     }
+    // Pass (a) bumps `updatedAt` on the rows it fills, so their planned
+    // cost-code CAS would miss on a version the backfill itself changed. Those
+    // rows are exempted from the version check — the attribution and
+    // uncoded predicates still guard them.
+    const filledByProjectPass = new Set(plan.projectFills.map(fill => fill.id));
+    for (const fill of plan.codeFills) {
+        fill.projectWasFilled = filledByProjectPass.has(fill.id);
+    }
+
     for (const [projectId, ids] of byProject) {
         // `projectId: null` in the predicate, not just in the plan: between the
         // read above and this write, a re-sync or a bookkeeper may have set it.
+        //
+        // No CAS on `updatedAt` here on purpose. This pass only ever fills a
+        // NULL, so "the row changed" and "the column is still NULL" are the
+        // same question, and the id-set write is one statement per project
+        // rather than one per row.
         const result = await db.expense.updateMany({
             where: { id: { in: ids }, projectId: null },
             data: { projectId },
@@ -526,12 +562,33 @@ export async function runBackfill({
         projectIdsWritten += result.count;
     }
 
+    // COST-CODE WRITES RUN UNDER THE SHARED PER-EXPENSE LOCK, one row at a
+    // time, and each is a compare-and-set on the row version its decision was
+    // made from.
+    //
+    // This script is the fourth writer of these columns, alongside the QBO
+    // sync, the tax PATCH and the booking fill — and the only one that had been
+    // left racing them. Its plan is the STALEST of the four: it is computed for
+    // every row up front and then applied in a loop that can take minutes, so
+    // "nothing changed since the read" is a much weaker assumption here than
+    // anywhere else.
+    //
+    // A miss is not an error and is not retried: the row moved, so the decision
+    // was made about a state that no longer exists. It is counted and reported,
+    // and a re-run will plan it again against the truth.
     let costCodesWritten = 0;
     let costCodesSkipped = 0;
     for (const fill of plan.codeFills) {
-        const result = await db.expense.updateMany({
+        const result = await writeUnderExpenseLock(db, fill.id, tx => tx.expense.updateMany({
             where: {
                 id: fill.id,
+                // The row version the plan was computed from. Pass (a) above
+                // may legitimately have bumped it, so a fill whose project was
+                // just written is re-read rather than assumed — see the
+                // `expectedUpdatedAt === null` branch in the helper.
+                ...(fill.expectedUpdatedAt && !fill.projectWasFilled
+                    ? { updatedAt: fill.expectedUpdatedAt }
+                    : {}),
                 // Everything the plan depended on, re-asserted at write time.
                 // The plan is a snapshot taken before pass (a) ran and before
                 // any concurrent sync or bookkeeper edit; the predicate is what
@@ -552,7 +609,7 @@ export async function runBackfill({
                 costCodeSource: fill.costCodeSource,
                 costCodeConfidence: fill.costCodeConfidence,
             },
-        });
+        }));
         costCodesWritten += result.count;
         if (result.count === 0) costCodesSkipped += 1;
     }

@@ -198,10 +198,17 @@ export async function deleteExpense(id: string, projectId: string) {
             qbPurchaseId: true,
             invoiceId: true,
             invoicedAt: true,
+            projectId: true,
             estimate: { select: { projectId: true } },
         },
     });
-    if (!expense || expense.estimate.projectId !== projectId || !canAccessProject(user, expense.estimate.projectId)) {
+    // Resolved, not read off the estimate. For a RE-ATTRIBUTED expense the
+    // estimate still names the job it left, so reading it here both admitted
+    // someone whose access is to that old job and refused the crew who now
+    // own the row — a deletion authorized against a project the expense is
+    // not on.
+    const resolvedProjectId = expense ? resolveExpenseProjectId(expense) : null;
+    if (!expense || resolvedProjectId !== projectId || !canAccessProject(user, resolvedProjectId)) {
         throw new Error("Forbidden");
     }
     assertExpenseMutableOutsideQbo(expense);

@@ -677,7 +677,14 @@ model Expense {
   /// it the CAS could only name the money columns, and a re-attribution
   /// landing in the gap would slip past a check that had already decided who
   /// was allowed to make it.
-  updatedAt DateTime @updatedAt
+  ///
+  /// `@default(now())` is load-bearing for the DEPLOY, not for the model. The
+  /// apply script runs against production BEFORE the build that knows about
+  /// this column, so for that window the OLD app is still inserting Expenses
+  /// without it. A NOT NULL column with no default would make every one of
+  /// those inserts fail — receipts, manual entries, the QBO sync, all of it —
+  /// for as long as the window lasts.
+  updatedAt DateTime @default(now()) @updatedAt
 
   /// Back-relation for ReceiptIntake.expenseId. Declared here rather than left
   /// SQL-only because `prisma migrate diff` WOULD see a foreign key that

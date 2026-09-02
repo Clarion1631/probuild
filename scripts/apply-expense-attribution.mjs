@@ -89,11 +89,18 @@ export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false`,
 
     // A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
-    // Three steps on purpose — nullable, backfill, NOT NULL — because a single
-    // NOT NULL DEFAULT now() would leave a DB default that `@updatedAt` does
-    // not declare, and CI compares the two. Each step is re-runnable.
+    //
+    // Nullable, backfill, DEFAULT, NOT NULL — and the DEFAULT is what makes the
+    // pre-deploy window survivable. This script runs BEFORE the build that
+    // knows about the column, so the OLD app is still inserting Expenses
+    // without it; NOT NULL with no default would fail every receipt, manual
+    // entry and QBO-sync insert until the deploy landed. Prisma declares the
+    // same default, so the migration check still sees them agree.
+    //
+    // Each step is independently re-runnable.
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3)`,
     `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL`,
+    `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET DEFAULT now()`,
     `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
 
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,

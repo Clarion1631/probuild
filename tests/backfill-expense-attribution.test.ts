@@ -30,6 +30,7 @@ type StubExpense = {
     vendor: string | null;
     description: string | null;
     date: Date | null;
+    updatedAt?: Date | null;
     estimate: { projectId: string | null };
 };
 
@@ -48,6 +49,7 @@ function expense(overrides: Partial<StubExpense> = {}): StubExpense {
         vendor: null,
         description: null,
         date: new Date("2026-08-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-09-01T00:00:00.000Z"),
         estimate: { projectId: "job-1" },
         ...overrides,
     };
@@ -93,6 +95,12 @@ function createStub(
         }
         if ("projectId" in where && (row.projectId ?? null) !== where.projectId) return false;
         if ("costCodeId" in where && (row.costCodeId ?? null) !== where.costCodeId) return false;
+        // The row-version CAS. Dates compare by value, not identity.
+        if ("updatedAt" in where) {
+            const want = where.updatedAt as Date | null;
+            const have = (row as any).updatedAt as Date | null | undefined;
+            if ((have?.getTime() ?? null) !== (want?.getTime() ?? null)) return false;
+        }
         if (Array.isArray(where.OR)) {
             const ok = (where.OR as Record<string, unknown>[]).some(branch => {
                 if (!("costCodeSource" in branch)) return false;
@@ -678,4 +686,78 @@ test("LABOR item dollars from another job stay unattributed too", () => {
     );
     assert.equal(labor.attributed, 100);
     assert.equal(labor.unattributed, 900);
+});
+
+// ── the backfill is ordered against the other three writers (round 10, #5) ──
+
+test("each cost-code write takes the shared per-expense lock", async () => {
+    const locks: unknown[] = [];
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async (_q: string, key: unknown) => { locks.push(key); return [{}]; };
+
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(locks, ["expense:e1"], "one lock, namespaced per expense");
+});
+
+test("a row that MOVED between the plan and the write is skipped, not coded", async () => {
+    // This script's plan is the stalest of the four writers': computed for
+    // every row up front, then applied in a loop that can run for minutes. The
+    // CAS on the row version is what stops it acting on a state that has since
+    // changed.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => [{}];
+
+    // Someone edits the row after findMany handed it to the planner.
+    const realUpdateMany = stub.db.expense.updateMany;
+    let moved = false;
+    (stub.db.expense as any).updateMany = async (args: any) => {
+        if (!moved && "updatedAt" in args.where) {
+            moved = true;
+            stub.rows[0].updatedAt = new Date("2026-09-02");
+        }
+        return realUpdateMany(args);
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0, "the stale decision is not applied");
+    assert.equal(stub.rows[0].costCodeId, null);
+});
+
+test("the CAS names the row version the plan was computed from", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => [{}];
+
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
+    assert.deepEqual(codeWrite.where.updatedAt, new Date("2026-09-01"));
+});
+
+test("a row the PROJECT pass just filled is exempt from the version check", async () => {
+    // Pass (a) bumps updatedAt itself, so a naive CAS would miss on a version
+    // the backfill changed a moment earlier — and code nothing, which is
+    // exactly the ordering bug from round 6 wearing a different hat.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" }, vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => [{}];
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.projectIds, 1);
+    assert.equal(result.written.costCodes, 1, "the code still lands");
+    const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
+    assert.ok(!("updatedAt" in codeWrite.where), "no version check on a row this run just touched");
 });
