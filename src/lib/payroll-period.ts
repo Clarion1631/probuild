@@ -192,11 +192,27 @@ export async function assertDayUnlockedInTx(
     if (period) throw new PeriodLockedError(period);
 }
 
+/**
+ * THE select every locked-period read shares.
+ *
+ * One object, not a literal repeated per call site: `timeZone` went missing
+ * from a hand-rolled copy of this query in the clock-out route, which silently
+ * demoted every locked period to a legacy row and re-derived its envelope from
+ * today's company zone. A column added here reaches every reader at once.
+ */
+export const LOCKED_PERIOD_SELECT = {
+    id: true,
+    periodStart: true,
+    periodEnd: true,
+    lockedAt: true,
+    timeZone: true,
+} as const;
+
 /** Locked periods read THROUGH a transaction client, so the check sees the same snapshot as the write. */
 export async function loadLockedPeriodsTx(tx: PayrollTxClient): Promise<LockedPeriodRow[]> {
     return tx.payrollPeriod.findMany({
         where: { lockedAt: { not: null } },
-        select: { id: true, periodStart: true, periodEnd: true, lockedAt: true, timeZone: true },
+        select: LOCKED_PERIOD_SELECT,
     });
 }
 
@@ -357,17 +373,29 @@ export function lockedPeriodFor(
     return null;
 }
 
-/** Inclusive company-local day keys for display — periodEnd is exclusive, so the last DAY is the day before it. */
-export function periodDisplayRange(period: Pick<LockedPeriodRow, "periodStart" | "periodEnd">): {
+/**
+ * Inclusive local day keys for display — periodEnd is exclusive, so the last
+ * DAY is the day before it.
+ *
+ * Formatted in the zone the period was LOCKED in, the same zone enforcement
+ * uses (see lockedPeriodFor). Formatting in whatever the company zone is today
+ * would make the refusal name a different pair of dates than the one that is
+ * actually frozen the moment CompanySettings.timeZone changes — telling the
+ * person holding the phone to look at a day that is not the one blocking them.
+ * `timeZone` is null on rows written before the column existed; those fall back
+ * to the company constant, which is what they were locked under.
+ */
+export function periodDisplayRange(period: Pick<LockedPeriodRow, "periodStart" | "periodEnd" | "timeZone">): {
     startKey: string;
     lastDayKey: string;
 } {
-    const startKey = dayKeyInTimeZone(period.periodStart, COMPANY_TIME_ZONE);
-    const endKeyExclusive = dayKeyInTimeZone(period.periodEnd, COMPANY_TIME_ZONE);
+    const zone = period.timeZone || COMPANY_TIME_ZONE;
+    const startKey = dayKeyInTimeZone(period.periodStart, zone);
+    const endKeyExclusive = dayKeyInTimeZone(period.periodEnd, zone);
     return { startKey, lastDayKey: addDaysToKey(endKeyExclusive, -1) };
 }
 
-export function periodLockedMessage(period: Pick<LockedPeriodRow, "periodStart" | "periodEnd">): string {
+export function periodLockedMessage(period: Pick<LockedPeriodRow, "periodStart" | "periodEnd" | "timeZone">): string {
     const { startKey, lastDayKey } = periodDisplayRange(period);
     return `Payroll for ${startKey} to ${lastDayKey} is locked, including the rest of the workweeks it touches — overtime is worked out per week, so a punch just outside the period still changes what was paid inside it. An admin has to unlock that period before this entry can change.`;
 }
@@ -417,7 +445,7 @@ export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
     const { prisma } = await import("./prisma");
     return prisma.payrollPeriod.findMany({
         where: { lockedAt: { not: null } },
-        select: { id: true, periodStart: true, periodEnd: true, lockedAt: true, timeZone: true },
+        select: LOCKED_PERIOD_SELECT,
     });
 }
 

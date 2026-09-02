@@ -109,6 +109,45 @@ test("the message names the LAST DAY of the period, not the exclusive end", () =
     assert.match(periodLockedMessage(period()), /2026-08-17 to 2026-08-30/);
 });
 
+// Mon 2026-08-17 00:00 JST .. Mon 2026-08-31 00:00 JST — the boundaries Tokyo
+// produces. Read in Los Angeles the SAME two instants land on 2026-08-16 and
+// 2026-08-30, so the two zones name a different pair of days for one period.
+const JST_LOCKED = period({
+    timeZone: "Asia/Tokyo",
+    periodStart: new Date("2026-08-16T15:00:00.000Z"),
+    periodEnd: new Date("2026-08-30T15:00:00.000Z"),
+});
+
+test("the refusal names the dates in the zone the period was LOCKED in", async () => {
+    // Enforcement already used the stored zone; only the MESSAGE did not, so a
+    // refusal could name a period that is a day off from the one actually
+    // frozen. Someone told "2026-08-16 to 2026-08-29 is locked" goes looking for
+    // a period that does not exist, and the admin unlocks the wrong one.
+    assert.match(periodLockedMessage(JST_LOCKED), /2026-08-17 to 2026-08-30/);
+    assert.doesNotMatch(
+        periodLockedMessage(JST_LOCKED),
+        /2026-08-16 to 2026-08-29/,
+        "that is the same period read in today's company zone, not the locked one"
+    );
+
+    // The control: strip the stored zone and the company constant is all that
+    // is left, which is exactly the pair of dates above.
+    assert.match(periodLockedMessage({ ...JST_LOCKED, timeZone: null }), /2026-08-16 to 2026-08-29/);
+
+    // End to end, through the 423 body and the thrown server-action variant.
+    const res = await assertPeriodUnlocked([INSIDE], async () => [JST_LOCKED]);
+    assert.ok(res);
+    assert.equal(res.status, 423);
+    assert.match((await res.json()).error, /2026-08-17 to 2026-08-30/);
+    await assert.rejects(
+        () => assertPeriodUnlockedOrThrow([INSIDE], async () => [JST_LOCKED]),
+        (error: Error) => {
+            assert.match(error.message, /2026-08-17 to 2026-08-30/);
+            return true;
+        }
+    );
+});
+
 test("an edit that MOVES an entry into a locked period is refused", async () => {
     // Old time is outside the locked period; the new one is inside. Both are
     // passed, exactly as the PATCH handler does.
@@ -124,14 +163,14 @@ test("an unlocked period lets the same edit through", async () => {
 
 // ── The clock-out route, through its real handler ──────────────────────────
 
-function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
+function clockOutDeps(lockedPeriods: LockedPeriodRow[], startTime: Date = INSIDE) {
     const updateCalls: Array<{ id: string }> = [];
     // Mirrors the real dependency: the guard runs INSIDE the close transaction,
     // so a locked period comes back as a result, not as a pre-check.
     // The real dependency re-reads the row FOR UPDATE inside the transaction and
     // checks its STORED startTime, then settles the day in the same transaction.
     const guardedClose = (id: string, userId: string, data: Record<string, unknown>) => {
-        const hit = lockedPeriodFor(lockedPeriods, INSIDE);
+        const hit = lockedPeriodFor(lockedPeriods, startTime);
         if (hit) return { ok: false as const, locked: hit };
         updateCalls.push({ id });
         return { ok: true as const, entry: { id, userId, ...data } };
@@ -140,7 +179,7 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         id: "te1",
         userId: "u1",
         projectId: "p1",
-        startTime: INSIDE,
+        startTime,
         endTime: null,
         notes: null,
         reviewReason: null,
@@ -153,16 +192,16 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })),
+        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(startTime, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })),
         loadLockedPeriods: async () => lockedPeriods,
     };
     return { dependencies, updateCalls };
 }
 
-function putReq() {
+function putReq(startTime: Date = INSIDE) {
     return new Request("https://example.test/api/time-entries", {
         method: "PUT",
-        body: JSON.stringify({ id: "te1", endTime: new Date(INSIDE.getTime() + 4 * 3_600_000).toISOString() }),
+        body: JSON.stringify({ id: "te1", endTime: new Date(startTime.getTime() + 4 * 3_600_000).toISOString() }),
     });
 }
 
@@ -181,6 +220,98 @@ test("PUT clock-out succeeds once the period is unlocked", async () => {
     const res = await createClockOutHandler(dependencies).PUT(putReq());
     assert.equal(res.status, 200);
     assert.equal(updateCalls.length, 1);
+});
+
+// A period locked in Honolulu (UTC-10, no DST), with the boundaries that zone
+// actually produces: Mon 2026-08-17 00:00 HST .. Mon 2026-08-31 00:00 HST.
+const HST_LOCKED = period({
+    timeZone: "Pacific/Honolulu",
+    periodStart: new Date("2026-08-17T10:00:00.000Z"),
+    periodEnd: new Date("2026-08-31T10:00:00.000Z"),
+});
+// Sun 2026-08-16 22:00 HST — the workweek BEFORE the locked one, so this punch
+// is free. Read in Los Angeles the same instant is Mon 2026-08-17 01:00 PDT,
+// i.e. inside the envelope the company zone would derive today.
+const HST_FREE_PUNCH = new Date("2026-08-17T08:00:00.000Z");
+
+test("a company-zone change does NOT strand an open punch outside the locked period", async () => {
+    // The regression: the clock-out route loaded locked periods with its own
+    // findMany, which dropped `timeZone` from the select. lockedPeriodFor then
+    // fell back to the CURRENT company zone and re-derived the envelope of a
+    // period that was locked (and paid) under a different one — widening it
+    // backwards by three hours and answering 423 PERIOD_LOCKED for a punch the
+    // in-transaction guard, which does read the stored zone, considers writable.
+    // The worker's phone can then never close the shift.
+    //
+    // COVERAGE BOUNDARY, stated rather than implied: the loader is INJECTED
+    // here, so this test proves the route honours a stored zone end to end — it
+    // cannot see what the production loader selects. The dropped column itself
+    // is caught by the two tests below (the wiring tripwire and the shared
+    // select), and this test passes with or without them.
+    const { dependencies, updateCalls } = clockOutDeps([HST_LOCKED], HST_FREE_PUNCH);
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq(HST_FREE_PUNCH));
+    assert.equal(res.status, 200, "the punch is outside the period's own envelope — it must close");
+    assert.equal(updateCalls.length, 1);
+
+    // The control that makes the assertion above mean something: with the
+    // stored zone dropped, the very same punch reads as frozen.
+    const zoneless = { ...HST_LOCKED, timeZone: null };
+    assert.equal(
+        lockedPeriodFor([zoneless], HST_FREE_PUNCH, { timeZone: "America/Los_Angeles" })?.id,
+        "pp1",
+        "control: without the stored zone this punch is falsely locked"
+    );
+    // And a punch genuinely inside the Honolulu envelope is still refused.
+    const inside = clockOutDeps([HST_LOCKED], new Date("2026-08-20T15:00:00.000Z"));
+    const refused = await createClockOutHandler(inside.dependencies).PUT(putReq(new Date("2026-08-20T15:00:00.000Z")));
+    assert.equal(refused.status, 423);
+    assert.equal(inside.updateCalls.length, 0);
+});
+
+test("the clock-out route uses THE canonical locked-period loader, not a local copy", () => {
+    // The hand-rolled copy is how `timeZone` went missing from the select in
+    // the first place. There is one loader; the route wires it straight in.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "route.ts"),
+        "utf8"
+    );
+    assert.doesNotMatch(
+        source,
+        /payrollPeriod\.findMany/,
+        "the route must not hand-roll the locked-period query — its select drifts"
+    );
+    assert.match(source, /loadLockedPeriods,/);
+    const imports = source.slice(0, source.indexOf('} from "@/lib/payroll-period"'));
+    assert.match(imports, /loadLockedPeriods,/, "loadLockedPeriods must come from lib/payroll-period");
+});
+
+test("every locked-period read selects the stored timeZone, from ONE shared select", async () => {
+    // Enforcement reads period.timeZone. A loader that does not select it turns
+    // every locked period into a legacy row and silently re-derives its
+    // envelope from today's company zone. Both loaders share one select object
+    // so a third reader cannot reintroduce the drift by copy-paste.
+    let selected: unknown;
+    const tx = {
+        $executeRawUnsafe: async () => 0,
+        $queryRawUnsafe: async () => [],
+        payrollPeriod: {
+            findMany: async (args: { select?: unknown }) => {
+                selected = args.select;
+                return [] as LockedPeriodRow[];
+            },
+        },
+    };
+    const { loadLockedPeriodsTx, LOCKED_PERIOD_SELECT } = await import("../src/lib/payroll-period");
+    assert.equal(LOCKED_PERIOD_SELECT.timeZone, true);
+    await loadLockedPeriodsTx(tx as never);
+    // Identity, not shape: a second literal that merely looks the same today is
+    // exactly what drifted.
+    assert.equal(selected, LOCKED_PERIOD_SELECT);
+
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "payroll-period.ts"), "utf8");
+    const literals = source.match(/select: \{ id: true/g) ?? [];
+    assert.equal(literals.length, 0, "locked-period reads must go through LOCKED_PERIOD_SELECT");
 });
 
 // ── Wiring tripwire for the two handlers that are not DI-factored ──────────

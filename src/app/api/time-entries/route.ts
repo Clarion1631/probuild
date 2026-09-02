@@ -16,6 +16,7 @@ import {
     withPayrollWrite,
     dayLockKey,
     isPeriodLockedError,
+    loadLockedPeriods,
     periodLockedResponse,
     withPayrollWriteTx,
     type LockedPeriodLoader,
@@ -793,11 +794,14 @@ const clockOutHandler = createClockOutHandler({
             payType: owner.payType ?? null,
         };
     },
-    loadLockedPeriods: async () =>
-        prisma.payrollPeriod.findMany({
-            where: { lockedAt: { not: null } },
-            select: { id: true, periodStart: true, periodEnd: true, lockedAt: true },
-        }),
+    // THE canonical loader, not a hand-rolled copy of it. A local findMany here
+    // dropped `timeZone` from the select, which made the fail-fast check
+    // re-derive every locked period's workweek envelope from TODAY's company
+    // zone: after a CompanySettings.timeZone change that moved the boundaries
+    // and answered 423 PERIOD_LOCKED for punches the in-transaction guard (which
+    // does read the stored zone) considers perfectly writable — stranding an
+    // open punch on the phone with no way to close it.
+    loadLockedPeriods,
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,
