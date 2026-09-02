@@ -5,9 +5,14 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
-import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
 import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
-import { deleteObjectOrRecord, retryPendingCleanups, sealObject } from "@/lib/receipt-intake/storage-cleanup";
+import {
+    deleteObjectOrRecord,
+    rejectRowAndQueueCleanup,
+    retryPendingCleanups,
+    sealObject,
+    settleQueuedCleanup,
+} from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
@@ -26,13 +31,13 @@ import {
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
     RUN_HARD_BUDGET_MS,
-    SIGNED_UPLOAD_TTL_MS,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
     type ClaimResult,
     type CutoverRequest,
     isUniqueViolation,
     runIntakeWorker,
+    uploadLeaseActive,
     type ReadPatch,
     type WorkerDependencies,
     type WorkerRow,
@@ -310,8 +315,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             const stale = await prisma.receiptIntake.findMany({
                 where: { state: "STAGING", createdAt: { lt: cutoff } },
                 select: {
-                    id: true, storagePath: true, mimeType: true,
-                    createdAt: true, expectedSha256: true,
+                    id: true, storagePath: true, mimeType: true, stateReason: true,
+                    createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
                 },
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
@@ -322,9 +327,22 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             let published = 0;
             let parked = 0;
             let rejected = 0;
+            let leaseActive = 0;
             for (const row of stale) {
                 // The sweep is inside the run's deadline, not outside it.
                 if (shouldStop()) break;
+
+                // NOTHING DESTRUCTIVE WHILE THE UPLOAD LEASE IS LIVE.
+                //
+                // `uploadUrlExpiresAt` is the promise /start made to this
+                // client. Until it passes, whatever is (or is not) at the path
+                // is provisional: an empty path is an upload in flight, and a
+                // half-written or superseded object is one the client is about
+                // to replace. Publishing is still allowed — a complete, correct
+                // object is a complete, correct object — but parking it as
+                // file-missing, or DELETING it as unacceptable, would destroy a
+                // receipt whose own upload link is still working.
+                const leaseLive = uploadLeaseActive(row);
 
                 // THE SAME validator /finalize uses. Publishing on "the object
                 // exists" alone would wave through a 40 MB video, an executable,
@@ -346,7 +364,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // turn a retry-in-progress into a review item, and the
                         // correct bytes arriving a minute later would find the
                         // row already gone from STAGING.
-                        if (row.createdAt.getTime() > Date.now() - SIGNED_UPLOAD_TTL_MS) continue;
+                        if (leaseLive) { leaseActive++; continue; }
                         await prisma.receiptIntake.updateMany({
                             where: { id: row.id, state: "STAGING" },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
@@ -389,7 +407,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // link was still perfectly usable — a slow phone on a bad
                     // connection came back to find its row already in the review
                     // queue. Wait until the URL cannot possibly land any more.
-                    if (row.createdAt.getTime() > Date.now() - SIGNED_UPLOAD_TTL_MS) continue;
+                    if (leaseLive) { leaseActive++; continue; }
                     await prisma.receiptIntake.updateMany({
                         where: { id: row.id, state: "STAGING" },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
@@ -397,14 +415,37 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     parked++;
                     continue;
                 }
-                // Rejected: the object exists and is not acceptable. Same
-                // outcome as /finalize — the row goes and so does the object.
-                await prisma.receiptIntake.deleteMany({ where: { id: row.id, state: "STAGING" } });
-                await deleteObjectOrRecord(row.storagePath, check.reason);
+                // Rejected: the object exists and is not acceptable.
+                //
+                // Not while the lease is live: what is at the path may be a
+                // partial write the client is still finishing, and deleting the
+                // row destroys the only record of an inbound receipt.
+                if (leaseLive) { leaseActive++; continue; }
+
+                // The SAME fenced transaction /finalize rejects with: the row
+                // and its cleanup record commit together, under the exact state
+                // and path we just inspected. The unfenced delete this replaces
+                // could destroy a row a concurrent /finalize had just published
+                // — and then delete the bytes that published row pointed at.
+                const dropped = await rejectRowAndQueueCleanup(
+                    {
+                        id: row.id,
+                        state: "STAGING",
+                        stateReason: row.stateReason,
+                        storagePath: row.storagePath,
+                    },
+                    check.reason,
+                );
+                // FENCE LOST: somebody else owns this row now. Touch NOTHING —
+                // above all not the object, which the winner may be using.
+                if (!dropped.ok) continue;
+                await settleQueuedCleanup(dropped.eventId, row.storagePath);
                 rejected++;
             }
-            if (published || parked || rejected) {
-                console.log("[cron/receipt-intake-worker] STAGING sweep", JSON.stringify({ published, parked, rejected }));
+            if (published || parked || rejected || leaseActive) {
+                console.log("[cron/receipt-intake-worker] STAGING sweep", JSON.stringify({
+                    published, parked, rejected, "upload-lease-active": leaseActive,
+                }));
             }
             return published + parked + rejected;
         },

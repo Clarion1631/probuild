@@ -14,7 +14,7 @@ import path from "node:path";
 const ROOT = path.resolve(__dirname, "..");
 const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
 const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
-const storage = readFileSync(path.join(ROOT, "src/lib/secure-storage.ts"), "utf8");
+const bucket = readFileSync(path.join(ROOT, "src/lib/receipt-intake/bucket.ts"), "utf8");
 
 /**
  * The body of one top-level function, EOL-agnostic.
@@ -79,7 +79,7 @@ test("the cleanup worker refuses to delete a path a LIVE row still points at", (
     assert.match(fn, /still referenced by/, "and resolves rather than retrying forever");
     // The reference check must come BEFORE the delete.
     assert.ok(
-        fn.indexOf("still referenced by") < fn.indexOf("removeSecureDocStrict"),
+        fn.indexOf("still referenced by") < fn.indexOf("removeReceiptObject"),
         "the check precedes the deletion",
     );
 });
@@ -90,18 +90,20 @@ test("an event is resolved only AFTER a confirmed deletion", () => {
     // through to the resolve.
     assert.match(fn, /\} catch \{[\s\S]*?continue;/, "a failed delete leaves the event pending");
     assert.ok(
-        fn.lastIndexOf("removeSecureDocStrict") < fn.lastIndexOf('status: "resolved" }'),
+        fn.lastIndexOf("removeReceiptObject") < fn.lastIndexOf('status: "resolved" }'),
         "resolve happens after the delete",
     );
 });
 
 test("a missing storage client is an ERROR for the cleanup path", () => {
-    // removeSecureDoc returns quietly with no client — right for its
-    // best-effort callers, catastrophic here: it would mark orphans resolved on
-    // a misconfigured deployment and lose them permanently.
-    assert.match(storage, /export async function removeSecureDocStrict/);
-    const strict = bodyOf(storage, "export async function removeSecureDocStrict");
-    assert.match(strict, /throw new Error\("secure storage is not configured"\)/);
-    // ...and the cleanup queue uses the strict one, never the quiet one.
-    assert.ok(!/\bremoveSecureDoc\(/.test(cleanup), "cleanup never uses the quiet variant");
+    // A deleter that returns quietly with no client is right for best-effort
+    // callers and catastrophic here: it would mark orphans resolved on a
+    // misconfigured deployment and lose them permanently.
+    assert.match(bucket, /export async function removeReceiptObject/);
+    const strict = bodyOf(bucket, "export async function removeReceiptObject");
+    assert.match(strict, /throw new Error\("receipt storage is not configured"\)/);
+    // ...and cleanup never reaches for a best-effort variant, or for any bucket
+    // but the receipts one.
+    assert.ok(!/removeSecureDoc/.test(cleanup), "cleanup never uses the quiet variant");
+    assert.ok(!/SECURE_BUCKET/.test(cleanup), "and never touches the shared document bucket");
 });

@@ -10,6 +10,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     runIntakeWorker,
     dateOnly,
@@ -23,6 +25,9 @@ import {
     type ReadPatch,
     type WorkerDependencies,
     type WorkerRow,
+    uploadLeaseActive,
+    uploadLeaseExpiry,
+    SIGNED_UPLOAD_TTL_MS,
 } from "../src/lib/receipt-intake/worker";
 import { normalizeDocType, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
@@ -1138,4 +1143,51 @@ test("a park AFTER a send keeps the key, on every one of those paths", async () 
         await runIntakeWorker(h.deps);
         assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), "the Purchase may exist");
     }
+});
+
+// ── The upload lease, not the row's age (round-13 item 2) ──────────────────
+
+test("a re-issued upload URL keeps the row safe from the sweeper", () => {
+    // The row is old; its LEASE is not. Judging it on createdAt declared a
+    // receipt missing — or destroyed one it called unacceptable — while the
+    // client's own upload link was live and about to land.
+    const old = new Date(NOW.getTime() - 6 * 60 * 60_000);
+    assert.equal(
+        uploadLeaseActive({ createdAt: old, uploadUrlExpiresAt: new Date(NOW.getTime() + 60_000) }, NOW),
+        true,
+        "a fresh lease on an old row",
+    );
+    assert.equal(
+        uploadLeaseActive({ createdAt: old, uploadUrlExpiresAt: new Date(NOW.getTime() - 60_000) }, NOW),
+        false,
+        "an expired lease is expired, however recently the row was touched",
+    );
+    // A row with no lease at all (the single-shot path writes its bytes through
+    // the server) falls back to its own age.
+    assert.equal(uploadLeaseActive({ createdAt: old, uploadUrlExpiresAt: null }, NOW), false);
+    assert.equal(
+        uploadLeaseActive({ createdAt: new Date(NOW.getTime() - 60_000), uploadUrlExpiresAt: null }, NOW),
+        true,
+    );
+});
+
+test("the lease a URL is issued under is exactly the signed-URL TTL", () => {
+    assert.equal(uploadLeaseExpiry(NOW).getTime() - NOW.getTime(), SIGNED_UPLOAD_TTL_MS);
+    assert.equal(SIGNED_UPLOAD_TTL_MS, 2 * 60 * 60_000);
+});
+
+test("/start stamps a lease on EVERY url it issues", () => {
+    const start = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    );
+    // Three: the new row, the re-armed park, and the resumed STAGING upload.
+    // A URL handed out without a lease is one the sweeper cannot see coming.
+    assert.equal(
+        (start.match(/uploadUrlExpiresAt: uploadLeaseExpiry\(\)/g) ?? []).length,
+        3,
+        "create, re-arm and resume all stamp the lease",
+    );
+    const signed = (start.match(/await signUpload\(/g) ?? []).length;
+    assert.equal(signed, 3, "and those are all the places a URL is issued");
 });

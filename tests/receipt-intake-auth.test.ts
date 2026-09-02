@@ -235,7 +235,9 @@ test("provenance rules are shared by BOTH upload paths", async () => {
         { ok: false, reason: "sourceRef-namespace-mismatch" });
     assert.deepEqual(decideSource(secret, { source: "web", sourceRef: "web:x" }),
         { ok: false, reason: "invalid-source" });
-    assert.ok(decideSource(secret, { source: "drive", sourceRef: "drive:FILE1" }).ok);
+    // A REAL Drive file id shape. The old rule accepted any tail at all,
+    // including none.
+    assert.ok(decideSource(secret, { source: "drive", sourceRef: "drive:1AbCdEfGhIjKlMnOp_qR" }).ok);
 
     // The inline body cap is well under the stored cap, which is the whole
     // reason the two-step path exists.
@@ -352,10 +354,10 @@ test("a secret may only declare the sources ITS key owns", async () => {
         capability: "archive", allowedSources: new Set(),
     } as any;
 
-    assert.ok(decideSource(ingest, { source: "drive", sourceRef: "drive:F1" }).ok);
+    assert.ok(decideSource(ingest, { source: "drive", sourceRef: "drive:1AbCdEfGhIjKlMnOp_qR" }).ok);
     // The archive key owns no sources, so it can never mint an intake row even
     // if it somehow reached this code.
-    assert.deepEqual(decideSource(archive, { source: "drive", sourceRef: "drive:F1" }),
+    assert.deepEqual(decideSource(archive, { source: "drive", sourceRef: "drive:1AbCdEfGhIjKlMnOp_qR" }),
         { ok: false, reason: "invalid-source" });
 });
 
@@ -467,4 +469,69 @@ test("machine endpoints refuse a Server Action dispatch; portal actions still wo
     } finally {
         env.NODE_ENV = prod;
     }
+});
+
+// ── sourceRef shape, per source (round-13 item 4) ──────────────────────────
+
+test("a sourceRef must carry a real id for its source, not just the prefix", async () => {
+    const { validateSourceRef, decideSource, MAX_SOURCE_REF_BYTES } =
+        await import("../src/lib/receipt-intake/intake-core");
+
+    // THE REGRESSION: `drive:` with an empty tail was a valid, unique,
+    // PERMANENT idempotency key. Every later empty-tail forward collided with
+    // it and was answered "already received", so real receipts were dropped —
+    // and for Drive the tail is also the QuickBooks DocNumber seed.
+    for (const source of ["drive", "email", "chat"]) {
+        assert.deepEqual(
+            validateSourceRef(source, `${source}:`),
+            { ok: false, reason: "invalid-sourceRef" },
+            source,
+        );
+    }
+
+    // Oversized: this value lands in a unique index, in logs, and in
+    // QuickBooks-facing identity.
+    const long = `drive:${"a".repeat(MAX_SOURCE_REF_BYTES)}`;
+    assert.deepEqual(validateSourceRef("drive", long), { ok: false, reason: "sourceRef-too-long" });
+    assert.equal(MAX_SOURCE_REF_BYTES, 512);
+
+    // Shape, per source.
+    assert.deepEqual(validateSourceRef("drive", "drive:1AbCdEfGhIjKlMnOp_qR"), { ok: true });
+    assert.deepEqual(validateSourceRef("drive", "drive:short"), { ok: false, reason: "invalid-sourceRef" });
+    assert.deepEqual(validateSourceRef("drive", "drive:has spaces here"), { ok: false, reason: "invalid-sourceRef" });
+    assert.deepEqual(validateSourceRef("email", "email:CADnq=abc123def/0"), { ok: true });
+    assert.deepEqual(
+        validateSourceRef("email", "email:CADnq=abc123def"),
+        { ok: false, reason: "invalid-sourceRef" },
+        "one message can carry several receipts; the attachment index is part of the identity",
+    );
+    assert.deepEqual(
+        validateSourceRef("chat", "chat:spaces/AAQANF47osY/messages/abc.def"),
+        { ok: true },
+    );
+    assert.deepEqual(
+        validateSourceRef("chat", "chat:spaces/AAQANF47osY/messages/abc.def/attachments/ATT.1"),
+        { ok: true },
+    );
+    assert.deepEqual(
+        validateSourceRef("chat", "chat:AAQANF47osY"),
+        { ok: false, reason: "invalid-sourceRef" },
+        "a bare space id is not a message",
+    );
+
+    // A control character is never part of an id, whatever the source.
+    assert.deepEqual(
+        validateSourceRef("drive", "drive:1AbCdEfGhIjKlMnOp\u0000qR"),
+        { ok: false, reason: "invalid-sourceRef" },
+    );
+
+    // And BOTH entry points get it, because decideSource is where it is applied.
+    const secret = {
+        ok: true, via: "secret", user: null, userVia: null,
+        capability: "ingest", allowedSources: new Set(["drive", "email", "chat"]),
+    } as any;
+    assert.deepEqual(decideSource(secret, { source: "drive", sourceRef: "drive:" }),
+        { ok: false, reason: "invalid-sourceRef" });
+    assert.deepEqual(decideSource(secret, { source: "drive", sourceRef: `drive:${"a".repeat(600)}` }),
+        { ok: false, reason: "sourceRef-too-long" });
 });

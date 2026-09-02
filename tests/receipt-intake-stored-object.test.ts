@@ -27,9 +27,23 @@ const PNG = Buffer.from(
     "base64",
 );
 const give = (r: DocBytesResult) => async () => r;
+/** A metadata size that says "small, and definitely there". */
+const sized = (size: number) => async () => ({ ok: true as const, size });
+const SMALL = sized(1);
+/**
+ * inspectStoredObject reads the size from METADATA before it reads a body, and
+ * its default lookup talks to Supabase. Every case here supplies both stubs, so
+ * a test can never accidentally exercise the real bucket.
+ */
+const inspect = (
+    path: string,
+    mime: string,
+    download: Parameters<typeof inspectStoredObject>[2],
+    size: Parameters<typeof inspectStoredObject>[3] = SMALL,
+) => inspectStoredObject(path, mime, download, size);
 
 test("a real image is accepted, and its metadata comes from the BYTES", async () => {
-    const check = await inspectStoredObject("p.jpg", "application/pdf", give({ ok: true, bytes: PNG }));
+    const check = await inspect("p.jpg", "application/pdf", give({ ok: true, bytes: PNG }));
     assert.ok(check.ok);
     // The declared type said PDF. The bytes say PNG, and the bytes win.
     assert.equal(check.mimeType, "image/png");
@@ -40,16 +54,16 @@ test("a real image is accepted, and its metadata comes from the BYTES", async ()
 test("oversize, empty and unidentifiable objects are REJECTED, not published", async () => {
     // The signed upload URL bypassed every check the server could otherwise
     // make, so these are enforced on the object itself.
-    const big = await inspectStoredObject("p.jpg", "image/jpeg", give({
+    const big = await inspect("p.jpg", "image/jpeg", give({
         ok: true, bytes: Buffer.alloc(MAX_STORED_BYTES + 1, 1),
     }));
     assert.equal(big.ok, false);
     assert.match((big as { reason: string }).reason, /^file-too-large:/);
 
-    const empty = await inspectStoredObject("p.jpg", "image/jpeg", give({ ok: true, bytes: Buffer.alloc(0) }));
+    const empty = await inspect("p.jpg", "image/jpeg", give({ ok: true, bytes: Buffer.alloc(0) }));
     assert.equal((empty as { reason: string }).reason, "empty-file");
 
-    const exe = await inspectStoredObject("p.exe", "image/jpeg", give({ ok: true, bytes: Buffer.from("MZ\x90\x00") }));
+    const exe = await inspect("p.exe", "image/jpeg", give({ ok: true, bytes: Buffer.from("MZ\x90\x00") }));
     assert.equal((exe as { reason: string }).reason, "unsupported-file-type");
 });
 
@@ -58,36 +72,56 @@ test("an oversize object is rejected from METADATA, with no body read at all", a
     // here sees the object is now. Downloading it to discover it is 400 MB is
     // how one upload takes the whole invocation — and its memory — with it.
     let downloads = 0;
-    const check = await inspectStoredObject(
+    const check = await inspect(
         "p.bin",
         "image/jpeg",
         async () => { downloads++; throw new Error("the body must never be fetched"); },
-        async () => MAX_STORED_BYTES + 1,
+        sized(MAX_STORED_BYTES + 1),
     );
     assert.equal(check.ok, false);
     assert.equal((check as { reason: string }).reason, `file-too-large:${MAX_STORED_BYTES + 1}`);
     assert.equal(downloads, 0, "not one byte was read");
 });
 
-test("an UNKNOWN metadata size still downloads, and the bytes decide", async () => {
-    // A null size is "storage did not say", not "fine". The byte-length check
-    // below it is what actually enforces the limit.
-    const check = await inspectStoredObject(
+test("an UNKNOWN metadata size is TRANSIENT, and still reads no body", async () => {
+    // "Storage did not say" used to mean "carry on and let the byte-length
+    // check catch it" — which is the download this call exists to avoid, taken
+    // on exactly the objects we know least about. Both callers retry a
+    // transient answer; neither is harmed by waiting, and both are harmed by a
+    // 400 MB read.
+    let downloads = 0;
+    const check = await inspect(
         "p.png",
         "image/png",
-        give({ ok: true, bytes: PNG }),
-        async () => null,
+        async () => { downloads++; throw new Error("the body must never be fetched"); },
+        async () => ({ ok: false as const, kind: "transient" as const, message: "size-unavailable" }),
     );
-    assert.ok(check.ok);
+    assert.equal(check.ok, false);
+    assert.equal((check as { kind: string }).kind, "transient");
+    assert.equal(downloads, 0, "not one byte was read");
+});
+
+test("a size lookup that says MISSING is missing, and reads no body either", async () => {
+    // An empty listing is an answer. Downloading to rediscover a 404 is a
+    // round trip that can only produce the same verdict.
+    let downloads = 0;
+    const check = await inspect(
+        "p.png",
+        "image/png",
+        async () => { downloads++; throw new Error("the body must never be fetched"); },
+        async () => ({ ok: false as const, kind: "missing" as const }),
+    );
+    assert.equal((check as { kind: string }).kind, "missing");
+    assert.equal(downloads, 0);
 });
 
 test("a metadata size AT the ceiling is not rejected before the download", async () => {
     let downloads = 0;
-    const check = await inspectStoredObject(
+    const check = await inspect(
         "p.png",
         "image/png",
         async () => { downloads++; return { ok: true as const, bytes: PNG }; },
-        async () => MAX_STORED_BYTES,
+        sized(MAX_STORED_BYTES),
     );
     assert.ok(check.ok);
     assert.equal(downloads, 1);
@@ -96,17 +130,17 @@ test("a metadata size AT the ceiling is not rejected before the download", async
 test("exactly at the ceiling is allowed", async () => {
     const atLimit = Buffer.concat([PNG, Buffer.alloc(MAX_STORED_BYTES - PNG.length, 0)]);
     assert.equal(atLimit.length, MAX_STORED_BYTES);
-    const check = await inspectStoredObject("p.png", "image/png", give({ ok: true, bytes: atLimit }));
+    const check = await inspect("p.png", "image/png", give({ ok: true, bytes: atLimit }));
     assert.ok(check.ok, "the boundary itself is not oversize");
 });
 
 test("missing and transient are DIFFERENT answers", async () => {
     // A confirmed 404 is terminal for the sweep; a storage blip must come back
     // next pass rather than park a good receipt as file-missing.
-    const missing = await inspectStoredObject("p.jpg", "image/jpeg", give({ ok: false, kind: "not-found" }));
+    const missing = await inspect("p.jpg", "image/jpeg", give({ ok: false, kind: "not-found" }));
     assert.deepEqual(missing, { ok: false, kind: "missing" });
 
-    const flaky = await inspectStoredObject("p.jpg", "image/jpeg", give({
+    const flaky = await inspect("p.jpg", "image/jpeg", give({
         ok: false, kind: "transient", message: "ECONNRESET",
     }));
     assert.deepEqual(flaky, { ok: false, kind: "transient", message: "ECONNRESET" });
@@ -163,7 +197,7 @@ test("a legacy row with no recorded sha is passed through, not refused", async (
 test("the validator hands back the exact bytes it verified", async () => {
     // The sealer copies THESE bytes rather than re-downloading, so the sealed
     // object is provably the content that passed validation.
-    const check = await inspectStoredObject("p.png", "image/png", give({ ok: true, bytes: PNG }));
+    const check = await inspect("p.png", "image/png", give({ ok: true, bytes: PNG }));
     assert.ok(check.ok);
     assert.ok(check.bytes.equals(PNG));
     assert.equal(createHash("sha256").update(check.bytes).digest("hex"), check.fileSha256);
@@ -232,7 +266,7 @@ test("text/plain is no longer accepted at all", async () => {
     // QuickBooks cannot attach a .txt, so accepting one meant reading it and
     // then stranding it unbookable — worse than refusing at the door.
     const txt = Buffer.from("VENDOR: Lowes\nTOTAL: 10.00");
-    const check = await inspectStoredObject("p.txt", "text/plain", give({ ok: true, bytes: txt }));
+    const check = await inspect("p.txt", "text/plain", give({ ok: true, bytes: txt }));
     assert.equal(check.ok, false);
     assert.equal((check as { reason: string }).reason, "unsupported-file-type");
 });
@@ -250,13 +284,16 @@ test("the sweeper's two parks are the ones /finalize recovers from", () => {
     const sweeper = readFileSync(
         path.join(root, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8",
     );
-    // Both the missing-object and the sha-mismatch branches wait for expiry.
+    // Both the missing-object and the sha-mismatch branches wait for the
+    // UPLOAD LEASE to expire — the promise /start actually made, not the row's
+    // age, which is older than the lease on any re-issued URL.
     const shaBranch = sweeper.slice(sweeper.indexOf('row.expectedSha256 !== check.fileSha256'));
     assert.match(
         shaBranch.slice(0, shaBranch.indexOf("parked++")),
-        /SIGNED_UPLOAD_TTL_MS/,
-        "a sha mismatch waits for the upload URL to expire",
+        /if \(leaseLive\) \{ leaseActive\+\+; continue; \}/,
+        "a sha mismatch waits for the upload lease to expire",
     );
+    assert.match(sweeper, /const leaseLive = uploadLeaseActive\(row\);/);
 
     const finalize = readFileSync(
         path.join(root, "src/app/api/receipts/intake/[id]/finalize/route.ts"), "utf8",

@@ -18,7 +18,7 @@
  * (tests/receipt-intake-book.test.ts). No module mocking — CI is Node 20.
  */
 import { matchCostCode } from "@/lib/project-match";
-import { toSecureRef } from "@/lib/secure-storage";
+import { receiptObjectRef } from "./bucket";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -172,10 +172,16 @@ export interface BookDependencies {
     /**
      * CAS on {id, state: BOOKING, claimToken} that persists sendAttempted.
      *
-     * This is the LAST FENCE before QuickBooks. It returns false when the row
-     * has been re-claimed, and the booking then aborts having sent nothing —
-     * which is the point: a zombie worker resuming with a stale view must not
+     * This is the LAST FENCE before QuickBooks, and the ONLY state check that
+     * matters at this point: it returns false when the row has been re-claimed
+     * or has moved on, and the booking then aborts having sent nothing — which
+     * is the point, because a zombie worker resuming with a stale view must not
      * create a Purchase the live worker is about to create as well.
+     *
+     * Called from BOTH QBO-core hooks: immediately before the create, and when
+     * the idempotency query finds a Purchase already there. The second is not
+     * a send, but it is the same fact about the row (QuickBooks holds a
+     * Purchase for it), written under the same fence.
      */
     markSendAttempted: (rowId: string, claimToken: string | null) => Promise<boolean>;
     /** The company's configured zone — Expense.date is a business calendar day. */
@@ -594,7 +600,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     const driveFileId = driveFileIdOf(row);
     const receiptUrl = driveFileId
         ? `https://drive.google.com/file/d/${driveFileId}/view`
-        : toSecureRef(row.storagePath);
+        : receiptObjectRef(row.storagePath);
     const docRef = isCheck
         ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
         : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");

@@ -7,7 +7,7 @@
  * outside the worker should read from it.
  */
 import { prisma } from "@/lib/prisma";
-import { resolveDocUrl, toSecureRef } from "@/lib/secure-storage";
+import { signReceiptDownloadUrl } from "./bucket";
 
 export const RECEIPT_INTAKE_LIST_SELECT = {
     id: true,
@@ -138,7 +138,7 @@ export async function listReceiptIntakes(args: ListReceiptIntakesArgs) {
 export async function withArchiveDownloadUrls<T extends { storagePath: string; project?: { name: string } | null }>(
     rows: T[],
     /** Injectable so the contract is testable without Supabase. */
-    sign: (ref: string, ttlSeconds: number) => Promise<string | null> = resolveDocUrl,
+    sign: (storagePath: string, ttlSeconds: number) => Promise<string | null> = signReceiptDownloadUrl,
 ): Promise<Array<Omit<T, "project"> & { projectName: string | null; downloadUrl: string | null }>> {
     return Promise.all(
         rows.map(async row => {
@@ -146,7 +146,7 @@ export async function withArchiveDownloadUrls<T extends { storagePath: string; p
             return {
                 ...(rest as Omit<T, "project">),
                 projectName: project?.name ?? null,
-                downloadUrl: await sign(toSecureRef(row.storagePath), ARCHIVE_SIGNED_URL_TTL_SECONDS),
+                downloadUrl: await sign(row.storagePath, ARCHIVE_SIGNED_URL_TTL_SECONDS),
             };
         }),
     );

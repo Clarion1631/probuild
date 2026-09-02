@@ -245,7 +245,7 @@ test("a non-drive row books under its intake id and stores the secure ref", asyn
     const r = recorder();
     await bookReceipt(row({ source: "mobile", sourceRef: "mobile:abc", id: "intake-9" }), r.deps);
     assert.equal(r.purchaseCalls[0].fileId, "intake-9");
-    assert.equal(r.expenses[0].receiptUrl, "secure:receipts/intake/intake-1.jpg");
+    assert.equal(r.expenses[0].receiptUrl, "receipt-intake:receipts/intake/intake-1.jpg");
 });
 
 test("a project with no estimate is terminal, spends NO attempt, and RELEASES the strong key", async () => {

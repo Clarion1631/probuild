@@ -13,12 +13,8 @@
  * straight to Supabase, so nothing it declared about the file is evidence.
  */
 import { createHash } from "node:crypto";
-import {
-    downloadDocBytesResult,
-    secureObjectSize,
-    toSecureRef,
-    type DocBytesResult,
-} from "@/lib/secure-storage";
+import type { DocBytesResult } from "@/lib/secure-storage";
+import { downloadReceiptObject, receiptObjectSize, type SizeResult } from "./bucket";
 import { EXT_BY_MIME, sniffMime } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
 
@@ -102,9 +98,9 @@ export async function sealAndPublish(
 export async function downloadVerified(
     storagePath: string,
     expectedSha256: string,
-    download: (ref: string) => Promise<DocBytesResult> = downloadDocBytesResult,
+    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
 ): Promise<VerifiedBytes> {
-    const result = await download(toSecureRef(storagePath));
+    const result = await download(storagePath);
     if (!result.ok) {
         return result.kind === "not-found"
             ? { ok: false, kind: "missing" }
@@ -144,9 +140,9 @@ export async function inspectStoredObject(
      * format that CAN be identified is identified from the bytes.
      */
     declaredMime: string,
-    download: (ref: string) => Promise<DocBytesResult> = downloadDocBytesResult,
+    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
     /** Metadata-only size lookup; injected so the "no body read" test is provable. */
-    sizeOf: (storagePath: string) => Promise<number | null> = secureObjectSize,
+    sizeOf: (storagePath: string) => Promise<SizeResult> = receiptObjectSize,
 ): Promise<StoredObjectCheck> {
     // SIZE FIRST, FROM METADATA — before a single byte is read.
     //
@@ -155,14 +151,23 @@ export async function inspectStoredObject(
     // takes the worker's whole invocation (and its memory) with it. `list`
     // returns the metadata row in one small request whatever the object's size.
     //
-    // A null size is "unknown", not "fine": the download below still enforces
-    // the limit on the bytes it actually got.
-    const declaredSize = await sizeOf(storagePath);
-    if (declaredSize !== null && declaredSize > MAX_STORED_BYTES) {
-        return { ok: false, kind: "rejected", reason: `file-too-large:${declaredSize}` };
+    // AN UNKNOWN SIZE IS TRANSIENT, not permission to proceed. It used to mean
+    // "carry on and let the byte-length check catch it" — which is the download
+    // this call exists to avoid, taken on exactly the objects we know least
+    // about (a storage hiccup, a missing client, an API with no metadata). The
+    // sweep and the client both retry a transient answer; neither can be hurt
+    // by waiting, and both can be hurt by a 400 MB read.
+    const declared = await sizeOf(storagePath);
+    if (!declared.ok) {
+        return declared.kind === "missing"
+            ? { ok: false, kind: "missing" }
+            : { ok: false, kind: "transient", message: declared.message ?? "size-unavailable" };
+    }
+    if (declared.size > MAX_STORED_BYTES) {
+        return { ok: false, kind: "rejected", reason: `file-too-large:${declared.size}` };
     }
 
-    const result = await download(toSecureRef(storagePath));
+    const result = await download(storagePath);
     if (!result.ok) {
         return result.kind === "not-found"
             ? { ok: false, kind: "missing" }

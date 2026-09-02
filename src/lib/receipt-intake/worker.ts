@@ -74,6 +74,31 @@ export const STAGING_SWEEP_BATCH = 10;
  * own upload link was still usable.
  */
 export const SIGNED_UPLOAD_TTL_MS = 2 * 60 * 60_000;
+
+/** When a URL issued now stops working. Written to the row by /intake/start. */
+export function uploadLeaseExpiry(now: Date = new Date()): Date {
+    return new Date(now.getTime() + SIGNED_UPLOAD_TTL_MS);
+}
+
+/**
+ * Could the object still arrive under a live upload URL?
+ *
+ * ROW AGE IS THE WRONG QUESTION. A row whose URL was re-issued (a resumed
+ * /start, or a re-arm after the sweeper parked it) is older than its lease, and
+ * judging it on createdAt declared a receipt missing — or destroyed one it
+ * called unacceptable — while the client's own upload link was still live and
+ * about to land. `uploadUrlExpiresAt` is what /start actually promised.
+ *
+ * Null means no signed URL was ever issued for this row (the single-shot path
+ * writes its bytes through the server), so the row's own age is all there is.
+ */
+export function uploadLeaseActive(
+    row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
+    now: Date = new Date(),
+): boolean {
+    if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt.getTime() > now.getTime();
+    return row.createdAt.getTime() > now.getTime() - SIGNED_UPLOAD_TTL_MS;
+}
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
  * from v3.4: an outage that never ends still has to end somewhere, and 20

@@ -99,7 +99,12 @@ model ReceiptIntake {
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
 
   // file (Supabase secure-docs, private)
-  storagePath String  // receipts/intake/<id>.<ext> in SECURE_BUCKET
+  storagePath String  // receipts/intake/<id>.<ext> in the `receipt-intake` bucket
+  // When the signed upload URL /intake/start last issued stops working. The
+  // sweeper uses THIS, not createdAt: a row whose URL was re-issued is older
+  // than its lease, and judging it on row age parked receipts whose own upload
+  // link was still live. Null on rows that never had a signed URL.
+  uploadUrlExpiresAt DateTime?
   fileName    String?
   mimeType    String
   fileSize    Int
@@ -158,6 +163,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
   "suggestedConfidence" DOUBLE PRECISION, "createdById" TEXT,
   "storagePath" TEXT NOT NULL, "fileName" TEXT, "mimeType" TEXT NOT NULL,
   "fileSize" INTEGER NOT NULL, "fileSha256" TEXT NOT NULL,
+  "expectedSha256" TEXT, "uploadUrlExpiresAt" TIMESTAMP(3),
   "vendor" TEXT, "txnDate" DATE, "totalCents" INTEGER, "taxCents" INTEGER,
   "docType" TEXT, "refNumber" TEXT, "memo" TEXT, "readJson" TEXT, "readAt" TIMESTAMP(3),
   "dedupStrongKey" TEXT, "dedupWeakKey" TEXT, "duplicateOfId" TEXT,
@@ -184,7 +190,24 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 --   expenseId  -> "Expense"(id)  ON DELETE SET NULL
 ```
 
-Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2).
+Run the apply script against prod BEFORE merging (CLAUDE.md pre-deploy rule #2):
+
+```bash
+SUPABASE_URL=... SUPABASE_SERVICE_KEY=...   node scripts/apply-receipt-intake.mjs --yes --expect-db postgres --expect-host <host>
+```
+
+It does BOTH halves of the rollout and verifies each:
+
+1. **Schema** — additive, idempotent DDL, then a shape check (every column, the CHECK
+   constraint, the FKs, and the partial unique index verified by its DEFINITION, not its
+   name).
+2. **Storage** — creates the private `receipt-intake` bucket, or verifies the existing one.
+   It exits nonzero on a different file-size limit, a different MIME allow-list, or a public
+   bucket, and never rewrites one.
+
+Both halves are safe to re-run. The bucket step needs `SUPABASE_URL` and
+`SUPABASE_SERVICE_KEY`; without them the script refuses rather than skipping it, because a
+missing bucket policy is invisible until a 400 MB object is already stored.
 
 ## 3. Endpoint contracts
 
@@ -473,15 +496,35 @@ URL bypasses this server entirely, so application code cannot stop the write —
 refuse the object afterwards, by which time the bytes are already paid for and sitting in
 the bucket. Set it where the write happens:
 
-> Supabase dashboard → Storage → the private receipts bucket (`SECURE_BUCKET`) → Settings →
-> **file size limit = 15 MB**. Supabase rejects a larger upload at the storage API with a
-> 413, before any object is created.
+> `node scripts/apply-receipt-intake.mjs --yes --expect-db … --expect-host …`, with
+> `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in the environment. It creates the bucket when
+> missing and VERIFIES it when present, and exits **nonzero** if it exists with a different
+> file-size limit, a different MIME allow-list, or as a public bucket. It never silently
+> "corrects" one: overwriting a limit somebody set deliberately is how a 400 MB upload
+> becomes possible again next quarter.
+
+Receipts live in their **own** bucket, `receipt-intake` — not `secure-docs`:
+
+* Those limits are **per bucket**, so `secure-docs` cannot carry a receipt policy without
+  imposing it on contracts, e-signatures and invoice PDFs.
+* A signed upload URL is a **write capability**. Issuing one against the bucket that also
+  holds countersigned contracts means a path-handling bug in intake is a write into the
+  contract store.
+* The orphan sweep **deletes** objects, unattended, from paths read out of an event log. It
+  must not be able to reach anything but receipts.
+
+All intake reads and writes go through `src/lib/receipt-intake/bucket.ts`, which is the one
+place that names the bucket.
 
 The server-side check stays regardless, and is checked in this order:
 1. **Object metadata first** (`list({ search })` → `metadata.size`) — one small request that
    costs the same whatever the object weighs. Oversize is rejected here, with no body read.
-2. **Then the downloaded byte length**, because a null metadata size means "storage did not
-   say", not "fine".
+2. **Then the downloaded byte length**, as a second line for anything the metadata missed.
+
+An **unknown** size is `transient`, not permission to proceed: a storage hiccup, a missing
+client or an API without metadata all used to fall through to the download — which is the
+read this check exists to avoid, taken on exactly the objects we know least about. Both
+callers retry a transient answer.
 
 **`text/plain` is refused with a 415.** QuickBooks cannot attach a `.txt`, so accepting one
 meant reading it with Gemini and then stranding it unbookable at

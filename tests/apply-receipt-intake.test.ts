@@ -15,7 +15,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { RECEIPT_INTAKE_STATES, statements, targetMatches } from "../scripts/apply-receipt-intake.mjs";
+import {
+    RECEIPT_BUCKET,
+    RECEIPT_BUCKET_FILE_SIZE_LIMIT,
+    RECEIPT_BUCKET_MIME_TYPES,
+    RECEIPT_INTAKE_STATES,
+    ensureReceiptBucket,
+    parseSizeLimit,
+    statements,
+    targetMatches,
+} from "../scripts/apply-receipt-intake.mjs";
 import { RECEIPT_INTAKE_STATES as RUNTIME_STATES } from "../src/lib/receipt-intake/route-state";
 
 const migrationSql = readFileSync(
@@ -247,4 +256,99 @@ test("verification asserts the CHECK ALLOWS every state, not just that it exists
     const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-intake.mjs"), "utf8");
     assert.match(source, /pg_get_constraintdef\(oid\) AS def FROM pg_constraint/, "verify reads the definition");
     assert.match(source, /does not allow/, "and fails loudly naming what is missing");
+});
+
+// ── The receipts bucket is provisioned, not assumed (round-13 item 3) ───────
+
+test("the bucket policy in the script matches the one the code writes through", async () => {
+    // Two places name the same limits: the provisioner and the runtime module.
+    // If they drift, the runtime happily writes objects the bucket refuses (or,
+    // worse, accepts objects the runtime thinks are impossible).
+    const { RECEIPT_BUCKET_POLICY } = await import("../src/lib/receipt-intake/bucket");
+    assert.equal(RECEIPT_BUCKET, RECEIPT_BUCKET_POLICY.name);
+    assert.equal(RECEIPT_BUCKET_FILE_SIZE_LIMIT, RECEIPT_BUCKET_POLICY.fileSizeLimit);
+    assert.deepEqual(
+        [...RECEIPT_BUCKET_MIME_TYPES].sort(),
+        [...RECEIPT_BUCKET_POLICY.allowedMimeTypes].sort(),
+        "the accepted formats and the bucket's allow-list are the same list",
+    );
+    assert.equal(RECEIPT_BUCKET_POLICY.public, false);
+    assert.equal(RECEIPT_BUCKET_FILE_SIZE_LIMIT, 15 * 1024 * 1024);
+});
+
+test("a missing bucket is CREATED private, with both limits", async () => {
+    const calls: Array<{ path: string; method: string; body: any }> = [];
+    const outcome = await ensureReceiptBucket("https://x.supabase.co", "key", async (_u: string, _k: string, path: string, init: any = {}) => {
+        calls.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+        if (init.method === "GET") return { status: 404, ok: false, body: { error: "not found" } };
+        return { status: 200, ok: true, body: { name: RECEIPT_BUCKET } };
+    });
+    assert.equal(outcome, "created");
+    assert.equal(calls[0].method, "GET", "it looks before it creates");
+    assert.equal(calls[1].body.public, false);
+    assert.equal(calls[1].body.file_size_limit, RECEIPT_BUCKET_FILE_SIZE_LIMIT);
+    assert.deepEqual(calls[1].body.allowed_mime_types, RECEIPT_BUCKET_MIME_TYPES);
+});
+
+test("an existing bucket with the right policy is VERIFIED, and nothing is written", async () => {
+    let writes = 0;
+    const outcome = await ensureReceiptBucket("https://x.supabase.co", "key", async (_u: string, _k: string, _p: string, init: any = {}) => {
+        if (init.method !== "GET") { writes++; return { status: 200, ok: true, body: {} }; }
+        return {
+            status: 200, ok: true,
+            body: {
+                name: RECEIPT_BUCKET, public: false,
+                file_size_limit: RECEIPT_BUCKET_FILE_SIZE_LIMIT,
+                allowed_mime_types: RECEIPT_BUCKET_MIME_TYPES,
+            },
+        };
+    });
+    assert.equal(outcome, "verified");
+    assert.equal(writes, 0, "re-running provisions nothing");
+});
+
+test("a DIFFERENT limit is a hard failure, never a silent correction", async () => {
+    // Overwriting a limit somebody set deliberately is how a 400 MB upload
+    // becomes possible again next quarter. The operator has to see it.
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+        [{ file_size_limit: 50 * 1024 * 1024 }, /file_size_limit/],
+        [{ file_size_limit: "50MB" }, /file_size_limit/],
+        [{ public: true }, /PUBLIC/],
+        [{ allowed_mime_types: null }, /allowed_mime_types is unset/],
+        [{ allowed_mime_types: ["image/png"] }, /missing/],
+        [{ allowed_mime_types: [...RECEIPT_BUCKET_MIME_TYPES, "application/zip"] }, /unexpected/],
+    ];
+    for (const [override, expected] of cases) {
+        const body = {
+            name: RECEIPT_BUCKET, public: false,
+            file_size_limit: RECEIPT_BUCKET_FILE_SIZE_LIMIT,
+            allowed_mime_types: RECEIPT_BUCKET_MIME_TYPES,
+            ...override,
+        };
+        await assert.rejects(
+            () => ensureReceiptBucket("https://x.supabase.co", "key", async () => ({ status: 200, ok: true, body })),
+            expected,
+            JSON.stringify(override),
+        );
+    }
+});
+
+test("Supabase's file_size_limit is read in either shape", () => {
+    // It comes back as a byte count from some API versions and as "15MB" from
+    // others; reading only one of those would fail a correct bucket.
+    assert.equal(parseSizeLimit(15728640), 15728640);
+    assert.equal(parseSizeLimit("15728640"), 15728640);
+    assert.equal(parseSizeLimit("15MB"), 15728640);
+    assert.equal(parseSizeLimit("15 mb"), 15728640);
+    assert.equal(parseSizeLimit(null), null);
+    assert.equal(parseSizeLimit("enormous"), null);
+});
+
+test("a storage read failure stops the run rather than assuming the bucket is fine", async () => {
+    await assert.rejects(
+        () => ensureReceiptBucket("https://x.supabase.co", "key", async () => ({
+            status: 500, ok: false, body: { error: "boom" },
+        })),
+        /could not read bucket/,
+    );
 });

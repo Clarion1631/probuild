@@ -14,8 +14,7 @@
  */
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
-import { SECURE_BUCKET, removeSecureDocStrict, toSecureRef } from "@/lib/secure-storage";
-import { getSupabase } from "@/lib/supabase";
+import { removeReceiptObject, uploadReceiptObject } from "./bucket";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
@@ -37,22 +36,10 @@ export async function sealObject(
     bytes: Buffer,
     contentType: string,
 ): Promise<string | null> {
-    const supabase = getSupabase();
-    if (!supabase) return null;
-    try {
-        // upsert: the canonical path is content-addressed, so a re-seal of the
-        // SAME bytes is a no-op by construction and must not fail.
-        const { error } = await supabase.storage
-            .from(SECURE_BUCKET)
-            .upload(canonicalPath, bytes, { contentType, upsert: true });
-        if (error) {
-            console.error("[receipts/intake] seal failed", error.message);
-            return null;
-        }
-    } catch (error) {
-        console.error("[receipts/intake] seal threw", error instanceof Error ? error.name : "error");
-        return null;
-    }
+    // upsert: the canonical path is content-addressed, so a re-seal of the
+    // SAME bytes is a no-op by construction and must not fail.
+    const copied = await uploadReceiptObject(canonicalPath, bytes, contentType, { upsert: true });
+    if (!copied) return null;
 
     // NOTE: the upload object is deliberately NOT deleted here.
     //
@@ -201,7 +188,7 @@ class RejectFenceLost extends Error {
  */
 export async function settleQueuedCleanup(eventId: string, storagePath: string): Promise<boolean> {
     try {
-        await removeSecureDocStrict(toSecureRef(storagePath));
+        await removeReceiptObject(storagePath);
     } catch (error) {
         console.error(
             "[receipts/intake] queued delete failed, left pending",
@@ -224,7 +211,7 @@ export async function settleQueuedCleanup(eventId: string, storagePath: string):
  */
 export async function deleteObjectOrRecord(storagePath: string, reason: string): Promise<boolean> {
     try {
-        await removeSecureDocStrict(toSecureRef(storagePath));
+        await removeReceiptObject(storagePath);
         return true;
     } catch (error) {
         console.error("[receipts/intake] object delete failed", storagePath, error instanceof Error ? error.name : "error");
@@ -288,12 +275,12 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
         }
 
         try {
-            await removeSecureDocStrict(toSecureRef(storagePath));
+            await removeReceiptObject(storagePath);
         } catch {
             // Still failing. Leave it pending for the next pass.
             continue;
         }
-        // Resolved ONLY after a delete that did not throw — removeSecureDoc
+        // Resolved ONLY after a delete that did not throw — removeReceiptObject
         // surfaces a missing storage client as an error rather than a success,
         // so a misconfigured deployment cannot quietly mark the queue clean.
         await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });

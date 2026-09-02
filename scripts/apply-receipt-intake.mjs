@@ -98,6 +98,7 @@ export const statements = [
        "fileSize"            INTEGER NOT NULL,
        "fileSha256"          TEXT NOT NULL,
        "expectedSha256"      TEXT,
+       "uploadUrlExpiresAt"  TIMESTAMP(3),
        "vendor"              TEXT,
        "txnDate"             DATE,
        "totalCents"          INTEGER,
@@ -133,6 +134,7 @@ export const statements = [
     // it. This is the whole reason the script is re-runnable.
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "uploadUrlExpiresAt" TIMESTAMP(3)`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
@@ -270,7 +272,8 @@ const expectedColumns = {
         "id", "source", "sourceRef", "state", "dryRun", "stateReason",
         "projectId", "costCodeId", "suggestedCostCodeId", "suggestedConfidence",
         "createdById", "storagePath", "fileName", "mimeType", "fileSize",
-        "fileSha256", "expectedSha256", "sendAttempted", "archivedByV1",
+        "fileSha256", "expectedSha256", "uploadUrlExpiresAt",
+        "sendAttempted", "archivedByV1",
         "vendor", "txnDate", "totalCents", "taxCents", "docType",
         "refNumber", "memo", "readJson", "readAt", "dedupStrongKey",
         "dedupWeakKey", "duplicateOfId", "qbPurchaseId", "expenseId",
@@ -303,6 +306,136 @@ const expectedPartialIndexes = [{
         /WHERE \(\("dedupStrongKey" IS NOT NULL\) AND \(state <> ALL \(ARRAY\['DUPLICATE'::text, 'VOID'::text\]\)\)\)/,
     ],
 }];
+
+
+// ── The receipts bucket ────────────────────────────────────────────────────
+//
+// Provisioned HERE rather than by hand in the dashboard, because two of its
+// settings are load-bearing and invisible from the application:
+//
+//   * fileSizeLimit — the two-step upload goes straight to a signed URL that
+//     never passes through the server, so the BUCKET is the only place a 400 MB
+//     write can actually be refused. Application code can only reject the
+//     object afterwards, once the bytes are already stored and paid for.
+//   * allowedMimeTypes — same reason, for a format QuickBooks cannot attach.
+//
+// It is its own bucket, not `secure-docs`: those limits are per-bucket and
+// cannot be imposed on contracts and invoice PDFs, and a signed upload URL is a
+// write capability that must not point anywhere near the contract store.
+//
+// Idempotent: create if missing, otherwise VERIFY. A bucket that exists with
+// the wrong limit is a hard failure — silently "fixing" a limit somebody set
+// deliberately is how a 400 MB upload becomes possible again next quarter.
+export const RECEIPT_BUCKET = "receipt-intake";
+export const RECEIPT_BUCKET_FILE_SIZE_LIMIT = 15 * 1024 * 1024;
+// EXACTLY the list src/lib/receipt-intake/file-type.ts accepts (asserted by
+// tests/apply-receipt-intake.test.ts). A bucket that allows more than the code
+// does lets an unreadable file be stored; one that allows less rejects uploads
+// the code promised were fine, at a signed URL where the caller sees only a
+// storage error.
+export const RECEIPT_BUCKET_MIME_TYPES = [
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/heic",
+    "image/heif",
+    "image/webp",
+    "image/gif",
+];
+
+/** Normalizes Supabase's file_size_limit, which comes back as bytes or "15MB". */
+export function parseSizeLimit(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === "number") return value;
+    const text = String(value).trim();
+    if (/^\d+$/.test(text)) return Number(text);
+    const match = text.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)$/i);
+    if (!match) return null;
+    const scale = { b: 1, kb: 1024, mb: 1024 * 1024, gb: 1024 * 1024 * 1024 }[match[2].toLowerCase()];
+    return Math.round(Number(match[1]) * scale);
+}
+
+async function storageRequest(baseUrl, key, path, init = {}) {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/storage/v1${path}`, {
+        ...init,
+        headers: {
+            authorization: `Bearer ${key}`,
+            apikey: key,
+            "content-type": "application/json",
+            ...(init.headers ?? {}),
+        },
+    });
+    const text = await res.text();
+    let body = null;
+    try {
+        body = text ? JSON.parse(text) : null;
+    } catch {
+        body = { raw: text.slice(0, 200) };
+    }
+    return { status: res.status, ok: res.ok, body };
+}
+
+/**
+ * Create or verify the bucket. Returns "created" | "verified"; THROWS when it
+ * exists with a different policy, because that is a fact the operator has to
+ * see rather than a state to overwrite.
+ */
+export async function ensureReceiptBucket(baseUrl, key, request = storageRequest) {
+    const existing = await request(baseUrl, key, `/bucket/${RECEIPT_BUCKET}`, { method: "GET" });
+
+    if (existing.status === 404) {
+        const created = await request(baseUrl, key, "/bucket", {
+            method: "POST",
+            body: JSON.stringify({
+                id: RECEIPT_BUCKET,
+                name: RECEIPT_BUCKET,
+                public: false,
+                file_size_limit: RECEIPT_BUCKET_FILE_SIZE_LIMIT,
+                allowed_mime_types: RECEIPT_BUCKET_MIME_TYPES,
+            }),
+        });
+        if (!created.ok) {
+            throw new Error(`could not create bucket ${RECEIPT_BUCKET}: ${created.status} ${JSON.stringify(created.body)}`);
+        }
+        return "created";
+    }
+    if (!existing.ok) {
+        throw new Error(`could not read bucket ${RECEIPT_BUCKET}: ${existing.status} ${JSON.stringify(existing.body)}`);
+    }
+
+    const bucket = existing.body ?? {};
+    const problems = [];
+    if (bucket.public === true) problems.push("bucket is PUBLIC; receipts must be private");
+    const limit = parseSizeLimit(bucket.file_size_limit);
+    if (limit !== RECEIPT_BUCKET_FILE_SIZE_LIMIT) {
+        problems.push(`file_size_limit is ${bucket.file_size_limit} (${limit} bytes), expected ${RECEIPT_BUCKET_FILE_SIZE_LIMIT}`);
+    }
+    const allowed = bucket.allowed_mime_types ?? null;
+    if (!Array.isArray(allowed)) {
+        problems.push("allowed_mime_types is unset; any file type could be uploaded");
+    } else {
+        const missing = RECEIPT_BUCKET_MIME_TYPES.filter(m => !allowed.includes(m));
+        const extra = allowed.filter(m => !RECEIPT_BUCKET_MIME_TYPES.includes(m));
+        if (missing.length) problems.push(`allowed_mime_types is missing ${missing.join(", ")}`);
+        if (extra.length) problems.push(`allowed_mime_types carries unexpected ${extra.join(", ")}`);
+    }
+    if (problems.length) {
+        throw new Error(`bucket ${RECEIPT_BUCKET} exists with the wrong policy:\n  - ${problems.join("\n  - ")}`);
+    }
+    return "verified";
+}
+
+async function applyBucket() {
+    const baseUrl = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY;
+    if (!baseUrl || !key) {
+        console.error("REFUSING: SUPABASE_URL and SUPABASE_SERVICE_KEY are required to provision the receipts bucket.");
+        console.error("  The bucket carries the 15 MiB and MIME limits that the signed-upload path cannot enforce anywhere else.");
+        process.exit(1);
+    }
+    const outcome = await ensureReceiptBucket(baseUrl, key);
+    console.log(`bucket ${RECEIPT_BUCKET}: ${outcome} (private, ${RECEIPT_BUCKET_FILE_SIZE_LIMIT} bytes, ${RECEIPT_BUCKET_MIME_TYPES.length} mime types)`);
+}
 
 async function main() {
     if (!process.argv.includes("--yes")) {
@@ -396,6 +529,10 @@ async function main() {
             }
             console.log(`verified partial index ${name}: ${row.def}`);
         }
+
+        // The bucket last: a failure here must not leave the table half-made,
+        // and the schema is useless without somewhere to put the bytes anyway.
+        await applyBucket();
 
         console.log("\nReceiptIntake migration applied and verified.");
     } finally {

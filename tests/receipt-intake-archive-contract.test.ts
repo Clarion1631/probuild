@@ -60,7 +60,7 @@ test("each row gets a short-lived signed URL and a flat project name", async () 
     );
 
     assert.equal(rows[0].projectName, "Berg ADU");
-    assert.equal(rows[0].downloadUrl, "https://signed.test/secure:receipts/intake/a.jpg");
+    assert.equal(rows[0].downloadUrl, "https://signed.test/receipts/intake/a.jpg");
     assert.equal(rows[1].projectName, null, "a project-less row is still archivable");
     // The nested relation is flattened away — the script gets `projectName`.
     assert.ok(!("project" in rows[0]));
@@ -69,7 +69,9 @@ test("each row gets a short-lived signed URL and a flat project name", async () 
     // and a URL captured from a log is useless by morning.
     assert.equal(ARCHIVE_SIGNED_URL_TTL_SECONDS, 600);
     assert.deepEqual(signed.map(s => s.ttl), [600, 600]);
-    assert.deepEqual(signed.map(s => s.ref), ["secure:receipts/intake/a.jpg", "secure:receipts/intake/b.pdf"]);
+    // The receipts bucket is named by the signer, so what it is handed is the
+    // PATH — an object in another bucket cannot be reached from here at all.
+    assert.deepEqual(signed.map(s => s.ref), ["receipts/intake/a.jpg", "receipts/intake/b.pdf"]);
 });
 
 test("a row whose URL cannot be signed is returned with null, never dropped", async () => {

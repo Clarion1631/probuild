@@ -3,13 +3,13 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
-import { SECURE_BUCKET } from "@/lib/secure-storage";
-import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
+import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -156,6 +156,10 @@ export async function POST(req: Request) {
                 // never trusted as the stored one — only checked against it.
                 fileSha256: "",
                 expectedSha256,
+                // The promise this response makes: until then the client's URL
+                // works, so nothing may declare the object missing or reject
+                // the row for what is at that path.
+                uploadUrlExpiresAt: uploadLeaseExpiry(),
             },
             select: { id: true, sourceRef: true, state: true },
         });
@@ -208,6 +212,7 @@ export async function POST(req: Request) {
                     data: {
                         storagePath: retryPath,
                         expectedSha256,
+                        uploadUrlExpiresAt: uploadLeaseExpiry(),
                         // The stored hash is what /finalize verifies against.
                         // Whatever was recorded describes bytes that are gone
                         // or were never right.
@@ -275,6 +280,13 @@ export async function POST(req: Request) {
             }
             const resumed = await signUpload(existing.storagePath);
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+            // A RESUMED url is a new lease. Without this the sweeper still
+            // judged the row by its original createdAt and could park (or
+            // reject) it while the URL just handed out was live.
+            await prisma.receiptIntake.updateMany({
+                where: { id: existing.id, state: "STAGING" },
+                data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
+            });
             return NextResponse.json({
                 ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
             });
@@ -301,25 +313,10 @@ export async function POST(req: Request) {
     });
 }
 
-async function signUpload(storagePath: string): Promise<{ uploadUrl: string; token: string; storagePath: string } | null> {
-    const supabase = getSupabase();
-    if (!supabase) return null;
-    try {
-        // upsert: true — a resumed /start for the SAME row must be able to
-        // overwrite a partial or failed upload at the same path. Without it the
-        // second attempt fails on "already exists" and the row can never be
-        // finalized. The sha checks above are what stop this from overwriting a
-        // DIFFERENT document.
-        const { data, error } = await supabase.storage
-            .from(SECURE_BUCKET)
-            .createSignedUploadUrl(storagePath, { upsert: true });
-        if (error || !data) {
-            console.error("[receipts/intake/start] sign failed", error?.message);
-            return null;
-        }
-        return { uploadUrl: data.signedUrl, token: data.token, storagePath };
-    } catch (error) {
-        console.error("[receipts/intake/start] sign threw", error instanceof Error ? error.name : "error");
-        return null;
-    }
-}
+/**
+ * The URL is `upsert: true` (see bucket.ts) so a resumed /start for the SAME
+ * row can replace its own partial upload — without that the second attempt
+ * fails "already exists" and the row can never be finalized. The sha checks
+ * above are what stop it from overwriting a DIFFERENT document.
+ */
+const signUpload = createReceiptUploadUrl;

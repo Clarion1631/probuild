@@ -233,3 +233,67 @@ test("a re-arm that changes the extension does not orphan the old object", () =>
     assert.match(body, /retryPath !== existing\.storagePath/);
     assert.match(body, /deleteObjectOrRecord\(existing\.storagePath, "start-rearmed-repath"\)/);
 });
+
+// ── The sweeper rejects through the same fenced transaction ────────────────
+
+const sweeper = readFileSync(
+    path.join(ROOT, "src/app/api/cron/receipt-intake-worker/route.ts"),
+    "utf8",
+);
+
+test("SWEEPER RACE: a publish that wins mid-sweep leaves the row and the bytes alone", async () => {
+    // The sweep reads a batch, then spends a storage round trip per row
+    // deciding what to do with it. A /finalize arriving in that window can
+    // publish the row and seal its object — and the old unfenced
+    // `deleteMany({ id, state: "STAGING" })` plus a bare object delete would
+    // then destroy a published receipt's row OR its bytes, depending on
+    // timing. The reject transaction is what makes that a no-op.
+    const { db, store } = client([parked()], s => {
+        s.rows = [parked({ state: "RECEIVED", storagePath: "receipts/row-1/sealed.png" })];
+    });
+    let deletedBytes = 0;
+    const dropped = await rejectRowAndQueueCleanup(parked() as never, "unsupported-file-type", db);
+    if (dropped.ok) deletedBytes++; // the caller only touches storage on success
+    assert.equal(dropped.ok, false, "the fence lost");
+    assert.equal(deletedBytes, 0, "so no object was deleted");
+    assert.deepEqual(store.events, [], "and nothing was queued for deletion");
+    assert.equal(store.rows[0].state, "RECEIVED", "the published row is untouched");
+});
+
+test("the sweeper uses the fenced reject, and touches no bytes when it loses", () => {
+    const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
+    const body = fn.slice(0, fn.indexOf("loadPhases:"));
+    assert.match(body, /const dropped = await rejectRowAndQueueCleanup\(/);
+    assert.match(body, /if \(!dropped\.ok\) continue;/);
+    assert.match(body, /settleQueuedCleanup\(dropped\.eventId, row\.storagePath\)/);
+    // The unfenced pair this replaces.
+    assert.ok(
+        !/deleteMany\(\{ where: \{ id: row\.id, state: "STAGING" \} \}\)/.test(body),
+        "no delete-by-id-and-state",
+    );
+    assert.ok(
+        body.indexOf("if (!dropped.ok) continue;") < body.indexOf("settleQueuedCleanup"),
+        "the object is only touched after the row is provably gone",
+    );
+});
+
+test("nothing destructive happens while the upload lease is live", () => {
+    const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
+    const body = fn.slice(0, fn.indexOf("loadPhases:"));
+    // Three destructive outcomes, three lease checks: sha-mismatch park,
+    // file-missing park, and the reject.
+    assert.equal(
+        (body.match(/if \(leaseLive\) \{ leaseActive\+\+; continue; \}/g) ?? []).length,
+        3,
+        "every destructive branch waits for the lease",
+    );
+    // Publishing is NOT gated on it: a complete, correct object is a complete,
+    // correct object whether or not the URL is still live.
+    const publishBranch = body.slice(body.indexOf("if (check.ok) {"), body.indexOf("if (check.kind === \"transient\")"));
+    assert.ok(publishBranch.includes("sealAndPublish"));
+    assert.equal(
+        (publishBranch.match(/if \(leaseLive\)/g) ?? []).length,
+        1,
+        "only the sha-mismatch park inside the ok branch waits",
+    );
+});

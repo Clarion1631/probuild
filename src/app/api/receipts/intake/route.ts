@@ -6,7 +6,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
+import { receiptObjectSize, uploadReceiptObject } from "@/lib/receipt-intake/bucket";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
@@ -337,10 +337,8 @@ export async function POST(req: Request) {
     // then a clean insert rather than a conflict against a half-written row.
     let uploadFailed: string | null = null;
     try {
-        const upload = await supabase.storage
-            .from(SECURE_BUCKET)
-            .upload(storagePath, parsed.bytes, { contentType: mimeType, upsert: false });
-        if (upload.error) uploadFailed = upload.error.message;
+        const stored = await uploadReceiptObject(storagePath, parsed.bytes, mimeType);
+        if (!stored) uploadFailed = "upload-failed";
     } catch (error) {
         uploadFailed = error instanceof Error ? `${error.name}: ${error.message}` : "upload-threw";
     }
@@ -399,21 +397,9 @@ export async function POST(req: Request) {
  * retry finds the STAGING row, confirms the object really is there, and
  * finishes the job.
  */
-/** Upload bytes to the private bucket. Returns false on any failure. */
-async function storeObject(storagePath: string, bytes: Buffer, mimeType: string): Promise<boolean> {
-    const supabase = getSupabase();
-    if (!supabase) return false;
-    try {
-        const { error } = await supabase.storage
-            .from(SECURE_BUCKET)
-            .upload(storagePath, bytes, { contentType: mimeType, upsert: true });
-        if (error) console.error("[receipts/intake] heal upload failed", error.message);
-        return !error;
-    } catch (error) {
-        console.error("[receipts/intake] heal upload threw", error instanceof Error ? error.name : "error");
-        return false;
-    }
-}
+/** Upload bytes to the receipts bucket. Returns false on any failure. */
+const storeObject = (storagePath: string, bytes: Buffer, mimeType: string) =>
+    uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true });
 
 async function publishStagedRow(id: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
@@ -520,7 +506,15 @@ async function respondToSourceRefConflict(
     // and the forwarder could delete its only copy of a receipt we did not
     // have. The state a row happens to be parked in says nothing about whether
     // its bytes exist.
-    if (!(await secureObjectExists(existing.storagePath))) {
+    // Metadata, not a download: this runs on every replay, and the object may
+    // be 15 MB. A TRANSIENT answer is not evidence of absence — healing on it
+    // would overwrite a document that is really there — so it is answered 503
+    // and the forwarder retries with its copy intact.
+    const present = await receiptObjectSize(existing.storagePath);
+    if (!present.ok && present.kind === "transient") {
+        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+    }
+    if (!present.ok) {
         // The caller just handed us the bytes again, so the orphan is fixable:
         // store them and republish. This is the retry HEALING the row rather
         // than merely reporting on it.

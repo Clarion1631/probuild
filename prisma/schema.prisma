@@ -3053,6 +3053,12 @@ model ReceiptIntake {
   /// The two-step flow hands the bytes straight to storage, so this is the only
   /// way to notice that a reused sourceRef is carrying a DIFFERENT document.
   expectedSha256 String?
+  /// When the signed upload URL /intake/start last issued stops working.
+  /// The sweeper uses THIS, not createdAt, to decide whether an object could
+  /// still arrive: a row whose URL was re-issued is younger than its row, and
+  /// parking it on row age declared a receipt missing while its own upload link
+  /// was live. Null on rows that never had a signed URL (the single-shot path).
+  uploadUrlExpiresAt DateTime?
 
   // read results (cents, like AutomationEvent)
   vendor     String?

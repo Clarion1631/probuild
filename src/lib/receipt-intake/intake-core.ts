@@ -63,9 +63,12 @@ export function decideSource(
         if (!auth.allowedSources.has(source)) return { ok: false, reason: "invalid-source" };
         if (!MACHINE_SOURCES.has(source)) return { ok: false, reason: "invalid-source" };
         if (!body.sourceRef) return { ok: false, reason: "missing-sourceRef" };
-        if (!body.sourceRef.startsWith(`${source}:`)) {
-            return { ok: false, reason: "sourceRef-namespace-mismatch" };
-        }
+        // SHAPE, not just namespace. `drive:` with an empty tail used to be a
+        // valid permanent idempotency key that every later empty-tail forward
+        // collided with — and for Drive the tail is also the QuickBooks
+        // DocNumber seed.
+        const shape = validateSourceRef(source, body.sourceRef);
+        if (!shape.ok) return { ok: false, reason: shape.reason };
         return { ok: true, source, sourceRef: body.sourceRef };
     }
 
@@ -83,4 +86,55 @@ export function decideSource(
         return { ok: true, source, sourceRef: `${source}:${auth.user.id}:${body.uploadId.toLowerCase()}` };
     }
     return { ok: true, source, sourceRef: `${source}:${randomUUID()}` };
+}
+
+/**
+ * The longest sourceRef we will store. Long enough for any real Chat resource
+ * name, short enough that it cannot be used as a payload: it lands in a UNIQUE
+ * index, in QuickBooks-facing identity (Drive rows book under this id) and in
+ * every log line about the row.
+ */
+export const MAX_SOURCE_REF_BYTES = 512;
+
+/**
+ * Per-source shape for the part AFTER `<source>:`.
+ *
+ * The namespace prefix alone was the only check, so `drive:` with nothing after
+ * it was a valid, unique, permanent idempotency key — and every subsequent
+ * empty-tail forward collided with it and was answered "already received",
+ * silently dropping real receipts. Worse for Drive specifically: the tail IS
+ * the QuickBooks DocNumber seed, so a junk tail becomes a junk DocNumber and
+ * two junk tails sharing a 21-character prefix collide in the books.
+ *
+ * Each pattern describes the id the forwarder actually holds:
+ *   drive — a Drive file id.
+ *   email — `<messageId>/<attachmentIndex>`: one message can carry several
+ *           receipts, and each attachment is its own document.
+ *   chat  — a Chat message resource name, optionally naming the attachment.
+ */
+export const SOURCE_REF_PATTERNS: Record<string, RegExp> = {
+    drive: /^[A-Za-z0-9_-]{10,128}$/,
+    email: /^[A-Za-z0-9_.+=~-]{1,256}\/\d{1,4}$/,
+    chat: /^spaces\/[A-Za-z0-9_-]{1,128}\/messages\/[A-Za-z0-9_.=-]{1,256}(?:\/attachments\/[A-Za-z0-9_.=-]{1,256})?$/,
+};
+
+export type SourceRefCheck = { ok: true } | { ok: false; reason: string };
+
+/** Shared by the single-shot POST and /start — one shape rule, checked once. */
+export function validateSourceRef(source: string, sourceRef: string): SourceRefCheck {
+    if (Buffer.byteLength(sourceRef, "utf8") > MAX_SOURCE_REF_BYTES) {
+        return { ok: false, reason: "sourceRef-too-long" };
+    }
+    const prefix = `${source}:`;
+    if (!sourceRef.startsWith(prefix)) return { ok: false, reason: "sourceRef-namespace-mismatch" };
+    const tail = sourceRef.slice(prefix.length);
+    if (!tail) return { ok: false, reason: "invalid-sourceRef" };
+    // No control characters or whitespace anywhere, whatever the source: this
+    // value is echoed into logs and compared for equality.
+    if (/[\u0000-\u001f\u007f\s]/.test(sourceRef)) return { ok: false, reason: "invalid-sourceRef" };
+    const pattern = SOURCE_REF_PATTERNS[source];
+    // An unknown source never reaches here (decideSource checks the list first),
+    // and if one ever did, "no pattern" must not mean "anything goes".
+    if (!pattern) return { ok: false, reason: "invalid-source" };
+    return pattern.test(tail) ? { ok: true } : { ok: false, reason: "invalid-sourceRef" };
 }
