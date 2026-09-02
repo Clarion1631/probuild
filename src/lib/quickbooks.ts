@@ -15,6 +15,18 @@ export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
     : "https://quickbooks.api.intuit.com/v3/company";
 
+/**
+ * Intuit's PrivateNote field length cap. `createQBMilestoneInvoice` truncates
+ * to this before sending — and a caller building a create-marker's recovery
+ * identity (see qbo-create-markers.ts) MUST truncate to the SAME length before
+ * composing it. The resolver matches the marker's `privateNote` against what
+ * QuickBooks actually stored via exact equality (qbo-ambiguous-create.ts); an
+ * untruncated identity next to a truncated stored note never matches, the
+ * resolver reports "none found", and a `confirmed-none` clear on that false
+ * negative releases the row to create a real duplicate invoice.
+ */
+export const QB_PRIVATE_NOTE_MAX_LEN = 4000;
+
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 
 export interface QBTokens {
@@ -170,7 +182,10 @@ export async function qboResponseError(res: Response, label: string): Promise<Er
     try {
         body = await res.text();
     } catch (error) {
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        // A caller-originated abort must propagate as itself — converting it
+        // into an HTTP-status error here would hide the cancellation from a
+        // caller that needs to tell "I gave up" apart from "QBO answered N".
+        if (isAbortError(error) || isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
     }
     return qboErrorFromStatus(res.status, body, label);
 }
@@ -265,6 +280,19 @@ export function isQBTimeoutError(error: unknown): error is QBTimeoutError {
         error instanceof QBTimeoutError ||
         (error instanceof Error && error.name === "QBTimeoutError")
     );
+}
+
+/**
+ * A CALLER's own abort — never our deadline (that is QBTimeoutError) and never
+ * a QBO transport failure (that is QboRetryableError). `asQboBoundaryError`
+ * above deliberately leaves a caller-originated abort as a raw AbortError, name
+ * this checks for. A body-read helper that does not recognise it (only
+ * checking isQBTimeoutError/isRetryableQboError) swallows it into an
+ * HTTP-status or malformed-body error instead of letting the cancellation
+ * propagate — see qboResponseError and parseJsonOrNull.
+ */
+export function isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === "AbortError";
 }
 
 const QB_DEFAULT_TIMEOUT_MS = 20_000;
@@ -747,9 +775,11 @@ export async function parseJsonOrNull<T = any>(res: Response): Promise<T | null>
         return (await res.json()) as T;
     } catch (error) {
         // A timeout or a dead connection is not "QBO sent no body" — those must
-        // reach the caller so a loop can stop. Only a genuine parse failure
+        // reach the caller so a loop can stop. Neither is a caller's own abort:
+        // that must propagate as itself, not degrade into a fabricated "no
+        // body" success/failure. Only a genuine parse failure
         // (QboMalformedResponseError) degrades to null.
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        if (isAbortError(error) || isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
         return null;
     }
 }
@@ -911,7 +941,7 @@ export async function createQBMilestoneInvoice(
         AllowOnlineACHPayment: true,
         ...(input.billEmail ? { BillEmail: { Address: input.billEmail } } : {}),
         ...(input.dueDate ? { DueDate: input.dueDate.toISOString().split("T")[0] } : {}),
-        ...(input.privateNote ? { PrivateNote: input.privateNote.slice(0, 4000) } : {}),
+        ...(input.privateNote ? { PrivateNote: input.privateNote.slice(0, QB_PRIVATE_NOTE_MAX_LEN) } : {}),
         Line: [
             {
                 LineNum: 1,

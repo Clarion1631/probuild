@@ -2628,7 +2628,31 @@ export async function deleteInvoiceMilestoneCore(
             throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
         }
 
-        await tx.paymentSchedule.delete({ where: { id: scheduleId } });
+        // Re-assert every deletable-state predicate checked above IN the delete
+        // itself, not just at the read. The milestone-rail's in-flight claim
+        // (pushMilestoneToQuickBooksCore in quickbooks-payments.ts) writes its
+        // `qbSyncError` CAS with a bare `updateMany` outside this transaction —
+        // `lockMoneyParents` above does not serialize against it. A push that
+        // lands its claim in the gap between the read and the delete would
+        // otherwise get an unconditional delete-by-id anyway, wiping the row
+        // (and its in-flight claim) out from under a create that may already be
+        // landing at QuickBooks, leaving a real invoice with nothing in
+        // ProBuild pointing at it. `deleteMany` with the same predicates makes
+        // this a CAS: it deletes only if nothing changed since the read.
+        const deleted = await tx.paymentSchedule.deleteMany({
+            where: {
+                id: scheduleId,
+                status: "Pending",
+                sourceScheduleId: null,
+                qbInvoiceId: null,
+                qbSyncError: null,
+                stripeSessionId: null,
+                stripePaymentIntentId: null,
+            },
+        });
+        if (deleted.count !== 1) {
+            throw new Error("This milestone changed while being deleted — refresh and try again.");
+        }
 
         const invoice = await tx.invoice.findUnique({ where: { id: locked.invoiceId } });
         if (!invoice) throw new Error("Invoice not found");

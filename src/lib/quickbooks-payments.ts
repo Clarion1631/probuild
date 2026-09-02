@@ -46,6 +46,7 @@ import {
     probeQBInvoice,
     getQBPayment,
     deleteQBInvoice,
+    QB_PRIVATE_NOTE_MAX_LEN,
 } from "./quickbooks";
 import {
     AMBIGUOUS_CREATE_MARKER,
@@ -790,7 +791,13 @@ export async function pushMilestoneToQuickBooks(
     }
 
     const description = `${projectName} — ${schedule.name}`;
-    const privateNote = milestonePrivateNote(invoice.code, schedule.name, projectName);
+    // Truncated to QBO's PrivateNote cap BEFORE it goes anywhere — see the
+    // matching comment in progress-billing.ts's stage function. QBO stores the
+    // truncated note; resolveAmbiguousInvoiceCreateCore matches the marker's
+    // identity against it by exact equality, so an untruncated identity here
+    // would never match and a `confirmed-none` clear on that false negative
+    // would let a real duplicate invoice through.
+    const privateNote = milestonePrivateNote(invoice.code, schedule.name, projectName).slice(0, QB_PRIVATE_NOTE_MAX_LEN);
     // Claim the send BEFORE the request goes out. Losing this CAS means another
     // sender got there first — refuse rather than race them into two invoices.
     // A failure to WRITE the marker must abort: without it a crash mid-create

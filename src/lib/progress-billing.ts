@@ -33,7 +33,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
-import { createRouteDeadline, remainingBudgetMs, type RouteDeadline, type QBTokens } from "./quickbooks";
+import { createRouteDeadline, remainingBudgetMs, QB_PRIVATE_NOTE_MAX_LEN, type RouteDeadline, type QBTokens } from "./quickbooks";
 import {
     compensateAndUnlink,
     compensationWindowMs,
@@ -630,7 +630,22 @@ export async function deleteProgressBillingCore(
             throw new Error(`This billing is "${billing.status}"${billing.qbInvoiceId ? " and has a QuickBooks invoice staged" : ""} — only Draft billings without a staged QuickBooks invoice can be deleted`);
         }
 
-        await tx.progressBilling.delete({ where: { id: billingId } }); // cascades to ProgressBillingLine only
+        // Re-assert the deletable state IN the delete itself, not just at the
+        // read above. The stage path's in-flight claim (stageProgressBillingToQuickBooksCore)
+        // writes its `qbSyncError` CAS with a bare `updateMany` outside this
+        // transaction — `lockMoneyParents` above does not serialize against it.
+        // A stage that lands its claim in the gap between the read and the
+        // delete would otherwise get an unconditional delete-by-id anyway,
+        // wiping the row (and its in-flight claim) out from under a create that
+        // may already be landing at QuickBooks, leaving a real invoice with
+        // nothing in ProBuild pointing at it. `deleteMany` with the same
+        // predicates makes this a CAS: it deletes only if nothing changed.
+        const deleted = await tx.progressBilling.deleteMany({
+            where: { id: billingId, status: "Draft", qbInvoiceId: null, qbSyncError: null },
+        }); // cascades to ProgressBillingLine only
+        if (deleted.count !== 1) {
+            throw new Error("This billing changed while being deleted — refresh and try again.");
+        }
 
         return { success: true as const, invoiceId: link.invoiceId, projectId: link.invoice.projectId };
     }));
@@ -787,7 +802,15 @@ export async function stageProgressBillingToQuickBooksCore(
     // (the billing was edited or voided mid-stage) and then fails to compensate
     // leaves a real invoice for the old total with a perfectly matching
     // identity — the resolver must be able to see the row moved.
-    const privateNote = progressBillingPrivateNote(invoice.code, billing.code);
+    // Truncated to QBO's PrivateNote cap BEFORE it goes anywhere — this exact
+    // string is what createQBMilestoneInvoice will send (it truncates again,
+    // harmlessly) and what the marker's identity records. Composing the
+    // identity from the untruncated note would make it un-matchable: QBO
+    // stores the truncated version, resolveAmbiguousInvoiceCreateCore compares
+    // by exact equality, and a mismatch reads as "no invoice found" — which
+    // lets a `confirmed-none` clear release a row that already has a real,
+    // collectible duplicate sitting in QuickBooks.
+    const privateNote = progressBillingPrivateNote(invoice.code, billing.code).slice(0, QB_PRIVATE_NOTE_MAX_LEN);
     const identity = {
         docNumber: billing.code,
         privateNote,
@@ -885,6 +908,17 @@ export async function stageProgressBillingToQuickBooksCore(
             `Staging this billing's QuickBooks invoice failed (${reason}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`
         );
 
+    // A lost claim after a successful compensation still needs saying when the
+    // row DID carry our link: the invoice is gone, but the row would keep
+    // pointing at it and refuse the next stage. Declared before either
+    // `compensate()` call site below so both can use it — the link-write catch
+    // used to skip this and silently drop the "deleted but not unlinked" state
+    // on the floor, re-throwing only the original write error.
+    const compensationNote = () =>
+        compensationUnlinkFailed
+            ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
+            : "";
+
     // Persist the link FIRST, before the pay-link fetch. That read is another
     // remote call, and a timeout there used to abandon a real, created invoice.
     // Guards pin id, Draft status, no existing qbInvoiceId, and the exact content
@@ -912,17 +946,16 @@ export async function stageProgressBillingToQuickBooksCore(
         });
     } catch (err) {
         // The link write itself failed, so nothing points at the new invoice.
-        if (!(await compensate())) throw orphanError(err instanceof Error ? err.message : String(err));
-        throw err instanceof Error ? err : new Error(String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        if (!(await compensate())) throw orphanError(message);
+        // Deleted, but check whether the local unlink ALSO landed —
+        // `compensate()` sets `compensationUnlinkFailed` from
+        // `compensateAndUnlink`'s `unlinked` field. Re-throwing the bare
+        // original error here used to discard that: the QBO invoice would be
+        // gone while the row kept its in-flight/link state, silently blocking
+        // every future stage attempt with no indication why.
+        throw new Error(`${message}${compensationNote()}`);
     }
-
-    // A lost claim after a successful compensation still needs saying when the
-    // row DID carry our link: the invoice is gone, but the row would keep
-    // pointing at it and refuse the next stage.
-    const compensationNote = () =>
-        compensationUnlinkFailed
-            ? ` The abandoned QuickBooks invoice ${billing.code} was deleted, but the link in ProBuild could not be cleared — clear it before re-staging.`
-            : "";
 
     if (claimedLink.count !== 1) {
         // A lost claim is most often a CONCURRENT stage that linked this very
