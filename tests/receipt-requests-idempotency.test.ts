@@ -13,7 +13,12 @@ import {
     type ReceiptEvidenceExpense,
     type ReceiptRequestBankLine,
 } from "../src/lib/receipt-requests";
-import { applyReceiptRequestPlan } from "../src/app/api/cron/receipt-requests/route";
+import {
+    applyReceiptRequestPlan,
+    evidenceBoundsFor,
+    shouldResumeSweep,
+    sweepPhaseAfter,
+} from "../src/app/api/cron/receipt-requests/route";
 
 /**
  * The whole promise of the nightly sweep in one file: run it twice over
@@ -269,4 +274,106 @@ test("the sweep's real apply path reads fresh, not from the run-start snapshot",
     assert.ok(applyAt > 0 && freshReadAt > applyAt, "the read must be INSIDE the per-issue callback");
     assert.match(source, /if \(codes\.length > 0 && hasResolution\(freshDetails\)\)/);
     assert.match(source, /mergeReceiptRequestDetails\(freshDetails, displayDetails\)/);
+});
+
+// ── Evidence bounds: a DATE column and a TIMESTAMP column are not the same ──
+
+test("DB-level bounds: txnDate gets calendar days, Expense.date gets instants", () => {
+    // ReceiptIntake.txnDate is `@db.Date` — a calendar day with no zone, which
+    // Postgres hands back at UTC midnight. Expense.date is a TIMESTAMP, a real
+    // instant whose day boundary is the company's midnight. ONE shared range
+    // could not be right for both; it was simply wrong for one of them.
+    const zone = "America/Los_Angeles";
+    const bounds = evidenceBoundsFor("2026-08-16", "2026-08-18", zone);
+
+    // Half-open at both ends: first allowed day in, day AFTER the last day out.
+    assert.equal(bounds.calendar.gte.toISOString(), "2026-08-16T00:00:00.000Z");
+    assert.equal(bounds.calendar.lt.toISOString(), "2026-08-19T00:00:00.000Z");
+    // August = PDT = UTC-7.
+    assert.equal(bounds.timestamp.gte.toISOString(), "2026-08-16T07:00:00.000Z");
+    assert.equal(bounds.timestamp.lt.toISOString(), "2026-08-19T07:00:00.000Z");
+
+    const inRange = (row: Date, r: { gte: Date; lt: Date }) => row >= r.gte && row < r.lt;
+
+    // A DATE row on the FIRST allowed day. This is the row the shared range
+    // dropped: 00:00Z is before Pacific midnight, so an intake filed on the
+    // first day of the window was invisible and its charge got chased.
+    const firstDayIntake = new Date("2026-08-16T00:00:00Z");
+    assert.equal(inRange(firstDayIntake, bounds.calendar), true);
+    assert.equal(inRange(firstDayIntake, bounds.timestamp), false, "the bug, in one line");
+
+    // And the other end: a DATE row on the day AFTER the window was let IN.
+    const dayAfterIntake = new Date("2026-08-19T00:00:00Z");
+    assert.equal(inRange(dayAfterIntake, bounds.calendar), false);
+    assert.equal(inRange(dayAfterIntake, bounds.timestamp), true, "off by one, both ways");
+
+    // A TIMESTAMP expense filed at 5pm Pacific on the LAST allowed day still
+    // counts — that is what the half-open upper bound bought.
+    assert.equal(inRange(new Date("2026-08-19T00:00:00Z"), bounds.timestamp), true);
+    // But one filed after Pacific midnight the next day does not.
+    assert.equal(inRange(new Date("2026-08-19T08:00:00Z"), bounds.timestamp), false);
+});
+
+test("the sweep sends each bound to the column it belongs to", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-requests/route.ts"),
+        "utf8",
+    );
+    assert.match(source, /where: \{ date: range\.timestamp \}/);
+    assert.match(source, /where: \{ txnDate: range\.calendar, state:/);
+    // BankLine.postedDate is `@db.Date` too.
+    assert.match(source, /postedDate: range\.calendar/);
+    assert.doesNotMatch(source, /where: \{ date: range \}/, "one shared range is the bug");
+});
+
+// ── The run-phase marker (round-11 item 3) ─────────────────────────────────
+
+test("budget spent right after the LAST open-issue page leaves phase 'lines'", () => {
+    // THE BUG: both cursors are cleared the moment their pass completes, so a
+    // run that finished the open-issue pass and then ran out of budget parked
+    // NEITHER — `?continue=1` saw "nothing in progress", exited, and the line
+    // half of the sweep waited for tomorrow's full sweep.
+    const phase = sweepPhaseAfter({
+        openExhausted: true, openErrors: 0,
+        lineExhausted: false, lineErrors: 0,
+    });
+    assert.equal(phase, "lines");
+    // With no cursor anywhere, the phase alone has to carry the resume.
+    assert.equal(shouldResumeSweep(phase, null, null), true);
+});
+
+test("the phase says which half is unfinished, and errors keep it unfinished", () => {
+    const at = (over: Partial<Parameters<typeof sweepPhaseAfter>[0]>) => sweepPhaseAfter({
+        openExhausted: true, openErrors: 0, lineExhausted: true, lineErrors: 0, ...over,
+    });
+    assert.equal(at({}), "done");
+    assert.equal(at({ openExhausted: false }), "open-issues");
+    // A pass that errored parked its cursor on the failure; the phase must keep
+    // pointing at it or the next resume steps over the row that failed.
+    assert.equal(at({ openErrors: 1 }), "open-issues");
+    assert.equal(at({ lineExhausted: false }), "lines");
+    assert.equal(at({ lineErrors: 1 }), "lines");
+
+    // A finished cycle is the ONLY thing a resume pass may skip.
+    assert.equal(shouldResumeSweep("done", null, null), false);
+    assert.equal(shouldResumeSweep("open-issues", null, null), true);
+    // Cursors written before the phase marker existed still resume.
+    assert.equal(shouldResumeSweep("done", "2026-08-01|bl-1", null), true);
+    assert.equal(shouldResumeSweep("done", null, "ri-1"), true);
+});
+
+test("a resume already past the open pass does not redo it", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-requests/route.ts"),
+        "utf8",
+    );
+    // The pass is skipped, not merely fast: re-running it would eat the budget
+    // the line pass has been waiting for.
+    assert.match(source, /while \(startPhase !== "lines" && Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
+    assert.match(source, /let openExhausted = startPhase === "lines";/);
+    // The phase is persisted from what actually happened, in one place.
+    assert.match(source, /const phase = sweepPhaseAfter\(\{/);
+    assert.match(source, /await writePhase\(phase\);/);
+    // A scheduled (non-resume) run always starts a fresh cycle.
+    assert.match(source, /runSweep\(now, continueOnly \? resumePhase : "open-issues"\)/);
 });

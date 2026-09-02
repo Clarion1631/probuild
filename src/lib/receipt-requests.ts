@@ -199,6 +199,175 @@ function ymdOf(dayNumberValue: number): string {
     return new Date(dayNumberValue * 86_400_000).toISOString().slice(0, 10);
 }
 
+/**
+ * The widest date gap at which two lines can still want the SAME receipt.
+ *
+ * Evidence has to land within ±2 days of a line to be a candidate for it, so
+ * two lines can only share a candidate when their own dates are at most 4 days
+ * apart. Wider than that and no single receipt can reach both.
+ */
+export const COMPETING_LINE_ADJACENCY_DAYS = RECEIPT_MATCH_DATE_SLOP_DAYS * 2;
+
+export interface CompetingLine {
+    id: string;
+    /** YYYY-MM-DD. */
+    postedDate: string;
+    amountCents: number;
+}
+
+export interface LineComponent {
+    /**
+     * `"<earliest posted date>|<lowest line id>"`. Sorts chronologically as a
+     * plain string, is unique (the lowest id belongs to exactly one component),
+     * and survives a line being deleted — which is what makes it usable as a
+     * durable resume cursor.
+     */
+    key: string;
+    lineIds: string[];
+}
+
+/**
+ * Group every line in the window into COMPETITION COMPONENTS, before any paging.
+ *
+ * Paging by line id and then widening each page to its neighbours is not the
+ * same thing, and the difference is a real bug: a group of lines competing for
+ * one receipt could straddle a page boundary, so each half was matched against
+ * the same evidence WITHOUT knowing about the other half, and one receipt closed
+ * two charges. Components are computed over the whole window first and pages are
+ * cut BETWEEN them (`pageComponents`), so a competition set is never split.
+ *
+ * Adjacency is same-amount and within `COMPETING_LINE_ADJACENCY_DAYS`. It is
+ * TRANSITIVE by construction: A↔B and B↔C put A and C in one component even
+ * when A and C are six days apart and share no candidate directly, because
+ * re-housing A can free the only receipt C can reach.
+ */
+export function groupCompetingLines(lines: readonly CompetingLine[]): LineComponent[] {
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+        let root = x;
+        while (parent.get(root) !== undefined && parent.get(root) !== root) root = parent.get(root) as string;
+        let cursor = x;
+        while (parent.get(cursor) !== undefined && parent.get(cursor) !== cursor) {
+            const next = parent.get(cursor) as string;
+            parent.set(cursor, root);
+            cursor = next;
+        }
+        return root;
+    };
+    const union = (a: string, b: string) => {
+        const ra = find(a);
+        const rb = find(b);
+        if (ra !== rb) parent.set(rb, ra);
+    };
+
+    for (const line of lines) parent.set(line.id, line.id);
+
+    // Bucket by amount, then walk each bucket in date order joining NEIGHBOURS.
+    // Consecutive unions are enough — transitivity does the rest, and it keeps
+    // this O(n log n) instead of O(n²) on a busy amount.
+    const buckets = new Map<number, CompetingLine[]>();
+    for (const line of lines) {
+        const bucket = buckets.get(line.amountCents);
+        if (bucket) bucket.push(line);
+        else buckets.set(line.amountCents, [line]);
+    }
+    for (const bucket of buckets.values()) {
+        const dated = bucket
+            .map(line => ({ line, day: dayNumber(line.postedDate) }))
+            .filter((entry): entry is { line: CompetingLine; day: number } => entry.day !== null)
+            .sort((a, b) => a.day - b.day || (a.line.id < b.line.id ? -1 : a.line.id > b.line.id ? 1 : 0));
+        for (let i = 1; i < dated.length; i++) {
+            if (dated[i].day - dated[i - 1].day <= COMPETING_LINE_ADJACENCY_DAYS) {
+                union(dated[i - 1].line.id, dated[i].line.id);
+            }
+        }
+    }
+
+    const groups = new Map<string, CompetingLine[]>();
+    for (const line of lines) {
+        const root = find(line.id);
+        const group = groups.get(root);
+        if (group) group.push(line);
+        else groups.set(root, [line]);
+    }
+
+    const components: LineComponent[] = [];
+    for (const group of groups.values()) {
+        let minDate = group[0].postedDate;
+        let minId = group[0].id;
+        for (const line of group) {
+            if (line.postedDate < minDate) minDate = line.postedDate;
+            if (line.id < minId) minId = line.id;
+        }
+        components.push({ key: `${minDate}|${minId}`, lineIds: group.map(line => line.id).sort() });
+    }
+    return components.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+}
+
+/** True when a stored cursor is one of `groupCompetingLines`' component keys. */
+export function isComponentKey(value: string | null | undefined): value is string {
+    return typeof value === "string" && /^\d{4}-\d{2}-\d{2}\|.+$/.test(value);
+}
+
+/**
+ * Cut components into pages of at most `maxLines` lines, NEVER splitting one.
+ *
+ * A component bigger than the page size gets a page to itself rather than being
+ * chopped: an over-large page costs memory, a split component costs correctness.
+ */
+export function pageComponents(
+    components: readonly LineComponent[],
+    maxLines: number,
+): LineComponent[][] {
+    const pages: LineComponent[][] = [];
+    let current: LineComponent[] = [];
+    let count = 0;
+    for (const component of components) {
+        if (current.length > 0 && count + component.lineIds.length > maxLines) {
+            pages.push(current);
+            current = [];
+            count = 0;
+        }
+        current.push(component);
+        count += component.lineIds.length;
+    }
+    if (current.length > 0) pages.push(current);
+    return pages;
+}
+
+/**
+ * Hosts a signed-memo PDF may live on: the affidavit app writes to Google Drive,
+ * and anything we store ourselves is in Supabase Storage. Anywhere else is not
+ * an artifact we can go back and read, which is the whole point of requiring one.
+ */
+const ARTIFACT_HOSTS = new Set(["drive.google.com", "docs.google.com"]);
+
+/**
+ * True when a URL points at a DURABLE copy of the signed memo.
+ *
+ * `signed:true` with no artifact used to be enough to close a chase, so a
+ * malformed or truncated forwarder row silenced a real missing receipt and left
+ * nothing behind to audit. A resolution has to be backed by something a human
+ * can open a year later.
+ */
+export function isDurableArtifactUrl(value: unknown): value is string {
+    if (typeof value !== "string" || value.length === 0 || value.length > 2_000) return false;
+    let parsed: URL;
+    try {
+        parsed = new URL(value);
+    } catch {
+        return false;
+    }
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (ARTIFACT_HOSTS.has(host) || host.endsWith(".googleusercontent.com")) return true;
+    // Our own Supabase Storage, object paths only — a bare project URL is not a file.
+    if (host.endsWith(".supabase.co") || host.endsWith(".supabase.in")) {
+        return parsed.pathname.startsWith("/storage/v1/object/");
+    }
+    return false;
+}
+
 /** `"pb-<bankLineId>"` — the identity the Chat card, the sweep, and Beverly's affidavit PDF all carry. */
 export function receiptRequestFingerprint(bankLineId: string): string {
     return `pb-${bankLineId}`;

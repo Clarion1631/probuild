@@ -293,13 +293,15 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /const BATCH_SIZE = 200;/);
     assert.match(source, /const RUN_BUDGET_MS = 45_000;/);
-    assert.match(source, /while \(Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
-    // Checkpoint after every batch, so a killed run loses one batch, not all.
+    assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
+    // Checkpoint after every page, so a killed run loses one page, not all.
     assert.match(source, /await writeCursor\(cursor\);/);
     // The cursor must NOT advance past a target whose write threw.
     assert.match(source, /if \(outcome\.summary\.errors > 0\) break;/);
-    const breakAt = source.indexOf("if (outcome.summary.errors > 0) break;");
-    const advanceAt = source.indexOf("cursor = batch[batch.length - 1].id;");
+    // lastIndexOf: both strings appear in the open-issue pass too, and it is
+    // the LINE pass's ordering this is about.
+    const breakAt = source.lastIndexOf("if (outcome.summary.errors > 0) break;");
+    const advanceAt = source.lastIndexOf("cursor = page[page.length - 1].key;");
     assert.ok(breakAt > 0 && advanceAt > breakAt, "the break must come BEFORE the cursor advances");
     // And errors make the run a 500.
     assert.match(source, /ok: totals\.errors === 0/);
@@ -377,14 +379,16 @@ test("the evidence upper bound is EXCLUSIVE and in the company timezone", () => 
     // receipt filed at 2pm on the 18th sat after 2026-08-18T00:00:00Z and was
     // invisible, so its charge got chased.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /async function evidenceRange\(fromYmd: string, toYmd: string\)/);
-    assert.match(source, /const zone = await resolveCompanyTimeZone\(\);/);
+    assert.match(source, /export function evidenceBoundsFor\(fromYmd: string, toYmd: string, zone: string\)/);
+    assert.match(source, /return evidenceBoundsFor\(fromYmd, toYmd, await resolveCompanyTimeZone\(\)\);/);
     assert.match(source, /lt: startOfDateInTimeZone\(dayAfter, zone\)/);
     // No caller may still use an inclusive upper bound on evidence.
     assert.doesNotMatch(source, /date: \{ gte: from, lte: to \}/);
     assert.doesNotMatch(source, /txnDate: \{ gte: from, lte: to \}/);
-    assert.match(source, /where: \{ date: range \}/);
-    assert.match(source, /where: \{ txnDate: range, state:/);
+    // Each column gets the bound for ITS type — see the DB-level boundary test
+    // in receipt-requests-idempotency.test.ts.
+    assert.match(source, /where: \{ date: range\.timestamp \}/);
+    assert.match(source, /where: \{ txnDate: range\.calendar, state:/);
 });
 
 test("open issues get their OWN pass, independent of the cursor", () => {
@@ -488,7 +492,7 @@ test("open issues are paged with their OWN cursor and budget", () => {
         "sharing one cursor would make each pass corrupt the other's resume point",
     );
     // Same wall clock as the line pass, and it never checkpoints past a failure.
-    assert.match(source, /while \(Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
+    assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
     assert.match(source, /if \(outcome\.summary\.errors > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
 });
 
@@ -508,9 +512,9 @@ test("a cursor write failure is a 500, never ok:true", () => {
     assert.match(source, /throw new CursorWriteError\(message\);/);
     assert.match(source, /if \(error instanceof CursorWriteError\)[\s\S]{0,300}status: 500/);
     assert.match(source, /error: "cursor-write-failed"/);
-    // Both cursors fail the same way.
+    // Every checkpoint fails the same way.
     const throws = source.match(/throw new CursorWriteError\(message\);/g) ?? [];
-    assert.equal(throws.length, 2, "the line cursor and the open-issue cursor");
+    assert.equal(throws.length, 3, "the line cursor, the open-issue cursor, and the phase");
 });
 
 test("the bank pull plans its window from a persisted high-water mark", () => {
@@ -565,8 +569,10 @@ test("?continue=1 and moreToProcess consult BOTH cursors", () => {
     // about the line cursor made a half-finished OPEN-ISSUE pass look like
     // nothing in progress.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /const \[lineCursor, openCursor\] = await Promise\.all\(\[readCursor\(\), readOpenCursor\(\)\]\);/);
-    assert.match(source, /if \(!lineCursor && !openCursor\)/);
+    assert.match(source, /const \[phase, lineCursor, openCursor\] = await Promise\.all\(\[readPhase\(\), readCursor\(\), readOpenCursor\(\)\]\);/);
+    // ...and the PHASE, because each cursor is cleared the moment its pass
+    // finishes, so a cycle can be unfinished with neither one parked.
+    assert.match(source, /if \(!shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
     assert.match(source, /moreToProcess: !exhausted \|\| !openExhausted/);
 });
 
@@ -591,4 +597,58 @@ test("a duplicate target must be a real original, and cycles are refused", () =>
     assert.match(source, /if \(original\.state === "DUPLICATE"\) throw/);
     assert.match(source, /if \(original\.state === "VOID"\) throw/);
     assert.match(source, /if \(original\.duplicateOfId === id\) throw/);
+});
+
+// ── A signed memo needs a durable artifact (round-11 item 6) ────────────────
+
+test("signed:true with no durable artifact is a 400 that writes nothing", async () => {
+    // `signed:true` on its own used to close the chase, so a truncated or
+    // malformed forwarder row silenced a genuinely missing receipt and left
+    // nothing behind a human could open. These requests are refused BEFORE any
+    // read or write — the route never reaches Prisma on this path.
+    process.env.RECEIPT_INTAKE_SECRET = "test-intake-secret";
+    const { POST } = await import("../src/app/api/automation/receipt-requests/answers/route");
+
+    const post = (body: Record<string, unknown>) => POST(new Request(
+        "https://probuild.test/api/automation/receipt-requests/answers",
+        {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-receipt-intake-secret": "test-intake-secret",
+            },
+            body: JSON.stringify(body),
+        },
+    ));
+
+    for (const [label, body] of [
+        ["no artifact at all", { fingerprint: "pb-bl-1", signed: true }],
+        ["an off-host URL", { fingerprint: "pb-bl-1", signed: true, pdf_url: "https://example.com/memo.pdf" }],
+        ["a non-https URL", { fingerprint: "pb-bl-1", signed: true, pdf_url: "http://drive.google.com/file/d/1/view" }],
+        ["an empty signature id", { fingerprint: "pb-bl-1", signed: true, signature_id: "   " }],
+    ] as const) {
+        const res = await post(body);
+        assert.equal(res.status, 400, label);
+        assert.deepEqual(await res.json(), { ok: false, reason: "missing-artifact", targetKey: "bl-1" }, label);
+    }
+
+    // Unauthenticated is still 401, and a row that is not a signature is still
+    // an ignore rather than an error — neither path reaches the artifact gate.
+    const unauth = await POST(new Request("https://probuild.test/api/automation/receipt-requests/answers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fingerprint: "pb-bl-1", signed: true }),
+    }));
+    assert.equal(unauth.status, 401);
+
+    const notSigned = await post({ fingerprint: "pb-bl-1", signed: false });
+    assert.equal(notSigned.status, 200);
+    assert.deepEqual(await notSigned.json(), { ok: true, ignored: true, reason: "not-a-signature" });
+
+    // Beverly's own fingerprints are still ignored, not 400'd: the forwarder
+    // ships one file for both systems and must not retry forever on rows that
+    // were never ours.
+    const notOurs = await post({ fingerprint: "bev-42", signed: true });
+    assert.equal(notOurs.status, 200);
+    assert.deepEqual(await notOurs.json(), { ok: true, ignored: true });
 });

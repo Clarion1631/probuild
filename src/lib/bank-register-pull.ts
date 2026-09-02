@@ -295,6 +295,32 @@ export function highWaterOf(lines: readonly BankRegisterIngestLine[], previous: 
     return best;
 }
 
+/**
+ * The boundary is WHAT WE SCANNED, not what came back.
+ *
+ * Deriving it from the returned transactions alone deadlocks the planner the
+ * moment a window is empty. A mark from January plus a 60-day cap asks QBO for
+ * January–February; if that stretch holds no transactions at all — a quiet
+ * period, or a range whose entries were later deleted — nothing comes back, the
+ * mark does not move, and the NEXT run plans exactly the same window. The pull
+ * never reaches the present, and the register silently stops updating while
+ * every run reports success.
+ *
+ * A completed fetch over [start, end] is proof about the whole range, including
+ * the parts of it that were empty. So the boundary advances to `scannedThrough`
+ * (the window's end) as well as past any row we actually stored, and never
+ * moves backwards.
+ */
+export function advanceScanBoundary(
+    previous: string | null,
+    scannedThrough: string,
+    lines: readonly BankRegisterIngestLine[],
+): string {
+    const fromRows = highWaterOf(lines, previous);
+    if (fromRows === null) return scannedThrough;
+    return scannedThrough > fromRows ? scannedThrough : fromRows;
+}
+
 // ── Orchestration ───────────────────────────────────────────────────────────
 
 export interface BankRegisterIngestResult {
@@ -535,10 +561,12 @@ export async function runBankRegisterPull(
 
     if (dependencies.saveWindowState && dependencies.windowState && summary.ok) {
         const complete = !summary.continues;
-        // The high-water mark still only moves for a COMPLETE run — stepping
-        // the window past rows this one never stored would lose them.
+        // The mark still only moves for a COMPLETE run — stepping the window
+        // past rows this one never stored would lose them. But a complete run
+        // scanned the WHOLE window, so the boundary is its end date, not merely
+        // the newest row that happened to come back (see advanceScanBoundary).
         const highWater = complete
-            ? highWaterOf(lines, dependencies.windowState.highWater)
+            ? advanceScanBoundary(dependencies.windowState.highWater, endDate, lines)
             : dependencies.windowState.highWater;
         summary.highWater = highWater;
         try {

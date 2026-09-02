@@ -4,6 +4,7 @@ import {
     PULL_FULL_SWEEP_DAYS,
     PULL_MAX_WINDOW_DAYS,
     PULL_OVERLAP_DAYS,
+    advanceScanBoundary,
     highWaterOf,
     resumeAfter,
     type PullWindowState,
@@ -133,7 +134,9 @@ test("the high-water mark advances only on a clean, COMPLETE run", async () => {
 
     await runBankRegisterPull(deps(base));
     assert.equal(saved.length, 1);
-    assert.equal(saved[0].highWater, "2026-08-30", "the batch's newest TxnDate");
+    // THE BOUNDARY IS WHAT WE SCANNED, not the newest row that came back — a
+    // complete fetch is proof about the whole window, including its empty parts.
+    assert.equal(saved[0].highWater, TODAY, "the window's end date");
 
     // A failed ingest must NOT step the window past rows it never stored.
     saved.length = 0;
@@ -250,4 +253,47 @@ test("a COMPLETE run clears the continuation point", async () => {
         budgetMs: 45_000,
     }));
     assert.equal(state.continueAfter, null, "finished means there is nothing to resume");
+});
+
+// ── The scan boundary is what we SCANNED, not what came back (item 5) ───────
+
+test("advanceScanBoundary moves to the window end, and never backwards", () => {
+    const line = (postedDate: string): BankRegisterIngestLine =>
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId: postedDate });
+    // An EMPTY window still advances the mark: we looked, and there was nothing.
+    assert.equal(advanceScanBoundary("2026-01-01", "2026-03-01", []), "2026-03-01");
+    assert.equal(advanceScanBoundary(null, "2026-03-01", []), "2026-03-01");
+    // A row newer than the window end (QBO can post ahead of it) still wins.
+    assert.equal(advanceScanBoundary("2026-01-01", "2026-03-01", [line("2026-03-05")]), "2026-03-05");
+    // And it never rewinds.
+    assert.equal(advanceScanBoundary("2026-05-01", "2026-03-01", [line("2026-02-01")]), "2026-05-01");
+});
+
+test("an OLD mark plus an EMPTY capped window still advances the boundary", async () => {
+    // THE DEADLOCK: with the mark derived only from returned transactions, a
+    // January mark asked for Jan–Feb, that stretch held nothing, the mark did
+    // not move, and the NEXT run planned exactly the same window. The pull never
+    // reached the present while every run reported success.
+    const saved: PullWindowState[] = [];
+    const state: PullWindowState = { highWater: "2026-01-01", lastFullSweep: "2026-09-01" };
+    const planned = planPullWindow(state, NOW);
+    assert.equal(planned.continues, true, "a 60-day cap with more history behind it");
+
+    const summary = await runBankRegisterPull(deps({
+        windowState: state,
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
+        fetchRows: async () => ({ rows: [] as BankRegisterRowLike[], stale: false }),
+        elapsedMs: () => 0,
+        budgetMs: 45_000,
+    }));
+
+    assert.equal(summary.ok, true);
+    assert.equal(summary.observations, 0);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].highWater, planned.endDate, "the mark moves to the end of what we scanned");
+    assert.ok(saved[0].highWater! > "2026-01-01");
+
+    // And the NEXT run therefore asks for a different, later window.
+    const next = planPullWindow(saved[0], NOW);
+    assert.ok(next.startDate > planned.startDate, `${next.startDate} must be past ${planned.startDate}`);
 });

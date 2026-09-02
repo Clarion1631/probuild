@@ -7,6 +7,10 @@ import {
     appendCardRecord,
     competingLineFilter,
     evidenceComponents,
+    groupCompetingLines,
+    isComponentKey,
+    isDurableArtifactUrl,
+    pageComponents,
     matchEvidenceToLines,
     evidenceUnitKey,
     hasResolution,
@@ -392,12 +396,12 @@ test("the sweep holds a DURABLE lease, not a released advisory claim", () => {
     assert.match(source, /takeLease\(LEASE_KEY, RUN_LEASE_MS, now, leaseToken\)/);
     // Taken before the work and released after it, not committed away first.
     const takeAt = source.indexOf("await takeLease(LEASE_KEY");
-    const workAt = source.indexOf("return await runSweep(now);");
+    const workAt = source.indexOf("return await runSweep(now");
     const releaseAt = source.indexOf("await releaseLease(LEASE_KEY");
     assert.ok(takeAt > 0 && workAt > takeAt && releaseAt > workAt);
     // And the retry path recomputes the SET.
     assert.match(source, /competingLineFilter\(/);
-    assert.match(source, /prisma\.bankLine\.findMany\(\{\s*\n\s*where: \{ amountCents: competing\.amountCents/);
+    assert.match(source, /prisma\.bankLine\.findMany\(\{[\s\S]{0,200}?where: \{ amountCents: competing\.amountCents/);
 });
 
 test("the sweep resumes from a durable cursor, oldest-first", () => {
@@ -405,9 +409,13 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     assert.match(source, /orderBy: \[\{ postedDate: "asc" \}, \{ id: "asc" \}\]/,
         "newest-first silently abandoned older candidates behind the cap");
     assert.match(source, /let cursor = await readCursor\(\);/);
-    assert.match(source, /cursor: \{ id: cursor \}, skip: 1/);
-    // Checkpointed after EVERY batch, so a run that dies loses one batch.
-    assert.match(source, /cursor = batch\[batch\.length - 1\]\.id;\s*\n\s*await writeCursor\(cursor\);/);
+    // The cursor is a COMPONENT KEY, not a line id: resuming inside a
+    // competition set is what let one receipt close two charges.
+    assert.match(source, /const resumeFrom = isComponentKey\(cursor\) \? cursor : null;/);
+    assert.match(source, /components\.filter\(component => component\.key > resumeFrom\)/);
+    assert.doesNotMatch(source, /cursor: \{ id: cursor \}, skip: 1/, "id paging is gone");
+    // Checkpointed after EVERY page, so a run that dies loses one page.
+    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(cursor\);/);
 });
 
 // ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────
@@ -451,7 +459,7 @@ test("the sweep expands each page to its competing cohort before matching", () =
     // COHORT, then EVIDENCE for the cohort's span, then DECIDE — in that order.
     const cohortAt = source.indexOf("const cohortRows =");
     const evidenceAt = source.indexOf("const \[expenseRows, intakeRows\] = await Promise.all([".replace(/\\/g, ""));
-    const planAt = source.indexOf("const plan = planReceiptRequests({", cohortAt);
+    const planAt = source.indexOf("const fullPlan = planReceiptRequests({", cohortAt);
     assert.ok(cohortAt > 0 && evidenceAt > cohortAt, "evidence must be loaded AFTER the cohort is known");
     assert.ok(planAt > evidenceAt, "and the decision comes last");
     // The loaded window is declared, so the matcher can decline to judge
@@ -682,4 +690,126 @@ test("the query filter is wide enough to CONTAIN a chain", () => {
     const f = competingLineFilter({ amountCents: -12_345, postedDate: "2026-08-05" });
     assert.ok(f.from <= "2026-08-01", `${f.from} must reach the chain's far end`);
     assert.ok(f.to >= "2026-08-09", `${f.to} must reach the chain's far end`);
+});
+
+// ── Competition components, computed BEFORE paging (round-11 item 1) ────────
+
+test("competing lines land in ONE component even when they straddle a page", () => {
+    // THE BUG: pages were cut by line id, so a set of lines competing for one
+    // receipt could fall either side of the 200th row. Each half then matched
+    // against the same evidence without knowing about the other, and one
+    // receipt closed two charges.
+    const BATCH = 200;
+    const filler = Array.from({ length: 260 }, (_, i) => ({
+        // Distinct amounts, so filler never competes with anything.
+        id: `L${String(i).padStart(4, "0")}`,
+        postedDate: "2026-08-10",
+        amountCents: -(1_000 + i),
+    }));
+    // Two charges for the same amount, one day apart, whose ids sit either side
+    // of the batch boundary in id order.
+    const twinA = { id: "L0198", postedDate: "2026-08-10", amountCents: -4_600 };
+    const twinB = { id: "L0203", postedDate: "2026-08-11", amountCents: -4_600 };
+    const lines = [...filler.filter(l => l.id !== twinA.id && l.id !== twinB.id), twinA, twinB];
+
+    const components = groupCompetingLines(lines);
+    const withTwinA = components.find(c => c.lineIds.includes("L0198"));
+    assert.ok(withTwinA);
+    assert.deepEqual(withTwinA.lineIds, ["L0198", "L0203"], "the twins are ONE component");
+
+    const pages = pageComponents(components, BATCH);
+    const pageOfA = pages.findIndex(page => page.some(c => c.lineIds.includes("L0198")));
+    const pageOfB = pages.findIndex(page => page.some(c => c.lineIds.includes("L0203")));
+    assert.equal(pageOfA, pageOfB, "and one component is never split across pages");
+
+    // The control: the OLD scheme really did split them, so this test would
+    // have failed before the fix rather than passing for free.
+    const idOrder = [...lines].sort((a, b) => (a.id < b.id ? -1 : 1)).map(l => l.id);
+    assert.notEqual(
+        Math.floor(idOrder.indexOf("L0198") / BATCH),
+        Math.floor(idOrder.indexOf("L0203") / BATCH),
+        "id-order paging put the twins on different pages",
+    );
+
+    // Every line is still accounted for, exactly once.
+    const paged = pages.flatMap(page => page.flatMap(c => c.lineIds)).sort();
+    assert.deepEqual(paged, lines.map(l => l.id).sort());
+});
+
+test("component membership is TRANSITIVE along the date chain", () => {
+    // 1st ↔ 3rd ↔ 5th: the 1st and the 5th share no candidate directly (4 days
+    // is the widest a single receipt can reach), but re-housing the 1st frees
+    // the only receipt the 5th can take.
+    const amountCents = -4_600;
+    const components = groupCompetingLines([
+        { id: "a", postedDate: "2026-08-01", amountCents },
+        { id: "b", postedDate: "2026-08-03", amountCents },
+        { id: "c", postedDate: "2026-08-05", amountCents },
+        // Same amount, far away: a different component.
+        { id: "far", postedDate: "2026-08-20", amountCents },
+        // Same day, different amount: also a different component.
+        { id: "other", postedDate: "2026-08-03", amountCents: -4_601 },
+    ]);
+    const keyed = new Map(components.map(c => [c.lineIds.join(","), c]));
+    assert.ok(keyed.has("a,b,c"), `expected a,b,c together; got ${[...keyed.keys()].join(" | ")}`);
+    assert.ok(keyed.has("far"));
+    assert.ok(keyed.has("other"));
+});
+
+test("a component larger than the page size gets its own page, never a split", () => {
+    const amountCents = -4_600;
+    const big = Array.from({ length: 7 }, (_, i) => ({
+        id: `big-${i}`,
+        postedDate: `2026-08-${String(i + 1).padStart(2, "0")}`,
+        amountCents,
+    }));
+    const pages = pageComponents(groupCompetingLines(big), 3);
+    assert.equal(pages.length, 1);
+    assert.equal(pages[0][0].lineIds.length, 7, "correctness beats page size");
+});
+
+test("component keys sort chronologically and survive as a resume cursor", () => {
+    const components = groupCompetingLines([
+        { id: "z", postedDate: "2026-08-20", amountCents: -1 },
+        { id: "a", postedDate: "2026-08-01", amountCents: -2 },
+    ]);
+    assert.deepEqual(components.map(c => c.key), ["2026-08-01|a", "2026-08-20|z"]);
+    assert.equal(isComponentKey("2026-08-01|a"), true);
+    // A cursor left by the OLD id-paging build is not a component key, so the
+    // sweep restarts the cycle instead of silently skipping the whole window.
+    assert.equal(isComponentKey("cmpd6xca1009x1iizdf4suln3"), false);
+    assert.equal(isComponentKey(null), false);
+});
+
+// ── A signed memo needs a durable artifact (round-11 item 6) ────────────────
+
+test("only a Drive or Storage URL counts as a durable artifact", () => {
+    for (const good of [
+        "https://drive.google.com/file/d/1abc/view",
+        "https://docs.google.com/document/d/1abc/edit",
+        "https://lh3.googleusercontent.com/d/1abc",
+        "https://ghzdbzdnwjxazvmcefbh.supabase.co/storage/v1/object/sign/secure-docs/memo.pdf",
+    ]) {
+        assert.equal(isDurableArtifactUrl(good), true, good);
+    }
+    for (const bad of [
+        // Not https.
+        "http://drive.google.com/file/d/1abc/view",
+        // Not an artifact host at all — this is the case that used to close a
+        // chase on nothing but a forwarder's say-so.
+        "https://example.com/memo.pdf",
+        // Our own project, but not an object path.
+        "https://ghzdbzdnwjxazvmcefbh.supabase.co/",
+        // Look-alike hosts.
+        "https://drive.google.com.evil.test/file",
+        "https://notgoogleusercontent.com/d/1abc",
+        "",
+        "not a url",
+        null,
+        undefined,
+        42,
+        `https://drive.google.com/${"x".repeat(2_100)}`,
+    ]) {
+        assert.equal(isDurableArtifactUrl(bad), false, String(bad).slice(0, 60));
+    }
 });

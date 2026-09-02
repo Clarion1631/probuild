@@ -12,6 +12,9 @@ import {
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
     competingLineFilter,
+    groupCompetingLines,
+    isComponentKey,
+    pageComponents,
     hasResolution,
     mergeReceiptRequestDetails,
     planReceiptRequests,
@@ -81,6 +84,81 @@ const CURSOR_KEY = "receiptRequestsCursor";
 const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";
 /** Open issues per batch. Smaller than the line batch: each one costs a lookup. */
 const OPEN_ISSUE_BATCH_SIZE = 100;
+
+/** Which half of the sweep is in progress. Persisted, so a resume knows. */
+const PHASE_KEY = "receiptRequestsPhase";
+
+/**
+ * The sweep's two passes, in order, plus "done".
+ *
+ * A CURSOR is not a phase marker. Both cursors are cleared the moment their
+ * pass finishes, so "open-issue pass complete, budget spent before a single
+ * line batch" looked exactly like "nothing in progress" — the `?continue=1`
+ * pass exited, and the line half of the sweep waited for tomorrow. The phase is
+ * what says a cycle is unfinished when neither cursor is parked.
+ */
+export type SweepPhase = "open-issues" | "lines" | "done";
+
+export function isSweepPhase(value: unknown): value is SweepPhase {
+    return value === "open-issues" || value === "lines" || value === "done";
+}
+
+/**
+ * Where the cycle stands once a run ends. ONE place, so the marker can never
+ * disagree with what the run actually finished.
+ *
+ * A pass that errored is NOT complete: its cursor was deliberately left parked
+ * on the failure, and the phase has to keep pointing at it or the next resume
+ * would step over the row that failed — the same "silently never chased" bug
+ * the cursor rule exists to prevent.
+ */
+export function sweepPhaseAfter(run: {
+    openExhausted: boolean;
+    openErrors: number;
+    lineExhausted: boolean;
+    lineErrors: number;
+}): SweepPhase {
+    if (!run.openExhausted || run.openErrors > 0) return "open-issues";
+    if (!run.lineExhausted || run.lineErrors > 0) return "lines";
+    return "done";
+}
+
+/**
+ * A resume pass has work whenever the cycle is unfinished — by the phase, or by
+ * either cursor. The cursors stay in the test for rows written before the phase
+ * marker existed.
+ */
+export function shouldResumeSweep(
+    phase: SweepPhase,
+    lineCursor: string | null,
+    openCursor: string | null,
+): boolean {
+    return phase !== "done" || !!lineCursor || !!openCursor;
+}
+
+async function readPhase(): Promise<SweepPhase> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: PHASE_KEY } });
+        const value = row?.value;
+        return isSweepPhase(value) ? value : "done";
+    } catch {
+        return "done";
+    }
+}
+
+async function writePhase(phase: SweepPhase): Promise<void> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: PHASE_KEY },
+            update: { value: phase },
+            create: { key: PHASE_KEY, value: phase },
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "UnknownError";
+        console.error("[cron/receipt-requests] phase write failed", message);
+        throw new CursorWriteError(message);
+    }
+}
 
 /** The resume cursor: the last BankLine id this sweep finished, oldest-first. */
 async function readCursor(): Promise<string | null> {
@@ -252,18 +330,19 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
 
     const [lines, expenseRows, intakeRows] = await Promise.all([
         prisma.bankLine.findMany({
-            where: { amountCents: competing.amountCents, postedDate: range },
+            // `BankLine.postedDate` is `@db.Date` as well — calendar bounds.
+            where: { amountCents: competing.amountCents, postedDate: range.calendar },
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         }),
         prisma.expense.findMany({
-            where: { date: range },
+            where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
                 receiptUrl: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
-            where: { txnDate: range, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
             select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
@@ -348,6 +427,12 @@ async function processBatch(
     detailsByKey: Map<string, Record<string, unknown>>,
     now: Date,
 ): Promise<{ summary: ReceiptRequestApplySummary; undecided: number }> {
+    // THE LINES THIS BATCH IS ANSWERABLE FOR. The cohort query below drags in
+    // neighbours so they can consume the evidence they are entitled to, but a
+    // neighbour's OWN verdict belongs to the page that owns it — judging it here,
+    // from a view that may be missing ITS competitors, is how a line got closed
+    // on one page and reopened on the next, night after night.
+    const judgeOnly = new Set(batch.map(row => row.id));
     // 1. THE COHORT.
     const cohortFilters = batch.map(row => competingLineFilter({
         amountCents: row.amountCents,
@@ -383,20 +468,20 @@ async function processBatch(
 
     const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
-            where: { date: range },
+            where: { date: range.timestamp },
             select: {
                 id: true, amount: true, date: true, vendor: true, qbPurchaseId: true,
                 receiptUrl: true, receiptIntake: { select: { id: true } },
             },
         }),
         prisma.receiptIntake.findMany({
-            where: { txnDate: range, state: { notIn: [...DEAD_INTAKE_STATES] } },
+            where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
             select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
 
     // 3. DECIDE.
-    const plan = planReceiptRequests({
+    const fullPlan = planReceiptRequests({
         bankLines: lines.map(row => ({
             id: row.id,
             postedDate: row.postedDate.toISOString().slice(0, 10),
@@ -434,6 +519,13 @@ async function processBatch(
         now,
     });
 
+    // The matching used every line; only this page's own lines get a verdict.
+    const plan = {
+        open: fullPlan.open.filter(item => judgeOnly.has(item.targetKey)),
+        close: fullPlan.close.filter(targetKey => judgeOnly.has(targetKey)),
+        undecided: fullPlan.undecided.filter(id => judgeOnly.has(id)),
+    };
+
     const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
         // FRESH READ before each write. The sweep can run for minutes; a memo
         // signed in that window would otherwise be un-answered by a merge from
@@ -470,25 +562,50 @@ async function processBatch(
 }
 
 
+export interface EvidenceBounds {
+    /** For TIMESTAMP columns (`Expense.date`), resolved in the company's zone. */
+    timestamp: { gte: Date; lt: Date };
+    /** For DATE columns (`ReceiptIntake.txnDate`), which have no zone at all. */
+    calendar: { gte: Date; lt: Date };
+}
+
 /**
- * The evidence window, as a half-open range in the COMPANY's timezone.
+ * The evidence window — as TWO ranges, because the two evidence tables store
+ * their dates in genuinely different types.
  *
- * `lte: <a Date at UTC midnight>` silently excluded most of the last allowed
- * day: an expense stamped 14:00 on the 18th is after `2026-08-18T00:00:00Z`, so
- * a receipt filed in the afternoon of the last in-window day was invisible and
- * its charge got chased. And UTC is the wrong day boundary anyway — a receipt
- * uploaded at 5pm Pacific belongs to that Pacific day, not the next UTC one.
+ * `Expense.date` is a TIMESTAMP: a real instant, so its day boundary is the
+ * company's midnight. (`lte: <UTC midnight>` used to silently exclude most of
+ * the last allowed day — an expense stamped 14:00 on the 18th is after
+ * `2026-08-18T00:00:00Z` — so a receipt filed in the afternoon of the last
+ * in-window day was invisible and its charge got chased.)
  *
- * So: start of the FIRST allowed day, inclusive; start of the day AFTER the
- * last allowed day, exclusive. Both resolved in the company's zone.
+ * `ReceiptIntake.txnDate` is `@db.Date`: a calendar day with NO zone, which
+ * Prisma reads and writes at UTC midnight. Comparing it against Pacific
+ * midnight (08:00Z) is wrong at BOTH ends — an intake on the first allowed day
+ * sits at 00:00Z, which is before 08:00Z and was dropped, while an intake on
+ * the day AFTER the window sits at 00:00Z, which is before the exclusive upper
+ * bound of 08:00Z and was let in. One shared range could not be right for both
+ * columns; it was simply wrong for one of them.
+ *
+ * Both are half-open: start of the FIRST allowed day, inclusive; start of the
+ * day AFTER the last allowed day, exclusive.
  */
-async function evidenceRange(fromYmd: string, toYmd: string): Promise<{ gte: Date; lt: Date }> {
-    const zone = await resolveCompanyTimeZone();
+export function evidenceBoundsFor(fromYmd: string, toYmd: string, zone: string): EvidenceBounds {
     const dayAfter = new Date(Date.parse(`${toYmd}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
     return {
-        gte: startOfDateInTimeZone(fromYmd, zone),
-        lt: startOfDateInTimeZone(dayAfter, zone),
+        timestamp: {
+            gte: startOfDateInTimeZone(fromYmd, zone),
+            lt: startOfDateInTimeZone(dayAfter, zone),
+        },
+        calendar: {
+            gte: new Date(`${fromYmd}T00:00:00Z`),
+            lt: new Date(`${dayAfter}T00:00:00Z`),
+        },
     };
+}
+
+async function evidenceRange(fromYmd: string, toYmd: string): Promise<EvidenceBounds> {
+    return evidenceBoundsFor(fromYmd, toYmd, await resolveCompanyTimeZone());
 }
 
 /** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
@@ -509,15 +626,20 @@ export async function GET(request: Request) {
     // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
     // even briefly block the real run.
     const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
+    let resumePhase: SweepPhase = "open-issues";
     if (continueOnly) {
-        // BOTH cursors. The sweep has two independent passes with two resume
-        // points, and asking only about the line cursor meant a half-finished
-        // OPEN-ISSUE pass looked like nothing in progress — so the resume pass
-        // exited and that backlog waited for tomorrow's full sweep.
-        const [lineCursor, openCursor] = await Promise.all([readCursor(), readOpenCursor()]);
-        if (!lineCursor && !openCursor) {
+        // THE PHASE, plus both cursors. The sweep has two independent passes
+        // with two resume points, and asking only about the line cursor meant a
+        // half-finished OPEN-ISSUE pass looked like nothing in progress — so the
+        // resume pass exited and that backlog waited for tomorrow's full sweep.
+        // Even both cursors are not enough: each is cleared the instant its pass
+        // completes, so a run that finished the open-issue pass and then ran out
+        // of budget parked NEITHER, and the line pass never resumed.
+        const [phase, lineCursor, openCursor] = await Promise.all([readPhase(), readCursor(), readOpenCursor()]);
+        if (!shouldResumeSweep(phase, lineCursor, openCursor)) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
+        resumePhase = phase === "done" ? "open-issues" : phase;
     }
 
     const leaseToken = randomUUID();
@@ -525,7 +647,8 @@ export async function GET(request: Request) {
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
     try {
-        return await runSweep(now);
+        // A scheduled full run always starts a fresh cycle at the top.
+        return await runSweep(now, continueOnly ? resumePhase : "open-issues");
     } catch (error) {
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
         // note in the log. Whatever this run committed stays committed, but the
@@ -542,9 +665,11 @@ export async function GET(request: Request) {
     }
 }
 
-async function runSweep(now: Date) {
+async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     const windowStart = ymdDaysBefore(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
+    // The cycle is unfinished from here until the line pass exhausts.
+    if (startPhase !== "lines") await writePhase("open-issues");
 
     // Every bank-line issue, open OR cleared. The open ones say what may need
     // closing; the cleared ones carry resolutions that must not be re-asked.
@@ -591,11 +716,14 @@ async function runSweep(now: Date) {
     };
     let openUndecided = 0;
     let openCursor = await readOpenCursor();
-    let openExhausted = false;
+    // A resume that already completed this pass goes straight to the lines:
+    // re-running it would be correct but would eat the budget the line pass has
+    // been waiting for.
+    let openExhausted = startPhase === "lines";
     let openBatches = 0;
     let targetMissing = 0;
 
-    while (Date.now() - startedAt < RUN_BUDGET_MS) {
+    while (startPhase !== "lines" && Date.now() - startedAt < RUN_BUDGET_MS) {
         const page = await prisma.reviewIssue.findMany({
             where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
             orderBy: [{ firstObservedAt: "asc" }, { id: "asc" }],
@@ -678,15 +806,53 @@ async function runSweep(now: Date) {
     let undecided = openUndecided;
     let exhausted = false;
 
-    while (Date.now() - startedAt < RUN_BUDGET_MS) {
+    // COMPONENTS FIRST, THEN PAGES — never the other way round.
+    //
+    // Paging by line id cut the window wherever the 200th row happened to fall,
+    // and a set of lines competing for one receipt could land either side of
+    // that cut. Each half then matched against the same evidence without seeing
+    // the other, and one receipt closed two charges — the exact bug the
+    // one-to-one matching exists to prevent. So the whole window's identity
+    // keys are grouped into competition components up front, and pages are cut
+    // BETWEEN components (`pageComponents`); a component larger than BATCH_SIZE
+    // gets its own oversized page rather than being split.
+    const windowLines = await prisma.bankLine.findMany({
+        where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
+        orderBy: [{ postedDate: "asc" }, { id: "asc" }],
+        select: { id: true, postedDate: true, amountCents: true },
+    });
+    const components = groupCompetingLines(windowLines.map(row => ({
+        id: row.id,
+        postedDate: row.postedDate.toISOString().slice(0, 10),
+        amountCents: row.amountCents,
+    })));
+    // The cursor is a COMPONENT KEY now. A cursor left by an older build is a
+    // bare BankLine id; it cannot be placed in this ordering, so the cycle
+    // restarts once — idempotent, and it self-corrects on the first checkpoint.
+    const resumeFrom = isComponentKey(cursor) ? cursor : null;
+    const pages = pageComponents(
+        resumeFrom ? components.filter(component => component.key > resumeFrom) : components,
+        BATCH_SIZE,
+    );
+    let pageIndex = 0;
+    exhausted = pages.length === 0;
+
+    while (pageIndex < pages.length && Date.now() - startedAt < RUN_BUDGET_MS) {
+        const page = pages[pageIndex++];
+        const ids = page.flatMap(component => component.lineIds);
         const batch = await prisma.bankLine.findMany({
-            where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
+            where: { id: { in: ids } },
             orderBy: [{ postedDate: "asc" }, { id: "asc" }],
-            take: BATCH_SIZE,
-            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         });
-        if (batch.length === 0) { exhausted = true; break; }
+        // Every line in the page vanished between the two queries. Nothing to
+        // judge, but the checkpoint still has to move past it.
+        if (batch.length === 0) {
+            cursor = page[page.length - 1].key;
+            await writeCursor(cursor);
+            if (pageIndex >= pages.length) exhausted = true;
+            continue;
+        }
 
         const outcome = await processBatch(batch, openIssues, resolvedIssueKeys, detailsByKey, now);
         batches++;
@@ -706,17 +872,33 @@ async function runSweep(now: Date) {
         // ground; the lifecycle writes are idempotent, so re-running is free.
         if (outcome.summary.errors > 0) break;
 
-        cursor = batch[batch.length - 1].id;
+        // The checkpoint is the last COMPONENT this page finished, so a resume
+        // can never land in the middle of a competition set.
+        cursor = page[page.length - 1].key;
         await writeCursor(cursor);
-        if (batch.length < BATCH_SIZE) { exhausted = true; break; }
+        if (pageIndex >= pages.length) { exhausted = true; break; }
     }
 
     // A finished sweep starts over from the oldest line next time — that pass
     // is what re-checks everything for CLOSES.
     if (exhausted && totals.errors === 0) await writeCursor(null);
 
+    // THE PHASE, LAST, FROM WHAT ACTUALLY HAPPENED. It is what carries "the
+    // open-issue half is done" across an invocation boundary — the cursor that
+    // pass just cleared cannot, and a run that finished the open pass and then
+    // spent its budget parked NEITHER cursor, so `?continue=1` saw nothing in
+    // progress and the line half waited for tomorrow.
+    const phase = sweepPhaseAfter({
+        openExhausted,
+        openErrors: openPass.errors,
+        lineExhausted: exhausted,
+        lineErrors: totals.errors - openPass.errors,
+    });
+    await writePhase(phase);
+
     const result = {
         ok: totals.errors === 0,
+        phase,
         window: { start: windowStart, end: windowEnd },
         batches,
         openBatches,

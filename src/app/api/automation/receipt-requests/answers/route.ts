@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { RECEIPT_INTAKE_SECRET_HEADER, secretMatches } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
-import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, isDurableArtifactUrl } from "@/lib/receipt-requests";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
 export const dynamic = "force-dynamic";
@@ -25,32 +25,27 @@ export const dynamic = "force-dynamic";
  * both systems and must not retry forever on rows that were never ours.
  *
  * NEVER emails anything, and never touches the PDF: it records the link
- * Beverly's app already produced.
+ * Beverly's app already produced. A `signed:true` carrying NO durable artifact
+ * — no Drive/Storage `pdf_url`, no `signature_id` — is a 400 and writes
+ * nothing.
  *
  * AUTH: the Phase 1 machine secret, fail-closed. Exact-match proxy bypass, so
  * the caller gets a clean 401 rather than a redirect. No session branch exists.
  */
 
-const MAX_URL_LEN = 2_000;
-
 interface AnswerBody {
     fingerprint?: unknown;
     signed?: unknown;
     pdf_url?: unknown;
+    signature_id?: unknown;
     job?: unknown;
     at?: unknown;
     message?: unknown;
     thread?: unknown;
 }
 
-function isHttpsUrl(value: string): boolean {
-    try {
-        const url = new URL(value);
-        return url.protocol === "https:";
-    } catch {
-        return false;
-    }
-}
+/** Signature ids are opaque; cap them so a stray blob cannot bloat the row. */
+const MAX_SIGNATURE_ID_LEN = 128;
 
 export async function POST(request: Request) {
     const provided = request.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
@@ -83,6 +78,24 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, ignored: true, reason: "not-a-signature" });
     }
 
+    // A SIGNATURE WITHOUT AN ARTIFACT IS NOT EVIDENCE.
+    //
+    // `signed:true` on its own used to close the chase, so a truncated or
+    // malformed forwarder row silenced a genuinely missing receipt and left
+    // nothing behind that a human could open. The memo has to be backed by the
+    // affidavit app's own durable copy — a Drive/Storage PDF link, or the
+    // signature id that identifies the stored record. Neither present is a 400
+    // and NOTHING is written: no resolution, no clear.
+    const artifactUrl = isDurableArtifactUrl(body.pdf_url) ? body.pdf_url : null;
+    const rawSignatureId = typeof body.signature_id === "string" ? body.signature_id.trim() : "";
+    const signatureId = rawSignatureId ? rawSignatureId.slice(0, MAX_SIGNATURE_ID_LEN) : null;
+    if (!artifactUrl && !signatureId) {
+        return NextResponse.json(
+            { ok: false, reason: "missing-artifact", targetKey: bankLineId },
+            { status: 400 },
+        );
+    }
+
     // RECORD FIRST, CLEAR ONLY IF IT COMMITTED.
     //
     // This used to clear the issue even when its details CAS lost — leaving a
@@ -106,9 +119,8 @@ export async function POST(request: Request) {
         // corrected amount written since must survive.
         const details = parseMissingReceiptDetails(issue.displayDetails);
         details.resolution = "memo-signed";
-        if (typeof body.pdf_url === "string" && body.pdf_url.length <= MAX_URL_LEN && isHttpsUrl(body.pdf_url)) {
-            details.pdfUrl = body.pdf_url;
-        }
+        if (artifactUrl) details.pdfUrl = artifactUrl;
+        if (signatureId) details.signatureId = signatureId;
         if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
         if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
 
