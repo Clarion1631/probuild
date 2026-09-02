@@ -136,13 +136,13 @@ export async function recalcProjectPercentComplete(
         // phase permanently at 0% while its budget dragged the weighted average
         // down, and made CO work in a shared phase inherit the estimate tasks'
         // progress instead of reporting its own.
+        // EVERY task on the project, not just the attributable ones: parenthood
+        // has to be computed over the complete set, or a coded parent whose
+        // children happen to be uncoded would look like a leaf.
         prisma.scheduleTask.findMany({
-            where: {
-                projectId: project.id,
-                OR: [{ estimateItemId: { not: null } }, { costCodeId: { not: null } }],
-            },
+            where: { projectId: project.id },
             select: {
-                id: true, status: true, type: true, costCodeId: true,
+                id: true, parentId: true, status: true, type: true, costCodeId: true,
                 estimateItem: { select: { costCodeId: true } },
             },
         }),
@@ -157,6 +157,17 @@ export async function recalcProjectPercentComplete(
     ]);
 
     const variance = reports[0]?.variance;
+
+    // Container tasks are STRUCTURE, not work. generateScheduleFromEstimate
+    // creates a phase parent per top-level estimate line and
+    // applyChangeOrderToSchedule creates one per change order; both mirror rows
+    // that are themselves excluded from the budget (section headers are not
+    // billable). Counting a parent alongside its own children means a phase with
+    // one completed leaf reports 1/2 = 50% when it is actually finished, and the
+    // deeper the estimate nests the worse it gets.
+    const hasChildren = new Set(
+        tasks.map((task) => task.parentId).filter((parentId): parentId is string => !!parentId)
+    );
 
     const counts = new Map<string, { totalTasks: number; doneTasks: number }>();
     for (const task of tasks) {
@@ -173,6 +184,9 @@ export async function recalcProjectPercentComplete(
         // Milestones and appointments are markers, not work — they must not
         // dilute (or inflate) a phase's completion ratio.
         if (task.type !== "task") continue;
+        // Neither may a container. A childless top-level task is still a leaf
+        // and still counts; only a task that actually has children is skipped.
+        if (hasChildren.has(task.id)) continue;
         const row = counts.get(costCodeId) ?? { totalTasks: 0, doneTasks: 0 };
         row.totalTasks += 1;
         if (task.status === TASK_STATUS_COMPLETE) row.doneTasks += 1;
@@ -232,7 +246,21 @@ export async function recalcProjectPercentComplete(
             "percentCompleteSource" = CASE WHEN "percentCompleteSource" IS DISTINCT FROM 'MANUAL'
                 THEN 'AUTO'::"PercentCompleteSource" ELSE "percentCompleteSource" END,
             "percentCompleteAsOf" = CASE WHEN "percentCompleteSource" IS DISTINCT FROM 'MANUAL'
-                THEN ${now}::timestamp(3) ELSE "percentCompleteAsOf" END
+                THEN ${now}::timestamp(3) ELSE "percentCompleteAsOf" END,
+            -- Seed a MISSING drift baseline the first time an auto value exists.
+            -- An override saved before the cron had ever produced a number has
+            -- nothing to snapshot, and that null used to persist forever, so the
+            -- drift rule could never fire for that job. Comparing auto against
+            -- the MANUAL value instead is a different quantity entirely (auto
+            -- 64 -> 58 is six points of drift but reads as four from a manual
+            -- 60). Taking the first real auto value AS the baseline restores the
+            -- promised rule: every later comparison is auto-vs-auto.
+            "percentCompleteAutoAtOverride" = CASE
+                WHEN "percentCompleteSource" = 'MANUAL'
+                 AND "percentCompleteAutoAtOverride" IS NULL
+                 AND "percentCompleteAuto" IS NULL
+                 AND ${auto}::numeric IS NOT NULL
+                THEN ${auto}::numeric ELSE "percentCompleteAutoAtOverride" END
         WHERE "id" = ${project.id}
         RETURNING "percentComplete", "percentCompleteSource"`;
 

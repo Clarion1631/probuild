@@ -31,6 +31,7 @@ import {
     phaseProgress,
     phasesMentionedInLogs,
     formatPercentCompleteDate,
+    percentCompleteDraftValue,
 } from "../src/lib/percent-complete";
 
 function phase(over: Partial<Parameters<typeof phaseProgress>[0]> & { costCodeId?: string; budget?: number } = {}) {
@@ -224,58 +225,28 @@ test("an AUTO project never needs review, however far the auto value moved", () 
 });
 
 test("no auto value at all → nothing to review, whatever the snapshot says", () => {
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: null, autoAtOverride: 10, manual: 60 }), false);
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: null, autoAtOverride: 10 }), false);
 });
 
-// No snapshot happens when the override was saved before the cron had ever
-// produced an auto value. Returning false there would leave that job silently
-// unreviewable forever — which is the case where the machine catching up
-// matters MOST, because the human was working with no machine estimate at all.
-test("no snapshot → drift falls back to comparing auto against the manual value", () => {
-    assert.equal(
-        percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null, manual: 60 }),
-        true
-    );
-    assert.equal(
-        percentCompleteNeedsReview({ source: "MANUAL", auto: 63, autoAtOverride: null, manual: 60 }),
-        false
-    );
-});
-
-test("no snapshot: the fallback uses the same strictly-greater 5-point threshold", () => {
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65, autoAtOverride: null, manual: 60 }), false);
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65.01, autoAtOverride: null, manual: 60 }), true);
-});
-
-test("no snapshot AND no manual value → still nothing to compare", () => {
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null, manual: null }), false);
+// A null baseline means the override predates the first auto value. It does NOT
+// stay null: the nightly recalc seeds it, atomically in the same UPDATE, the
+// first time it computes a real auto value for a manually-overridden job (see
+// the seeding tests in tests/percent-complete-recalc-race.test.ts). So "no
+// review yet" here is a statement about ordering, not a permanent blind spot.
+test("no baseline yet → no review; the recalc seeds one rather than guessing", () => {
     assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 90, autoAtOverride: null }), false);
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 63, autoAtOverride: null }), false);
 });
 
-test("a real snapshot always wins over the manual fallback", () => {
-    // Snapshot says the auto value has not moved (60 → 62), even though the
-    // manual value sits far away at 5. The snapshot is the baseline; no review.
-    assert.equal(
-        percentCompleteNeedsReview({ source: "MANUAL", auto: 62, autoAtOverride: 60, manual: 5 }),
-        false
-    );
-});
-
-test("drift of exactly 5.00 points does NOT flag a review", () => {
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65, autoAtOverride: 60 }), false);
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 55, autoAtOverride: 60 }), false);
-    assert.equal(PERCENT_COMPLETE_DRIFT_POINTS, 5);
-});
-
-test("drift of 5.01 points flags a review, in either direction", () => {
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 65.01, autoAtOverride: 60 }), true);
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 54.99, autoAtOverride: 60 }), true);
-});
-
-test("drift is measured against the auto SNAPSHOT, not the manual value", () => {
-    // Manual 60 while auto has always read 20: the human simply disagrees with
-    // the machine, which is the entire point of an override. Not a review.
-    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 20, autoAtOverride: 20 }), false);
+test("drift is ALWAYS auto-vs-auto, never auto-vs-manual", () => {
+    // Both cases sit against a manual value of 60, which is deliberately not an
+    // input to the rule at all.
+    // 64 → 58 is SIX points of drift and must flag, even though it lands only
+    // two points away from the manual value.
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 58, autoAtOverride: 64 }), true);
+    // 62 → 66 is FOUR points of drift and must not flag, even though it sits
+    // six points away from the manual value.
+    assert.equal(percentCompleteNeedsReview({ source: "MANUAL", auto: 66, autoAtOverride: 62 }), false);
 });
 
 test("reset to auto clears the review flag (source AUTO, snapshot null)", () => {
@@ -398,6 +369,41 @@ test("manual input is clamped 0-100 and rounded to 2dp", () => {
     assert.equal(normalizePercentCompleteInput(140), 100);
     assert.equal(normalizePercentCompleteInput(-3), 0);
     assert.equal(normalizePercentCompleteInput(33.336), 33.34);
+});
+
+// The edit box must be re-seeded from what the server STORED, or a clamped save
+// leaves the input reading 140 beside a card reading 100% -- and the wrong one
+// is the editable one. There is no DOM harness in this repo (no jsdom, no
+// testing-library), so the round trip is covered at its seam: the exact
+// normalization the action applies, then the exact string the input is re-seeded
+// with. The component calls both of these and nothing else.
+test("a clamped save re-seeds the input with the STORED value, not the typed one", () => {
+    const typed = "140";
+    const stored = normalizePercentCompleteInput(typed);
+    assert.equal(stored, 100);
+    assert.equal(percentCompleteDraftValue(stored), "100");
+});
+
+test("a rounded save re-seeds with the rounded value", () => {
+    const stored = normalizePercentCompleteInput("33.336");
+    assert.equal(stored, 33.34);
+    assert.equal(percentCompleteDraftValue(stored), "33.34");
+});
+
+test("a below-range save re-seeds at zero", () => {
+    const stored = normalizePercentCompleteInput("-3");
+    assert.equal(stored, 0);
+    assert.equal(percentCompleteDraftValue(stored), "0");
+});
+
+test("resetting to an auto value of null empties the box rather than writing \"null\"", () => {
+    assert.equal(percentCompleteDraftValue(null), "");
+    assert.equal(percentCompleteDraftValue(undefined), "");
+});
+
+test("an in-range save re-seeds with itself", () => {
+    const stored = normalizePercentCompleteInput("60");
+    assert.equal(percentCompleteDraftValue(stored), "60");
 });
 
 test("unusable manual input is null, never 0 (0% is a claim, blank is not)", () => {

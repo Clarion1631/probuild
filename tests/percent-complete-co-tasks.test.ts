@@ -49,15 +49,15 @@ const coItem = (id: string, costCodeId: string | null, total: number) => ({
 });
 
 /** An estimate-generated task: phase comes from the live estimate item. */
-const estimateTask = (id: string, costCodeId: string | null, status: string) => ({
-    id, status, type: "task",
+const estimateTask = (id: string, costCodeId: string | null, status: string, parentId: string | null = null) => ({
+    id, status, type: "task", parentId,
     costCodeId: costCodeId,           // stamped at generation
     estimateItem: { costCodeId },     // and resolvable live
 });
 
 /** A CO-generated task: estimateItemId is ALWAYS null, so the stamp is all there is. */
-const coTask = (id: string, costCodeId: string | null, status: string) => ({
-    id, status, type: "task",
+const coTask = (id: string, costCodeId: string | null, status: string, parentId: string | null = null) => ({
+    id, status, type: "task", parentId,
     costCodeId,
     estimateItem: null,
 });
@@ -137,16 +137,69 @@ const recalc = () => recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" }
 
 // ── the query itself ────────────────────────────────────────────────────────
 
-test("the task query accepts EITHER an estimate-item link or a stamped cost code", async () => {
+test("the task query loads the WHOLE project, so parenthood can be computed", async () => {
     fixture.estimateItems = [estimateItem("i1", "cc-demo", 1_000)];
     await recalc();
 
-    // Filtering on estimateItemId alone is what made CO tasks invisible.
-    assert.deepEqual(recordedTaskQuery.where.OR, [
-        { estimateItemId: { not: null } },
-        { costCodeId: { not: null } },
-    ]);
-    assert.equal(recordedTaskQuery.where.estimateItemId, undefined);
+    // Filtering on estimateItemId alone is what made CO tasks invisible; any
+    // filter at all would also hide a coded parent whose children are uncoded,
+    // making the parent look like a leaf.
+    assert.deepEqual(recordedTaskQuery.where, { projectId: "p1" });
+    assert.equal(recordedTaskQuery.select.parentId, true);
+});
+
+// -- containers are structure, not work ------------------------------------
+
+test("a completed leaf under an incomplete PHASE PARENT reports 100, not 50", async () => {
+    // generateScheduleFromEstimate creates a phase parent per top-level estimate
+    // line -- a row that mirrors an estimate SECTION, which is itself excluded
+    // from the budget because section headers are not billable. Counting it
+    // beside its own child made a finished phase read 1/2.
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("parent", "cc-demo", "Not Started"),
+        estimateTask("leaf", "cc-demo", "Complete", "parent"),
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 100);
+});
+
+test("a childless top-level task is a LEAF and still counts", async () => {
+    // A childless top-level line inside a phased estimate is placed as a task in
+    // its own right, so "parentId is null" must not be the exclusion rule.
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.scheduleTasks = [estimateTask("solo", "cc-demo", "Not Started")];
+
+    await recalc();
+    assert.equal(written?.auto, 0);
+});
+
+test("nested containers are excluded at every level", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("grandparent", "cc-demo", "Not Started"),
+        estimateTask("parent", "cc-demo", "Not Started", "grandparent"),
+        estimateTask("leafA", "cc-demo", "Complete", "parent"),
+        estimateTask("leafB", "cc-demo", "Not Started", "parent"),
+    ];
+
+    await recalc();
+    // Only the two leaves count: 1 of 2 done.
+    assert.equal(written?.auto, 50);
+});
+
+test("the CO parent is a container too and never dilutes its phase", async () => {
+    fixture.estimateItems = [estimateItem("i1", "cc-demo", 10_000)];
+    fixture.changeOrderItems = [coItem("co1", "cc-elec", 10_000)];
+    fixture.scheduleTasks = [
+        estimateTask("t1", "cc-demo", "Complete"),
+        coTask("coParent", "cc-elec", "Not Started"),
+        coTask("coChild", "cc-elec", "Complete", "coParent"),
+    ];
+
+    await recalc();
+    assert.equal(written?.auto, 100);
 });
 
 // ── a CO-only phase ─────────────────────────────────────────────────────────

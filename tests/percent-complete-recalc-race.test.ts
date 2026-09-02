@@ -28,6 +28,7 @@ interface Row {
     percentComplete: number | null;
     percentCompleteSource: "AUTO" | "MANUAL" | null;
     percentCompleteAuto: number | null;
+    percentCompleteAutoAtOverride: number | null;
     percentCompleteAsOf: Date | null;
 }
 
@@ -45,6 +46,7 @@ function resetFixture() {
         percentComplete: 10,
         percentCompleteSource: "AUTO",
         percentCompleteAuto: 10,
+        percentCompleteAutoAtOverride: null,
         percentCompleteAsOf: null,
     };
     sqlSeen = [];
@@ -108,6 +110,17 @@ const fakePrisma = {
         // WHERE "id" = ... matched nothing.
         if (rowDeleted) return [];
 
+        // Seed a missing drift baseline the first time a real auto value exists
+        // under a manual override — evaluated against the PRE-UPDATE row, like
+        // every other CASE in the statement.
+        if (
+            row.percentCompleteSource === "MANUAL"
+            && row.percentCompleteAutoAtOverride === null
+            && row.percentCompleteAuto === null
+            && auto !== null
+        ) {
+            row.percentCompleteAutoAtOverride = auto;
+        }
         row.percentCompleteAuto = auto;
         if (row.percentCompleteSource !== "MANUAL") {
             row.percentComplete = auto;
@@ -241,6 +254,56 @@ test("a vanished project is distinguishable from an unmeasurable one", async () 
     assert.equal(vanished.notFound, true);
     assert.equal(unmeasurable.notFound, false);
     assert.equal(unmeasurable.auto, null);
+});
+
+// -- seeding a missing drift baseline ---------------------------------------
+
+test("an override saved before any auto value existed gets its baseline seeded", async () => {
+    // This job was overridden before the cron had ever run, so there was nothing
+    // to snapshot. Left null forever, the drift rule could never fire for it.
+    row.percentComplete = 60;
+    row.percentCompleteSource = "MANUAL";
+    row.percentCompleteAuto = null;
+    row.percentCompleteAutoAtOverride = null;
+
+    await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    assert.equal(row.percentCompleteAutoAtOverride, 100, "the first real auto value becomes the baseline");
+    assert.equal(row.percentCompleteAuto, 100);
+    assert.equal(row.percentComplete, 60, "the override itself is untouched");
+    assert.equal(row.percentCompleteSource, "MANUAL");
+});
+
+test("an EXISTING baseline is never re-seeded — drift must stay measurable", async () => {
+    row.percentComplete = 60;
+    row.percentCompleteSource = "MANUAL";
+    row.percentCompleteAuto = 40;
+    row.percentCompleteAutoAtOverride = 40;
+
+    await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    assert.equal(row.percentCompleteAutoAtOverride, 40, "re-seeding would erase the drift every night");
+    assert.equal(row.percentCompleteAuto, 100);
+});
+
+test("an AUTO job never gets a baseline — it has no override to drift from", async () => {
+    row.percentCompleteSource = "AUTO";
+    row.percentCompleteAuto = null;
+    row.percentCompleteAutoAtOverride = null;
+
+    await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    assert.equal(row.percentCompleteAutoAtOverride, null);
+});
+
+test("the seeding statement is part of the SAME single guarded UPDATE", async () => {
+    row.percentCompleteSource = "MANUAL";
+    row.percentCompleteAuto = null;
+    await recalcProjectPercentComplete({ id: "p1", name: "Berg ADU" });
+
+    assert.equal(sqlSeen.length, 1);
+    assert.match(sqlSeen[0], /"percentCompleteAutoAtOverride" = CASE/);
+    assert.match(sqlSeen[0], /"percentCompleteAutoAtOverride" IS NULL/);
 });
 
 test("the recalc never reads the source into JS to decide — one guarded statement", async () => {

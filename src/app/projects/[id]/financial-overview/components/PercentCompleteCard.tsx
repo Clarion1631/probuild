@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import { updateProjectPercentComplete, resetProjectPercentCompleteToAuto } from "@/lib/actions";
+import { percentCompleteDraftValue } from "@/lib/percent-complete";
 
 export interface PercentCompleteCardProps {
     projectId: string;
@@ -42,7 +43,7 @@ export interface PercentCompleteCardProps {
 export default function PercentCompleteCard(props: PercentCompleteCardProps) {
     const router = useRouter();
     const [pending, startTransition] = useTransition();
-    const [draft, setDraft] = useState(props.percentComplete === null ? "" : String(props.percentComplete));
+    const [draft, setDraft] = useState(percentCompleteDraftValue(props.percentComplete));
 
     const asOfLabel = props.asOfLabel;
     const sourceLabel = props.source === "MANUAL" ? "Manual" : props.source === "AUTO" ? "Auto" : null;
@@ -50,7 +51,11 @@ export default function PercentCompleteCard(props: PercentCompleteCardProps) {
     function save() {
         startTransition(async () => {
             try {
-                await updateProjectPercentComplete(props.projectId, draft);
+                const result = await updateProjectPercentComplete(props.projectId, draft);
+                // Re-seed from what was STORED, not from what was typed: the
+                // server clamps and rounds, so 140 comes back as 100 and the
+                // box must agree with the card above it.
+                setDraft(percentCompleteDraftValue(result.percentComplete));
                 toast.success("Percent complete saved");
                 router.refresh();
             } catch (error) {
@@ -63,7 +68,7 @@ export default function PercentCompleteCard(props: PercentCompleteCardProps) {
         startTransition(async () => {
             try {
                 const result = await resetProjectPercentCompleteToAuto(props.projectId);
-                setDraft(result.percentComplete === null ? "" : String(result.percentComplete));
+                setDraft(percentCompleteDraftValue(result.percentComplete));
                 toast.success("Back on the automatic estimate");
                 router.refresh();
             } catch (error) {

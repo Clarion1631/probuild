@@ -315,7 +315,6 @@ export async function computeProjectFinancials(
             source: percentCompleteSource,
             auto: percentCompleteAuto,
             autoAtOverride: percentCompleteAutoAtOverride,
-            manual: percentComplete,
         }),
         contractValue,
         earnedRevenue,

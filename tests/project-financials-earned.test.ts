@@ -229,14 +229,19 @@ test("an ARCHIVED accepted estimate is not contract value", async () => {
     assert.equal(fin.forecastedIncomingFromEstimates, 38_000);
 });
 
-test("a manual override with no auto snapshot still reviews when auto disagrees", async () => {
-    // Overridden before the cron had ever produced an auto value, so there was
-    // nothing to snapshot. The manual value becomes the comparison baseline.
+test("a manual override with no drift baseline does not claim a review yet", async () => {
+    // Overridden before the cron had ever produced an auto value, so there is
+    // nothing to compare against. Measuring the gap to the MANUAL value instead
+    // would answer a different question (disagreement, not drift). The nightly
+    // recalc seeds the baseline from the first real auto value; see
+    // tests/percent-complete-recalc-race.test.ts.
     fixture.project.percentCompleteAutoAtOverride = null;
     fixture.project.percentComplete = D(60);
     fixture.project.percentCompleteAuto = D(90);
     const fin = await computeProjectFinancials("p1");
-    assert.equal(fin.percentCompleteNeedsReview, true);
+    assert.equal(fin.percentCompleteNeedsReview, false);
+    // The percentage itself is still reported -- only the flag waits.
+    assert.equal(fin.percentComplete, 60);
 });
 
 test("earned revenue and margin follow contract value × percent complete", async () => {

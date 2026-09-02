@@ -72,7 +72,6 @@ export async function loadMarginDigestJobs(): Promise<MarginDigestJob[]> {
                 source: job.percentCompleteSource,
                 auto: job.percentCompleteAuto,
                 autoAtOverride: job.percentCompleteAutoAtOverride,
-                manual: job.percentComplete,
             }),
             earnedMargin: fin.earnedMargin,
             asOfLabel: formatPercentCompleteDate(job.percentCompleteAsOf, timeZone),
