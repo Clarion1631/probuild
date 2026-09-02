@@ -901,17 +901,25 @@ export async function createQBMilestoneInvoice(
 }
 
 /**
- * Fetch the customer-facing payment link, distinguishing "QuickBooks answered,
- * there is no link" from "QuickBooks did not answer".
+ * Fetch the customer-facing payment link for a QBO invoice (requires QB
+ * Payments enabled).
  *
- * `getQBInvoicePaymentLink` below collapses both into null, which is fine for a
- * caller that only wants a link if one is going spare — but fatal for the
- * paylink-pending sweep: during the 2026-09-01 outage every invoice read
- * answered 503, and a null-means-no-link sweep would have cleared every pending
- * marker without ever fetching a link. This one throws instead, so the sweep
- * stops on an outage and retries next run.
+ * `null` means one thing only: QuickBooks answered, and this invoice has no
+ * payment link. Every FAILURE is typed and thrown — 401/403 as a QboHttpError
+ * (the credential is bad; a human has to reconnect), 408/429/5xx and our own
+ * deadline as retryable (come back later).
+ *
+ * It used to return null for all of those too, which quietly cost real money in
+ * two ways. The create paths could not tell "no link exists" from "we never
+ * asked", so a 503 left a linked row with no link and no marker and nothing
+ * ever retried it. And the paylink-pending sweep would have read a 503 storm —
+ * exactly the 2026-09-01 shape — as "none of these invoices has a link" and
+ * cleared every pending marker in one pass.
+ *
+ * Callers that genuinely only want a link if one is going spare catch it
+ * explicitly at the call site (search: `getQBInvoicePaymentLink(...).catch`).
  */
-export async function readQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
+export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
     const res = await qbTimedFetch(url, {
         qbDeadline: deadline,
@@ -920,18 +928,6 @@ export async function readQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: st
     if (!res.ok) throw await qboResponseError(res, "QB invoice payment link");
     const data = await parseJsonOrNull(res);
     return data?.Invoice?.InvoiceLink || null;
-}
-
-/** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
-export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<string | null> {
-    const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
-    const res = await qbTimedFetch(url, {
-        qbDeadline: deadline,
-        headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.Invoice?.InvoiceLink || null;
 }
 
 /** One QuickBooks invoice as the ambiguous-create resolver needs to see it. */

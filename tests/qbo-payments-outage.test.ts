@@ -1638,3 +1638,54 @@ test("a row that changed under the sweep is skipped, not overwritten", async () 
     assert.equal(result.skipped, 1);
     assert.equal(milestones[0].qbInvoiceLink, null, "the unlink wins");
 });
+
+// --- The pay-link read reports its failures instead of answering null ---
+
+test("getQBInvoicePaymentLink: null means 'no link', every failure is typed", async () => {
+    const { getQBInvoicePaymentLink, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+
+    // QuickBooks answered and this invoice simply has no payment link.
+    const noLink = await withFetch(
+        async () => json(200, { Invoice: { Id: "1" } }),
+        () => getQBInvoicePaymentLink(TOKENS, "1"),
+    );
+    assert.equal(noLink, null);
+
+    const link = await withFetch(
+        async () => json(200, { Invoice: { InvoiceLink: "https://pay.example/1" } }),
+        () => getQBInvoicePaymentLink(TOKENS, "1"),
+    );
+    assert.equal(link, "https://pay.example/1");
+
+    // 401/403: the credential is bad. A human has to reconnect, so this must
+    // never read as "there is no link" — it surfaces.
+    for (const status of [401, 403]) {
+        const error = await withFetch(
+            async () => json(status, { Fault: {} }),
+            () => getQBInvoicePaymentLink(TOKENS, "1"),
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error, `status ${status} must throw`);
+        assert.equal(qboHttpStatus(error), status);
+        assert.equal(isRetryableQboError(error), false, `${status} is not something to retry into`);
+    }
+
+    // 408/429/5xx: transient. The create paths keep paylink-pending on these.
+    for (const status of [408, 429, 500, 503]) {
+        const error = await withFetch(
+            async () => json(status, { Fault: {} }),
+            () => getQBInvoicePaymentLink(TOKENS, "1"),
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.equal(isRetryableQboError(error), true, `status ${status} must be retryable`);
+    }
+});
+
+test("a transient pay-link failure on an ALREADY-linked milestone parks it for the sweep", async () => {
+    // Not an error the operator must fix: the invoice is linked and correct.
+    // Only sweepPendingPayLinks has work left to do.
+    const { isAmbiguousCreateFailure, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const { QboRetryableError, QboHttpError } = await import("../src/lib/quickbooks");
+    assert.equal(isAmbiguousCreateFailure(new QboRetryableError("503", 503)), true);
+    // ...while an auth failure is NOT swallowed into the marker.
+    assert.equal(isAmbiguousCreateFailure(new QboHttpError("401", 401)), false);
+    assert.equal(PAYLINK_PENDING_MARKER, "paylink-pending");
+});

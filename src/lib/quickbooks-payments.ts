@@ -41,7 +41,6 @@ import {
     ensureQBServiceItem,
     createQBMilestoneInvoice,
     getQBInvoicePaymentLink,
-    readQBInvoicePaymentLink,
     getQBInvoiceStatus,
     probeQBInvoice,
     getQBPayment,
@@ -333,7 +332,7 @@ export async function sweepPendingPayLinks(
     },
 ): Promise<PayLinkSweepResult> {
     const db: PayLinkSweepDb = deps?.db ?? prisma;
-    const readPayLink = deps?.readPayLink ?? readQBInvoicePaymentLink;
+    const readPayLink = deps?.readPayLink ?? getQBInvoicePaymentLink;
     const result: PayLinkSweepResult = { checked: 0, repaired: 0, noLink: 0, skipped: 0 };
 
     const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
@@ -522,17 +521,35 @@ export async function pushMilestoneToQuickBooks(
     const tokens = passedTokens ?? await getFreshQBTokens(pushDeadline);
 
     if (schedule.qbInvoiceId) {
-        const payLink = schedule.qbInvoiceLink || (await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, pushDeadline));
+        // The pay-link read now reports its failures instead of answering null.
+        // A transient one (408/429/5xx/our deadline) must not fail a milestone
+        // that is already correctly linked — it leaves PAYLINK_PENDING_MARKER so
+        // `sweepPendingPayLinks` finishes it. A 401/403 is a different animal:
+        // the credential is bad and only a human reconnect fixes it, so it
+        // surfaces.
+        let payLink = schedule.qbInvoiceLink;
+        let linkReadFailed = false;
+        if (!payLink) {
+            try {
+                payLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, pushDeadline);
+            } catch (error) {
+                if (!isAmbiguousCreateFailure(error)) throw error;
+                linkReadFailed = true;
+            }
+        }
         const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId, pushDeadline);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
-        // A reachable invoice (status read back) clears any stale voided/notFound flag.
-        const clearFlag = !!status && !!schedule.qbSyncError;
-        if (linkChanged || clearFlag) {
+        // A reachable invoice (status read back) clears any stale voided/notFound
+        // flag — unless the link read just failed, in which case the row still
+        // has work outstanding and must keep a marker for the sweep.
+        const clearFlag = !!status && !!schedule.qbSyncError && !linkReadFailed;
+        if (linkChanged || clearFlag || linkReadFailed) {
             await prisma.paymentSchedule.update({
                 where: { id: schedule.id },
                 data: {
                     ...(linkChanged ? { qbInvoiceLink: payLink } : {}),
                     ...(clearFlag ? { qbSyncError: null } : {}),
+                    ...(linkReadFailed ? { qbSyncError: PAYLINK_PENDING_MARKER } : {}),
                 },
             });
         }
@@ -663,9 +680,11 @@ export async function pushMilestoneToQuickBooks(
             payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
         } catch (error) {
             if (!isAmbiguousCreateFailure(error)) throw error;
-            // Linked but no pay link: leave PAYLINK_PENDING_MARKER for the
-            // sweep. The invoice exists and is correct; only the convenience
-            // link is missing, so this is not an error the operator must fix.
+            // Linked but no pay link: leave PAYLINK_PENDING_MARKER for
+            // sweepPendingPayLinks (below, run by the qbo-maintenance
+            // sync-payment-options action) to finish. The invoice exists and is
+            // correct; only the convenience link is missing, so this is not an
+            // error the operator must fix.
             console.warn(`[quickbooks-payments] pay link pending for ${docNumber} (QBO id ${qbId})`);
             return { qbInvoiceId: qbId, payLink: null, qbTotal: total };
         }

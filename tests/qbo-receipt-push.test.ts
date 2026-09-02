@@ -1817,11 +1817,14 @@ test("a 400 on the REAL customer create is a terminal qbo-fault at the route", a
     assert.equal(events[0].reason, "qbo-fault:400");
 });
 
-test("a 403 from an ensure is terminal too, while a 503 stays retryable", async () => {
+test("a business 4xx from an ensure is terminal, while a 503 stays retryable", async () => {
+    // Was written with 403. A 401/403 is now classified as qbo-auth (the
+    // CREDENTIAL is bad, not the receipt — see the qbo-auth tests above), so
+    // the terminal-4xx rule is exercised with a real business refusal instead.
     const { QboHttpError, QboRetryableError } = await import("../src/lib/quickbooks");
 
     const terminal = createRouteHandlers({
-        createPurchase: async () => { throw new QboHttpError("QB customer create failed (403)", 403); },
+        createPurchase: async () => { throw new QboHttpError("QB customer create failed (400): closed period", 400); },
     });
     const terminalResponse = await terminal.POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
         method: "POST",
@@ -1829,7 +1832,7 @@ test("a 403 from an ensure is terminal too, while a 503 stays retryable", async 
         headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
     }));
     assert.equal(terminalResponse.status, 200);
-    assert.deepEqual(await terminalResponse.json(), { ok: false, reason: "qbo-fault", detail: "403" });
+    assert.deepEqual(await terminalResponse.json(), { ok: false, reason: "qbo-fault", detail: "400" });
 
     const transient = createRouteHandlers({
         createPurchase: async () => { throw new QboRetryableError("QB customer create failed (503)", 503); },
@@ -1950,4 +1953,75 @@ test("typed refresh failures propagate from the attachment LOOKUP 401 retry too"
         );
         assert.equal(thrown?.name, error.name, `${error.name} was swallowed by the lookup branch`);
     }
+});
+
+// ─── Route: a bad CREDENTIAL is not a bad receipt ──────────────────────────
+
+test("route: QBO 401/403 is qbo-auth 503, not a terminal qbo-fault", async () => {
+    // The 4xx-is-terminal rule is right for a business refusal and wrong for
+    // this one: nothing is wrong with the receipt, the connection is broken.
+    // Answering 200 qbo-fault told the bot to give up and book by email, for
+    // every receipt, silently, until somebody noticed.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboHttpError(`QB purchase create failed (${status})`, status);
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events.length, 1);
+        assert.equal(events[0].status, "error", "an error event is what puts it in the digest");
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a token refresh that strands or cannot be saved is qbo-auth too", async () => {
+    const { QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+    for (const error of [new QBTokenStrandedError("HTTP 500"), new QBTokenPersistenceError()]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            getFreshTokens: async () => {
+                throw error;
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, error.name);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a genuine business 4xx is still terminal", async () => {
+    // The guard above must not swallow the case it was carved out of.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QboHttpError("QB vendor create failed (400): closed period", 400);
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "qbo-fault", detail: "400" });
+    assert.equal(events[0].status, "fallback");
 });

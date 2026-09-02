@@ -241,3 +241,21 @@ test("a lost link claim compensates the invoice it created", async () => {
     assert.deepEqual(calls.deleted, ["qb-1"]);
     assert.equal(row.qbInvoiceId, null);
 });
+
+test("an AUTH failure on the pay link surfaces; it is not filed as pending", async () => {
+    // 401/403 means the credential is bad and only a human reconnect fixes it.
+    // Filing it as paylink-pending would hide a broken connection behind a
+    // sweep that can never succeed.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo({ payLinkThrows: new QboHttpError("QB invoice payment link failed (401)", 401) });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        (e: unknown) => e instanceof Error && (e as any).status === 401,
+    );
+    // The invoice is still linked — it exists, and deleting it would be worse.
+    assert.equal(row.qbInvoiceId, "qb-1");
+    assert.equal(row.status, "Staged");
+    assert.equal(calls.deleted.length, 0, "a linked row must never have its invoice deleted");
+});

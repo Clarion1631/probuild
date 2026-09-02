@@ -876,9 +876,11 @@ export async function stageProgressBillingToQuickBooksCore(
         payLink = await qbo.getPaymentLink(tokens, qbId, stageDeadline);
     } catch (error) {
         if (!isAmbiguousCreateFailure(error)) throw error;
-        // Linked but no pay link: PAYLINK_PENDING_MARKER stays for the sweep to
-        // finish. The invoice exists and is correct; only the convenience link is
-        // missing, so this is a success, not something the operator must fix.
+        // Linked but no pay link: PAYLINK_PENDING_MARKER stays for
+        // sweepPendingPayLinks (src/lib/quickbooks-payments.ts, run by the
+        // qbo-maintenance sync-payment-options action) to finish. The invoice
+        // exists and is correct; only the convenience link is missing, so this is
+        // a success, not something the operator must fix.
         console.warn(`[progress-billing] pay link pending for ${billing.code} (QBO id ${qbId})`);
         return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: null };
     }

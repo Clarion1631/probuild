@@ -39,7 +39,14 @@ export const CREATE_IN_FLIGHT_MARKER = "create-in-flight";
  */
 export const CREATE_IN_FLIGHT_STALE_MS = 5 * 60_000;
 
-/** Pay-link fetch failed AFTER the invoice was linked; the sweep retries it. */
+/**
+ * The pay-link fetch failed AFTER the invoice was linked, transiently.
+ *
+ * The invoice itself is correct and collectible; only the convenience link is
+ * missing. `sweepPendingPayLinks` (src/lib/quickbooks-payments.ts, run by
+ * POST /api/integrations/qbo-maintenance {"action":"sync-payment-options"})
+ * is what finishes these — this marker is a work queue, not an error.
+ */
 export const PAYLINK_PENDING_MARKER = "paylink-pending";
 
 /**

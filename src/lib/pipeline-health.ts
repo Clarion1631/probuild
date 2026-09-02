@@ -83,6 +83,11 @@ export interface PipelineHealth {
     bank: TimestampProbe;
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
+    /**
+     * Events in the last 24h where QuickBooks refused the CREDENTIAL (401/403,
+     * or a refresh that stranded). Optional so an older snapshot still fits.
+     */
+    qboAuth?: CountProbe;
 }
 
 /**
@@ -136,6 +141,14 @@ export const RECOVERED_BOOKING_DETAIL = '"attachment":"attached"';
 
 /** The payments cron's per-run audit row (see quickbooks-payments.ts). */
 export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+
+/**
+ * The reason a route records when QuickBooks rejects the CREDENTIAL rather than
+ * the document (401/403, or a refresh that stranded). It needs its own line in
+ * the digest: "automation errors: 3" does not tell anyone to go and reconnect
+ * QuickBooks, and nothing else in this pipeline fixes itself less on its own.
+ */
+export const QBO_AUTH_EVENT_REASON = "qbo-auth";
 /**
  * Only a run tagged "cron" counts as the heartbeat. On-view and manual
  * refreshes write their own source precisely so they cannot stand in for an
@@ -181,6 +194,8 @@ export function evaluatePipelineHealth(input: {
     receipts24h: CountsProbe;
     bank: TimestampProbe;
     stuck: CountProbe;
+    /** Optional so existing snapshots stay valid; absent means "not measured". */
+    qboAuth?: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -204,6 +219,14 @@ export function evaluatePipelineHealth(input: {
         reasons.push("intuit-status-unreachable");
     } else if (input.intuit.indicator !== "none") {
         reasons.push(`intuit-${input.intuit.indicator}`);
+    }
+
+    if (input.qboAuth && input.qboAuth.status === "error") {
+        reasons.push("probe-failed:qboAuth");
+    } else if (input.qboAuth && input.qboAuth.count > 0) {
+        // Nothing will book until a human reconnects QuickBooks, so say that
+        // rather than folding it into a generic error count.
+        reasons.push("quickbooks-reconnect-needed");
     }
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
@@ -296,7 +319,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck] = await Promise.all([
+    const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -400,6 +423,14 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             }),
             0,
         ),
+        // Separate from `stuck` on purpose: this one names the fix.
+        probe<number>(
+            "qboAuth",
+            () => prisma.automationEvent.count({
+                where: { createdAt: { gte: since24h }, reason: QBO_AUTH_EVENT_REASON },
+            }),
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -430,6 +461,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             at: lastBankLine.value?.toISOString() ?? null,
         },
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
+        qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -446,6 +478,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
         stuck: snapshot.stuck,
+        qboAuth: snapshot.qboAuth,
     };
 }
 
@@ -497,6 +530,9 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
     ];
+    if (health.qboAuth && health.qboAuth.status === "ok" && health.qboAuth.count > 0) {
+        lines.push(`QuickBooks refused our credential ${health.qboAuth.count} time(s) in 24h — reconnect it in Settings → Integrations.`);
+    }
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);
 
     return { subject, text: lines.join("\n") };

@@ -547,3 +547,22 @@ test("the journey mapper renders attachment-failed as failed, not in-flight", as
     assert.equal(journey.finalState, "error");
     assert.equal(journey.finalReason, "failed:fault");
 });
+
+// ─── A refused credential names its own fix ─────────────────────────────────
+
+test("a QuickBooks auth refusal reads as reconnect-needed, not a generic error", () => {
+    // "Automation errors (24h): 3" does not tell anyone to reconnect
+    // QuickBooks, and nothing in this pipeline fixes itself less on its own.
+    const verdict = evaluatePipelineHealth(snapshot({ qboAuth: { status: "ok", count: 2 } }));
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.reasons.includes("quickbooks-reconnect-needed"), verdict.reasons.join(","));
+
+    // Zero is silent, and an absent probe (older snapshot) changes nothing.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({ qboAuth: { status: "ok", count: 0 } })), { ok: true, reasons: [] });
+    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+
+    // And a probe that could not run must not read as "no auth failures".
+    const failed = evaluatePipelineHealth(snapshot({ qboAuth: { status: "error", reason: "error", count: 0 } }));
+    assert.equal(failed.ok, false);
+    assert.ok(failed.reasons.includes("probe-failed:qboAuth"), failed.reasons.join(","));
+});

@@ -13,11 +13,32 @@ import {
 import {
     isQBTimeoutError,
     isQBBudgetExhaustedError,
+    isQBTokenStrandedError,
     createRouteDeadline,
     qboHttpStatus,
     type QBTokens,
     type RouteDeadline,
 } from "@/lib/quickbooks";
+
+/**
+ * QuickBooks refused the CREDENTIAL, not the receipt.
+ *
+ * 401/403 (and a refresh that stranded or could not be persisted) look like a
+ * business refusal to a status-range check, and used to be answered
+ * `qbo-fault` + 200 — terminal. That told the bot to stop trying and book by
+ * email, silently, for every receipt until somebody noticed. It is retryable in
+ * the only sense that matters: nothing is wrong with the receipt, and the
+ * moment QuickBooks is reconnected the same push succeeds.
+ */
+const QBO_AUTH_REASON = "qbo-auth";
+
+/** Did QuickBooks reject who we are, rather than what we sent? */
+function isQboAuthFailure(error: unknown): boolean {
+    if (isQBTokenStrandedError(error)) return true;
+    if (error instanceof Error && error.name === "QBTokenPersistenceError") return true;
+    const status = qboHttpStatus(error);
+    return status === 401 || status === 403;
+}
 
 /**
  * Whole-request budget, under the 60s route ceiling. Every QBO call this push
@@ -263,6 +284,14 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
                     return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
                 }
+                if (isQboAuthFailure(error)) {
+                    // Reconnect QuickBooks. 503 + retry so the bot keeps the
+                    // receipt queued instead of burning its attempts, and the
+                    // error event puts it in the morning digest.
+                    console.error("QBO receipt push auth failure", error instanceof Error ? error.name : "UnknownError");
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: QBO_AUTH_REASON }));
+                    return NextResponse.json({ ok: false, retry: true, reason: QBO_AUTH_REASON }, { status: 503 });
+                }
                 // Token refresh failures are transient (QBO outage, network) —
                 // retryable, so this is the one case that stays 500.
                 console.error("QBO receipt push token fetch failed", error instanceof Error ? error.name : "UnknownError");
@@ -337,6 +366,15 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     console.error("QBO receipt push account misconfiguration", error.message);
                     await logEvent(pushEventFromOutcome(input, { status: "fallback", reason: "account-misconfigured" }));
                     return NextResponse.json({ ok: false, reason: "account-misconfigured" });
+                }
+                if (isQboAuthFailure(error)) {
+                    // 401/403 is NOT a business refusal: the receipt is fine and
+                    // the credential is not. Terminal handling here parked every
+                    // receipt as "maybe in QuickBooks" while the connection sat
+                    // broken.
+                    console.error("QBO receipt push auth failure", error instanceof Error ? error.name : "UnknownError");
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: QBO_AUTH_REASON }));
+                    return NextResponse.json({ ok: false, retry: true, reason: QBO_AUTH_REASON }, { status: 503 });
                 }
                 // A deterministic 4xx from an ensure (customer/vendor create
                 // rejected with 400/403, a bad reference, a closed period) is a
