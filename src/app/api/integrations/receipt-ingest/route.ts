@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
@@ -117,17 +118,35 @@ export async function POST(req: Request) {
             .filter(Boolean)
             .join("; ");
 
-        await prisma.expense.create({
+        // A MATCHED PHASE IS STILL A CLAIM ABOUT THIS JOB (round 18, item 4).
+        //
+        // `matchCostCode` is a string match over the company's codes; it knows
+        // nothing about which phases this job carries, and nothing here held
+        // the answer still. The invariant locks the four tables it rests on and
+        // answers on the transaction that inserts the row; a code that is not
+        // (or no longer) a phase of this job is dropped rather than posted,
+        // with the same warning an unmatched category already produces.
+        const ingested = await prisma.$transaction(async tx => {
+            let phaseId = costCode?.id ?? null;
+            if (phaseId) {
+                const verdict = await assertPhaseOfProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    project.id,
+                    phaseId,
+                );
+                if (!verdict.ok) phaseId = null;
+            }
+            await tx.expense.create({
             data: {
                 estimateId,
                 projectId: project.id,
-                costCodeId: costCode?.id ?? null,
+                costCodeId: phaseId,
                 // The category came from the Apps Script's Gemini read, not
                 // from a person — "ai", never "capture", so nothing downstream
                 // treats it as a human's answer. No confidence: matchCostCode
                 // is a string match and has no score to report, and inventing
                 // one would be a guess presented as a measurement.
-                costCodeSource: costCode ? "ai" : null,
+                costCodeSource: phaseId ? "ai" : null,
                 costCodeConfidence: null,
                 amount,
                 vendor: body.vendor || "Unknown",
@@ -138,8 +157,15 @@ export async function POST(req: Request) {
                     `[Drive import] ${docRef} · ${group.category}` +
                     (lineSummary ? ` · ${lineSummary}` : "") +
                     ` · pending bookkeeper review`,
-            },
+                },
+            });
+            return phaseId;
         });
+        if (costCode && ingested === null) {
+            warnings.push(
+                `"${group.category}" matched ${costCode.code}, which is not a phase of this job — expense created without one`,
+            );
+        }
         created++;
     }
 

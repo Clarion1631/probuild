@@ -22,6 +22,7 @@ import {
     expectedColumns,
     expectedConstraints,
     expectedIndexes,
+    pickCompanyTimeZone,
     reanchorSql,
     statements,
     targetMatches,
@@ -296,4 +297,78 @@ test("taxSource is declared everywhere the other tax columns are", () => {
 test("Prisma declares the same default, so the migration check sees them agree", () => {
     const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
     assert.match(schema, /updatedAt DateTime @default\(now\(\)\) @updatedAt/);
+});
+
+// ── the company zone is not guessed (Codex round 18, item 5) ───────────────
+
+test("only an ABSENT settings row falls back to the app default", () => {
+    // This zone decides which quarter every legacy receipt lands in. An empty
+    // result is a database that has never had settings written, and the app's
+    // own default is the honest answer for it.
+    assert.deepEqual(pickCompanyTimeZone([]), {
+        timeZone: "America/Los_Angeles",
+        from: "default",
+    });
+    assert.deepEqual(pickCompanyTimeZone([{ timeZone: null }]), {
+        timeZone: "America/Los_Angeles",
+        from: "default",
+    });
+    assert.deepEqual(pickCompanyTimeZone([{ timeZone: "   " }]), {
+        timeZone: "America/Los_Angeles",
+        from: "default",
+    });
+});
+
+test("a configured zone is used verbatim, and reported as such", () => {
+    assert.deepEqual(pickCompanyTimeZone([{ timeZone: "America/New_York" }]), {
+        timeZone: "America/New_York",
+        from: "settings",
+    });
+    assert.deepEqual(pickCompanyTimeZone([{ timeZone: "  UTC  " }]), {
+        timeZone: "UTC",
+        from: "settings",
+    });
+});
+
+test("an UNREADABLE settings query is not an answer", () => {
+    // The old code wrapped the query in `.catch(() => [undefined])`, so a
+    // permissions error or a dropped connection read as "no settings" and
+    // quietly re-anchored a whole table into Pacific.
+    assert.throws(() => pickCompanyTimeZone(undefined as never), /refusing to guess/i);
+    assert.throws(() => pickCompanyTimeZone(null as never), /refusing to guess/i);
+});
+
+test("the script does not swallow the settings query error", () => {
+    const script = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    const read = script.slice(script.indexOf('SELECT "timeZone" FROM "CompanySettings"'));
+    assert.ok(
+        !/\.catch\(/.test(read.slice(0, 200)),
+        "an unreadable settings table must abort, not fall back",
+    );
+});
+
+test("the re-anchor is idempotent by MARKER, not by shape", () => {
+    // The time-of-day predicate was the whole guard, and it is not one for a
+    // company configured as UTC: there the rewrite is the identity, so every
+    // row stayed at midnight and stayed eligible forever.
+    const sql = reanchorSql("America/Los_Angeles");
+    assert.match(sql, /"attributionAnchoredAt" IS NULL/, "already-anchored rows are skipped");
+    assert.match(sql, /SET[\s\S]*"attributionAnchoredAt" = now\(\)/, "and the fact is recorded");
+    // The legacy selector stays: everything written by time-expense-core has
+    // always carried a real time-of-day.
+    assert.match(sql, /"date"::time = TIME '00:00:00'/);
+    // The marker column ships with the rest of the DDL, in both files.
+    assert.ok((statements as string[]).some(s => /"attributionAnchoredAt" TIMESTAMP\(3\)/.test(s)));
+    assert.match(migrationSql, /"attributionAnchoredAt" TIMESTAMP\(3\)/);
+});
+
+test("ReceiptIntake.costCodeSource ships behind the same guard as the other two", () => {
+    // Phase 1 owns that table; the column is additive and skipped when the
+    // table is not there yet (round 18, item 3).
+    const guarded = (statements as string[]).find(s => s.includes("ReceiptIntake"));
+    assert.match(guarded!, /"costCodeSource" TEXT/);
+    assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT/);
 });

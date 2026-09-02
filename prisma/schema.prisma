@@ -663,6 +663,11 @@ model Expense {
   /// the decision that there is NO tax, which is a null taxAmount and so
   /// cannot be told from "nobody has looked" without this column.
   taxSource           String?
+  /// Set by the one-off UTC re-anchor in the Phase 3 rollout script. A row that
+  /// carries it has already had its `date` moved from UTC midnight to the
+  /// company's calendar day, so a re-run skips it — the predicate alone cannot
+  /// tell a re-anchored row from one legitimately written at local midnight.
+  attributionAnchoredAt DateTime?
   /// A re-sync changed the gross out from under a tax classification a human
   /// had made, so the tax fields were cleared and this row needs a person to
   /// look at it again. Additive and default-false; the tax report ignores it
@@ -3103,6 +3108,14 @@ model ReceiptIntake {
   /// counts, so a missing answer never inflates the deduction. Set at capture
   /// (the mobile toggle) and copied onto the Expense at booking.
   installedAtCustomer Boolean?
+  /// WHO supplied `costCodeId` on this row: "user" (a signed-in person
+  /// through the app or the mobile capture screen) or "machine" (a
+  /// shared-secret forwarder resolving it from a Drive folder or a mail
+  /// rule). Booking copies the distinction onto the Expense, because a
+  /// machine's phase is a guess a later pass may correct and a person's
+  /// is not. Nullable: rows captured before this column existed say
+  /// nothing, and "nothing" is treated as a machine guess.
+  costCodeSource String?
   createdById         String?
   createdBy           User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
 

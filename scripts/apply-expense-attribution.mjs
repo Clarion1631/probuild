@@ -62,6 +62,36 @@ export function targetMatches(actual, expectDb, expectHost) {
  */
 export const DEFAULT_COMPANY_TIME_ZONE = "America/Los_Angeles";
 
+/**
+ * ONLY AN ABSENT SETTINGS ROW FALLS BACK.
+ *
+ * This decides the zone every legacy `Expense.date` is re-anchored INTO, so a
+ * wrong answer silently moves receipts between quarters on a tax filing. There
+ * are three distinguishable cases and they must not be collapsed:
+ *
+ *   * no row at all  -> a database that has never had settings written; the
+ *                       app's own default is the honest answer.
+ *   * a row with a blank zone -> same thing said differently.
+ *   * a row we could not read -> NOT an answer. The previous version wrapped
+ *                       the query in `.catch(() => [undefined])`, so a
+ *                       permissions error, a typo'd column, or a dropped
+ *                       connection read as "no settings" and quietly re-anchored
+ *                       a whole table into Pacific.
+ *
+ * So the caller passes the QUERY RESULT and this returns the zone; an error is
+ * the caller's to throw, and main() no longer swallows it.
+ */
+export function pickCompanyTimeZone(rows) {
+    if (!Array.isArray(rows)) {
+        throw new Error("CompanySettings query did not return rows; refusing to guess the company time zone");
+    }
+    const zone = rows[0]?.timeZone;
+    if (zone === undefined || zone === null || String(zone).trim() === "") {
+        return { timeZone: DEFAULT_COMPANY_TIME_ZONE, from: "default" };
+    }
+    return { timeZone: String(zone).trim(), from: "settings" };
+}
+
 /** Built per-run so the zone is the company's, not a hard-coded guess. */
 export function reanchorSql(timeZone) {
     // The zone is interpolated, so it must be a real IANA name and nothing
@@ -69,9 +99,23 @@ export function reanchorSql(timeZone) {
     if (!/^[A-Za-z][A-Za-z0-9+_-]*(\/[A-Za-z0-9+_-]+)*$/.test(timeZone)) {
         throw new Error(`Refusing to interpolate a suspicious time zone: ${timeZone}`);
     }
+    // IDEMPOTENT BY MARKER, not by shape.
+    //
+    // The predicate on the time-of-day was the whole guard: re-anchoring moves
+    // a row off 00:00 UTC, so a second run "could not match it again". That is
+    // true only when the company zone has an offset. For a company configured
+    // as UTC the rewrite is the identity, so every row stayed at midnight and
+    // stayed eligible forever — and a row legitimately written at local
+    // midnight in such a company is indistinguishable from an un-anchored one.
+    //
+    // `attributionAnchoredAt` records the fact instead of inferring it. The
+    // time-of-day predicate stays, because it is what selects the LEGACY rows
+    // (everything time-expense-core wrote has always carried a real time).
     return `UPDATE "Expense"
-   SET "date" = (("date"::date)::timestamp AT TIME ZONE '${timeZone}') AT TIME ZONE 'UTC'
+   SET "date" = (("date"::date)::timestamp AT TIME ZONE '${timeZone}') AT TIME ZONE 'UTC',
+       "attributionAnchoredAt" = now()
  WHERE "date" IS NOT NULL
+   AND "attributionAnchoredAt" IS NULL
    AND "date"::time = TIME '00:00:00'`;
 }
 
@@ -92,6 +136,10 @@ export const statements = [
     // be told from "nobody has looked" without this column. Booking never
     // overwrites "manual".
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT`,
+    // The re-anchor marker (see reanchorSql): a predicate on the time-of-day
+    // cannot tell an already-re-anchored row from one legitimately written at
+    // local midnight, so the fact is recorded on the row.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "attributionAnchoredAt" TIMESTAMP(3)`,
 
     // A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2;
     // ordering fixed in round 13, item 6).
@@ -210,6 +258,7 @@ END $$`,
        IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
          ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;
          ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN;
+         ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
        END IF;
      END $$`,
 ];
@@ -218,7 +267,7 @@ export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
         "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
-        "taxSource", "updatedAt",
+        "taxSource", "attributionAnchoredAt", "updatedAt",
     ],
 };
 
@@ -303,12 +352,16 @@ async function main() {
         }
 
         // The company zone, for the legacy re-anchor below. Read before the DDL
-        // so a missing CompanySettings row fails loudly rather than half-way.
-        const [settings] = await prisma.$queryRawUnsafe(
+        // so a bad answer fails before anything is written.
+        //
+        // NOT wrapped in a catch: an unreadable settings table is not "no
+        // settings", and treating it as such re-anchors a whole table into a
+        // zone nobody chose. An absent row is the only thing that falls back.
+        const settingsRows = await prisma.$queryRawUnsafe(
             `SELECT "timeZone" FROM "CompanySettings" WHERE id = 'singleton'`,
-        ).catch(() => [undefined]);
-        const companyTimeZone = settings?.timeZone || DEFAULT_COMPANY_TIME_ZONE;
-        console.log(`company time zone for the date re-anchor: ${companyTimeZone}`);
+        );
+        const { timeZone: companyTimeZone, from: zoneFrom } = pickCompanyTimeZone(settingsRows);
+        console.log(`company time zone for the date re-anchor: ${companyTimeZone} (from ${zoneFrom})`);
 
         // ONE TRANSACTION FOR THE WHOLE THING (Codex round 13, item 6).
         //

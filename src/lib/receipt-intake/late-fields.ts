@@ -14,6 +14,13 @@
 
 export interface LateFields {
     costCodeId?: string;
+    /**
+     * Derived, never taken from the request body: "user" when a signed-in
+     * person supplied the phase, "machine" when a shared-secret forwarder did.
+     * It rides with `costCodeId` so a late phase carries the same provenance a
+     * captured one does.
+     */
+    costCodeSource?: string;
     projectId?: string;
     /**
      * Phase 3's tax answer: was this material installed at a customer job?
@@ -28,11 +35,12 @@ export interface LateFields {
     installedAtCustomer?: boolean;
 }
 
-export type LateFieldKey = "costCodeId" | "projectId" | "installedAtCustomer";
+export type LateFieldKey = "costCodeId" | "costCodeSource" | "projectId" | "installedAtCustomer";
 export type LateFieldValue = string | boolean;
 
 export interface LateFieldRow {
     costCodeId: string | null;
+    costCodeSource?: string | null;
     projectId: string | null;
     installedAtCustomer?: boolean | null;
     state: string;

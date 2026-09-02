@@ -5,6 +5,7 @@ import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
@@ -154,8 +155,23 @@ export async function POST(req: NextRequest) {
             costTypeId = resolved.costTypeId;
         }
 
-        const newExpense = await prisma.expense.create({
-            data: {
+        // THE PHASE ANSWER THAT COUNTS, taken with the write (round 18, item 4).
+        //
+        // The check above ran on the global client and holds nothing: an
+        // estimate archived or reassigned, or the code deactivated, between it
+        // and the insert would still be stamped onto a brand new row — as
+        // "capture", which no automated pass may then correct.
+        const created = await prisma.$transaction(async tx => {
+            if (costCodeId) {
+                const verdict = await assertPhaseOfProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    projectId,
+                    costCodeId,
+                );
+                if (!verdict.ok) return { expense: null, phaseRejected: verdict.reason } as const;
+            }
+            const expense = await tx.expense.create({
+                data: {
                 estimateId,
                 // Phase 3: born with its job. Resolved above in both branches
                 // (derived from the estimate on the web path, checked against
@@ -173,10 +189,22 @@ export async function POST(req: NextRequest) {
                 description: description || null,
                 receiptUrl: receiptUrl || null,
                 status: "Pending",
-            },
+                },
+            });
+            return { expense, phaseRejected: null } as const;
         });
+        if (created.phaseRejected) {
+            return NextResponse.json(
+                {
+                    error: "That cost code stopped being one of this project's phases.",
+                    code: "PHASE_NOT_ON_PROJECT",
+                    reason: created.phaseRejected,
+                },
+                { status: 400 },
+            );
+        }
 
-        return NextResponse.json(newExpense);
+        return NextResponse.json(created.expense);
     } catch (error: any) {
         console.error("Error creating expense:", error);
         return NextResponse.json(

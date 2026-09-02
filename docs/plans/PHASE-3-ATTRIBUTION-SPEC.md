@@ -314,17 +314,57 @@ return. As built:
 * `/reports/tax-paid-at-source` counts ONLY an explicit `true`;
 * `Expense.taxDeductibleBase` (added in this PR) holds the resold portion of a MIXED
   receipt, and the report uses it in place of the pre-tax total when it is set;
-* **`Expense.taxSource`** records WHO decided the tax columns: `ocr` (the intake pipeline
-  read it off the receipt) or `manual` (a bookkeeper, through the PATCH). Booking never
-  overwrites a `manual` decision — including the decision that a receipt has NO tax, which
-  is a null `taxAmount` and cannot be told from "nobody has looked" without this column.
+* **`Expense.taxSource` is a four-state column**, not a label. It governs the two tax
+  FIGURES (`taxAmount`, `taxDeductibleBase`) and nothing else — `installedAtCustomer` is
+  its own evidence, since a non-null value already means somebody answered.
+
+  | state | meaning | who writes it | may an automated pass overwrite the figures? |
+  |---|---|---|---|
+  | `null` | nobody has looked, or nobody has looked SINCE the figures were invalidated | the initial insert | yes |
+  | `"ocr"` | the intake pipeline read the figures off the receipt | booking | yes — it is a guess, and re-readable |
+  | `"manual"` | a person supplied an amount | the PATCH, when the request carries a tax figure | **no** |
+  | `"manual-none"` | a person looked and said this receipt carries NO sales tax | the PATCH, when the request carries `taxAmount: null` | **no** |
+
+  The last two are `HUMAN_TAX_SOURCES` (`src/lib/expense-attribution.ts`); booking and the
+  QBO sync both compose `taxNotHumanDecidedWhere()` rather than testing for one of them by
+  hand. `"manual-none"` exists because a null `taxAmount` alone cannot say whether a person
+  decided there is no tax or nobody has looked yet — and OCR overwriting the first of those
+  is a bookkeeper's answer silently replaced by a machine's guess.
+
+  OMITTING the `taxAmount` key leaves `taxSource` untouched: that request said nothing
+  about tax, so nobody decided anything and a later read may still fill it.
+* **A blank deduction base means "the whole pre-tax total", and the SERVER stores it.**
+  Not a null with a remembered meaning: when a PATCH writes the tax figures and leaves
+  `taxDeductibleBase` blank, the row is saved with `amount − taxAmount` (sign intact, so a
+  refund's base is negative). Legacy nulls stay readable and the report still treats them
+  as the whole pre-tax total; nothing new is added to them.
 * **`Expense.needsTaxReview` is cleared only by an explicit acknowledgement.** A re-sync
   that moves the gross on a classified row raises it, and the report skips flagged rows.
-  Clearing it requires `taxReviewAck: true` in the PATCH body AND both `taxAmount` and
-  `taxDeductibleBase` in the same request (`installedAtCustomer` is optional — a null
-  reads as "unanswered" and cannot overstate a deduction). A partial correction is still
-  accepted; it just leaves the flag standing, because the flag means the WHOLE
-  classification is in doubt rather than whichever field the request happens to touch.
+  Clearing it requires `taxReviewAck: true` AND the `taxAmount` key in the same request —
+  either a coherent figure (→ `"manual"`) or an explicit `null` meaning "this receipt has
+  no sales tax" (→ `"manual-none"`). A request that OMITS `taxAmount` is a 400: it has
+  nothing to certify. `taxDeductibleBase` is optional (blank is computed, as above) and
+  `installedAtCustomer` is optional (a null reads as "unanswered" and cannot overstate a
+  deduction). A partial correction without the ack is still accepted; it just leaves the
+  flag standing, because the flag means the WHOLE classification is in doubt rather than
+  whichever field the request happens to touch.
+* **`ReceiptIntake.costCodeSource` records WHO captured a phase**: `"user"` (a signed-in
+  person, through the app or the mobile capture screen) or `"machine"` (a shared-secret
+  forwarder resolving it from a Drive folder or a mail rule). Booking copies the
+  distinction onto the Expense — a user's capture books as `capture` and is untouchable, a
+  machine's books as `machine` and stays correctable by the backfill and the QBO
+  suggester. It is derived from the CALLER at every door (`captureActorSource(auth.via)`),
+  never read off a request body, and a row captured before the column existed is treated
+  as a machine guess.
+* **Phase validity is a transactional invariant.** `assertPhaseOfProjectTx`
+  (`src/lib/phase-invariant.ts`) share-locks `Project` → `Estimate` → `EstimateItem` →
+  `CostCode` in that fixed order and then answers on the CALLER'S transaction, so an
+  estimate archived or reassigned, or a cost code deactivated, between the check and the
+  write cannot be written into job cost. Every Expense writer that sets a cost code calls
+  it inside its write transaction: the POST route, the PATCH, the legacy PUT,
+  `createExpenseCore`, the Drive receipt ingest, receipt booking (which parks the row as
+  `phase-changed:<reason>` rather than booking an uncoded receipt) and the QBO suggester.
+  `tests/expense-writer-phase-guard.test.ts` fails when a new writer appears without it.
 * the correction path is **`PATCH /api/expenses/[id]`**, NOT the PUT on that route. PUT is
   guarded by `assertExpenseMutableOutsideQbo`, and every expense the pipeline books carries a
   `qbPurchaseId` — so PUT cannot reach a single row the tax report is made of, and it now

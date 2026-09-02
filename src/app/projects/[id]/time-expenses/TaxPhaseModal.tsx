@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
+import { taxIsAtSource } from "@/lib/expense-attribution";
 
 /**
  * The bookkeeper's correction surface for the WA "tax paid at source" report
@@ -89,8 +90,9 @@ export default function TaxPhaseModal({
         if (parsedTax !== expense.taxAmount) {
             body.taxAmount = parsedTax;
             // `taxAtSource` is the factual "tax was charged here"; it follows
-            // the figure rather than being a second thing to get wrong.
-            body.taxAtSource = (parsedTax ?? 0) > 0;
+            // the figure rather than being a second thing to get wrong. SIGNED:
+            // a return carries negative tax and the fact still holds.
+            body.taxAtSource = taxIsAtSource(parsedTax);
         }
         const nextBase = base.trim() === "" ? null : Number(base);
         if (nextBase !== expense.taxDeductibleBase) body.taxDeductibleBase = nextBase;
@@ -106,7 +108,7 @@ export default function TaxPhaseModal({
         if (expense.needsTaxReview && reviewAck) {
             body.taxReviewAck = true;
             body.taxAmount = parsedTax;
-            body.taxAtSource = (parsedTax ?? 0) > 0;
+            body.taxAtSource = taxIsAtSource(parsedTax);
             body.taxDeductibleBase = nextBase;
         }
 
@@ -231,9 +233,10 @@ export default function TaxPhaseModal({
                         placeholder={`whole pre-tax total — ${isCredit ? "-" : ""}${money(baseCeiling)}`}
                     />
                     <span className="text-xs text-hui-textMuted">
-                        Leave blank to claim the whole pre-tax total. Set it when only part of the receipt was
-                        resold to the client; it must point the same way as the receipt and cannot exceed{" "}
-                        {isCredit ? `-${money(baseCeiling)}` : money(baseCeiling)}.
+                        Leave blank and the whole pre-tax total is recorded for you (
+                        {isCredit ? `-${money(baseCeiling)}` : money(baseCeiling)}). Set it when only part of
+                        the receipt was resold to the client; it must point the same way as the receipt and
+                        cannot exceed that amount.
                     </span>
                 </label>
 

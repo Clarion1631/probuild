@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { resolveCostCode } from "./cost-coding";
 import { prismaCostCodingDataSource } from "./cost-coding-db";
 import { isCostCodeAllowedForProject } from "./project-phases";
+import { assertPhaseOfProjectTx } from "./phase-invariant";
 import { prismaPhaseDataSource } from "./project-phases-db";
 import { resolveExpenseProjectId } from "./expense-attribution";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -211,8 +212,21 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         : null;
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
-    return prisma.expense.create({
-        data: {
+    // THE PHASE ANSWER THAT COUNTS, taken with the write (round 18, item 4).
+    // The check above answers on the global client and holds nothing; this one
+    // locks the four tables it rests on and reads them on the transaction that
+    // inserts the row.
+    return prisma.$transaction(async tx => {
+        if (costCodeId) {
+            const verdict = await assertPhaseOfProjectTx(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                estimate.projectId,
+                costCodeId,
+            );
+            if (!verdict.ok) throw new Error("That cost code isn't one of this project's phases.");
+        }
+        return tx.expense.create({
+            data: {
             estimateId,
             // Phase 3: the estimate's project, already resolved and validated
             // above (including the change-order cross-check).
@@ -231,7 +245,8 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
             receiptUrl,
             changeOrderId: changeOrder?.id ?? null,
             isBillable: data.isBillable ?? Boolean(changeOrder),
-        },
+            },
+        });
     });
 }
 

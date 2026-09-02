@@ -31,6 +31,10 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL
 -- "there is no tax here", which is a NULL taxAmount and so cannot be told from
 -- "nobody has looked" without this column. Booking never overwrites "manual".
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT;
+-- The re-anchor marker. See the UPDATE the rollout script runs: a predicate on
+-- the time-of-day cannot tell a row that has already been re-anchored from one
+-- legitimately written at local midnight, so the fact is recorded.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "attributionAnchoredAt" TIMESTAMP(3);
 
 -- A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
 --
@@ -143,5 +147,9 @@ DO $$ BEGIN
   IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
     ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN;
+    -- "user" | "machine": who supplied the captured phase. Booking copies the
+    -- distinction onto the Expense so an automated pass may correct a machine's
+    -- guess and may never touch a person's answer.
+    ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
   END IF;
 END $$;

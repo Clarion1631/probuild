@@ -610,12 +610,26 @@ test("a full acknowledgement clears the flag", async () => {
     assert.equal(updateArgs?.data.taxSource, "manual");
 });
 
-test("an acknowledgement without both figures is refused, not half-applied", async () => {
+test("an acknowledgement that OMITS taxAmount is refused, not half-applied", async () => {
+    // Round 18: a request that says nothing about tax has nothing to certify.
+    // Supplying only the amount IS enough (the base is computed), so the
+    // refusal is specifically about the key being absent.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    const res = await patch({ taxReviewAck: true, taxDeductibleBase: 50 });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).code, "TAX_REVIEW_INCOMPLETE");
     assert.equal(updateArgs, null, "nothing is written");
+});
+
+test("an acknowledgement with only the tax figure is enough", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+    assert.equal(updateArgs?.data.taxSource, "manual");
+    // ...and the blank base is STORED as the whole pre-tax total rather than
+    // left as a null whose meaning every reader has to remember.
+    assert.equal(updateArgs?.data.taxDeductibleBase, 191.19, "207.74 - 16.55");
 });
 
 test("an UNflagged row does not need an acknowledgement", async () => {
@@ -698,14 +712,17 @@ test("answering ONLY installedAtCustomer does not claim the tax figures", async 
     assert.equal(updateArgs?.data.taxSource, undefined);
 });
 
-test("an EXPLICIT null tax is a manual 'no tax' decision", async () => {
-    // Round 17, item 2. Sending the key with null is a bookkeeper looking at
-    // the receipt and saying there is no sales tax on it. Booking must not then
-    // write an OCR guess over that answer, which is what `taxSource` prevents.
+test("an EXPLICIT null tax is a manual 'no tax' decision, in its own state", async () => {
+    // Round 18: the four states are null (unreviewed), "ocr", "manual" (a
+    // person's figure) and "manual-none" (a person's "there is no tax here").
+    // The last is the one a null `taxAmount` cannot express on its own, which
+    // is the entire reason the column exists.
     const res = await patch({ taxAmount: null, taxAtSource: false });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, null, "the clear lands");
-    assert.equal(updateArgs?.data.taxSource, "manual", "and it is recorded as theirs");
+    assert.equal(updateArgs?.data.taxSource, "manual-none");
+    // With no tax, the whole receipt is the pre-tax total, and it is stored.
+    assert.equal(updateArgs?.data.taxDeductibleBase, 207.74);
 });
 
 test("an OMITTED tax key leaves the provenance alone", async () => {
@@ -733,14 +750,17 @@ test("a phase-only edit touches neither the flag nor the provenance", async () =
 
 // ── an acknowledgement must carry real figures (round 17, item 2) ──────────
 
-test("an ack whose taxAmount is null is refused, and the flag stays", async () => {
-    // "I re-checked these numbers" has to contain numbers. A null would
-    // certify an empty row straight back into the excise report.
+test("a FLAGGED no-tax workflow: ack + null clears the flag as manual-none", async () => {
+    // The whole point of the flag is that a person looks again. "I looked, and
+    // this receipt has no sales tax" is one of the two answers they can reach,
+    // and refusing it would leave the row flagged forever.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxAmount: null, taxDeductibleBase: 50 });
-    assert.equal(res.status, 400);
-    assert.equal((await res.json()).code, "TAX_REVIEW_INCOMPLETE");
-    assert.equal(updateArgs, null, "nothing is written, so the flag stands");
+    const res = await patch({ taxReviewAck: true, taxAmount: null });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, null);
+    assert.equal(updateArgs?.data.taxSource, "manual-none");
+    assert.equal(updateArgs?.data.needsTaxReview, false, "answered, so no longer waiting");
+    assert.equal(updateArgs?.data.taxDeductibleBase, 207.74, "the whole receipt, stored");
 });
 
 test("an ack whose figures point the wrong way is refused", async () => {
@@ -795,4 +815,38 @@ test("a refund's base is bounded by the pre-tax MAGNITUDE", async () => {
     const tooBig = await patch({ taxDeductibleBase: -47 });
     assert.equal(tooBig.status, 400);
     assert.equal(updateArgs, null);
+});
+
+// ── the four taxSource states, end to end (Codex round 18, item 2) ─────────
+
+test("a BLANK base on an ordinary tax edit is stored, not left null", async () => {
+    // "Null means the whole pre-tax total" is a rule every reader has to
+    // remember; the server writes what the person meant instead.
+    const res = await patch({ taxAmount: 16.55, taxAtSource: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxDeductibleBase, 191.19);
+});
+
+test("an EXPLICIT base is honoured, not overwritten by the computed one", async () => {
+    const res = await patch({ taxAmount: 16.55, taxDeductibleBase: 100 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxDeductibleBase, 100, "a mixed receipt keeps its split");
+});
+
+test("a REFUND's blank base is computed with the sign intact", async () => {
+    storedExpense = {
+        ...(storedExpense as object), amount: -50, taxAmount: null, taxDeductibleBase: null,
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: -4, taxAtSource: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxDeductibleBase, -46);
+});
+
+test("an installedAtCustomer-only edit computes nothing and claims nothing", async () => {
+    // It is not a tax figure, so it neither stamps provenance nor invents a
+    // deduction base for a row nobody has priced.
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, undefined);
+    assert.equal(updateArgs?.data.taxDeductibleBase, undefined);
 });

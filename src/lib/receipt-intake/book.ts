@@ -20,7 +20,7 @@
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
-import { isPlausibleReceiptTax } from "@/lib/expense-attribution";
+import { isPlausibleReceiptTax, taxNotHumanDecidedWhere } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
@@ -50,6 +50,13 @@ export interface BookableRow {
     dryRun: boolean;
     projectId: string | null;
     costCodeId: string | null;
+    /**
+     * WHO supplied `costCodeId`: "user" (a signed-in person) or "machine" (a
+     * shared-secret forwarder). Null on rows captured before this existed, and
+     * treated as a machine guess — the safe direction, since it leaves the
+     * phase correctable rather than freezing an unattributed guess in place.
+     */
+    costCodeSource: string | null;
     suggestedCostCodeId: string | null;
     /** The model's confidence in that phase suggestion, 0..1. */
     suggestedConfidence: number | null;
@@ -659,8 +666,17 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // captured code that the final project does not carry is dropped by
         // resolvePhase, and calling the survivor "capture" would then be a
         // claim about a decision that did not stick.
+        // A MACHINE'S CAPTURE IS NOT A HUMAN'S.
+        //
+        // Everything that arrived as `row.costCodeId` used to book as
+        // "capture", which `HUMAN_COST_CODE_SOURCES` makes untouchable — so a
+        // Drive folder name or a mail rule could pin a phase that no later pass
+        // was allowed to correct, with exactly the authority of a person who
+        // picked it. The intake row records which it was; booking carries that
+        // through.
+        const capturedByHuman = row.costCodeSource === "user";
         const costCodeSource = costCodeId
-            ? (costCodeId === row.costCodeId ? "capture" : "ai")
+            ? (costCodeId === row.costCodeId ? (capturedByHuman ? "capture" : "machine") : "ai")
             : null;
         const costCodeConfidence = costCodeSource === "ai" ? row.suggestedConfidence : null;
         const driveFileId = driveFileIdOf(row);
@@ -725,6 +741,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         taxAmount: true,
                         taxAtSource: true,
                         taxSource: true,
+                        receiptUrl: true,
                         installedAtCustomer: true,
                         estimate: { select: { projectId: true } },
                     },
@@ -825,7 +842,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             // two apart. The explicit NULL branch is required:
                             // SQL `<> 'manual'` is NULL for a NULL column, so a
                             // bare not-equals would drop every legacy row.
-                            OR: [{ taxSource: null }, { taxSource: { not: "manual" } }],
+                            ...taxNotHumanDecidedWhere(),
                         },
                         data: {
                             // Same bound as the create path above: an
@@ -859,6 +876,28 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             installedAtCustomer: null,
                         },
                         data: { installedAtCustomer: row.installedAtCustomer },
+                    });
+                }
+
+                // A RECOVERED ROW USUALLY HAS NO LINK TO THE DOCUMENT.
+                //
+                // v1 created plenty of Expenses with a null `receiptUrl`, and a
+                // crash between the Purchase and this commit leaves one too.
+                // Booking knows exactly where the bytes are, and a receipt
+                // nobody can open is the difference between a defensible
+                // deduction and a number in a spreadsheet.
+                //
+                // Guarded on `receiptUrl: null`, so an existing link — a Drive
+                // URL somebody fixed by hand, or one an earlier pass wrote — is
+                // never replaced by this one.
+                if (receiptUrl) {
+                    await tx.expense.updateMany({
+                        where: {
+                            id: existing.id,
+                            projectId: expectedProjectId ?? row.projectId,
+                            receiptUrl: null,
+                        },
+                        data: { receiptUrl },
                     });
                 }
 

@@ -7,6 +7,7 @@ import { after } from "next/server";
 import { suggestCode } from "./expense-cost-suggest";
 import {
     HUMAN_COST_CODE_SOURCES,
+    HUMAN_TAX_SOURCES,
     notHumanCodedExpenseWhere,
     resolveExpenseProjectId,
 } from "./expense-attribution";
@@ -785,7 +786,7 @@ export function planQboExpenseUpdate(
         existingTax !== null ||
         existingBase !== null ||
         existing.installedAtCustomer != null ||
-        existing.taxSource === "manual";
+        (HUMAN_TAX_SOURCES as readonly string[]).includes(existing.taxSource ?? "");
     const existingAmount =
         existing.amount === null || existing.amount === undefined ? null : Number(existing.amount);
     const amountMoved =

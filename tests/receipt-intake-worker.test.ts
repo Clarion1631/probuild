@@ -49,6 +49,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         dryRun: true,
         projectId: "proj-1",
         costCodeId: null,
+        costCodeSource: null,
         suggestedCostCodeId: null,
         suggestedConfidence: null,
         taxAtSource: false,

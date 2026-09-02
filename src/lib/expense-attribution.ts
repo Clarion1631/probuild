@@ -297,3 +297,57 @@ export function isPlausibleReceiptTax(taxAmount: number, grossAmount: number): b
     if (Math.sign(taxAmount) !== Math.sign(grossAmount)) return false;
     return Math.abs(taxAmount) <= maxPlausibleTaxAmount(grossAmount);
 }
+
+
+/**
+ * `Expense.taxSource` — WHO decided the two tax FIGURES (`taxAmount` and
+ * `taxDeductibleBase`), as four explicit states rather than a boolean dressed
+ * up as a string:
+ *
+ *   null          nobody has looked, or nobody has looked SINCE the figures
+ *                 were invalidated. An automated read may fill them.
+ *   "ocr"         the intake pipeline read them off the receipt. A guess, and
+ *                 re-readable: a later pass or a person may replace it.
+ *   "manual"      a person supplied an amount. Untouchable by any automated
+ *                 pass.
+ *   "manual-none" a person looked and said this receipt carries NO sales tax.
+ *                 Also untouchable — and it is the state a null `taxAmount`
+ *                 cannot express on its own, which is the entire reason this
+ *                 column exists.
+ *
+ * The last two are the human states, and both must survive a booking, a
+ * re-sync, and a backfill.
+ */
+export const HUMAN_TAX_SOURCES = ["manual", "manual-none"] as const;
+
+/**
+ * The `where` fragment for "an automated pass may write the tax figures here".
+ *
+ * The explicit NULL branch is not decoration: SQL `NOT IN (…)` is NULL for a
+ * NULL column, so a bare `notIn` silently excludes every legacy row — which is
+ * the exact opposite of the intent, since those are the rows most in need of a
+ * first read.
+ */
+export function taxNotHumanDecidedWhere(): {
+    OR: ({ taxSource: null } | { taxSource: { notIn: string[] } })[];
+} {
+    return {
+        OR: [
+            { taxSource: null },
+            { taxSource: { notIn: [...HUMAN_TAX_SOURCES] } },
+        ],
+    };
+}
+
+/**
+ * `taxAtSource` is the FACT that sales tax was charged on this receipt, and it
+ * follows the figure rather than being a second thing to get wrong.
+ *
+ * Signed: a return carries NEGATIVE tax and the fact is just as true — the tax
+ * was charged, and is now coming back. `> 0` read every credit as "no tax
+ * here", which is how a refund's tax quietly left the filing.
+ */
+export function taxIsAtSource(taxAmount: number | null | undefined): boolean {
+    if (taxAmount === null || taxAmount === undefined) return false;
+    return Number.isFinite(taxAmount) && taxAmount !== 0;
+}

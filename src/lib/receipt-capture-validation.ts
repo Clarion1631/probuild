@@ -20,3 +20,21 @@ export function optionalBool(value: unknown): boolean | null {
     if (value === "false") return false;
     return null;
 }
+
+
+/**
+ * WHO supplied a captured phase.
+ *
+ * A signed-in person picking a phase on their phone is an ANSWER. A
+ * shared-secret forwarder resolving one from a Drive folder name or a mail rule
+ * is a GUESS that happens to arrive at capture time, and it has no more
+ * standing than the suggester's. Booking copies the distinction onto the
+ * Expense, where "capture" is untouchable and a machine's phase stays
+ * correctable by the backfill and the QBO suggester.
+ *
+ * Recorded at the door, because that is the only place the caller's identity is
+ * still in hand.
+ */
+export function captureActorSource(via: "session" | "secret"): "user" | "machine" {
+    return via === "session" ? "user" : "machine";
+}

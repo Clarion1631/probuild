@@ -7,7 +7,12 @@ import {
     QboManagedExpenseError,
     assertExpenseMutableOutsideQbo,
 } from "@/lib/qbo-expense-guard";
-import { isPlausibleReceiptTax, maxPlausibleTaxAmount, resolveExpenseProjectId } from "@/lib/expense-attribution";
+import {
+    isPlausibleReceiptTax,
+    maxPlausibleTaxAmount,
+    resolveExpenseProjectId,
+    taxIsAtSource,
+} from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
@@ -257,7 +262,19 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // and the description. `undefined` tells Prisma "leave it alone";
         // an explicitly-sent null still clears the field.
         const has = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
-        const updatedExpense = await prisma.expense.update({
+        // THE PHASE ANSWER THAT COUNTS, taken with the write (round 18, item 4).
+        // Same reason as the POST and the PATCH: the check above holds nothing,
+        // and this route stamps "manual", which no automated pass may correct.
+        const legacyWrite = await prisma.$transaction(async tx => {
+            if (editsCostCode && nextCostCodeId) {
+                const verdict = await assertPhaseOfProjectTx(
+                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                    resolveExpenseProjectId(expense),
+                    nextCostCodeId,
+                );
+                if (!verdict.ok) return { expense: null, phaseRejected: verdict.reason } as const;
+            }
+            const updated = await tx.expense.update({
             where: { id },
             data: {
                 amount: nextAmount,
@@ -277,9 +294,21 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                     }
                     : {}),
             },
+            });
+            return { expense: updated, phaseRejected: null } as const;
         });
+        if (legacyWrite.phaseRejected) {
+            return NextResponse.json(
+                {
+                    error: "That cost code stopped being one of this project's phases.",
+                    code: "PHASE_NOT_ON_PROJECT",
+                    reason: legacyWrite.phaseRejected,
+                },
+                { status: 400 },
+            );
+        }
 
-        return NextResponse.json(updatedExpense);
+        return NextResponse.json(legacyWrite.expense);
     } catch (error) {
         if (error instanceof QboManagedExpenseError) {
             return NextResponse.json({ error: error.message }, { status: 409 });
@@ -405,31 +434,39 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 { status: 400 },
             );
         }
-        // AN ACKNOWLEDGEMENT MUST CARRY REAL FIGURES.
+        // AN ACKNOWLEDGEMENT MUST SAY WHAT WAS DECIDED.
         //
-        // Clearing the flag says "I have re-checked these numbers", so the
-        // request has to contain numbers to have checked: both keys present,
-        // both non-null, both finite, and both coherent with the amount — the
-        // same sign and magnitude rules the writes themselves enforce. An ack
-        // carrying `taxAmount: null` would otherwise certify an empty row back
-        // into the excise report.
+        // Clearing the flag says "I have re-checked this receipt", and there
+        // are exactly two answers a person can have re-checked TO:
+        //
+        //   * a figure — `taxAmount` a coherent number, or
+        //   * "there is no sales tax on this receipt" — `taxAmount` an explicit
+        //     null, which is a decision and is recorded as `manual-none`.
+        //
+        // What is NOT an answer is omitting the key: that request says nothing
+        // about tax at all, so there is nothing to certify and the flag stands.
+        // A blank `taxDeductibleBase` is fine either way — the server computes
+        // and stores the whole pre-tax total below rather than leaving a null
+        // whose meaning has to be remembered by every reader.
         const acknowledgesReview = body.taxReviewAck === true;
         if (acknowledgesReview) {
             const gross = Number(expense.amount);
-            const ackTax = editsTaxAmount ? Number(body.taxAmount) : Number.NaN;
-            const ackBase = editsBase ? Number(body.taxDeductibleBase) : Number.NaN;
-            const coherent = (value: number) =>
-                Number.isFinite(value) &&
-                (value === 0 || Math.sign(value) === Math.sign(gross)) &&
-                Math.abs(value) <= Math.abs(gross);
-            const complete =
-                editsTaxAmount && body.taxAmount !== null &&
-                editsBase && body.taxDeductibleBase !== null &&
-                coherent(ackTax) && coherent(ackBase);
-            if (!complete) {
+            const coherent = (value: unknown) => {
+                const parsed = Number(value);
+                return (
+                    Number.isFinite(parsed) &&
+                    (parsed === 0 || Math.sign(parsed) === Math.sign(gross)) &&
+                    Math.abs(parsed) <= Math.abs(gross)
+                );
+            };
+            const answered =
+                editsTaxAmount &&
+                (body.taxAmount === null || coherent(body.taxAmount)) &&
+                (!editsBase || body.taxDeductibleBase === null || coherent(body.taxDeductibleBase));
+            if (!answered) {
                 return NextResponse.json(
                     {
-                        error: "Acknowledging a tax review needs a real taxAmount and taxDeductibleBase in the same request.",
+                        error: "Acknowledging a tax review needs taxAmount in the same request — a figure, or an explicit null meaning this receipt has no sales tax.",
                         code: "TAX_REVIEW_INCOMPLETE",
                     },
                     { status: 400 },
@@ -440,19 +477,25 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // ordinary edits; a flagged one keeps its flag until it is given.
         const clearsReview = !expense.needsTaxReview || acknowledgesReview;
 
-        // A DECISION ABOUT THE TAX FIGURES, which an explicit null IS.
+        // WHICH OF THE FOUR STATES THIS REQUEST PUTS THE ROW IN.
         //
-        // `taxSource` governs `taxAmount` and `taxDeductibleBase`. Sending
-        // `taxAmount: null` is not an absence — it is a bookkeeper looking at
-        // the receipt and saying there is no sales tax on it, and booking must
-        // not then write an OCR guess over that. What leaves the column alone
-        // is OMITTING the key: the request said nothing about tax, so nobody
-        // decided anything and a later read may still fill it.
+        // `taxSource` governs `taxAmount` and `taxDeductibleBase` (see
+        // HUMAN_TAX_SOURCES in expense-attribution.ts):
+        //
+        //   * an explicit `taxAmount: null` is a person saying this receipt has
+        //     NO sales tax -> "manual-none". Not an absence: it is the answer a
+        //     null figure cannot express on its own, and booking must not write
+        //     an OCR guess over it.
+        //   * any other tax-figure edit -> "manual".
+        //   * OMITTING both keys leaves the column alone, so a row nobody has
+        //     spoken about stays open to an automated read.
         //
         // `installedAtCustomer` is NOT one of these — its own value is its
         // evidence (non-null means answered) and booking already refuses to
         // touch it once it is set.
         const stampsTaxProvenance = editsTaxAmount || editsBase;
+        const nextTaxSource =
+            editsTaxAmount && body.taxAmount === null ? "manual-none" : "manual";
 
         // `taxReviewAck` is not a column, so a request carrying nothing else
         // has no field to write. Told, not silently no-opped.
@@ -596,9 +639,17 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // claim is still true — tax was charged on the original purchase and is
         // coming back. Testing `<= 0` here refused every credit whose tax a
         // bookkeeper tried to record.
+        // DERIVED WHEN THE REQUEST DOES NOT SAY. `taxAtSource` is the fact that
+        // tax was charged, and it follows the figure — so a request that
+        // changes the figure and stays silent about the flag gets the flag that
+        // matches, rather than a 400 about a pair it never asserted. A caller
+        // that DOES assert both still has to make them agree.
+        const derivesAtSource = editsTaxAmount && !editsTaxAtSource;
         const resultingAtSource = editsTaxAtSource
             ? (nextTaxAtSource as boolean)
-            : Boolean(expense.taxAtSource);
+            : derivesAtSource
+                ? taxIsAtSource(nextTaxAmount)
+                : Boolean(expense.taxAtSource);
         if (resultingAtSource && resultingTax === 0) {
             return NextResponse.json(
                 { error: "taxAtSource can't be true with no tax amount on the receipt." },
@@ -673,11 +724,30 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             estimateId: expense.estimateId,
             updatedAt: expense.updatedAt,
         };
+        // A BLANK DEDUCTION BASE IS NOT A NULL WITH A MEANING.
+        //
+        // "Null means the whole pre-tax total" is a rule every reader has to
+        // remember, and the report is one of several. When a person edits the
+        // tax figures and leaves the base blank, the server computes and stores
+        // what they meant — `amount - tax` — so the row says it outright. The
+        // legacy nulls stay readable; nothing new adds to them.
+        const computedBase =
+            stampsTaxProvenance && (editsBase ? nextBase === null : resultingBase === null)
+                ? Math.round((Number(expense.amount) - resultingTax) * 100) / 100
+                : null;
+        const writesBase = editsBase || computedBase !== null;
+
         const data = {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
-                ...(editsBase ? { taxDeductibleBase: nextBase } : {}),
+                ...(writesBase
+                    ? { taxDeductibleBase: computedBase !== null ? computedBase : nextBase }
+                    : {}),
                 ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
-                ...(editsTaxAtSource ? { taxAtSource: nextTaxAtSource as boolean } : {}),
+                ...(editsTaxAtSource
+                    ? { taxAtSource: nextTaxAtSource as boolean }
+                    : derivesAtSource
+                        ? { taxAtSource: resultingAtSource }
+                        : {}),
                 // A human just answered, so the row is no longer awaiting one.
                 // Cleared in the SAME write as the answer: two statements would
                 // leave a window where the report sees an answered row it still
@@ -703,7 +773,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                         //     it — a blank is an absence, not a decision, and
                         //     locking the column on an absence would freeze the
                         //     row out of the pipeline forever.
-                        ...(stampsTaxProvenance ? { taxSource: "manual" } : {}),
+                        ...(stampsTaxProvenance ? { taxSource: nextTaxSource } : {}),
                     }
                     : {}),
                 ...(editsCostCode

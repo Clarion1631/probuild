@@ -5,7 +5,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { optionalBool } from "@/lib/receipt-capture-validation";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import {
     finalizeDisposition,
@@ -156,6 +156,15 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     const lateFields = Object.fromEntries(
         Object.entries(lateInput).filter(([, v]) => v !== null),
     ) as LateFields;
+    // A LATE PHASE CARRIES THE SAME PROVENANCE A CAPTURED ONE DOES.
+    //
+    // Derived from the CALLER, never read off the body: a signed-in person
+    // answering is "user", a shared-secret forwarder resolving the job from a
+    // Drive folder is "machine". Booking makes the first untouchable and leaves
+    // the second correctable, which is the whole point of recording it.
+    if (lateFields.costCodeId) {
+        lateFields.costCodeSource = captureActorSource(auth.via);
+    }
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },

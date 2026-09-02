@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
-import { optionalBool } from "@/lib/receipt-capture-validation";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
 import { SECURE_BUCKET } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
@@ -148,6 +148,7 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId,
                 costCodeId,
+                costCodeSource: costCodeId ? captureActorSource(auth.via) : null,
                 // Tri-state, and nothing defaults it: silence is "nobody said",
                 // which is never claimed on the excise return.
                 installedAtCustomer: optionalBool(body.installedAtCustomer),

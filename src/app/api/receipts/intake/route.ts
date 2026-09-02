@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
-import { optionalBool } from "@/lib/receipt-capture-validation";
+import { captureActorSource, optionalBool } from "@/lib/receipt-capture-validation";
 import { resolveInstalledAtCustomer } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { receiptObjectSize, uploadReceiptObject } from "@/lib/receipt-intake/bucket";
@@ -305,6 +305,9 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId: parsed.projectId,
                 costCodeId: parsed.costCodeId,
+                // Only meaningful when a phase was actually supplied; a row
+                // with no captured code has no captured provenance either.
+                costCodeSource: parsed.costCodeId ? captureActorSource(auth.via) : null,
                 installedAtCustomer: resolveInstalledAtCustomer(parsed.installedAtCustomer),
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Only a shared-secret forwarder may assert this: it is the

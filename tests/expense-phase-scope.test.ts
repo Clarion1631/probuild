@@ -17,7 +17,11 @@ import { resolveCostCode, type CostCodingDataSource } from "../src/lib/cost-codi
 // mobile-auth, which throws at import time unless NEXTAUTH_SECRET is set —
 // true in CI, and a unit test has no business needing a JWT secret.
 import { resolveInstalledAtCustomer } from "../src/lib/expense-attribution";
-import { optionalBool } from "../src/lib/receipt-capture-validation";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { captureActorSource, optionalBool } from "../src/lib/receipt-capture-validation";
+
+const ROOT = path.resolve(__dirname, "..");
 import { authorizePhase } from "../src/lib/receipt-intake/late-fields";
 
 // ── the two checks every phase writer must run ─────────────────────────────
@@ -142,4 +146,42 @@ test("optionalBool is tri-state across JSON and multipart", () => {
     for (const silent of [undefined, null, "", "yes", 1, {}]) {
         assert.equal(optionalBool(silent), null, JSON.stringify(silent) ?? "undefined");
     }
+});
+
+// ── who supplied the captured phase (Codex round 18, item 3) ───────────────
+
+test("a signed-in person is 'user'; a shared-secret forwarder is 'machine'", () => {
+    // A person picking a phase on their phone is an ANSWER. A forwarder
+    // resolving one from a Drive folder name is a GUESS that happens to arrive
+    // at capture time, and it has no more standing than the suggester's.
+    assert.equal(captureActorSource("session"), "user");
+    assert.equal(captureActorSource("secret"), "machine");
+});
+
+test("both intake doors record the actor with the captured phase", () => {
+    // The value has to be written where the caller's identity is still in hand.
+    for (const rel of [
+        "src/app/api/receipts/intake/route.ts",
+        "src/app/api/receipts/intake/start/route.ts",
+    ]) {
+        const source = readFileSync(path.join(ROOT, rel), "utf8");
+        assert.match(source, /captureActorSource\(auth\.via\)/, `${rel} does not record the actor`);
+        // ...and only when a phase was actually captured: a row with no code
+        // has no captured provenance either.
+        assert.match(source, /costCodeSource: [\w.]+\s*\?\s*captureActorSource/, rel);
+    }
+});
+
+test("a late phase at finalize carries the same provenance", () => {
+    const source = readFileSync(
+        path.join(ROOT, "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    assert.match(source, /lateFields\.costCodeSource = captureActorSource\(auth\.via\)/);
+    // Derived from the CALLER, never read off the body — otherwise a forwarder
+    // could label its own guess a person's answer.
+    assert.ok(
+        !/costCodeSource:\s*(?:body|json|form)/.test(source),
+        "provenance must not be taken from the request",
+    );
 });

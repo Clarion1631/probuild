@@ -9,6 +9,8 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     HUMAN_COST_CODE_SOURCES,
     expenseForProjectWhere,
@@ -17,6 +19,7 @@ import {
     isPlausibleReceiptTax,
     maxPlausibleTaxAmount,
     notHumanCodedExpenseWhere,
+    taxIsAtSource,
     resolveExpenseCostCodeId,
     resolveExpenseProjectId,
     resolveExpenseProjectLabel,
@@ -244,4 +247,35 @@ test("a REFUND's tax is negative, and a positive one on it is refused", () => {
     assert.equal(isPlausibleReceiptTax(4, -50), false, "a dropped minus sign");
     assert.equal(isPlausibleReceiptTax(-4, 50), false, "and the same the other way");
     assert.equal(isPlausibleReceiptTax(0, -50), true, "a credit can carry no tax");
+});
+
+// ── taxAtSource follows the figure, signed (Codex round 18, item 1) ────────
+
+test("taxIsAtSource is true for any non-zero figure, either direction", () => {
+    // The FACT is "tax was charged on this receipt". On a return it is just as
+    // true — the tax was charged, and is now coming back. `> 0` read every
+    // credit as "no tax here", which is how a refund's tax left the filing.
+    assert.equal(taxIsAtSource(16.55), true);
+    assert.equal(taxIsAtSource(-4), true, "a credit still carries the fact");
+    assert.equal(taxIsAtSource(0), false, "zero is an answer: no tax");
+    assert.equal(taxIsAtSource(null), false, "and silence is not a claim");
+    assert.equal(taxIsAtSource(undefined), false);
+    assert.equal(taxIsAtSource(Number.NaN), false);
+});
+
+test("the tax & phase modal derives the flag from the figure, not from its sign", () => {
+    // The modal is the only writer a bookkeeper touches directly. It computed
+    // `(parsedTax ?? 0) > 0`, so saving a refund's -$4 of tax silently stored
+    // taxAtSource=false and dropped the row out of the excise report — on both
+    // the ordinary save and the review acknowledgement.
+    const modal = readFileSync(
+        path.join(__dirname, "..", "src/app/projects/[id]/time-expenses/TaxPhaseModal.tsx"),
+        "utf8",
+    );
+    const assignments = [...modal.matchAll(/body\.taxAtSource = ([^;]+);/g)].map(m => m[1].trim());
+    assert.equal(assignments.length, 2, "the ordinary save and the ack both set it");
+    for (const assignment of assignments) {
+        assert.equal(assignment, "taxIsAtSource(parsedTax)", "both go through the shared rule");
+    }
+    assert.ok(!/taxAtSource[^;]*>\s*0/.test(modal), "no positive-only copy survives");
 });

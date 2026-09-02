@@ -80,6 +80,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         dryRun: false,
         projectId: "proj-1",
         costCodeId: null,
+        costCodeSource: null,
         suggestedCostCodeId: "cc-plumb",
         suggestedConfidence: 0.82,
         taxAtSource: true,
@@ -154,7 +155,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
                 expenseUpdates.push(args);
                 const cur = state.existingExpense ?? {};
                 const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
-                for (const key of ["costCodeId", "taxAmount", "installedAtCustomer"]) {
+                for (const key of ["costCodeId", "taxAmount", "installedAtCustomer", "receiptUrl"]) {
                     if (key in args.where && !eq(cur[key], args.where[key])) return { count: 0 };
                 }
                 // `projectId` is pinned in every fill predicate to the
@@ -1489,4 +1490,72 @@ test("a row with NO phase is not parked by this check", async () => {
     assert.equal(result.outcome, "booked", "it books UNCODED, as it always did");
     assert.equal(asked, 2, "no third question once there is no code left to check");
     assert.equal(rec.expenses[0].costCodeId, null);
+});
+
+// ── a machine's capture is not a human's (round 18, item 3) ────────────────
+
+test("a phase captured by a PERSON books as untouchable 'capture'", () => {
+    const rec = recorder();
+    return bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "user" }), rec.deps).then(() => {
+        assert.equal(rec.expenses[0].costCodeId, "cc-demo");
+        assert.equal(rec.expenses[0].costCodeSource, "capture");
+    });
+});
+
+test("a phase captured by a FORWARDER books as correctable 'machine'", () => {
+    // A Drive folder name is a guess. Booking it as "capture" gave it exactly
+    // the authority of a person who picked it, and froze it against every later
+    // pass that could have corrected it.
+    const rec = recorder();
+    return bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "machine" }), rec.deps).then(() => {
+        assert.equal(rec.expenses[0].costCodeId, "cc-demo");
+        assert.equal(rec.expenses[0].costCodeSource, "machine");
+    });
+});
+
+test("a row captured before the column existed is treated as a machine guess", () => {
+    // The safe direction: it leaves the phase correctable rather than freezing
+    // an unattributed guess in place forever.
+    const rec = recorder();
+    return bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: null }), rec.deps).then(() => {
+        assert.equal(rec.expenses[0].costCodeSource, "machine");
+    });
+});
+
+// ── a recovered row gets its receipt link (round 18, item 6) ───────────────
+
+test("an existing Expense with NO receiptUrl is given one", () => {
+    // v1 created plenty of these, and a crash between the Purchase and the
+    // commit leaves one too. A receipt nobody can open is the difference
+    // between a defensible deduction and a number in a spreadsheet.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null, receiptUrl: null,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row(), rec.deps).then(result => {
+        assert.equal(result.outcome, "booked");
+        assert.ok(rec.existingExpense.receiptUrl, "the link is filled");
+    });
+});
+
+test("an EXISTING receiptUrl is never replaced", () => {
+    // Somebody may have fixed it by hand, or an earlier pass wrote a better
+    // one. The guard is the predicate, so a value that appears between the read
+    // and the write survives as well.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        receiptUrl: "https://drive.google.com/file/d/HAND-FIXED/view",
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    return bookReceipt(row(), rec.deps).then(() => {
+        assert.equal(
+            rec.existingExpense.receiptUrl,
+            "https://drive.google.com/file/d/HAND-FIXED/view",
+            "the existing link stands",
+        );
+    });
 });
