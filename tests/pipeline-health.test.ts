@@ -431,3 +431,69 @@ test("the digest flags an incomplete payments run in the body", () => {
     assert.match(text, /Last payments sync: .*\[incomplete run\]/);
     assert.match(text, /Needs attention: payments-sync-partial/);
 });
+
+
+// --- The latest failed run is never hidden ---
+
+test("payments-sync-error fires when the LATEST event is an error, at any age", () => {
+    // Codex gate: the heartbeat query excluded "error", so an error right after
+    // a good run was invisible; health then leaned on a 24h error count while
+    // staleness used 26h, leaving a two-hour green window (or forever, if the
+    // cron then stopped entirely).
+    const justNow = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(1 * HOUR), runStatus: "error" },
+    }));
+    assert.equal(justNow.ok, false);
+    assert.deepEqual(justNow.reasons, ["payments-sync-error"]);
+
+    // Older than the 24h `stuck` window, still red.
+    const old = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(25 * HOUR), runStatus: "error" },
+    }));
+    assert.equal(old.ok, false);
+    assert.deepEqual(old.reasons, ["payments-sync-error"]);
+});
+
+test("staleness still outranks the latest-run status", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        lastPaymentsSync: { status: "ok", at: iso(40 * HOUR), runStatus: "error" },
+    }));
+    assert.deepEqual(v.reasons, ["payments-sync-stale"]);
+});
+
+test("the digest marks a failed last payments run", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["payments-sync-error"],
+        qbo: {
+            lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+            lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "error" },
+        },
+    }));
+    assert.match(text, /Last payments sync: .*\[last run FAILED\]/);
+});
+
+// --- A booking with no receipt is not a fresh receipt ---
+
+test("attachment-failed is not a booking for freshness purposes", async () => {
+    const { ATTACHMENT_FAILED_STATUS, BOOKED_PUSH_STATUSES } = await import("../src/lib/pipeline-health");
+    const route = await import("../src/app/api/integrations/qbo-receipts/create/route");
+
+    // The route and the health check must agree on the marker, or the signal
+    // is written somewhere nothing reads.
+    assert.equal(route.ATTACHMENT_FAILED_STATUS, ATTACHMENT_FAILED_STATUS);
+    assert.equal(ATTACHMENT_FAILED_STATUS, "attachment-failed");
+    // Codex gate: a Purchase booked with no receipt used to log "created" and
+    // count as a perfectly healthy, fresh booking.
+    assert.equal(BOOKED_PUSH_STATUSES.includes(ATTACHMENT_FAILED_STATUS), false);
+});
+
+test("only a stored receipt counts as an attached booking", async () => {
+    const { attachmentSucceeded } = await import("../src/app/api/integrations/qbo-receipts/create/route");
+    assert.equal(attachmentSucceeded("attached"), true);
+    assert.equal(attachmentSucceeded("already-attached"), true);
+    for (const bad of ["skipped", "failed:400", "failed:fault", undefined]) {
+        assert.equal(attachmentSucceeded(bad), false, String(bad));
+    }
+});

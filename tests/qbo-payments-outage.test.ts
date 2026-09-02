@@ -395,3 +395,44 @@ test("a token-persistence failure marks the run failed with its own reason", asy
         { reason: "token-not-persisted", abortedOnQboOutage: false },
     );
 });
+
+
+// --- Never settle a payment we could not read ---
+
+test("a null payment read leaves the milestone unsettled and records an error", async () => {
+    const result = emptyResult();
+    const errors: string[] = [];
+    let settled = 0;
+    const { client } = fakeQbo({
+        probe: () => ({ state: "ok", balance: 0, total: 100, paymentTxnIds: ["p1"] }),
+        payment: () => null, // 400/404/malformed body
+    });
+    // Mirrors the real row body: a null read must throw, never settle.
+    const handler = async (row: { id: string; qbInvoiceId: string }) => {
+        result.checked++;
+        const probe = await client.probeInvoice(row.qbInvoiceId);
+        if (probe.state !== "ok") return;
+        if (probe.total > 0 && probe.balance <= 0) {
+            const p = await client.getPayment(probe.paymentTxnIds[0]);
+            if (!p) throw new Error("QBO payment p1 could not be read; milestone left unsettled");
+            settled++;
+        }
+    };
+    await runQboRowLoop(rows(3), result, handler, (row) => errors.push(row.id), "milestones");
+
+    // Codex gate: this used to fall back to `new Date()` and settle anyway,
+    // stamping today as the payment date - wrong money data, reported clean.
+    assert.equal(settled, 0);
+    assert.deepEqual(errors, ["s0", "s1", "s2"]);
+    assert.equal(result.abortedOnQboOutage, false, "a bad row is not an outage");
+});
+
+test("401/403/408 payment reads abort the run; a plain 404 does not", async () => {
+    const { isSharedQboFailureStatus } = await import("../src/lib/quickbooks");
+    for (const status of [401, 403, 408, 429, 500, 503]) {
+        assert.equal(isSharedQboFailureStatus(status), true, String(status));
+    }
+    for (const status of [400, 404, 409, 422]) {
+        assert.equal(isSharedQboFailureStatus(status), false, String(status));
+    }
+});

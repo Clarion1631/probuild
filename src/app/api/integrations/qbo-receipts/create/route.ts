@@ -122,9 +122,27 @@ export interface QboReceiptCreateHandlerDependencies {
  * is no trusted file id yet at that point — so they are correctly excluded
  * from this guarantee (see the early-return checks above, which log nothing).
  */
+/**
+ * A Purchase that posted but carries no receipt image.
+ *
+ * The upload can fail terminally (a QBO Fault, a hard 4xx) or be skipped
+ * (unsupported type, corrupt base64, oversized). Retrying those forever is
+ * pointless — but logging them as a plain "created"/"already-exists" was worse:
+ * the bot moved on, health counted a healthy booking, and the receipt was
+ * silently missing from the books with nothing to alert on. This status keeps
+ * the booking terminal (no retry loop) while making it visible and stopping it
+ * from refreshing receipt freshness.
+ */
+export const ATTACHMENT_FAILED_STATUS = "attachment-failed";
+
+/** Did this outcome actually get the receipt image into QuickBooks? */
+export function attachmentSucceeded(attachment: string | undefined): boolean {
+    return attachment === "attached" || attachment === "already-attached";
+}
+
 function pushEventFromOutcome(
     input: CreateQBReceiptPurchaseInput,
-    outcome: { status: "created" | "already-exists" | "fallback" | "error"; reason?: string },
+    outcome: { status: "created" | "already-exists" | "fallback" | "error" | "attachment-failed"; reason?: string },
     detail?: Record<string, unknown>,
 ): AutomationEventInput {
     const taxCents = input.groups
@@ -230,10 +248,16 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 // Apps Script treats ok:false as terminal, same convention as
                 // sendToProBuild.txt.
                 const result = await dependencies.createPurchase(tokens, input);
+                // A booking whose receipt never made it is reported as
+                // attachment-failed, not as a clean create — see
+                // ATTACHMENT_FAILED_STATUS.
+                const bookedWithoutReceipt = result.ok && !attachmentSucceeded(result.attachment);
                 const event = pushEventFromOutcome(
                     input,
                     result.ok
-                        ? { status: result.alreadyExists ? "already-exists" : "created" }
+                        ? bookedWithoutReceipt
+                            ? { status: ATTACHMENT_FAILED_STATUS, reason: result.attachment }
+                            : { status: result.alreadyExists ? "already-exists" : "created" }
                         : { status: "fallback", reason: result.reason },
                     {
                         // The QBO deep link needs the purchase id (fileId is

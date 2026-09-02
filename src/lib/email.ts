@@ -14,7 +14,21 @@ export async function sendNotification(
     subject: string,
     htmlContent: string,
     attachments?: { filename: string, content: Buffer }[],
-    options?: { fromName?: string; replyTo?: string; cc?: string[]; bcc?: string[]; copyToInternal?: boolean }
+    options?: {
+        fromName?: string;
+        replyTo?: string;
+        cc?: string[];
+        bcc?: string[];
+        copyToInternal?: boolean;
+        /**
+         * Explicit plain-text part. Without it the text body is derived by
+         * stripping tags and collapsing ALL whitespace, which turns a
+         * line-per-item report into one unreadable paragraph — fine for prose,
+         * useless for anything whose layout carries meaning. Pass the original
+         * text when you have it.
+         */
+        text?: string;
+    }
 ): Promise<{ success: boolean; id?: string }> {
     // The "to" can be comma-separated (e.g. the System Notification Email setting
     // holding several team addresses) — split into a proper recipient list.
@@ -38,8 +52,9 @@ export async function sendNotification(
         return { success: true, id: "mock_resend_id_123" };
     }
 
-    // Strip HTML tags for plain text version (improves deliverability)
-    const textContent = htmlContent
+    // Strip HTML tags for plain text version (improves deliverability).
+    // A caller-supplied `text` always wins — see the option's doc comment.
+    const textContent = options?.text ?? htmlContent
         .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
         .replace(/<[^>]+>/g, ' ')
         .replace(/\s+/g, ' ')

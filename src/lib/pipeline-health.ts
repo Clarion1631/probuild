@@ -148,6 +148,13 @@ export const PAYMENTS_SYNC_CRON_SOURCE = "cron";
  * it counts for freshness — and is then flagged separately, immediately.
  */
 export const PAYMENTS_SYNC_HEARTBEAT_STATUSES = ["ok", "partial"];
+/**
+ * A receipt-push event that booked a Purchase but never stored its receipt.
+ * Terminal by design (retrying a rejected file is a loop), so it must not count
+ * as a healthy booking — otherwise a run of them reads as a perfectly fresh
+ * receipt pipeline while every receipt is missing its image.
+ */
+export const ATTACHMENT_FAILED_STATUS = "attachment-failed";
 /** The cron runs hourly; 26h leaves room for a couple of missed runs and DST. */
 export const PAYMENTS_SYNC_STALE_HOURS = 26;
 
@@ -206,11 +213,16 @@ export function evaluatePipelineHealth(input: {
         const at = input.lastPaymentsSync.at ? Date.parse(input.lastPaymentsSync.at) : null;
         const stale = at === null || Number.isNaN(at) || input.now - at > PAYMENTS_SYNC_STALE_HOURS * HOUR_MS;
         if (stale) reasons.push("payments-sync-stale");
+        // `runStatus` is the status of the LATEST cron event, whatever it was —
+        // deliberately not the status of the run that set the freshness
+        // timestamp above. An error immediately after a good run used to be
+        // invisible here, leaving health green on the strength of the older
+        // success until the 24h error count and the 26h staleness window
+        // disagreed (a two-hour green gap) or forever if the cron then stopped.
+        else if (input.lastPaymentsSync.runStatus === "error") reasons.push("payments-sync-error");
         // A run that skipped rows or hit errors did NOT verify those payments.
         // It proves the cron is alive, so it counts for freshness — but it must
-        // be reported the same day, not hidden inside the 26h staleness window
-        // (repeated partial runs could otherwise stay green until tomorrow's
-        // digest, or indefinitely).
+        // be reported the same day, not hidden inside the 26h staleness window.
         else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
     }
 
@@ -310,22 +322,32 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 )?.createdAt ?? null,
             null,
         ),
-        probe<{ createdAt: Date; status: string } | null>(
+        probe<{ createdAt: Date | null; latestStatus: string | null }>(
             "lastPaymentsSync",
-            async () =>
-                (await prisma.automationEvent.findFirst({
-                    // "partial" counts for freshness (the cron ran) and is then
-                    // reported on its own; only a hard "error" is excluded,
-                    // since `stuck` already surfaces those.
-                    where: {
-                        kind: PAYMENTS_SYNC_EVENT_KIND,
-                        status: { in: PAYMENTS_SYNC_HEARTBEAT_STATUSES },
-                        source: PAYMENTS_SYNC_CRON_SOURCE,
-                    },
-                    orderBy: { createdAt: "desc" },
-                    select: { createdAt: true, status: true },
-                })) ?? null,
-            null,
+            async () => {
+                // TWO reads, deliberately. Freshness may only come from a run
+                // that actually ran (ok/partial), but the reason must reflect
+                // the LATEST event whatever it was — otherwise an error right
+                // after a success is invisible.
+                const [fresh, latest] = await Promise.all([
+                    prisma.automationEvent.findFirst({
+                        where: {
+                            kind: PAYMENTS_SYNC_EVENT_KIND,
+                            status: { in: PAYMENTS_SYNC_HEARTBEAT_STATUSES },
+                            source: PAYMENTS_SYNC_CRON_SOURCE,
+                        },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    }),
+                    prisma.automationEvent.findFirst({
+                        where: { kind: PAYMENTS_SYNC_EVENT_KIND, source: PAYMENTS_SYNC_CRON_SOURCE },
+                        orderBy: { createdAt: "desc" },
+                        select: { status: true },
+                    }),
+                ]);
+                return { createdAt: fresh?.createdAt ?? null, latestStatus: latest?.status ?? null };
+            },
+            { createdAt: null, latestStatus: null },
         ),
         probe<Array<{ status: string; _count: { _all: number } }>>(
             "receipts24h",
@@ -371,8 +393,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         lastPaymentsSync: {
             status: lastPaymentsSync.status,
             reason: lastPaymentsSync.reason,
-            at: lastPaymentsSync.value?.createdAt.toISOString() ?? null,
-            runStatus: lastPaymentsSync.value?.status ?? null,
+            at: lastPaymentsSync.value.createdAt?.toISOString() ?? null,
+            runStatus: lastPaymentsSync.value.latestStatus,
         },
         receipts24h: { status: receiptRows.status, reason: receiptRows.reason, counts },
         bank: {
@@ -431,7 +453,13 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         `Intuit status: ${health.intuit.indicator}${health.intuit.description ? ` (${health.intuit.description})` : ""}${health.intuit.status === "error" ? " [status page unreachable]" : ""}`,
         `Last QBO purchase sync: ${ago(health.qbo.lastPurchaseSync, now)}`,
         `Last receipt booked: ${ago(health.qbo.lastReceiptPush, now)}`,
-        `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}${health.qbo.lastPaymentsSync.runStatus === "partial" ? " [incomplete run]" : ""}`,
+        `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}${
+            health.qbo.lastPaymentsSync.runStatus === "partial"
+                ? " [incomplete run]"
+                : health.qbo.lastPaymentsSync.runStatus === "error"
+                    ? " [last run FAILED]"
+                    : ""
+        }`,
         `Receipts (24h): ${receiptsLine}`,
         `Bank ledger through: ${
             health.bank.status === "error"

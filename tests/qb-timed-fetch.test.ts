@@ -65,13 +65,13 @@ test("times out into QBTimeoutError when the server never responds", async () =>
 });
 
 test("timeout message carries the path but never the query string", async () => {
-    const error = await qbTimedFetch(`${base}/v3/company/hang?query=select%20*&token=shhh`, {}, 100)
+    const error = await qbTimedFetch(`${base}/v3/company/hang?query=select%20*&token=shhh`, {}, 1_000)
         .then(() => null, (e: unknown) => e as Error);
     assert.ok(error instanceof QBTimeoutError);
     assert.match(error.message, /\/v3\/company\/hang/);
     assert.doesNotMatch(error.message, /shhh/);
     assert.doesNotMatch(error.message, /select/);
-    assert.match(error.message, /100ms/);
+    assert.match(error.message, /1000ms/);
 });
 
 test("a successful response passes through untouched", async () => {
@@ -173,7 +173,7 @@ test("the deadline wins the race even if the caller aborts a moment later", asyn
     // outage is misreported as a caller cancellation and the receipt route
     // answers 500 instead of 503.
     const controller = new AbortController();
-    const pending = qbTimedFetch(`${base}/v3/company/hang`, { signal: controller.signal }, 60).then(
+    const pending = qbTimedFetch(`${base}/v3/company/hang`, { signal: controller.signal }, 1_000).then(
         () => null,
         (e: unknown) => e as Error,
     );
@@ -181,7 +181,8 @@ test("the deadline wins the race even if the caller aborts a moment later", asyn
     // SYNCHRONOUSLY the moment the real deadline has fired. Registered after
     // the call, so the wrapper's own timeout signal is created — and fires —
     // first. Both signals end up aborted; only the latched winner disambiguates.
-    AbortSignal.timeout(60).addEventListener("abort", () => controller.abort(), { once: true });
+    // (1s, not 60ms: deadlines are clamped to a 1s floor.)
+    AbortSignal.timeout(1_000).addEventListener("abort", () => controller.abort(), { once: true });
 
     const error = await pending;
     // Let the sibling handler land regardless of timer/microtask interleaving,
@@ -259,14 +260,14 @@ test("an already-aborted caller signal is honoured immediately without AbortSign
 
 test("QB_FETCH_TIMEOUT_MS drives the default deadline", async () => {
     const previous = process.env.QB_FETCH_TIMEOUT_MS;
-    process.env.QB_FETCH_TIMEOUT_MS = "120";
+    process.env.QB_FETCH_TIMEOUT_MS = "1200";
     try {
         const error = await qbTimedFetch(`${base}/v3/company/hang`).then(
             () => null,
             (e: unknown) => e as Error,
         );
         assert.ok(error instanceof QBTimeoutError);
-        assert.match(error.message, /120ms/);
+        assert.match(error.message, /1200ms/);
     } finally {
         if (previous === undefined) delete process.env.QB_FETCH_TIMEOUT_MS;
         else process.env.QB_FETCH_TIMEOUT_MS = previous;
@@ -285,20 +286,47 @@ test("a garbage QB_FETCH_TIMEOUT_MS falls back to the 20s default rather than th
     }
 });
 
-test("fractional and sub-1ms timeouts never reach AbortSignal.timeout", async () => {
+test("a bad timeout value never reaches AbortSignal.timeout", async () => {
     // A fraction would be coerced and a 0/negative value rejected outright,
     // which would break EVERY QB call rather than one misconfigured setting.
     for (const value of [0.5, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
         const res = await qbTimedFetch(`${base}/v3/company/query`, {}, value);
         assert.equal(res.status, 200, `timeout ${value} should fall back to the default`);
     }
-    // A valid fraction floors instead of falling back: 150.9 -> 150.
-    const error = await qbTimedFetch(`${base}/v3/company/hang`, {}, 150.9).then(
+    // A valid fraction floors instead of falling back: 1500.9 -> 1500.
+    const error = await qbTimedFetch(`${base}/v3/company/hang`, {}, 1500.9).then(
         () => null,
         (e: unknown) => e as Error,
     );
     assert.ok(error instanceof QBTimeoutError);
-    assert.match(error.message, /150ms/);
+    assert.match(error.message, /1500ms/);
+});
+
+test("a huge but FINITE timeout is clamped instead of throwing", async () => {
+    // Codex gate: AbortSignal.timeout takes an unsigned long long, so a value
+    // past that bound threw synchronously — one mistyped env var would have
+    // broken every QuickBooks call in the app. 2**32 is finite, so the
+    // Number.isFinite guard above did not catch it.
+    for (const value of [4294967296, 2 ** 53, 60_000]) {
+        // A responsive endpoint: the clamped deadline never fires, so what this
+        // asserts is that the call was MADE at all rather than throwing
+        // synchronously out of AbortSignal.timeout.
+        const res = await qbTimedFetch(`${base}/v3/company/query`, {}, value);
+        assert.equal(res.status, 200, `timeout ${value} must not throw`);
+    }
+});
+
+test("a sub-second timeout is raised to the 1s floor", async () => {
+    const started = Date.now();
+    const error = await qbTimedFetch(`${base}/v3/company/hang`, {}, 5).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    assert.ok(error instanceof QBTimeoutError);
+    assert.match(error.message, /1000ms/);
+    // A 5ms deadline would make QuickBooks permanently "down" — the floor is
+    // what stops a misconfiguration becoming a self-inflicted outage.
+    assert.ok(Date.now() - started >= 900, "must actually wait the floor");
 });
 
 

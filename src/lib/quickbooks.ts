@@ -71,6 +71,20 @@ export function isRetryableQboStatus(status: number): boolean {
 }
 
 /**
+ * A status that will repeat identically on the NEXT record.
+ *
+ * 429/5xx: QBO cannot serve requests. 401/403: the credential is bad, and it is
+ * the same credential for every remaining row. 408: the request timed out at
+ * QBO's edge, same as our own deadline firing. A caller looping over records
+ * must stop on all of these — working through the rest produces identical
+ * failures at full cost, which is how a handful of 20s waits consumed the
+ * payments cron's entire 120s ceiling.
+ */
+export function isSharedQboFailureStatus(status: number): boolean {
+    return status === 401 || status === 403 || status === 408 || isRetryableQboStatus(status);
+}
+
+/**
  * Did QBO fail in a way that means the NEXT call will fail the same way?
  *
  * A caller looping over many records must stop on this: each further attempt
@@ -99,13 +113,23 @@ function safePath(url: string): string {
     }
 }
 
-/** Clamp a configured timeout to a positive integer of milliseconds. */
+/** Below this a timeout is a self-inflicted outage; above it Vercel kills us first. */
+const QB_MIN_TIMEOUT_MS = 1_000;
+const QB_MAX_TIMEOUT_MS = 55_000;
+
+/** Clamp a configured timeout into a range AbortSignal.timeout can actually take. */
 function normalizeTimeoutMs(value: number, fallback: number): number {
     if (!Number.isFinite(value)) return fallback;
     // AbortSignal.timeout takes an unsigned integer; a fraction or a
     // sub-millisecond value would either be coerced or reject outright.
     const whole = Math.floor(value);
-    return whole >= 1 ? whole : fallback;
+    if (whole < 1) return fallback;
+    // A large-but-finite value (QB_FETCH_TIMEOUT_MS=4294967296) exceeds the
+    // unsigned-long-long bound and makes AbortSignal.timeout throw
+    // SYNCHRONOUSLY — which would break every QuickBooks call in the app over a
+    // single mistyped env var. Clamp instead: a too-long deadline is useless
+    // anyway, since the route ceiling kills the function first.
+    return Math.min(Math.max(whole, QB_MIN_TIMEOUT_MS), QB_MAX_TIMEOUT_MS);
 }
 
 interface SignalRace {
@@ -771,11 +795,7 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
     if (res.status === 400 && /"code"\s*:\s*"610"|Object Not Found/i.test(body)) {
         return { state: "notFound" };
     }
-    // 429/5xx: QBO cannot serve requests right now. 401/403: the credential
-    // itself is bad, and it is the SAME credential for every remaining row, so
-    // working through them would produce identical failures at full cost.
-    // All of these are connection-level.
-    if (res.status === 429 || res.status >= 500 || res.status === 401 || res.status === 403) {
+    if (isSharedQboFailureStatus(res.status)) {
         return { state: "error", status: res.status, connectionFailed: true };
     }
     return { state: "error", status: res.status };
@@ -788,9 +808,10 @@ export async function getQBPayment(
 ): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null> {
     const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
     if (!res.ok) {
-        // 429/5xx is QBO refusing to serve, not "this payment does not exist" —
-        // raise so a looping caller aborts instead of burning a deadline per row.
-        if (isRetryableQboStatus(res.status)) {
+        // Not "this payment does not exist" — QBO is refusing, or the shared
+        // credential is bad. Raise so a looping caller aborts instead of
+        // burning a deadline per row (and never settles off a missing read).
+        if (isSharedQboFailureStatus(res.status)) {
             throw new QboRetryableError(`QB payment read failed with status ${res.status}`, res.status);
         }
         return null;

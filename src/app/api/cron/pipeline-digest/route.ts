@@ -63,7 +63,7 @@ async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: T): Prom
 
 export interface PipelineDigestDependencies {
     getHealth: () => Promise<PipelineHealth>;
-    sendEmail: (to: string, subject: string, html: string) => Promise<{ success: boolean }>;
+    sendEmail: (to: string, subject: string, html: string, text: string) => Promise<{ success: boolean }>;
     postChat: (webhookUrl: string, text: string) => Promise<{ sent: boolean; reason?: string }>;
     getChatWebhook: () => string | undefined;
     getRecipient: () => string;
@@ -85,8 +85,10 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
             const { subject, text } = formatPipelineDigest(health);
 
             const to = dependencies.getRecipient();
-            // sendNotification takes HTML and derives its own plain-text part;
-            // <pre> keeps the line-per-item layout intact in an HTML client.
+            // <pre> keeps the line-per-item layout intact for HTML clients,
+            // and the ORIGINAL text is passed as the explicit text part — the
+            // derived one collapses every newline, flattening this report into
+            // a single unreadable line for plain-text readers.
             const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
             const html = `<pre style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.5;">${escaped}</pre>`;
 
@@ -101,7 +103,7 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
             }
             const [emailOutcome, chatOutcome] = await Promise.allSettled([
                 emailConfigured
-                    ? withDeadline(dependencies.sendEmail(to, subject, html), deadlineMs, { success: false })
+                    ? withDeadline(dependencies.sendEmail(to, subject, html, text), deadlineMs, { success: false })
                     : Promise.resolve({ success: false }),
                 chatWebhook
                     ? withDeadline(dependencies.postChat(chatWebhook, text), deadlineMs, { sent: false, reason: "timed out" })
@@ -138,8 +140,8 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
 
 const handlers = createPipelineDigestHandlers({
     getHealth: getPipelineHealth,
-    sendEmail: (to, subject, html) =>
-        sendNotification(to, subject, html, undefined, { fromName: "ProBuild" }),
+    sendEmail: (to, subject, html, text) =>
+        sendNotification(to, subject, html, undefined, { fromName: "ProBuild", text }),
     postChat: postTextToWebhook,
     getChatWebhook: () => process.env.BOT_HEALTH_CHAT_WEBHOOK,
     getRecipient: () => process.env.PIPELINE_DIGEST_TO || DEFAULT_TO,

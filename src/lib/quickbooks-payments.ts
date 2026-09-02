@@ -833,11 +833,10 @@ export async function syncQuickBooksPayments(
         take: 100,
     });
 
-    if (pending.length === 0 && pendingBillings.length === 0) {
-        await recordPaymentsSyncEvent(result, options?.source);
-        return result;
-    }
-
+    // Tokens FIRST, even with nothing to do. Recording "ok" before proving we
+    // can talk to QuickBooks let a disconnected or expired integration emit a
+    // fresh successful heartbeat every hour, forever — the health check would
+    // read a perfectly alive money rail that could not have synced anything.
     let tokens: QBTokens;
     try {
         tokens = await getFreshQBTokens();
@@ -861,6 +860,12 @@ export async function syncQuickBooksPayments(
         probeInvoice: (qbInvoiceId) => probeQBInvoice(tokens, qbInvoiceId),
         getPayment: (paymentId) => getQBPayment(tokens, paymentId),
     };
+
+    // Nothing to sync, but the credentials were just proven — a genuine "ok".
+    if (pending.length === 0 && pendingBillings.length === 0) {
+        await recordPaymentsSyncEvent(result, options?.source);
+        return result;
+    }
 
     // Milestones whose linked QBO invoice was found voided/deleted THIS run (flag was
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
@@ -930,12 +935,19 @@ export async function syncQuickBooksPayments(
                 let paidAt = new Date();
                 let referenceNumber: string | null = null;
                 if (paymentId) {
-                    // Same abort rule as the probe: a timeout/429/5xx here
-                    // throws and stops the run rather than costing another
+                    // Same abort rule as the probe: a timeout/401/403/408/429/5xx
+                    // here throws and stops the run rather than costing another
                     // full deadline on every remaining settled invoice.
                     const p = await qbo.getPayment(paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p?.referenceNumber || null;
+                    // A null read means we could not learn WHEN this was paid.
+                    // Settling anyway used to stamp `new Date()` on it, quietly
+                    // recording today as the payment date — wrong money data,
+                    // reported as a clean run. Leave it Pending and retry.
+                    if (!p) {
+                        throw new Error(`QBO payment ${paymentId} could not be read; milestone left unsettled`);
+                    }
+                    if (p.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
+                    referenceNumber = p.referenceNumber || null;
                 }
                 const recorded = await settleMilestoneFromQBPayment({
                     paymentScheduleId: schedule.id,
@@ -987,8 +999,13 @@ export async function syncQuickBooksPayments(
                 let referenceNumber: string | null = null;
                 if (paymentId) {
                     const p = await qbo.getPayment(paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p?.referenceNumber || null;
+                    // Same rule as the milestone loop: never settle a payment
+                    // whose date we could not read.
+                    if (!p) {
+                        throw new Error(`QBO payment ${paymentId} could not be read; progress billing left unsettled`);
+                    }
+                    if (p.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
+                    referenceNumber = p.referenceNumber || null;
                 }
                 const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });
                 if (settled) result.progressBillingsSettled++;
