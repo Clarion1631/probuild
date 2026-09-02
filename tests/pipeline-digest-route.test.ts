@@ -35,7 +35,7 @@ function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {
     return createPipelineDigestHandlers({
         getHealth: overrides.getHealth ?? (async () => HEALTH),
         sendEmail: overrides.sendEmail ?? (async () => ({ success: true })),
-        postChat: overrides.postChat ?? (async () => true),
+        postChat: overrides.postChat ?? (async () => ({ sent: true })),
         getChatWebhook: overrides.getChatWebhook ?? (() => undefined),
         getRecipient: overrides.getRecipient ?? (() => "ops@example.test"),
         isEmailConfigured: overrides.isEmailConfigured ?? (() => true),
@@ -131,7 +131,7 @@ test("a failing email does not stop the Chat post from being attempted", async (
             getChatWebhook: () => "https://chat.googleapis.com/v1/spaces/x",
             postChat: async () => {
                 chatCalls += 1;
-                return true;
+                return { sent: true };
             },
         });
         const response = await GET(cronRequest());
@@ -230,7 +230,7 @@ test("an unconfigured mailer still lets the Chat post through", async () => {
         const { GET } = handlers({
             isEmailConfigured: () => false,
             getChatWebhook: () => "https://chat.googleapis.com/v1/spaces/x",
-            postChat: async () => true,
+            postChat: async () => ({ sent: true }),
         });
         const response = await GET(cronRequest());
         assert.equal(response.status, 500);

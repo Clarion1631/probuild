@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getPipelineHealth, formatPipelineDigest, type PipelineHealth } from "@/lib/pipeline-health";
 import { sendNotification } from "@/lib/email";
-import { postTextToChatWebhook } from "@/lib/chat-webhook";
+import { postTextToWebhook } from "@/lib/chat-webhook";
 import { isCronAuthorized } from "@/lib/cron-auth";
 
 export const dynamic = "force-dynamic";
@@ -64,7 +64,7 @@ async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: T): Prom
 export interface PipelineDigestDependencies {
     getHealth: () => Promise<PipelineHealth>;
     sendEmail: (to: string, subject: string, html: string) => Promise<{ success: boolean }>;
-    postChat: (webhookUrl: string, text: string) => Promise<boolean>;
+    postChat: (webhookUrl: string, text: string) => Promise<{ sent: boolean; reason?: string }>;
     getChatWebhook: () => string | undefined;
     getRecipient: () => string;
     /** False when email cannot actually be delivered (see isEmailDeliveryConfigured). */
@@ -104,12 +104,12 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
                     ? withDeadline(dependencies.sendEmail(to, subject, html), deadlineMs, { success: false })
                     : Promise.resolve({ success: false }),
                 chatWebhook
-                    ? withDeadline(dependencies.postChat(chatWebhook, text), deadlineMs, false)
-                    : Promise.resolve(false),
+                    ? withDeadline(dependencies.postChat(chatWebhook, text), deadlineMs, { sent: false, reason: "timed out" })
+                    : Promise.resolve({ sent: false, reason: "no webhook configured" }),
             ]);
 
             const emailed = emailOutcome.status === "fulfilled" && emailOutcome.value.success === true;
-            const chatPosted = chatOutcome.status === "fulfilled" && chatOutcome.value === true;
+            const chatPosted = chatOutcome.status === "fulfilled" && chatOutcome.value.sent === true;
 
             console.log("[cron/pipeline-digest]", JSON.stringify({
                 ok: health.ok,
@@ -140,7 +140,7 @@ const handlers = createPipelineDigestHandlers({
     getHealth: getPipelineHealth,
     sendEmail: (to, subject, html) =>
         sendNotification(to, subject, html, undefined, { fromName: "ProBuild" }),
-    postChat: postTextToChatWebhook,
+    postChat: postTextToWebhook,
     getChatWebhook: () => process.env.BOT_HEALTH_CHAT_WEBHOOK,
     getRecipient: () => process.env.PIPELINE_DIGEST_TO || DEFAULT_TO,
 });
