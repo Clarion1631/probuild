@@ -14891,14 +14891,45 @@ export async function markTimeEntryReviewed(entryId: string) {
     const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true, email: true, role: true } });
     if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
 
-    const entry = await prisma.timeEntry.findUnique({ where: { id: entryId }, select: { id: true, needsReview: true, notes: true, reviewReason: true } });
+    const entry = await prisma.timeEntry.findUnique({
+        where: { id: entryId },
+        select: {
+            id: true, needsReview: true, notes: true, reviewReason: true, durationHours: true,
+            user: { select: { id: true, name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true } },
+        },
+    });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.needsReview) return { success: true }; // already reviewed — idempotent
+
+    // The $0-rate escape hatch has to close behind itself. A manager may close
+    // someone's punch at a $0 rate, but the flag it leaves is the ONLY thing
+    // stopping that zero-cost labor being exported and locked — so clearing it
+    // is not a rubber stamp. Require a real rate now, and REPRICE the entry in
+    // the same transaction; otherwise the flag goes away and the $0 stays.
+    const { ZERO_RATE_REVIEW_NOTE, zeroRateBlocks } = await import("./pay-rate-guard");
+    const isZeroRateFlag = (entry.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE);
+    let reprice: { laborCost: number; burdenCost: number } | null = null;
+    if (isZeroRateFlag) {
+        const owner = entry.user;
+        if (zeroRateBlocks({
+            role: owner.role,
+            email: owner.email,
+            payType: owner.payType,
+            hourlyRate: toNum(owner.hourlyRate),
+        })) {
+            throw new Error(
+                `${owner.name || owner.email} still has no hourly rate. Set it on Company → Team Members first — clearing this flag would export the shift at $0.`
+            );
+        }
+        const hours = entry.durationHours ?? 0;
+        reprice = { laborCost: hours * toNum(owner.hourlyRate), burdenCost: hours * toNum(owner.burdenRate) };
+    }
 
     const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
     await prisma.timeEntry.update({
         where: { id: entryId },
         data: {
+            ...(reprice ?? {}),
             needsReview: false,
             // Retire the settlement-owned notes (src/lib/wa-breaks.ts) so a later
             // day re-plan cannot read them as "still unanswered" and re-flag a row
@@ -15418,7 +15449,20 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
 
     // Pass 1, OUTSIDE the transaction: readiness. Cheap, and it gives the human
     // a useful message instead of a rolled-back transaction.
-    const precheck = await loadGustoExport(periodStart, periodEnd);
+    const precheck = await loadGustoExport(periodStart, periodEnd, {
+        startKey: range.startKey,
+        endKey: range.endKey,
+    });
+    // An already-locked period is NOT re-lockable. Re-running the lock would
+    // overwrite lockedAt, the locker, the hash and both snapshots — rewriting
+    // the payroll audit trail after mutable names, Gusto mappings or cost codes
+    // had changed. Unlocking is the deliberate, ADMIN-only way back.
+    if (precheck.period?.lockedAt) {
+        return {
+            success: false as const,
+            error: "That period is already locked. An admin has to unlock it before it can be locked again.",
+        };
+    }
     if (precheck.blocking.length > 0) {
         return {
             success: false as const,
@@ -15468,8 +15512,22 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                 );
             }
 
+            // Re-check INSIDE the transaction: the pre-check above is advisory,
+            // and two concurrent locks of the same period would otherwise both
+            // pass it. The exclusive advisory lock serialises them, so the
+            // second one sees the first one's committed lockedAt.
+            const existing = await tx.payrollPeriod.findUnique({
+                where: { periodStartKey_periodEndKey: { periodStartKey: range.startKey, periodEndKey: range.endKey } },
+                select: { lockedAt: true },
+            });
+            if (existing?.lockedAt) {
+                throw new Error("That period was locked by someone else while this lock was being taken.");
+            }
+
             await tx.payrollPeriod.upsert({
-                where: { periodStart_periodEnd: { periodStart, periodEnd } },
+                // Keyed on the STABLE day keys, not the timestamps — those move
+                // if the company time zone changes and would miss this row.
+                where: { periodStartKey_periodEndKey: { periodStartKey: range.startKey, periodEndKey: range.endKey } },
                 // timeZone is persisted so enforcement can rebuild this
                 // period's workweek envelope exactly as it was, even if
                 // CompanySettings.timeZone changes later.
@@ -15479,6 +15537,8 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                 // cost code) and recomputing later would not reproduce the file
                 // that was actually sent to payroll.
                 create: {
+                    periodStartKey: range.startKey,
+                    periodEndKey: range.endKey,
                     periodStart,
                     periodEnd,
                     lockedAt,
@@ -15489,6 +15549,10 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                     detailCsvSnapshot: precheck.detailCsv,
                 },
                 update: {
+                    // The timestamps are refreshed too: an UNLOCKED row keyed to
+                    // these days may have been created in a different zone.
+                    periodStart,
+                    periodEnd,
                     lockedAt,
                     lockedById: user.id,
                     exportHash: precheck.exportHash,
@@ -15498,7 +15562,11 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                 },
             });
 
-            const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx });
+            const confirmed = await loadGustoExport(periodStart, periodEnd, {
+                client: tx,
+                startKey: range.startKey,
+                endKey: range.endKey,
+            });
             if (confirmed.blocking.length > 0) {
                 throw new Error(
                     "Someone changed a time entry in this period while it was being locked. Nothing was locked - refresh and try again."
@@ -15613,23 +15681,25 @@ export async function unlockPayrollPeriod(periodStartKey: string, periodEndKey: 
     if (!user) throw new Error("Not authenticated");
     if (user.role !== "ADMIN") throw new Error("Forbidden");
 
-    const { resolveCompanyTimeZone } = await import("./company-timezone");
-    const { startOfDateInTimeZone } = await import("./tz-date");
-    const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
-    if (!DAY_KEY.test(periodStartKey) || !DAY_KEY.test(periodEndKey) || periodEndKey <= periodStartKey) {
-        return { success: false as const, error: "Pick a valid period." };
-    }
-    const timeZone = await resolveCompanyTimeZone();
-    const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
-    const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
+    // The same shared validator the lock action and the export use.
+    const { validatePayrollRange } = await import("./payroll-config");
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
 
     // Unlock deletes the snapshot: the period is editable again, so a frozen
     // CSV would immediately stop describing it. The row and its exportHash stay
     // as the record that this period WAS exported.
-    await prisma.payrollPeriod.updateMany({
-        where: { periodStart, periodEnd },
+    //
+    // Matched on the STABLE day keys. Reconstructing timestamps in today's zone
+    // missed the row entirely if the company zone had changed since the lock —
+    // zero rows updated, and the caller was still told it succeeded.
+    const unlocked = await prisma.payrollPeriod.updateMany({
+        where: { periodStartKey: range.startKey, periodEndKey: range.endKey },
         data: { lockedAt: null, summaryCsvSnapshot: null, detailCsvSnapshot: null },
     });
+    if (unlocked.count === 0) {
+        return { success: false as const, error: "There is no locked period for those dates." };
+    }
 
     revalidatePath("/manager/payroll-export");
     revalidatePath("/manager/time-entries");

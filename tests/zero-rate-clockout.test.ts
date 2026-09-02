@@ -212,3 +212,15 @@ test("the PATCH edit path still mirrors the block, and only on an OPEN -> CLOSED
     assert.match(source, /if \(zeroRate && isOwner\)/);
     assert.match(source, /appendZeroRateReview\(/);
 });
+
+test("clearing the zero-rate review flag requires a real rate and reprices the entry", () => {
+    // The flag is the ONLY thing stopping a manager-closed $0 shift being
+    // exported and locked, so "Mark reviewed" must not be a rubber stamp.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function markTimeEntryReviewed"));
+    const body = fn.slice(0, fn.indexOf("\nexport "));
+    assert.match(body, /ZERO_RATE_REVIEW_NOTE/, "it has to recognise the zero-rate flag specifically");
+    assert.match(body, /zeroRateBlocks\(/, "and re-check the rate before clearing it");
+    assert.match(body, /reprice/, "and reprice the entry rather than leaving the $0 cost");
+    assert.match(body, /laborCost: hours \* toNum\(owner\.hourlyRate\)/);
+});

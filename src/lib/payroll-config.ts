@@ -127,55 +127,30 @@ export function validatePayrollRange(startKey: unknown, endKey: unknown): Payrol
     return { ok: true, startKey, endKey, days };
 }
 
-/** The configured pay-period week start, as a day key on or before `dayKey`. */
-function configuredWeekStartKey(dayKey: string, weekStart: PayrollWeekStart): string {
-    const dow = new Date(`${dayKey}T00:00:00Z`).getUTCDay(); // 0 = Sunday
-    const back = weekStart === "sunday" ? dow : dow === 0 ? 6 : dow - 1;
-    return addDaysToKey(dayKey, -back);
-}
-
 /**
  * WORKWEEK ENVELOPE — the range a lock actually has to freeze.
  *
  * Overtime is a property of the WORKWEEK, not of the pay period: an entry
  * inside a locked period can flip between regular and OT because of hours in
  * the same week that fall OUTSIDE the period. Freezing only [periodStart,
- * periodEnd) therefore does not freeze the exported numbers — someone edits the
- * Sunday before a Monday-start period and the locked period's OT split moves.
+ * periodEnd) therefore does not freeze the exported numbers.
  *
- * The envelope is the UNION of two week alignments, and both are load-bearing:
- *
- *  - the Mon-Sun WORKWEEK from src/lib/overtime.ts, which is what the 40-hour
- *    threshold is actually computed over (WA law, not configuration); and
- *  - the configured PAYROLL_WEEK_START, which is where a human draws the
- *    period boundary.
- *
- * They coincide on the default (monday). With PAYROLL_WEEK_START=sunday they do
- * not, and taking only the configured one would leave a Monday of OT-relevant
- * hours editable. Widest wins.
+ * The envelope is the Mon-Sun WORKWEEK from src/lib/overtime.ts and NOTHING
+ * else. PAYROLL_WEEK_START deliberately does not widen it: it moves where a
+ * human draws the pay-period boundary, but WA overtime is always Monday-based,
+ * and the export only ever QUERIES Monday workweeks. Widening the lock to a
+ * Sunday alignment froze entries the readiness check never looked at and the
+ * hash never covered — locked rows that were not in the export at all.
  */
 export function payrollLockEnvelope(
     periodStart: Date,
     periodEnd: Date,
-    timeZone: string,
-    weekStart: PayrollWeekStart = payrollWeekStart()
+    timeZone: string
 ): { start: Date; end: Date } {
-    const firstDayKey = dayKeyInTimeZone(periodStart, timeZone);
-    // periodEnd is exclusive, so the last DAY inside the period is the day
-    // containing the final instant, not the day periodEnd names.
-    const lastDayKey = dayKeyInTimeZone(new Date(periodEnd.getTime() - 1), timeZone);
-
-    const startCandidates = [
-        workweekStartKey(periodStart, timeZone),
-        configuredWeekStartKey(firstDayKey, weekStart),
-    ];
-    const endCandidates = [
-        addDaysToKey(workweekStartKey(new Date(periodEnd.getTime() - 1), timeZone), 7),
-        addDaysToKey(configuredWeekStartKey(lastDayKey, weekStart), 7),
-    ];
-
-    const startKey = startCandidates.sort()[0];
-    const endKey = endCandidates.sort()[endCandidates.length - 1];
+    const startKey = workweekStartKey(periodStart, timeZone);
+    // periodEnd is exclusive, so the last instant inside the period is the one
+    // whose week must be included.
+    const endKey = addDaysToKey(workweekStartKey(new Date(periodEnd.getTime() - 1), timeZone), 7);
     return {
         start: startOfDateInTimeZone(startKey, timeZone),
         end: startOfDateInTimeZone(endKey, timeZone),

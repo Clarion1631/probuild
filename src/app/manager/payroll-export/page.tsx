@@ -79,7 +79,7 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const periodStart = startOfDateInTimeZone(startKey, timeZone);
     const periodEnd = startOfDateInTimeZone(endKeyExclusive, timeZone);
 
-    const result = await loadGustoExport(periodStart, periodEnd);
+    const result = await loadGustoExport(periodStart, periodEnd, { startKey, endKey: endKeyExclusive });
     // Overlap, not exact match: an ad-hoc range that merely overlaps a locked
     // period has no row of its own, and the exact lookup used to call it
     // unlocked while half of it was frozen.

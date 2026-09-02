@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
+import { applyRateChange } from "@/lib/pay-rate-write";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -51,7 +52,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const session = await getServerSession(authOptions);
         if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        // `permissions` is loaded because applyRateChange below asks whether
+        // this user has financialReports, not just whether they are a manager.
+        const currentUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            include: { permissions: true },
+        });
         if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
@@ -67,15 +73,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 if (userInfo.name !== undefined) data.name = userInfo.name;
                 if (userInfo.role !== undefined) data.role = userInfo.role;
                 if (userInfo.status !== undefined) data.status = userInfo.status;
-                if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
-                if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
-                // lastRateSyncAt means "last time this rate was CONFIRMED", not
-                // "last time it changed" — saving the editor with the same
-                // number is a human confirming it, and that is exactly what the
-                // Payroll rates panel's staleness warning is asking about.
-                if (userInfo.hourlyRate !== undefined || userInfo.burdenRate !== undefined) {
-                    data.lastRateSyncAt = new Date();
-                }
+                // Rates are NOT written here — see the applyRateChange call
+                // below. They need a payroll permission, an exact-decimal parse
+                // and a lastRateSyncAt stamp, and doing that inline in three
+                // routes is how two of them ended up skipping the stamp.
                 // FINANCE accounts must never be offered as dispatch-board crew —
                 // guard server-side even though the Team page hides the toggle.
                 if (userInfo.showOnDispatch !== undefined) {
@@ -90,6 +91,21 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 // project. Fail-soft inside the helper; never blocks the save.
                 const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
                 after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
+            }
+        }
+
+        // Pay rates and pay type: ONE validated path, with its own permission
+        // boundary (ADMIN or financialReports). Returns changed:false when the
+        // payload had no rate fields, so an ordinary profile edit by a MANAGER
+        // is unaffected.
+        if (userInfo) {
+            const rateResult = await applyRateChange(currentUser, id, {
+                hourlyRate: userInfo.hourlyRate,
+                burdenRate: userInfo.burdenRate,
+                payType: userInfo.payType,
+            });
+            if (!rateResult.ok) {
+                return NextResponse.json({ error: rateResult.error }, { status: rateResult.status });
             }
         }
 

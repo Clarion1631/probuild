@@ -174,3 +174,48 @@ test("an impossible calendar date is a 400, not a silently rolled-forward period
     assert.equal(res.status, 400);
     assert.equal(loads, 0);
 });
+
+test("a lock is found by its STABLE day keys, not by reconstructed timestamps", async () => {
+    // The regression: timestamps are derived from company-local days, so they
+    // move when CompanySettings.timeZone changes. An exact timestamp lookup
+    // then missed the period's own locked row — the download silently served
+    // LIVE csv instead of the frozen snapshot, and unlock updated zero rows
+    // while still reporting success.
+    const snapshot = { summaryCsv: "FROZEN\n", detailCsv: "FROZEN-D\n", exportHash: "frozen" };
+    const seen: Array<{ start: Date; keys: { startKey: string; endKey: string } }> = [];
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        // The company zone has CHANGED since the lock was taken.
+        resolveTimeZone: async () => "America/New_York",
+        load: async (periodStart, _periodEnd, keys) => {
+            seen.push({ start: periodStart, keys });
+            return loaded([], snapshot);
+        },
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), snapshot.summaryCsv, "the frozen file must still be served");
+    assert.equal(res.headers.get("x-export-source"), "snapshot");
+
+    // The day keys handed to the loader are the ones from the REQUEST, verbatim
+    // — they do not pass through the (now different) time zone.
+    assert.deepEqual(seen[0].keys, { startKey: "2026-08-17", endKey: "2026-08-31" });
+    // The timestamp, by contrast, IS zone-derived — which is exactly why it
+    // cannot be the lock's identity.
+    assert.equal(seen[0].start.toISOString(), "2026-08-17T04:00:00.000Z");
+});
+
+test("the loader is always given the request's day keys, on the live path too", async () => {
+    const seen: Array<{ startKey: string; endKey: string }> = [];
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => "America/Los_Angeles",
+        load: async (_s, _e, keys) => {
+            seen.push(keys);
+            return loaded();
+        },
+    });
+    await handler.GET(url());
+    assert.deepEqual(seen, [{ startKey: "2026-08-17", endKey: "2026-08-31" }]);
+});

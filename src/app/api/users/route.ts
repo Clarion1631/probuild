@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
             orderBy: [{ role: "asc" }, { name: "asc" }],
             select: {
                 id: true, name: true, email: true, role: true, status: true,
-                hourlyRate: true, burdenRate: true, showOnDispatch: true, pinCode: true, invitedAt: true,
+                showOnDispatch: true, pinCode: true, invitedAt: true,
                 permissions: true,
                 projectAccess: { select: { projectId: true } },
                 assignedProjects: { select: { id: true } },
@@ -32,9 +32,9 @@ export async function GET(req: NextRequest) {
         });
 
         // Never expose PIN hash to clients; replace with a boolean indicator.
-        // Payroll fields deliberately do NOT live here — this is a MANAGER-level
-        // roster endpoint, and the Payroll rates panel reads its own
-        // payroll-scoped GET /api/payroll/roster instead.
+        // Payroll fields are NOT selected here — this is a MANAGER-level roster
+        // endpoint, and pay is gated on ADMIN-or-financialReports. The Payroll
+        // rates panel reads its own payroll-scoped GET /api/payroll/roster.
         const safeUsers = users.map(({ pinCode, ...u }) => ({ ...u, hasPin: !!pinCode }));
         return NextResponse.json(safeUsers);
     } catch (error: any) {

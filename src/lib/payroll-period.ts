@@ -218,8 +218,7 @@ export function lockedPeriodFor(
         const envelope = payrollLockEnvelope(
             period.periodStart,
             period.periodEnd,
-            period.timeZone || fallbackZone,
-            options.weekStart
+            period.timeZone || fallbackZone
         );
         if (at >= envelope.start.getTime() && at < envelope.end.getTime()) return period;
     }

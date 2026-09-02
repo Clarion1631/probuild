@@ -44,6 +44,23 @@ ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "timeZone" TEXT;
 -- mutable inputs (name, email, payType, Gusto id mapping, a punch's project and
 -- cost code) and would not reproduce. Unlock clears them.
 ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "summaryCsvSnapshot" TEXT;
+
+-- AlterTable: STABLE IDENTITY. The timestamps are derived from company-local
+-- calendar days, so they move if the company time zone changes and an exact
+-- timestamp lookup then misses its own locked row. Periods are identified by
+-- these keys; the timestamps stay for range/overlap queries.
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "periodStartKey" TEXT;
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "periodEndKey" TEXT;
+
+-- Backfill from the timestamps, in the zone each row was locked in (falling
+-- back to the company default for rows written before timeZone existed).
+UPDATE "PayrollPeriod"
+SET "periodStartKey" = to_char("periodStart" AT TIME ZONE COALESCE("timeZone", 'America/Los_Angeles'), 'YYYY-MM-DD'),
+    "periodEndKey"   = to_char("periodEnd"   AT TIME ZONE COALESCE("timeZone", 'America/Los_Angeles'), 'YYYY-MM-DD')
+WHERE "periodStartKey" IS NULL OR "periodEndKey" IS NULL;
+
+-- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "PayrollPeriod_periodStartKey_periodEndKey_key" ON "PayrollPeriod"("periodStartKey", "periodEndKey");
 ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "detailCsvSnapshot" TEXT;
 
 -- CreateIndex: every payroll read is a startTime RANGE scan (whole workweeks

@@ -78,6 +78,15 @@ model User {
 /// differently means the underlying entries moved after the lock.
 model PayrollPeriod {
   id          String    @id @default(cuid())
+  /// STABLE IDENTITY. The company-local calendar days the period covers,
+  /// half-open, as YYYY-MM-DD. The timestamps below are derived from these in
+  /// the zone recorded in `timeZone`, so they MOVE if CompanySettings.timeZone
+  /// changes — which made an exact timestamp lookup miss its own locked row
+  /// (downloads fell back to live CSV, unlock updated zero rows and still
+  /// reported success). Look periods up by these keys; use the timestamps only
+  /// for range/overlap queries.
+  periodStartKey String?
+  periodEndKey   String?
   periodStart DateTime  @db.Timestamptz(6)
   periodEnd   DateTime  @db.Timestamptz(6)
   lockedAt    DateTime? @db.Timestamptz(6)
@@ -102,6 +111,7 @@ model PayrollPeriod {
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
 
   @@unique([periodStart, periodEnd])
+  @@unique([periodStartKey, periodEndKey])
   @@index([lockedAt])
   @@index([lockedById])
 }

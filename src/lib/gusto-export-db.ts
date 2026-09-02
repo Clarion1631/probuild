@@ -85,6 +85,9 @@ export type PayrollPeriodRow = {
     exportHash: string | null;
     /** The zone the period was locked in — enforcement uses it, not today's company zone. */
     timeZone: string | null;
+    /** STABLE identity: the company-local days this period covers, half-open. */
+    periodStartKey: string | null;
+    periodEndKey: string | null;
     /** THE EXPORT, FROZEN at lock time. Served verbatim; never recomputed. */
     summaryCsvSnapshot: string | null;
     detailCsvSnapshot: string | null;
@@ -99,6 +102,8 @@ const PAYROLL_PERIOD_SELECT = {
     lockedById: true,
     exportHash: true,
     timeZone: true,
+    periodStartKey: true,
+    periodEndKey: true,
     summaryCsvSnapshot: true,
     detailCsvSnapshot: true,
     lockedBy: { select: { name: true, email: true } },
@@ -114,10 +119,17 @@ export function hashExport(summaryCsv: string, detailCsv: string): string {
         .digest("hex");
 }
 
-/** The PayrollPeriod row for exactly this range, if a human has already reviewed it. */
-export async function findPayrollPeriod(periodStart: Date, periodEnd: Date, client: ExportDbClient = prisma) {
+/**
+ * The PayrollPeriod row for exactly this range, by its STABLE day keys.
+ *
+ * Not by timestamp: the timestamps are derived from company-local days, so they
+ * move when CompanySettings.timeZone changes, and an exact timestamp match then
+ * fails to find a period's own locked row — the download quietly fell back to
+ * live CSV and unlock updated zero rows while reporting success.
+ */
+export async function findPayrollPeriod(startKey: string, endKey: string, client: ExportDbClient = prisma) {
     return client.payrollPeriod.findUnique({
-        where: { periodStart_periodEnd: { periodStart, periodEnd } },
+        where: { periodStartKey_periodEndKey: { periodStartKey: startKey, periodEndKey: endKey } },
         select: PAYROLL_PERIOD_SELECT,
     });
 }
@@ -142,6 +154,9 @@ export async function loadGustoExport(
     periodStart: Date,
     periodEnd: Date,
     options: {
+        /** Stable day keys identifying this period. Required to find its locked row and snapshot. */
+        startKey?: string;
+        endKey?: string;
         /** Read through a transaction client — used by lockPayrollPeriod to recompute inside its own transaction. */
         client?: ExportDbClient;
     } = {}
@@ -154,8 +169,13 @@ export async function loadGustoExport(
     // inside the period depends on hours in the same week outside it.
     const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
 
+    // Day keys derived in the CURRENT zone are only a fallback for callers that
+    // did not supply them; a stored period is always matched on its own keys.
+    const startKey = options.startKey ?? dayKeyInTimeZone(periodStart, timeZone);
+    const endKey = options.endKey ?? dayKeyInTimeZone(periodEnd, timeZone);
+
     const [period, overlappingLocks] = await Promise.all([
-        findPayrollPeriod(periodStart, periodEnd, client),
+        findPayrollPeriod(startKey, endKey, client),
         findOverlappingLockedPeriods(envelope.start, envelope.end, client),
     ]);
 

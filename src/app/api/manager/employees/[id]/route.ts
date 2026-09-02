@@ -4,6 +4,7 @@ import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { applyRateChange } from "@/lib/pay-rate-write";
 
 const VALID_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
 const VALID_STATUSES = new Set(["PENDING", "ACTIVATED", "DISABLED"]);
@@ -58,17 +59,36 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         );
     }
 
+    // applyRateChange asks whether this caller has financialReports, not just
+    // whether they are a manager, so the permissions row has to be loaded.
+    const rateActor = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { role: true, permissions: true },
+    });
+
     const data: Record<string, unknown> = {};
     if (typeof body.role === "string") data.role = body.role;
     if (typeof body.status === "string") data.status = body.status;
-    if (typeof body.hourlyRate === "number" && Number.isFinite(body.hourlyRate) && body.hourlyRate >= 0) {
-        data.hourlyRate = body.hourlyRate;
-    }
-    if (typeof body.burdenRate === "number" && Number.isFinite(body.burdenRate) && body.burdenRate >= 0) {
-        data.burdenRate = body.burdenRate;
+    // Rates go through the ONE validated path: payroll permission, exact
+    // decimal, lastRateSyncAt stamped. This route used to write them as raw JS
+    // numbers with no stamp and only a manager-level gate.
+    const rateResult = await applyRateChange(rateActor, id, {
+        hourlyRate: body.hourlyRate,
+        burdenRate: body.burdenRate,
+        payType: body.payType,
+    });
+    if (!rateResult.ok) {
+        return NextResponse.json({ error: rateResult.error }, { status: rateResult.status });
     }
 
     if (Object.keys(data).length === 0) {
+        if (rateResult.changed) {
+            const row = await prisma.user.findUnique({
+                where: { id },
+                select: { id: true, email: true, name: true, role: true, status: true },
+            });
+            return NextResponse.json(row);
+        }
         return NextResponse.json({ error: "No mutable fields supplied" }, { status: 400 });
     }
 

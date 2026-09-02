@@ -357,8 +357,7 @@ test("the lock envelope stretches a period out to whole workweeks", () => {
     const envelope = payrollLockEnvelope(
         new Date("2026-08-19T07:00:00.000Z"),
         new Date("2026-08-27T07:00:00.000Z"),
-        TZ,
-        "monday"
+        TZ
     );
     // Back to Mon 08-17, forward to Mon 08-31 (the Monday after the week
     // containing Wed 08-26, the last day inside the period).
@@ -369,24 +368,45 @@ test("the lock envelope stretches a period out to whole workweeks", () => {
     const exact = payrollLockEnvelope(
         new Date("2026-08-17T07:00:00.000Z"),
         new Date("2026-08-31T07:00:00.000Z"),
-        TZ,
-        "monday"
+        TZ
     );
     assert.equal(exact.start.toISOString(), "2026-08-17T07:00:00.000Z");
     assert.equal(exact.end.toISOString(), "2026-08-31T07:00:00.000Z");
 });
 
-test("a Sunday-start pay period still covers the Mon-Sun OT week", () => {
+test("the envelope is Mon-Sun OT weeks ONLY — PAYROLL_WEEK_START never widens it", () => {
     const TZ = "America/Los_Angeles";
-    // Sun 2026-08-16 .. Sun 2026-08-30 with weekStart=sunday. The configured
-    // alignment alone would start at Sun 08-16 — but the OT week containing
-    // that Sunday starts Mon 08-10, and those hours decide the Sunday's OT.
+    // A Sunday-start pay period, Sun 2026-08-16 .. Sun 2026-08-30. An earlier
+    // version also aligned the envelope to the configured week start, which
+    // froze roughly two extra weeks — entries the export never queried, that the
+    // readiness check never saw and the hash never covered, locked anyway.
+    //
+    // The envelope must be exactly the workweeks the EXPORT queries: the Monday
+    // week containing the first instant, through the Monday after the week
+    // containing the last.
     const envelope = payrollLockEnvelope(
         new Date("2026-08-16T07:00:00.000Z"),
         new Date("2026-08-30T07:00:00.000Z"),
-        TZ,
-        "sunday"
+        TZ
     );
-    assert.equal(envelope.start.toISOString(), "2026-08-10T07:00:00.000Z", "widest of the two week alignments wins");
-    assert.ok(envelope.end.getTime() >= new Date("2026-08-30T07:00:00.000Z").getTime());
+    assert.equal(envelope.start.toISOString(), "2026-08-10T07:00:00.000Z");
+    assert.equal(envelope.end.toISOString(), "2026-08-31T07:00:00.000Z");
+
+    // Same answer whatever PAYROLL_WEEK_START says, because it is not consulted.
+    const previous = process.env.PAYROLL_WEEK_START;
+    try {
+        process.env.PAYROLL_WEEK_START = "sunday";
+        const withSunday = payrollLockEnvelope(
+            new Date("2026-08-16T07:00:00.000Z"),
+            new Date("2026-08-30T07:00:00.000Z"),
+            TZ
+        );
+        assert.deepEqual(
+            [withSunday.start.toISOString(), withSunday.end.toISOString()],
+            [envelope.start.toISOString(), envelope.end.toISOString()]
+        );
+    } finally {
+        if (previous === undefined) delete process.env.PAYROLL_WEEK_START;
+        else process.env.PAYROLL_WEEK_START = previous;
+    }
 });

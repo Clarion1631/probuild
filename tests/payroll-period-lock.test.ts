@@ -415,3 +415,25 @@ test("a write validates the row's STORED startTime, not the caller's stale copy"
     assert.match(source, /export type PayrollWriteTarget = \{/);
     assert.match(source, /entryIds\?: string\[\];/);
 });
+
+test("lock and unlock are keyed on stable day keys, and a locked period is not re-lockable", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+
+    const lock = source.slice(source.indexOf("export async function lockPayrollPeriod"));
+    const lockBody = lock.slice(0, lock.indexOf("\nexport "));
+    // Re-locking would overwrite lockedAt, the locker, the hash and BOTH
+    // snapshots — rewriting the payroll audit after mutable inputs changed.
+    // Checked before the transaction AND inside it (two concurrent locks would
+    // both pass the outer check).
+    assert.match(lockBody, /precheck\.period\?\.lockedAt/);
+    assert.match(lockBody, /if \(existing\?\.lockedAt\)/);
+    assert.match(lockBody, /periodStartKey_periodEndKey/);
+
+    const unlock = source.slice(source.indexOf("export async function unlockPayrollPeriod"));
+    const unlockBody = unlock.slice(0, unlock.indexOf("\n}"));
+    // Matched on keys, and a zero-row update is reported as a failure rather
+    // than a silent success.
+    assert.match(unlockBody, /periodStartKey: range\.startKey/);
+    assert.match(unlockBody, /unlocked\.count === 0/);
+    assert.doesNotMatch(unlockBody, /startOfDateInTimeZone/, "unlock must not reconstruct timestamps");
+});

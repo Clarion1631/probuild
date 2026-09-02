@@ -38,7 +38,7 @@ export interface GustoExportDependencies {
     /** Resolved staff viewer, or null when there is no session. */
     authenticate(): Promise<GustoExportViewer | null>;
     resolveTimeZone(): Promise<string>;
-    load(periodStart: Date, periodEnd: Date): Promise<LoadedGustoExport>;
+    load(periodStart: Date, periodEnd: Date, keys: { startKey: string; endKey: string }): Promise<LoadedGustoExport>;
 }
 
 export function createGustoExportHandler(dependencies: GustoExportDependencies) {
@@ -66,7 +66,7 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
             const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
 
-            const result = await dependencies.load(periodStart, periodEnd);
+            const result = await dependencies.load(periodStart, periodEnd, { startKey: range.startKey, endKey: range.endKey });
 
             // A LOCKED period is served from its snapshot, verbatim. No
             // readiness check and no recompute: this is the file that was sent
@@ -127,7 +127,7 @@ const handler = createGustoExportHandler({
         return { role: user.role, canReadFinancialReports: hasPermission(user, "financialReports") };
     },
     resolveTimeZone: resolveCompanyTimeZone,
-    load: loadGustoExport,
+    load: (periodStart, periodEnd, keys) => loadGustoExport(periodStart, periodEnd, keys),
 });
 
 export async function GET(req: Request) {

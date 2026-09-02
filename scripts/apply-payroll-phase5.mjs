@@ -57,6 +57,14 @@ const STATEMENTS = [
     // cost code after logistics recoding) and would not reproduce.
     `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "summaryCsvSnapshot" TEXT`,
     `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "detailCsvSnapshot" TEXT`,
+    // Stable identity — see the matching migration.
+    `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "periodStartKey" TEXT`,
+    `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "periodEndKey" TEXT`,
+    `UPDATE "PayrollPeriod"
+     SET "periodStartKey" = to_char("periodStart" AT TIME ZONE COALESCE("timeZone", 'America/Los_Angeles'), 'YYYY-MM-DD'),
+         "periodEndKey"   = to_char("periodEnd"   AT TIME ZONE COALESCE("timeZone", 'America/Los_Angeles'), 'YYYY-MM-DD')
+     WHERE "periodStartKey" IS NULL OR "periodEndKey" IS NULL`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "PayrollPeriod_periodStartKey_periodEndKey_key" ON "PayrollPeriod"("periodStartKey", "periodEndKey")`,
     // Every payroll read is a startTime RANGE scan; no FK index serves that.
     `CREATE INDEX IF NOT EXISTS "TimeEntry_startTime_idx" ON "TimeEntry"("startTime")`,
     // ADD CONSTRAINT has no IF NOT EXISTS — guard it so a replay is a no-op.
@@ -80,10 +88,21 @@ try {
     // RAW span, deduct a meal it never owed, and reprice it at the member's
     // current rate. The readers were fixed instead.
 
-    // ONE-SHOT seed for User.payType from the env list, so the export is not
-    // blocked on day one by a column nobody has filled in yet. Only touches
-    // rows still NULL, so a re-run never overwrites a human's answer — after
-    // this, the COLUMN is the source of truth and the env list is a fallback.
+    // User.payType is left NULL for anyone nobody has confirmed.
+    //
+    // An earlier revision also stamped every ACTIVATED crew member and manager
+    // as HOURLY. That defeated the whole point of the column: stored values beat
+    // the env fallback, so a salaried manager omitted from
+    // PAYROLL_SALARIED_EMAILS would have been permanently marked hourly, and
+    // later fixing the env var would have changed nothing — Gusto would pay them
+    // a salary AND the exported hours. NULL blocks the export until a human
+    // answers on Company -> Team Members, which is the fail-closed behaviour the
+    // column exists for.
+    //
+    // The SALARY seed below is kept because it only ever moves a row in the SAFE
+    // direction (excluded from the summary = cannot be double-paid) and only for
+    // emails an operator explicitly listed. It never overwrites an existing
+    // answer.
     const salaried = (process.env.PAYROLL_SALARIED_EMAILS ?? "cj@goldentouchremodeling.com,rlord@goldentouchremodeling.com")
         .split(",")
         .map((email) => email.trim().toLowerCase())
@@ -95,15 +114,12 @@ try {
         );
         console.log(`seeded ${seededSalary} user(s) to payType = SALARY from PAYROLL_SALARIED_EMAILS`);
     }
-    // Everyone else who is an ACTIVATED crew/manager account is hourly. ADMIN
-    // and FINANCE are left NULL deliberately: they are salaried by role for the
-    // rate guard, but the export only demands an answer for people who actually
-    // punched, and a human should confirm rather than a script assuming.
-    const seededHourly = await prisma.$executeRawUnsafe(
-        `UPDATE "User" SET "payType" = 'HOURLY'
-         WHERE "payType" IS NULL AND "status" = 'ACTIVATED' AND "role" IN ('FIELD_CREW', 'EMPLOYEE', 'MANAGER')`
+    const unconfirmed = await prisma.$queryRawUnsafe(
+        `SELECT count(*)::int AS n FROM "User" WHERE "payType" IS NULL AND "status" = 'ACTIVATED'`
     );
-    console.log(`seeded ${seededHourly} user(s) to payType = HOURLY`);
+    console.log(
+        `${unconfirmed[0].n} activated user(s) still have no payType — the payroll export will refuse to run for anyone with hours until they are set on Company -> Team Members. This is intentional.`
+    );
 
     const cols = await prisma.$queryRawUnsafe(
         `SELECT table_name, column_name FROM information_schema.columns
