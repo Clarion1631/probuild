@@ -156,7 +156,7 @@ test("evidence appears → close; evidence disappears → reopen at the next gen
     const store = inMemoryLifecycle();
     await run(store, []);
 
-    const matched: ReceiptEvidenceExpense[] = [{ amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }];
+    const matched: ReceiptEvidenceExpense[] = [{ id: "exp-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }];
     const closing = await run(store, matched);
     assert.equal(closing.closed, 1);
     const lowes = store.issues.get(`${RECEIPT_REQUEST_TARGET_TYPE}::bl-lowes`)!;
@@ -205,6 +205,8 @@ test("one failing target never abandons the rest of the sweep", async () => {
         if (targetKey === "bl-lowes") throw new Error("version conflict storm");
         return { decision: { step: 2, action: "create", canonicalCodes: ["MISSING_RECEIPT"], reasonHash: "x", openGeneration: 1 }, applied: true };
     });
-    assert.deepEqual(seen, ["bl-lowes", "bl-depot"]);
+    // Oldest charge first — the matcher's own deterministic order, not the
+    // caller's input order (that is what makes evidence assignment stable).
+    assert.deepEqual(seen, ["bl-depot", "bl-lowes"]);
     assert.deepEqual(summary, { opened: 1, closed: 0, touched: 0, skipped: 1 });
 });

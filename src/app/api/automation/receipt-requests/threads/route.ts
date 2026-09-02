@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { RECEIPT_INTAKE_SECRET_HEADER, secretMatches } from "@/lib/receipt-intake/intake-auth";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
+import { CARD_HISTORY_DAYS, RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
 import {
     parseOwnerChatUsers,
     serializeThreads,
@@ -33,8 +33,9 @@ export const dynamic = "force-dynamic";
  * here at all.
  */
 
-/** Cards posted in the last two weeks. Older threads are closed business. */
-const WINDOW_DAYS = 14;
+/** Cards posted in the last two weeks. Older threads are closed business, and
+ * this matches CARD_HISTORY_DAYS, the retention the issue's own cards[] keeps. */
+const WINDOW_DAYS = CARD_HISTORY_DAYS;
 
 export async function GET(request: Request) {
     const provided = request.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
@@ -50,40 +51,52 @@ export async function GET(request: Request) {
         select: { targetKey: true, reasonCodes: true, displayDetails: true },
     });
 
-    // One record per thread, items in their card order. A cleared issue is
-    // already excluded above — the sweep must never chase something answered.
+    // One record per thread, items in their card order. An issue carries a
+    // 14-day `cards[]` HISTORY, not just today's card: an item asked about on
+    // Monday and again on Wednesday lives in two threads, and a reply in
+    // Monday's thread must still resolve. Exporting only the latest silently
+    // stranded those replies.
     const byThread = new Map<string, PostedCardRecord & { seen: Map<number, ThreadRecordItem> }>();
     for (const issue of issues) {
         if (decodeReasonCodes(issue.reasonCodes).length === 0) continue;
         const details = parseMissingReceiptDetails(issue.displayDetails);
-        const card = details.card && typeof details.card === "object" ? (details.card as Record<string, unknown>) : null;
-        if (!card) continue;
-        const threadName = typeof card.threadName === "string" ? card.threadName : "";
-        const cardDate = typeof card.date === "string" ? card.date : "";
-        if (!threadName || cardDate < cutoff) continue;
+        const history = Array.isArray(details.cards)
+            ? (details.cards as unknown[])
+            : details.card && typeof details.card === "object"
+                // Rows written before cards[] existed still carry the single slot.
+                ? [details.card]
+                : [];
 
-        const record = byThread.get(threadName) ?? {
-            threadName,
-            messageName: typeof card.messageName === "string" ? card.messageName : "",
-            owner: typeof details.owner === "string" ? details.owner : "unassigned",
-            items: [],
-            seen: new Map<number, ThreadRecordItem>(),
-        };
-        const n = typeof card.n === "number" ? card.n : record.seen.size + 1;
-        // Numbering is what a "sign 2" reply resolves against, so a duplicate
-        // n would make that reply ambiguous. First writer wins, deterministically.
-        if (!record.seen.has(n)) {
-            const amountCents = typeof details.amountCents === "number" ? details.amountCents : 0;
-            record.seen.set(n, {
-                n,
-                fingerprint: typeof details.fingerprint === "string" ? details.fingerprint : `pb-${issue.targetKey}`,
-                date: typeof details.postedDate === "string" ? details.postedDate : "",
-                vendor: typeof details.payee === "string" ? details.payee : "",
-                cents: Math.abs(amountCents),
-                amount: (Math.abs(amountCents) / 100).toFixed(2),
-            });
+        for (const entry of history) {
+            if (!entry || typeof entry !== "object") continue;
+            const card = entry as Record<string, unknown>;
+            const threadName = typeof card.threadName === "string" ? card.threadName : "";
+            const cardDate = typeof card.date === "string" ? card.date : "";
+            if (!threadName || cardDate < cutoff) continue;
+
+            const record = byThread.get(threadName) ?? {
+                threadName,
+                messageName: typeof card.messageName === "string" ? card.messageName : "",
+                owner: typeof details.owner === "string" ? details.owner : "unassigned",
+                items: [],
+                seen: new Map<number, ThreadRecordItem>(),
+            };
+            const n = typeof card.n === "number" ? card.n : record.seen.size + 1;
+            // Numbering is what a "sign 2" reply resolves against, so a duplicate
+            // n would make that reply ambiguous. First writer wins, deterministically.
+            if (!record.seen.has(n)) {
+                const amountCents = typeof details.amountCents === "number" ? details.amountCents : 0;
+                record.seen.set(n, {
+                    n,
+                    fingerprint: typeof details.fingerprint === "string" ? details.fingerprint : `pb-${issue.targetKey}`,
+                    date: typeof details.postedDate === "string" ? details.postedDate : "",
+                    vendor: typeof details.payee === "string" ? details.payee : "",
+                    cents: Math.abs(amountCents),
+                    amount: (Math.abs(amountCents) / 100).toFixed(2),
+                });
+            }
+            byThread.set(threadName, record);
         }
-        byThread.set(threadName, record);
     }
 
     const posted: PostedCardRecord[] = [...byThread.values()].map(record => ({

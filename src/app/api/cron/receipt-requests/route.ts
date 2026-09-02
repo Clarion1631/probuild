@@ -9,9 +9,12 @@ import {
     RECEIPT_MATCH_DATE_SLOP_DAYS,
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
+    hasResolution,
+    mergeReceiptRequestDetails,
     planReceiptRequests,
     type ReceiptRequestPlan,
 } from "@/lib/receipt-requests";
+import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -132,29 +135,46 @@ export async function GET(request: Request) {
     const evidenceStart = new Date(`${ymdDaysBefore(now, LOOKBACK_DAYS + RECEIPT_MATCH_DATE_SLOP_DAYS)}T00:00:00Z`);
     const evidenceEnd = new Date(`${ymdDaysBefore(now, -RECEIPT_MATCH_DATE_SLOP_DAYS)}T00:00:00Z`);
 
-    const [bankLineRows, expenseRows, intakeRows, openIssues] = await Promise.all([
+    // Every bank-line issue, open OR cleared. The open ones say what may need
+    // closing; the cleared ones carry resolutions that must not be re-asked.
+    const allIssues = await prisma.reviewIssue.findMany({
+        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
+        select: { targetKey: true, clearedAt: true, displayDetails: true },
+    });
+    const openIssues = allIssues.filter(issue => issue.clearedAt === null);
+    const resolvedIssueKeys = allIssues
+        .filter(issue => hasResolution(parseMissingReceiptDetails(issue.displayDetails)))
+        .map(issue => issue.targetKey);
+
+    const [windowLines, openIssueLines, expenseRows, intakeRows] = await Promise.all([
         prisma.bankLine.findMany({
             where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
             orderBy: { postedDate: "desc" },
             take: MAX_BANK_LINES,
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         }),
+        // ALWAYS loaded, regardless of age. An issue opened 90 days ago falls
+        // out of the window, and a line the matcher cannot see is a line it can
+        // never CLOSE — the chase would nag forever after the receipt turned up.
+        openIssues.length === 0 ? Promise.resolve([]) : prisma.bankLine.findMany({
+            where: { id: { in: openIssues.map(issue => issue.targetKey) } },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        }),
         prisma.expense.findMany({
             where: { date: { gte: evidenceStart, lte: evidenceEnd } },
-            select: { amount: true, date: true, vendor: true },
+            select: { id: true, amount: true, date: true, vendor: true },
         }),
         prisma.receiptIntake.findMany({
             where: {
                 txnDate: { gte: evidenceStart, lte: evidenceEnd },
                 state: { notIn: [...DEAD_INTAKE_STATES] },
             },
-            select: { totalCents: true, txnDate: true, vendor: true, state: true },
-        }),
-        prisma.reviewIssue.findMany({
-            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
-            select: { targetKey: true },
+            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true },
         }),
     ]);
+
+    // De-duplicate: an in-window line that also has an open issue appears twice.
+    const bankLineRows = [...new Map([...windowLines, ...openIssueLines].map(row => [row.id, row])).values()];
 
     const plan = planReceiptRequests({
         bankLines: bankLineRows.map(row => ({
@@ -169,23 +189,36 @@ export async function GET(request: Request) {
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
-            return [{ amountCents: cents, date: row.date ? row.date.toISOString().slice(0, 10) : null, vendor: row.vendor }];
+            return [{ id: row.id, amountCents: cents, date: row.date ? row.date.toISOString().slice(0, 10) : null, vendor: row.vendor }];
         }),
         intakes: intakeRows.map(row => ({
+            id: row.id,
             totalCents: row.totalCents,
             txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
             vendor: row.vendor,
             state: row.state,
         })),
         openIssueKeys: openIssues.map(row => row.targetKey),
+        resolvedIssueKeys,
         now,
     });
 
+    // displayDetails is MERGED, never replaced. The matcher owns the facts about
+    // the charge and recomputes them nightly; the resolution and the Chat card
+    // history are ANSWERS written by other paths, and overwriting them would
+    // silently delete a signed memo's PDF link and the threads the sweep needs
+    // to find replies in.
+    const detailsByKey = new Map(allIssues.map(issue => [issue.targetKey, parseMissingReceiptDetails(issue.displayDetails)]));
+
     const summary = await applyReceiptRequestPlan(plan, (targetKey, codes, displayDetails) =>
-        evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes, displayDetails, {
+        evaluateReviewIssue(
+            RECEIPT_REQUEST_TARGET_TYPE,
+            targetKey,
+            codes,
+            displayDetails ? mergeReceiptRequestDetails(detailsByKey.get(targetKey), displayDetails) : null,
             // Delivery is the per-owner digest, never the per-issue drainer.
-            episodeStatus: "SUPPRESSED",
-        }));
+            { episodeStatus: "SUPPRESSED" },
+        ));
 
     const result = {
         ok: true,

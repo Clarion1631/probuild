@@ -54,6 +54,9 @@ export interface ReceiptRequestBankLine {
 
 /** An Expense, already reduced to integer cents by the caller. */
 export interface ReceiptEvidenceExpense {
+    /** Stable row id. Evidence is assigned to at most ONE bank line, and the
+     * tie-break has to be deterministic across runs — see assignEvidence. */
+    id: string;
     /** POSITIVE cents (an Expense's amount is a magnitude, not a signed posting). */
     amountCents: number;
     /** YYYY-MM-DD, or null when the expense has no date. */
@@ -62,6 +65,7 @@ export interface ReceiptEvidenceExpense {
 }
 
 export interface ReceiptEvidenceIntake {
+    id: string;
     totalCents: number | null;
     /** YYYY-MM-DD, or null. */
     txnDate: string | null;
@@ -92,6 +96,13 @@ export interface ReceiptRequestInput {
     intakes: readonly ReceiptEvidenceIntake[];
     /** targetKeys of bank-line issues that are currently OPEN (clearedAt null). */
     openIssueKeys: readonly string[];
+    /**
+     * targetKeys whose issue carries a RESOLUTION (a signed memo, most often).
+     * Open or cleared — either way the question has been answered, and the
+     * matcher must not re-ask it. Includes cleared issues on purpose: those are
+     * exactly the ones a re-open would resurrect.
+     */
+    resolvedIssueKeys?: readonly string[];
     now: Date;
 }
 
@@ -147,12 +158,24 @@ function toYmd(date: Date): string {
  * ZIPs and terminal ids are noise; "LLC"/"INC" survive but are harmless
  * because a shared token still needs the amount and date to agree.
  */
+export const GENERIC_PAYEE_TOKENS: ReadonlySet<string> = new Set([
+    "LLC", "INC", "CO", "CORP", "THE", "AND",
+]);
+
 export function payeeTokens(value: string): string[] {
     return (value ?? "")
         .toUpperCase()
         .replace(/[^A-Z0-9 ]/g, " ")
         .split(/\s+/)
-        .filter(token => token.length >= 3 && !/^\d+$/.test(token));
+        .filter(token =>
+            token.length >= 3
+            && !/^\d+$/.test(token)
+            // A legal suffix names no merchant. "ACME LLC" and "ZENITH LLC"
+            // share a token and would otherwise "agree" on identity, which is
+            // exactly the amount+date-alone match the Chevron/Cash App lesson
+            // forbids. ("CO" is already below the length floor; it is listed so
+            // the rule reads as one intent rather than two accidents.)
+            && !GENERIC_PAYEE_TOKENS.has(token));
 }
 
 /**
@@ -180,6 +203,7 @@ export function payeeMatches(a: string, b: string | null | undefined): boolean {
 // ── Satisfaction ─────────────────────────────────────────────────────────────
 
 interface EvidenceRow {
+    id: string;
     amountCents: number;
     date: string | null;
     vendor: string | null;
@@ -212,26 +236,51 @@ function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: Eviden
  * newly-discovered ones: the lifecycle's same-hash "touch" step is what makes
  * that idempotent, and re-emitting is what keeps `displayDetails` (the amount,
  * the payee, the owner) current on the dashboard.
+ *
+ * EVIDENCE IS ASSIGNED ONE-TO-ONE. A single $46.00 Lowe's receipt cannot answer
+ * for two separate $46.00 Lowe's charges — before this, it silently closed
+ * both, and the second charge's missing receipt was never chased. Lines are
+ * processed oldest-first, and each takes the closest-dated unconsumed evidence
+ * row (lowest id breaks a tie), so the assignment is the same on every run.
+ *
+ * OUT OF SCOPE, deliberately, and stated so nobody reads a gap as a bug:
+ *   - SPLIT TENDERS. One receipt paid across two cards posts as two bank lines
+ *     for partial amounts. Exact-cents matching will not close either, so both
+ *     get chased. A human resolves them; guessing at sums is how you close a
+ *     charge nothing actually covers.
+ *   - REFUNDS/REVERSALS. A credit is not spend and drops out at the policy
+ *     step; matching a refund back to the charge it reverses is the refund
+ *     pipeline's job (validateRefundEventSigns), not this one.
  */
 export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestPlan {
     const open: ReceiptRequestPlan["open"] = [];
     const close: string[] = [];
     const openKeys = new Set(input.openIssueKeys);
+    const resolvedKeys = new Set(input.resolvedIssueKeys ?? []);
     const todayDay = dayNumber(toYmd(input.now));
 
-    const liveIntakes: EvidenceRow[] = [];
-    for (const intake of input.intakes) {
-        if (DEAD_INTAKE_STATES.has(intake.state)) continue;
-        if (intake.totalCents === null) continue;
-        liveIntakes.push({ amountCents: intake.totalCents, date: intake.txnDate, vendor: intake.vendor });
-    }
     const evidence: EvidenceRow[] = [
-        ...input.expenses.map(e => ({ amountCents: e.amountCents, date: e.date, vendor: e.vendor })),
-        ...liveIntakes,
+        ...input.expenses.map(e => ({ id: `expense:${e.id}`, amountCents: e.amountCents, date: e.date, vendor: e.vendor })),
+        ...input.intakes
+            .filter(intake => !DEAD_INTAKE_STATES.has(intake.state) && intake.totalCents !== null)
+            .map(intake => ({ id: `intake:${intake.id}`, amountCents: intake.totalCents as number, date: intake.txnDate, vendor: intake.vendor })),
     ];
+    const consumed = new Set<string>();
 
-    for (const line of input.bankLines) {
+    // Oldest charge first, id breaking the tie: the assignment below depends on
+    // the order lines are visited, so it must not depend on query order.
+    const orderedLines = [...input.bankLines].sort((a, b) =>
+        (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+    for (const line of orderedLines) {
         const closeIfOpen = () => { if (openKeys.has(line.id)) close.push(line.id); };
+
+        // A RESOLVED issue is answered evidence, not an open question. A signed
+        // memo is the receipt when no merchant receipt exists, so the line
+        // stays unmatched forever — without this it would re-open every single
+        // night, which is precisely the nag the memo was signed to stop. It
+        // reopens only when a human explicitly clears the resolution.
+        if (resolvedKeys.has(line.id)) continue;
 
         // Money in and policy-exempt rails drop out here — including a credit
         // that later reversed a charge we were already chasing.
@@ -247,13 +296,18 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
 
         // Grace window. A line we can't date is not chased either — an
         // unparseable posted date is a data problem, not a missing receipt.
+        // An OPEN issue overrides the window at the query level (the caller
+        // always loads those lines), but never the grace rule itself: a line
+        // this young cannot have an issue in the first place.
         const lineDay = dayNumber(line.postedDate);
         if (lineDay === null || todayDay === null || todayDay - lineDay < RECEIPT_REQUEST_GRACE_DAYS) {
             continue;
         }
 
         const payee = normalizePayee(line.rawDescriptor);
-        if (evidence.some(row => satisfies(line, payee, row))) {
+        const match = assignEvidence(line, payee, evidence, consumed);
+        if (match) {
+            consumed.add(match.id);
             closeIfOpen();
             continue;
         }
@@ -274,4 +328,104 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     }
 
     return { open, close };
+}
+
+/**
+ * The single unconsumed evidence row that answers for this line, or null.
+ * Closest date wins; the lowest id breaks a tie, so two equally-close rows
+ * always resolve the same way and a re-run reproduces the assignment exactly.
+ */
+function assignEvidence(
+    line: ReceiptRequestBankLine,
+    payee: string,
+    evidence: readonly EvidenceRow[],
+    consumed: ReadonlySet<string>,
+): EvidenceRow | null {
+    const lineDay = dayNumber(line.postedDate);
+    if (lineDay === null) return null;
+    let best: EvidenceRow | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const row of evidence) {
+        if (consumed.has(row.id)) continue;
+        if (!satisfies(line, payee, row)) continue;
+        const distance = Math.abs((dayNumber(row.date as string) as number) - lineDay);
+        if (distance < bestDistance || (distance === bestDistance && best !== null && row.id < best.id)) {
+            best = row;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+// ── displayDetails merging ───────────────────────────────────────────────────
+
+/**
+ * Keys the nightly matcher must never clobber. The matcher owns the FACTS about
+ * the charge (owner, amount, payee) and recomputes them every run; these are
+ * the ANSWERS and the history, written by other paths, and a plain overwrite
+ * would silently delete a signed memo's PDF link and the Chat thread the sweep
+ * needs to find its replies.
+ */
+export const PRESERVED_DETAIL_KEYS = ["resolution", "pdfUrl", "signedAt", "signedThread", "cards", "card"] as const;
+
+/**
+ * Merge freshly-computed facts over an existing details blob, preserving the
+ * answer/history keys. Never mutates either input.
+ */
+export function mergeReceiptRequestDetails(
+    existing: Record<string, unknown> | null | undefined,
+    fresh: Record<string, unknown>,
+): Record<string, unknown> {
+    const merged: Record<string, unknown> = { ...fresh };
+    if (!existing) return merged;
+    for (const key of PRESERVED_DETAIL_KEYS) {
+        if (existing[key] !== undefined) merged[key] = existing[key];
+    }
+    return merged;
+}
+
+/** True when a details blob records an answer that closes the chase. */
+export function hasResolution(details: Record<string, unknown> | null | undefined): boolean {
+    return typeof details?.resolution === "string" && details.resolution !== "";
+}
+
+export interface CardRecord {
+    threadName: string | null;
+    messageName: string | null;
+    n: number;
+    /** YYYY-MM-DD Pacific. */
+    date: string;
+    requestId: string;
+}
+
+/** How much card/thread history each issue keeps. The sweep only looks back this far. */
+export const CARD_HISTORY_DAYS = 14;
+
+/**
+ * Append one card record to an issue's history, dropping entries older than
+ * `CARD_HISTORY_DAYS` and replacing same-day re-posts rather than stacking
+ * them. An ARRAY, not a single `card`: the threads endpoint has to export every
+ * live thread an item was asked in, and the old single-slot field silently
+ * forgot yesterday's thread the moment today's card went out — so a reply in
+ * yesterday's thread had nothing to resolve against.
+ */
+export function appendCardRecord(
+    details: Record<string, unknown> | null | undefined,
+    record: CardRecord,
+    now: Date,
+): Record<string, unknown> {
+    const merged: Record<string, unknown> = { ...(details ?? {}) };
+    const priorRaw = Array.isArray(merged.cards) ? (merged.cards as unknown[]) : [];
+    const cutoffDay = (dayNumber(toYmd(now)) ?? 0) - CARD_HISTORY_DAYS;
+    const kept = priorRaw.filter((entry): entry is CardRecord => {
+        if (!entry || typeof entry !== "object") return false;
+        const date = (entry as { date?: unknown }).date;
+        if (typeof date !== "string") return false;
+        const day = dayNumber(date);
+        return day !== null && day >= cutoffDay && date !== record.date;
+    });
+    merged.cards = [...kept, record];
+    // The single-slot field stays in step for readers that only want "latest".
+    merged.card = record;
+    return merged;
 }

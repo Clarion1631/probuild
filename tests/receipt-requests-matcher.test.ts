@@ -26,6 +26,7 @@ const line = (over: Partial<ReceiptRequestBankLine> = {}): ReceiptRequestBankLin
 });
 
 const expense = (over: Partial<ReceiptEvidenceExpense> = {}): ReceiptEvidenceExpense => ({
+    id: "exp-1",
     amountCents: 12_345,
     date: "2026-08-16",
     vendor: "Lowe's Home Improvement",
@@ -33,6 +34,7 @@ const expense = (over: Partial<ReceiptEvidenceExpense> = {}): ReceiptEvidenceExp
 });
 
 const intake = (over: Partial<ReceiptEvidenceIntake> = {}): ReceiptEvidenceIntake => ({
+    id: "int-1",
     totalCents: 12_345,
     txnDate: "2026-08-16",
     vendor: "Lowes",
