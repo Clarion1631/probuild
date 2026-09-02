@@ -66,6 +66,15 @@ jobs:
       # The focused integration regression deliberately drifts the disposable
       # database's function and trigger after proving the checker recognizes
       # the production snapshot. It therefore runs last in this job.
+      # The receipt-intake claim transaction against a REAL Postgres. The rest
+      # of that feature's suites mock every DB call, so the SQL — a void
+      # function read through $queryRaw, a claim that behaves differently than
+      # its mock — is the one part they cannot see.
+      - name: Receipt-intake claim + advisory locks against real Postgres
+        run: npx tsx --test tests/receipt-intake-claim-db.test.ts
+        env:
+          RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

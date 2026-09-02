@@ -63,6 +63,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         busyPasses: 0,
         lastError: null,
         suggestedConfidence: null,
+        sendAttempted: false,
         ...overrides,
     };
 }
@@ -97,6 +98,7 @@ interface Harness {
     claimOpts: CutoverRequest[];
     boundary: Date | null;
     sweepCalls: number;
+    cleanupCalls: number;
     bookBudgets: number[];
     clock: number;
 }
@@ -104,7 +106,7 @@ interface Harness {
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
-        retried: [], claimOpts: [], sweepCalls: 0, bookBudgets: [], clock: 0,
+        retried: [], claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
         boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
@@ -116,6 +118,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         cutoverBoundary: async () => h.boundary,
         isDryRunEnabled: () => true,
         sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
+        retryStorageCleanups: async () => { h.cleanupCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
@@ -125,9 +128,8 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         finishRouting: async (id, stateReason) => { h.finished.push({ id, stateReason }); },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
-        book: async (_row, remainingMs) => {
+        book: async () => {
             h.books++;
-            h.bookBudgets.push(remainingMs);
             return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult;
         },
         applyBookResult: async () => {},
@@ -823,4 +825,87 @@ test("the deadline starts at invocation entry, so a slow sweep cannot overrun it
     assert.equal(h.reads, 0, "no Gemini call after the budget is gone");
     assert.equal(summary.processed, 0);
     assert.equal(summary.deferredToNextRun, 2, "both rows keep their lease for the next run");
+});
+
+// ── A missing boundary halts the WHOLE pass (round-7 item 3) ───────────────
+
+test("live mode with no recorded boundary claims nothing at all", async () => {
+    // Refusing only the retire/requeue was not enough: the pass went on to
+    // claim and BOOK rows while the shadow backlog sat undecided. Live mode
+    // without a boundary means we cannot tell which rows v1 already booked,
+    // and booking anything under that uncertainty is the double-booking this
+    // whole mechanism exists to prevent.
+    const h = harness([workerRow(), workerRow({ id: "row-2" })], {
+        isDryRunEnabled: () => false,
+        cutoverBoundary: async () => null,
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary, { processed: 0, byState: {}, cutoverBlocked: "cutover-boundary-missing" });
+    assert.deepEqual(h.claimOpts, [], "claim() is never even called");
+    assert.equal(h.sweepCalls, 0, "and no housekeeping runs either");
+    assert.equal(h.books, 0);
+    assert.equal(h.reads, 0);
+});
+
+test("dry-run mode does not need a boundary", async () => {
+    // Nothing books in shadow mode, so there is nothing to be uncertain about.
+    const h = harness([workerRow()], { isDryRunEnabled: () => true, cutoverBoundary: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.cutoverBlocked, undefined);
+    assert.equal(summary.processed, 1);
+});
+
+// ── Orphaned objects are chased (round-7 item 5) ───────────────────────────
+
+test("every pass retries storage deletes that failed earlier", async () => {
+    // A rejected row is deleted, so after that nothing in the database
+    // references its bytes — without this they sit in a private bucket forever.
+    const h = harness([], { retryStorageCleanups: async () => { h.cleanupCalls++; return 3; } });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.cleanupCalls, 1);
+    assert.equal(summary.orphansCleaned, 3);
+});
+
+test("a failing cleanup pass never takes the run down", async () => {
+    const h = harness([workerRow()], {
+        retryStorageCleanups: async () => { throw new Error("storage down"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.orphansCleaned, undefined);
+    assert.deepEqual(summary.byState, { READ: 1 }, "the batch still ran");
+});
+
+// ── A row that never sent releases its key, whatever killed it (item 7) ────
+
+test("a weak-lookup failure at the retry limit RELEASES the strong key", async () => {
+    // This row exhausted its attempts entirely on a database fault and never
+    // touched QuickBooks. Holding its key quarantines the corrected resend
+    // against a row that never became a purchase.
+    const h = harness([workerRow({ attempts: 19, sendAttempted: false })], {
+        findWeakHit: async () => { throw new Error("connection reset"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.equal(h.states[0].patch?.dedupStrongKey, null, "the key goes back");
+});
+
+test("a finishRouting failure at the retry limit also releases the key", async () => {
+    const h = harness([workerRow({ attempts: 19, sendAttempted: false })], {
+        finishRouting: async () => { throw new Error("connection reset"); },
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.equal(h.states[0].patch?.dedupStrongKey, null);
+});
+
+test("a row that DID send keeps its key at the retry limit", async () => {
+    // QuickBooks may hold a Purchase whose response we lost.
+    const h = harness([workerRow({ attempts: 19, sendAttempted: true })], {
+        findWeakHit: async () => { throw new Error("connection reset"); },
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.equal(h.states[0].patch, undefined, "no patch, so the key is untouched");
 });

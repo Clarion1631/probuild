@@ -113,6 +113,8 @@ export interface WorkerDependencies {
      * be able to eat the invocation before any real work starts.
      */
     sweepStaleStaging: (shouldStop: () => boolean) => Promise<number>;
+    /** Retry storage deletes that failed when a row was rejected. */
+    retryStorageCleanups: (shouldStop: () => boolean) => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
     /** Tagged: a confirmed 404 and a transient storage fault are NOT the same answer. */
     downloadBytes: (storagePath: string) => Promise<DocBytesResult>;
@@ -131,8 +133,8 @@ export interface WorkerDependencies {
      * row when another document with this weak key is already BOOKING/BOOKED.
      */
     promoteToBooking: (rowId: string, weakKey: string | null) => Promise<{ promoted: boolean; conflictId?: string }>;
-    /** `remainingMs` is what is left of the invocation when the booking starts. */
-    book: (row: BookableRow, remainingMs: number) => Promise<BookResult>;
+    /** The pass's ONE absolute deadline — never a snapshot of "time left". */
+    book: (row: BookableRow) => Promise<BookResult>;
     applyBookResult: (rowId: string, result: BookResult) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string) => Promise<void>;
@@ -190,6 +192,8 @@ export interface WorkerRunSummary {
     cutoverBlocked?: "cutover-boundary-missing";
     /** STAGING rows whose upload never landed, parked for a human. */
     staleStagingSwept?: number;
+    /** Previously-failed object deletions that finally succeeded. */
+    orphansCleaned?: number;
 }
 
 function centsOf(amount: string): number | null {
@@ -277,9 +281,10 @@ export interface CutoverRequest {
     /** Run the cutover this pass (i.e. dry-run is off). */
     run: boolean;
     /**
-     * The instant v1 stopped booking. Rows received BEFORE it were booked by
-     * v1 and are retired; rows received AFTER it were booked by nobody and are
-     * handed to v2. null refuses to touch either side.
+     * The instant v1 stopped booking. Only rows received before it are even
+     * CANDIDATES for retirement — and each still needs its own evidence that v1
+     * booked it. Never null when `run` is true: the pass halts before claiming
+     * rather than proceed without it.
      */
     boundary: Date | null;
 }
@@ -288,7 +293,6 @@ export interface ClaimResult {
     rows: WorkerRow[];
     shadowRetired: number;
     requeued: number;
-    boundaryMissing: boolean;
 }
 
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
@@ -298,10 +302,6 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // STILL go on to start a 25s Gemini read and a QBO round trip.
     const startedAt = deps.monotonicMs();
     const outOfTime = () => deps.monotonicMs() - startedAt >= RUN_SOFT_DEADLINE_MS;
-    // What is left of the PLATFORM budget, not the soft deadline: a booking may
-    // legitimately run past the point where we stop taking new rows, it just
-    // must not start without room to finish.
-    const remainingMs = () => RUN_HARD_BUDGET_MS - (deps.monotonicMs() - startedAt);
 
     // CUTOVER. Rows received while dry-run was on were booked by v1, so v2 must
     // never book them: they are RETIRED as SHADOW_DONE, not requeued.
@@ -319,18 +319,31 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // either side and says so.
     const runCutover = !deps.isDryRunEnabled();
     const boundary = runCutover ? await deps.cutoverBoundary() : null;
+
+    // HALT THE WHOLE PASS, before anything is claimed.
+    //
+    // Refusing only the retire/requeue was not enough: the pass went on to claim
+    // and BOOK rows while the shadow backlog sat in an undecided state. Live
+    // mode with no recorded boundary means we cannot tell which rows v1 already
+    // booked, and booking anything under that uncertainty is the double-booking
+    // this whole mechanism exists to prevent. Nothing is touched until an
+    // operator records the boundary.
+    if (runCutover && !boundary) {
+        console.error("[cron/receipt-intake-worker] cutover-boundary-missing: halting the pass, nothing claimed");
+        return { processed: 0, byState: {}, cutoverBlocked: "cutover-boundary-missing" };
+    }
+
     const claimed = await deps.claim({ run: runCutover, boundary });
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, shadowRetired, requeued, boundaryMissing } = claimed;
-    if (boundaryMissing) {
-        console.error("[cron/receipt-intake-worker] cutover-boundary-missing: refusing to retire or requeue");
-    }
+    const { rows, shadowRetired, requeued } = claimed;
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
     const staged = await deps.sweepStaleStaging(outOfTime).catch(() => 0);
+    // Orphaned objects from rejected rows. Nothing else remembers them.
+    const cleaned = await deps.retryStorageCleanups(outOfTime).catch(() => 0);
 
     const byState: Record<string, number> = {};
     const bump = (state: string) => { byState[state] = (byState[state] ?? 0) + 1; };
@@ -366,12 +379,12 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                     bump("NEEDS_REVIEW");
                     continue;
                 }
-                const result = await deps.book({ ...row, dryRun: false }, remainingMs());
+                const result = await deps.book({ ...row, dryRun: false });
                 await deps.applyBookResult(row.id, result);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun) { bump("BOOKING"); continue; }
-                const result = await deps.book(row, remainingMs());
+                const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result);
                 bump(stateForBookResult(result));
             }
@@ -386,8 +399,8 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
         ...(shadowRetired ? { shadowRetired } : {}),
         ...(requeued ? { requeued } : {}),
-        ...(boundaryMissing ? { cutoverBlocked: "cutover-boundary-missing" as const } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
+        ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };
 }
 
@@ -416,7 +429,18 @@ export async function handleRowError(
 
     const attempts = row.attempts + 1;
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        await deps.applyState(row.id, "NEEDS_REVIEW", "max-retries").catch(() => {});
+        // Same rule as booking's own ceiling: a row that exhausted its attempts
+        // without ever reaching QuickBooks (a weak-lookup fault, a
+        // finishRouting fault, a storage outage) created no Purchase, so its
+        // strong key must go back or a corrected resend collides with it.
+        await deps
+            .applyState(
+                row.id,
+                "NEEDS_REVIEW",
+                "max-retries",
+                row.sendAttempted ? undefined : { dedupStrongKey: null },
+            )
+            .catch(() => {});
         return "NEEDS_REVIEW";
     }
     await deps.retryRow(

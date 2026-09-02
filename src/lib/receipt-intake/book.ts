@@ -20,7 +20,12 @@
 import { matchCostCode } from "@/lib/project-match";
 import { toSecureRef } from "@/lib/secure-storage";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
-import { QBTimeoutError, type QBTokens, type RouteDeadline } from "@/lib/quickbooks";
+import {
+    QBTimeoutError,
+    remainingBudgetMs,
+    type QBTokens,
+    type RouteDeadline,
+} from "@/lib/quickbooks";
 import {
     QboAccountConfigError,
     QboPurchaseFaultError,
@@ -57,6 +62,12 @@ export interface BookableRow {
     attempts: number;
     /** Carries a previous attachment failure across a retry — see below. */
     lastError: string | null;
+    /**
+     * True once a QBO create has been ATTEMPTED for this row. It is the only
+     * honest answer to "could a Purchase exist?", and it is what decides whether
+     * a park may release the strong key.
+     */
+    sendAttempted: boolean;
 }
 
 /**
@@ -145,6 +156,8 @@ export interface BookPrismaClient {
 
 export interface BookDependencies {
     db: BookPrismaClient;
+    /** Persists sendAttempted BEFORE the create — the flag must survive a crash. */
+    markSendAttempted: (rowId: string) => Promise<void>;
     /** The company's configured zone — Expense.date is a business calendar day. */
     companyTimeZone: () => Promise<string>;
     /**
@@ -162,10 +175,15 @@ export interface BookDependencies {
         input: CreateQBReceiptPurchaseInput,
         deadline?: RouteDeadline,
     ) => Promise<CreateQBReceiptPurchaseResult>;
-    /** Milliseconds left in the worker's invocation. Undefined = unbounded (tests). */
-    remainingBudgetMs?: () => number;
-    /** Threads the same budget into every QuickBooks call this booking makes. */
-    deadline?: () => RouteDeadline | undefined;
+    /**
+     * The invocation's ONE absolute deadline. Undefined = unbounded (tests).
+     *
+     * Deliberately the deadline OBJECT rather than a remaining-milliseconds
+     * number: a number is measured once and then decays silently, so a booking
+     * that spent 20s downloading its file still believed it had the budget it
+     * was handed on entry. Every check below recomputes from this instead.
+     */
+    deadline?: RouteDeadline;
     /**
      * Reads the stored file back out of the private bucket. TAGGED, because a
      * confirmed 404 and a transient storage fault must not book the same way.
@@ -291,10 +309,9 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // Runway check BEFORE anything else that could touch QuickBooks. Deferred,
     // not retried: the document is fine and this costs it no attempt — the
     // invocation simply ran out of room, and the next pass has a full budget.
-    const remaining = deps.remainingBudgetMs?.();
-    if (remaining !== undefined && remaining < MIN_BOOKING_BUDGET_MS) {
-        return { outcome: "deferred", reason: "out-of-budget" };
-    }
+    const outOfRunway = () =>
+        deps.deadline !== undefined && remainingBudgetMs(deps.deadline) < MIN_BOOKING_BUDGET_MS;
+    if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
 
     // Everything down to the QBO call is a PRE-SEND refusal: nothing was ever
     // sent, so the strong key must be handed back (see BookResult).
@@ -348,6 +365,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     }
     const bytes = download.bytes;
 
+    // RE-CHECKED after the download, which is the slowest thing before the
+    // send. A 15 MB object over a slow link can eat the whole runway that the
+    // entry check just approved.
+    if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
+
     // PREFLIGHT, before anything is created. A format or size QBO cannot accept
     // is a fact about this file, known now — so refuse now, rather than
     // discovering it from `attachment:"skipped"` after a Purchase already
@@ -377,18 +399,28 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         fileContentType: row.mimeType,
     };
 
+    // RECORDED BEFORE THE CALL, and persisted, because the question it answers
+    // is "might QuickBooks hold a Purchase for this row?" — and a process that
+    // dies mid-create must still answer yes. Setting it after would make the
+    // one case that matters look like a row that never sent.
+    await deps.markSendAttempted(row.id);
+    const sent = { attempted: true };
+
     let result: CreateQBReceiptPurchaseResult;
     try {
-        // ONE budget threaded through both round trips, so a slow token refresh
-        // shortens the create rather than each getting a fresh 20s.
-        const deadline = deps.deadline?.();
-        const tokens = await deps.getTokens(deadline);
-        result = await deps.createPurchase(tokens, input, deadline);
+        // The SAME absolute deadline for both round trips, so a slow token
+        // refresh shortens the create rather than each helping itself to a
+        // fresh 20s.
+        const tokens = await deps.getTokens(deps.deadline);
+        // Last gate before the books are touched: the refresh may have consumed
+        // what was left.
+        if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
+        result = await deps.createPurchase(tokens, input, deps.deadline);
     } catch (error) {
         const terminal = terminalReasonFor(error);
         // A send WAS attempted: QBO may hold a Purchase whose response we lost,
         // so the key stays claimed even though the row is parked.
-        if (terminal) return { outcome: "needs-review", reason: terminal, releaseStrongKey: false };
+        if (terminal) return { outcome: "needs-review", reason: terminal, releaseStrongKey: !sent.attempted };
         // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
         // 429/5xx and DB errors are all transport-class: try again later.
         return retry(row, deps, now, describe(error));
@@ -406,6 +438,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // quarantine the corrected re-submission against a booking that never
         // happened. Release it. A THROWN fault is different — it can come from
         // inside the create — and keeps the key.
+        // ok:false is decided inside createQBReceiptPurchase BEFORE qbCreateFn
+        // runs, so no Purchase exists for this row and the key goes back.
         return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: true };
     }
 
@@ -596,7 +630,14 @@ async function resolvePhase(
     };
 }
 
-/** A refusal reached WITHOUT any QBO call — the strong key goes back. */
+/**
+ * A refusal reached WITHOUT any QBO call — the strong key goes back.
+ *
+ * The rule is about the SEND, not about the reason: any terminal park that
+ * provably created no Purchase releases the key, whatever the reason string
+ * says. Holding it makes a corrected resubmission collide with a row that never
+ * became a purchase, and the reviewer then has two stuck rows instead of one.
+ */
 function parkedBeforeSend(reason: string): BookResult {
     return { outcome: "needs-review", reason, releaseStrongKey: true };
 }
@@ -605,8 +646,12 @@ function retry(row: BookableRow, deps: BookDependencies, now: Date, reason: stri
     const attempts = row.attempts + 1;
     // `>=`, so MAX_BOOK_ATTEMPTS reads as "20 attempts in total" rather than 21.
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        // Sends were attempted to get here, so the key stays claimed.
-        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: false };
+        // Keyed on the ROW's record of whether a send ever happened, not on the
+        // assumption that reaching the retry limit implies one. A row can
+        // exhaust its attempts entirely on storage faults, having never touched
+        // QuickBooks — and holding its key then quarantines the corrected
+        // resend against nothing.
+        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: !row.sendAttempted };
     }
     return {
         outcome: "retry",

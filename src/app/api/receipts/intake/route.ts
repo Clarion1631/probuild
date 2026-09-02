@@ -65,6 +65,8 @@ interface ParsedBody {
     projectId: string | null;
     costCodeId: string | null;
     threadName: string | null;
+    /** The forwarder reporting that v1 already booked and archived this file. */
+    archivedByV1: boolean;
 }
 
 function bad(reason: string) {
@@ -117,6 +119,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
             projectId: str(form.get("projectId")),
             costCodeId: str(form.get("costCodeId")),
             threadName: str(form.get("threadName")),
+            archivedByV1: form.get("archivedByV1") === "true",
         };
     }
 
@@ -144,6 +147,9 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         projectId: str(json.projectId),
         costCodeId: str(json.costCodeId),
         threadName: str(json.threadName),
+        // Strict === true: only an explicit boolean may mark a row as already
+        // booked by v1, because that flag is what excuses v2 from booking it.
+        archivedByV1: json.archivedByV1 === true,
     };
 }
 
@@ -245,6 +251,10 @@ export async function POST(req: Request) {
                 projectId: parsed.projectId,
                 costCodeId: parsed.costCodeId,
                 createdById: auth.via === "session" ? auth.user.id : null,
+                // Only a shared-secret forwarder may assert this: it is the
+                // claim that v1 already put this document in the books, and it
+                // is what stops v2 from booking it at cutover.
+                archivedByV1: auth.via === "secret" ? parsed.archivedByV1 : false,
                 storagePath,
                 fileName: parsed.fileName,
                 mimeType,

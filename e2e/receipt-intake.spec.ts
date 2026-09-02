@@ -1,5 +1,6 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
+import { createHash } from "node:crypto";
 
 /**
  * POST/GET /api/receipts/intake — request-level auth matrix and idempotency.
@@ -698,5 +699,198 @@ test.describe("the two machine secrets are not interchangeable", () => {
         expect(mirrorStartingUpload.status()).toBe(403);
 
         await machine.dispose();
+    });
+});
+
+test.describe("cutover retirement needs evidence, not just an old timestamp", () => {
+    test("a shadow row v1 provably booked is retired; one it never touched is handed to v2", async ({ request }) => {
+        // "Received before the boundary" says when the file ARRIVED, not that
+        // anything booked it. v1 skips documents constantly — a bad read, a
+        // park, a file it never picked up — and retiring those as
+        // "booked-by-v1" silently drops real expenses.
+        const boundary = new Date(Date.now() + 60_000);
+        const evidencedFile = `EVID-${Date.now()}`;
+        const orphanFile = `ORPH-${Date.now()}`;
+
+        const evidenced = await postIntake(request, intakeBody({ sourceRef: `drive:${evidencedFile}` }));
+        const orphan = await postIntake(request, intakeBody({ sourceRef: `drive:${orphanFile}` }));
+        expect(evidenced.res.status()).toBe(200);
+        expect(orphan.res.status()).toBe(200);
+        minted.push(evidenced.body.id, orphan.body.id);
+
+        // Both parked exactly as the shadow week leaves them.
+        await prisma.receiptIntake.updateMany({
+            where: { id: { in: [evidenced.body.id, orphan.body.id] } },
+            data: { state: "READ", dryRun: true },
+        });
+
+        // Only ONE of them has v1's own booking event behind it. v1 pushes go
+        // through ProBuild's create route, which logs exactly this.
+        const event = await prisma.automationEvent.create({
+            data: {
+                kind: "receipt-push",
+                status: "created",
+                source: "apps-script",
+                driveFileId: evidencedFile,
+            },
+        });
+
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key: "cutoverV1StoppedAt" },
+                update: { value: boundary.toISOString() },
+                create: { key: "cutoverV1StoppedAt", value: boundary.toISOString() },
+            });
+
+            // Drive the real cutover through the worker's own claim path.
+            const res = await request.get("/api/cron/receipt-intake-worker", {
+                headers: process.env.CRON_SECRET ? { authorization: `Bearer ${process.env.CRON_SECRET}` } : {},
+                maxRedirects: 0,
+            });
+            // Skip cleanly if the cron is secret-gated in this environment.
+            test.skip(res.status() === 401, "CRON_SECRET not available to the spec");
+            expect(res.status()).toBe(200);
+
+            const after = await prisma.receiptIntake.findMany({
+                where: { id: { in: [evidenced.body.id, orphan.body.id] } },
+                select: { id: true, state: true, stateReason: true, dryRun: true },
+            });
+            const byId = Object.fromEntries(after.map(r => [r.id, r]));
+
+            expect(byId[evidenced.body.id].state).toBe("SHADOW_DONE");
+            expect(byId[evidenced.body.id].stateReason).toBe("booked-by-v1");
+
+            // No evidence -> v2's to book. Safe because a Drive row books under
+            // the DRIVE FILE ID, so a v1/v2 overlap collapses to one Purchase.
+            expect(byId[orphan.body.id].state).not.toBe("SHADOW_DONE");
+            expect(byId[orphan.body.id].dryRun).toBe(false);
+        } finally {
+            await prisma.automationEvent.delete({ where: { id: event.id } }).catch(() => {});
+            await prisma.automationSetting.deleteMany({ where: { key: "cutoverV1StoppedAt" } }).catch(() => {});
+        }
+    });
+
+    test("the forwarder can assert it already archived a file", async ({ request }) => {
+        // The second accepted form of evidence, for documents v1 handled before
+        // the create route existed to log them.
+        const ref = `${REF_PREFIX}archived-by-v1`;
+        const res = await postIntake(request, JSON.stringify({
+            source: "drive", sourceRef: ref, fileBase64: PNG_BASE64,
+            mimeType: "image/png", archivedByV1: true,
+        }));
+        expect(res.res.status()).toBe(200);
+        const row = await prisma.receiptIntake.findUnique({ where: { id: res.body.id } });
+        expect(row?.archivedByV1).toBe(true);
+    });
+
+    test("a SESSION caller cannot claim v1 already booked something", async ({ request }) => {
+        // That flag is what excuses v2 from booking a document. Only a
+        // shared-secret forwarder may assert it.
+        const res = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json" },
+            data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", archivedByV1: true }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(200);
+        const body = await res.json();
+        minted.push(body.id);
+        const row = await prisma.receiptIntake.findUnique({ where: { id: body.id } });
+        expect(row?.archivedByV1).toBe(false, "a browser upload can never claim v1 booked it");
+    });
+});
+
+test.describe("two-step upload: a reused key cannot swap the document", () => {
+    const startPath = `${INTAKE_PATH}/start`;
+    const sha = (b64: string) => createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex");
+
+    test("SEQUENTIAL reuse with different bytes is refused before a URL is issued", async ({ request }) => {
+        // Caught at /start, not at /finalize: by then the caller would have
+        // uploaded receipt B over receipt A's object and A's bytes are gone.
+        const ref = `${REF_PREFIX}twostep-seq`;
+        const first = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(first.status()).toBe(200);
+        const started = await first.json();
+        minted.push(started.id);
+        expect(started.uploadUrl).toBeTruthy();
+
+        // Same key, same document — a plain retry resumes.
+        const resumed = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(resumed.status()).toBe(200);
+        expect((await resumed.json()).id).toBe(started.id);
+
+        // Same key, DIFFERENT document — refused.
+        const swapped = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(OTHER_PNG_BASE64),
+            }),
+            maxRedirects: 0,
+        });
+        expect(swapped.status()).toBe(409);
+        expect((await swapped.json()).error).toBe("sourceRef-conflict");
+    });
+
+    test("CONCURRENT starts on one key yield ONE row", async ({ request }) => {
+        const ref = `${REF_PREFIX}twostep-race`;
+        const body = JSON.stringify({
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        const fire = () => request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: body,
+            maxRedirects: 0,
+        });
+
+        const results = await Promise.all([fire(), fire(), fire()]);
+        for (const r of results) expect(r.status()).toBe(200);
+        const ids = new Set(await Promise.all(results.map(async r => (await r.json()).id)));
+        expect(ids.size).toBe(1, "the unique index collapses the race to one row");
+
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: ref } });
+        expect(rows).toHaveLength(1);
+        expect(rows[0].expectedSha256).toBe(sha(PNG_BASE64));
+        minted.push(rows[0].id);
+    });
+
+    test("finalize refuses when the STORED bytes are not what /start was told", async ({ request }) => {
+        const ref = `${REF_PREFIX}twostep-sha`;
+        const started = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            // Declares a hash the bytes will never match.
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: "a".repeat(64) }),
+            maxRedirects: 0,
+        });
+        expect(started.status()).toBe(200);
+        const { id, storagePath } = await started.json();
+        minted.push(id);
+
+        // Put REAL bytes at the path the row points at, as a direct upload would.
+        await prisma.receiptIntake.update({ where: { id }, data: { storagePath } });
+        const seeded = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}twostep-sha-src` }),
+            maxRedirects: 0,
+        });
+        expect(seeded.status()).toBe(200);
+        const seededRow = await prisma.receiptIntake.findUnique({ where: { id: (await seeded.json()).id } });
+        minted.push(seededRow!.id);
+        await prisma.receiptIntake.update({ where: { id }, data: { storagePath: seededRow!.storagePath } });
+
+        const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(409);
+        expect((await finalized.json()).error).toBe("sha-mismatch");
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("STAGING");
     });
 });

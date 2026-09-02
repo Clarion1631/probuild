@@ -4,9 +4,11 @@ import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
+import { inspectStoredObject } from "@/lib/receipt-intake/stored-object";
+import { deleteObjectOrRecord, retryPendingCleanups } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
-import { createRouteDeadline } from "@/lib/quickbooks";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import { resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
@@ -19,6 +21,7 @@ import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
+    RUN_HARD_BUDGET_MS,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
     type ClaimResult,
@@ -61,7 +64,7 @@ const WORKER_ROW_SELECT = {
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
-    suggestedConfidence: true,
+    suggestedConfidence: true, sendAttempted: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true,
 } as const;
 
@@ -102,31 +105,87 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         // resend of the same receipt still collides with them and is caught.
         let shadowRetired = 0;
         let requeued = 0;
-        let boundaryMissing = false;
         if (opts.run) {
+            // runIntakeWorker halts before ever calling claim() without one, so
+            // this is belt-and-braces rather than the real gate.
             if (!opts.boundary) {
-                // Refuse. Retiring on a guess destroys evidence of real
-                // expenses; requeuing on a guess double-books them. A logged
-                // no-op is the only honest third option.
-                boundaryMissing = true;
+                console.error("[cron/receipt-intake-worker] claim() reached with no boundary — refusing");
             } else {
                 const parked: Prisma.ReceiptIntakeWhereInput = {
                     dryRun: true,
                     state: { in: ["READ", "BOOKING"] },
                 };
 
-                // BEFORE the boundary: v1 was still booking, so it booked these.
-                const retired = await tx.receiptIntake.updateMany({
+                // RETIREMENT NEEDS POSITIVE EVIDENCE, not just an old timestamp.
+                //
+                // "Received before the boundary" says when the file ARRIVED, not
+                // that anything booked it. v1 skips documents constantly — a bad
+                // read, a park, a file it never picked up — and every one of
+                // those would have been retired as "booked-by-v1" and silently
+                // dropped. So a row is only retired when we can point at the
+                // booking:
+                //
+                //   * an AutomationEvent from v1's own push (it goes through
+                //     ProBuild's create route, which logs kind receipt-push with
+                //     status created/already-exists and the Drive fileId), or
+                //   * the forwarder telling us it archived the file
+                //     (archivedByV1, set from the forward payload).
+                //
+                // Everything else is handed to v2. That is safe for the Drive
+                // rows this applies to: they book under the DRIVE FILE ID, so
+                // QBO's DocNumber/requestid idempotency collapses a v1/v2
+                // overlap into one Purchase.
+                const candidates = await tx.receiptIntake.findMany({
                     where: { ...parked, createdAt: { lt: opts.boundary } },
-                    data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
+                    select: { id: true, source: true, sourceRef: true, archivedByV1: true },
                 });
-                shadowRetired = retired.count;
 
-                // AFTER it: v1 had already stopped, so NOBODY booked these.
-                // They are the only rows from the shadow week that v2 must
-                // actually book — dropping them would lose real expenses.
+                const driveIds = candidates
+                    .map(r => (r.source === "drive" && r.sourceRef.startsWith("drive:")
+                        ? r.sourceRef.slice("drive:".length)
+                        : null))
+                    .filter((v): v is string => !!v);
+
+                const bookedByV1 = driveIds.length
+                    ? new Set(
+                        (await tx.automationEvent.findMany({
+                            where: {
+                                kind: "receipt-push",
+                                status: { in: ["created", "already-exists"] },
+                                driveFileId: { in: driveIds },
+                            },
+                            select: { driveFileId: true },
+                        })).map(e => e.driveFileId).filter((v): v is string => !!v),
+                    )
+                    : new Set<string>();
+
+                const evidenced: string[] = [];
+                const unevidenced: string[] = [];
+                for (const row of candidates) {
+                    const driveId = row.source === "drive" && row.sourceRef.startsWith("drive:")
+                        ? row.sourceRef.slice("drive:".length)
+                        : null;
+                    if (row.archivedByV1 || (driveId && bookedByV1.has(driveId))) evidenced.push(row.id);
+                    else unevidenced.push(row.id);
+                }
+
+                if (evidenced.length) {
+                    const retired = await tx.receiptIntake.updateMany({
+                        where: { id: { in: evidenced } },
+                        data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
+                    });
+                    shadowRetired = retired.count;
+                }
+
+                // Everything else — after the boundary, or before it with no
+                // evidence — is v2's to book.
                 const handed = await tx.receiptIntake.updateMany({
-                    where: { ...parked, createdAt: { gte: opts.boundary } },
+                    where: {
+                        OR: [
+                            { ...parked, createdAt: { gte: opts.boundary } },
+                            ...(unevidenced.length ? [{ id: { in: unevidenced } }] : []),
+                        ],
+                    },
                     data: { dryRun: false, nextRetryAt: null },
                 });
                 requeued = handed.count;
@@ -134,6 +193,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 if (shadowRetired > 0 || requeued > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
                         boundary: opts.boundary.toISOString(), shadowRetired, requeued,
+                        unevidenced: unevidenced.length,
                     }));
                 }
             }
@@ -152,7 +212,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             take: BATCH_SIZE,
             select: WORKER_ROW_SELECT,
         });
-        if (due.length === 0) return { rows: [], shadowRetired, requeued, boundaryMissing };
+        if (due.length === 0) return { rows: [], shadowRetired, requeued };
 
         // THE claim. Anything this run took is invisible to the next one for
         // the lease, whether or not the advisory lock held.
@@ -160,11 +220,11 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             where: { id: { in: due.map(r => r.id) } },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS) },
         });
-        return { rows: due as WorkerRow[], shadowRetired, requeued, boundaryMissing };
+        return { rows: due as WorkerRow[], shadowRetired, requeued };
     });
 }
 
-function buildDeps(): WorkerDependencies {
+function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     return {
         claim,
 
@@ -182,7 +242,7 @@ function buildDeps(): WorkerDependencies {
             const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
             const stale = await prisma.receiptIntake.findMany({
                 where: { state: "STAGING", createdAt: { lt: cutoff } },
-                select: { id: true, storagePath: true },
+                select: { id: true, storagePath: true, mimeType: true },
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
                 // spends the invocation on housekeeping.
@@ -191,30 +251,51 @@ function buildDeps(): WorkerDependencies {
 
             let published = 0;
             let parked = 0;
+            let rejected = 0;
             for (const row of stale) {
                 // The sweep is inside the run's deadline, not outside it.
                 if (shouldStop()) break;
-                const probe = await downloadDocBytesResult(toSecureRef(row.storagePath));
-                if (probe.ok) {
-                    // The upload landed; only the publish was lost. Finish it.
+
+                // THE SAME validator /finalize uses. Publishing on "the object
+                // exists" alone would wave through a 40 MB video, an executable,
+                // or a truncated upload that /finalize would have refused — and
+                // those rows then go to Gemini and, if they read at all, to
+                // QuickBooks. One implementation, so the two cannot diverge.
+                const check = await inspectStoredObject(row.storagePath, row.mimeType);
+
+                if (check.ok) {
                     await prisma.receiptIntake.updateMany({
                         where: { id: row.id, state: "STAGING" },
-                        data: { state: "RECEIVED", nextRetryAt: null },
+                        data: {
+                            state: "RECEIVED",
+                            nextRetryAt: null,
+                            mimeType: check.mimeType,
+                            fileSize: check.fileSize,
+                            fileSha256: check.fileSha256,
+                        },
                     });
                     published++;
                     continue;
                 }
-                if (probe.kind === "transient") continue; // unknown is not a verdict
-                await prisma.receiptIntake.updateMany({
-                    where: { id: row.id, state: "STAGING" },
-                    data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
-                });
-                parked++;
+                if (check.kind === "transient") continue; // unknown is not a verdict
+                if (check.kind === "missing") {
+                    await prisma.receiptIntake.updateMany({
+                        where: { id: row.id, state: "STAGING" },
+                        data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
+                    });
+                    parked++;
+                    continue;
+                }
+                // Rejected: the object exists and is not acceptable. Same
+                // outcome as /finalize — the row goes and so does the object.
+                await prisma.receiptIntake.deleteMany({ where: { id: row.id, state: "STAGING" } });
+                await deleteObjectOrRecord(row.storagePath, check.reason);
+                rejected++;
             }
-            if (published || parked) {
-                console.log("[cron/receipt-intake-worker] STAGING sweep", JSON.stringify({ published, parked }));
+            if (published || parked || rejected) {
+                console.log("[cron/receipt-intake-worker] STAGING sweep", JSON.stringify({ published, parked, rejected }));
             }
-            return published + parked;
+            return published + parked + rejected;
         },
 
         loadPhases: async () => prisma.costCode.findMany({
@@ -297,6 +378,8 @@ function buildDeps(): WorkerDependencies {
 
         companyTimeZone: resolveCompanyTimeZone,
 
+        retryStorageCleanups: shouldStop => retryPendingCleanups(STAGING_SWEEP_BATCH, shouldStop),
+
         promoteToBooking: async (rowId, weakKey) => prisma.$transaction(async tx => {
             // LAST weak-dedup check, taken INSIDE the transition. The check at
             // read time can miss a pair that arrived in the same batch window,
@@ -319,7 +402,14 @@ function buildDeps(): WorkerDependencies {
             // Rows with different weak keys take different locks and never
             // block each other.
             if (weakKey) {
-                await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
+                // $executeRaw, NOT $queryRaw. pg_advisory_xact_lock returns
+                // VOID: `SELECT` of it produces a row whose single column has no
+                // readable type, and Prisma's query path can reject that outright
+                // — which would throw INSIDE the promotion transaction and, on
+                // the retry path, look like a transient DB fault forever while
+                // the lock was never actually taken. $executeRaw runs the
+                // statement for its effect and asks nothing of the result.
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
                 // EVERY LIVE STATE, not just the post-booking ones.
                 //
                 // Limiting this to BOOKING/BOOKED/ARCHIVED meant a twin sitting
@@ -363,16 +453,19 @@ function buildDeps(): WorkerDependencies {
             return { promoted: true };
         }),
 
-        book: (row, remainingMs) => bookReceipt(row, {
+        book: row => bookReceipt(row, {
             db: prisma as unknown as BookPrismaClient,
             companyTimeZone: resolveCompanyTimeZone,
+            markSendAttempted: async rowId => {
+                await prisma.receiptIntake.update({ where: { id: rowId }, data: { sendAttempted: true } });
+            },
             isCostCodeAllowed: (projectId, costCodeId) =>
                 isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
-            remainingBudgetMs: () => remainingMs,
-            // ONE deadline for the whole booking, threaded into the token
-            // refresh AND the Purchase create so they share a budget instead of
-            // each helping itself to a fresh 20s.
-            deadline: () => createRouteDeadline(Math.max(0, remainingMs)),
+            // The invocation's ONE absolute deadline, created at entry and
+            // shared by every check and every QuickBooks call. Never a
+            // remaining-milliseconds snapshot: that is measured once and then
+            // decays silently while the work runs.
+            deadline: invocationDeadline,
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             getTokens: deadline => getFreshQBTokens(deadline),
@@ -461,7 +554,7 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const summary = await runIntakeWorker(buildDeps());
+    const summary = await runIntakeWorker(buildDeps(createRouteDeadline(RUN_HARD_BUDGET_MS)));
     if (summary.processed > 0 || summary.skipped) {
         console.log("[cron/receipt-intake-worker]", JSON.stringify(summary));
     }

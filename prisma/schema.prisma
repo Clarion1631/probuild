@@ -3049,6 +3049,10 @@ model ReceiptIntake {
   mimeType    String
   fileSize    Int
   fileSha256  String
+  /// What the CLIENT said it was about to upload, recorded by /intake/start.
+  /// The two-step flow hands the bytes straight to storage, so this is the only
+  /// way to notice that a reused sourceRef is carrying a DIFFERENT document.
+  expectedSha256 String?
 
   // read results (cents, like AutomationEvent)
   vendor     String?
@@ -3067,6 +3071,15 @@ model ReceiptIntake {
   duplicateOfId  String?
 
   // booking + archive
+  /// Set the instant before the QBO create is attempted. A park BEFORE this is
+  /// true provably created no Purchase, so its strong key can be released; a
+  /// park after it must keep the key, because QuickBooks may hold a Purchase
+  /// whose response we lost.
+  sendAttempted      Boolean  @default(false)
+  /// Positive evidence that v1 (the Apps Script) already booked this document.
+  /// The cutover retires ONLY rows carrying it — never rows that merely predate
+  /// the boundary, because "old" is not proof anybody booked anything.
+  archivedByV1       Boolean  @default(false)
   qbPurchaseId       String?
   expenseId          String?   @unique
   expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)

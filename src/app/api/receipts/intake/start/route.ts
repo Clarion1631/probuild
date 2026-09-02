@@ -47,6 +47,16 @@ export async function POST(req: Request) {
     // real type from the STORED BYTES, so a lie costs the caller its upload.
     if (!ext) return NextResponse.json({ ok: false, reason: "unsupported-file-type" }, { status: 400 });
 
+    // The client's own hash of what it is ABOUT to upload. Persisted, because
+    // the two-step flow hands the bytes straight to storage: without it a
+    // reused sourceRef carrying a DIFFERENT document is indistinguishable from
+    // an honest retry, and /finalize would attach one receipt's bytes to
+    // another receipt's identity.
+    const expectedSha256 = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
+    if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+        return NextResponse.json({ ok: false, reason: "invalid-sha256" }, { status: 400 });
+    }
+
     const declaredSize = Number(body.fileSize);
     if (Number.isFinite(declaredSize) && declaredSize > MAX_STORED_BYTES) {
         return NextResponse.json({ ok: false, reason: "file-too-large", maxBytes: MAX_STORED_BYTES }, { status: 413 });
@@ -81,14 +91,18 @@ export async function POST(req: Request) {
                 projectId,
                 costCodeId: str(body.costCodeId),
                 createdById: auth.via === "session" ? auth.user.id : null,
+                // Forwarder-only, same as the single-shot path: this is the
+                // claim that v1 already booked the document.
+                archivedByV1: auth.via === "secret" && body.archivedByV1 === true,
                 storagePath,
                 fileName: str(body.fileName),
                 mimeType,
                 fileSize: 0,
                 // Unknown until the bytes land. /finalize recomputes it FROM
                 // STORAGE and writes the real value; a client-declared hash is
-                // never trusted as the stored one.
+                // never trusted as the stored one — only checked against it.
                 fileSha256: "",
+                expectedSha256,
             },
             select: { id: true, sourceRef: true, state: true },
         });
@@ -98,7 +112,10 @@ export async function POST(req: Request) {
             // client resumes rather than orphaning a second object.
             const existing = await prisma.receiptIntake.findUnique({
                 where: { sourceRef: decided.sourceRef },
-                select: { id: true, sourceRef: true, state: true, storagePath: true, createdById: true },
+                select: {
+                    id: true, sourceRef: true, state: true, storagePath: true,
+                    createdById: true, expectedSha256: true, fileSha256: true,
+                },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
             const maySee =
@@ -106,6 +123,19 @@ export async function POST(req: Request) {
                 existing.createdById === auth.user.id ||
                 auth.user.role === "ADMIN";
             if (!maySee) return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
+
+            // SAME KEY, DIFFERENT DOCUMENT. Caught HERE, before a signed URL is
+            // handed out — otherwise the caller would upload receipt B over
+            // receipt A's object and only /finalize would notice, by which point
+            // A's bytes are gone.
+            const knownSha = existing.fileSha256 || existing.expectedSha256;
+            if (expectedSha256 && knownSha && knownSha.toLowerCase() !== expectedSha256) {
+                return NextResponse.json(
+                    { ok: false, error: "sourceRef-conflict", reason: "this sourceRef already holds a different document", existingId: existing.id },
+                    { status: 409 },
+                );
+            }
+
             if (existing.state !== "STAGING") {
                 return NextResponse.json(
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
@@ -141,7 +171,14 @@ async function signUpload(storagePath: string): Promise<{ uploadUrl: string; tok
     const supabase = getSupabase();
     if (!supabase) return null;
     try {
-        const { data, error } = await supabase.storage.from(SECURE_BUCKET).createSignedUploadUrl(storagePath);
+        // upsert: true — a resumed /start for the SAME row must be able to
+        // overwrite a partial or failed upload at the same path. Without it the
+        // second attempt fails on "already exists" and the row can never be
+        // finalized. The sha checks above are what stop this from overwriting a
+        // DIFFERENT document.
+        const { data, error } = await supabase.storage
+            .from(SECURE_BUCKET)
+            .createSignedUploadUrl(storagePath, { upsert: true });
         if (error || !data) {
             console.error("[receipts/intake/start] sign failed", error?.message);
             return null;

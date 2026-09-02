@@ -1,10 +1,9 @@
-import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
 import { authenticateIntake, STAFF_READ_ROLES } from "@/lib/receipt-intake/intake-auth";
-import { sniffMime } from "@/lib/receipt-intake/file-type";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import { inspectStoredObject } from "@/lib/receipt-intake/stored-object";
+import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -40,6 +39,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         select: {
             id: true, state: true, sourceRef: true, storagePath: true, mimeType: true,
             projectId: true, dryRun: true, createdById: true, fileSha256: true,
+            expectedSha256: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
@@ -62,9 +62,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         });
     }
 
-    const download = await downloadDocBytesResult(toSecureRef(row.storagePath));
-    if (!download.ok) {
-        if (download.kind === "not-found") {
+    // ONE validator, shared with the worker's stale-STAGING sweep — see
+    // stored-object.ts. If the two disagreed, whichever ran first would decide
+    // whether a 40 MB video became a receipt.
+    const check = await inspectStoredObject(row.storagePath, row.mimeType);
+    if (!check.ok) {
+        if (check.kind === "missing") {
             // The upload never landed. Retryable, and NEVER a 2xx: the
             // forwarders treat 2xx as "we have it" and would drop their copy.
             return NextResponse.json(
@@ -72,39 +75,48 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 { status: 409 },
             );
         }
-        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-    }
-
-    const bytes = download.bytes;
-    if (bytes.length > MAX_STORED_BYTES) {
-        // Enforced on the OBJECT, because the signed URL bypassed every check
-        // this server could otherwise have made. Drop it rather than leave an
-        // oversize file in a private bucket nobody will ever book.
+        if (check.kind === "transient") {
+            return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+        }
+        // REJECTED. The row goes, and so must the object — nothing references it
+        // once the row is gone, so a failed delete is recorded for the sweep to
+        // retry rather than shrugged off.
         await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
-        return NextResponse.json({ ok: false, reason: "file-too-large", maxBytes: MAX_STORED_BYTES }, { status: 413 });
-    }
-
-    // The stored type is decided on the BYTES, exactly like the single-shot path.
-    const mimeType = sniffMime(bytes, row.mimeType);
-    if (!mimeType) {
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
-        return NextResponse.json({ ok: false, reason: "unsupported-file-type" }, { status: 400 });
-    }
-
-    const fileSha256 = createHash("sha256").update(bytes).digest("hex");
-    // A declared hash is an INTEGRITY check on the client's own upload, never
-    // the value we store. A mismatch means the bytes in the bucket are not the
-    // bytes the client meant to send.
-    if (declaredSha && declaredSha !== fileSha256) {
+        await deleteObjectOrRecord(row.storagePath, check.reason);
+        const status = check.reason.startsWith("file-too-large") ? 413 : 400;
         return NextResponse.json(
-            { ok: false, error: "sha-mismatch", reason: "stored bytes do not match the declared sha256" },
-            { status: 409 },
+            { ok: false, reason: check.reason, maxBytes: MAX_STORED_BYTES },
+            { status },
         );
+    }
+
+    const { mimeType, fileSize, fileSha256 } = check;
+
+    // THE HASH IS CHECKED AGAINST BOTH RECORDED EXPECTATIONS.
+    //
+    // `expectedSha256` was written by /start from what the client said it was
+    // about to upload; `declaredSha` is what it says now. Either disagreeing
+    // with the stored bytes means the object is not the document this row was
+    // created for — which is exactly the case a reused sourceRef produces, and
+    // the case that would otherwise attach one receipt's bytes to another
+    // receipt's identity.
+    for (const [label, expected] of [["declared", declaredSha], ["expected", row.expectedSha256]] as const) {
+        if (expected && expected.toLowerCase() !== fileSha256) {
+            return NextResponse.json(
+                {
+                    ok: false,
+                    error: "sha-mismatch",
+                    reason: `stored bytes do not match the ${label} sha256`,
+                    storedSha256: fileSha256,
+                },
+                { status: 409 },
+            );
+        }
     }
 
     const published = await prisma.receiptIntake.updateMany({
         where: { id, state: "STAGING" },
-        data: { state: "RECEIVED", mimeType, fileSize: bytes.length, fileSha256 },
+        data: { state: "RECEIVED", mimeType, fileSize, fileSha256 },
     });
     if (published.count === 0) {
         // Another finalize won the race and published it. Same outcome.
@@ -117,6 +129,6 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     return NextResponse.json({
         ok: true, id, state: "RECEIVED", sourceRef: row.sourceRef,
-        projectId: row.projectId, dryRun: row.dryRun, fileSize: bytes.length,
+        projectId: row.projectId, dryRun: row.dryRun, fileSize,
     });
 }

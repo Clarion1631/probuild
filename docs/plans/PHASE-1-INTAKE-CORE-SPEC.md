@@ -522,14 +522,21 @@ an overlap safe in general.
    an ISO timestamp. This is the ONLY input that separates "v1 booked it" from "nobody booked
    it", and nothing in the database can infer it.
 5. **Only then set `RECEIPT_INTAKE_DRYRUN=false`.** On its first pass the worker splits the
-   shadow backlog on that boundary:
-   - received BEFORE it -> `SHADOW_DONE` / `booked-by-v1`. Terminal; v2 never books these,
-     because v1 already did and QBO's DocNumber idempotency cannot recognise a v2 UUID.
-   - received AFTER it -> handed to v2 for real booking. v1 had already stopped, so nobody
-     booked these; retiring them would drop real expenses on the floor.
-   With no boundary recorded the pass touches NEITHER side and logs
-   `cutover-boundary-missing`. That is deliberate: retiring on a guess destroys evidence,
-   requeuing on a guess double-books, and a visible no-op is the only honest third option.
+   shadow backlog. The boundary narrows the CANDIDATES; **evidence** decides each one:
+   - before the boundary AND provably booked by v1 -> `SHADOW_DONE` / `booked-by-v1`.
+     Terminal; v2 never books these. Evidence is either an `AutomationEvent`
+     (`kind: receipt-push`, status `created`/`already-exists`) whose `driveFileId` matches
+     the row — v1's pushes go through ProBuild's create route, which logs them — or the
+     forwarder sending `archivedByV1: true` on the forward.
+   - everything else, including rows before the boundary with NO evidence -> handed to v2.
+     "Received before the boundary" says when the file arrived, not that anything booked
+     it: v1 skips documents constantly, and retiring those would drop real expenses. This
+     is safe because a Drive row books under the **Drive file id**, so a v1/v2 overlap on
+     the same file collapses to one Purchase through QBO's DocNumber/requestid idempotency.
+   With no boundary recorded in live mode the worker **halts the entire pass before
+   claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking
+   anything while we cannot tell what v1 already booked is the double-booking this whole
+   mechanism exists to prevent.
 
 Retired rows keep their read results and dedup keys, so a post-cutover resend of a
 shadow-week receipt still collides with them and is caught as a duplicate.

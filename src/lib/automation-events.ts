@@ -17,7 +17,19 @@ import { prisma } from "@/lib/prisma";
  */
 
 export interface AutomationEventInput {
-    kind: "receipt-push" | "qbo-sync" | "receipt-stage" | "setting" | "qbo-payments-sync";
+    kind:
+        | "receipt-push"
+        | "qbo-sync"
+        | "receipt-stage"
+        | "setting"
+        | "qbo-payments-sync"
+        /**
+         * A rejected intake object whose DELETE from storage failed. The row is
+         * already gone, so nothing else remembers the orphan — without this the
+         * bytes sit in a private bucket forever, unreferenced. The receipt
+         * worker's sweep retries the deletion and resolves the event.
+         */
+        | "storage-cleanup-pending";
     stage?: string;
     status: string;
     reason?: string;

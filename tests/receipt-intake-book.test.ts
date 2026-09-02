@@ -52,12 +52,14 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         memo: null,
         attempts: 0,
         lastError: null,
+        sendAttempted: false,
         ...overrides,
     };
 }
 
 interface Recorder {
     deps: BookDependencies;
+    sendMarks: string[];
     purchaseCalls: any[];
     expenses: any[];
     intakeUpdates: any[];
@@ -66,6 +68,7 @@ interface Recorder {
 
 function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
     const purchaseCalls: any[] = [];
+    const sendMarks: string[] = [];
     const expenses: any[] = [];
     const intakeUpdates: any[] = [];
     const events: any[] = [];
@@ -102,9 +105,10 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         now: () => NOW,
         companyTimeZone: async () => "America/Los_Angeles",
         isCostCodeAllowed: async () => true,
+        markSendAttempted: async id => { sendMarks.push(id); },
         ...overrides,
     };
-    return { deps, purchaseCalls, expenses, intakeUpdates, events };
+    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {
@@ -413,12 +417,24 @@ test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTA
     assert.equal((await bookReceipt(row({ attempts: 18 }), nearly.deps)).outcome, "retry");
 
     // row.attempts 19 -> this is attempt 20, the last one the constant allows.
+    // sendAttempted is what decides the key, not the fact of reaching the limit.
     const exhausted = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
-    assert.deepEqual(await bookReceipt(row({ attempts: 19 }), exhausted.deps), {
+    assert.deepEqual(await bookReceipt(row({ attempts: 19, sendAttempted: true }), exhausted.deps), {
         outcome: "needs-review",
         reason: "max-retries",
-        // Sends were attempted to get here, so the key is NOT released.
+        // A send HAS been attempted, so QBO may hold a Purchase: keep the key.
         releaseStrongKey: false,
+    });
+
+    // ...and a row that burned all 20 attempts WITHOUT ever reaching QuickBooks
+    // (storage faults, say) created no Purchase, so its key must go back.
+    const neverSent = recorder({
+        downloadBytes: async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
+    });
+    assert.deepEqual(await bookReceipt(row({ attempts: 19, sendAttempted: false }), neverSent.deps), {
+        outcome: "needs-review",
+        reason: "max-retries",
+        releaseStrongKey: true,
     });
 });
 
@@ -532,7 +548,8 @@ test("a booking with less than 25s of runway DEFERS instead of starting", async 
     // not fit in a few seconds, and a booking cut off mid-flight is the worst
     // outcome available: the Purchase may exist in the real books while the row
     // never learns it did.
-    const r = recorder({ remainingBudgetMs: () => 9_000 });
+    // An absolute deadline that is already nearly spent.
+    const r = recorder({ deadline: { startedAt: Date.now() - 50_000, budgetMs: 55_000 } });
     const result = await bookReceipt(row(), r.deps);
     assert.deepEqual(result, { outcome: "deferred", reason: "out-of-budget" });
     assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
@@ -540,7 +557,7 @@ test("a booking with less than 25s of runway DEFERS instead of starting", async 
 });
 
 test("the runway check spends no attempt — the document did nothing wrong", async () => {
-    const r = recorder({ remainingBudgetMs: () => 0 });
+    const r = recorder({ deadline: { startedAt: Date.now() - 60_000, budgetMs: 55_000 } });
     const result = await bookReceipt(row({ attempts: 3 }), r.deps);
     assert.equal(result.outcome, "deferred");
     assert.ok(!("attempts" in result), "not a retry, so no attempt is spent");
@@ -548,9 +565,9 @@ test("the runway check spends no attempt — the document did nothing wrong", as
 
 test("ample runway books normally, and threads ONE deadline into both QBO calls", async () => {
     const seen: unknown[] = [];
+    const deadline = { startedAt: Date.now(), budgetMs: 55_000 };
     const r = recorder({
-        remainingBudgetMs: () => 50_000,
-        deadline: () => ({ startedAt: 0, budgetMs: 50_000 }) as any,
+        deadline,
         getTokens: async d => { seen.push(d); return { accessToken: "t", realmId: "r" } as any; },
         createPurchase: async (_t, input, d) => {
             seen.push(d);
@@ -562,6 +579,7 @@ test("ample runway books normally, and threads ONE deadline into both QBO calls"
     assert.equal(result.outcome, "booked");
     assert.equal(seen.length, 2);
     assert.strictEqual(seen[0], seen[1], "the SAME deadline object, so a slow refresh shortens the create");
+    assert.strictEqual(seen[0], deadline, "and it is the INVOCATION's deadline, not a fresh one");
 });
 
 test("MIN_BOOKING_BUDGET_MS is the documented 25s", () => {

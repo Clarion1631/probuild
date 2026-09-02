@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "mimeType" TEXT NOT NULL,
     "fileSize" INTEGER NOT NULL,
     "fileSha256" TEXT NOT NULL,
+    "expectedSha256" TEXT,
     "vendor" TEXT,
     "txnDate" DATE,
     "totalCents" INTEGER,
@@ -41,6 +42,8 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "dedupStrongKey" TEXT,
     "dedupWeakKey" TEXT,
     "duplicateOfId" TEXT,
+    "sendAttempted" BOOLEAN NOT NULL DEFAULT false,
+    "archivedByV1" BOOLEAN NOT NULL DEFAULT false,
     "qbPurchaseId" TEXT,
     "expenseId" TEXT,
     "archiveDriveFileId" TEXT,
@@ -58,6 +61,9 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
 -- scripts/apply-receipt-intake.mjs: CREATE TABLE IF NOT EXISTS is a no-op on an
 -- existing table, so a column added to the CREATE above would never reach it.
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false;
 
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");

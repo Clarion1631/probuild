@@ -94,6 +94,7 @@ export const statements = [
        "mimeType"            TEXT NOT NULL,
        "fileSize"            INTEGER NOT NULL,
        "fileSha256"          TEXT NOT NULL,
+       "expectedSha256"      TEXT,
        "vendor"              TEXT,
        "txnDate"             DATE,
        "totalCents"          INTEGER,
@@ -106,6 +107,8 @@ export const statements = [
        "dedupStrongKey"      TEXT,
        "dedupWeakKey"        TEXT,
        "duplicateOfId"       TEXT,
+       "sendAttempted"       BOOLEAN NOT NULL DEFAULT false,
+       "archivedByV1"        BOOLEAN NOT NULL DEFAULT false,
        "qbPurchaseId"        TEXT,
        "expenseId"           TEXT,
        "archiveDriveFileId"  TEXT,
@@ -124,6 +127,9 @@ export const statements = [
     // existing table, so a column added to the CREATE above would never reach
     // it. This is the whole reason the script is re-runnable.
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false`,
 
     // Intake idempotency: one row per caller-supplied sourceRef. A forwarder
     // replaying the same Drive file / Gmail message is a no-op.
@@ -250,7 +256,8 @@ const expectedColumns = {
         "id", "source", "sourceRef", "state", "dryRun", "stateReason",
         "projectId", "costCodeId", "suggestedCostCodeId", "suggestedConfidence",
         "createdById", "storagePath", "fileName", "mimeType", "fileSize",
-        "fileSha256", "vendor", "txnDate", "totalCents", "taxCents", "docType",
+        "fileSha256", "expectedSha256", "sendAttempted", "archivedByV1",
+        "vendor", "txnDate", "totalCents", "taxCents", "docType",
         "refNumber", "memo", "readJson", "readAt", "dedupStrongKey",
         "dedupWeakKey", "duplicateOfId", "qbPurchaseId", "expenseId",
         "archiveDriveFileId", "attempts", "busyPasses", "lastError", "nextRetryAt",
