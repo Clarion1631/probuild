@@ -33,6 +33,7 @@ import {
     isQBTimeoutError,
     isBudgetExhausted,
     remainingBudgetMs,
+    createRouteDeadline,
     QBBudgetExhaustedError,
     qboHttpStatus,
     type RouteDeadline,
@@ -226,6 +227,12 @@ export interface QboReceiptPushDependencies {
         purchaseId: string,
         file: { base64: string; contentType: string; fileName: string },
     ) => Promise<ReceiptAttachmentStatus>;
+    /**
+     * Forced token refresh used by the 401 retry on the attachment lookup and
+     * upload. Injectable for the same reason the other QBO calls are: those
+     * retries are real behaviour that needs covering without a live Intuit.
+     */
+    refreshTokensFn: () => Promise<QBTokens>;
 }
 
 const BANK_ACCOUNT_ID_DEFAULT = "154"; // Washington Trust Bank
@@ -464,17 +471,36 @@ async function ensureAttachmentOnExistingPurchase(
     input: CreateQBReceiptPurchaseInput,
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
     uploadAttachment: QboReceiptPushDependencies["uploadAttachment"],
+    deadline?: RouteDeadline,
+    /** Injectable for tests; defaults to the real token refresh. */
+    refreshTokens?: () => Promise<QBTokens>,
 ): Promise<ReceiptAttachmentStatus> {
     const plan = planAttachmentUpload(input);
     if (!plan) return "skipped";
     // QBO transaction ids are numeric; refuse anything else rather than escape it.
     if (!/^\d+$/.test(purchaseId)) return "skipped";
 
+    const refresh = refreshTokens ?? (async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens(deadline);
+    });
+    const lookupSql = `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`;
+
     try {
-        const rows = await qbQueryFn<QBAttachable>(
-            tokens,
-            `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
-        );
+        // The token can age out between the Purchase lookup and here, exactly
+        // as it can on the upload. One forced refresh repairs it in place
+        // instead of costing the receipt a whole extra bot pass.
+        let activeTokens = tokens;
+        let rows: QBAttachable[];
+        try {
+            rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
+        } catch (error) {
+            if (qboHttpStatus(error) !== 401) throw error;
+            const refreshed = await refresh().catch(() => null);
+            if (!refreshed) throw error;
+            activeTokens = refreshed;
+            rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
+        }
         // Entity ids are only unique per entity type, so a value-only query can
         // surface attachments from other transaction types — keep Purchase links.
         const alreadyAttached = (rows ?? []).some(
@@ -486,7 +512,7 @@ async function ensureAttachmentOnExistingPurchase(
                 ) && (row.FileName ?? "") === plan.fileName,
         );
         if (alreadyAttached) return "already-attached";
-        return await uploadAttachment(tokens, purchaseId, plan);
+        return await uploadAttachment(activeTokens, purchaseId, plan);
     } catch (error) {
         // Retryable: our deadline, a 429/5xx, a transport failure. These say
         // nothing about the file, so they must NOT become a terminal `failed:`
@@ -494,12 +520,19 @@ async function ensureAttachmentOnExistingPurchase(
         // resending and leave the Purchase unattached.
         if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
 
-        // Terminal: QuickBooks answered, with a refusal that will repeat. A
-        // 400/403/404 on the Attachable lookup is a real answer (bad query,
-        // no access, no such purchase) — retrying it forever is a loop, so it
-        // rides along on ok:true as a recorded failure instead.
+        // Same transient set as the upload path, which this must match: 401
+        // (survived a forced refresh) and 408 join 429/5xx as retryable.
+        // Treating a 401 as terminal here while the upload retried it was the
+        // inconsistency — one recovery step giving up where the other kept going.
         const status = qboHttpStatus(error);
-        if (status !== null && !isRetryableQboStatus(status)) {
+        if (status !== null && isTransientAttachmentStatus(status)) {
+            throw new QboRetryableError(`QB attachment lookup failed with status ${status}`, status);
+        }
+        // Terminal: QuickBooks answered with a refusal that will repeat. A
+        // 400/403/404 is a real answer (bad query, no access, no such
+        // purchase) — retrying it forever is a loop, so it rides along on
+        // ok:true as a recorded failure instead.
+        if (status !== null) {
             return `failed:${status}`;
         }
 
@@ -547,6 +580,16 @@ export class QboAccountConfigError extends Error {
 const verifiedAccountsCache = new Map<string, number>();
 /** Short TTL: account config is mutable, and this only exists to skip repeat round trips. */
 const VERIFIED_ACCOUNTS_TTL_MS = 5 * 60_000;
+/**
+ * The shared verification's OWN budget, independent of whoever happened to
+ * start it.
+ *
+ * Binding it to the initiator's deadline meant a push with 700ms left would
+ * kick off the verification everyone else waits on and then poison it for all
+ * of them. The shared work gets a fixed, generous budget; each waiter races it
+ * against its own remaining time (below) and walks away alone.
+ */
+const ACCOUNT_VERIFY_BUDGET_MS = 20_000;
 /** In-flight verifications, shared so concurrent pushes do not duplicate the queries. */
 const verifyingAccounts = new Map<string, Promise<void>>();
 
@@ -580,6 +623,11 @@ async function resolveOverheadAccountId(
 
 async function verifyReceiptAccounts(
     tokens: QBTokens,
+    /**
+     * Deliberately NOT the caller's query function: this runs on the shared
+     * verification's own clock so one impatient request cannot cut short the
+     * work every concurrent push is waiting on.
+     */
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
     bankAccountId: string,
     expenseAccountId: string,
@@ -696,7 +744,11 @@ export async function createQBReceiptPurchase(
     const ensureVendorFn = deps.ensureVendorFn ?? ((t, n) => ensureQBVendor(t, n, deadline));
     const ensureCustomerFn = deps.ensureCustomerFn ?? ((t, c) => ensureQBCustomer(t, c, deadline));
     const listProjects = deps.listProjects ?? defaultListInProgressProjects;
-    const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, undefined, deadline));
+    const refreshTokensFn = deps.refreshTokensFn ?? (async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens(deadline);
+    });
+    const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, refreshTokensFn, deadline));
     // The QBO calls above (queries, ensures, create, upload) are all bounded by
     // `deadline`; the account-identity verify below goes through qbQueryFn, so
     // it is covered too.
@@ -729,6 +781,8 @@ export async function createQBReceiptPurchase(
             input,
             qbQueryFn,
             uploadAttachment,
+            deadline,
+            refreshTokensFn,
         );
         return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true, attachment };
     }
@@ -860,7 +914,11 @@ export async function createQBReceiptPurchase(
 
     // Once per process, before the first create — never write against a
     // misconfigured account.
-    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId, deadline);
+    // The verification is SHARED across concurrent pushes, so it runs with its
+    // own fixed budget; `deadline` below is only this waiter's patience.
+    const verifyQueryFn = deps.qbQueryFn
+        ?? (<T = any>(t: QBTokens, q: string) => qbQuery<T>(t, q, createRouteDeadline(ACCOUNT_VERIFY_BUDGET_MS)));
+    await verifyReceiptAccounts(tokens, verifyQueryFn, bankAccountId, expenseAccountId, taxAccountId, deadline);
 
     const requestId = receiptRequestId(input.fileId);
     // Last check before the write that actually posts money. Starting it with

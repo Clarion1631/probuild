@@ -1548,3 +1548,152 @@ test("qbQuery raises a typed QboHttpError carrying the status", async () => {
     assert.equal(error?.name, "QboHttpError");
     assert.equal(qboHttpStatus(error), 404);
 });
+
+
+// --- Recovery lookup must match the upload path's transient set ---
+
+test("a 401 attachment LOOKUP forces one refresh and retries, like the upload does", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // Codex gate: the upload retried a 401 after a forced refresh while the
+    // lookup treated it as terminal - one recovery step giving up exactly
+    // where the other kept going.
+    let lookups = 0;
+    let refreshes = 0;
+    const uploads: string[] = [];
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            lookups++;
+            if (lookups === 1) throw new QboHttpError("QB query failed (401)", 401);
+            return []; // after the refresh: no attachment on file yet
+        },
+        uploadAttachment: async (t) => {
+            uploads.push(t.accessToken);
+            return "attached";
+        },
+    });
+
+    deps.refreshTokensFn = async () => {
+        refreshes++;
+        return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+    };
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
+    assert.equal(lookups, 2, "one retry after the refresh");
+    assert.equal(refreshes, 1, "exactly one forced refresh");
+    assert.deepEqual(uploads, ["fresh-token"], "the upload must use the refreshed token");
+});
+
+test("a 401 lookup that survives the refresh is retryable, not terminal", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    let refreshes = 0;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (401)", 401);
+        },
+    });
+
+    deps.refreshTokensFn = async () => {
+        refreshes++;
+        return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+    };
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (e: unknown) => (e as Error)?.name === "QboRetryableError",
+    );
+    assert.equal(refreshes, 1, "must not loop on the refresh");
+});
+
+test("a 408 attachment lookup is retryable, matching the upload path", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (408)", 408);
+        },
+    });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (e: unknown) => (e as Error)?.name === "QboRetryableError",
+    );
+});
+
+test("the lookup and the upload agree on which statuses are transient", async () => {
+    const { isTransientAttachmentStatus } = await import("../src/lib/qbo-receipt-push");
+    // One list, both paths.
+    for (const status of [401, 408, 429, 500, 503]) {
+        assert.equal(isTransientAttachmentStatus(status), true, String(status));
+    }
+    for (const status of [400, 403, 404, 413, 415]) {
+        assert.equal(isTransientAttachmentStatus(status), false, String(status));
+    }
+});
+
+// --- The shared verification runs on its own clock, whoever starts it ---
+
+test("a SHORT-budget push starting the verification does not poison it for others", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    const { createQBReceiptPurchase } = await import("../src/lib/qbo-receipt-push");
+
+    // Codex gate: ordering matters. When the impatient request is the one that
+    // KICKS OFF the shared verification, binding that work to its deadline
+    // killed the verification everyone else was waiting on. The shared work
+    // now has its own fixed budget; the initiator only gives up on its own.
+    let accountQueries = 0;
+    const slowAccounts = async (query: string) => {
+        if (/FROM Account/i.test(query)) {
+            accountQueries++;
+            await new Promise(resolve => setTimeout(resolve, 1_200));
+            return defaultAccountRow(query);
+        }
+        return [];
+    };
+    const makeDeps = () => ({
+        qbQueryFn: (async (_t: unknown, query: string) => await slowAccounts(query)) as never,
+        ensureVendorFn: (async () => "vendor-1") as never,
+        ensureCustomerFn: (async () => "cust-1") as never,
+        listProjects: async () => [PROJECT],
+        qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
+        uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
+    });
+
+    // Cold cache for this realm so the verification genuinely runs.
+    const tokens = { ...TOKENS, realmId: `realm-order-${Date.now()}` };
+    const nearlySpent = createRouteDeadline(1_400, Date.now() - 700); // ~700ms left
+
+    // The impatient one goes FIRST and therefore starts the shared work.
+    const impatient = createQBReceiptPurchase(tokens, baseInput(), makeDeps(), nearlySpent);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const patient = createQBReceiptPurchase(
+        tokens,
+        baseInput({ fileId: "3CdEfGhIjKlMnOpQrStUvWxYz1234567890" }),
+        makeDeps(),
+        createRouteDeadline(30_000),
+    );
+
+    const [impatientResult, patientResult] = await Promise.allSettled([impatient, patient]);
+
+    assert.equal(impatientResult.status, "rejected", "the initiator should give up on its own budget");
+    if (impatientResult.status === "rejected") {
+        assert.ok(
+            isQBBudgetExhaustedError(impatientResult.reason),
+            `expected a budget error, got ${(impatientResult.reason as Error)?.name}`,
+        );
+    }
+    // The whole point: the patient push still completes.
+    assert.equal(
+        patientResult.status,
+        "fulfilled",
+        `the shared verification was poisoned: ${JSON.stringify(patientResult)}`,
+    );
+    assert.equal(accountQueries, 3, "one shared verification, not one per push");
+});
