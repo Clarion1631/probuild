@@ -135,7 +135,16 @@ function recorder(
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
-            updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },
+            // TWO fenced writes, in one transaction: the state fence
+            // (`state: 'BOOKING'`) refuses when a human voided the row, and the
+            // claim CAS (`claimToken`) refuses when the row was re-claimed.
+            // `intakeStillBooking` lets a test say "somebody voided it while
+            // QuickBooks was answering".
+            updateMany: async (args: any) => {
+                if (args.where?.state === "BOOKING" && !intakeStillBooking) return { count: 0 };
+                intakeUpdates.push(args.data);
+                return { count: 1 };
+            },
         },
         $transaction: async (fn: any) => fn(tx),
     };
@@ -994,15 +1003,26 @@ test("losing the claim DURING the commit rolls back and reports stale", async ()
     // the successor's retry hits alreadyExists and books it once, under one
     // owner — but THIS worker must not complete a BOOKED write.
     const r = recorder();
-    (r.deps.db as any).receiptIntake.updateMany = async () => ({ count: 0 });
+    // The STATE fence passes (nobody voided it) and the CLAIM CAS fails
+    // (somebody re-claimed it). Zeroing both would be the VOID case, which is
+    // booked-after-void, not stale — they are different failures.
+    let calls = 0;
+    (r.deps.db as any).receiptIntake.updateMany = async () => ({ count: ++calls === 1 ? 1 : 0 });
     const result = await bookReceipt(row(), r.deps);
 
     assert.deepEqual(result, { outcome: "stale" });
+    assert.equal(calls, 2, "the claim CAS is a second write, after the Expense");
     assert.equal(r.purchaseCalls.length, 1, "the create did happen");
     assert.equal(r.events.length, 0, "but nothing is logged as booked");
 });
 
 test("the BOOKED write is a CAS on state AND token", async () => {
+    // BOTH, but as two writes in one transaction, and it has to be two: the
+    // first write moves the row to BOOKED, so a second one re-asserting
+    // `state: 'BOOKING'` would fail on this transaction's OWN uncommitted
+    // write, every time. So the state fence goes first (a void loses there, and
+    // is parked as booked-after-void) and the claim CAS follows (a re-claim
+    // loses there, and rolls the whole thing back as stale).
     const wheres: any[] = [];
     const r = recorder();
     (r.deps.db as any).receiptIntake.updateMany = async (args: any) => {
@@ -1010,7 +1030,10 @@ test("the BOOKED write is a CAS on state AND token", async () => {
         return { count: 1 };
     };
     await bookReceipt(row({ claimToken: "token-abc" }), r.deps);
-    assert.deepEqual(wheres, [{ id: "intake-1", state: "BOOKING", claimToken: "token-abc" }]);
+    assert.deepEqual(wheres, [
+        { id: "intake-1", state: "BOOKING" },
+        { id: "intake-1", claimToken: "token-abc" },
+    ]);
 });
 
 // ── A Purchase found by the idempotency query is still a Purchase ───────────

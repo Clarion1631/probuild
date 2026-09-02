@@ -591,6 +591,13 @@ function stateForBookResult(result: BookResult): string {
         case "deferred": return "BOOKING";
         case "retry": return "BOOKING";
         case "stale": return "STALE";
+        // Nothing was sent and nothing is written back: the row is already
+        // whatever the human made it (VOID, DUPLICATE, ...). Reporting the
+        // state it USED to be in would overwrite their decision.
+        case "aborted": return "ABORTED";
+        // book.ts already recorded the orphaned Purchase on the row; the state
+        // is whatever the human set (VOID/DUPLICATE) and must not be moved.
+        case "booked-after-void": return "BOOKED_AFTER_VOID";
     }
 }
 

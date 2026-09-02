@@ -671,8 +671,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // `qbPurchaseId`, which means "this row is booked", and this
                 // row is not. The queue surfaces "booked-after-void" so
                 // somebody voids it in QBO by hand. No Expense is written.
-                await tx.receiptIntake.update({
-                    where: { id: row.id },
+                //
+                // FENCED ON THE CLAIM as well: a superseded worker writes
+                // NOTHING to a row it no longer owns (Phase 1's rule). The
+                // orphaned Purchase still reaches a human either way — the
+                // "booked-after-void" audit event below is written regardless.
+                await tx.receiptIntake.updateMany({
+                    where: { id: row.id, claimToken: row.claimToken },
                     data: {
                         postVoidQbPurchaseId: result.qbPurchaseId,
                         stateReason: "booked-after-void",
@@ -736,7 +741,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     claimedAt: null,
                 },
             });
-            if (claimed.count === 0) throw new StaleClaimError();
+            if (confirmed.count === 0) throw new StaleClaimError();
             return expense.id;
         });
 
