@@ -180,7 +180,13 @@ export interface OwnerVerdict {
     cardTail: string | null;
 }
 
-const CARD_OWNERS: Record<string, ReceiptOwner> = {
+/**
+ * THE card map. Exported so downstream modules (the missing-receipt matcher,
+ * the per-owner Chat digest) reference this one config object instead of
+ * re-declaring card tails in their own logic — a second copy is how a card
+ * reassignment silently addresses the wrong person.
+ */
+export const CARD_OWNERS: Record<string, ReceiptOwner> = {
     "8516": "CJ",
     "6098": "Richard",
     "4297": "Justin",
