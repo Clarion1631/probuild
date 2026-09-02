@@ -18,7 +18,7 @@
  *       - `const` / `let` / `var` declarations whose initialisers are inert
  *         (literals, arrays, objects, arrows/function expressions that are not
  *         invoked, and calls only to a few pure path helpers bound by import),
- *       - `export { ... }` lists,
+ *       - `export { ... }` lists without a `from` (a re-export loads a module),
  *       - exactly one guard: `const isMainModule = <exact expression>;` then
  *         `if (isMainModule) { ... }` with no `else`.
  *     Anything else at module scope (an expression statement, `try`, a loop, a
@@ -163,7 +163,11 @@ function analyse(name: string, text: string): SourceReport {
     // Pass 2: every module-level statement must be one of the allowed kinds.
     for (const st of sf.statements) {
         if (ts.isImportDeclaration(st)) continue;
-        if (ts.isExportDeclaration(st)) continue; // `export { a, b }`
+        if (ts.isExportDeclaration(st)) {
+            // `export { a, b }` is inert; any re-export with a specifier loads that module on import.
+            if (st.moduleSpecifier) bad(st, `re-export from ${st.moduleSpecifier.getText(sf)} at module scope loads another module on import`);
+            continue;
+        }
         if (ts.isFunctionDeclaration(st)) {
             if (st.body) scanExecutable(st.body, false);
             continue;
@@ -297,6 +301,26 @@ if (isMainModule) {}`,
         classAtModuleScope: `${URL_IMPORT}
 async function main() {}
 class Holder { static { main(); } }
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        reexportStar: `${URL_IMPORT}
+async function main() {}
+export * from "./evil-side-effect.mjs";
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        reexportNamed: `${URL_IMPORT}
+async function main() {}
+export { foo } from "./evil-side-effect.mjs";
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        reexportNamespace: `${URL_IMPORT}
+async function main() {}
+export * as ns from "dotenv";
+${GUARD_LINE}
+if (isMainModule) { await main(); }`,
+        exportDefault: `${URL_IMPORT}
+async function main() {}
+export default main();
 ${GUARD_LINE}
 if (isMainModule) { await main(); }`,
         helperInvoked: `${URL_IMPORT}
