@@ -48,6 +48,46 @@ test("oversize, empty and unidentifiable objects are REJECTED, not published", a
     assert.equal((exe as { reason: string }).reason, "unsupported-file-type");
 });
 
+test("an oversize object is rejected from METADATA, with no body read at all", async () => {
+    // The signed upload URL bypasses this server, so the first time anything
+    // here sees the object is now. Downloading it to discover it is 400 MB is
+    // how one upload takes the whole invocation — and its memory — with it.
+    let downloads = 0;
+    const check = await inspectStoredObject(
+        "p.bin",
+        "image/jpeg",
+        async () => { downloads++; throw new Error("the body must never be fetched"); },
+        async () => MAX_STORED_BYTES + 1,
+    );
+    assert.equal(check.ok, false);
+    assert.equal((check as { reason: string }).reason, `file-too-large:${MAX_STORED_BYTES + 1}`);
+    assert.equal(downloads, 0, "not one byte was read");
+});
+
+test("an UNKNOWN metadata size still downloads, and the bytes decide", async () => {
+    // A null size is "storage did not say", not "fine". The byte-length check
+    // below it is what actually enforces the limit.
+    const check = await inspectStoredObject(
+        "p.png",
+        "image/png",
+        give({ ok: true, bytes: PNG }),
+        async () => null,
+    );
+    assert.ok(check.ok);
+});
+
+test("a metadata size AT the ceiling is not rejected before the download", async () => {
+    let downloads = 0;
+    const check = await inspectStoredObject(
+        "p.png",
+        "image/png",
+        async () => { downloads++; return { ok: true as const, bytes: PNG }; },
+        async () => MAX_STORED_BYTES,
+    );
+    assert.ok(check.ok);
+    assert.equal(downloads, 1);
+});
+
 test("exactly at the ceiling is allowed", async () => {
     const atLimit = Buffer.concat([PNG, Buffer.alloc(MAX_STORED_BYTES - PNG.length, 0)]);
     assert.equal(atLimit.length, MAX_STORED_BYTES);

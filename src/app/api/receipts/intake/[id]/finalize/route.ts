@@ -6,83 +6,49 @@ import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
-import { deleteObjectOrRecord, sealObject } from "@/lib/receipt-intake/storage-cleanup";
+import { reconcileLateFields, type Denial, type LateFields } from "@/lib/receipt-intake/late-fields";
+import {
+    deleteObjectOrRecord,
+    rejectRowAndQueueCleanup,
+    sealObject,
+    settleQueuedCleanup,
+} from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Apply late fields where the row has none; refuse where they disagree.
+ * Route adapter over the late-field rules (src/lib/receipt-intake/late-fields.ts).
  *
- * Returns a 409 response on conflict, or null when the row is now consistent
- * with what the caller sent.
+ * The rules live in a lib because their interesting behaviour is entirely about
+ * races — a worker claiming the row, a state transition, a second caller
+ * writing a different project — and none of that is reachable from a test that
+ * has to stand up a route handler.
  */
-/** Late fields may only land while a row is still un-routed. */
-const LATE_FIELD_STATES = ["STAGING", "RECEIVED"];
-
-async function reconcileLateFields(
+async function applyLateFields(
     id: string,
-    lateFields: Partial<{ costCodeId: string; projectId: string }>,
+    lateFields: LateFields,
+    auth: Extract<IntakeAuth, { ok: true }>,
 ): Promise<NextResponse | null> {
-    const entries = Object.entries(lateFields) as Array<["costCodeId" | "projectId", string]>;
-    if (entries.length === 0) return null;
-
-    const current = await prisma.receiptIntake.findUnique({
-        where: { id },
-        select: { costCodeId: true, projectId: true, state: true },
+    const denial = await reconcileLateFields(id, lateFields, {
+        read: rowId => prisma.receiptIntake.findUnique({
+            where: { id: rowId },
+            select: { costCodeId: true, projectId: true, state: true, claimToken: true },
+        }),
+        applyIfNull: async (rowId, state, toApply) => {
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: {
+                    id: rowId,
+                    state,
+                    claimToken: null,
+                    ...Object.fromEntries(Object.keys(toApply).map(key => [key, null])),
+                },
+                data: toApply,
+            });
+            return count;
+        },
+        authorize: projectId => authorizeLateFields(auth, projectId, lateFields),
     });
-    if (!current) return null;
-
-    // NULL-OR-EQUAL only, and only BEFORE the row is routed.
-    //
-    // Past RECEIVED the read has already happened: the dedup keys, the phase
-    // suggestion and possibly a booking were all computed from the project this
-    // row had at the time. Changing it afterwards does not re-derive any of
-    // that — it just makes the row disagree with its own history, and after
-    // BOOKED it disagrees with a Purchase in the real books.
-    if (!LATE_FIELD_STATES.includes(current.state)) {
-        const differs = entries.some(([key, value]) => current[key] !== value);
-        if (!differs) return null; // already exactly what the caller is asking for
-        return NextResponse.json(
-            {
-                ok: false,
-                error: "late-fields-too-late",
-                reason: `this row is ${current.state}; its job and phase were already used to route it`,
-                state: current.state,
-            },
-            { status: 409 },
-        );
-    }
-
-    const conflicts = entries.filter(([key, value]) => current[key] !== null && current[key] !== value);
-    if (conflicts.length > 0) {
-        return NextResponse.json(
-            {
-                ok: false,
-                error: "late-fields-conflict",
-                reason: "this row already carries different values for these fields",
-                fields: Object.fromEntries(
-                    conflicts.map(([key]) => [key, { stored: current[key], supplied: lateFields[key] }]),
-                ),
-            },
-            { status: 409 },
-        );
-    }
-
-    const toApply = Object.fromEntries(entries.filter(([key]) => current[key] === null));
-    if (Object.keys(toApply).length > 0) {
-        // EXACT-state CAS, and still conditional on each field being null: a
-        // concurrent writer that set it — or moved the row on — wins rather
-        // than being overwritten.
-        await prisma.receiptIntake.updateMany({
-            where: {
-                id,
-                state: current.state,
-                ...Object.fromEntries(Object.keys(toApply).map(key => [key, null])),
-            },
-            data: toApply,
-        });
-    }
-    return null;
+    return denial ? NextResponse.json(denial.body, { status: denial.status }) : null;
 }
 
 /**
@@ -97,22 +63,22 @@ async function reconcileLateFields(
 async function authorizeLateFields(
     auth: Extract<IntakeAuth, { ok: true }>,
     rowProjectId: string | null,
-    lateFields: Partial<{ costCodeId: string; projectId: string }>,
-): Promise<NextResponse | null> {
+    lateFields: LateFields,
+): Promise<Denial | null> {
     const projectId = lateFields.projectId ?? rowProjectId;
 
     if (lateFields.projectId && auth.via === "session") {
         if (!(await userCanAccessProject(auth.user, lateFields.projectId))) {
-            return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });
+            return { status: 403, body: { ok: false, reason: "forbidden" } };
         }
     }
 
     if (lateFields.costCodeId) {
         if (!projectId) {
-            return NextResponse.json(
-                { ok: false, error: "cost-code-without-project", reason: "a phase is only meaningful against a job" },
-                { status: 400 },
-            );
+            return {
+                status: 400,
+                body: { ok: false, error: "cost-code-without-project", reason: "a phase is only meaningful against a job" },
+            };
         }
         const allowed = await isCostCodeAllowedForProject(
             prismaPhaseDataSource,
@@ -120,15 +86,15 @@ async function authorizeLateFields(
             lateFields.costCodeId,
         );
         if (!allowed) {
-            return NextResponse.json(
-                {
+            return {
+                status: 400,
+                body: {
                     ok: false,
                     error: "cost-code-not-a-phase",
                     reason: "that cost code is not a phase of this job",
                     projectId,
                 },
-                { status: 400 },
-            );
+            };
         }
     }
     return null;
@@ -197,7 +163,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     // Authorize the late fields BEFORE anything is written or published.
     const denied = await authorizeLateFields(auth, row.projectId, lateFields);
-    if (denied) return denied;
+    if (denied) return NextResponse.json(denied.body, { status: denied.status });
 
     // A LATE finalize on a row the sweeper already parked file-missing is a
     // RECOVERY, not a duplicate: the upload landed after the sweep looked. It
@@ -220,7 +186,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // floor while telling the caller it worked. Same behaviour as the
     // two-publisher path below, because a caller cannot tell which one it hit.
     if (!recoverable) {
-        const conflict = await reconcileLateFields(id, lateFields);
+        const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
         // PERSISTED values, re-read after the reconcile — the caller must be
         // told what the row actually holds, not what it asked for.
@@ -250,11 +216,18 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         if (check.kind === "transient") {
             return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
         }
-        // REJECTED. The row goes, and so must the object — nothing references it
-        // once the row is gone, so a failed delete is recorded for the sweep to
-        // retry rather than shrugged off.
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
-        await deleteObjectOrRecord(row.storagePath, check.reason);
+        // REJECTED. The row goes, and so must the object — but the two writes
+        // are ONE transaction. A best-effort delete followed by a best-effort
+        // cleanup could drop the row and lose the object with nothing left
+        // referencing or remembering it.
+        const rejected = await rejectRowAndQueueCleanup(id, row.storagePath, check.reason);
+        if (!rejected.ok) {
+            // The row's deletion is not confirmed, so it may still point at
+            // these bytes. Keep the object and answer retryably; an identical
+            // retry re-validates and rejects again.
+            return NextResponse.json({ ok: false, reason: "reject-failed", retryable: true }, { status: 503 });
+        }
+        await settleQueuedCleanup(rejected.eventId, row.storagePath);
         const status = check.reason.startsWith("file-too-large") ? 413 : 400;
         return NextResponse.json(
             { ok: false, reason: check.reason, maxBytes: MAX_STORED_BYTES },
@@ -317,7 +290,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!outcome.published) {
         // Another publisher won. Same outcome for the caller — but the late
         // fields still have to be reconciled against what that publisher wrote.
-        const reconciled = await reconcileLateFields(id, lateFields);
+        const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;
         const current = await prisma.receiptIntake.findUnique({
             where: { id },

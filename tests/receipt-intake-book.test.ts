@@ -29,6 +29,23 @@ import {
     QboVendorDuplicateError,
 } from "../src/lib/qbo-receipt-push";
 
+/**
+ * A createPurchase stub that stands for a call which REACHED the create.
+ *
+ * createQBReceiptPurchase fires `onBeforeCreate` immediately before the HTTP
+ * create and nowhere else, so whether a stub invokes it is the whole difference
+ * between "QuickBooks may hold a Purchase" and "nothing was ever sent" — which
+ * is what decides whether a parked row keeps its strong dedup key. Stubs
+ * standing for a PRE-create refusal (an account or vendor ensure, an ok:false
+ * decision) deliberately do not use this.
+ */
+function atCreate<T>(fn: (...args: any[]) => Promise<T>) {
+    return async (tokens: any, input: any, deadline: any, onBeforeCreate?: () => Promise<void>) => {
+        await onBeforeCreate?.();
+        return fn(tokens, input, deadline);
+    };
+}
+
 const NOW = new Date("2026-09-01T12:00:00.000Z");
 
 function row(overrides: Partial<BookableRow> = {}): BookableRow {
@@ -100,10 +117,10 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         isPushEnabled: () => true,
         isPushPaused: async () => false,
         getTokens: async () => ({ accessToken: "t", realmId: "r" }) as any,
-        createPurchase: async (_tokens, input) => {
+        createPurchase: atCreate(async (_tokens: any, input: any) => {
             purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: input.fileId.slice(0, 21), alreadyExists: false, attachment: "attached" };
-        },
+        }) as any,
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         logEvent: async (event) => { events.push(event); },
         now: () => NOW,
@@ -235,7 +252,7 @@ test("every PRE-send refusal releases the key; every POST-send one holds it", as
     // Post-send: QBO may hold a Purchase whose response we lost, so the key
     // stays claimed even though the row is parked.
     const faulted = recorder({
-        createPurchase: async () => { throw new QboPurchaseFaultError(400, "closed period", "6210"); },
+        createPurchase: atCreate(async () => { throw new QboPurchaseFaultError(400, "closed period", "6210"); }) as any,
     });
     const result = await bookReceipt(row(), faulted.deps);
     assert.equal((result as any).releaseStrongKey, false);
@@ -263,15 +280,31 @@ test("a dryRun row can never reach QuickBooks, even called directly", async () =
 });
 
 test("QBO business-rule faults are TERMINAL, never retried", async () => {
-    const cases: [unknown, string][] = [
-        [new QboPurchaseFaultError(400, "closed period", "6210"), "qbo-fault:6210"],
+    // A fault raised by the PURCHASE create may have created one: QuickBooks
+    // answered, and a lost response looks exactly like this. Key retained.
+    const posted = recorder({
+        createPurchase: atCreate(async () => {
+            throw new QboPurchaseFaultError(400, "closed period", "6210");
+        }) as any,
+    });
+    assert.deepEqual(await bookReceipt(row(), posted.deps), {
+        outcome: "needs-review", reason: "qbo-fault:6210", releaseStrongKey: false,
+    });
+
+    // The ENSURES — resolving the expense account, creating the vendor — run
+    // BEFORE the create, so nothing was posted and the strong key goes back.
+    // This is what moving the fenced send mark to the create bought: these two
+    // used to quarantine the corrected re-submission against a booking that
+    // never happened.
+    const preCreate: [unknown, string][] = [
         [new QboAccountConfigError("bad account"), "qbo-fault:account-config"],
         [new QboVendorDuplicateError("Lowes"), "qbo-fault:vendor-duplicate"],
     ];
-    for (const [error, reason] of cases) {
+    for (const [error, reason] of preCreate) {
         const r = recorder({ createPurchase: async () => { throw error; } });
         const result = await bookReceipt(row(), r.deps);
-        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: false }, reason);
+        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: true }, reason);
+        assert.deepEqual(r.sendMarks, [], "the create was never reached");
         assert.equal(r.expenses.length, 0);
     }
 });
@@ -338,9 +371,9 @@ test("attachmentBlocker mirrors QBO's own ceilings", () => {
 
 test("an attachment upload that FAILED is retried, never reported as booked", async () => {
     const r = recorder({
-        createPurchase: async () => ({
+        createPurchase: atCreate(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "failed:500",
-        }) as any,
+        })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
     assert.equal(result.outcome, "retry");
@@ -353,18 +386,18 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
     // response — exactly when a Purchase is most likely to be sitting in the
     // books without its image. It was the one path exempt from the check.
     const failing = recorder({
-        createPurchase: async () => ({
+        createPurchase: atCreate(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
-        }) as any,
+        })) as any,
     });
     const failed = await bookReceipt(row(), failing.deps);
     assert.equal(failed.outcome, "retry", "an upload fault on an existing Purchase is recoverable");
     assert.equal(failing.expenses.length, 0, "and it is NOT booked meanwhile");
 
     const skipped = recorder({
-        createPurchase: async () => ({
+        createPurchase: atCreate(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped",
-        }) as any,
+        })) as any,
     });
     const skippedResult = await bookReceipt(row(), skipped.deps);
     assert.equal(skippedResult.outcome, "needs-review");
@@ -391,15 +424,15 @@ test("a previous attachment failure does NOT block the recovery attempt", async 
 
 test("already-attached counts as attached on the fresh-create path too", async () => {
     const r = recorder({
-        createPurchase: async () => ({
+        createPurchase: atCreate(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "already-attached",
-        }) as any,
+        })) as any,
     });
     assert.equal((await bookReceipt(row(), r.deps)).outcome, "booked");
 });
 
 test("a QBTimeoutError retries on the backoff schedule", async () => {
-    const r = recorder({ createPurchase: async () => { throw new QBTimeoutError("timed out"); } });
+    const r = recorder({ createPurchase: atCreate(async () => { throw new QBTimeoutError("timed out"); }) as any });
     const first = await bookReceipt(row({ attempts: 0 }), r.deps);
     assert.equal(first.outcome, "retry");
     assert.equal((first as any).attempts, 1);
@@ -407,22 +440,22 @@ test("a QBTimeoutError retries on the backoff schedule", async () => {
     assert.equal((first as any).reason, "QBTimeoutError");
 
     const third = await bookReceipt(row({ attempts: 2 }), recorder({
-        createPurchase: async () => { throw new QBTimeoutError("timed out"); },
+        createPurchase: atCreate(async () => { throw new QBTimeoutError("timed out"); }) as any,
     }).deps);
     assert.equal((third as any).nextRetryAt.getTime(), NOW.getTime() + 60 * 60_000);
 });
 
 test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTAL", async () => {
-    const transient = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    const transient = recorder({ createPurchase: atCreate(async () => { throw new TypeError("fetch failed"); }) as any });
     assert.equal((await bookReceipt(row({ attempts: 5 }), transient.deps)).outcome, "retry");
 
     // row.attempts 18 -> this is attempt 19: still retryable.
-    const nearly = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    const nearly = recorder({ createPurchase: atCreate(async () => { throw new TypeError("fetch failed"); }) as any });
     assert.equal((await bookReceipt(row({ attempts: 18 }), nearly.deps)).outcome, "retry");
 
     // row.attempts 19 -> this is attempt 20, the last one the constant allows.
     // sendAttempted is what decides the key, not the fact of reaching the limit.
-    const exhausted = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    const exhausted = recorder({ createPurchase: atCreate(async () => { throw new TypeError("fetch failed"); }) as any });
     assert.deepEqual(await bookReceipt(row({ attempts: 19, sendAttempted: true }), exhausted.deps), {
         outcome: "needs-review",
         reason: "max-retries",
@@ -444,10 +477,10 @@ test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTA
 
 test("alreadyExists books identically — the lost-response retry", async () => {
     const r = recorder({
-        createPurchase: async (_t, input) => ({
+        createPurchase: atCreate(async (_t: any, input: any) => ({
             ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
             alreadyExists: true, attachment: "already-attached",
-        }) as any,
+        })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
     assert.equal(result.outcome, "booked");
@@ -573,11 +606,11 @@ test("ample runway books normally, and threads ONE deadline into both QBO calls"
     const r = recorder({
         deadline,
         getTokens: async d => { seen.push(d); return { accessToken: "t", realmId: "r" } as any; },
-        createPurchase: async (_t, input, d) => {
+        createPurchase: atCreate(async (_t: any, input: any, d: any) => {
             seen.push(d);
             r.purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "attached" } as any;
-        },
+        }) as any,
     });
     const result = await bookReceipt(row(), r.deps);
     assert.equal(result.outcome, "booked");
@@ -720,12 +753,12 @@ test("budget exhausted AFTER the token refresh also leaves it unset", async () =
 test("a real create DOES mark it, before the call", async () => {
     const order: string[] = [];
     const r = recorder({
-        createPurchase: async (_t, input) => {
+        createPurchase: atCreate(async (_t: any, input: any) => {
             order.push("create");
             r.purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "attached" } as any;
-        },
-        markSendAttempted: async id => { order.push("mark"); r.sendMarks.push(id); return true; },
+        }) as any,
+        markSendAttempted: async (id: string) => { order.push("mark"); r.sendMarks.push(id); return true; },
     });
     await bookReceipt(row(), r.deps);
     assert.deepEqual(order, ["mark", "create"], "marked FIRST, so a mid-create death still records it");
@@ -739,9 +772,9 @@ test("a 4xx or fault attachment failure goes to a human on the FIRST one", async
     // Purchase sits in the books without its receipt.
     for (const attachment of ["failed:400", "failed:413", "failed:415", "failed:fault"]) {
         const r = recorder({
-            createPurchase: async () => ({
+            createPurchase: atCreate(async () => ({
                 ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment,
-            }) as any,
+            })) as any,
         });
         const result = await bookReceipt(row(), r.deps);
         assert.equal(result.outcome, "needs-review", attachment);
@@ -755,9 +788,9 @@ test("a 4xx or fault attachment failure goes to a human on the FIRST one", async
 test("a 5xx or thrown attachment failure is still retried", async () => {
     for (const attachment of ["failed:500", "failed:502", "failed:AbortError", "failed:TypeError"]) {
         const r = recorder({
-            createPurchase: async () => ({
+            createPurchase: atCreate(async () => ({
                 ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment,
-            }) as any,
+            })) as any,
         });
         const result = await bookReceipt(row(), r.deps);
         assert.equal(result.outcome, "retry", attachment);
@@ -776,7 +809,7 @@ test("isTerminalAttachmentFailure splits refusal from blip", () => {
 // ── retry() must read the CURRENT send flag (round-9 item 2) ───────────────
 
 test("attempt 20 RETAINS the key when the failure was at the create", async () => {
-    const r = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    const r = recorder({ createPurchase: atCreate(async () => { throw new TypeError("fetch failed"); }) as any });
     const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
     assert.equal((result as any).reason, "max-retries");
     // row.sendAttempted was false when the row was CLAIMED, but this attempt
@@ -787,9 +820,9 @@ test("attempt 20 RETAINS the key when the failure was at the create", async () =
 
 test("attempt 20 RETAINS the key when the failure was at the attachment leg", async () => {
     const r = recorder({
-        createPurchase: async () => ({
+        createPurchase: atCreate(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "failed:500",
-        }) as any,
+        })) as any,
     });
     const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
     assert.equal((result as any).reason, "max-retries");

@@ -72,6 +72,19 @@ const WORKER_ROW_SELECT = {
 } as const;
 
 /**
+ * RELEASING OWNERSHIP is part of the transition, not a follow-up write.
+ *
+ * A claim is what makes a row invisible to the next pass. Every write that
+ * COMPLETES, DEFERS or PARKS the work must hand it back in the same update, or
+ * the row stays owned by a pass that has finished: the claim query skips it,
+ * every fenced write misses it, and it sits until a human notices. The only
+ * transitions that keep it are READ -> BOOKING (the same pass books it, under
+ * the same token) and abandonment at the soft deadline, where the pass really
+ * is still holding the row.
+ */
+const RELEASE_CLAIM = { claimToken: null, claimedAt: null } as const;
+
+/**
  * A row parked by the shadow week (dryRun=true, sitting at READ or BOOKING) is
  * DONE until the cutover. It is excluded from the claim rather than merely
  * skipped inside the loop, because the batch is only ten rows: after a couple
@@ -470,11 +483,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         applyState: async (rowId, state, stateReason, patch, ownership) => {
             const { count } = await prisma.receiptIntake.updateMany({
-                where: {
-                    id: rowId,
-                    ...(ownership ? { state: ownership.state, claimToken: ownership.claimToken } : {}),
-                },
-                data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null },
+                where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null, ...RELEASE_CLAIM },
             });
             return count > 0;
         },
@@ -569,6 +579,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                             // strong key goes back (same rule as book.ts).
                             dedupStrongKey: null,
                             nextRetryAt: null,
+                            ...RELEASE_CLAIM,
                         },
                     });
                     return { promoted: false, conflictId: conflict.id };
@@ -576,6 +587,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             }
             // CAS: only the current claim holder promotes. A superseded worker
             // must not move a row into BOOKING that its successor is handling.
+            //
+            // THE ONE TRANSITION THAT KEEPS THE CLAIM, deliberately: promotion
+            // hands the row straight to bookReceipt in this same pass, and both
+            // its send mark and its BOOKED commit CAS on this token. Releasing
+            // here would admit a second worker to the same booking.
             const { count } = await tx.receiptIntake.updateMany({
                 where: { id: rowId, state: "READ", claimToken },
                 data: { state: "BOOKING", stateReason: null },
@@ -607,8 +623,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             getTokens: deadline => getFreshQBTokens(deadline),
-            createPurchase: (tokens, input, deadline) =>
-                createQBReceiptPurchase(tokens, input, {}, deadline),
+            createPurchase: (tokens, input, deadline, onBeforeCreate) =>
+                createQBReceiptPurchase(tokens, input, { onBeforeCreate }, deadline),
             downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
             logEvent: logAutomationEvent,
             now: () => new Date(),
@@ -620,8 +636,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // A superseded worker writes NOTHING: the row belongs to whoever
             // holds the current token, and its state is theirs to set.
             if (result.outcome === "stale") return;
-            // Every write below is a CAS on the claim, for the same reason.
-            const owns = { id: rowId, claimToken } as const;
+            // Every write below is a CAS on the claim AND on the state.
+            //
+            // The token alone is not enough here: bookReceipt own commit may
+            // already have moved the row to BOOKED under this same token, and a
+            // late deferred/retry result would then overwrite a booked row with
+            // "come back in an hour". Pinning BOOKING means only a row still
+            // waiting to book can be written by a booking result.
+            const owns = { id: rowId, state: "BOOKING", claimToken } as const;
             if (result.outcome === "needs-review") {
                 await prisma.receiptIntake.updateMany({
                     where: owns,
@@ -629,6 +651,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         state: "NEEDS_REVIEW",
                         stateReason: result.reason,
                         nextRetryAt: null,
+                        ...RELEASE_CLAIM,
                         // Parked before any QBO send: hand the strong key back,
                         // or a corrected re-send of the same receipt would be
                         // quarantined against a row that never became a purchase.
@@ -646,6 +669,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         state: "BOOKING",
                         stateReason: result.reason,
                         nextRetryAt: new Date(now.getTime() + 60 * 60_000),
+                        ...RELEASE_CLAIM,
                     },
                 });
                 return;
@@ -657,6 +681,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     attempts: result.attempts,
                     lastError: result.reason.slice(0, 400),
                     nextRetryAt: result.nextRetryAt,
+                    ...RELEASE_CLAIM,
                 },
             });
         },
@@ -672,6 +697,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     busyPasses,
                     lastError: reason,
                     nextRetryAt: new Date(Date.now() + backoffMs(1)),
+                    ...RELEASE_CLAIM,
                 },
             });
             return count > 0;
@@ -680,9 +706,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {
             const { count } = await prisma.receiptIntake.updateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
-                data: { attempts, lastError: reason, nextRetryAt },
+                data: { attempts, lastError: reason, nextRetryAt, ...RELEASE_CLAIM },
             });
             return count > 0;
+        },
+
+        // Re-read taken RIGHT BEFORE routing, after the download and the model
+        // call. A late job assignment landing in that window must not be routed
+        // over: NEEDS_JOB for a receipt that HAS a job sends a human looking for
+        // a problem that no longer exists.
+        refreshProjectId: async rowId => {
+            const row = await prisma.receiptIntake.findUnique({
+                where: { id: rowId },
+                select: { projectId: true },
+            });
+            return row?.projectId ?? null;
         },
 
         now: () => new Date(),

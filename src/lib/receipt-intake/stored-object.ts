@@ -13,7 +13,12 @@
  * straight to Supabase, so nothing it declared about the file is evidence.
  */
 import { createHash } from "node:crypto";
-import { downloadDocBytesResult, toSecureRef, type DocBytesResult } from "@/lib/secure-storage";
+import {
+    downloadDocBytesResult,
+    secureObjectSize,
+    toSecureRef,
+    type DocBytesResult,
+} from "@/lib/secure-storage";
 import { EXT_BY_MIME, sniffMime } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
 
@@ -140,7 +145,23 @@ export async function inspectStoredObject(
      */
     declaredMime: string,
     download: (ref: string) => Promise<DocBytesResult> = downloadDocBytesResult,
+    /** Metadata-only size lookup; injected so the "no body read" test is provable. */
+    sizeOf: (storagePath: string) => Promise<number | null> = secureObjectSize,
 ): Promise<StoredObjectCheck> {
+    // SIZE FIRST, FROM METADATA — before a single byte is read.
+    //
+    // The signed upload URL bypasses this server, so nothing has seen this
+    // object yet. Downloading it to discover it is 400 MB is how one upload
+    // takes the worker's whole invocation (and its memory) with it. `list`
+    // returns the metadata row in one small request whatever the object's size.
+    //
+    // A null size is "unknown", not "fine": the download below still enforces
+    // the limit on the bytes it actually got.
+    const declaredSize = await sizeOf(storagePath);
+    if (declaredSize !== null && declaredSize > MAX_STORED_BYTES) {
+        return { ok: false, kind: "rejected", reason: `file-too-large:${declaredSize}` };
+    }
+
     const result = await download(toSecureRef(storagePath));
     if (!result.ok) {
         return result.kind === "not-found"

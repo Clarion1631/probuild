@@ -128,6 +128,16 @@ export interface WorkerDependencies {
     retryStorageCleanups: (shouldStop: () => boolean) => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
     /**
+     * Re-read the row's projectId immediately before routing.
+     *
+     * The claim snapshot can be stale by seconds: /finalize accepts a late job
+     * assignment while a row is unclaimed, and the Gemini read that runs in
+     * between takes 25 seconds. Routing on the snapshot published NEEDS_JOB for
+     * a receipt that HAS a job by then — and NEEDS_JOB is where a human goes
+     * looking for exactly that problem.
+     */
+    refreshProjectId: (rowId: string) => Promise<string | null>;
+    /**
      * Tagged, and VERIFIED: the bytes must hash to what the row recorded at
      * finalize. A sha stored once and never re-checked proves nothing about
      * what is being read now.
@@ -154,8 +164,9 @@ export interface WorkerDependencies {
         rowId: string,
         state: ReceiptIntakeState,
         stateReason: string | null,
-        patch?: Partial<ReadPatch>,
-        ownership?: Ownership,
+        patch: Partial<ReadPatch> | undefined,
+        /** REQUIRED. An unowned write clobbers whatever the successor decided. */
+        ownership: Ownership,
     ) => Promise<boolean>;
     /**
      * READ + dryRun=false -> BOOKING, and the LAST weak-dedup check, taken
@@ -633,6 +644,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         suggestedConfidence: read.suggestedConfidence,
     };
 
+    // Re-read RIGHT BEFORE routing. Everything above — the download, a 25s
+    // model call — is time in which a late job assignment can have landed.
+    const projectId = await deps.refreshProjectId(row.id).catch(() => row.projectId);
+    const hasProject = !!projectId;
+
     const routeInput = {
         docType: read.docType,
         amount: keys.amount,
@@ -664,7 +680,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         return reason ? `${reason};tax-implausible` : "tax-implausible";
     };
 
-    const gate = routeState(routeInput, { strong: null, weak: null }, !!row.projectId);
+    const gate = routeState(routeInput, { strong: null, weak: null }, hasProject);
     if (gate.state !== "READ") {
         // A multi-doc, a non-receipt, or a $0/negative misread must never hold
         // a dedup key — it would quarantine the real receipt that arrives next
@@ -704,13 +720,13 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     if (!applied.owned) return "STALE";
 
     if (applied.strongOwner) {
-        const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, !!row.projectId);
-        await deps.applyState(row.id, second.state, note(second.stateReason), {
+        const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, hasProject);
+        const owned = await deps.applyState(row.id, second.state, note(second.stateReason), {
             ...base,
             dedupStrongKey: null,
             duplicateOfId: second.duplicateOfId,
-        });
-        return second.state;
+        }, ownershipOf(row));
+        return owned ? second.state : "STALE";
     }
 
     // No strong hit (or no strong key at all — a placeholder ref). The weak net
@@ -724,19 +740,19 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // re-checks the weak net.
     const weak = await deps.findWeakHit(row.id, keys.weak);
     if (weak) {
-        const third = routeState(routeInput, { strong: null, weak }, !!row.projectId);
+        const third = routeState(routeInput, { strong: null, weak }, hasProject);
         // RELEASE the strong key. Nothing was sent to QuickBooks, so this row
         // is parked pre-send and the documented rule applies to it like any
         // other. Holding the key made a CORRECTED resend of the same receipt
         // collide with a row that was never booked — the review queue then had
         // two rows and neither could proceed. The weak pair is still visible to
         // a human through duplicateOfId and the reason.
-        await deps.applyState(row.id, third.state, note(third.stateReason), {
+        const owned = await deps.applyState(row.id, third.state, note(third.stateReason), {
             ...base,
             dedupStrongKey: null,
             duplicateOfId: third.duplicateOfId,
-        });
-        return third.state;
+        }, ownershipOf(row));
+        return owned ? third.state : "STALE";
     }
 
     // Routing is complete. This is the ONLY path to READ, and the only place
@@ -782,8 +798,9 @@ export function ownershipOf(row: WorkerRow): Ownership {
 async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: string): Promise<string> {
     const attempts = row.attempts + 1;
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        await deps.applyState(row.id, "NEEDS_REVIEW", "max-retries");
-        return "NEEDS_REVIEW";
+        // Through parkTerminal like every other terminal park, so the
+        // strong-key release is decided in exactly one place.
+        return parkTerminal(row, deps, "max-retries");
     }
     const owned = await deps.retryRow(
         row.id,

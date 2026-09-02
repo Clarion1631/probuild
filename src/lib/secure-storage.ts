@@ -379,6 +379,37 @@ export async function uploadSecureDoc(
  * Deliberately a separate export rather than a behaviour change to
  * removeSecureDoc: several callers outside this feature do not guard it.
  */
+/**
+ * Byte size of a stored object WITHOUT downloading it.
+ *
+ * The signed upload URL bypasses this server entirely, so the first time we see
+ * a two-step object is when something reads it — and reading it is exactly what
+ * must not happen for a 400 MB file. `list` with a search returns the metadata
+ * row, which is one small request regardless of the object's size.
+ *
+ * Returns null when the size cannot be determined (missing object, no client,
+ * an older storage API without metadata): callers treat that as "unknown" and
+ * fall through to their normal path rather than refusing on an absence.
+ */
+export async function secureObjectSize(storagePath: string): Promise<number | null> {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    const slash = storagePath.lastIndexOf("/");
+    const dir = slash > 0 ? storagePath.slice(0, slash) : "";
+    const name = slash > 0 ? storagePath.slice(slash + 1) : storagePath;
+    try {
+        const { data, error } = await supabase.storage
+            .from(SECURE_BUCKET)
+            .list(dir, { search: name, limit: 100 });
+        if (error || !data) return null;
+        const match = data.find(entry => entry.name === name);
+        const size = (match?.metadata as { size?: unknown } | undefined)?.size;
+        return typeof size === "number" && Number.isFinite(size) ? size : null;
+    } catch {
+        return null;
+    }
+}
+
 export async function removeSecureDocStrict(ref: string): Promise<void> {
     const path = secureRefPath(ref);
     if (!path) throw new Error(`not a secure ref: ${String(ref).slice(0, 80)}`);

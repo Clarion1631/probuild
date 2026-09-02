@@ -92,6 +92,93 @@ export async function recordPendingCleanup(storagePath: string, reason: string):
 }
 
 /**
+ * Reject a row and queue its object for deletion IN ONE TRANSACTION.
+ *
+ * The two writes cannot be separate. Delete-then-record loses the object
+ * whenever the record fails (nothing references the bytes any more, and nothing
+ * remembers them). Record-then-delete leaves a cleanup event naming a path a
+ * live row still points at, and the sweep would delete a receipt in use — the
+ * sweep's own "still referenced" guard papers over that, but only until the row
+ * is re-pointed. Both in one transaction means the queue entry exists if and
+ * only if the row is gone.
+ *
+ * Returns false when the row's deletion is NOT confirmed. The caller must then
+ * keep the object and fail retryably: an object with no queue entry and a row
+ * that still exists is a state we can resume from; the reverse is not.
+ */
+/** The two writes the reject transaction needs — injectable so it is testable. */
+export interface RejectTxClient {
+    automationEvent: { create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }> };
+    receiptIntake: {
+        deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
+        findUnique(args: { where: { id: string }; select: { id: true } }): Promise<{ id: string } | null>;
+    };
+}
+export interface RejectClient {
+    $transaction<T>(fn: (tx: RejectTxClient) => Promise<T>): Promise<T>;
+}
+
+export async function rejectRowAndQueueCleanup(
+    rowId: string,
+    storagePath: string,
+    reason: string,
+    db: RejectClient = prisma as unknown as RejectClient,
+): Promise<{ ok: true; eventId: string } | { ok: false }> {
+    try {
+        const eventId = await db.$transaction(async tx => {
+            const event = await tx.automationEvent.create({
+                data: {
+                    kind: STORAGE_CLEANUP_KIND,
+                    status: "pending",
+                    reason: reason.slice(0, 500),
+                    source: "receipt-intake",
+                    detail: JSON.stringify({ storagePath, rowId }),
+                },
+                select: { id: true },
+            });
+            await tx.receiptIntake.deleteMany({ where: { id: rowId } });
+            // deleteMany's count is 0 both when somebody else already deleted
+            // the row (fine — it is gone, which is all we need) and when the id
+            // never matched. Only the row's ABSENCE is the condition worth
+            // committing on, so assert that directly.
+            const survivor = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { id: true } });
+            if (survivor) throw new Error(`row ${rowId} still exists after delete`);
+            return event.id;
+        });
+        return { ok: true, eventId };
+    } catch (error) {
+        console.error(
+            "[receipts/intake] reject transaction failed",
+            rowId,
+            error instanceof Error ? error.name : "error",
+        );
+        return { ok: false };
+    }
+}
+
+/**
+ * Try the queued deletion now. A failure is not an error for the caller — the
+ * event stays pending and the worker's sweep retries it.
+ */
+export async function settleQueuedCleanup(eventId: string, storagePath: string): Promise<boolean> {
+    try {
+        await removeSecureDocStrict(toSecureRef(storagePath));
+    } catch (error) {
+        console.error(
+            "[receipts/intake] queued delete failed, left pending",
+            storagePath,
+            error instanceof Error ? error.name : "error",
+        );
+        return false;
+    }
+    // Resolve only AFTER a delete that did not throw, same rule as the sweep.
+    await prisma.automationEvent
+        .update({ where: { id: eventId }, data: { status: "resolved" } })
+        .catch(() => { /* the sweep will find it still pending and re-check */ });
+    return true;
+}
+
+/**
  * Delete the object. If that fails, record the path so the sweep can retry.
  * Never throws: the caller is already rejecting a row and must not be derailed
  * by the cleanup of it.

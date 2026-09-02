@@ -122,6 +122,9 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
         retryStorageCleanups: async () => { h.cleanupCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
+        // Defaults to what the row already carries: the interesting case is the
+        // one that overrides it, where a late assignment landed mid-pass.
+        refreshProjectId: async rowId => rows.find(r => r.id === rowId)?.projectId ?? null,
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { owned: true, strongOwner: null }; },
@@ -810,6 +813,37 @@ test("an unreadable date falls back to the COMPANY's calendar day, not UTC's", a
 });
 
 // ── The sweep lives inside the run's budget (round-5 item 7) ───────────────
+
+test("INTERLEAVING: a job assigned after the claim is honoured, not parked NEEDS_JOB", async () => {
+    // The pass claims a row with no project, spends ~25s in the reader, and a
+    // finalize writes the project in the meantime. Routing on the value read at
+    // claim time would publish NEEDS_JOB for a receipt that HAS a job — and
+    // NEEDS_JOB is exactly where a human goes looking for that problem, so the
+    // row would sit in the one queue that means the opposite of its state.
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => "proj-late",
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { READ: 1 }, "routed, not parked");
+    assert.deepEqual(h.states, [], "no NEEDS_JOB park was written");
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+});
+
+test("a row with no job at claim time AND none at routing time still parks", async () => {
+    // The control for the test above: the re-read is a re-read, not a way to
+    // pretend every row has a job.
+    const h = harness([workerRow({ projectId: null })], { refreshProjectId: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_JOB: 1 });
+});
+
+test("a failing re-read falls back to the claimed value instead of losing the row", async () => {
+    const h = harness([workerRow({ projectId: "proj-1" })], {
+        refreshProjectId: async () => { throw new Error("pool exhausted"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { READ: 1 });
+});
 
 test("the deadline starts at invocation entry, so a slow sweep cannot overrun it", async () => {
     // The sweep downloads objects. Timing it OUT of the budget meant it could

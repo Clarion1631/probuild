@@ -468,6 +468,21 @@ fine.
 
 Both inline ceilings answer with a 413 naming the two-step path.
 
+**The 15 MiB ceiling is set on the Supabase bucket as well as in code.** The signed upload
+URL bypasses this server entirely, so application code cannot stop the write — it can only
+refuse the object afterwards, by which time the bytes are already paid for and sitting in
+the bucket. Set it where the write happens:
+
+> Supabase dashboard → Storage → the private receipts bucket (`SECURE_BUCKET`) → Settings →
+> **file size limit = 15 MB**. Supabase rejects a larger upload at the storage API with a
+> 413, before any object is created.
+
+The server-side check stays regardless, and is checked in this order:
+1. **Object metadata first** (`list({ search })` → `metadata.size`) — one small request that
+   costs the same whatever the object weighs. Oversize is rejected here, with no body read.
+2. **Then the downloaded byte length**, because a null metadata size means "storage did not
+   say", not "fine".
+
 **`text/plain` is refused with a 415.** QuickBooks cannot attach a `.txt`, so accepting one
 meant reading it with Gemini and then stranding it unbookable at
 `unsupported-attachment` — worse than a clear refusal at the door. v1 converted these using

@@ -6,7 +6,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
-import { recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
+import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
 import {
     MAX_INLINE_JSON_BYTES,
@@ -403,14 +403,37 @@ async function storeObject(storagePath: string, bytes: Buffer, mimeType: string)
     }
 }
 
-async function publishStagedRow(id: string): Promise<NextResponse> {
+/** The only two parked reasons a later, correct upload may recover from. */
+export const RECOVERABLE_REASONS = ["file-missing", "sha-mismatch"];
+
+async function publishStagedRow(id: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
-        const published = await prisma.receiptIntake.update({
-            where: { id },
+        // EXACT-state CAS. `update` by id alone would publish a row that had
+        // since moved on — a booked row dragged back to RECEIVED and re-read,
+        // which is a second Purchase waiting to happen.
+        const { count } = await prisma.receiptIntake.updateMany({
+            where: { id, state: expectState },
             data: { state: "RECEIVED" },
+        });
+        if (count === 0) {
+            const current = await prisma.receiptIntake.findUnique({
+                where: { id },
+                select: { state: true },
+            });
+            // Somebody else published it; that is the outcome the caller wanted.
+            if (current?.state === "RECEIVED") {
+                return NextResponse.json({ ok: true, id, state: "RECEIVED", alreadyPublished: true });
+            }
+            return NextResponse.json(
+                { ok: false, error: "publish-conflict", id, state: current?.state ?? "gone" },
+                { status: 409 },
+            );
+        }
+        const published = await prisma.receiptIntake.findUnique({
+            where: { id },
             select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
         });
-        return NextResponse.json({ ok: true, ...published });
+        return NextResponse.json({ ok: true, ...(published ?? { id, state: "RECEIVED" }) });
     } catch (error) {
         // The bytes ARE stored; only the publish failed. Leave the row in
         // STAGING — 503 tells the caller to retry, and the retry resumes.
@@ -445,7 +468,7 @@ async function respondToSourceRefConflict(
         where: { sourceRef },
         select: {
             id: true, state: true, source: true, sourceRef: true, projectId: true,
-            dryRun: true, fileSha256: true, createdById: true, storagePath: true,
+            dryRun: true, fileSha256: true, createdById: true, storagePath: true, stateReason: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
@@ -492,16 +515,38 @@ async function respondToSourceRefConflict(
         // The caller just handed us the bytes again, so the orphan is fixable:
         // store them and republish. This is the retry HEALING the row rather
         // than merely reporting on it.
-        const healable = existing.state === "STAGING" || existing.state === "NEEDS_REVIEW";
+        // Recovery is restricted to the two reasons a later, correct upload can
+        // actually fix. "Any NEEDS_REVIEW row" was far too broad: a row parked
+        // for a vendor mismatch, a zero total, or a QBO fault would be dragged
+        // back to RECEIVED and re-read, discarding the decision a human had
+        // already made about it.
+        const healable = existing.state === "STAGING"
+            || (existing.state === "NEEDS_REVIEW" && RECOVERABLE_REASONS.includes(existing.stateReason ?? ""));
         if (healable) {
             const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
             if (!healed) {
                 return NextResponse.json({ ok: false, error: "storage-failed" }, { status: 503 });
             }
-            await prisma.receiptIntake.update({
-                where: { id: existing.id },
+            // EXACT state AND reason. Losing this race means somebody moved the
+            // row while we were uploading, so the object we just wrote is
+            // unreferenced — clean it up rather than orphan it.
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: {
+                    id: existing.id,
+                    state: existing.state,
+                    ...(existing.state === "NEEDS_REVIEW" ? { stateReason: existing.stateReason } : {}),
+                },
                 data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
             });
+            if (count === 0) {
+                if (payload.storagePath !== existing.storagePath) {
+                    await deleteObjectOrRecord(payload.storagePath, "heal-lost-race");
+                }
+                return NextResponse.json(
+                    { ok: false, error: "publish-conflict", id: existing.id },
+                    { status: 409 },
+                );
+            }
             return NextResponse.json({
                 ok: true, recovered: true, id: existing.id, state: "RECEIVED",
                 sourceRef: existing.sourceRef, projectId: existing.projectId, dryRun: existing.dryRun,

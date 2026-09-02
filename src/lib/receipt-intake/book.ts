@@ -193,7 +193,9 @@ export interface BookDependencies {
     createPurchase: (
         tokens: QBTokens,
         input: CreateQBReceiptPurchaseInput,
-        deadline?: RouteDeadline,
+        deadline: RouteDeadline | undefined,
+        /** Invoked by the QBO core immediately before the create. */
+        onBeforeCreate: () => Promise<void>,
     ) => Promise<CreateQBReceiptPurchaseResult>;
     /**
      * The invocation's ONE absolute deadline. Undefined = unbounded (tests).
@@ -449,16 +451,28 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // strong key would then be held forever against a Purchase that does
         // not exist. Persisted rather than in-memory, because the case the flag
         // exists for is the process dying mid-create.
-        // It is ALSO the last fence: a CAS on the claim token. If this worker
-        // has been superseded the write affects zero rows and we abort HERE,
-        // before the create — so a zombie cannot post a Purchase that the live
-        // worker is about to post as well.
-        const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
-        if (!stillOurs) return { outcome: "stale" };
-        sent.attempted = true;
-
-        result = await deps.createPurchase(tokens, input, deps.deadline);
+        // The mark happens INSIDE createQBReceiptPurchase, immediately before
+        // the create — not here.
+        //
+        // Everything the QBO core does first can fail without any Purchase
+        // existing: the DocNumber query, the project match, ensureVendor,
+        // ensureCustomer, the account verification, the money validation.
+        // Marking before all of that meant a vendor-duplicate or an
+        // account-config fault left sendAttempted=true, and the row then held
+        // its dedup key forever against a Purchase that was never created.
+        //
+        // The hook is also the last ownership fence: a CAS on the claim token
+        // that THROWS when this worker has been superseded, which aborts the
+        // create so a zombie cannot post a Purchase the live worker is about to
+        // post as well.
+        result = await deps.createPurchase(tokens, input, deps.deadline, async () => {
+            const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
+            if (!stillOurs) throw new StaleClaimError();
+            sent.attempted = true;
+        });
     } catch (error) {
+        // A lost CAS from inside the create hook: nothing was sent.
+        if (error instanceof StaleClaimError) return { outcome: "stale" };
         const terminal = terminalReasonFor(error);
         // A send WAS attempted: QBO may hold a Purchase whose response we lost,
         // so the key stays claimed even though the row is parked.
@@ -610,6 +624,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     bookedAt: now,
                     lastError: null,
                     nextRetryAt: null,
+                    // Ownership is released by the write that completes the
+                    // transition — a booked row is nobody's to hold.
+                    claimToken: null,
+                    claimedAt: null,
                 },
             });
             if (claimed.count === 0) throw new StaleClaimError();

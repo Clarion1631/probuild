@@ -211,6 +211,20 @@ export interface QboReceiptProjectCandidate {
 export interface QboReceiptPushDependencies {
     qbQueryFn: <T = any>(tokens: QBTokens, query: string) => Promise<T[]>;
     qbCreateFn: (tokens: QBTokens, payload: Record<string, unknown>, requestId: string) => Promise<{ id: string }>;
+    /**
+     * Invoked IMMEDIATELY before qbCreateFn, and nowhere else.
+     *
+     * Callers that record "a Purchase may now exist" need that record to happen
+     * at the last possible instant. Everything above this line — the DocNumber
+     * query, the project match, the vendor/customer ensures, the account
+     * verification, the money validation — can fail without any Purchase being
+     * created, and a caller that marked earlier would treat those as
+     * "might have booked" forever.
+     *
+     * Throwing from this hook aborts the create, which is the point: it is also
+     * the caller's last chance to check it still owns the row.
+     */
+    onBeforeCreate?: () => Promise<void>;
     ensureVendorFn: (tokens: QBTokens, name: string) => Promise<string>;
     // Injectable (unlike the plain re-export of ensureQBCustomer) because the
     // customer is now resolved on EVERY create — there is no more per-client
@@ -810,6 +824,7 @@ export async function createQBReceiptPurchase(
     if (isBudgetExhausted(deadline)) {
         throw new QBBudgetExhaustedError("Route budget exhausted before the QBO Purchase create");
     }
+    await deps.onBeforeCreate?.();
     const created = await qbCreateFn(tokens, payload, requestId);
 
     let attachment: ReceiptAttachmentStatus = "skipped";
