@@ -27,13 +27,26 @@ CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");
 -- SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
 -- project delete must not silently destroy spend history that the estimate
 -- still holds.
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'Expense_projectId_fkey'
-                    AND conrelid = '"Expense"'::regclass) THEN
+--
+-- Guarded on the DEFINITION, not just the name (Codex round 1, issue 9). A
+-- name-only `IF NOT EXISTS` silently accepts a pre-existing constraint of the
+-- same name that points somewhere else or carries ON DELETE CASCADE — which is
+-- precisely the failure this constraint exists to prevent. Existing-and-wrong
+-- raises instead of being skipped: an operator has to look at it.
+DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_projectId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
     ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
       FOREIGN KEY ("projectId") REFERENCES "Project"("id")
       ON DELETE SET NULL ON UPDATE CASCADE;
+  ELSIF existing_def NOT LIKE '%REFERENCES "Project"(id)%'
+     OR existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+    RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
   END IF;
 END $$;
 

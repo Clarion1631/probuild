@@ -69,15 +69,26 @@ export const statements = [
     // SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
     // project delete must not silently destroy spend history that the estimate
     // still holds.
-    `DO $$ BEGIN
-       IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                       WHERE conname = 'Expense_projectId_fkey'
-                         AND conrelid = '"Expense"'::regclass) THEN
-         ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
-           FOREIGN KEY ("projectId") REFERENCES "Project"("id")
-           ON DELETE SET NULL ON UPDATE CASCADE;
-       END IF;
-     END $$`,
+    //
+    // Guarded on the DEFINITION, not just the name: a name-only IF NOT EXISTS
+    // silently accepts a same-named constraint that points elsewhere or carries
+    // ON DELETE CASCADE. Existing-and-wrong raises rather than being skipped.
+    `DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_projectId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
+      FOREIGN KEY ("projectId") REFERENCES "Project"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+  ELSIF existing_def NOT LIKE '%REFERENCES "Project"(id)%'
+     OR existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+    RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
+  END IF;
+END $$`,
 
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
     `UPDATE "Expense" e SET "projectId" = est."projectId"
@@ -103,8 +114,27 @@ export const expectedColumns = {
     ],
 };
 
+/**
+ * Verified by DEFINITION, not by name (Codex round 1, issue 9).
+ *
+ * The DO-block above skips when a constraint of that NAME already exists — so
+ * a pre-existing `Expense_projectId_fkey` pointing at the wrong table, or
+ * carrying ON DELETE CASCADE, would be left in place and the script would still
+ * report success. The whole point of SET NULL here is that deleting a project
+ * must not destroy spend history; a CASCADE wearing the same name is the exact
+ * failure this check has to catch.
+ */
 export const expectedConstraints = [
-    { name: "Expense_projectId_fkey", table: "Expense" },
+    {
+        name: "Expense_projectId_fkey",
+        table: "Expense",
+        mustMatch: [
+            /FOREIGN KEY \("projectId"\)/,
+            /REFERENCES "?Project"?\(id\)/,
+            /ON UPDATE CASCADE/,
+            /ON DELETE SET NULL/,
+        ],
+    },
 ];
 
 export const expectedIndexes = [
@@ -160,16 +190,25 @@ async function main() {
             }
             console.log(`verified ${table}: ${columns.length} columns`);
         }
-        for (const { name, table } of expectedConstraints) {
+        for (const { name, table, mustMatch } of expectedConstraints) {
             const [row] = await prisma.$queryRawUnsafe(
-                `SELECT 1 AS ok FROM pg_constraint WHERE conname = $1`, name,
+                `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+                  WHERE conname = $1 AND conrelid = $2::regclass`,
+                name, `"${table}"`,
             );
             if (!row) {
                 console.error(`VERIFY FAILED: constraint ${name} missing on ${table}`);
                 process.exit(1);
             }
+            for (const pattern of mustMatch) {
+                if (!pattern.test(row.def)) {
+                    console.error(`VERIFY FAILED: ${name} does not match ${pattern}
+  actual: ${row.def}`);
+                    process.exit(1);
+                }
+            }
+            console.log(`verified constraint ${name}: ${row.def}`);
         }
-        console.log(`verified ${expectedConstraints.length} constraint(s)`);
         for (const { name, table } of expectedIndexes) {
             const [row] = await prisma.$queryRawUnsafe(
                 `SELECT 1 AS ok FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace`, name,

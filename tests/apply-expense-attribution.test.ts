@@ -92,12 +92,40 @@ test("the backfill UPDATE only ever touches rows whose projectId is still NULL",
     assert.ok(!/SET "projectId" = est\."projectId"[\s\S]*WHERE(?![\s\S]*projectId" IS NULL)/.test(update!));
 });
 
-test("the FK is SET NULL, guarded, and named the way Prisma would name it", () => {
+test("the FK is SET NULL, named the way Prisma would name it, and guarded on its DEFINITION", () => {
+    // A name-only `IF NOT EXISTS` would silently accept a pre-existing
+    // Expense_projectId_fkey that points at another table or carries ON DELETE
+    // CASCADE — exactly the thing SET NULL is here to prevent. Existing-and-
+    // wrong must RAISE, not be skipped.
     const fk = (statements as string[]).find(s => s.includes("Expense_projectId_fkey"));
     assert.ok(fk);
-    assert.match(fk!, /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/);
+    assert.match(fk!, /pg_get_constraintdef\(oid\)/);
     assert.match(fk!, /ON DELETE SET NULL ON UPDATE CASCADE/);
-    assert.deepEqual(expectedConstraints, [{ name: "Expense_projectId_fkey", table: "Expense" }]);
+    assert.match(fk!, /NOT LIKE '%ON DELETE SET NULL%'/);
+    assert.match(fk!, /NOT LIKE '%REFERENCES "Project"\(id\)%'/);
+    assert.match(fk!, /RAISE EXCEPTION/);
+    assert.ok(
+        !/IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(fk!),
+        "the name-only guard must be gone, not merely accompanied",
+    );
+
+    // ...and the post-run verification asserts the same thing against the live
+    // catalog, rather than only asserting the constraint's NAME exists.
+    assert.equal(expectedConstraints.length, 1);
+    const [constraint] = expectedConstraints as { name: string; table: string; mustMatch: RegExp[] }[];
+    assert.equal(constraint.name, "Expense_projectId_fkey");
+    assert.equal(constraint.table, "Expense");
+    const rendered = 'FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE SET NULL';
+    for (const pattern of constraint.mustMatch) {
+        assert.match(rendered, pattern, `pg_get_constraintdef output must satisfy ${pattern}`);
+    }
+    // A CASCADE wearing the right name must fail every one of those checks.
+    const cascade = 'FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE CASCADE';
+    assert.ok(
+        constraint.mustMatch.some(pattern => !pattern.test(cascade)),
+        "an ON DELETE CASCADE constraint of the same name must be rejected",
+    );
+
     assert.deepEqual(expectedIndexes, [{ name: "Expense_projectId_idx", table: "Expense" }]);
 });
 
