@@ -33,6 +33,10 @@ const fakePrisma = {
             updateArgs = args;
             return { id: "e1", ...args.data };
         },
+        deleteMany: async (args: unknown) => {
+            deleteArgs = args;
+            return { count: 1 };
+        },
     },
     estimateItem: {
         findFirst: async (args: { where: Record<string, any> }) => {
@@ -55,7 +59,11 @@ const fakePrisma = {
     costCode: { findUnique: async () => null },
 };
 
-let PUT: (req: any, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
+type Handler = (req: any, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
+let PUT: Handler;
+let PATCH: Handler;
+let DELETE: Handler;
+let deleteArgs: unknown;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -87,6 +95,8 @@ before(async () => {
     }
     if (typeof mod.PUT !== "function") throw new Error("expense-edit-authz: mocks did not apply");
     PUT = mod.PUT;
+    PATCH = mod.PATCH;
+    DELETE = mod.DELETE;
 });
 
 beforeEach(() => {
@@ -101,6 +111,7 @@ beforeEach(() => {
         estimate: { projectId: "job-1" },
     };
     updateArgs = null;
+    deleteArgs = null;
     estimateItems = [
         { id: "item-own", estimateId: "est-job-1", projectId: "job-1" },
         { id: "item-elsewhere", estimateId: "est-job-2", projectId: "job-2" },
@@ -109,6 +120,14 @@ beforeEach(() => {
 
 function call(body: Record<string, unknown>) {
     return PUT({ json: async () => body } as any, { params: Promise.resolve({ id: "e1" }) });
+}
+
+function patch(body: Record<string, unknown>) {
+    return PATCH({ json: async () => body } as any, { params: Promise.resolve({ id: "e1" }) });
+}
+
+function del() {
+    return DELETE({} as any, { params: Promise.resolve({ id: "e1" }) });
 }
 
 // ── item 3: authorization ──────────────────────────────────────────────────
@@ -138,35 +157,97 @@ test("an expense with no resolvable project fails CLOSED", async () => {
     assert.equal(res.status, 403, "no scope to authorize against means nobody may edit it");
 });
 
-test("editing the tax fields needs financialReports on top of project access", async () => {
-    currentUser = { id: "u4", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
-    const res = await call({ installedAtCustomer: true });
-    assert.equal(res.status, 403);
+test("PUT refuses the tax fields outright — PATCH is their single writer", async () => {
+    for (const body of [{ installedAtCustomer: true }, { taxDeductibleBase: 50 }]) {
+        const res = await call(body);
+        assert.equal(res.status, 400, JSON.stringify(body));
+        assert.match((await res.json()).error, /PATCH/);
+    }
     assert.equal(updateArgs, null);
-    // ...while an ordinary field edit by the same user still works.
-    assert.equal((await call({ vendor: "Fine" })).status, 200);
 });
 
-test("a permitted bookkeeper can record the tax answer and the allocation", async () => {
-    const res = await call({ installedAtCustomer: true, taxDeductibleBase: 50 });
+test("PUT is a PARTIAL update: omitted fields keep their values", async () => {
+    // It used to write `body.vendor || null` unconditionally, so any request
+    // that did not resend every field wiped the ones it left out.
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.vendor, undefined);
+    assert.equal(updateArgs?.data.date, undefined);
+    assert.equal(updateArgs?.data.description, undefined);
+    assert.equal(updateArgs?.data.itemId, undefined);
+    // ...while an explicitly-sent null still clears.
+    await call({ vendor: null });
+    assert.equal(updateArgs?.data.vendor, null);
+});
+
+// ── item 3: the tax-correction PATCH ───────────────────────────────────────
+
+test("PATCH reaches a QBO-managed row — the population the report is made of", async () => {
+    // Every pipeline expense carries a qbPurchaseId, so PUT's mutability guard
+    // excluded exactly the rows this correction path exists for.
+    storedExpense = { ...storedExpense, qbPurchaseId: "qb-123" };
+    const res = await patch({ installedAtCustomer: true, taxDeductibleBase: 50 });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.installedAtCustomer, true);
     assert.equal(updateArgs?.data.taxDeductibleBase, 50);
 });
 
-test("installedAtCustomer can be set back to unknown", async () => {
-    assert.equal((await call({ installedAtCustomer: null })).status, 200);
+test("PATCH touches NOTHING but the three ProBuild-only columns", async () => {
+    await patch({ installedAtCustomer: true });
+    assert.deepEqual(Object.keys(updateArgs?.data ?? {}), ["installedAtCustomer"]);
+    // A caller sending a QBO-synced field is told, not silently ignored.
+    const res = await patch({ amount: "1.00" });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /only edits/);
+});
+
+test("PATCH needs financialReports for the tax fields, and project access always", async () => {
+    currentUser = { id: "u4", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    assert.equal((await patch({ installedAtCustomer: true })).status, 403);
+    currentUser = { id: "u5", role: "MANAGER", permissions: { timeClock: true, financialReports: true }, projectIds: ["other"] };
+    assert.equal((await patch({ installedAtCustomer: true })).status, 403);
+    currentUser = null;
+    assert.equal((await patch({ installedAtCustomer: true })).status, 401);
+});
+
+test("PATCH can set installedAtCustomer back to unknown, and rejects a non-tri-state", async () => {
+    assert.equal((await patch({ installedAtCustomer: null })).status, 200);
     assert.equal(updateArgs?.data.installedAtCustomer, null);
-    assert.equal((await call({ installedAtCustomer: "yes" })).status, 400, "and only a real tri-state is accepted");
+    assert.equal((await patch({ installedAtCustomer: "yes" })).status, 400);
+});
+
+test("PATCH enforces the deduction ceiling", async () => {
+    // 207.74 gross − 16.55 tax = 191.19.
+    assert.equal((await patch({ taxDeductibleBase: 191.20 })).status, 400);
+    assert.equal((await patch({ taxDeductibleBase: 191.19 })).status, 200);
+});
+
+// ── item 8: DELETE gets the same gate ──────────────────────────────────────
+
+test("DELETE is authorized like PUT, not merely authenticated", async () => {
+    currentUser = { id: "u2", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["other-job"] };
+    assert.equal((await del()).status, 403);
+    assert.equal(deleteArgs, null, "and nothing is deleted");
+
+    currentUser = { id: "u3", role: "FIELD_CREW", permissions: {}, projectIds: ["job-1"] };
+    assert.equal((await del()).status, 403, "no timeClock permission");
+
+    currentUser = null;
+    assert.equal((await del()).status, 401);
+});
+
+test("DELETE fails closed on an expense with no resolvable project", async () => {
+    storedExpense = { ...storedExpense, projectId: null, estimate: { projectId: null } };
+    assert.equal((await del()).status, 403);
+    assert.equal(deleteArgs, null);
+});
+
+test("DELETE still works for someone who may actually do it", async () => {
+    assert.equal((await del()).status, 200);
+    assert.deepEqual(deleteArgs, { where: { id: "e1", qbPurchaseId: null } });
 });
 
 // ── item 4: the invariant is about the RESULTING row ───────────────────────
-
-test("a base above the pre-tax total is refused", async () => {
-    // 207.74 gross − 16.55 tax = 191.19.
-    assert.equal((await call({ taxDeductibleBase: 191.20 })).status, 400);
-    assert.equal((await call({ taxDeductibleBase: 191.19 })).status, 200);
-});
 
 test("LOWERING the amount cannot strand an impossible base", async () => {
     // The other door into the same illegal state: this request never mentions
@@ -184,11 +265,10 @@ test("lowering the amount is fine when the resulting row still holds", async () 
     assert.equal((await call({ amount: "100.00" })).status, 200);
 });
 
-test("both fields moving together are checked against each other", async () => {
-    // A PUT that lowers the amount AND sets a base must be judged on the pair,
-    // not on the amount it started with.
-    assert.equal((await call({ amount: "60.00", taxDeductibleBase: 55 })).status, 400);
-    assert.equal((await call({ amount: "60.00", taxDeductibleBase: 40 })).status, 200);
+test("a PATCH base is judged against the row's real amount", async () => {
+    storedExpense = { ...storedExpense, amount: 60, taxAmount: 5 };
+    assert.equal((await patch({ taxDeductibleBase: 56 })).status, 400);
+    assert.equal((await patch({ taxDeductibleBase: 55 })).status, 200);
 });
 
 // ── item 5: the item link may not cross jobs ───────────────────────────────

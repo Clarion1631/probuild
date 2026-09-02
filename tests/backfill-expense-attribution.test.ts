@@ -169,6 +169,7 @@ test("the item fallback wins over the rules, and is sourced 'backfill'", () => {
         items: new Map([["item-1", { costCodeId: "cc-frame", estimateId: "est-job-1", projectId: "job-1" }]]),
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
     });
     assert.equal(plan.codeFills.length, 1);
     assert.equal(plan.codeFills[0].costCodeId, "cc-frame", "a real link beats a regex guess");
@@ -217,10 +218,26 @@ test("an item on ANOTHER estimate of the SAME job is accepted", () => {
         items: new Map([["item-co", { costCodeId: "cc-frame", estimateId: "est-job-1-co", projectId: "job-1" }]]),
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
+        allowedCodesByProject: ALL_PHASES,
     });
     assert.equal(plan.codeFills.length, 1);
     assert.equal(plan.codeFills[0].costCodeId, "cc-frame");
     assert.match(plan.codeFills[0].why, /same project/);
+});
+
+test("an item link does not excuse a code that is NOT a live phase of the job", () => {
+    // The link proves the JOB; it does not prove the CODE. An item on a draft
+    // or archived estimate can carry a code the job never committed to, and
+    // the item fallback used to bypass the phase gate entirely.
+    const plan = planBackfill({
+        expenses: [expense({ id: "e1", projectId: "job-1", itemId: "item-draft" })],
+        items: new Map([["item-draft", { costCodeId: "cc-frame", estimateId: "est-draft", projectId: "job-1" }]]),
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+        allowedCodesByProject: new Map([["job-1", new Set(["cc-plumb"])]]),
+    });
+    assert.deepEqual(plan.codeFills, []);
+    assert.equal(plan.remainder[0].reason, "phase-not-on-project");
 });
 
 test("the PROJECT decides, and a matching estimateId is no longer a shortcut", () => {

@@ -44,6 +44,7 @@ import {
     resolveExpenseProjectId,
 } from "../src/lib/expense-attribution.ts";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project.ts";
+import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases.ts";
 import { csvCell, csvNumber } from "../src/lib/csv-safe.ts";
 
 /**
@@ -154,6 +155,19 @@ export function planBackfill({
                 item.projectId === resolvedProjectId;
             if (!sameProject) {
                 add(expense, "item-outside-estimate");
+                continue;
+            }
+            // The item link proves the job; it does NOT prove the code is a
+            // live phase of that job. An item on a draft estimate can carry a
+            // code the job never committed to, so the same phase gate the
+            // suggester passes through applies here too.
+            const allowedForItem = allowedCodesByProject.get(resolvedProjectId);
+            if (!allowedForItem || allowedForItem.size === 0) {
+                add(expense, "no-phases");
+                continue;
+            }
+            if (!allowedForItem.has(item.costCodeId)) {
+                add(expense, "phase-not-on-project");
                 continue;
             }
             codeFills.push({
@@ -304,7 +318,7 @@ export async function runBackfill({
     // The item's OWN estimate and project come back with it: the fallback has
     // to prove the link does not cross jobs before it copies a code.
     const itemRowsRaw = await db.estimateItem.findMany({
-        where: { costCodeId: { not: null } },
+        where: { costCodeId: { not: null }, costCode: { isActive: true } },
         select: {
             id: true, costCodeId: true, estimateId: true,
             estimate: { select: { projectId: true } },
@@ -323,13 +337,30 @@ export async function runBackfill({
     }]));
     const itemCostCodeById = new Map(itemRows.map(row => [row.id, row.costCodeId]));
 
-    // The phases each job actually has. Mirrors resolveProjectPhaseCodes'
-    // estimate-item half (src/lib/project-phases.ts) — the Safety phase is
-    // deliberately absent, because a materials receipt is never a safety
+    // THE PHASES EACH JOB ACTUALLY HAS — the same set the app itself uses.
+    //
+    // An earlier version built this from `itemRows` above, which is every coded
+    // estimate item on any estimate at all. That let a code from a DRAFT or
+    // ARCHIVED estimate, or an INACTIVE cost code, count as "a phase of this
+    // job" — so the fail-closed check was looser than it claimed, and looser
+    // than the clock-in route it is supposed to mirror. This now applies
+    // PHASE_ELIGIBLE_ESTIMATE_WHERE and `costCode.isActive`, exactly as
+    // resolveProjectPhaseCodes does.
+    //
+    // The Safety phase is deliberately NOT appended: resolveProjectPhaseCodes
+    // adds it for In Progress jobs, but a materials receipt is never a safety
     // meeting and this pass has no business assigning one.
+    const phaseRows = await db.estimateItem.findMany({
+        where: {
+            costCodeId: { not: null },
+            costCode: { isActive: true },
+            estimate: { ...PHASE_ELIGIBLE_ESTIMATE_WHERE },
+        },
+        select: { costCodeId: true, estimate: { select: { projectId: true } } },
+    });
     const allowedCodesByProject = new Map();
-    for (const row of itemRows) {
-        const projectId = row.projectId;
+    for (const row of phaseRows) {
+        const projectId = row.estimate?.projectId ?? null;
         if (!projectId || !row.costCodeId) continue;
         if (!allowedCodesByProject.has(projectId)) allowedCodesByProject.set(projectId, new Set());
         allowedCodesByProject.get(projectId).add(row.costCodeId);

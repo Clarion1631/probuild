@@ -656,15 +656,26 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     costCodeId,
                     costCodeSource,
                     costCodeConfidence,
-                    // The tax the VENDOR charged, from the read — deliberately
-                    // not `taxApplied`. `taxApplied` is what the QBO Purchase
-                    // split onto the reclaimable account, and buildGroups zeroes
-                    // it for a check or a nonsense read. The WA deduction is
-                    // based on tax actually paid at the register, so the receipt's
-                    // own figure is the right one here, and the two are allowed
-                    // to disagree.
-                    taxAmount: row.taxCents !== null ? row.taxCents / 100 : null,
-                    taxAtSource: row.taxAtSource,
+                    // ONLY TAX `buildGroups` ACCEPTED (Codex round 4).
+                    //
+                    // An earlier version stored `row.taxCents` — the raw read —
+                    // on the reasoning that the WA deduction is about tax paid
+                    // at the register, not about what QuickBooks split. That is
+                    // true in principle and wrong in practice: `buildGroups`
+                    // REJECTS a tax read on a check, and rejects a nonsense one
+                    // (tax >= total), and those rejected values were still
+                    // landing on the Expense with `taxAtSource` true. The tax
+                    // report reads exactly those two columns, so an OCR misread
+                    // no human ever saw could be claimed on an excise return —
+                    // and `amount - taxAmount` could even go negative.
+                    //
+                    // `taxApplied` is the validated figure, read back off the
+                    // groups that actually posted. A rejected read is stored
+                    // NOWHERE the report can reach: `ReceiptIntake.taxCents`
+                    // keeps the raw value for audit, and a human can set the
+                    // real one through the tax-correction PATCH.
+                    taxAmount: taxApplied > 0 ? taxApplied / 100 : null,
+                    taxAtSource: taxApplied > 0,
                     installedAtCustomer: row.installedAtCustomer,
                     amount: amountCents / 100,
                     vendor: row.vendor || "Unknown",
