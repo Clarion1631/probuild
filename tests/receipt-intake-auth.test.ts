@@ -427,10 +427,17 @@ test("isCronAuthorized fails closed on an unset secret and is constant-time", as
     }
 });
 
-test("machine endpoints refuse a Server Action dispatch; portal actions still work", async () => {
-    // The matcher's FIRST entry already routes every next-action request here
-    // regardless of path, so these were reaching the proxy — the bypass was
-    // waving them through before any action check ran.
+test("ANONYMOUS action dispatch: allowlisted paths pass, everything else is 403", async () => {
+    // Next's action IDs are GLOBAL — the path a `next-action` POST is sent to
+    // only decides whose middleware runs first, not which action runs. So every
+    // public-bypass path was an anonymous dispatcher for any action in the app,
+    // and the old denylist (legal pages + machine endpoints) closed the two
+    // somebody had thought of while /api/auth, /api/mobile, /api/pdf/*, /login,
+    // /share/* and the asset patterns stayed open.
+    //
+    // These are RUNTIME dispatches through the real proxy, not assertions about
+    // a helper: the bug was an ORDERING one (the bypass returned next() before
+    // any action check ran), and only driving the request end to end can see it.
     const { default: proxy } = await loadProxy();
     const { NextRequest } = await import("next/server");
     const event = { waitUntil() {} } as any;
@@ -445,38 +452,79 @@ test("machine endpoints refuse a Server Action dispatch; portal actions still wo
         }), event);
 
     try {
+        // REFUSED — none of these define an anonymous Server Action, and each
+        // one bypasses the proxy for its own unrelated reason.
         for (const path of [
+            // Machine endpoints: their only gate is a secret checked in the
+            // handler, which an action dispatch never reaches.
             "/api/cron/receipt-intake-worker",
             "/api/health/pipeline",
             "/api/integrations/qbo-receipts/create",
             "/api/webhook/stripe",
             "/api/twilio/sms",
+            "/api/receipts/intake",
+            "/api/receipts/intake/start",
+            "/api/receipts/intake/abc123/finalize",
+            // Public bypasses the old denylist never mentioned. These are the
+            // regression: every one of them dispatched actions anonymously.
+            "/api/auth/session",
+            "/api/mobile/projects",
+            "/api/pdf/estimates/abc123",
+            "/api/portal/verify",
+            "/api/payments/deposit-ingest",
+            "/api/selections/item-comments",
+            "/login",
+            "/share/room/sometoken",
+            // Legal pages, as before.
+            "/privacy",
+            "/terms",
+            "/account-deletion",
+            "/support",
         ]) {
             const res = await dispatch(path);
             assert.ok(res, path);
-            assert.equal(res.status, 403, `${path} must refuse an action dispatch`);
+            assert.equal(res.status, 403, `${path} must refuse an anonymous action dispatch`);
+            // NextResponse.next() carries x-middleware-next: 1. Anything else
+            // means the proxy kept control, which is the point.
             assert.equal(res.headers.get("x-middleware-next"), null, path);
         }
 
-        // Routes that GENUINELY serve anonymous Server Actions are untouched —
-        // 403ing them would break the client portal.
-        for (const path of ["/api/portal/verify", "/api/payments/deposit-ingest", "/api/selections/item-comments"]) {
+        // ALLOWED — the client portal and the sub portal genuinely dispatch
+        // actions with no session (approveEstimate, markInvoiceViewed,
+        // subPortalUploadCOI, the sub sign-in flow). Each authorizes on its own
+        // client/token check INSIDE the action; 403ing them here would break
+        // the portal outright.
+        for (const path of [
+            "/portal",
+            "/portal/estimates/cmpd8mblp0004od6iufe0jfzc",
+            "/portal/invoices/abc123",
+            "/portal/projects/abc123/selections",
+            "/portal/clip",
+            "/sub-portal",
+            "/sub-portal/login",
+            "/sub-portal/projects/abc123",
+        ]) {
             const res = await dispatch(path);
-            assert.equal(res!.headers.get("x-middleware-next"), "1", `${path} must still pass`);
+            assert.equal(res!.headers.get("x-middleware-next"), "1", `${path} must still dispatch`);
         }
 
-        // And an ordinary cron call is unaffected.
-        const normal = await proxy(
-            new NextRequest("https://probuild.test/api/cron/receipt-intake-worker", { method: "GET" }),
-            event,
-        );
-        assert.equal(normal!.headers.get("x-middleware-next"), "1");
+        // The allowlist is a PREFIX of path segments, not a substring: a route
+        // that merely starts with the same letters is not the portal.
+        for (const path of ["/portalx", "/sub-portalx", "/api/portal-ish"]) {
+            const res = await dispatch(path);
+            assert.equal(res!.status, 403, path);
+        }
+
+        // And an ordinary request — no next-action header — is untouched on
+        // every one of those paths.
+        for (const path of ["/api/cron/receipt-intake-worker", "/api/receipts/intake", "/login", "/share/room/t"]) {
+            const res = await proxy(new NextRequest(`https://probuild.test${path}`, { method: "GET" }), event);
+            assert.equal(res!.headers.get("x-middleware-next"), "1", `${path} without the header`);
+        }
     } finally {
         env.NODE_ENV = prod;
     }
 });
-
-// ── sourceRef shape, per source (round-13 item 4) ──────────────────────────
 
 test("a sourceRef must carry a real id for its source, not just the prefix", async () => {
     const { validateSourceRef, decideSource, MAX_SOURCE_REF_BYTES } =
