@@ -18,22 +18,35 @@
 // Kept statement-for-statement in sync with
 // prisma/migrations/20260901000000_payroll_phase5/migration.sql.
 import { PrismaClient } from "@prisma/client";
+
+/**
+ * Which addresses this run is allowed to mark SALARY.
+ *
+ * NO DEFAULT, deliberately. An unset env var means nobody — the previous
+ * revision defaulted to two hardcoded people, which is a migration script
+ * guessing a pay type on nobody's authority. Exported so the rule can be tested
+ * without a database.
+ */
+export function classifySalariedEmails(raw) {
+    if (typeof raw !== "string") return [];
+    return [
+        ...new Set(
+            raw
+                .split(",")
+                .map((email) => email.trim().toLowerCase())
+                .filter(Boolean)
+        ),
+    ].sort();
+}
+
+/** `--dry-run` prints what the seed WOULD do and writes nothing. */
+export const isDryRun = (argv = process.argv) => argv.includes("--dry-run");
+
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-config({ path: join(__dirname, "..", ".env.production.local") });
-config({ path: join(__dirname, "..", ".env.local") });
-config({ path: join(__dirname, "..", ".env") });
-
-if (!process.env.DATABASE_URL) {
-    console.error("DATABASE_URL is not set (.env.production.local missing?).");
-    process.exit(1);
-}
-
-const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
-
 const STATEMENTS = [
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRateSyncAt" TIMESTAMPTZ(6)`,
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payType" TEXT`,
@@ -157,148 +170,205 @@ const STATEMENTS = [
      END $$`,
 ];
 
-try {
-    for (const sql of STATEMENTS) {
-        await prisma.$executeRawUnsafe(sql);
-        console.log("ok:", sql.split("\n")[0].trim().slice(0, 90));
-    }
-    // NO endTime backfill — see the note in the matching migration. Synthesising
-    // a span for a manual entry makes WA meal settlement treat PAID hours as a
-    // RAW span, deduct a meal it never owed, and reprice it at the member's
-    // current rate. The readers were fixed instead.
+/**
+ * DO NOT run any of this at import time.
+ *
+ * The env loading below reads .env.production.local, so merely importing this
+ * file used to load PRODUCTION credentials and then execute every statement
+ * against them. That is not hypothetical: it happened on 2026-09-02 when a test
+ * imported the module to reach classifySalariedEmails, and the whole Phase 5
+ * migration ran against production as a side effect of the import.
+ *
+ * Everything with a side effect now lives in main(), which only runs when this
+ * file is the entrypoint. The exported helpers above are pure and safe to
+ * import.
+ */
+async function main() {
+    config({ path: join(__dirname, "..", ".env.production.local") });
+    config({ path: join(__dirname, "..", ".env.local") });
+    config({ path: join(__dirname, "..", ".env") });
 
-    // User.payType is left NULL for anyone nobody has confirmed.
-    //
-    // An earlier revision also stamped every ACTIVATED crew member and manager
-    // as HOURLY. That defeated the whole point of the column: stored values beat
-    // the env fallback, so a salaried manager omitted from
-    // PAYROLL_SALARIED_EMAILS would have been permanently marked hourly, and
-    // later fixing the env var would have changed nothing — Gusto would pay them
-    // a salary AND the exported hours. NULL blocks the export until a human
-    // answers on Company -> Team Members, which is the fail-closed behaviour the
-    // column exists for.
-    //
-    // The SALARY seed below is kept because it only ever moves a row in the SAFE
-    // direction (excluded from the summary = cannot be double-paid) and only for
-    // emails an operator explicitly listed. It never overwrites an existing
-    // answer.
-    const salaried = (process.env.PAYROLL_SALARIED_EMAILS ?? "cj@goldentouchremodeling.com,rlord@goldentouchremodeling.com")
-        .split(",")
-        .map((email) => email.trim().toLowerCase())
-        .filter(Boolean);
-    if (salaried.length) {
-        const seededSalary = await prisma.$executeRawUnsafe(
-            `UPDATE "User" SET "payType" = 'SALARY' WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,
-            salaried
+    if (!process.env.DATABASE_URL) {
+        console.error("DATABASE_URL is not set (.env.production.local missing?).");
+        process.exit(1);
+    }
+
+    const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+
+    const dryRun = isDryRun();
+    if (dryRun) console.log("[dry-run] the payType seed will print what it would do and write nothing.");
+
+
+    try {
+        for (const sql of STATEMENTS) {
+            await prisma.$executeRawUnsafe(sql);
+            console.log("ok:", sql.split("\n")[0].trim().slice(0, 90));
+        }
+        // NO endTime backfill — see the note in the matching migration. Synthesising
+        // a span for a manual entry makes WA meal settlement treat PAID hours as a
+        // RAW span, deduct a meal it never owed, and reprice it at the member's
+        // current rate. The readers were fixed instead.
+
+        // User.payType is left NULL for anyone nobody has confirmed.
+        //
+        // An earlier revision also stamped every ACTIVATED crew member and manager
+        // as HOURLY. That defeated the whole point of the column: stored values beat
+        // the env fallback, so a salaried manager omitted from
+        // PAYROLL_SALARIED_EMAILS would have been permanently marked hourly, and
+        // later fixing the env var would have changed nothing — Gusto would pay them
+        // a salary AND the exported hours. NULL blocks the export until a human
+        // answers on Company -> Team Members, which is the fail-closed behaviour the
+        // column exists for.
+        //
+        // The SALARY seed only ever moves a row in the SAFE direction (excluded from
+        // the summary = cannot be double-paid), only for emails an operator
+        // EXPLICITLY listed, and never over an existing answer.
+        //
+        // It used to default that list to two named people when the env var was
+        // unset. That is the same guess the NULL column exists to prevent, just
+        // aimed the other way: a migration script deciding, on nobody's authority,
+        // that two specific humans are salaried. If either had actually been hourly
+        // the export would have silently dropped their hours. No env var, no seed.
+        const salaried = classifySalariedEmails(process.env.PAYROLL_SALARIED_EMAILS);
+        if (!salaried.length) {
+            console.log(
+                "PAYROLL_SALARIED_EMAILS is not set — no payType is being seeded. Everyone stays NULL until a human answers on Company -> Team Members."
+            );
+        } else if (dryRun) {
+            const would = await prisma.$queryRawUnsafe(
+                `SELECT "email" FROM "User" WHERE "payType" IS NULL AND lower("email") = ANY($1::text[]) ORDER BY "email"`,
+                salaried
+            );
+            console.log(`[dry-run] would set payType = SALARY for ${would.length} user(s):`);
+            for (const row of would) console.log(`[dry-run]   ${row.email}`);
+            const unmatched = salaried.filter(
+                (email) => !would.some((row) => String(row.email).toLowerCase() === email)
+            );
+            // Listed but not matched: already answered, or the address is wrong.
+            // Worth printing — a typo in the env var is otherwise invisible.
+            if (unmatched.length) {
+                console.log(`[dry-run] ${unmatched.length} listed address(es) matched no NULL-payType user: ${unmatched.join(", ")}`);
+            }
+        } else {
+            const seededSalary = await prisma.$executeRawUnsafe(
+                `UPDATE "User" SET "payType" = 'SALARY' WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,
+                salaried
+            );
+            console.log(`seeded ${seededSalary} user(s) to payType = SALARY from PAYROLL_SALARIED_EMAILS`);
+        }
+        const unconfirmed = await prisma.$queryRawUnsafe(
+            `SELECT count(*)::int AS n FROM "User" WHERE "payType" IS NULL AND "status" = 'ACTIVATED'`
         );
-        console.log(`seeded ${seededSalary} user(s) to payType = SALARY from PAYROLL_SALARIED_EMAILS`);
+        console.log(
+            `${unconfirmed[0].n} activated user(s) still have no payType — the payroll export will refuse to run for anyone with hours until they are set on Company -> Team Members. This is intentional.`
+        );
+
+        // ----------------------------------------------------------------------
+        // TimeEntry no longer cascades from User or Project (review round 16).
+        // Idempotent on confdeltype: 'c' is CASCADE, 'r' is RESTRICT, so a second
+        // run finds 'r' and does nothing.
+        // ----------------------------------------------------------------------
+        await prisma.$executeRawUnsafe(`
+            DO $$
+            DECLARE
+                fk RECORD;
+            BEGIN
+                FOR fk IN
+                    SELECT unnest(ARRAY['TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey']) AS name,
+                           unnest(ARRAY['userId', 'projectId'])                               AS col,
+                           unnest(ARRAY['User', 'Project'])                                   AS parent
+                LOOP
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = fk.name
+                          AND conrelid = '"TimeEntry"'::regclass
+                          AND confdeltype = 'c'
+                    ) THEN
+                        EXECUTE format('ALTER TABLE "TimeEntry" DROP CONSTRAINT %I', fk.name);
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = fk.name AND conrelid = '"TimeEntry"'::regclass
+                    ) THEN
+                        EXECUTE format(
+                            'ALTER TABLE "TimeEntry" ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+                            fk.name, fk.col, fk.parent
+                        );
+                    END IF;
+                END LOOP;
+            END $$;
+        `);
+        const cascading = await prisma.$queryRawUnsafe(
+            `SELECT conname FROM pg_constraint
+              WHERE conrelid = '"TimeEntry"'::regclass AND confdeltype = 'c'
+                AND conname IN ('TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey')`
+        );
+        console.log(`TimeEntry parent FKs still cascading: ${cascading.length} (expected 0)`);
+        if (cascading.length !== 0) process.exit(1);
+
+        // ----------------------------------------------------------------------
+        // A wrong-range period is DISCARDED, not deleted (review round 16, item 6).
+        // Unlocking leaves the row behind and every overlap check then refuses the
+        // corrected range forever, so there was no way back from a typo.
+        //
+        // These three columns, the index and the CHECK shipped in the migration but
+        // NOT here for one commit — a prod run of this script would have left the
+        // discard action writing to columns that did not exist. tests/
+        // payroll-apply-script-parity.test.ts now fails the build if the two files
+        // ever diverge again.
+        // ----------------------------------------------------------------------
+        await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedAt" TIMESTAMPTZ(6)`);
+        await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedById" TEXT`);
+        await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedReason" TEXT`);
+        await prisma.$executeRawUnsafe(
+            `CREATE INDEX IF NOT EXISTS "PayrollPeriod_discardedAt_idx" ON "PayrollPeriod"("discardedAt")`
+        );
+        // A LOCKED period is never discarded: that would retire hours already
+        // exported and paid, and every reader would stop seeing the freeze that
+        // protects them. VALIDATE, not NOT VALID — an unvalidated constraint is not
+        // enforced for existing rows, so prod would disagree with CI's replay.
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked"`
+        );
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_discard_unlocked"
+                CHECK ("discardedAt" IS NULL OR "lockedAt" IS NULL) NOT VALID`
+        );
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
+        );
+
+        const discardBits = await prisma.$queryRawUnsafe(
+            `SELECT column_name AS name FROM information_schema.columns
+              WHERE table_name = 'PayrollPeriod'
+                AND column_name IN ('discardedAt', 'discardedById', 'discardedReason')
+             UNION ALL
+             SELECT indexname FROM pg_indexes
+              WHERE tablename = 'PayrollPeriod' AND indexname = 'PayrollPeriod_discardedAt_idx'
+             UNION ALL
+             SELECT conname FROM pg_constraint
+              WHERE conrelid = '"PayrollPeriod"'::regclass
+                AND conname = 'PayrollPeriod_discard_unlocked'
+                AND convalidated`
+        );
+        console.log(`verified ${discardBits.length}/5 discard columns, index and validated CHECK`);
+        if (discardBits.length !== 5) process.exit(1);
+
+        const cols = await prisma.$queryRawUnsafe(
+            `SELECT table_name, column_name FROM information_schema.columns
+             WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))
+                OR (table_name = 'PayrollPeriod' AND column_name IN ('id','periodStart','periodEnd','lockedAt','lockedById','exportHash','createdAt'))`
+        );
+        console.log(`verified ${cols.length}/9 columns present`);
+        if (cols.length !== 9) process.exit(1);
+    } finally {
+        await prisma.$disconnect();
     }
-    const unconfirmed = await prisma.$queryRawUnsafe(
-        `SELECT count(*)::int AS n FROM "User" WHERE "payType" IS NULL AND "status" = 'ACTIVATED'`
-    );
-    console.log(
-        `${unconfirmed[0].n} activated user(s) still have no payType — the payroll export will refuse to run for anyone with hours until they are set on Company -> Team Members. This is intentional.`
-    );
-
-    // ----------------------------------------------------------------------
-    // TimeEntry no longer cascades from User or Project (review round 16).
-    // Idempotent on confdeltype: 'c' is CASCADE, 'r' is RESTRICT, so a second
-    // run finds 'r' and does nothing.
-    // ----------------------------------------------------------------------
-    await prisma.$executeRawUnsafe(`
-        DO $$
-        DECLARE
-            fk RECORD;
-        BEGIN
-            FOR fk IN
-                SELECT unnest(ARRAY['TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey']) AS name,
-                       unnest(ARRAY['userId', 'projectId'])                               AS col,
-                       unnest(ARRAY['User', 'Project'])                                   AS parent
-            LOOP
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = fk.name
-                      AND conrelid = '"TimeEntry"'::regclass
-                      AND confdeltype = 'c'
-                ) THEN
-                    EXECUTE format('ALTER TABLE "TimeEntry" DROP CONSTRAINT %I', fk.name);
-                END IF;
-
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = fk.name AND conrelid = '"TimeEntry"'::regclass
-                ) THEN
-                    EXECUTE format(
-                        'ALTER TABLE "TimeEntry" ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I("id") ON DELETE RESTRICT ON UPDATE CASCADE',
-                        fk.name, fk.col, fk.parent
-                    );
-                END IF;
-            END LOOP;
-        END $$;
-    `);
-    const cascading = await prisma.$queryRawUnsafe(
-        `SELECT conname FROM pg_constraint
-          WHERE conrelid = '"TimeEntry"'::regclass AND confdeltype = 'c'
-            AND conname IN ('TimeEntry_userId_fkey', 'TimeEntry_projectId_fkey')`
-    );
-    console.log(`TimeEntry parent FKs still cascading: ${cascading.length} (expected 0)`);
-    if (cascading.length !== 0) process.exit(1);
-
-    // ----------------------------------------------------------------------
-    // A wrong-range period is DISCARDED, not deleted (review round 16, item 6).
-    // Unlocking leaves the row behind and every overlap check then refuses the
-    // corrected range forever, so there was no way back from a typo.
-    //
-    // These three columns, the index and the CHECK shipped in the migration but
-    // NOT here for one commit — a prod run of this script would have left the
-    // discard action writing to columns that did not exist. tests/
-    // payroll-apply-script-parity.test.ts now fails the build if the two files
-    // ever diverge again.
-    // ----------------------------------------------------------------------
-    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedAt" TIMESTAMPTZ(6)`);
-    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedById" TEXT`);
-    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedReason" TEXT`);
-    await prisma.$executeRawUnsafe(
-        `CREATE INDEX IF NOT EXISTS "PayrollPeriod_discardedAt_idx" ON "PayrollPeriod"("discardedAt")`
-    );
-    // A LOCKED period is never discarded: that would retire hours already
-    // exported and paid, and every reader would stop seeing the freeze that
-    // protects them. VALIDATE, not NOT VALID — an unvalidated constraint is not
-    // enforced for existing rows, so prod would disagree with CI's replay.
-    await prisma.$executeRawUnsafe(
-        `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked"`
-    );
-    await prisma.$executeRawUnsafe(
-        `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_discard_unlocked"
-            CHECK ("discardedAt" IS NULL OR "lockedAt" IS NULL) NOT VALID`
-    );
-    await prisma.$executeRawUnsafe(
-        `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
-    );
-
-    const discardBits = await prisma.$queryRawUnsafe(
-        `SELECT column_name AS name FROM information_schema.columns
-          WHERE table_name = 'PayrollPeriod'
-            AND column_name IN ('discardedAt', 'discardedById', 'discardedReason')
-         UNION ALL
-         SELECT indexname FROM pg_indexes
-          WHERE tablename = 'PayrollPeriod' AND indexname = 'PayrollPeriod_discardedAt_idx'
-         UNION ALL
-         SELECT conname FROM pg_constraint
-          WHERE conrelid = '"PayrollPeriod"'::regclass
-            AND conname = 'PayrollPeriod_discard_unlocked'
-            AND convalidated`
-    );
-    console.log(`verified ${discardBits.length}/5 discard columns, index and validated CHECK`);
-    if (discardBits.length !== 5) process.exit(1);
-
-    const cols = await prisma.$queryRawUnsafe(
-        `SELECT table_name, column_name FROM information_schema.columns
-         WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))
-            OR (table_name = 'PayrollPeriod' AND column_name IN ('id','periodStart','periodEnd','lockedAt','lockedById','exportHash','createdAt'))`
-    );
-    console.log(`verified ${cols.length}/9 columns present`);
-    if (cols.length !== 9) process.exit(1);
-} finally {
-    await prisma.$disconnect();
 }
+
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMainModule) {
+    await main();
+}
+

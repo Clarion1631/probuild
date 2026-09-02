@@ -4,7 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
-import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
+import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { deleteParentWithTimeEntries } from "@/lib/payroll-parent-delete";
 import { isPeriodLockedError, periodLockedResponse } from "@/lib/payroll-period";
 
@@ -92,15 +92,15 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             try {
                 await prisma.$transaction(async (tx) => {
                     if (userInfo) {
-                        const rateResult = await applyRateChange(
+                        const rateResult = await applyRateChangeInTx(
+                            tx,
                             currentUser,
                             id,
                             {
                                 hourlyRate: userInfo.hourlyRate,
                                 burdenRate: userInfo.burdenRate,
                                 payType: userInfo.payType,
-                            },
-                            tx as never
+                            }
                         );
                         if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                     }

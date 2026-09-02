@@ -4,7 +4,7 @@ import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
-import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
+import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 
 const VALID_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
 const VALID_STATUSES = new Set(["PENDING", "ACTIVATED", "DISABLED"]);
@@ -82,11 +82,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     let updated;
     try {
         updated = await prisma.$transaction(async (tx) => {
-            const rateResult = await applyRateChange(
+            const rateResult = await applyRateChangeInTx(
+                tx,
                 rateActor,
                 id,
-                { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType },
-                tx as never
+                { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType }
             );
             if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
 

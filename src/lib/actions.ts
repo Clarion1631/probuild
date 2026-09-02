@@ -15996,29 +15996,79 @@ export async function discardPayrollPeriod(periodStartKey: string, periodEndKey:
     return { success: true as const };
 }
 
-export async function unlockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
+export async function unlockPayrollPeriod(
+    periodStartKey: string,
+    periodEndKey: string,
+    /**
+     * The lockedAt the CALLER was looking at, as an ISO string.
+     *
+     * Unlock is destructive — it drops the frozen CSV snapshots — and it used to
+     * match on the date range alone. So a stale page could unlock a period that
+     * had been unlocked and re-locked since, throwing away a DIFFERENT lock's
+     * snapshot than the one on screen, and a double-submit could unlock a fresh
+     * lock somebody had just taken. Comparing the lockedAt makes the button act
+     * on the lock it was rendered for, or on nothing.
+     */
+    expectedLockedAt: string
+) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Not authenticated");
     if (user.role !== "ADMIN") throw new Error("Forbidden");
 
     // The same shared validator the lock action and the export use.
     const { validatePayrollRange } = await import("./payroll-config");
+    const { STALE_LOCK_CODE } = await import("./payroll-period");
     const range = validatePayrollRange(periodStartKey, periodEndKey);
     if (!range.ok) return { success: false as const, error: range.error };
 
-    // Unlock deletes the snapshot: the period is editable again, so a frozen
-    // CSV would immediately stop describing it. The row and its exportHash stay
-    // as the record that this period WAS exported.
-    //
-    // Matched on the STABLE day keys. Reconstructing timestamps in today's zone
-    // missed the row entirely if the company zone had changed since the lock —
-    // zero rows updated, and the caller was still told it succeeded.
-    const unlocked = await prisma.payrollPeriod.updateMany({
-        where: { periodStartKey: range.startKey, periodEndKey: range.endKey },
-        data: { lockedAt: null, summaryCsvSnapshot: null, detailCsvSnapshot: null },
+    const expected = typeof expectedLockedAt === "string" ? new Date(expectedLockedAt) : new Date(NaN);
+    if (Number.isNaN(expected.getTime())) {
+        return {
+            success: false as const,
+            code: STALE_LOCK_CODE,
+            error: "Refresh the page and try again — this unlock does not say which lock it is for.",
+        };
+    }
+
+    const unlocked = await prisma.$transaction(async (tx) => {
+        // The EXCLUSIVE payroll lock, the same one lockPayrollPeriod takes. It is
+        // what makes this compare-and-set meaningful: without it, a lock creation
+        // can commit between the read and the write, and the unlock would drop a
+        // snapshot the check never saw.
+        const { acquirePayrollLockCreationLock } = await import("./payroll-period");
+        await acquirePayrollLockCreationLock(tx as never);
+
+        // Unlock deletes the snapshot: the period is editable again, so a frozen
+        // CSV would immediately stop describing it. The row and its exportHash
+        // stay as the record that this period WAS exported.
+        //
+        // Matched on the STABLE day keys. Reconstructing timestamps in today's
+        // zone missed the row entirely if the company zone had changed since the
+        // lock — zero rows updated, and the caller was still told it succeeded.
+        //
+        // `lockedAt: expected` IS the compare-and-set, and `not: null` makes an
+        // already-unlocked period fail it too rather than reporting success for
+        // a no-op.
+        return tx.payrollPeriod.updateMany({
+            where: {
+                periodStartKey: range.startKey,
+                periodEndKey: range.endKey,
+                lockedAt: expected,
+                NOT: { lockedAt: null },
+            },
+            data: { lockedAt: null, summaryCsvSnapshot: null, detailCsvSnapshot: null },
+        });
     });
+
     if (unlocked.count === 0) {
-        return { success: false as const, error: "There is no locked period for those dates." };
+        // One message for every miss. Distinguishing "no such period" from
+        // "somebody re-locked it" would require a second read that could itself
+        // be stale, and the action is the same either way: look again.
+        return {
+            success: false as const,
+            code: STALE_LOCK_CODE,
+            error: "That period is not locked the way this page shows it — somebody may have unlocked or re-locked it since. Nothing was changed; refresh and check before unlocking.",
+        };
     }
 
     revalidatePath("/manager/payroll-export");

@@ -113,3 +113,66 @@ test("the discard DDL is present in the script in full", () => {
     // the constraint already being there.
     assert.match(script, /DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked"/);
 });
+
+// ── The script guesses nothing, and importing it does nothing (round 19) ────
+
+test("no salaried list means NOBODY is seeded — the script never guesses a pay type", async () => {
+    const { classifySalariedEmails } = await import("../scripts/apply-payroll-phase5.mjs");
+    // The previous revision defaulted this to two named people. That is the same
+    // guess the NULL column exists to prevent, aimed the other way: if either had
+    // actually been hourly, the export would have silently dropped their hours.
+    assert.deepEqual(classifySalariedEmails(undefined), []);
+    assert.deepEqual(classifySalariedEmails(""), []);
+    assert.deepEqual(classifySalariedEmails("   "), []);
+    assert.deepEqual(classifySalariedEmails(null), []);
+    assert.deepEqual(classifySalariedEmails(42), []);
+});
+
+test("the list is normalised: trimmed, lower-cased, de-duplicated, sorted", async () => {
+    const { classifySalariedEmails } = await import("../scripts/apply-payroll-phase5.mjs");
+    assert.deepEqual(
+        classifySalariedEmails(" B@x.com , a@x.com ,, A@X.com "),
+        ["a@x.com", "b@x.com"],
+        "the SQL compares lower(email), so the list has to match that shape"
+    );
+});
+
+test("no hardcoded person survives anywhere in the script", () => {
+    const script = read(SCRIPT);
+    assert.doesNotMatch(script, /goldentouchremodeling\.com/, "the script must not name individual employees");
+    assert.match(script, /classifySalariedEmails\(process\.env\.PAYROLL_SALARIED_EMAILS\)/);
+    // And it says so out loud when the list is empty, rather than seeding silently.
+    assert.match(script, /PAYROLL_SALARIED_EMAILS is not set/);
+});
+
+test("--dry-run prints what it would set and writes nothing", async () => {
+    const { isDryRun } = await import("../scripts/apply-payroll-phase5.mjs");
+    assert.equal(isDryRun(["node", "s.mjs", "--dry-run"]), true);
+    assert.equal(isDryRun(["node", "s.mjs"]), false);
+
+    const script = read(SCRIPT);
+    // The dry-run branch must SELECT, never UPDATE.
+    const seed = script.slice(script.indexOf("const salaried = classifySalariedEmails"));
+    const body = seed.slice(0, seed.indexOf("const unconfirmed"));
+    const dryBranch = body.slice(body.indexOf("} else if (dryRun) {"), body.indexOf("} else {"));
+    assert.match(dryBranch, /SELECT "email" FROM "User"/);
+    assert.doesNotMatch(dryBranch, /UPDATE "User"/, "a dry run that writes is not a dry run");
+    // The real branch is the only one that updates.
+    assert.match(body.slice(body.indexOf("} else {")), /UPDATE "User" SET "payType" = 'SALARY'/);
+});
+
+test("IMPORTING the script must not load production env or run anything", () => {
+    const script = read(SCRIPT);
+    // On 2026-09-02 a test imported this module to reach classifySalariedEmails.
+    // The module called config({ path: ".env.production.local" }) at top level,
+    // so the import loaded PRODUCTION credentials and executed the entire
+    // migration against them. Everything with a side effect now lives in main().
+    assert.match(script, /const isMainModule = process\.argv\[1\] && fileURLToPath\(import\.meta\.url\) === process\.argv\[1\]/);
+    assert.match(script, /if \(isMainModule\) \{\s*\n\s*await main\(\);/);
+
+    // The dangerous calls must all be INSIDE main(), never at module scope.
+    const beforeMain = script.slice(0, script.indexOf("async function main()"));
+    assert.doesNotMatch(beforeMain, /config\(\{ path:/, "env loading at module scope runs on import");
+    assert.doesNotMatch(beforeMain, /new PrismaClient\(/, "constructing a client at module scope connects on import");
+    assert.doesNotMatch(beforeMain, /\$executeRawUnsafe/, "no statement may run at module scope");
+});

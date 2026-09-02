@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { applyRateChange, canWriteRates } from "../src/lib/pay-rate-write";
+import { applyRateChange, applyRateChangeInTx, canWriteRates } from "../src/lib/pay-rate-write";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-pay-rate-write-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -158,4 +158,68 @@ test("the rate import locks every affected row, in a stable order", () => {
     assert.match(body, /\[\.\.\.clean\]\.sort\(\(a, b\) => a\.userId\.localeCompare\(b\.userId\)\)/);
     // Locks first, then the compare-and-set writes.
     assert.ok(body.indexOf("lockOwnerRowForUpdate") < body.indexOf("tx.user.updateMany"));
+});
+
+// ── The opener vs the in-transaction worker (review round 19, item 1) ───────
+
+test("applyRateChangeInTx does NOT open a transaction — a tx has no $transaction", async () => {
+    // The crash this pins: every route runs its rate write inside its own
+    // interactive transaction, and an interactive Prisma client has no
+    // $transaction method. A version that opened one unconditionally threw
+    // TypeError on every rate edit, and type-checked only because the call
+    // sites cast their tx with `as never`.
+    const writes: unknown[] = [];
+    const tx = {
+        user: { update: async (args: unknown) => { writes.push(args); return {}; } },
+        $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+        // Deliberately absent: $transaction. Reaching for it is the bug.
+    };
+    const result = await applyRateChangeInTx(tx, ADMIN, "u1", { hourlyRate: "31.00" });
+    assert.deepEqual(result, { ok: true, changed: true });
+    assert.equal(writes.length, 1);
+});
+
+test("no call site casts its tx away any more", () => {
+    for (const file of [
+        "src/app/api/manager/employees/[id]/route.ts",
+        "src/app/api/users/route.ts",
+        "src/app/api/users/[id]/route.ts",
+    ]) {
+        const source = readFileSync(path.join(process.cwd(), file), "utf8");
+        // `tx as never` is what let the wrong function be called for a whole
+        // round without tsc noticing.
+        assert.doesNotMatch(source, /tx as never/, file);
+        assert.match(source, /applyRateChangeInTx\(\s*\n\s*tx,/, file);
+        assert.doesNotMatch(source, /\bapplyRateChange\(/, `${file}: routes use the InTx variant`);
+    }
+});
+
+test("applyRateChange is the ONLY opener, and refuses before taking a connection", async () => {
+    let opened = false;
+    const client = {
+        $transaction: async (fn: any) => {
+            opened = true;
+            return fn({
+                user: { update: async () => ({}) },
+                $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+            });
+        },
+    };
+    // Refused: never opens.
+    const refused = await applyRateChange(CREW, "u1", { hourlyRate: "31.00" }, client as never);
+    assert.equal(refused.ok, false);
+    assert.equal(opened, false);
+
+    // Allowed: opens exactly one.
+    const allowed = await applyRateChange(ADMIN, "u1", { hourlyRate: "31.00" }, client as never);
+    assert.deepEqual(allowed, { ok: true, changed: true });
+    assert.equal(opened, true);
+});
+
+test("a payload with no rate fields still short-circuits without a transaction", async () => {
+    let opened = false;
+    const client = { $transaction: async (fn: any) => { opened = true; return fn({} as never); } };
+    const result = await applyRateChange(CREW, "u1", {}, client as never);
+    assert.deepEqual(result, { ok: true, changed: false });
+    assert.equal(opened, false, "an ordinary profile edit must not need payroll permission OR a transaction");
 });

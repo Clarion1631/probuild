@@ -3,7 +3,7 @@ import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
+import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -85,11 +85,11 @@ export async function POST(req: Request) {
                         invitedAt: new Date(),
                     },
                 });
-                const rateResult = await applyRateChange(
+                const rateResult = await applyRateChangeInTx(
+                    tx,
                     currentUser,
                     created.id,
-                    { hourlyRate, burdenRate, payType: body.payType },
-                    tx as never
+                    { hourlyRate, burdenRate, payType: body.payType }
                 );
                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                 return created;
@@ -184,11 +184,11 @@ export async function PATCH(req: Request) {
         let _pin;
         try {
             const updated = await prisma.$transaction(async (tx) => {
-                const rateResult = await applyRateChange(
+                const rateResult = await applyRateChangeInTx(
+                    tx,
                     currentUser,
                     id,
-                    { hourlyRate, burdenRate, payType: body.payType },
-                    tx as never
+                    { hourlyRate, burdenRate, payType: body.payType }
                 );
                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                 return tx.user.update({

@@ -201,6 +201,7 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                                 reviewedExportHash={result.exportHash}
                                 locked={false}
                                 canUnlock={false}
+                                lockedAtIso={null}
                                 blocked
                                 deferredCount={deferredCount}
                             />
@@ -313,6 +314,9 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                                 reviewedExportHash={result.exportHash}
                                 locked={locked}
                                 canUnlock={viewer?.role === "ADMIN" && !!exactLock}
+                                // The lock AS RENDERED. Sent back with the unlock so a
+                                // stale page cannot drop a different lock's snapshot.
+                                lockedAtIso={exactLock?.lockedAt ? new Date(exactLock.lockedAt).toISOString() : null}
                                 blocked={blocked}
                                 deferredCount={0}
                             />

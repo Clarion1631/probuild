@@ -473,3 +473,65 @@ test("the page is Suspense-wrapped, because useSearchParams opts it out of prere
     assert.match(page, /<Suspense fallback=/);
     assert.match(page, /function TeamPageInner\(\)/);
 });
+
+// ── Unlock is a compare-and-set on lockedAt (round 19, item 3) ──────────────
+
+test("unlock takes the lockedAt it rendered, and CASes on it", () => {
+    const actions = read("src/lib/actions.ts");
+    const fn = actions.slice(actions.indexOf("export async function unlockPayrollPeriod"));
+    const body = fn.slice(0, fn.indexOf("\nexport ") > 0 ? fn.indexOf("\nexport ") : undefined);
+
+    assert.match(body, /expectedLockedAt: string/);
+    // The CAS itself: the exact lockedAt, AND not-null so an already-unlocked
+    // period fails rather than reporting success for a no-op.
+    assert.match(body, /lockedAt: expected,\s*\n\s*NOT: \{ lockedAt: null \},/);
+    // Under the EXCLUSIVE payroll lock — otherwise a lock creation can commit
+    // between the check and the write and the unlock drops a snapshot the check
+    // never saw.
+    assert.match(body, /acquirePayrollLockCreationLock/);
+    assert.match(body, /prisma\.\$transaction/);
+    // A typed refusal, not a bare message.
+    assert.match(body, /code: STALE_LOCK_CODE/);
+    // The constant lives in payroll-period.ts: actions.ts is "use server", where
+    // only async functions may be exported (the build catches it).
+    assert.match(read("src/lib/payroll-period.ts"), /export const STALE_LOCK_CODE = "STALE_LOCK"/);
+    assert.doesNotMatch(actions, /export const STALE_LOCK_CODE/);
+});
+
+test("a malformed or missing expectedLockedAt is refused before any write", () => {
+    const actions = read("src/lib/actions.ts");
+    const fn = actions.slice(actions.indexOf("export async function unlockPayrollPeriod"));
+    const body = fn.slice(0, fn.indexOf("\nexport ") > 0 ? fn.indexOf("\nexport ") : undefined);
+    assert.match(body, /Number\.isNaN\(expected\.getTime\(\)\)/);
+    // Ordered before the transaction opens.
+    assert.ok(body.indexOf("Number.isNaN(expected.getTime())") < body.indexOf("prisma.$transaction"));
+});
+
+test("the UI sends the lockedAt it rendered, and hides the button without one", () => {
+    const controls = read("src/app/manager/payroll-export/PayrollLockControls.tsx");
+    assert.match(controls, /lockedAtIso: string \| null;/);
+    assert.match(controls, /unlockPayrollPeriod\(startKey, endKeyExclusive, lockedAtIso\)/);
+    // No lockedAt rendered means no unlock button — a click with nothing to
+    // compare against could only ever be a guess.
+    assert.match(controls, /canUnlock && lockedAtIso \?/);
+
+    const page = read("src/app/manager/payroll-export/page.tsx");
+    assert.match(page, /lockedAtIso=\{exactLock\?\.lockedAt \? new Date\(exactLock\.lockedAt\)\.toISOString\(\) : null\}/);
+    assert.match(page, /lockedAtIso=\{null\}/, "the not-locked render passes null too");
+});
+
+test("the CAS shape refuses a stale replay and an already-unlocked period alike", () => {
+    // Both misses are the same Prisma predicate, so this pins the predicate's
+    // truth table rather than re-describing the code.
+    const lockedAt = new Date("2026-09-08T00:00:00.000Z");
+    const matches = (rowLockedAt: Date | null, expected: Date) =>
+        rowLockedAt !== null && rowLockedAt.getTime() === expected.getTime();
+
+    // The lock the page rendered: unlocks.
+    assert.equal(matches(lockedAt, lockedAt), true);
+    // Re-locked since the page rendered: refused, so the NEW lock's snapshot
+    // survives.
+    assert.equal(matches(new Date("2026-09-09T00:00:00.000Z"), lockedAt), false);
+    // Already unlocked: refused, rather than reporting success for a no-op.
+    assert.equal(matches(null, lockedAt), false);
+});

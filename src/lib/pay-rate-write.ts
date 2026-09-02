@@ -70,16 +70,26 @@ export type RateWriteClient = {
     $transaction<T>(fn: (tx: RateWriteTx) => Promise<T>): Promise<T>;
 };
 
+/**
+ * An INTERACTIVE transaction client. Note what is absent: `$transaction`. That
+ * is deliberate — it is the thing a tx cannot do, and typing it out here is what
+ * makes the mistake above impossible to repeat without a cast.
+ */
 export type RateWriteTx = {
     user: { update(args: unknown): Promise<unknown> };
     $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
 };
 
-export async function applyRateChange(
+/** Does this payload touch payroll at all? Both entry points ask, so they cannot disagree. */
+function touchesPayroll(change: RateChange): boolean {
+    return change.hourlyRate !== undefined || change.burdenRate !== undefined || change.payType !== undefined;
+}
+
+export async function applyRateChangeInTx(
+    tx: RateWriteTx,
     actor: RateActor,
     userId: string,
-    change: RateChange,
-    client: RateWriteClient = prisma as never
+    change: RateChange
 ): Promise<RateWriteResult> {
     const touchesRates = change.hourlyRate !== undefined || change.burdenRate !== undefined;
     const touchesPayType = change.payType !== undefined;
@@ -121,13 +131,43 @@ export async function applyRateChange(
     // point of the staleness marker is that no rate write can skip it.
     if (touchesRates) data.lastRateSyncAt = new Date();
 
-    // EXCLUSIVE row lock, then the write, in ONE transaction. Settlement reads
-    // the same row FOR SHARE while it reprices a day, so this waits rather than
-    // moving the rate underneath a day that is mid-reprice — which would leave
-    // one day's shifts priced at two different rates.
-    await client.$transaction(async (tx) => {
-        await lockOwnerRowForUpdate(tx, userId);
-        await tx.user.update({ where: { id: userId }, data });
-    });
+    // EXCLUSIVE row lock, then the write, on the CALLER's transaction.
+    // Settlement reads the same row FOR SHARE while it reprices a day, so this
+    // waits rather than moving the rate underneath a day that is mid-reprice —
+    // which would leave one day's shifts priced at two different rates.
+    await lockOwnerRowForUpdate(tx, userId);
+    await tx.user.update({ where: { id: userId }, data });
     return { ok: true, changed: true };
+}
+
+/**
+ * Open a transaction and apply the change in it.
+ *
+ * THE ONLY OPENER. Every route already runs its rate write inside its own
+ * interactive transaction (the rate has to commit or roll back with the rest of
+ * the profile edit), and an interactive Prisma client has no `$transaction`
+ * method — so a version of this that opened one unconditionally crashed every
+ * one of those routes at runtime. It type-checked because the call sites cast
+ * their `tx` with `as never`.
+ *
+ * If you have a transaction, call applyRateChangeInTx with it. This is for the
+ * caller that does not.
+ */
+export async function applyRateChange(
+    actor: RateActor,
+    userId: string,
+    change: RateChange,
+    // ONE cast, here, in the safe direction: Prisma's interactive tx is a
+    // superset of RateWriteTx. It replaces the four `tx as never` casts at the
+    // call sites, which were pointing the other way and hid a real crash.
+    client: RateWriteClient = prisma as unknown as RateWriteClient
+): Promise<RateWriteResult> {
+    // Both cheap answers are decided BEFORE a connection is taken: a payload
+    // with no rate fields does nothing, and a caller without payroll access is
+    // refused. Neither needs a transaction.
+    if (!touchesPayroll(change)) return { ok: true, changed: false };
+    if (!canWriteRates(actor)) {
+        return { ok: false, status: 403, error: "Payroll access is required to change pay rates." };
+    }
+    return client.$transaction((tx) => applyRateChangeInTx(tx, actor, userId, change));
 }

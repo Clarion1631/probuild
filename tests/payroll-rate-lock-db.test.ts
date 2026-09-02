@@ -131,3 +131,90 @@ test("two settlements for DIFFERENT days do not block each other", { skip }, asy
         await b.$disconnect();
     }
 });
+
+/**
+ * The crash of round 18, against a real database.
+ *
+ * Every rate route runs its write inside its own interactive transaction. An
+ * interactive Prisma client has no `$transaction` method, so a version of
+ * applyRateChange that opened one unconditionally threw TypeError on every rate
+ * edit in production — and type-checked, because all four call sites cast their
+ * tx with `as never`. The unit tests use a hand-written fake, which cannot prove
+ * the real Prisma tx object behaves this way. This does.
+ */
+test("a rate edit through a REAL interactive transaction saves", { skip }, async () => {
+    const { applyRateChangeInTx } = await import("../src/lib/pay-rate-write");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const userId = `rate-route-${Date.now()}`;
+
+    try {
+        await db.$executeRawUnsafe(
+            `INSERT INTO "User" ("id", "email", "name", "role", "status", "hourlyRate", "burdenRate")
+             VALUES ($1, $2, 'Route Test', 'FIELD_CREW', 'ACTIVATED', 25.00, 5.00)`,
+            userId,
+            `${userId}@example.test`
+        );
+
+        // Exactly the shape the routes use: their own interactive transaction,
+        // other columns updated alongside the rate, one commit.
+        const result = await db.$transaction(async (tx) => {
+            const rate = await applyRateChangeInTx(tx as never, { role: "ADMIN" }, userId, {
+                hourlyRate: "31.25",
+                burdenRate: "7.50",
+                payType: "HOURLY",
+            });
+            await tx.user.update({ where: { id: userId }, data: { name: "Route Test Renamed" } });
+            return rate;
+        });
+        assert.deepEqual(result, { ok: true, changed: true });
+
+        const [saved] = (await db.$queryRawUnsafe(
+            `SELECT "hourlyRate", "burdenRate", "payType", "name", "lastRateSyncAt" FROM "User" WHERE "id" = $1`,
+            userId
+        )) as Array<Record<string, unknown>>;
+        assert.equal(String(saved.hourlyRate), "31.25");
+        assert.equal(String(saved.burdenRate), "7.5");
+        assert.equal(saved.payType, "HOURLY");
+        assert.equal(saved.name, "Route Test Renamed", "the rate and the profile edit commit together");
+        assert.ok(saved.lastRateSyncAt, "every rate write stamps the staleness marker");
+    } finally {
+        await db.$executeRawUnsafe(`DELETE FROM "User" WHERE "id" = $1`, userId).catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("a refused rate edit rolls the whole transaction back", { skip }, async () => {
+    const { applyRateChangeInTx, RateChangeError } = await import("../src/lib/pay-rate-write");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const userId = `rate-refuse-${Date.now()}`;
+
+    try {
+        await db.$executeRawUnsafe(
+            `INSERT INTO "User" ("id", "email", "name", "role", "status", "hourlyRate", "burdenRate")
+             VALUES ($1, $2, 'Refuse Test', 'FIELD_CREW', 'ACTIVATED', 25.00, 5.00)`,
+            userId,
+            `${userId}@example.test`
+        );
+
+        await assert.rejects(() =>
+            db.$transaction(async (tx) => {
+                await tx.user.update({ where: { id: userId }, data: { name: "Should Not Persist" } });
+                const rate = await applyRateChangeInTx(tx as never, { role: "FIELD_CREW" }, userId, {
+                    hourlyRate: "99.00",
+                });
+                if (!rate.ok) throw new RateChangeError(rate.status, rate.error);
+                return rate;
+            })
+        );
+
+        const [after] = (await db.$queryRawUnsafe(
+            `SELECT "name", "hourlyRate" FROM "User" WHERE "id" = $1`,
+            userId
+        )) as Array<Record<string, unknown>>;
+        assert.equal(after.name, "Refuse Test", "the profile edit rolls back with the refused rate");
+        assert.equal(String(after.hourlyRate), "25");
+    } finally {
+        await db.$executeRawUnsafe(`DELETE FROM "User" WHERE "id" = $1`, userId).catch(() => {});
+        await db.$disconnect();
+    }
+});

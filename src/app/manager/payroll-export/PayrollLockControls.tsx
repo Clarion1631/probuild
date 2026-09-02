@@ -25,6 +25,12 @@ type Props = {
     locked: boolean;
     /** Only an exact locked period can be unlocked, and only by an admin. */
     canUnlock: boolean;
+    /**
+     * The lockedAt this page RENDERED, ISO. Sent back with the unlock so the
+     * button acts on the lock the admin is looking at, not on whatever lock
+     * happens to be there when the click arrives.
+     */
+    lockedAtIso: string | null;
     blocked: boolean;
     deferredCount: number;
 };
@@ -35,6 +41,7 @@ export default function PayrollLockControls({
     reviewedExportHash,
     locked,
     canUnlock,
+    lockedAtIso,
     blocked,
     deferredCount,
 }: Props) {
@@ -82,12 +89,14 @@ export default function PayrollLockControls({
             )}
 
             {locked ? (
-                canUnlock ? (
+                canUnlock && lockedAtIso ? (
                     <button
                         type="button"
                         disabled={disabled}
                         onClick={() =>
-                            run("Period unlocked.", () => unlockPayrollPeriod(startKey, endKeyExclusive))
+                            run("Period unlocked.", () =>
+                                unlockPayrollPeriod(startKey, endKeyExclusive, lockedAtIso)
+                            )
                         }
                         className="hui-btn hui-btn-secondary text-sm disabled:opacity-40"
                     >

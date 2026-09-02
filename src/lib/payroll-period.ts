@@ -374,6 +374,15 @@ export function periodLockedMessage(period: Pick<LockedPeriodRow, "periodStart" 
 
 export const PERIOD_LOCKED_CODE = "PERIOD_LOCKED";
 
+/**
+ * Refusal code for "the lock you are looking at is not the lock that is there
+ * now" — a stale unlock, or one aimed at an already-unlocked period.
+ *
+ * Lives here rather than in actions.ts because that file is "use server", where
+ * only async functions may be exported.
+ */
+export const STALE_LOCK_CODE = "STALE_LOCK";
+
 export function periodLockedResponse(period: LockedPeriodRow): NextResponse {
     return NextResponse.json(
         {
