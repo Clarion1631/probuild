@@ -277,12 +277,37 @@ export function blockingEntries(
     /** Start of the WORKWEEK ENVELOPE (not the period). */
     windowStart: Date,
     /** End of the WORKWEEK ENVELOPE (not the period), exclusive. */
-    windowEnd: Date
+    windowEnd: Date,
+    /** The PAY PERIOD itself. Narrower than the envelope — see the note below. */
+    periodStart: Date,
+    periodEnd: Date
 ): BlockingEntry[] {
     const byId = new Map(users.map((user) => [user.id, user]));
+
+    // Who is actually being PAID by this run. The envelope deliberately reaches
+    // back to the start of the workweek so the overtime split inside the period
+    // is computed against the hours that already pushed that week toward 40 —
+    // those extra days are CONTEXT, not payable rows.
+    //
+    // Blocking on a context row of somebody with no in-period hours froze the
+    // export permanently: a former employee whose last shift landed in the tail
+    // of a workweek, carrying needsReview or an unsettled DEFERRED meal, has
+    // nobody left to fix it and no hours in this run to be wrong about. Their
+    // row cannot change a single number in the file, so it cannot be a reason to
+    // refuse to produce it.
+    //
+    // The moment that person HAS an in-period row, their context rows matter
+    // again — the OT split for the week is built from both — so they block as
+    // they always did.
+    const paidThisPeriod = new Set<string>();
+    for (const entry of entries) {
+        if (inPeriod(entry, periodStart, periodEnd)) paidThisPeriod.add(entry.userId);
+    }
+
     const blocking: BlockingEntry[] = [];
     for (const entry of entries) {
         if (!inPeriod(entry, windowStart, windowEnd)) continue;
+        if (!inPeriod(entry, periodStart, periodEnd) && !paidThisPeriod.has(entry.userId)) continue;
         // Order matters only for which single reason is reported first; each
         // condition is independently disqualifying.
         //
@@ -494,7 +519,7 @@ export function buildGustoExport(input: {
         employees,
         detail,
         blocking: [
-            ...blockingEntries(entries, users, envelopeStart, envelopeEnd),
+            ...blockingEntries(entries, users, envelopeStart, envelopeEnd, periodStart, periodEnd),
             ...unknownPayTypeBlockers(entries, users, periodStart, periodEnd),
         ],
     };

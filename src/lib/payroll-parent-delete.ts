@@ -1,5 +1,5 @@
 /**
- * Deleting a parent that owns time entries.
+ * Deleting parents that own time entries.
  *
  * TimeEntry used to CASCADE from both User and Project, so deleting a person or
  * a job silently destroyed their payroll history — including hours inside a
@@ -9,68 +9,139 @@
  * past it.
  *
  * The rule: hours in a locked period are never deleted, by anyone, for any
- * reason. Everything else is removed EXPLICITLY, under the payroll advisory
- * lock, in the same transaction as the parent — so a clock-in that lands
- * mid-delete either blocks on the lock or fails the foreign key, and can never
- * be quietly orphaned.
+ * reason. Everything else is removed EXPLICITLY, in one transaction with the
+ * parents, and only after every row has been checked.
+ *
+ * DISCOVERY HAPPENS INSIDE THE TRANSACTION, under the shared payroll advisory
+ * lock, ALWAYS — including when the caller's world looks empty. Reading first
+ * and locking second left two holes: a parent with no entries took no lock at
+ * all (the lock target was empty, so the guard returned early), and a row that
+ * appeared between the read and the write was deleted without ever being
+ * checked against a locked period.
  */
 
 import { toCompanyDayKey } from "@/lib/company-day";
-import { dayLockKey, withPayrollWriteTx, type PayrollTxClient } from "@/lib/payroll-period";
+import {
+    acquirePayrollWriteLock,
+    assertEntriesUnlockedInTx,
+    dayLockKey,
+    type PayrollTxClient,
+} from "@/lib/payroll-period";
 import { prisma } from "@/lib/prisma";
 
 export type TimeEntryParent = { userId: string } | { projectId: string };
 
+type DiscoveredEntry = { id: string; userId: string; startTime: Date };
+
+function scopeOf(parent: TimeEntryParent) {
+    return "userId" in parent ? { userId: parent.userId } : { projectId: parent.projectId };
+}
+
 /**
- * Remove a parent's time entries and then the parent, atomically.
+ * Raised when a time entry is created for one of these parents after the
+ * delete has already checked and removed everything it could see.
  *
- * Throws PeriodLockedError (mapped to 423 PERIOD_LOCKED by the callers) if ANY
- * of those entries is frozen — the check is inside the transaction, under the
- * shared lock, because a period can be locked between reading the rows and
- * deleting them.
+ * Aborting is the only safe answer: the new row has NOT been validated against
+ * the locked periods, and deleting it anyway is exactly the silent destruction
+ * this module exists to prevent. The caller retries, and the second pass sees
+ * the row properly.
  */
+export class ConcurrentTimeEntryError extends Error {
+    constructor(count: number) {
+        super(
+            `${count} time ${count === 1 ? "entry" : "entries"} were created while this delete was running. Nothing was deleted — try again.`
+        );
+        this.name = "ConcurrentTimeEntryError";
+    }
+}
+
+export function isConcurrentTimeEntryError(error: unknown): error is ConcurrentTimeEntryError {
+    return error instanceof Error && error.name === "ConcurrentTimeEntryError";
+}
+
+export type ParentDeleteDeps = {
+    /** Injected in tests so both the locked and the raced branch can be driven directly. */
+    runTransaction?: <T>(fn: (tx: PayrollTxClient) => Promise<T>) => Promise<T>;
+};
+
+/**
+ * Remove several parents' time entries and then the parents, atomically.
+ *
+ * ONE transaction for the whole set: every parent is checked before any parent
+ * is deleted, so a single locked period rolls the entire batch back rather than
+ * leaving half a list deleted and the caller told it succeeded.
+ *
+ * Throws PeriodLockedError (mapped to 423 PERIOD_LOCKED where a status code is
+ * available) if any entry is frozen, and ConcurrentTimeEntryError if a new
+ * entry appears mid-delete.
+ */
+export async function deleteParentsWithTimeEntries(
+    parents: TimeEntryParent[],
+    deleteParentRows: (tx: PayrollTxClient) => Promise<void>,
+    deps: ParentDeleteDeps = {}
+): Promise<{ deletedEntries: number }> {
+    const scopes = parents.map(scopeOf);
+    const runTransaction =
+        deps.runTransaction ?? (<T,>(fn: (tx: PayrollTxClient) => Promise<T>) => prisma.$transaction(fn as never) as Promise<T>);
+
+    return runTransaction(async (tx) => {
+        const client = tx as unknown as typeof prisma;
+
+        // 1. The shared payroll lock, ALWAYS and FIRST — before anything is even
+        //    read. Deferring it to the guard meant a parent that happened to
+        //    have no entries took no lock, so a clock-in could land between the
+        //    look and the delete with nothing serializing the two.
+        await acquirePayrollWriteLock(tx);
+
+        // 2. Discovery, now that the lock is held. Everything below is checked
+        //    against THIS set; nothing outside it is ever deleted.
+        const discovered: DiscoveredEntry[] = scopes.length
+            ? await client.timeEntry.findMany({
+                  where: { OR: scopes as never },
+                  select: { id: true, userId: true, startTime: true },
+              })
+            : [];
+
+        const entryIds = [...new Set(discovered.map((entry) => entry.id))].sort();
+        // Qualified keys — the same `wa-breaks:<user>:<day>` form settlement
+        // uses. A bare day key hashes to a DIFFERENT advisory lock, which would
+        // leave this delete and a concurrent settlement holding two different
+        // locks and believing they were serialized.
+        const dayKeys = [
+            ...new Set(discovered.map((entry) => dayLockKey(entry.userId, toCompanyDayKey(entry.startTime)))),
+        ].sort();
+
+        // 3. Day locks, then FOR UPDATE on the discovered rows, then the
+        //    locked-period check against their STORED startTimes. Throws
+        //    PeriodLockedError, which aborts the whole transaction.
+        await assertEntriesUnlockedInTx(tx, entryIds, { dayKeys });
+
+        // 4. Delete by the CHECKED id set. Scoping this by the parent instead
+        //    would sweep up any row that appeared since discovery — a row no
+        //    locked-period check has ever seen.
+        const removed = entryIds.length
+            ? await client.timeEntry.deleteMany({ where: { id: { in: entryIds } } })
+            : { count: 0 };
+
+        // 5. Anything left under these parents appeared while we were working.
+        //    It is unchecked, so it is not ours to delete: abort and let the
+        //    caller retry, rather than destroying it or failing later on an
+        //    opaque foreign-key error.
+        const leftover = scopes.length
+            ? await client.timeEntry.count({ where: { OR: scopes as never } })
+            : 0;
+        if (leftover > 0) throw new ConcurrentTimeEntryError(leftover);
+
+        await deleteParentRows(tx);
+        return { deletedEntries: removed.count };
+    });
+}
+
+/** One parent. Same guarantees — this is the shape the users route needs. */
 export async function deleteParentWithTimeEntries(
     parent: TimeEntryParent,
     deleteParentRow: (tx: PayrollTxClient) => Promise<void>,
-    /**
-     * Injected in tests. The LOCKED branch throws out of withPayrollWriteTx, so
-     * exercising it for real needs a database with a locked period in it; these
-     * two seams let both branches be driven directly.
-     */
-    deps: {
-        readEntries?: (where: object) => Promise<Array<{ id: string; userId: string; startTime: Date }>>;
-        runWrite?: typeof withPayrollWriteTx;
-    } = {}
+    deps: ParentDeleteDeps = {}
 ): Promise<{ deletedEntries: number }> {
-    const where = "userId" in parent ? { userId: parent.userId } : { projectId: parent.projectId };
-    const readEntries =
-        deps.readEntries ??
-        ((scope: object) =>
-            prisma.timeEntry.findMany({ where: scope as never, select: { id: true, userId: true, startTime: true } }));
-    const runWrite = deps.runWrite ?? withPayrollWriteTx;
-
-    // Read the ids and days OUTSIDE the transaction only to build the lock
-    // target — the values are not trusted. withPayrollWriteTx re-reads every
-    // row FOR UPDATE and validates its STORED startTime against the locked
-    // periods, so a row moved in between is judged on where it actually is.
-    const entries = await readEntries(where);
-
-    const entryIds = entries.map((entry) => entry.id);
-    // Qualified keys — the same `wa-breaks:<user>:<day>` form settlement uses.
-    // A bare day key hashes to a DIFFERENT advisory lock, which would leave this
-    // delete and a concurrent settlement holding two different locks and
-    // believing they were serialized.
-    const dayKeys = [
-        ...new Set(entries.map((entry) => dayLockKey(entry.userId, toCompanyDayKey(entry.startTime)))),
-    ].sort();
-
-    return runWrite({ entryIds, dayKeys }, async (tx) => {
-        const client = tx as unknown as typeof prisma;
-        // Scoped by the PARENT, not by the id list: an entry created after the
-        // read above would otherwise survive and block the parent delete with a
-        // foreign-key error that names nothing useful.
-        const removed = await client.timeEntry.deleteMany({ where });
-        await deleteParentRow(tx);
-        return { deletedEntries: removed.count };
-    });
+    return deleteParentsWithTimeEntries([parent], deleteParentRow, deps);
 }

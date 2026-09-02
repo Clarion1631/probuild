@@ -208,7 +208,10 @@ test("open, flagged, zero-hour and unsettled-meal entries all block; outside the
         // Same workweek, before the period — fetched for the 40h threshold only.
         entry({ userId: alice.id, id: "outside", startTime: at8am("2026-08-14"), durationHours: 8, needsReview: true }),
     ];
-    const blocking = blockingEntries(entries, [alice], PERIOD_START, PERIOD_END);
+    // Alice HAS in-period hours, so her out-of-period context row is judged as
+    // it always was (it is excluded here by the envelope argument, which this
+    // call deliberately passes as the period).
+    const blocking = blockingEntries(entries, [alice], PERIOD_START, PERIOD_END, PERIOD_START, PERIOD_END);
     assert.deepEqual(
         blocking.map((row) => [row.id, row.reason]),
         [
@@ -748,4 +751,68 @@ test("a detail row's paid hours equal its own regular + overtime, always", async
     // And the column still totals the employee's paid hours.
     const paid = result.detail.reduce((sum, row) => sum + toHundredths(row.paidHours), 0);
     assert.equal(paid, toHundredths(totalsFor(alice.id, result).totalHours));
+});
+
+// ── Context rows outside the period (review round 17, item 2) ───────────────
+
+/**
+ * The envelope reaches back to the start of the workweek so the OT split inside
+ * the period is computed against the hours that already pushed that week toward
+ * 40. Those extra days are CONTEXT, not payable rows.
+ */
+const ENVELOPE_START = new Date("2026-08-10T07:00:00.000Z"); // Mon of the week PERIOD_START falls in
+const CONTEXT_DAY = at8am("2026-08-14"); // inside the envelope, before the period
+
+test("a FORMER employee's context row does not block a period they have no hours in", () => {
+    // Dana left. Her last shift was flagged and never resolved, and it sits in
+    // the workweek tail the envelope pulls in. She has nobody left to fix it and
+    // no hours in this run to be wrong about — blocking on it froze the payroll
+    // export permanently.
+    const entries = [
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: dana.id, id: "dana-context", startTime: CONTEXT_DAY, durationHours: 8, needsReview: true }),
+    ];
+    const blocking = blockingEntries(entries, [alice, dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => row.id), []);
+});
+
+test("the same is true of an unsettled DEFERRED meal on a context row", () => {
+    const entries = [
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+        entry({ userId: dana.id, id: "dana-deferred", startTime: CONTEXT_DAY, durationHours: 8, mealOutcome: "DEFERRED" }),
+    ];
+    const blocking = blockingEntries(entries, [alice, dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => row.id), []);
+});
+
+test("but the moment that person HAS in-period hours, their context row blocks again", () => {
+    // Now Dana's context row can change a number in this file: the OT split for
+    // that week is built from both rows. It is a real blocker again.
+    const entries = [
+        entry({ userId: dana.id, id: "dana-context", startTime: CONTEXT_DAY, durationHours: 8, needsReview: true }),
+        entry({ userId: dana.id, id: "dana-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+    ];
+    const blocking = blockingEntries(entries, [dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["dana-context", "needsReview"]]);
+});
+
+test("an IN-PERIOD row of somebody with no other hours still blocks", () => {
+    // The exemption is about being outside the period, never about being a
+    // lightly-used account — otherwise one flagged shift would export unnoticed.
+    const entries = [
+        entry({ userId: dana.id, id: "dana-only", startTime: at8am("2026-08-18"), durationHours: 8, needsReview: true }),
+    ];
+    const blocking = blockingEntries(entries, [dana], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["dana-only", "needsReview"]]);
+});
+
+test("an OPEN context punch of a current worker with in-period hours still blocks", () => {
+    // Somebody still on the clock from before the period: their hours are not
+    // final, and they ARE being paid this run.
+    const entries = [
+        entry({ userId: alice.id, id: "alice-open-context", startTime: CONTEXT_DAY, durationHours: 0, endTime: null }),
+        entry({ userId: alice.id, id: "alice-in", startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" }),
+    ];
+    const blocking = blockingEntries(entries, [alice], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
+    assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["alice-open-context", "open"]]);
 });

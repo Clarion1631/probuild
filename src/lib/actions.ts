@@ -8647,19 +8647,25 @@ export async function resetProjectPercentCompleteToAuto(projectId: string) {
 
 export async function deleteProjects(projectIds: string[]) {
     await assertActiveStaff();
-    const { deleteParentWithTimeEntries } = await import("./payroll-parent-delete");
-    // One project at a time, each atomic with its own time entries. A single
-    // deleteMany used to CASCADE every punch on every job in the list into
-    // nothing — locked, exported, paid hours included — and report success.
+    const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
+    // ONE transaction for the whole selection: every project is checked before
+    // any project is deleted. Looping per project left the caller half-deleted
+    // when the third job in the list turned out to be locked — the first two
+    // were already gone and there was nothing to undo them with.
     //
-    // A locked period throws PeriodLockedError out of here. Server actions have
-    // no status code, so the caller sees its message; the API surface that CAN
-    // answer 423 is DELETE /api/users/[id].
-    for (const projectId of projectIds) {
-        await deleteParentWithTimeEntries({ projectId }, async (tx) => {
-            await (tx as unknown as typeof prisma).project.delete({ where: { id: projectId } });
-        });
-    }
+    // A single deleteMany, which is what this used to be, was worse still: it
+    // CASCADEd every punch on every job in the list into nothing — locked,
+    // exported, paid hours included — and reported success.
+    //
+    // A locked period throws PeriodLockedError out of here and rolls the batch
+    // back. Server actions have no status code, so the caller sees its message;
+    // the API surface that CAN answer 423 is DELETE /api/users/[id].
+    await deleteParentsWithTimeEntries(
+        projectIds.map((projectId) => ({ projectId })),
+        async (tx) => {
+            await (tx as unknown as typeof prisma).project.deleteMany({ where: { id: { in: projectIds } } });
+        }
+    );
     revalidatePath(`/projects`);
     return { success: true };
 }

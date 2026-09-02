@@ -244,6 +244,54 @@ try {
     console.log(`TimeEntry parent FKs still cascading: ${cascading.length} (expected 0)`);
     if (cascading.length !== 0) process.exit(1);
 
+    // ----------------------------------------------------------------------
+    // A wrong-range period is DISCARDED, not deleted (review round 16, item 6).
+    // Unlocking leaves the row behind and every overlap check then refuses the
+    // corrected range forever, so there was no way back from a typo.
+    //
+    // These three columns, the index and the CHECK shipped in the migration but
+    // NOT here for one commit — a prod run of this script would have left the
+    // discard action writing to columns that did not exist. tests/
+    // payroll-apply-script-parity.test.ts now fails the build if the two files
+    // ever diverge again.
+    // ----------------------------------------------------------------------
+    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedAt" TIMESTAMPTZ(6)`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedById" TEXT`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "discardedReason" TEXT`);
+    await prisma.$executeRawUnsafe(
+        `CREATE INDEX IF NOT EXISTS "PayrollPeriod_discardedAt_idx" ON "PayrollPeriod"("discardedAt")`
+    );
+    // A LOCKED period is never discarded: that would retire hours already
+    // exported and paid, and every reader would stop seeing the freeze that
+    // protects them. VALIDATE, not NOT VALID — an unvalidated constraint is not
+    // enforced for existing rows, so prod would disagree with CI's replay.
+    await prisma.$executeRawUnsafe(
+        `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_discard_unlocked"`
+    );
+    await prisma.$executeRawUnsafe(
+        `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_discard_unlocked"
+            CHECK ("discardedAt" IS NULL OR "lockedAt" IS NULL) NOT VALID`
+    );
+    await prisma.$executeRawUnsafe(
+        `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
+    );
+
+    const discardBits = await prisma.$queryRawUnsafe(
+        `SELECT column_name AS name FROM information_schema.columns
+          WHERE table_name = 'PayrollPeriod'
+            AND column_name IN ('discardedAt', 'discardedById', 'discardedReason')
+         UNION ALL
+         SELECT indexname FROM pg_indexes
+          WHERE tablename = 'PayrollPeriod' AND indexname = 'PayrollPeriod_discardedAt_idx'
+         UNION ALL
+         SELECT conname FROM pg_constraint
+          WHERE conrelid = '"PayrollPeriod"'::regclass
+            AND conname = 'PayrollPeriod_discard_unlocked'
+            AND convalidated`
+    );
+    console.log(`verified ${discardBits.length}/5 discard columns, index and validated CHECK`);
+    if (discardBits.length !== 5) process.exit(1);
+
     const cols = await prisma.$queryRawUnsafe(
         `SELECT table_name, column_name FROM information_schema.columns
          WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))
