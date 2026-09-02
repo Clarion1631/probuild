@@ -371,17 +371,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.needsReview = true;
     }
 
-    // Runs after the meal/rest notices so it composes onto their reason.
-    if (zeroRate) {
-        Object.assign(data, appendZeroRateReview(data.reviewReason ?? existing.reviewReason));
-    }
+    // NO zero-rate flag here, deliberately. `zeroRate` above was decided from an
+    // UNLOCKED read taken before the transaction; it is a cheap fail-fast, not a
+    // fact. Writing the flag from it produced a "$0 pay rate" warning on entries
+    // whose rate had since been fixed, and missed entries whose rate had since
+    // been zeroed. The flag is decided from the LOCKED read inside the
+    // transaction instead (see liveZeroRate below).
 
-    // Capture the as-clocked values exactly once. Subsequent edits update the latest
-    // times but never overwrite the original snapshot.
-    if (!existing.isEdited) {
-        data.originalStartTime = existing.startTime;
-        data.originalEndTime = existing.endTime;
-    }
+    // The as-clocked snapshot is captured INSIDE the transaction, from the
+    // locked row -- see `stored.isEdited` below.
 
     if (isPrivileged && !isOwner) {
         data.editedByManagerId = user.id;
@@ -431,7 +429,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // the moment a concurrent writer moves the punch, and the days
                 // locked above were derived from it.
                 const [stored] = (await client.$queryRawUnsafe(
-                    `SELECT "userId", "projectId", "startTime", "endTime", "updatedAt"
+                    `SELECT "userId", "projectId", "startTime", "endTime", "updatedAt",
+                            "mealOutcome", "mealSkipStatus", "reviewReason", "needsReview", "isEdited"
                        FROM "TimeEntry" WHERE "id" = $1`,
                     id
                 )) as Array<{
@@ -440,8 +439,29 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     startTime: Date;
                     endTime: Date | null;
                     updatedAt: Date;
+                    mealOutcome: string | null;
+                    mealSkipStatus: string | null;
+                    reviewReason: string | null;
+                    needsReview: boolean;
+                    isEdited: boolean;
                 }>;
                 if (!stored) throw new EntryMovedError();
+
+                // THE OPTIMISTIC LOCK, checked against the row this request was
+                // COMPUTED FROM. Every state-dependent field above -- the end
+                // time, the meal settlement, the review notices, the original-
+                // values snapshot -- was derived from `existing`, read before this
+                // transaction existed. Asserting the locked row still carries the
+                // same updatedAt is what makes all of that sound: from here on,
+                // `existing` and `stored` describe the same row state.
+                //
+                // Comparing against `stored.updatedAt` instead (which the CAS in
+                // the write below used to do) proves nothing at all: the row is
+                // held FOR UPDATE, so a value re-read inside the transaction can
+                // never differ from itself.
+                if (stored.updatedAt.getTime() !== existing.updatedAt.getTime()) {
+                    throw new EntryMovedError();
+                }
 
                 // WHO OWNS IT NOW. Everything above — the authorization, the
                 // period check, the pricing target, the day locks — was decided
@@ -464,22 +484,41 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // this edit would price the shift from the stale value.
                 const liveOwner = await readOwnerRatesForUpdate(client as never, stored.userId, toNum);
                 if (liveOwner && newEnd != null) {
-                    if (
-                        zeroRateBlocks({
-                            role: liveOwner.role,
-                            email: liveOwner.email,
-                            payType: liveOwner.payType,
-                            hourlyRate: liveOwner.hourlyRate,
-                        }) &&
-                        !acknowledgedZeroRate
-                    ) {
-                        throw new ZeroRateAtWriteError();
-                    }
+                    // THE ONLY zero-rate decision that writes anything. The
+                    // pre-transaction check is a fail-fast; this one is the fact,
+                    // because the owner row is held FOR UPDATE from here until
+                    // commit and no rate import can move it underneath us.
+                    const liveZeroRate = zeroRateBlocks({
+                        role: liveOwner.role,
+                        email: liveOwner.email,
+                        payType: liveOwner.payType,
+                        hourlyRate: liveOwner.hourlyRate,
+                    });
+                    if (liveZeroRate && !acknowledgedZeroRate) throw new ZeroRateAtWriteError();
+
                     // Re-price from the LOCKED read: the costs computed above
                     // came from a copy taken before this transaction opened.
                     data.laborCost = (durationHours ?? 0) * liveOwner.hourlyRate;
                     data.burdenCost = (durationHours ?? 0) * liveOwner.burdenRate;
+
+                    // Flagged from the LOCKED rate, composed onto whatever the
+                    // meal/rest notices already wrote. A rate fixed since the
+                    // pre-read produces NO warning; a rate zeroed since it does.
+                    if (liveZeroRate) {
+                        Object.assign(
+                            data,
+                            appendZeroRateReview((data.reviewReason as string | undefined) ?? stored.reviewReason)
+                        );
+                    }
                 }
+                // The as-clocked snapshot, from the LOCKED row. Identical to
+                // `existing` by the updatedAt assertion above; read from `stored`
+                // so the source of truth inside the transaction is the locked row.
+                if (!stored.isEdited) {
+                    data.originalStartTime = stored.startTime;
+                    data.originalEndTime = stored.endTime;
+                }
+
                 if (stored.startTime.getTime() !== existing.startTime.getTime()) {
                     // It moved days. The day locks we hold are for the old day,
                     // so we cannot safely settle — refuse and let the client
@@ -493,8 +532,13 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // recomputed duration and cost from a copy read before any of
                 // that. updatedAt moves on every write, so it is the one value
                 // that catches all of them.
+                // CAS on the updatedAt this request was COMPUTED FROM, not on
+                // the one just re-read under the lock. The latter is a tautology
+                // -- the row cannot change while we hold it -- so it detected
+                // nothing. This is the value that makes the write conditional on
+                // the world not having moved.
                 const claim = await client.timeEntry.updateMany({
-                    where: { id, updatedAt: stored.updatedAt },
+                    where: { id, updatedAt: existing.updatedAt },
                     data,
                 });
                 if (claim.count !== 1) throw new EntryMovedError();

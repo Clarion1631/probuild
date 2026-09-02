@@ -301,7 +301,7 @@ test("a resume asks GitHub before filing, using the submission marker", () => {
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
         "utf8"
     );
-    assert.match(route, /reserved\.resume \? await findIssueByMarker\(marker\) : null/);
+    assert.match(route, /reserved\.resume \? await findIssueByMarker\(marker, deadline\) : null/);
     assert.match(route, /alreadyFiled \?\?/, "only file when the search found nothing");
     // The marker goes INTO the body, or the search could never find it.
     assert.match(route, /metadata: \[[\s\S]{0,200}marker,/);
@@ -322,7 +322,7 @@ test("BOTH help routes reconcile with the provider before filing", () => {
             "utf8"
         );
         assert.match(source, /const marker = submissionMarker\(requestId\);/, route);
-        assert.match(source, /reserved\.resume \? await findIssueByMarker\(marker\) : null/, route);
+        assert.match(source, /reserved\.resume \? await findIssueByMarker\(marker, deadline\) : null/, route);
         assert.match(source, /alreadyFiled \?\?/, route);
         assert.match(source, /marker,/, `${route} must put the marker in the issue body`);
         // providerState / providerIssueRef are written by completeUnderLease now.

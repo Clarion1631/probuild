@@ -205,7 +205,7 @@ export type ReserveResult =
     | { ok: false; reason: "in-flight" };
 
 /** How long a provider lease is honoured before another attempt may take it. */
-export const HELP_LEASE_MS = 2 * 60 * 1000;
+export const HELP_LEASE_MS = 4 * 60 * 1000;
 
 /**
  * Claim the right to call GitHub for this report, atomically.
@@ -242,11 +242,52 @@ export async function claimProviderLease(
 }
 
 /**
- * The provider call must finish INSIDE the lease, with room to spare — a call
- * that outlives its own lease is exactly the overlap the fence exists to catch,
- * and one that is merely aborted leaves nothing to reconcile.
+ * Budget for ONE provider call.
+ *
+ * A resumed submission makes TWO: the marker search, then the create. Giving
+ * each its own fresh 90s timeout meant the pair could run for 180s against a
+ * 120s lease — the attempt outlived the lease it was fenced by, a second
+ * claimant took over, and the first came back to write a result nobody wanted.
  */
 export const HELP_PROVIDER_TIMEOUT_MS = 90 * 1000;
+
+/**
+ * Budget for the WHOLE provider interaction, as ONE absolute deadline shared by
+ * every call in the attempt. 2 x 90s, so a slow search cannot eat the create's
+ * time and still leave the pair inside it.
+ *
+ * Must stay comfortably under HELP_LEASE_MS: the lease is 240s, this is 180s,
+ * and the 60s margin covers the DB round-trips around the calls plus the lease
+ * renewal between them.
+ */
+export const HELP_PROVIDER_DEADLINE_MS = 2 * HELP_PROVIDER_TIMEOUT_MS;
+
+/** One deadline for the attempt. Both provider calls share it. */
+export function providerDeadlineSignal(): AbortSignal {
+    return AbortSignal.timeout(HELP_PROVIDER_DEADLINE_MS);
+}
+
+/**
+ * Push this attempt's lease out, but only while it still holds it.
+ *
+ * Called between the two provider calls: the marker search may have used most
+ * of the deadline, and the create still has to happen inside the lease. Fenced
+ * on the token for the same reason the completion is — a superseded attempt
+ * must not be able to extend a lease it no longer owns.
+ */
+export async function renewProviderLease(
+    requestId: string,
+    leaseToken: string,
+    client: { $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<number> } = prisma as never
+): Promise<boolean> {
+    const expiry = new Date(Date.now() + HELP_LEASE_MS);
+    const renewed = await client.$executeRaw`
+        UPDATE "HelpRequest"
+        SET "providerLeaseExpiresAt" = ${expiry}
+        WHERE "id" = ${requestId} AND "providerLeaseToken" = ${leaseToken}
+    `;
+    return renewed === 1;
+}
 
 /**
  * Finish a submission, but only while this attempt still holds the lease.

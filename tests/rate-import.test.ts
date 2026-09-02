@@ -299,15 +299,19 @@ test("the preview fingerprint covers the OLD rate, so a stale approval is refuse
 
 // ── Config defaults (labelled in payroll-config.ts as pending Justin) ───────
 
-test("CJ and Richard are the default salaried list, matched case-insensitively", () => {
-    assert.deepEqual(DEFAULT_SALARIED_EMAILS, [
-        "cj@goldentouchremodeling.com",
-        "rlord@goldentouchremodeling.com",
-    ]);
-    assert.equal(isSalariedEmail("CJ@GoldenTouchRemodeling.com"), true);
+test("there is NO default salaried list — unset env means nobody is exempt", () => {
+    // Reversed in review round 21. The list used to default to two named
+    // employees, which is the code deciding on nobody's authority that two
+    // specific humans are salaried. That guess fails OPEN in the direction that
+    // loses money for the worker: if either had actually been hourly, their
+    // hours would have been silently dropped from the summary csv.
+    assert.deepEqual(DEFAULT_SALARIED_EMAILS, []);
+    assert.equal(isSalariedEmail("CJ@GoldenTouchRemodeling.com"), false);
     assert.equal(isSalariedEmail("tim@example.com"), false);
     assert.equal(isSalariedEmail(null), false);
-    // An env value REPLACES the default list rather than extending it.
+    // An explicit list still works, and still matches case-insensitively.
+    assert.equal(isSalariedEmail("CJ@GoldenTouchRemodeling.com", ["cj@goldentouchremodeling.com"]), true);
+    // And it REPLACES rather than extends — there is nothing left to extend.
     assert.equal(isSalariedEmail("cj@goldentouchremodeling.com", ["someone@else.com"]), false);
 });
 

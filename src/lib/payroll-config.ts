@@ -31,15 +31,21 @@ export const DEFAULT_PAYROLL_PERIOD: PayrollPeriodLength = "biweekly";
 /** DEFAULT pending Justin — see section 7 risk 2 of the Phase 5 spec. */
 export const DEFAULT_PAYROLL_WEEK_START: PayrollWeekStart = "monday";
 /**
- * DEFAULT pending Justin — see section 7 risk 3 of the Phase 5 spec. CJ ($92k)
- * and Richard ($80k) punch the clock for job costing but are paid a salary in
- * Gusto, so their hours must not reach the SUMMARY csv (Gusto would pay them
- * twice). The DETAIL csv keeps them, because job costing still needs the hours.
+ * NOBODY, unless an operator says so.
+ *
+ * A salaried person's hours must not reach the SUMMARY csv (Gusto pays them a
+ * salary AND would pay the exported hours). This list used to default to two
+ * named employees, which meant the code decided, on nobody's authority, that
+ * two specific humans were salaried.
+ *
+ * That guess fails OPEN in the direction that loses money for the worker: if
+ * either had actually been hourly, their hours would have been silently dropped
+ * from the pay run. An empty default fails CLOSED instead — nobody is exempt,
+ * everybody's hours are exported, and a genuinely salaried person is excluded
+ * only once PAYROLL_SALARIED_EMAILS names them. The payType column is the
+ * durable answer; this env var is the override.
  */
-export const DEFAULT_SALARIED_EMAILS = [
-    "cj@goldentouchremodeling.com",
-    "rlord@goldentouchremodeling.com",
-];
+export const DEFAULT_SALARIED_EMAILS: string[] = [];
 
 /**
  * Anchor day the repeating period grid is measured from. 2026-01-05 is a
@@ -70,7 +76,13 @@ export function payrollWeekStart(): PayrollWeekStart {
     return raw === "monday" || raw === "sunday" ? raw : DEFAULT_PAYROLL_WEEK_START;
 }
 
-/** Lowercased salaried-employee emails. An env value REPLACES the default list; it does not extend it. */
+/**
+ * Lowercased salaried-employee emails, from PAYROLL_SALARIED_EMAILS only.
+ *
+ * Unset means an EMPTY set — nobody is exempt from the summary csv. There is no
+ * hardcoded fallback: see DEFAULT_SALARIED_EMAILS for why guessing here fails in
+ * the direction that silently underpays somebody.
+ */
 export function salariedEmails(): string[] {
     const raw = readEnv("PAYROLL_SALARIED_EMAILS");
     const list = raw ? raw.split(",") : DEFAULT_SALARIED_EMAILS;

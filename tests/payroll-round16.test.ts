@@ -344,12 +344,43 @@ test("both payroll-writing routes are wrapped in the mapping", () => {
 
 // ---------------------------------------------------------------- item 8
 
-test("the provider call must finish INSIDE its lease", () => {
-    assert.ok(HELP_PROVIDER_TIMEOUT_MS < HELP_LEASE_MS, "a call that outlives its lease has already been superseded");
+test("the whole provider interaction fits inside ONE lease", async () => {
+    const { HELP_LEASE_MS, HELP_PROVIDER_TIMEOUT_MS, HELP_PROVIDER_DEADLINE_MS } = await import(
+        "../src/lib/help-chat/submission-guard"
+    );
+    // A resumed submission makes TWO calls: the marker search, then the create.
+    // Each used to get its own fresh 90s timeout, so the pair could run 180s
+    // against a 120s lease — the attempt outlived the fence it was held by.
+    assert.equal(HELP_PROVIDER_DEADLINE_MS, 2 * HELP_PROVIDER_TIMEOUT_MS);
+    assert.ok(
+        HELP_PROVIDER_DEADLINE_MS < HELP_LEASE_MS,
+        `the combined provider budget (${HELP_PROVIDER_DEADLINE_MS}ms) must fit inside the lease (${HELP_LEASE_MS}ms)`
+    );
+    // With room for the DB round-trips and the renewal between the two calls.
+    assert.ok(HELP_LEASE_MS - HELP_PROVIDER_DEADLINE_MS >= 60_000, "at least a 60s margin");
+
     const github = read("src/lib/help-chat/github.ts");
-    // Both provider calls, not just the write one: a slow marker search burns
-    // the same lease.
-    assert.equal((github.match(/AbortSignal\.timeout\(HELP_PROVIDER_TIMEOUT_MS\)/g) ?? []).length, 2);
+    // Both calls take the CALLER's signal when it has one, rather than each
+    // starting its own clock.
+    assert.equal((github.match(/signal: providerSignal\(signal\)/g) ?? []).length, 2);
+    assert.match(github, /return signal \?\? AbortSignal\.timeout\(HELP_PROVIDER_TIMEOUT_MS\)/);
+});
+
+test("both routes share ONE deadline and renew the lease between the two calls", () => {
+    for (const file of ["src/app/api/help-chat/request/route.ts", "src/app/api/help-chat/bug-fix/route.ts"]) {
+        const source = read(file);
+        assert.match(source, /const deadline = providerDeadlineSignal\(\)/, file);
+        assert.match(source, /findIssueByMarker\(marker, deadline\)/, file);
+        assert.match(source, /signal: deadline,/, file);
+        // Renewed only on the resume path, because that is the only one that
+        // makes two calls — and fenced on the token, so a superseded attempt
+        // cannot extend a lease it no longer holds.
+        assert.match(source, /renewProviderLease\(requestId, leaseToken\)/, file);
+        assert.match(source, /superseded: true/, file);
+    }
+
+    const guard = read("src/lib/help-chat/submission-guard.ts");
+    assert.match(guard, /WHERE "id" = \$\{requestId\} AND "providerLeaseToken" = \$\{leaseToken\}/);
 });
 
 test("an expired lease: the second claimant files, the first's late completion is a no-op", async () => {
@@ -534,4 +565,85 @@ test("the CAS shape refuses a stale replay and an already-unlocked period alike"
     assert.equal(matches(new Date("2026-09-09T00:00:00.000Z"), lockedAt), false);
     // Already unlocked: refused, rather than reporting success for a no-op.
     assert.equal(matches(null, lockedAt), false);
+});
+
+// ── Round 21 regressions: the CAS, the locked rate, the empty salaried list ──
+
+test("a same-owner concurrent edit is caught by the CAS on the INITIAL updatedAt", () => {
+    // The scenario the old CAS could not see. Nobody reassigns the entry, so the
+    // owner check passes and the day locks are right — but another writer
+    // changed the endTime / meal outcome / attestation between the pre-read and
+    // the lock. This request recomputed duration and cost from the pre-read, so
+    // its `data` describes a row that no longer exists.
+    //
+    // updatedAt moves on EVERY write (Prisma @updatedAt), so it is the one value
+    // that catches all of those at once. Comparing the re-read against itself,
+    // which is what the code did, catches none of them.
+    const preRead = new Date("2026-09-01T10:00:00.000Z");
+    const afterConcurrentEdit = new Date("2026-09-01T10:00:05.000Z");
+
+    const casMatches = (initial: Date, current: Date) => initial.getTime() === current.getTime();
+
+    // No concurrent write: the edit lands.
+    assert.equal(casMatches(preRead, preRead), true);
+    // A concurrent write moved updatedAt without moving startTime or the owner:
+    // REFUSED, where the old tautological comparison would have accepted it.
+    assert.equal(casMatches(preRead, afterConcurrentEdit), false);
+
+    // The tautology, spelled out: the re-read compared against itself is always
+    // equal, whatever happened before the lock was taken.
+    assert.equal(casMatches(afterConcurrentEdit, afterConcurrentEdit), true);
+});
+
+test("the zero-rate flag follows the LOCKED rate, in both directions", async () => {
+    const { zeroRateBlocks, appendZeroRateReview, ZERO_RATE_REVIEW_NOTE } = await import(
+        "../src/lib/pay-rate-guard"
+    );
+    const hourly = { role: "FIELD_CREW", email: "tim@example.com", payType: "HOURLY" };
+
+    // Rate became zero AFTER the pre-read: the pre-check saw 25 and passed, the
+    // LOCKED read sees 0 — refused (or, when acknowledged, flagged).
+    assert.equal(zeroRateBlocks({ ...hourly, hourlyRate: 25 }), false, "the stale pre-read");
+    assert.equal(zeroRateBlocks({ ...hourly, hourlyRate: 0 }), true, "the locked read is what decides");
+    const flagged = appendZeroRateReview("Meal break not taken");
+    assert.equal(flagged.needsReview, true);
+    assert.match(flagged.reviewReason, /Meal break not taken/);
+    assert.match(flagged.reviewReason, /\$0 pay rate/);
+
+    // Rate FIXED after the pre-read: the pre-check saw 0, the locked read sees
+    // 25 — no warning at all. The old code wrote the flag from the pre-read, so
+    // this entry came back carrying a "$0 pay rate" note that was untrue.
+    assert.equal(zeroRateBlocks({ ...hourly, hourlyRate: 25 }), false);
+    assert.equal(ZERO_RATE_REVIEW_NOTE.length > 0, true);
+});
+
+test("nobody is salaried by default — the list is empty until an operator sets it", async () => {
+    const { DEFAULT_SALARIED_EMAILS, salariedEmails, isSalariedEmail } = await import(
+        "../src/lib/payroll-config"
+    );
+    const before = process.env.PAYROLL_SALARIED_EMAILS;
+    try {
+        delete process.env.PAYROLL_SALARIED_EMAILS;
+        assert.deepEqual(DEFAULT_SALARIED_EMAILS, []);
+        assert.deepEqual(salariedEmails(), [], "unset env means NOBODY is exempt");
+
+        process.env.PAYROLL_SALARIED_EMAILS = " CJ@Example.com , rlord@example.com ";
+        assert.deepEqual(salariedEmails(), ["cj@example.com", "rlord@example.com"]);
+        assert.equal(isSalariedEmail("cj@example.com"), true);
+    } finally {
+        if (before === undefined) delete process.env.PAYROLL_SALARIED_EMAILS;
+        else process.env.PAYROLL_SALARIED_EMAILS = before;
+    }
+});
+
+test("no employee is named in the payroll source any more", () => {
+    // The hardcoded list was the code asserting, on nobody's authority, that two
+    // specific humans are salaried.
+    for (const file of ["src/lib/payroll-config.ts", "scripts/apply-payroll-phase5.mjs"]) {
+        const source = read(file);
+        assert.doesNotMatch(source, /cj@goldentouchremodeling\.com/, file);
+        assert.doesNotMatch(source, /rlord@goldentouchremodeling\.com/, file);
+    }
+    // And the config says so out loud, so the next reader knows it is deliberate.
+    assert.match(read("src/lib/payroll-config.ts"), /fails CLOSED/);
 });

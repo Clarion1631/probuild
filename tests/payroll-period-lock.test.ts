@@ -621,10 +621,29 @@ test("PATCH re-reads the row and compare-and-sets on updatedAt", () => {
     assert.match(patchHalf, /readOwnerRatesForUpdate\(client as never, stored\.userId, toNum\)/);
     assert.match(patchHalf, /settleDayWithinTx\([\s\S]{0,400}?stored\.userId,/);
     assert.match(patchHalf, /stored\.startTime\.getTime\(\) !== existing\.startTime\.getTime\(\)/);
-    // CAS on updatedAt: a concurrent write can change endTime, the meal
-    // outcome or the attestations WITHOUT moving startTime, and this edit
-    // recomputed duration and cost from a copy read before any of that.
-    assert.match(patchHalf, /updateMany\(\{[\s\S]{0,160}updatedAt: stored\.updatedAt/);
+    // CAS on the INITIAL updatedAt — the value this request was COMPUTED FROM.
+    // It used to compare against the copy re-read inside the transaction, which
+    // proves nothing: the row is held FOR UPDATE, so a value re-read under the
+    // lock can never differ from itself. A concurrent write that changed the
+    // endTime, the meal outcome or the attestations sailed straight through.
+    assert.match(patchHalf, /updateMany\(\{[\s\S]{0,240}updatedAt: existing\.updatedAt/);
+    assert.doesNotMatch(patchHalf, /updatedAt: stored\.updatedAt/);
+    // And the same value is asserted early, so the pre-transaction computations
+    // are known to describe the locked row.
+    assert.match(patchHalf, /stored\.updatedAt\.getTime\(\) !== existing\.updatedAt\.getTime\(\)/);
+
+    // State-dependent fields come from the LOCKED row.
+    assert.match(patchHalf, /"mealOutcome", "mealSkipStatus", "reviewReason", "needsReview", "isEdited"/);
+    assert.match(patchHalf, /if \(!stored\.isEdited\) \{/);
+    assert.match(patchHalf, /data\.originalStartTime = stored\.startTime/);
+
+    // The zero-rate FLAG is decided from the locked rate, never the pre-read.
+    assert.match(patchHalf, /const liveZeroRate = zeroRateBlocks\(\{/);
+    assert.match(patchHalf, /if \(liveZeroRate && !acknowledgedZeroRate\) throw new ZeroRateAtWriteError\(\)/);
+    assert.match(patchHalf, /if \(liveZeroRate\) \{[\s\S]{0,200}appendZeroRateReview\(/);
+    // The stale pre-transaction flag write is gone: it warned "$0 pay rate" on
+    // entries whose rate had since been fixed, and missed ones since zeroed.
+    assert.doesNotMatch(patchHalf, /if \(zeroRate\) \{\s*\n\s*Object\.assign/);
     assert.match(patchHalf, /EntryMovedError/);
     assert.match(source, /ENTRY_MOVED_CODE = "ENTRY_MOVED"/);
 });

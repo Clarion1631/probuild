@@ -21,7 +21,6 @@ import { getGustoSettings } from "./integration-store";
 import { workweekStartKey } from "./overtime";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
 import { isSalariedEmail, payrollLockEnvelope, salariedEmails } from "./payroll-config";
-import { HOURLY_PAID_ROLES } from "./pay-rate-guard";
 import {
     buildGustoExport,
     toDetailCsv,
@@ -284,10 +283,19 @@ export async function loadGustoExport(
     const userRows = await client.user.findMany({
         where: {
             OR: [
+                // Known-hourly staff appear as 0.00 summary rows even with no
+                // punches — their pay type is answered, so they cannot block.
                 { status: "ACTIVATED", payType: "HOURLY" },
-                { status: "ACTIVATED", payType: null, role: { in: [...HOURLY_PAID_ROLES] } },
+                // Anyone who actually worked in the period, whatever their
+                // status or pay type.
                 { id: { in: punchedUserIds } },
             ],
+            // The clause that used to sit here pulled in every ACTIVATED
+            // null-payType user in an hourly role, regardless of hours. That is
+            // what let a new hire with no punches block the whole pay run: the
+            // export refused until somebody answered a question about a person
+            // this file says nothing about. Null pay types now reach the roster
+            // only via punchedUserIds.
         },
         select: { id: true, name: true, email: true, payType: true },
         orderBy: { id: "asc" },

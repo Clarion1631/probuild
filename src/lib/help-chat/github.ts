@@ -1,5 +1,15 @@
 import { HELP_PROVIDER_TIMEOUT_MS } from "./submission-guard";
 
+/**
+ * The caller's absolute deadline when it has one, else a fresh per-call budget.
+ *
+ * An attempt that makes two calls passes ONE signal through both, so the pair
+ * shares a single deadline instead of each starting its own clock.
+ */
+function providerSignal(signal?: AbortSignal): AbortSignal {
+    return signal ?? AbortSignal.timeout(HELP_PROVIDER_TIMEOUT_MS);
+}
+
 interface GitHubIssueOptions {
   title: string;
   description: string;
@@ -21,7 +31,8 @@ export async function createHelpChatGitHubIssue({
   labelPrefix,
   labels,
   metadata = [],
-}: GitHubIssueOptions): Promise<GitHubIssueResult | null> {
+  signal,
+}: GitHubIssueOptions & { signal?: AbortSignal }): Promise<GitHubIssueResult | null> {
   const token = process.env.GITHUB_TOKEN;
   const repo = process.env.GITHUB_REPO || "Clarion1631/probuild";
 
@@ -58,7 +69,7 @@ export async function createHelpChatGitHubIssue({
       {
         // Bounded BELOW the provider lease: a call still running when the lease
         // expires has already been superseded by another claimant.
-        signal: AbortSignal.timeout(HELP_PROVIDER_TIMEOUT_MS),
+        signal: providerSignal(signal),
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -104,7 +115,7 @@ export async function createHelpChatGitHubIssue({
  * an annoyance; a lost bug report is the thing this whole path exists to
  * prevent.
  */
-export async function findIssueByMarker(marker: string): Promise<GitHubIssueResult | null> {
+export async function findIssueByMarker(marker: string, signal?: AbortSignal): Promise<GitHubIssueResult | null> {
     const token = process.env.GITHUB_TOKEN;
     const repo = process.env.GITHUB_REPO || "Clarion1631/probuild";
     if (!token) return null;
@@ -114,7 +125,7 @@ export async function findIssueByMarker(marker: string): Promise<GitHubIssueResu
     try {
         const query = encodeURIComponent(`repo:${owner}/${repoName} in:body "${marker}"`);
         const res = await fetch(`https://api.github.com/search/issues?q=${query}&per_page=1`, {
-            signal: AbortSignal.timeout(HELP_PROVIDER_TIMEOUT_MS),
+            signal: providerSignal(signal),
             headers: {
                 Authorization: `Bearer ${token}`,
                 Accept: "application/vnd.github+json",

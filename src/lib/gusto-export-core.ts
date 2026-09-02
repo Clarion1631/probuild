@@ -375,23 +375,30 @@ export function unknownPayTypeBlockers(
         }
     }
 
-    // EVERY user on the roster, not only those with hours. A zero-hour worker is
-    // in the summary csv as a 0.00 row, so the file makes a claim about them —
-    // and whether they belong in it at all depends on their pay type. Checking
-    // only the ones who punched let an unanswered account ship a row that says
-    // "this person worked nothing", when they may be salaried and not belong in
-    // the file, or hourly and genuinely owed nothing. Unknown is unknown.
+    // Only people with HOURS IN THIS PERIOD.
+    //
+    // This reverses an earlier decision here, deliberately. The argument for
+    // checking every roster user was that a zero-hour worker still ships a 0.00
+    // row, so the file makes a claim about them. True — but the cost of that
+    // reading is that hiring somebody on Friday freezes Monday's payroll for
+    // everyone until an admin answers a question about a person with no hours in
+    // the run. A 0.00 row is not a payment, and an unanswered pay type cannot
+    // make it wrong; an unanswered pay type on somebody who WORKED can.
+    //
+    // The pay type is still required before their first real hours reach a pay
+    // run, which is the moment it can actually cost somebody money.
     const blockers: BlockingEntry[] = [];
     for (const user of users) {
         // An UNRECOGNISED value counts as unknown, exactly like null — never as
         // a default.
         if (isKnownPayType(user.payType)) continue;
         const entry = firstEntryFor.get(user.id);
+        if (!entry) continue;
         blockers.push({
-            id: entry?.id ?? `no-pay-type:${user.id}`,
+            id: entry.id,
             userId: user.id,
             userLabel: userLabel(user, user.id),
-            startTime: entry?.startTime ?? periodStart,
+            startTime: entry.startTime,
             reason: "unknownPayType" as const,
         });
     }

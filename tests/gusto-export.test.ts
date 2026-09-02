@@ -237,10 +237,13 @@ test("a worker with no payType blocks the export — guessing is a wrong paycheq
     assert.equal(result.blocking[0].userLabel, "New Hire");
 });
 
-test("a payType-less worker on the roster blocks even with no in-period hours", () => {
-    // This used to pass only people who PUNCHED. A roster member with no hours
-    // still gets a 0.00 row in the summary, so the file asserts something about
-    // them; if nobody has said how they are paid, that assertion is a guess.
+test("a payType-less worker with NO in-period hours does not block", () => {
+    // Reverses an earlier reading here, deliberately (review round 21). The
+    // argument for blocking was that a zero-hour worker still ships a 0.00 row,
+    // so the file asserts something about them. True — but a 0.00 row is not a
+    // payment, and an unanswered pay type cannot make it wrong. The cost of the
+    // old reading was that hiring somebody on Friday froze Monday's payroll for
+    // everyone until an admin answered a question about a person with no hours.
     const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
     const result = buildGustoExport({
         // Same workweek, before the period — fetched for the 40h threshold only.
@@ -250,7 +253,48 @@ test("a payType-less worker on the roster blocks even with no in-period hours", 
         periodEnd: PERIOD_END,
         timeZone: TZ,
     });
+    assert.deepEqual(result.blocking.map((row) => row.reason), []);
+});
+
+test("but the SAME worker blocks the moment they have in-period hours", () => {
+    // The pay type is still required before their first real hours reach a pay
+    // run — the moment it can actually cost somebody money.
+    const unknown: ExportUser = { id: "u-new", name: "New Hire", email: "new@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: unknown.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [unknown],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
     assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+    // And the blocker points at the actual punch, not at the period boundary.
+    assert.equal(result.blocking[0].startTime.getTime(), new Date(at8am("2026-08-18")).getTime());
+});
+
+test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    // An hourly ADMIN or FINANCE user is a real arrangement; keying the roster
+    // off role alone dropped them from the file entirely.
+    assert.match(source, /status: "ACTIVATED", payType: "HOURLY"/);
+    // The role-based null-payType clause is GONE: it pulled in every activated
+    // hourly-role user regardless of hours, which is what let a new hire with no
+    // punches block the whole pay run.
+    assert.doesNotMatch(source, /payType: null, role: \{ in: \[\.\.\.HOURLY_PAID_ROLES\] \}/);
+    // Null pay types reach the roster only by having actually worked.
+    assert.match(source, /id: \{ in: punchedUserIds \}/);
+});
+
+test("a ZERO-HOUR roster member with no payType does NOT block the others' pay run", () => {
+    const unanswered: ExportUser = { id: "u-quiet", name: "Quiet Hire", email: "quiet@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: alice.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [alice, unanswered],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => [row.userId, row.reason]), []);
 });
 
 test("readiness looks at the whole workweek ENVELOPE, not just the period", () => {
@@ -532,34 +576,7 @@ test("an UNRECOGNISED payType is unknown, never a default", () => {
     assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
 });
 
-test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
-    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
-    // An hourly ADMIN or FINANCE user is a real arrangement; keying the roster
-    // off role alone dropped them from the file entirely.
-    assert.match(source, /status: "ACTIVATED", payType: "HOURLY"/);
-    assert.match(source, /status: "ACTIVATED", payType: null, role: \{ in: \[\.\.\.HOURLY_PAID_ROLES\] \}/);
-});
 
-test("a ZERO-HOUR roster member with no payType blocks the export too", () => {
-    // A zero-hour worker still gets a 0.00 row, so the file makes a claim about
-    // them — and whether they belong in it at all depends on their pay type.
-    // Checking only the people who punched let an unanswered account ship a row
-    // saying "worked nothing" when they might be salaried and not belong there.
-    const unanswered: ExportUser = { id: "u-quiet", name: "Quiet Hire", email: "quiet@example.com", payType: null };
-    const result = buildGustoExport({
-        entries: [entry({ userId: alice.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
-        users: [alice, unanswered],
-        periodStart: PERIOD_START,
-        periodEnd: PERIOD_END,
-        timeZone: TZ,
-    });
-    assert.deepEqual(
-        result.blocking.map((row) => [row.userId, row.reason]),
-        [["u-quiet", "unknownPayType"]]
-    );
-    // The blocker still carries a sensible instant even with no entry to hang it on.
-    assert.equal(result.blocking[0].startTime.getTime(), PERIOD_START.getTime());
-});
 
 test("a disabled former employee with only a CONTEXT punch is not on the roster", () => {
     // The wider query exists to get the 40h threshold right. A punch in the

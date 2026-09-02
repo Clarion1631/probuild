@@ -15,6 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { isSalariedEmail } from "../src/lib/payroll-config";
 import {
     appendZeroRateReview,
     isSalariedOwner,
@@ -73,14 +74,30 @@ test("a role nobody has heard of FAILS CLOSED — the allowlist version failed o
     assert.equal(zeroRateBlocks({ hourlyRate: 0 }), true);
 });
 
-test("a SALARIED MANAGER is exempt — CJ and Richard would otherwise never clock out", () => {
-    // They are MANAGERs in ProBuild and salaried in Gusto, so $0 is the CORRECT
-    // hourly rate for them. A role-only rule left them permanently stuck with an
-    // open punch and there is no sweeper that closes one.
-    assert.equal(isSalariedOwner({ role: "MANAGER", email: "cj@goldentouchremodeling.com" }), true);
-    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "CJ@GoldenTouchRemodeling.com", hourlyRate: 0 }), false);
-    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "rlord@goldentouchremodeling.com", hourlyRate: 0 }), false);
-    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "tim@example.com", hourlyRate: 0 }), true);
+test("payType SALARY is what exempts a manager — not their email address", () => {
+    // The email allow-list no longer carries a default (review round 21), so the
+    // DURABLE answer is the payType column. A salaried MANAGER with payType set
+    // is exempt; the same manager with payType still unanswered is BLOCKED,
+    // which is the fail-closed direction: they cannot clock out at $0 until
+    // somebody says how they are paid.
+    assert.equal(isSalariedOwner({ role: "MANAGER", email: "cj@example.com", payType: "SALARY" }), true);
+    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "cj@example.com", payType: "SALARY", hourlyRate: 0 }), false);
+
+    // Unanswered: blocked. This is a deliberate behaviour change — it used to be
+    // waved through by a hardcoded list of two email addresses.
+    assert.equal(isSalariedOwner({ role: "MANAGER", email: "cj@example.com", payType: null }), false);
+    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "cj@example.com", payType: null, hourlyRate: 0 }), true);
+
+    // An explicit env list still exempts, for the window before payType is set.
+    assert.equal(
+        isSalariedEmail("cj@example.com", ["cj@example.com"]),
+        true,
+        "PAYROLL_SALARIED_EMAILS remains the override"
+    );
+
+    // ADMIN and FINANCE stay exempt by role, unchanged.
+    assert.equal(isSalariedOwner({ role: "ADMIN", email: "a@example.com", payType: null }), true);
+    assert.equal(zeroRateBlocks({ role: "FIELD_CREW", email: "tim@example.com", payType: null, hourlyRate: 0 }), true);
 });
 
 function deps(options: {
@@ -226,10 +243,12 @@ test("an ADMIN owner at $0 is exempt and clocks out normally", async () => {
 });
 
 test("a salaried MANAGER at $0 clocks out through the real route", async () => {
+    // payType SALARY is the exemption now — the hardcoded email list is gone.
     const { dependencies, updateCalls } = deps({
         selfRole: "MANAGER",
         selfRate: 0,
         selfEmail: "cj@goldentouchremodeling.com",
+        ownerPayType: "SALARY",
     });
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());

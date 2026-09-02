@@ -7,6 +7,8 @@ import {
   checkHelpSubmission,
   claimProviderLease,
   completeUnderLease,
+  providerDeadlineSignal,
+  renewProviderLease,
   helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
@@ -136,11 +138,27 @@ export async function POST(req: NextRequest) {
     }
 
     const marker = submissionMarker(requestId);
-    const alreadyFiled = reserved.resume ? await findIssueByMarker(marker) : null;
+    // ONE absolute deadline for the whole provider interaction, shared by the
+    // marker search AND the create. Giving each call its own fresh timeout let
+    // the pair run for twice the budget and outlive the lease fencing them.
+    const deadline = providerDeadlineSignal();
+    const alreadyFiled = reserved.resume ? await findIssueByMarker(marker, deadline) : null;
+    // The search may have eaten most of the deadline, and the create still has
+    // to land inside the lease. Fenced on the token: a superseded attempt must
+    // not be able to extend a lease it no longer holds.
+    if (reserved.resume && !alreadyFiled && !(await renewProviderLease(requestId, leaseToken))) {
+        const lost = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+        return helpChatResponse({
+            body: { request: lost, duplicate: true, inFlight: true, superseded: true },
+            filed: lost?.providerState === "created",
+            submissionId,
+        });
+    }
 
     const ghIssue =
       alreadyFiled ??
       (await createHelpChatGitHubIssue({
+        signal: deadline,
         title,
         description,
         currentPage,
