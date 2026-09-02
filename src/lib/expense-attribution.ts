@@ -137,3 +137,23 @@ export function notHumanCodedExpenseWhere(): Prisma.ExpenseWhereInput {
         ],
     };
 }
+
+/**
+ * NO DEFAULT. Silence means NULL, on every source, including a receipt that
+ * arrived in a job folder.
+ *
+ * An earlier version defaulted this to TRUE for any non-overhead project, on
+ * the reasoning that a job receipt is job material. That was wrong, and wrong
+ * in the one direction a tax figure must never fail in: WAC 458-20-102(12)(b)
+ * allows the cost of the articles actually RESOLD, and a receipt coded to a
+ * live job is just as likely to be consumables, tools, fuel, dump fees, or a
+ * service. Defaulting it turned "nobody looked at this" into a deduction
+ * claimed on a state return.
+ *
+ * An explicit true/false from the caller is honoured — the crew member standing
+ * in front of the material is the one person who actually knows — and a
+ * bookkeeper can correct it afterwards on the expense edit route.
+ */
+export function resolveInstalledAtCustomer(declared: boolean | null): boolean | null {
+    return declared;
+}

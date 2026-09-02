@@ -13,7 +13,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isCostCodeAllowedForProject, type PhaseDataSource } from "../src/lib/project-phases";
 import { resolveCostCode, type CostCodingDataSource } from "../src/lib/cost-coding";
-import { resolveInstalledAtCustomer } from "../src/app/api/receipts/intake/route";
+// From the PURE module, not the route: importing the route pulls in
+// mobile-auth, which throws at import time unless NEXTAUTH_SECRET is set —
+// true in CI, and a unit test has no business needing a JWT secret.
+import { resolveInstalledAtCustomer } from "../src/lib/expense-attribution";
 
 // ── the two checks every phase writer must run ─────────────────────────────
 
