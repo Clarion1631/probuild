@@ -21,6 +21,10 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DE
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN;
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,30);
+-- Mixed receipts: the portion actually resold, when it is less than the whole
+-- pre-tax total. NULL means "all of it", and is only reached on a row a human
+-- has explicitly flagged installed-at-customer.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30);
 
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");
 

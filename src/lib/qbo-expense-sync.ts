@@ -11,6 +11,8 @@ import {
     resolveExpenseProjectId,
 } from "./expense-attribution";
 import { isOverheadProject } from "./overhead-project";
+import { isCostCodeAllowedForProject } from "./project-phases";
+import { prismaPhaseDataSource } from "./project-phases-db";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
 // never drift from the values that module READS.
@@ -833,6 +835,8 @@ export type QboCostCodeSuggestionResult =
     | "no-match"
     /** The rules named a code this company does not have active. */
     | "unknown-code"
+    /** The code exists, but it is not one of THIS job's phases. */
+    | "phase-not-on-project"
     /** Already coded, or coded by a human: the guard held. */
     | "not-written"
     | "written";
@@ -849,6 +853,12 @@ export async function applyQboExpenseCostCodeSuggestion(
     client: QboCostCodeSuggestionClient,
     input: QboCostCodeSuggestionInput,
     costCodeIdByCode: ReadonlyMap<string, string>,
+    /**
+     * "Is this code a phase of that job?" Injected so the rules stay testable
+     * without a database. Omitted = no scope check, which is only acceptable
+     * for a caller that has already scoped the map it passed in.
+     */
+    isAllowedForProject?: (projectId: string, costCodeId: string) => Promise<boolean>,
 ): Promise<QboCostCodeSuggestionResult> {
     const stored = await client.expense.findUnique({
         where: { qbPurchaseId: input.qbPurchaseId },
@@ -882,6 +892,14 @@ export async function applyQboExpenseCostCodeSuggestion(
 
     const costCodeId = costCodeIdByCode.get(suggestion.code);
     if (!costCodeId) return "unknown-code";
+
+    // A phase the job does not have is not an answer, however confident the
+    // regex was. The rules match on a vendor name; they know nothing about
+    // which phases this job actually carries, and an automated write has LESS
+    // standing to invent one than a human does, not more.
+    if (isAllowedForProject && !(await isAllowedForProject(projectId, costCodeId))) {
+        return "phase-not-on-project";
+    }
 
     const written = await client.expense.updateMany({
         where: {
@@ -1100,6 +1118,8 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
                 prisma as unknown as QboCostCodeSuggestionClient,
                 input,
                 await loadCostCodes(),
+                (projectId, costCodeId) =>
+                    isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
             );
         },
         now: () => new Date(),

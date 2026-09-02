@@ -12,7 +12,9 @@
 // never when it merely lacks a contradiction:
 //   * `taxAtSource` — the read actually found tax on the receipt,
 //   * `installedAtCustomer === true` — a NULL is "nobody said", and a NULL
-//     must never be spent as a deduction, and
+//     must never be spent as a deduction. Nothing defaults this: it is set at
+//     capture by the person holding the material, or corrected afterwards by a
+//     bookkeeper on the expense edit route, and
 //   * `taxAmount > 0` — a zero is an answer (no tax), not an absence.
 //
 // TWO THINGS THIS FILE IS FUSSY ABOUT, both because it feeds a tax filing:
@@ -67,18 +69,28 @@ export interface TaxAtSourceRow {
     reference: string;
     /** Gross paid, in whole cents. */
     receiptTotalCents: number;
-    /** receiptTotal - tax, in whole cents. The excise line's base. */
+    /**
+     * The excise line's base, in whole cents. `taxDeductibleBase` when a
+     * bookkeeper has allocated one (a MIXED receipt: some material resold, some
+     * shop consumables), otherwise the whole pre-tax total.
+     */
     deductionBaseCents: number;
+    /** True when the base above is an explicit human allocation, not the whole receipt. */
+    baseIsAllocated: boolean;
     taxCents: number;
 }
 
 export const TAX_REPORT_AMOUNT_NOTE =
-    "Receipt Total is the gross amount paid; the deduction base is that total less the sales tax on the receipt.";
+    "Receipt Total is the gross amount paid. The deduction base is that total less the sales tax on the receipt, " +
+    "unless a bookkeeper has allocated a smaller amount for a mixed receipt — in which case only the allocated " +
+    "portion is claimed.";
 
 export const TAX_REPORT_FOOTNOTE =
     "Sales tax already paid on materials resold as part of customer work is deductible on the WA excise return line " +
-    "\"taxable amount for tax paid at source\". Only receipts flagged installed-at-customer count; Shop and consumable " +
-    "purchases are excluded.";
+    "\"taxable amount for tax paid at source\" (WAC 458-20-102(12)(b) — the cost of the articles actually resold). " +
+    "A receipt counts only when someone has explicitly marked it installed-at-customer; unreviewed receipts, Shop " +
+    "purchases, consumables, tools and services are all excluded. For a mixed receipt, set a deduction base on the " +
+    "expense so only the resold portion is claimed.";
 
 /** Whole cents from a value for display only. */
 export function centsToDollars(cents: number): number {
@@ -356,6 +368,7 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
             description: true,
             amount: true,
             taxAmount: true,
+            taxDeductibleBase: true,
             projectId: true,
             project: { select: { name: true } },
             estimate: { select: { projectId: true, project: { select: { name: true } } } },
@@ -366,6 +379,11 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
     return rows.map(row => {
         const taxCents = toCents(row.taxAmount);
         const receiptTotalCents = toCents(row.amount);
+        // An allocation, when a human made one, ALWAYS wins — including when it
+        // is larger than the pre-tax total, which the edit route refuses to
+        // store. Silently clamping here would hide a bad allocation instead of
+        // surfacing it; the validation belongs at the write, and does exist.
+        const allocated = row.taxDeductibleBase !== null && row.taxDeductibleBase !== undefined;
         return {
             id: row.id,
             // The `date: { gte }` filter above already excluded null dates.
@@ -376,7 +394,10 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
             projectName: row.project?.name ?? row.estimate?.project?.name ?? "(unassigned)",
             reference: extractReference(row.description),
             receiptTotalCents,
-            deductionBaseCents: receiptTotalCents - taxCents,
+            deductionBaseCents: allocated
+                ? toCents(row.taxDeductibleBase)
+                : receiptTotalCents - taxCents,
+            baseIsAllocated: allocated,
             taxCents,
         };
     });

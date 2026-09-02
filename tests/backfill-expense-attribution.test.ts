@@ -59,13 +59,45 @@ const COST_CODE_IDS = new Map([
     ["02-FRAME", "cc-frame"],
 ]);
 
+/**
+ * STATEFUL by design. An earlier version returned `{ count: 1 }` without
+ * touching the fixture, which made every write look like it succeeded — and
+ * that is exactly what hid the bug where pass (a) filled `projectId` and pass
+ * (c)'s predicate then matched nothing. A stub that cannot fail a predicate
+ * cannot test a predicate.
+ */
 function createStub(
     expenses: StubExpense[],
     items: { id: string; costCodeId: string | null; estimateId: string; estimate: { projectId: string | null } }[] = [],
 ) {
     const writes: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
+    const rows = expenses;
+
+    const matches = (row: StubExpense, where: Record<string, unknown>): boolean => {
+        if (typeof where.id === "string" && row.id !== where.id) return false;
+        if (where.id && typeof where.id === "object") {
+            const ids = (where.id as { in?: string[] }).in ?? [];
+            if (!ids.includes(row.id)) return false;
+        }
+        if ("projectId" in where && (row.projectId ?? null) !== where.projectId) return false;
+        if ("costCodeId" in where && (row.costCodeId ?? null) !== where.costCodeId) return false;
+        if (Array.isArray(where.OR)) {
+            const ok = (where.OR as Record<string, unknown>[]).some(branch => {
+                if (!("costCodeSource" in branch)) return false;
+                const expected = branch.costCodeSource;
+                if (expected === null) return (row.costCodeSource ?? null) === null;
+                const notIn = (expected as { notIn?: string[] }).notIn ?? [];
+                // SQL semantics: NULL NOT IN (...) is NULL, i.e. NOT a match.
+                return row.costCodeSource !== null && !notIn.includes(row.costCodeSource);
+            });
+            if (!ok) return false;
+        }
+        return true;
+    };
+
     return {
         writes,
+        rows,
         db: {
             project: {
                 async findMany() {
@@ -88,10 +120,16 @@ function createStub(
                 async findMany() { return []; },
             },
             expense: {
-                async findMany() { return expenses; },
+                async findMany() { return rows; },
                 async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
                     writes.push(args);
-                    return { count: 1 };
+                    let count = 0;
+                    for (const row of rows) {
+                        if (!matches(row, args.where)) continue;
+                        Object.assign(row, args.data);
+                        count += 1;
+                    }
+                    return { count };
                 },
             },
         },
@@ -312,10 +350,28 @@ test("the remainder CSV carries what Marge needs to decide, including WHY", () =
     );
     const [header, row] = csv.split("\n");
     assert.equal(header, "expense_id,project,date,vendor,amount,reason,description");
-    assert.match(
+    assert.equal(
         row,
-        /^e9,"Mueller Bath",2026-08-01,"Lowe""s",12\.50,"item-outside-estimate","misc supplies"$/,
+        '"e9","Mueller Bath","2026-08-01","Lowe""s",12.50,"item-outside-estimate","misc supplies"',
     );
+});
+
+test("the remainder CSV neutralizes formulas — vendor names here are OCR output", () => {
+    // This file used to have its own escaper that merely quoted, so a receipt
+    // read as `=cmd|...` was executable the moment the CSV was opened.
+    const csv = remainderCsv(
+        [{
+            ...expense({ id: "e1", vendor: "=cmd|'/c calc'!A1", description: "@SUM(A1)", amount: -5 }),
+            reason: "no-rule-match",
+        }],
+        new Map([["job-1", "+Mueller"]]),
+    );
+    const row = csv.split("\n")[1];
+    assert.match(row, /"'=cmd\|'\/c calc'!A1"/);
+    assert.match(row, /"'@SUM\(A1\)"/);
+    assert.match(row, /"'\+Mueller"/);
+    // ...while a negative amount stays a NUMBER, or every SUM in the sheet breaks.
+    assert.match(row, /,-5\.00,/);
 });
 
 // ── the run ─────────────────────────────────────────────────────────────────
@@ -333,9 +389,10 @@ test("a dry run makes ZERO write calls", async () => {
 });
 
 test("apply writes both passes, each behind its own predicate", async () => {
-    const stub = createStub([
-        expense({ id: "e1", vendor: "Summit Plumbing", projectId: null, estimate: { projectId: "job-1" } }),
-    ]);
+    const stub = createStub(
+        [expense({ id: "e1", vendor: "Summit Plumbing", projectId: null, estimate: { projectId: "job-1" } })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
 
     const projectWrite = stub.writes.find(w => "projectId" in w.data)!;
@@ -348,9 +405,9 @@ test("apply writes both passes, each behind its own predicate", async () => {
         { costCodeSource: null },
         { costCodeSource: { notIn: ["capture", "manual"] } },
     ]);
-    // The attribution the plan was made under, re-asserted at write time. The
-    // plan is a snapshot; the predicate is what makes acting on it safe.
-    assert.equal(codeWrite.where.projectId, null);
+    // The POST-FILL project. Asserting `null` here is what let the ordering
+    // bug through: pass (a) had already set it, so the write matched nothing.
+    assert.equal(codeWrite.where.projectId, "job-1");
     assert.deepEqual(codeWrite.data, {
         costCodeId: "cc-plumb",
         costCodeSource: "ai",
@@ -358,16 +415,85 @@ test("apply writes both passes, each behind its own predicate", async () => {
     });
 });
 
-test("a cost-code write requires the project the plan was scoped to", async () => {
-    // A row that was ALREADY attributed when the plan was made must be written
-    // under that same id — not under `null`, which would silently match a
-    // different set of rows.
-    const stub = createStub([
-        expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" }),
-    ]);
+test("ONE --apply actually codes the row, and a second dry run plans nothing", async () => {
+    // The end-to-end proof, against a stub that honours predicates. The bug
+    // this catches produced a run that reported success and wrote no cost code
+    // at all, because pass (c)'s predicate still said `projectId: null` after
+    // pass (a) had filled it.
+    const stub = createStub(
+        [expense({ id: "e1", vendor: "Summit Plumbing", projectId: null, estimate: { projectId: "job-1" } })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+
+    const applied = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(applied.written.projectIds, 1);
+    assert.equal(applied.written.costCodes, 1, "the cost code must actually land");
+    assert.equal(stub.rows[0].projectId, "job-1");
+    assert.equal(stub.rows[0].costCodeId, "cc-plumb");
+    assert.equal(stub.rows[0].costCodeSource, "ai");
+
+    const rerun = await runBackfill({ db: stub.db, apply: false, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(rerun.plan.projectFills, [], "re-run must plan zero project fills");
+    assert.deepEqual(rerun.plan.codeFills, [], "re-run must plan zero cost codes");
+});
+
+test("a row re-attributed between the plan and the write is skipped, not miscoded", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", vendor: "Summit Plumbing", projectId: "job-1" })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    // Someone moves the row after findMany has handed it to the planner.
+    const passThrough = stub.db.expense.updateMany;
+    let moved = false;
+    stub.db.expense.updateMany = async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        if (!moved) {
+            moved = true;
+            stub.rows[0].projectId = "job-elsewhere";
+        }
+        return passThrough(args);
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0);
+    assert.equal(stub.rows[0].costCodeId, null, "no phase from the job it left");
+});
+
+test("a cost-code write requires the project the plan resolved", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
     assert.equal(codeWrite.where.projectId, "job-1");
+});
+
+test("a suggested phase the JOB does not have is refused", () => {
+    // "The cost code exists" is not a permission (cost-coding.ts SCOPE note),
+    // and a regex that fired on a vendor name knows nothing about which phases
+    // this job has. The allowed set comes from the project's coded estimate
+    // items — here it holds only framing, so the plumbing suggestion is out.
+    const plan = planBackfill({
+        expenses: [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" })],
+        items: NO_ITEMS,
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+        allowedCodesByProject: new Map([["job-1", new Set(["cc-frame"])]]),
+    });
+    assert.deepEqual(plan.codeFills, []);
+    assert.equal(plan.remainder[0].reason, "phase-not-on-project");
+});
+
+test("a suggested phase the job DOES have is accepted", () => {
+    const plan = planBackfill({
+        expenses: [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" })],
+        items: NO_ITEMS,
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+        allowedCodesByProject: new Map([["job-1", new Set(["cc-plumb"])]]),
+    });
+    assert.equal(plan.codeFills.length, 1);
+    assert.equal(plan.codeFills[0].costCodeId, "cc-plumb");
 });
 
 test("the write predicate re-checks NULL, not just the plan", async () => {

@@ -645,9 +645,18 @@ model Expense {
   /// WA excise "tax paid at source": GTR paid sales tax at the register on
   /// material it resold as part of customer work.
   taxAtSource         Boolean   @default(false)
-  /// null = unknown/legacy. Only TRUE rows are deductible on the excise
-  /// return, so an absent answer must never read as a yes.
+  /// null = NOBODY HAS SAID. Only an explicit TRUE is deductible on the excise
+  /// return: WAC 458-20-102(12)(b) allows the cost of the articles actually
+  /// resold, so an unanswered receipt must never be claimed. Defaulting this
+  /// from the project (a real job => true) was wrong and was removed — a job
+  /// receipt can still be consumables, tools, or services.
   installedAtCustomer Boolean?
+  /// The portion of this receipt that was actually resold to the customer,
+  /// when it is LESS than the whole pre-tax total (a mixed receipt: some
+  /// material installed, some shop consumables). Null means "the whole pre-tax
+  /// total", which is only reached once installedAtCustomer is an explicit
+  /// true. Set by a bookkeeper on the expense edit route.
+  taxDeductibleBase   Decimal?
   /// capture | ai | manual | backfill. Precedence: capture = manual >
   /// ai = backfill > null. Nothing but a human edit rewrites capture/manual.
   costCodeSource      String?

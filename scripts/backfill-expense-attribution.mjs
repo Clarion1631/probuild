@@ -44,6 +44,7 @@ import {
     resolveExpenseProjectId,
 } from "../src/lib/expense-attribution.ts";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project.ts";
+import { csvCell, csvNumber } from "../src/lib/csv-safe.ts";
 
 /**
  * Both current tiers clear this (0.9 vendor, 0.75 line), so it changes nothing
@@ -92,8 +93,18 @@ export function measureCoverage(rows) {
  *   estimate item, so the link can be checked before it is trusted
  * @param costCodeIdByCode "03-PLUMB" -> cost code id
  * @param scopedProjectIds the In Progress, non-overhead jobs the suggester may touch
+ * @param allowedCodesByProject project id -> the cost code ids that are actually
+ *   PHASES OF THAT JOB. "The cost code exists" is not a permission
+ *   (src/lib/cost-coding.ts SCOPE note), and a rule that fires on a vendor name
+ *   knows nothing about which phases the job has.
  */
-export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectIds }) {
+export function planBackfill({
+    expenses,
+    items,
+    costCodeIdByCode,
+    scopedProjectIds,
+    allowedCodesByProject = new Map(),
+}) {
     const inScope = new Set(scopedProjectIds);
     const projectFills = [];
     const codeFills = [];
@@ -151,7 +162,7 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
                 costCodeSource: "backfill",
                 costCodeConfidence: null,
                 why: "item cost code (same project)",
-                expectedProjectId: expense.projectId ?? null,
+                expectedProjectId: resolvedProjectId,
                 expense,
             });
             continue;
@@ -168,6 +179,15 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
         }
         const suggestion = suggestCode(expense);
         const costCodeId = suggestion ? costCodeIdByCode.get(suggestion.code) : undefined;
+        // A phase the job does not have is not an answer, however confident the
+        // regex was. Same rule the clock-in route enforces via
+        // isCostCodeAllowedForProject — applied here too, because an automated
+        // write has less standing to invent a phase than a human does, not more.
+        const allowed = allowedCodesByProject.get(resolvedProjectId);
+        if (costCodeId && allowed && !allowed.has(costCodeId)) {
+            add(expense, "phase-not-on-project");
+            continue;
+        }
         if (suggestion && costCodeId && suggestion.confidence >= MIN_CONFIDENCE) {
             codeFills.push({
                 id: expense.id,
@@ -175,10 +195,10 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
                 costCodeSource: "ai",
                 costCodeConfidence: suggestion.confidence,
                 why: suggestion.why,
-                // The attribution the decision was scoped BY, so the write can
-                // require it is unchanged. `null` is a real expectation: it
-                // means the row was still unattributed when the plan was made.
-                expectedProjectId: expense.projectId ?? null,
+                // The attribution the decision was scoped by, as it will be
+                // AFTER pass (a) has run — which is the state the write
+                // actually meets.
+                expectedProjectId: resolvedProjectId,
                 expense,
             });
         } else {
@@ -198,24 +218,34 @@ export function projectedRows(expenses, codeFills) {
     }));
 }
 
-function csvEscape(value) {
-    return `"${String(value ?? "").replace(/"/g, '""').replace(/\s+/g, " ").slice(0, 160)}"`;
+/**
+ * One cell of free text, collapsed to a single line and capped.
+ *
+ * The collapse and the cap are this script's own presentation choice — a
+ * 4,000-character receipt description makes the CSV unreadable. The QUOTING and
+ * the formula neutralization are NOT: they come from src/lib/csv-safe.ts, the
+ * same helper the tax report uses. This used to be a private `csvEscape` that
+ * only quoted, which left every vendor and description in this file executable
+ * when Marge opened it — and vendor names here are OCR output.
+ */
+function textCell(value) {
+    return csvCell(String(value ?? "").replace(/\s+/g, " ").slice(0, 160));
 }
 
 export function remainderCsv(remainder, projectNameById) {
     const lines = [["expense_id", "project", "date", "vendor", "amount", "reason", "description"].join(",")];
     for (const expense of remainder) {
         lines.push([
-            expense.id,
-            csvEscape(projectNameById.get(resolveExpenseProjectId(expense)) ?? ""),
-            expense.date ? new Date(expense.date).toISOString().slice(0, 10) : "",
-            csvEscape(expense.vendor),
-            num(expense.amount).toFixed(2),
+            textCell(expense.id),
+            textCell(projectNameById.get(resolveExpenseProjectId(expense)) ?? ""),
+            textCell(expense.date ? new Date(expense.date).toISOString().slice(0, 10) : ""),
+            textCell(expense.vendor),
+            csvNumber(num(expense.amount)),
             // WHY it is here. "item-outside-estimate" in particular is not
             // "we could not guess" — it is "this row claims a line item on
             // another job", which is a data problem a human should look at.
-            csvEscape(expense.reason),
-            csvEscape(expense.description),
+            textCell(expense.reason),
+            textCell(expense.description),
         ].join(","));
     }
     return lines.join("\n");
@@ -259,21 +289,41 @@ export async function runBackfill({
 
     // The item's OWN estimate and project come back with it: the fallback has
     // to prove the link does not cross jobs before it copies a code.
-    const itemRows = await db.estimateItem.findMany({
+    const itemRowsRaw = await db.estimateItem.findMany({
         where: { costCodeId: { not: null } },
         select: {
             id: true, costCodeId: true, estimateId: true,
             estimate: { select: { projectId: true } },
         },
     });
-    const items = new Map(itemRows.map(row => [row.id, {
+    const itemRows = itemRowsRaw.map(row => ({
+        id: row.id,
         costCodeId: row.costCodeId,
         estimateId: row.estimateId,
         projectId: row.estimate?.projectId ?? null,
+    }));
+    const items = new Map(itemRows.map(row => [row.id, {
+        costCodeId: row.costCodeId,
+        estimateId: row.estimateId,
+        projectId: row.projectId,
     }]));
     const itemCostCodeById = new Map(itemRows.map(row => [row.id, row.costCodeId]));
 
-    const plan = planBackfill({ expenses, items, costCodeIdByCode, scopedProjectIds });
+    // The phases each job actually has. Mirrors resolveProjectPhaseCodes'
+    // estimate-item half (src/lib/project-phases.ts) — the Safety phase is
+    // deliberately absent, because a materials receipt is never a safety
+    // meeting and this pass has no business assigning one.
+    const allowedCodesByProject = new Map();
+    for (const row of itemRows) {
+        const projectId = row.projectId;
+        if (!projectId || !row.costCodeId) continue;
+        if (!allowedCodesByProject.has(projectId)) allowedCodesByProject.set(projectId, new Set());
+        allowedCodesByProject.get(projectId).add(row.costCodeId);
+    }
+
+    const plan = planBackfill({
+        expenses, items, costCodeIdByCode, scopedProjectIds, allowedCodesByProject,
+    });
 
     // ── the table ───────────────────────────────────────────────────────────
     const scoped = new Set(scopedProjectIds);
@@ -381,6 +431,12 @@ export async function runBackfill({
                 // any concurrent sync or bookkeeper edit; the predicate is what
                 // makes it safe to act on. A row that moved is skipped, not
                 // coded on stale reasoning.
+                // The RESOLVED project — i.e. the value pass (a) above has
+                // just written, not the NULL this row had when the plan was
+                // made. Using the pre-fill value meant every legacy row the
+                // project pass touched then failed this predicate and silently
+                // wrote no cost code at all: an `--apply` that reported success
+                // and coded nothing.
                 projectId: fill.expectedProjectId,
                 costCodeId: null,
                 ...notHumanCodedExpenseWhere(),

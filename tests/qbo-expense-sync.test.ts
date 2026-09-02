@@ -1350,6 +1350,34 @@ test("a vanished row is reported, not treated as a silent success", async () => 
     );
 });
 
+test("a phase the JOB does not have is refused, however confident the rule was", async () => {
+    // The rules match on a vendor name. They know nothing about which phases
+    // this job carries, and an automated write has LESS standing to invent one
+    // than a human does, not more.
+    const fake = fakeSuggestionClient();
+    const result = await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+        COST_CODE_IDS,
+        async () => false,
+    );
+    assert.equal(result, "phase-not-on-project");
+    assert.equal(fake.calls.length, 0, "and nothing is written");
+});
+
+test("the scope check is asked about the row's OWN job and the resolved code", async () => {
+    const fake = fakeSuggestionClient();
+    const asked: { projectId: string; costCodeId: string }[] = [];
+    await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+        COST_CODE_IDS,
+        async (projectId, costCodeId) => { asked.push({ projectId, costCodeId }); return true; },
+    );
+    assert.deepEqual(asked, [{ projectId: "project-1", costCodeId: "cc-plumb" }]);
+    assert.equal(fake.calls.length, 1, "an allowed phase still writes");
+});
+
 test("no rule match and an unknown code both write nothing", async () => {
     const fake = fakeSuggestionClient();
     assert.equal(

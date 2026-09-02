@@ -63,6 +63,9 @@ export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,30)`,
+    // Mixed receipts: the portion actually resold, when it is less than the
+    // whole pre-tax total. NULL means "all of it".
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30)`,
 
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
 
@@ -112,7 +115,7 @@ END $$`,
 export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
-        "costCodeSource", "costCodeConfidence",
+        "costCodeSource", "costCodeConfidence", "taxDeductibleBase",
     ],
 };
 

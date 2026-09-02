@@ -23,7 +23,6 @@ import {
     serializeReceiptIntake,
     withArchiveDownloadUrls,
 } from "@/lib/receipt-intake/queries";
-import { isOverheadProject } from "@/lib/overhead-project";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -142,22 +141,23 @@ function optionalBool(value: unknown): boolean | null {
 }
 
 /**
- * The default the mobile app relies on (spec §5c): a receipt filed against a
- * real job was installed at the customer's; one filed against the Shop overhead
- * bucket was consumed by the business and is NOT deductible on the excise
- * return. An explicit answer from the caller always wins — the crew member
- * standing in front of the material knows better than this rule does.
+ * NO DEFAULT. Silence means NULL, on every source, including a receipt that
+ * arrived in a job folder.
  *
- * With no project at all the answer stays NULL. Guessing "yes" would quietly
- * inflate a tax deduction, which is the one direction this must never fail in.
+ * An earlier version defaulted this to TRUE for any non-overhead project, on
+ * the reasoning that a job receipt is job material. That was wrong, and wrong
+ * in the one direction a tax figure must never fail in: WAC 458-20-102(12)(b)
+ * allows the cost of the articles actually RESOLD, and a receipt coded to a
+ * live job is just as likely to be consumables, tools, fuel, dump fees, or a
+ * service. Defaulting it turned "nobody looked at this" into a deduction
+ * claimed on a state return.
+ *
+ * An explicit true/false from the caller is honoured — the crew member standing
+ * in front of the material is the one person who actually knows — and a
+ * bookkeeper can correct it afterwards on the expense edit route.
  */
-export function resolveInstalledAtCustomer(
-    declared: boolean | null,
-    projectId: string | null,
-): boolean | null {
-    if (declared !== null) return declared;
-    if (!projectId) return null;
-    return !isOverheadProject(projectId);
+export function resolveInstalledAtCustomer(declared: boolean | null): boolean | null {
+    return declared;
 }
 
 async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
@@ -332,10 +332,7 @@ export async function POST(req: Request) {
                 dryRun: process.env.RECEIPT_INTAKE_DRYRUN !== "false",
                 projectId: parsed.projectId,
                 costCodeId: parsed.costCodeId,
-                installedAtCustomer: resolveInstalledAtCustomer(
-                    parsed.installedAtCustomer,
-                    parsed.projectId,
-                ),
+                installedAtCustomer: resolveInstalledAtCustomer(parsed.installedAtCustomer),
                 createdById: auth.via === "session" ? auth.user.id : null,
                 // Only a shared-secret forwarder may assert this: it is the
                 // claim that v1 already put this document in the books, and it

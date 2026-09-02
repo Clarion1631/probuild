@@ -6,6 +6,11 @@ import {
     QboManagedExpenseError,
     assertExpenseMutableOutsideQbo,
 } from "@/lib/qbo-expense-guard";
+import { resolveExpenseProjectId } from "@/lib/expense-attribution";
+import { resolveCostCode } from "@/lib/cost-coding";
+import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -42,9 +47,16 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         const expense = await prisma.expense.findUnique({
             where: { id },
-            select: { qbPurchaseId: true },
+            select: {
+                qbPurchaseId: true,
+                amount: true,
+                taxAmount: true,
+                projectId: true,
+                estimate: { select: { projectId: true } },
+            },
         });
         assertExpenseMutableOutsideQbo(expense);
+        if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
         const body = await req.json();
 
         if (body.itemId) {
@@ -63,17 +75,97 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const editsCostCode = Object.prototype.hasOwnProperty.call(body, "costCodeId");
         const nextCostCodeId: string | null =
             typeof body.costCodeId === "string" && body.costCodeId.trim() ? body.costCodeId.trim() : null;
+        const resolvedProjectId = resolveExpenseProjectId(expense);
         if (editsCostCode && nextCostCodeId) {
-            const costCode = await prisma.costCode.findUnique({
-                where: { id: nextCostCodeId },
-                select: { id: true, isActive: true },
+            // BOTH checks, per the SCOPE note on resolveCostCode: existence and
+            // active-ness are ATTRIBUTION, "this code belongs to this job" is
+            // PERMISSION, and neither implies the other. Validating only the
+            // former let a human move an expense onto a phase from an entirely
+            // different job.
+            const resolved = await resolveCostCode(prismaCostCodingDataSource, {
+                costCodeId: nextCostCodeId,
             });
-            if (!costCode) {
-                return NextResponse.json({ error: "Cost code not found." }, { status: 400 });
+            if (!resolved.ok) {
+                return NextResponse.json(
+                    { error: resolved.error, code: resolved.code },
+                    { status: resolved.status },
+                );
             }
-            if (!costCode.isActive) {
-                return NextResponse.json({ error: "That cost code is inactive." }, { status: 400 });
+            if (!resolvedProjectId) {
+                return NextResponse.json(
+                    {
+                        error: "This expense isn't attached to a project, so a phase can't be validated against one.",
+                        code: "PHASE_NOT_ON_PROJECT",
+                    },
+                    { status: 400 },
+                );
             }
+            const allowed = await isCostCodeAllowedForProject(
+                prismaPhaseDataSource,
+                resolvedProjectId,
+                resolved.costCodeId,
+            );
+            if (!allowed) {
+                return NextResponse.json(
+                    {
+                        error: "That cost code isn't one of this project's phases.",
+                        code: "PHASE_NOT_ON_PROJECT",
+                    },
+                    { status: 400 },
+                );
+            }
+        }
+
+        // ── the tax-deduction correction path (Phase 3, §7) ─────────────────
+        //
+        // Nothing defaults `installedAtCustomer` any more, so this route is how
+        // an unreviewed receipt becomes a claimable one. It is the ONLY place a
+        // human answer can be recorded after capture, which is why it validates
+        // rather than trusts: a deduction base larger than the pre-tax total is
+        // a filing error, and it must be refused at the write rather than
+        // clamped later where nobody would see it.
+        const editsInstalled = Object.prototype.hasOwnProperty.call(body, "installedAtCustomer");
+        let nextInstalled: boolean | null = null;
+        if (editsInstalled) {
+            const raw = body.installedAtCustomer;
+            if (raw !== null && typeof raw !== "boolean") {
+                return NextResponse.json(
+                    { error: "installedAtCustomer must be true, false, or null." },
+                    { status: 400 },
+                );
+            }
+            nextInstalled = raw;
+        }
+
+        const editsBase = Object.prototype.hasOwnProperty.call(body, "taxDeductibleBase");
+        let nextBase: number | null = null;
+        if (editsBase && body.taxDeductibleBase !== null) {
+            const parsed = Number(body.taxDeductibleBase);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                return NextResponse.json(
+                    { error: "taxDeductibleBase must be a number ≥ 0, or null." },
+                    { status: 400 },
+                );
+            }
+            // Validated against the amount this request LEAVES on the row, not
+            // the one it started with — a PUT that lowers the amount and sets a
+            // base in the same call must not be able to slip past by being
+            // checked against the old, larger figure.
+            const nextAmount =
+                body.amount !== undefined && body.amount !== null
+                    ? Number(body.amount)
+                    : Number(expense.amount);
+            const tax = Number(expense.taxAmount ?? 0);
+            const ceiling = Math.round((nextAmount - tax) * 100) / 100;
+            if (!Number.isFinite(ceiling) || parsed > ceiling) {
+                return NextResponse.json(
+                    {
+                        error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).`,
+                    },
+                    { status: 400 },
+                );
+            }
+            nextBase = parsed;
         }
 
         const updatedExpense = await prisma.expense.update({
@@ -94,6 +186,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                         costCodeConfidence: null,
                     }
                     : {}),
+                ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
+                ...(editsBase ? { taxDeductibleBase: nextBase } : {}),
             },
         });
 

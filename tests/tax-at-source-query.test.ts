@@ -17,6 +17,8 @@ import Module from "node:module";
 const PACIFIC = "America/Los_Angeles";
 
 const recorded: any[] = [];
+/** Per-test override for the mixed-receipt allocation. */
+let withTaxDeductibleBase: string | null = null;
 
 const fakePrisma = {
     companySettings: {
@@ -34,6 +36,7 @@ const fakePrisma = {
                     description: "[Receipt intake] Invoice 82766",
                     amount: "207.74",
                     taxAmount: "16.55",
+                    taxDeductibleBase: withTaxDeductibleBase,
                     projectId: "job-b",
                     project: { name: "Mesplay Kitchen" },
                     estimate: { projectId: "job-a", project: { name: "Mueller Bath" } },
@@ -108,6 +111,22 @@ test("resolveTaxAtSourceFilters takes the zone from company settings", async () 
     const filters = await resolveTaxAtSourceFilters({ from: "2026-01-01", to: "2026-03-31" });
     assert.equal(filters.timeZone, PACIFIC);
     assert.equal(filters.from.toISOString(), "2026-01-01T08:00:00.000Z", "PST, not the server's zone");
+});
+
+test("an allocated deduction base replaces the whole pre-tax total", async () => {
+    // The mixed-receipt correction path. Without it the report claims the
+    // entire job-coded receipt, which WAC 458-20-102(12)(b) does not allow —
+    // only the cost of the articles actually resold.
+    const filters = parseTaxAtSourceFilters({ from: "2026-07-01", to: "2026-09-30" }, PACIFIC);
+    withTaxDeductibleBase = "50.00";
+    try {
+        const [row] = await queryTaxAtSourceRows(filters);
+        assert.equal(row.deductionBaseCents, 5000);
+        assert.equal(row.baseIsAllocated, true);
+        assert.equal(row.receiptTotalCents, 20774, "the gross is unchanged");
+    } finally {
+        withTaxDeductibleBase = null;
+    }
 });
 
 test("a row is stamped with its COMPANY day and its RESOLVED job", async () => {

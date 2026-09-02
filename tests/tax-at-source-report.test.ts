@@ -42,6 +42,7 @@ function row(overrides: Partial<TaxAtSourceRow> = {}): TaxAtSourceRow {
         reference: "001916749100246",
         receiptTotalCents,
         deductionBaseCents: receiptTotalCents - taxCents,
+        baseIsAllocated: false,
         taxCents,
         ...overrides,
     };
@@ -147,6 +148,18 @@ test("an empty period is zeros, not NaN", () => {
     const { months, summary } = groupTaxAtSource([]);
     assert.deepEqual(months, []);
     assert.deepEqual(summary, { count: 0, deductionBaseCents: 0, receiptTotalCents: 0, taxCents: 0 });
+});
+
+test("a mixed receipt contributes only its ALLOCATED base", () => {
+    // $207.74 gross, $16.55 tax, but only $50 of it was material resold to the
+    // customer — the rest was shop consumables. Claiming the whole pre-tax
+    // $191.19 would overstate the deduction by $141.19 on one receipt.
+    const { summary } = groupTaxAtSource([
+        row({ receiptTotalCents: 20774, taxCents: 1655, deductionBaseCents: 5000, baseIsAllocated: true }),
+    ]);
+    assert.equal(summary.deductionBaseCents, 5000);
+    assert.equal(summary.receiptTotalCents, 20774, "the gross is still reported honestly");
+    assert.equal(summary.taxCents, 1655);
 });
 
 // ── period boundaries, in the company zone ──────────────────────────────────
