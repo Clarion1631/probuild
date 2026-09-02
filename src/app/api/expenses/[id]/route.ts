@@ -336,6 +336,9 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 taxAmount: true,
                 taxAtSource: true,
                 taxDeductibleBase: true,
+                // Whether this row is WAITING for a person. It decides what it
+                // takes to clear the flag below.
+                needsTaxReview: true,
                 estimateId: true,
                 projectId: true,
                 updatedAt: true,
@@ -357,6 +360,9 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // told, not silently ignored.
         const allowed = new Set([
             "installedAtCustomer", "taxDeductibleBase", "taxAmount", "taxAtSource", "costCodeId",
+            // Not a column: the explicit "I have re-checked this flagged row"
+            // acknowledgement. See the needsTaxReview rule below.
+            "taxReviewAck",
         ]);
         const rejected = Object.keys(body).filter(key => !allowed.has(key));
         if (rejected.length) {
@@ -374,6 +380,49 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const editsTaxAmount = has("taxAmount");
         const editsTaxAtSource = has("taxAtSource");
         const editsCostCode = has("costCodeId");
+
+        // CLEARING A REVIEW FLAG IS ITS OWN DECISION.
+        //
+        // `needsTaxReview` means a re-sync moved the gross out from under a
+        // classification a human made, so the whole classification is in doubt
+        // — not just whichever field the next request happens to touch. Letting
+        // any tax edit clear it meant a bookkeeper answering "yes, installed at
+        // customer" silently certified a tax amount and a deduction split they
+        // never looked at, and the row went straight back into the excise
+        // report.
+        //
+        // So clearing it takes an explicit acknowledgement AND the two figures
+        // the report actually reads. `installedAtCustomer` is optional: it is
+        // the one field whose absence cannot overstate a deduction (a null
+        // reads as "unanswered" and the report skips the row).
+        //
+        // A tax edit WITHOUT the ack is still accepted — a partial correction
+        // is normal work — it simply leaves the flag standing.
+        if (has("taxReviewAck") && body.taxReviewAck !== true && body.taxReviewAck !== false) {
+            return NextResponse.json(
+                { error: "taxReviewAck must be true or false." },
+                { status: 400 },
+            );
+        }
+        const acknowledgesReview = body.taxReviewAck === true;
+        if (acknowledgesReview && !(editsTaxAmount && editsBase)) {
+            return NextResponse.json(
+                {
+                    error: "Acknowledging a tax review needs both taxAmount and taxDeductibleBase in the same request.",
+                    code: "TAX_REVIEW_INCOMPLETE",
+                },
+                { status: 400 },
+            );
+        }
+        // An unflagged row has nothing to clear, so the ack is not required of
+        // ordinary edits; a flagged one keeps its flag until it is given.
+        const clearsReview = !expense.needsTaxReview || acknowledgesReview;
+
+        // `taxReviewAck` is not a column, so a request carrying nothing else
+        // has no field to write. Told, not silently no-opped.
+        if (!editsInstalled && !editsBase && !editsTaxAmount && !editsTaxAtSource && !editsCostCode) {
+            return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
+        }
 
         // The money permission governs anything that lands on a tax return.
         if ((editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource)
@@ -552,7 +601,12 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 // refuses to count.
                 ...(editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource
                     ? {
-                        needsTaxReview: false,
+                        // Only when the answer that justifies clearing it came
+                        // with the request. Written in the SAME statement as
+                        // that answer: two statements would leave a window
+                        // where the report sees a cleared row it has not been
+                        // given the figures for.
+                        ...(clearsReview ? { needsTaxReview: false } : {}),
                         // WHO decided. Everything the intake pipeline writes is
                         // "ocr" and re-readable; this is a person, and booking
                         // must not write over it. It matters most in the case

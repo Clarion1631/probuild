@@ -1731,7 +1731,7 @@ test("a second deactivation of an already-retired row is unchanged", async () =>
         amount: 0, status: "Reviewed" as const,
         description: "[QuickBooks import] Removed in QBO (deleted)",
         qbSyncToken: "1",
-        taxAmount: null, taxAtSource: false, installedAtCustomer: null,
+        taxAmount: null, taxAtSource: false, taxSource: null, installedAtCustomer: null,
         taxDeductibleBase: null, needsTaxReview: false,
     };
     const fake = createFakePrisma([retired as any]);
@@ -1931,4 +1931,36 @@ test("a newer sync landing between the read and the write wins", async () => {
         await applyQboExpenseCostCodeSuggestion(fake.client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
         "not-written",
     );
+});
+
+test("deleting a MANUALLY classified purchase retires its provenance too", () => {
+    // Codex round 14, item 3. Leaving `taxSource` behind on a zeroed row means
+    // the idempotency check never sees the classification as retired, so every
+    // subsequent sync re-writes the same row and reports it as a change — and
+    // the row still claims a person stands behind figures that are now null.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            taxAmount: 34.06, taxAtSource: true, taxSource: "manual",
+            installedAtCustomer: true, taxDeductibleBase: 100, needsTaxReview: false,
+        } as any,
+    ]);
+
+    return (async () => {
+        const removal = {
+            qbPurchaseId: "purchase-1", qbSyncToken: "1",
+            reason: "deleted", qbSyncedAt: new Date("2026-09-02T00:00:00.000Z"),
+        };
+        assert.equal(await deactivateQboExpense(fake.client, removal), "removed");
+        const row = fake.rows.get("purchase-1") as any;
+        assert.equal(row.amount, 0);
+        assert.equal(row.taxAmount, null);
+        assert.equal(row.taxSource, null, "nobody stands behind a purchase QBO says never happened");
+        assert.equal(row.installedAtCustomer, null);
+        assert.equal(row.taxDeductibleBase, null);
+        assert.equal(row.needsTaxReview, false, "a gone purchase is not something to re-check");
+
+        // ...and it is now genuinely idempotent.
+        assert.equal(await deactivateQboExpense(fake.client, removal), "unchanged");
+    })();
 });

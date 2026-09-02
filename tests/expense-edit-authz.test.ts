@@ -357,17 +357,22 @@ test("a line item on this job's estimate is accepted", async () => {
 
 // ── the needsTaxReview lifecycle (Codex round 7, item 3) ───────────────────
 
-test("a human answer CLEARS needsTaxReview in the same write", async () => {
+test("a full answer CLEARS needsTaxReview in the same write", async () => {
     // Two statements would leave a window where the report sees an answered
-    // row it still refuses to count.
+    // row it still refuses to count. Round 14 made the answer that justifies
+    // clearing it an explicit one: the ack plus both figures.
     storedExpense = { ...storedExpense, needsTaxReview: true };
-    const res = await patch({ installedAtCustomer: true });
+    const res = await patch({
+        taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50, installedAtCustomer: true,
+    });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.installedAtCustomer, true);
     assert.equal(updateArgs?.data.needsTaxReview, false, "answered, so no longer awaiting one");
 });
 
-test("every tax field clears the flag, and a phase-only edit does not", async () => {
+test("no single tax field clears the flag on its own", async () => {
+    // Round 14: each of these is a partial answer, and the flag says the WHOLE
+    // classification is in doubt. They are accepted and the flag stands.
     storedExpense = { ...storedExpense, needsTaxReview: true };
     for (const body of [
         { taxAmount: 10 },
@@ -375,14 +380,19 @@ test("every tax field clears the flag, and a phase-only edit does not", async ()
         { taxDeductibleBase: 50 },
         { installedAtCustomer: false },
     ]) {
-        await patch(body);
-        assert.equal(updateArgs?.data.needsTaxReview, false, JSON.stringify(body));
+        const res = await patch(body);
+        assert.equal(res.status, 200, JSON.stringify(body));
+        assert.equal(updateArgs?.data.needsTaxReview, undefined, JSON.stringify(body));
     }
-    // A cost-code edit is not an answer to the tax question, so the row stays
-    // flagged — otherwise re-phasing a receipt would quietly re-admit it to the
-    // filing.
+    // A cost-code edit is not an answer to the tax question either, and it does
+    // not even carry the provenance stamp.
     await patch({ costCodeId: null });
     assert.equal(updateArgs?.data.needsTaxReview, undefined);
+    // On an UNflagged row the same edits clear nothing because there is
+    // nothing to clear, but the column is still written false as before.
+    storedExpense = { ...storedExpense, needsTaxReview: false };
+    await patch({ taxAmount: 10 });
+    assert.equal(updateArgs?.data.needsTaxReview, false);
 });
 
 // ── the item link is judged on the RESOLVED job (item 4) ───────────────────
@@ -575,4 +585,57 @@ test("an omitted amount leaves the stored one alone", async () => {
     const res = await call({ vendor: "Lowe's" });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.amount, undefined);
+});
+
+// ── clearing a review flag is its own decision (Codex round 14, item 1) ─────
+
+test("an installedAtCustomer-only PATCH on a FLAGGED row leaves the flag up", async () => {
+    // The flag means the gross moved under the whole classification, not just
+    // under the field this request happens to touch. Clearing it here would
+    // certify a tax amount and a split nobody re-checked, and put the row
+    // straight back into the excise report.
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.installedAtCustomer, true, "the edit still lands");
+    assert.equal(updateArgs?.data.needsTaxReview, undefined, "but the flag is untouched");
+});
+
+test("a full acknowledgement clears the flag", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({
+        taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 100, installedAtCustomer: true,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+    assert.equal(updateArgs?.data.taxSource, "manual");
+});
+
+test("an acknowledgement without both figures is refused, not half-applied", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_REVIEW_INCOMPLETE");
+    assert.equal(updateArgs, null, "nothing is written");
+});
+
+test("an UNflagged row does not need an acknowledgement", async () => {
+    // The ack exists to make clearing a flag deliberate. Requiring it of
+    // ordinary edits would just teach people to send it always.
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+});
+
+test("taxReviewAck on its own has nothing to write", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: false });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /Nothing to update/);
+});
+
+test("a non-boolean taxReviewAck is refused", async () => {
+    const res = await patch({ taxReviewAck: "yes", taxAmount: 1, taxDeductibleBase: 1 });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /taxReviewAck/);
 });

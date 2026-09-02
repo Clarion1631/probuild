@@ -314,6 +314,17 @@ return. As built:
 * `/reports/tax-paid-at-source` counts ONLY an explicit `true`;
 * `Expense.taxDeductibleBase` (added in this PR) holds the resold portion of a MIXED
   receipt, and the report uses it in place of the pre-tax total when it is set;
+* **`Expense.taxSource`** records WHO decided the tax columns: `ocr` (the intake pipeline
+  read it off the receipt) or `manual` (a bookkeeper, through the PATCH). Booking never
+  overwrites a `manual` decision — including the decision that a receipt has NO tax, which
+  is a null `taxAmount` and cannot be told from "nobody has looked" without this column.
+* **`Expense.needsTaxReview` is cleared only by an explicit acknowledgement.** A re-sync
+  that moves the gross on a classified row raises it, and the report skips flagged rows.
+  Clearing it requires `taxReviewAck: true` in the PATCH body AND both `taxAmount` and
+  `taxDeductibleBase` in the same request (`installedAtCustomer` is optional — a null
+  reads as "unanswered" and cannot overstate a deduction). A partial correction is still
+  accepted; it just leaves the flag standing, because the flag means the WHOLE
+  classification is in doubt rather than whichever field the request happens to touch.
 * the correction path is **`PATCH /api/expenses/[id]`**, NOT the PUT on that route. PUT is
   guarded by `assertExpenseMutableOutsideQbo`, and every expense the pipeline books carries a
   `qbPurchaseId` — so PUT cannot reach a single row the tax report is made of, and it now
@@ -343,10 +354,18 @@ Remaining mobile-repo diff (a separate PR in `gtr-probuild-mobile`):
 - The `/api/expenses` no-photo path keeps working unchanged for older builds;
   `costCodeId` is optional there on purpose, so a legacy app is never broken.
 
-## 6. Backfill — `scripts/backfill-expense-attribution.mjs`
+## 6. Backfill — `scripts/backfill-expense-attribution.ts`
 
 One-shot, dry-run DEFAULT (`--apply` to write, `--csv <path>`), same shape and .env
-loading as `suggest-expense-cost-codes.mjs`. Steps:
+loading as `suggest-expense-cost-codes.ts`. It is TypeScript and runs under the tsx
+loader:
+
+```
+node --import=tsx scripts/backfill-expense-attribution.ts          # dry run
+node --import=tsx scripts/backfill-expense-attribution.ts --apply  # write
+```
+
+Steps:
 (a) `projectId` from `estimate.projectId` where NULL (same UPDATE as the apply script —
     belt and braces; report rows touched).
 (b) Item fallback: expenses with `costCodeId` NULL and a coded `itemId` → copy the item's

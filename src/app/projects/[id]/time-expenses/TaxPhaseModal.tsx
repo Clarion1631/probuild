@@ -64,6 +64,9 @@ export default function TaxPhaseModal({
         expense.taxDeductibleBase === null ? "" : String(expense.taxDeductibleBase),
     );
     const [costCodeId, setCostCodeId] = useState<string>(expense.costCodeId ?? "");
+    // Only meaningful on a flagged row: the explicit "I have re-checked these
+    // figures" the server requires before it will clear the flag.
+    const [reviewAck, setReviewAck] = useState(false);
     const [saving, setSaving] = useState(false);
 
     const parsedTax = taxAmount.trim() === "" ? null : Number(taxAmount);
@@ -88,6 +91,19 @@ export default function TaxPhaseModal({
         if (nextBase !== expense.taxDeductibleBase) body.taxDeductibleBase = nextBase;
         const nextCode = costCodeId || null;
         if (nextCode !== expense.costCodeId) body.costCodeId = nextCode;
+
+        // ACKNOWLEDGING A REVIEW SENDS THE FIGURES, CHANGED OR NOT.
+        //
+        // The flag says the whole classification is in doubt because the gross
+        // moved underneath it, so "I did not edit that field" is not the same
+        // as "I checked it". The server refuses an ack that does not carry both
+        // numbers, which is what makes the confirmation mean something.
+        if (expense.needsTaxReview && reviewAck) {
+            body.taxReviewAck = true;
+            body.taxAmount = parsedTax;
+            body.taxAtSource = (parsedTax ?? 0) > 0;
+            body.taxDeductibleBase = nextBase;
+        }
 
         if (Object.keys(body).length === 0) {
             onClose();
@@ -126,10 +142,24 @@ export default function TaxPhaseModal({
                         {expense.vendor || "Expense"} · {money(expense.amount)}
                     </p>
                     {expense.needsTaxReview && (
-                        <p className="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
-                            QuickBooks changed this purchase&apos;s total after someone recorded its tax, so the
-                            tax details were cleared. Please re-check them.
-                        </p>
+                        <div className="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 space-y-2">
+                            <p>
+                                QuickBooks changed this purchase&apos;s total after someone recorded its tax, so
+                                these figures are in doubt. Please re-check them.
+                            </p>
+                            <label className="flex items-start gap-2 font-medium">
+                                <input
+                                    type="checkbox"
+                                    className="mt-0.5"
+                                    checked={reviewAck}
+                                    onChange={event => setReviewAck(event.target.checked)}
+                                />
+                                <span>
+                                    I have re-checked the tax and the deductible amount below. Until this is
+                                    ticked the receipt stays out of the excise report.
+                                </span>
+                            </label>
+                        </div>
                     )}
                 </div>
 

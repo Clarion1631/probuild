@@ -538,6 +538,7 @@ type ExpenseTransaction = {
             installedAtCustomer?: boolean | null;
             taxDeductibleBase?: unknown;
             needsTaxReview?: boolean;
+            taxSource?: string | null;
             amount: unknown;
             vendor: string | null;
             date: Date | null;
@@ -611,6 +612,7 @@ export interface QboExpenseRetirementData {
     qbSyncedAt: Date;
     taxAmount: null;
     taxAtSource: false;
+    taxSource: null;
     installedAtCustomer: null;
     taxDeductibleBase: null;
     needsTaxReview: false;
@@ -958,6 +960,11 @@ export async function deactivateQboExpense(
                 installedAtCustomer: true,
                 taxDeductibleBase: true,
                 needsTaxReview: true,
+                // Retired with the rest of the classification, and therefore
+                // part of "is it already retired?" — otherwise a deleted
+                // purchase that a bookkeeper had classified reports "unchanged"
+                // forever while still carrying their provenance.
+                taxSource: true,
             },
         });
         if (!existing) return "unchanged";
@@ -987,7 +994,8 @@ export async function deactivateQboExpense(
             existing.taxAtSource === false &&
             existing.installedAtCustomer === null &&
             existing.taxDeductibleBase === null &&
-            existing.needsTaxReview === false;
+            existing.needsTaxReview === false &&
+            existing.taxSource === null;
         if (
             Number(existing.amount) === 0 &&
             existing.description === description &&
@@ -1007,6 +1015,7 @@ export async function deactivateQboExpense(
                 qbSyncedAt: removal.qbSyncedAt,
                 taxAmount: null,
                 taxAtSource: false,
+                taxSource: null,
                 installedAtCustomer: null,
                 taxDeductibleBase: null,
                 needsTaxReview: false,
