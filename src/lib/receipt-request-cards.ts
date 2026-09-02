@@ -414,3 +414,74 @@ export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promis
     }
     return { kind: "delivered", owner: card.owner, threadName, messageName };
 }
+
+// ── Re-verifying a claimed snapshot before it goes out ──────────────────────
+
+/** One item's CURRENT truth, read fresh from its ReviewIssue. */
+export interface CardItemTruth {
+    /** Non-null once the issue was answered or the charge got its receipt. */
+    clearedAt: Date | null;
+    /** Every current reason code has been acknowledged by a human. */
+    acknowledged: boolean;
+    /** A signed memo (or another recorded answer) is on the row. */
+    resolved: boolean;
+    /** Who owns it NOW — a human may have reassigned it since selection. */
+    owner: string;
+}
+
+export type CardItemDropReason = "missing" | "cleared" | "acknowledged" | "resolved" | "owner-changed";
+
+export interface RebuiltCard {
+    items: CardItem[];
+    /** What was dropped and why, for the run summary. */
+    dropped: Array<{ issueId: string; reason: CardItemDropReason }>;
+}
+
+/**
+ * Re-verify a claimed snapshot against current truth, immediately before the
+ * card is posted.
+ *
+ * THE SNAPSHOT IS TAKEN EARLY AND POSTED LATE. Selection happens at the top of
+ * the run; the post happens after every other owner's row has been claimed, and
+ * a retry pass can post a snapshot claimed HOURS earlier. Everything that
+ * answers an item — the nightly sweep closing it, a human acknowledging it on
+ * the Receipts tab, a signed memo arriving through the bridge, Marge assigning
+ * it to somebody else — happens in that window, and the card went out anyway.
+ * Asking a person for a receipt they already sent is exactly how a chase list
+ * becomes noise people stop reading.
+ *
+ * `n` is renumbered over the survivors, because the numbers are what people
+ * reply with ("2 is on the truck"). A gap in them would make a reply ambiguous
+ * against the thread the bridge resolves it in.
+ *
+ * PURE: the caller does the reading. An item with no truth entry was deleted
+ * outright and is dropped as `missing`.
+ */
+export function rebuildCardItems(
+    items: readonly CardItem[],
+    truth: ReadonlyMap<string, CardItemTruth>,
+    owner: string,
+): RebuiltCard {
+    const kept: CardItem[] = [];
+    const dropped: RebuiltCard["dropped"] = [];
+    for (const item of items) {
+        const current = truth.get(item.issueId);
+        const reason: CardItemDropReason | null = !current
+            ? "missing"
+            : current.clearedAt !== null
+                ? "cleared"
+                : current.resolved
+                    ? "resolved"
+                    : current.acknowledged
+                        ? "acknowledged"
+                        : current.owner !== owner
+                            ? "owner-changed"
+                            : null;
+        if (reason) {
+            dropped.push({ issueId: item.issueId, reason });
+            continue;
+        }
+        kept.push({ ...item, n: kept.length + 1 });
+    }
+    return { items: kept, dropped };
+}

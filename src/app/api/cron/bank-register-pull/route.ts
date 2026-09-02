@@ -135,7 +135,7 @@ const MINT_MAX_BATCHES = 10;
  * `bankLineId: null`, so a concurrent reconcile that just claimed the same
  * observation wins and this mint rolls back rather than forking the identity.
  */
-async function mintFromQbo(account: string): Promise<{ minted: number; skipped: Record<string, number> }> {
+async function mintFromQbo(account: string, deadlineAt?: number): Promise<{ minted: number; skipped: Record<string, number> }> {
     const since = new Date(Date.now() - MINT_LOOKBACK_DAYS * 86_400_000);
     let minted = 0;
     const skipped: Record<string, number> = {};
@@ -148,6 +148,15 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
     // it, writes at most MINT_BATCH_SIZE rows, and commits; the next batch
     // re-reads the world, so nothing is planned against stale state.
     for (let batch = 0; batch < MINT_MAX_BATCHES; batch++) {
+        // THE RUN'S ABSOLUTE DEADLINE, CHECKED PER BATCH. Minting creates
+        // permanent rows; being killed by the platform half way through leaves
+        // the pull with no checkpoint written, so it re-fetches the same window
+        // and mints against a picture it has already half-acted on. The
+        // deadline handed in already holds back CHECKPOINT_RESERVE_MS.
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+            skipped["deadline"] = (skipped["deadline"] ?? 0) + 1;
+            break;
+        }
         const result = await prisma.$transaction(async tx => {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BANK_LINE_IDENTITY_LOCK}))`;
 
@@ -250,8 +259,11 @@ async function runPull() {
             return { status: response.status, body };
         },
 
-        reconcile: async (account: string) => {
-            const result = await bankLedgerReconcileHandlers.runReconcile(account);
+        reconcile: async (account: string, deadlineAt?: number) => {
+            // The run's absolute deadline goes THROUGH to the linker's own
+            // batch loop: links it cannot start come back in `remaining`
+            // instead of the platform killing this run mid-chunk.
+            const result = await bankLedgerReconcileHandlers.runReconcile(account, deadlineAt);
             return {
                 linked: result.linked,
                 proposed: result.proposed,
@@ -278,10 +290,14 @@ async function runPull() {
     // matcher working from incomplete truth — and a 200 meant the platform
     // never surfaced it, so nobody looked. Whatever committed stays committed
     // and re-running is a no-op for it.
-    // Record the last SUCCESS, not the last run: pipeline-health reads this to
-    // decide whether the chaser is being fed, and a failed run that stamped the
-    // clock would keep the health check green while the pull was dead.
-    if (summary.ok) {
+    // Record the last COMPLETE SUCCESS, not the last run: pipeline-health reads
+    // this to decide whether the chaser is being fed, and a failed run that
+    // stamped the clock would keep the health check green while the pull was
+    // dead. A budget-truncated run is not a failure, but it is not proof the
+    // register is current either — it read part of one window — so it does not
+    // stamp the clock. If truncation persists, the mark goes stale and
+    // `bank-pull-stale` fires, which is exactly the signal wanted.
+    if (summary.ok && summary.complete) {
         try {
             await prisma.automationSetting.upsert({
                 where: { key: BANK_PULL_LAST_SUCCESS_KEY },

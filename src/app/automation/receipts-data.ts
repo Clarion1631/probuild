@@ -8,6 +8,7 @@
  */
 import { prisma } from "@/lib/prisma";
 import { RECEIPT_INTAKE_LIST_SELECT } from "@/lib/receipt-intake/queries";
+import { POSSIBLE_ORPHAN_REASON } from "@/lib/receipt-intake/park";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner } from "@/lib/receipt-requests";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
@@ -277,7 +278,20 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
     const duplicatesWhere = { state: "DUPLICATE", ...projectWhere };
     // Deliberately NOT state-scoped: the whole point is the states the other
     // groups hide.
-    const exceptionsWhere = { postVoidQbPurchaseId: { not: null }, ...projectWhere };
+    //
+    // TWO KINDS OF ORPHAN, and the second one is not optional. A row with
+    // `postVoidQbPurchaseId` has a KNOWN Purchase behind it. A row parked by
+    // hand after `sendAttempted` was set may have one — we never got the
+    // response — so it kept its strong dedup key, and without surfacing it here
+    // that quarantine would be invisible: the human would re-send the receipt,
+    // watch it bounce as a duplicate, and have nothing telling them why.
+    const exceptionsWhere = {
+        OR: [
+            { postVoidQbPurchaseId: { not: null } },
+            { stateReason: { endsWith: `:${POSSIBLE_ORPHAN_REASON}` } },
+        ],
+        ...projectWhere,
+    };
     const issueWhere = { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null };
 
     const [

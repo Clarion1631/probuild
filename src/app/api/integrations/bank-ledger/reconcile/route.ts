@@ -122,14 +122,26 @@ export async function persistLinksInChunks(
     chunkSize: number,
     runChunk: (chunk: ReconcileLink[], chunkIndex: number) => Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }>,
     maxChunks: number = Infinity,
+    /**
+     * `deadlineAt` is an ABSOLUTE epoch-ms instant this loop must not start a
+     * chunk after — the caller's wall clock, already reduced by its own
+     * checkpoint reserve. Un-started chunks come back in `remaining`, exactly
+     * like the `maxChunks` cap: two different reasons to stop, one honest
+     * report. Absent means no deadline, which is every caller but the cron.
+     */
+    options: { deadlineAt?: number; now?: () => number } = {},
 ): Promise<PersistedReconciliation> {
     const linked: string[] = [];
     const exceptions: ReconcileExceptionResult[] = [];
     const chunkErrors: ReconcileChunkError[] = [];
+    const now = options.now ?? (() => Date.now());
 
     let attempted = 0;
     let chunksRun = 0;
     for (let start = 0; start < links.length && chunksRun < maxChunks; start += chunkSize) {
+        // Checked BEFORE the chunk, never during: a chunk is one transaction
+        // and abandoning it half way is not a thing this can do.
+        if (options.deadlineAt !== undefined && now() >= options.deadlineAt) break;
         const chunk = links.slice(start, start + chunkSize);
         const chunkIndex = Math.floor(start / chunkSize);
         try {
@@ -160,7 +172,7 @@ export interface BankLedgerReconcileHandlerDependencies {
     findCandidateBankLines(account: string | null): Promise<ReconcileBankLine[]>;
 
     /** Writes links in bounded chunks, up to RECONCILE_MAX_CHUNKS_PER_INVOCATION per call (see the module comment); a per-link unique-index conflict is caught and reported as an exception, a whole-chunk failure is reported as a chunk error, and any links past the per-invocation cap are reported in `remaining` — none of these fail the whole run. */
-    persistLinks(links: ReconcileLink[]): Promise<PersistedReconciliation>;
+    persistLinks(links: ReconcileLink[], deadlineAt?: number): Promise<PersistedReconciliation>;
 }
 
 function ambiguousForResponse(ambiguous: ReconcileAmbiguousGroup[]) {
@@ -183,7 +195,7 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
      * chunked writes rather than a second implementation. POST keeps every
      * one of its body/scope validations — this is reached only after them.
      */
-    async function runReconcile(account: string | null) {
+    async function runReconcile(account: string | null, deadlineAt?: number) {
         const [observations, bankLines] = await Promise.all([
             dependencies.findUnlinkedQboObservations(account),
             dependencies.findCandidateBankLines(account),
@@ -194,7 +206,7 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
             return { proposed: 0, linked: 0, exceptions: [] as ReconcileExceptionResult[], ambiguous, chunkErrors: [] as ReconcileChunkError[], remaining: 0 };
         }
 
-        const result = await dependencies.persistLinks(proposed);
+        const result = await dependencies.persistLinks(proposed, deadlineAt);
         return {
             proposed: proposed.length,
             linked: result.linked.length,
@@ -322,7 +334,7 @@ const handlers = createBankLedgerReconcileHandlers({
         }));
     },
 
-    persistLinks: async links => {
+    persistLinks: async (links, deadlineAt) => {
         return persistLinksInChunks(links, RECONCILE_CHUNK_SIZE, async (chunk, chunkIndex) => {
             const chunkLinked: string[] = [];
             const chunkExceptions: ReconcileExceptionResult[] = [];
@@ -366,7 +378,7 @@ const handlers = createBankLedgerReconcileHandlers({
             }, { timeout: RECONCILE_TX_TIMEOUT_MS });
 
             return { linked: chunkLinked, exceptions: chunkExceptions };
-        }, RECONCILE_MAX_CHUNKS_PER_INVOCATION);
+        }, RECONCILE_MAX_CHUNKS_PER_INVOCATION, { deadlineAt });
     },
 });
 

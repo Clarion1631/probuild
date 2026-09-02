@@ -84,9 +84,12 @@ test("the lease FAILS CLOSED: an unreadable lease means the run is skipped", () 
     assert.match(source, /catch \(error\) \{[\s\S]*?return null;/);
 });
 
-test("the bank pull records its last SUCCESS, not its last run", () => {
+test("the bank pull records its last COMPLETE success, not its last run", () => {
     // pipeline-health reads this to decide whether the chaser is being fed; a
-    // failed run that stamped the clock would keep the check green.
+    // failed run that stamped the clock would keep the check green. So would a
+    // budget-truncated one, which is not a failure but read only part of one
+    // window — if truncation persists the mark goes stale and bank-pull-stale
+    // fires, which is exactly the signal wanted.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(source, /if \(summary\.ok\) \{[\s\S]*?BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(source, /if \(summary\.ok && summary\.complete\) \{[\s\S]*?BANK_PULL_LAST_SUCCESS_KEY/);
 });

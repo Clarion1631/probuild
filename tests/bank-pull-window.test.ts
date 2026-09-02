@@ -4,6 +4,7 @@ import {
     PULL_FULL_SWEEP_DAYS,
     PULL_MAX_WINDOW_DAYS,
     PULL_OVERLAP_DAYS,
+    CHECKPOINT_RESERVE_MS,
     advanceScanBoundary,
     highWaterOf,
     resumeAfter,
@@ -296,4 +297,150 @@ test("an OLD mark plus an EMPTY capped window still advances the boundary", asyn
     // And the NEXT run therefore asks for a different, later window.
     const next = planPullWindow(saved[0], NOW);
     assert.ok(next.startDate > planned.startDate, `${next.startDate} must be past ${planned.startDate}`);
+});
+
+// ── `complete` is not `ok` (round-12 item 3) ───────────────────────────────
+
+test("a budget-truncated window is ok:true, complete:false — and mints nothing", async () => {
+    // Folding the two together forced a choice between two wrong answers: page
+    // a human for a backlog that is draining normally, or let a run that read
+    // half its window MINT canonical ledger rows and stamp the freshness clock.
+    const saved: PullWindowState[] = [];
+    const mintCalls: Array<number | undefined> = [];
+    let clock = 0;
+    const summary = await runBankRegisterPull(deps({
+        windowState: { highWater: "2026-08-30", lastFullSweep: "2026-09-01" },
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
+        mintFromQbo: async (_account: string, deadlineAt?: number) => {
+            mintCalls.push(deadlineAt);
+            return { minted: 1, skipped: {} };
+        },
+        // 1,200 rows = 3 batches; the third check is over budget.
+        elapsedMs: () => (clock += 20_000) - 20_000,
+        budgetMs: 25_000,
+    }));
+
+    assert.equal(summary.ok, true, "truncation is not a failure");
+    assert.equal(summary.complete, false, "but the picture is partial");
+    assert.equal(summary.continues, true);
+    assert.deepEqual(mintCalls, [], "and NOTHING is minted from a half-read window");
+    assert.equal(summary.mintSkipped, "incomplete-window");
+    assert.equal(saved.length, 1, "the checkpoint is still persisted");
+    assert.ok(saved[0].continueAfter, "with the resume point on it");
+});
+
+test("a capped window and un-attempted links are incomplete, not failures", async () => {
+    // A capped window has history behind it; `remaining` links are the linker
+    // hitting its own cap. Both leave the picture partial, neither is a fault.
+    const capped = await runBankRegisterPull(deps({
+        windowState: { highWater: "2026-01-01", lastFullSweep: "2026-09-01" },
+        saveWindowState: async () => {},
+        elapsedMs: () => 0,
+        budgetMs: 45_000,
+    }));
+    assert.equal(capped.ok, true);
+    assert.equal(capped.complete, false, "60-day cap: more history behind it");
+
+    const incomplete = await runBankRegisterPull(deps({
+        reconcile: async () => ({ linked: 1, proposed: 5, chunkErrors: 0, remaining: 4 }),
+        elapsedMs: () => 0,
+        budgetMs: 45_000,
+    }));
+    assert.equal(incomplete.ok, true, "links not attempted are not an error");
+    assert.equal(incomplete.complete, false);
+    assert.equal(incomplete.error, "reconcile-incomplete");
+
+    // A ROLLED-BACK chunk still is a failure — that one is something going wrong.
+    const rolledBack = await runBankRegisterPull(deps({
+        reconcile: async () => ({ linked: 0, proposed: 5, chunkErrors: 1, remaining: 0 }),
+        elapsedMs: () => 0,
+        budgetMs: 45_000,
+    }));
+    assert.equal(rolledBack.ok, false);
+    assert.equal(rolledBack.complete, false);
+});
+
+// ── The absolute deadline reaches reconcile and mint (item 4) ──────────────
+
+test("reconcile and mint are handed an absolute deadline, minus the reserve", async () => {
+    const seen: Array<number | undefined> = [];
+    const at = 1_800_000_000_000;
+    await runBankRegisterPull(deps({
+        clock: () => at,
+        elapsedMs: () => 10_000,
+        budgetMs: 50_000,
+        reconcile: async (_account: string, deadlineAt?: number) => {
+            seen.push(deadlineAt);
+            return { linked: 0, proposed: 0 };
+        },
+        mintFromQbo: async (_account: string, deadlineAt?: number) => {
+            seen.push(deadlineAt);
+            return { minted: 0, skipped: {} };
+        },
+    }));
+    // 50s budget, 10s already spent, 5s held back for the checkpoint write.
+    assert.deepEqual(seen, [at + 35_000, at + 35_000]);
+    assert.equal(CHECKPOINT_RESERVE_MS, 5_000);
+});
+
+test("no budget means no deadline — every other caller runs unbounded", async () => {
+    const seen: Array<number | undefined> = [];
+    await runBankRegisterPull(deps({
+        reconcile: async (_a: string, deadlineAt?: number) => { seen.push(deadlineAt); return { linked: 0, proposed: 0 }; },
+    }));
+    assert.deepEqual(seen, [undefined]);
+});
+
+test("exhaustion during the FETCH: nothing is ingested, the checkpoint still lands", async () => {
+    // The fetch has already happened by the time the budget is checked, so a
+    // slow QuickBooks can eat the whole invocation. Not one batch may post
+    // after that — a partial post with no checkpoint is what made the next run
+    // replay the same prefix.
+    const ingestCalls: number[] = [];
+    const saved: PullWindowState[] = [];
+    const summary = await runBankRegisterPull(deps({
+        windowState: { highWater: "2026-08-30", lastFullSweep: "2026-09-01" },
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
+        ingest: async (_account: string, lines: BankRegisterIngestLine[]) => {
+            ingestCalls.push(lines.length);
+            return { status: 200, body: { ok: true, inserted: lines.length, existing: 0 } };
+        },
+        // The fetch alone spent the budget.
+        elapsedMs: () => 60_000,
+        budgetMs: 50_000,
+    }));
+    assert.deepEqual(ingestCalls, [], "not a single batch is posted");
+    assert.equal(summary.ok, true);
+    assert.equal(summary.complete, false);
+    assert.equal(summary.remainingBatches, 3, "all three batches are still owed");
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].highWater, "2026-08-30", "the mark cannot move past rows nobody stored");
+});
+
+test("exhaustion at the LAST ingest batch checkpoints the batch before it", async () => {
+    const saved: PullWindowState[] = [];
+    let checks = 0;
+    // Batches 1 and 2 are inside the budget; the check before batch 3 is not.
+    const summary = await runBankRegisterPull(deps({
+        windowState: { highWater: "2026-08-30", lastFullSweep: "2026-09-01" },
+        saveWindowState: async (next: PullWindowState) => { saved.push(next); },
+        elapsedMs: () => (checks++ < 2 ? 0 : 60_000),
+        budgetMs: 50_000,
+    }));
+    assert.equal(summary.continues, true);
+    assert.equal(summary.remainingBatches, 1, "exactly the last batch");
+    assert.equal(summary.complete, false);
+    assert.equal(summary.ok, true);
+    // The resume point is the last line of batch 2 in (date, qbTxnId) order —
+    // the 1000th of 1200 — so batch 3 is exactly what the next run starts
+    // with: no replay, no gap.
+    const ordered = resumeAfter(
+        ROWS.map(r => ({
+            postedDate: r.date, amountCents: r.amountCents,
+            rawDescriptor: r.name ?? "", checkNumber: null, qbTxnId: r.qbTxnId as string,
+        })),
+        null,
+    );
+    assert.equal(summary.continueAfter?.qbTxnId, ordered[999].qbTxnId);
+    assert.deepEqual(saved[0].continueAfter, summary.continueAfter);
 });

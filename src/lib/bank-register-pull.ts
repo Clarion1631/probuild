@@ -333,8 +333,17 @@ export interface BankRegisterPullDependencies {
     fetchRows(startDate: string, endDate: string): Promise<{ rows: BankRegisterRowLike[]; stale: boolean }>;
     /** Posts one batch through the bank-ledger ingest path (source QBO_REGISTER). */
     ingest(account: string, lines: BankRegisterIngestLine[]): Promise<BankRegisterIngestResult>;
-    /** Runs the reconcile step for the account. Errors here never fail the pull. */
-    reconcile(account: string): Promise<{
+    /**
+     * Runs the reconcile step for the account. Errors here never fail the pull.
+     *
+     * `deadlineAt` is an ABSOLUTE epoch-ms deadline, already reduced by
+     * `CHECKPOINT_RESERVE_MS`. Reconcile's own batch loop checks it and stops
+     * cleanly, reporting the links it did not attempt in `remaining` — a
+     * relative budget could not survive being handed across a module boundary,
+     * and without one the linker happily ran past the invocation's wall clock
+     * and the platform killed the run before the checkpoint was written.
+     */
+    reconcile(account: string, deadlineAt?: number): Promise<{
         linked: number;
         proposed: number;
         /** Chunks whose transaction rolled back. Their links did NOT persist. */
@@ -349,8 +358,10 @@ export interface BankRegisterPullDependencies {
      * reconcile, so anything the statement already covers is linked and no
      * longer a mint candidate.
      */
-    mintFromQbo?(account: string): Promise<{ minted: number; skipped: Record<string, number> } | null>;
+    mintFromQbo?(account: string, deadlineAt?: number): Promise<{ minted: number; skipped: Record<string, number> } | null>;
     now?(): number;
+    /** Wall clock, injectable so the absolute deadline is testable. Defaults to Date.now. */
+    clock?(): number;
     account?: string;
     days?: number;
     /** The persisted window state; omitted, the caller gets the legacy fixed window. */
@@ -363,8 +374,34 @@ export interface BankRegisterPullDependencies {
     elapsedMs?(): number;
 }
 
+/**
+ * Held back from the deadline handed to reconcile and mint, so the run still
+ * owns enough of its wall clock to write the checkpoint. A run that spends its
+ * last millisecond linking rows and is then killed mid-write is the failure
+ * this reserve exists to prevent: the work committed, the resume point did not.
+ */
+export const CHECKPOINT_RESERVE_MS = 5_000;
+
 export interface BankRegisterPullSummary {
+    /**
+     * Nothing FAILED. A budget-truncated run is still `ok` — it did what it
+     * could, correctly.
+     */
     ok: boolean;
+    /**
+     * Everything this run set out to do actually happened: the whole window
+     * was fetched and ingested, no history remains behind the window, and
+     * reconcile attempted every link it planned.
+     *
+     * SEPARATE FROM `ok` on purpose. Folding the two together forced a choice
+     * between two wrong answers: call a truncated run a failure (and page a
+     * human at 2am for a backlog that is draining normally), or call it a
+     * success (and let it MINT canonical ledger rows from a window it only
+     * half read, and stamp the freshness clock the health check trusts).
+     * `ok` decides the HTTP status; `complete` decides whether this run's
+     * picture is whole enough to act on.
+     */
+    complete: boolean;
     account: string;
     startDate: string;
     endDate: string;
@@ -399,7 +436,7 @@ export interface BankRegisterPullSummary {
     fullSweep?: boolean;
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
-    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed";
+    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window";
     minted?: { minted: number; skipped: Record<string, number> } | null;
 }
 
@@ -426,6 +463,19 @@ export async function runBankRegisterPull(
     const { startDate, endDate } = planned;
     const elapsed = dependencies.elapsedMs ?? (() => 0);
     const budgetMs = dependencies.budgetMs ?? Number.POSITIVE_INFINITY;
+    const clock = dependencies.clock ?? (() => Date.now());
+    /**
+     * The ABSOLUTE instant reconcile and mint must be finished by, minus the
+     * checkpoint reserve. Read fresh each time: the fetch and the ingest have
+     * already spent part of the budget by the time reconcile starts, and
+     * handing it the budget it had at the top of the run would be handing it
+     * time that no longer exists.
+     */
+    const workDeadline = (): number | undefined => (
+        Number.isFinite(budgetMs)
+            ? clock() + (budgetMs - elapsed()) - CHECKPOINT_RESERVE_MS
+            : undefined
+    );
 
     const fetched = await dependencies.fetchRows(startDate, endDate);
     const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
@@ -436,6 +486,8 @@ export async function runBankRegisterPull(
     // success.
     const summary: BankRegisterPullSummary = {
         ok: !fetched.stale,
+        // Assumed whole until something proves otherwise, below.
+        complete: !fetched.stale,
         account,
         startDate,
         endDate,
@@ -455,10 +507,16 @@ export async function runBankRegisterPull(
     // that has nothing to do with the other rows.
     if (conflicts.length > 0) {
         summary.ok = false;
+        summary.complete = false;
         summary.error = "qbo-duplicate-conflict";
         summary.conflictQbTxnIds = [...conflicts];
     }
     summary.fullSweep = planned.fullSweep;
+    // A CAPPED window is not an incomplete RUN, but it is an incomplete
+    // PICTURE: history remains behind it, and minting from a partial backlog
+    // creates canonical rows whose statement counterpart is in the part we have
+    // not read yet.
+    if (planned.continues) summary.complete = false;
     // NOTE: no early return on an empty fetch. Reconciliation still has to run —
     // yesterday's observations may be waiting for a canonical line that only
     // arrived today, and skipping the backlog because TONIGHT'S register was
@@ -480,6 +538,11 @@ export async function runBankRegisterPull(
     for (const batch of batches) {
         if (elapsed() >= budgetMs) {
             summary.continues = true;
+            // Truncated, not failed: it posted what it could and recorded where
+            // to carry on. `ok` stays true; `complete` is what says the picture
+            // is partial, and it is `complete` that gates minting and the
+            // freshness stamp.
+            summary.complete = false;
             summary.remainingBatches = batches.length - batchIndex;
             break;
         }
@@ -492,6 +555,7 @@ export async function runBankRegisterPull(
             continue;
         }
         summary.ok = false;
+        summary.complete = false;
         summary.error = body?.reason ?? `http-${status}`;
         if (body?.qbTxnId) {
             summary.conflictQbTxnIds = [...new Set([...(summary.conflictQbTxnIds ?? []), body.qbTxnId])];
@@ -503,18 +567,22 @@ export async function runBankRegisterPull(
     // evidence, and linking it is what unblocks receipt matching. A reconcile
     // failure is reported, never thrown — the observations are already stored.
     try {
-        const reconciled = await dependencies.reconcile(account);
+        // The absolute deadline, minus the checkpoint reserve, so the linker's
+        // own batch loop stops in time for this run to record where it got to.
+        const reconciled = await dependencies.reconcile(account, workDeadline());
         summary.reconciled = reconciled;
-        // PARTIAL WORK IS NOT SUCCESS. `chunkErrors` means a chunk's whole
-        // transaction rolled back, and `remaining` means links were never
-        // attempted — both leave observations unlinked, which is exactly the
-        // state that starves the matcher. Reporting 200 here meant the run
-        // looked clean while the ledger was still incomplete.
+        // A ROLLED-BACK CHUNK IS A FAILURE; LINKS NOT ATTEMPTED ARE MERELY
+        // INCOMPLETE. Both leave observations unlinked, which starves the
+        // matcher — but only one of them is something going wrong. `remaining`
+        // is the linker hitting its own cap or this run's deadline, which is
+        // the system working as designed and draining over several passes;
+        // paging a human for it trains them to ignore the page.
         if (reconciled && (reconciled.chunkErrors ?? 0) > 0) {
             summary.ok = false;
+            summary.complete = false;
             summary.error = summary.error ?? "reconcile-chunk-errors";
         } else if (reconciled && (reconciled.remaining ?? 0) > 0) {
-            summary.ok = false;
+            summary.complete = false;
             summary.error = summary.error ?? "reconcile-incomplete";
         }
     } catch (error) {
@@ -523,6 +591,7 @@ export async function runBankRegisterPull(
         // starve the matcher, which is the entire reason this cron exists.
         // Swallowing it returned 200 and nothing was ever paged.
         summary.ok = false;
+        summary.complete = false;
         summary.error = summary.error ?? "reconcile-failed";
         console.error("[bank-register-pull] reconcile failed", error instanceof Error ? error.message : "UnknownError");
     }
@@ -535,17 +604,28 @@ export async function runBankRegisterPull(
     // writes a permanent row from a picture we already know is wrong, and
     // `amountCents` is immutable by trigger, so only a human can undo it.
     // Reconciliation just LINKS rows that already exist, so it always runs.
-    const mintIsSafe = summary.ok && !fetched.stale && conflicts.length === 0;
+    // AND IT NEEDS A COMPLETE ONE. A budget-truncated run has ingested only
+    // part of its window, so an observation whose canonical line is in the part
+    // it never read looks unmatched — and minting turns that into a permanent
+    // duplicate BankLine that only a human can unpick.
+    const mintIsSafe = summary.ok && summary.complete && !fetched.stale && conflicts.length === 0;
     if (dependencies.mintFromQbo && !mintIsSafe) {
         summary.minted = null;
-        summary.mintSkipped = fetched.stale ? "stale-fetch" : conflicts.length > 0 ? "conflicts" : "ingest-failed";
+        summary.mintSkipped = fetched.stale
+            ? "stale-fetch"
+            : conflicts.length > 0
+                ? "conflicts"
+                : summary.ok
+                    ? "incomplete-window"
+                    : "ingest-failed";
     }
     if (dependencies.mintFromQbo && mintIsSafe) {
         try {
-            summary.minted = await dependencies.mintFromQbo(account);
+            summary.minted = await dependencies.mintFromQbo(account, workDeadline());
         } catch (error) {
             summary.minted = null;
             summary.ok = false;
+            summary.complete = false;
             summary.error = summary.error ?? "mint-failed";
             console.error("[bank-register-pull] mint failed", error instanceof Error ? error.message : "UnknownError");
         }
@@ -560,28 +640,35 @@ export async function runBankRegisterPull(
     }
 
     if (dependencies.saveWindowState && dependencies.windowState && summary.ok) {
-        const complete = !summary.continues;
-        // The mark still only moves for a COMPLETE run — stepping the window
-        // past rows this one never stored would lose them. But a complete run
-        // scanned the WHOLE window, so the boundary is its end date, not merely
-        // the newest row that happened to come back (see advanceScanBoundary).
-        const highWater = complete
+        // NOT `summary.complete`. This asks the narrower question "did this run
+        // ingest every batch of the window it fetched?", and a CAPPED window
+        // that finished is exactly the case whose mark must advance — that
+        // advance is how a backlog drains forward instead of re-planning the
+        // same window forever. `summary.complete` is about the whole picture
+        // and is deliberately false for a capped window.
+        const windowFullyIngested = !summary.continues;
+        // The mark still only moves when the window was fully ingested —
+        // stepping it past rows this one never stored would lose them. And it
+        // moves to the window's END DATE, not merely the newest row that
+        // happened to come back (see advanceScanBoundary).
+        const highWater = windowFullyIngested
             ? advanceScanBoundary(dependencies.windowState.highWater, endDate, lines)
             : dependencies.windowState.highWater;
         summary.highWater = highWater;
         try {
             await dependencies.saveWindowState({
                 highWater,
-                lastFullSweep: complete && planned.fullSweep
+                lastFullSweep: windowFullyIngested && planned.fullSweep
                     ? endDate
                     : dependencies.windowState.lastFullSweep,
-                // Cleared on a complete run; set when we stopped part way.
-                continueAfter: complete ? null : summary.continueAfter ?? dependencies.windowState.continueAfter ?? null,
+                // Cleared on a finished window; set when we stopped part way.
+                continueAfter: windowFullyIngested ? null : summary.continueAfter ?? dependencies.windowState.continueAfter ?? null,
             });
         } catch (error) {
             // Same reasoning as the sweep's cursor: work committed, the
             // checkpoint did not, so the run must not report success.
             summary.ok = false;
+            summary.complete = false;
             summary.error = summary.error ?? "window-state-write-failed";
             console.error("[bank-register-pull] window state write failed", error instanceof Error ? error.message : "UnknownError");
         }

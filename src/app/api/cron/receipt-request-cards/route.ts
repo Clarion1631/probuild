@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord, effectiveOwner } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord, effectiveOwner, hasResolution } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_RATE_CEILING,
@@ -12,9 +12,11 @@ import {
     isPacificWeekday,
     pacificDate,
     postOwnerCard,
+    rebuildCardItems,
     selectOwnerItems,
     type CardCandidateIssue,
     type CardItem,
+    type CardItemTruth,
     type OwnerCard,
 } from "@/lib/receipt-request-cards";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
@@ -168,6 +170,34 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
     }
 
     return { candidates, pages, exhausted };
+}
+
+/**
+ * Current truth for the issues in a claimed snapshot, read in ONE query right
+ * before the send. The shape is exactly what `rebuildCardItems` needs, so the
+ * decision itself stays pure and testable.
+ */
+async function loadCardItemTruth(issueIds: string[]): Promise<Map<string, CardItemTruth>> {
+    if (issueIds.length === 0) return new Map();
+    const rows = await prisma.reviewIssue.findMany({
+        where: { id: { in: issueIds } },
+        select: { id: true, clearedAt: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
+    });
+    const truth = new Map<string, CardItemTruth>();
+    for (const row of rows) {
+        const details = parseMissingReceiptDetails(row.displayDetails);
+        const currentCodes = decodeReasonCodes(row.reasonCodes);
+        const acked = new Set(decodeReasonCodes(row.acknowledgedCodes));
+        truth.set(row.id, {
+            clearedAt: row.clearedAt,
+            acknowledged: currentCodes.length > 0 && currentCodes.every(code => acked.has(code)),
+            resolved: hasResolution(details),
+            owner: effectiveOwner(details),
+        });
+    }
+    // Ids with no row are simply absent — rebuildCardItems drops them as
+    // `missing`, which is the right answer for an issue that was deleted.
+    return truth;
 }
 
 /** Parse a claimed row's immutable item snapshot back into card items. */
@@ -349,11 +379,44 @@ export async function GET(request: Request) {
     }
 
     const posted: Array<{ owner: string; items: number; threadName: string | null; resumed: boolean }> = [];
+    // Rows whose every item was answered between selection and the send. The
+    // row is REMOVED rather than marked, so the owner's day is not consumed:
+    // the unique key is (owner, pacificDate), and a row left behind would block
+    // a card for genuinely new items later the same day.
+    const cancelled: string[] = [];
+    const dropped: Array<{ owner: string; issueId: string; reason: string }> = [];
     // A webhook IS configured and a delivery still failed. That is an outage,
     // not a quiet day: a 200 here meant nobody was ever told the crew's card
     // did not go out.
     const failures: string[] = [];
-    for (const { card, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+    for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+        // RE-VERIFY UNDER THE CLAIM, IMMEDIATELY BEFORE THE SEND.
+        //
+        // The snapshot was chosen at the top of the run — or, on a retry pass,
+        // hours ago. The sweep closing an item, a human acknowledging it, a
+        // signed memo arriving, or Marge reassigning it all happen in that
+        // window, and the card went out regardless. Asking somebody for a
+        // receipt they already sent is how the list becomes noise.
+        const truth = await loadCardItemTruth(claimedCard.items.map(item => item.issueId));
+        const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);
+        for (const drop of rebuilt.dropped) dropped.push({ owner: claimedCard.owner, ...drop });
+
+        if (rebuilt.items.length === 0) {
+            // Nothing left to ask about. Delete the row rather than posting an
+            // empty card or parking a status: a row that survives holds this
+            // owner's (owner, pacificDate) slot, so a genuinely new item found
+            // later today would have no card to go on.
+            await prisma.receiptRequestCard.deleteMany({
+                where: { id: rowId, claimToken: token, postedAt: null },
+            });
+            cancelled.push(claimedCard.owner);
+            continue;
+        }
+
+        const card = rebuilt.dropped.length === 0
+            ? claimedCard
+            : buildCardFromItems(claimedCard.owner, date, rebuilt.items, claimedCard.overflow, claimedCard.overflowExact);
+
         // HISTORY IS WRITTEN AFTER A VALIDATED POST, and only then.
         //
         // Writing it first (the previous shape) marked items `everCarded` for
@@ -367,7 +430,11 @@ export async function GET(request: Request) {
         // from a crash before it, so the next run knows not to repost.
         const marked = await prisma.receiptRequestCard.updateMany({
             where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
-            data: { status: "POSTING" },
+            // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The row is
+            // the record of the card that was posted; leaving the pre-rebuild
+            // list on it would make a resumed run re-post items this one
+            // deliberately dropped.
+            data: { status: "POSTING", itemsJson: JSON.stringify(card.items) },
         });
         if (marked.count === 0) {
             // Someone else owns it now; do not send.
@@ -450,6 +517,10 @@ export async function GET(request: Request) {
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
         claimed: toPost.length,
+        // Rows whose whole snapshot was answered between selection and the
+        // send. Not a failure — the opposite — but worth seeing.
+        cancelledOwners: cancelled,
+        droppedItems: dropped,
         posted,
     };
     if (failures.length > 0) {

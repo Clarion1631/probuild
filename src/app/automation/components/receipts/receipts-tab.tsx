@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
 import { retryTargetFor } from "@/lib/receipt-intake/route-state";
+import { isPossibleOrphanReason } from "@/lib/receipt-intake/park";
 import { StatCard } from "../shared/stat-card";
 import MarkReviewedButton from "../register/mark-reviewed-button";
 import {
@@ -165,9 +166,9 @@ export function ReceiptsTab({
             {groupIsVisible("exceptions", filters) && queue.counts.exceptions > 0 && (
                 <GroupCard title={RECEIPT_GROUP_LABELS.exceptions} count={counts.exceptions}>
                     <p className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">
-                        QuickBooks holds a purchase for each of these, but the receipt was voided or re-classified
-                        before it finished booking. Nothing here can remove them — open each one in QuickBooks, void it
-                        there, then mark it resolved.
+                        Each of these was voided or re-classified after the send to QuickBooks had already started.
+                        Where the purchase id is known it is linked below — open it in QuickBooks, void it there, then
+                        mark it resolved. Nothing here can remove it for you.
                     </p>
                     {queue.exceptions.map(row => (
                         <RowShell key={row.id}>
@@ -177,6 +178,13 @@ export function ReceiptsTab({
                                     state <span className="font-mono">{row.state}</span>
                                     {row.stateReason ? ` · ${row.stateReason}` : ""}
                                 </p>
+                                {isPossibleOrphanReason(row.stateReason) && !row.postVoidQbPurchaseId && (
+                                    <p className="text-xs text-red-700 mt-1">
+                                        The send had started, so QuickBooks may hold a purchase we never got an answer
+                                        for. Check QuickBooks for this vendor and amount. This receipt stays blocked
+                                        from re-sending until you resolve it, so the same purchase can&apos;t book twice.
+                                    </p>
+                                )}
                             </div>
                             <div className="flex items-center gap-3 flex-wrap">
                                 {row.postVoidQbPurchaseId && (

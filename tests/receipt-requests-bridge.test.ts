@@ -351,14 +351,16 @@ test("minting and adoption run in bounded transactions with explicit timeouts", 
     assert.match(ingest, /timeout: STATEMENT_TX_TIMEOUT_MS/);
 });
 
-test("the bank pull fails on a stale fetch, chunk errors, or unattempted links", () => {
+test("the bank pull fails on a stale fetch and on chunk errors; truncation is not a failure", () => {
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     assert.match(lib, /ok: !fetched\.stale/);
     assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-chunk-errors";/);
     assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-incomplete";/);
-    // The last-success stamp is only written for a fully successful run.
+    // The last-success stamp needs a run that was BOTH clean and whole: a
+    // budget-truncated run read part of one window, which is not proof the
+    // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /if \(summary\.ok\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -421,8 +423,10 @@ test("reconciliation always runs; minting needs a fresh, conflict-free pull", ()
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     // No early return that would skip the backlog on an empty fetch.
     assert.doesNotMatch(lib, /if \(lines\.length === 0\) return summary;/);
-    assert.match(lib, /const mintIsSafe = summary\.ok && !fetched\.stale && conflicts\.length === 0;/);
-    assert.match(lib, /mintSkipped = fetched\.stale \? "stale-fetch"/);
+    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && conflicts\.length === 0;/);
+    assert.match(lib, /summary\.mintSkipped = fetched\.stale\s*\n\s*\? "stale-fetch"/);
+    // A truncated window has its own reason, distinct from a failed ingest.
+    assert.match(lib, /\? "incomplete-window"/);
 });
 
 test("the lease release is a single fenced statement", () => {
@@ -434,7 +438,7 @@ test("the lease release is a single fenced statement", () => {
 
 test("cards write POSTING before the webhook and never repost an uncertain row", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    const markAt = source.indexOf('data: { status: "POSTING" }');
+    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
     const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
     assert.ok(markAt > 0 && postAt > markAt, "POSTING must be written BEFORE the call");
     // A post that succeeded but whose completion write lost is UNCERTAIN.
@@ -651,4 +655,23 @@ test("signed:true with no durable artifact is a 400 that writes nothing", async 
     const notOurs = await post({ fingerprint: "bev-42", signed: true });
     assert.equal(notOurs.status, 200);
     assert.deepEqual(await notOurs.json(), { ok: true, ignored: true });
+});
+
+test("the card snapshot is re-verified under the claim, immediately before the send", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    // Rebuild -> (cancel | POSTING) -> post. In that order, inside the loop
+    // that already holds the claim token.
+    const rebuildAt = source.indexOf("const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);");
+    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    assert.ok(rebuildAt > 0 && markAt > rebuildAt && postAt > markAt);
+    // The truth is read fresh, not carried from the selection scan.
+    assert.match(source, /async function loadCardItemTruth\(issueIds: string\[\]\)/);
+    assert.match(source, /where: \{ id: \{ in: issueIds \} \}/);
+    // An empty rebuild DELETES the row, so the owner's day is not consumed by
+    // a slot that can never be posted.
+    assert.match(source, /if \(rebuilt\.items\.length === 0\) \{[\s\S]{0,600}deleteMany\(\{\s*\n\s*where: \{ id: rowId, claimToken: token, postedAt: null \}/);
+    // The retry pass goes through the SAME loop, so it rebuilds too: it posts
+    // from `toPost`, which every path feeds.
+    assert.match(source, /for \(const \{ card: claimedCard, rowId, token, resumed \} of toPost\.slice\(0, CARD_RATE_CEILING\)\)/);
 });

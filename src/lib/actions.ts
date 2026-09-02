@@ -21,6 +21,7 @@ import { parsePaymentDateInput } from "./payment-date";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
+import { planParkWrites, type ParkPlan } from "./receipt-intake/park";
 import { RECEIPT_OWNER_CHOICES, RECEIPT_REQUEST_TARGET_TYPE } from "./receipt-requests";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { prismaPhaseDataSource } from "./project-phases-db";
@@ -15248,6 +15249,24 @@ async function receiptIntakeWriteFailure(id: string, allowedStates: readonly str
     throw new StaleReceiptIntakeError();
 }
 
+/**
+ * Run a park plan: try the key-releasing write, and if it matched nothing try
+ * the key-KEEPING one. Both losing means the row moved under the human (or the
+ * worker holds it), which is a refusal they can act on.
+ *
+ * The order matters and is not an optimisation: the release branch is the
+ * narrower CAS (`sendAttempted: false`), so trying it first means the common,
+ * clean case takes exactly one write, and the fallback only runs for a row
+ * whose send had already started.
+ */
+async function runParkWrites(plan: ParkPlan, id: string, expected: string, now: Date): Promise<void> {
+    const released = await prisma.receiptIntake.updateMany(plan.release);
+    if (released.count === 1) return;
+    const kept = await prisma.receiptIntake.updateMany(plan.keep);
+    if (kept.count === 1) return;
+    await receiptIntakeWriteFailure(id, [expected], now);
+}
+
 /** Every state a manual write may legally act on (never BOOKED/ARCHIVED). */
 const HUMAN_WRITABLE_STATES = ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING", "DUPLICATE", "VOID", "NON_RECEIPT"];
 
@@ -15359,23 +15378,18 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
         // A BOOKED row is money history — it is never reclassified from here.
         throw new Error("That receipt can't be marked a duplicate");
     }
-    const result = await prisma.receiptIntake.updateMany({
-        // CAS on the exact state the view saw. The lease fence matters most on
-        // this path: BOOKING is a legal source state, and BOOKING is where the
-        // worker is mid-send.
-        where: { id, state: expected, ...notClaimedByWorker(now) },
-        data: {
-            state: "DUPLICATE",
-            duplicateOfId,
-            stateReason: `manual-dup:${duplicateOfId}`,
-            nextRetryAt: null,
-            // Parked without ever reaching QuickBooks, so the strong key goes
-            // back — same rule as book.ts, or a corrected re-send of this
-            // receipt would be quarantined against a row that never booked.
-            dedupStrongKey: null,
-        },
-    });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
+    // CAS on the exact state the view saw. The lease fence matters most on this
+    // path: BOOKING is a legal source state, and BOOKING is where the worker is
+    // mid-send. The strong key goes back ONLY if the send had not started —
+    // see planParkWrites.
+    await runParkWrites(planParkWrites({
+        id,
+        expectedState: expected,
+        targetState: "DUPLICATE",
+        stateReason: `manual-dup:${duplicateOfId}`,
+        extraData: { duplicateOfId },
+        claimFence: notClaimedByWorker(now),
+    }), id, expected, now);
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15403,11 +15417,13 @@ export async function voidReceiptIntake(id: string, expectedState: string) {
     const now = new Date();
     const expected = assertExpectedState(expectedState);
     if (["BOOKED", "ARCHIVED"].includes(expected)) throw new Error("A booked receipt can't be voided");
-    const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: expected, ...notClaimedByWorker(now) },
-        data: { state: "VOID", stateReason: "voided-by-user", nextRetryAt: null, dedupStrongKey: null },
-    });
-    if (result.count === 0) await receiptIntakeWriteFailure(id, [expected], now);
+    await runParkWrites(planParkWrites({
+        id,
+        expectedState: expected,
+        targetState: "VOID",
+        stateReason: "voided-by-user",
+        claimFence: notClaimedByWorker(now),
+    }), id, expected, now);
     revalidateReceiptQueue();
     return { success: true };
 }

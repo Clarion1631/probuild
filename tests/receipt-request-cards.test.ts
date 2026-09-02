@@ -4,6 +4,7 @@ import { effectiveOwner } from "../src/lib/receipt-requests";
 import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
+    buildCardFromItems,
     buildOwnerCards,
     centsToAmount,
     isPacificWeekday,
@@ -12,8 +13,11 @@ import {
     parseOwnerChatUsers,
     postOwnerCard,
     requestIdFor,
+    rebuildCardItems,
     serializeThreads,
     type CardCandidateIssue,
+    type CardItem,
+    type CardItemTruth,
 } from "../src/lib/receipt-request-cards";
 
 // A Thursday, 8:00 AM Pacific.
@@ -272,4 +276,97 @@ test("a 2xx with NO message name is UNKNOWN, not rejected", async () => {
         assert.equal(r.kind, "unknown", JSON.stringify(body));
         assert.equal(r.reason, "no-bridge-identity");
     }
+});
+
+// ── The snapshot is re-verified under the claim, before the send (item 5) ───
+
+const truthOf = (over: Partial<CardItemTruth> = {}): CardItemTruth => ({
+    clearedAt: null,
+    acknowledged: false,
+    resolved: false,
+    owner: "CJ",
+    ...over,
+});
+
+const cardItem = (issueId: string, n: number): CardItem => ({
+    n,
+    fingerprint: `pb-bl-${issueId}`,
+    date: "2026-08-16",
+    vendor: "LOWES",
+    cents: 12_345,
+    amount: "123.45",
+    cardTail: "8516",
+    issueId,
+    targetKey: `bl-${issueId}`,
+});
+
+test("an item answered between selection and the send is dropped from the card", () => {
+    // Selection happens at the top of the run; a retry pass posts a snapshot
+    // claimed hours earlier. Everything that answers an item happens in that
+    // window — and the card used to go out regardless.
+    const items = [cardItem("a", 1), cardItem("b", 2), cardItem("c", 3), cardItem("d", 4), cardItem("e", 5)];
+    const truth = new Map<string, CardItemTruth>([
+        ["a", truthOf()],
+        // The sweep closed it: the receipt turned up.
+        ["b", truthOf({ clearedAt: new Date("2026-08-20T14:00:00Z") })],
+        // A memo was signed through the bridge.
+        ["c", truthOf({ resolved: true })],
+        // A human acknowledged it on the Receipts tab.
+        ["d", truthOf({ acknowledged: true })],
+        // Marge reassigned it to Richard.
+        ["e", truthOf({ owner: "Richard" })],
+    ]);
+
+    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    assert.deepEqual(rebuilt.items.map(i => i.issueId), ["a"]);
+    assert.deepEqual(rebuilt.dropped, [
+        { issueId: "b", reason: "cleared" },
+        { issueId: "c", reason: "resolved" },
+        { issueId: "d", reason: "acknowledged" },
+        { issueId: "e", reason: "owner-changed" },
+    ]);
+});
+
+test("an issue that no longer exists is dropped, not carried", () => {
+    const rebuilt = rebuildCardItems([cardItem("gone", 1)], new Map(), "CJ");
+    assert.deepEqual(rebuilt.items, []);
+    assert.deepEqual(rebuilt.dropped, [{ issueId: "gone", reason: "missing" }]);
+});
+
+test("survivors are RENUMBERED, because the numbers are what people reply with", () => {
+    // "2 is on the truck" has to mean the second line of the card that was
+    // actually posted; a gap in the numbering makes the reply ambiguous.
+    const items = [cardItem("a", 1), cardItem("b", 2), cardItem("c", 3)];
+    const truth = new Map<string, CardItemTruth>([
+        ["a", truthOf({ clearedAt: new Date() })],
+        ["b", truthOf()],
+        ["c", truthOf()],
+    ]);
+    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    assert.deepEqual(rebuilt.items.map(i => i.n), [1, 2]);
+    assert.deepEqual(rebuilt.items.map(i => i.issueId), ["b", "c"]);
+    // And the rendered card counts from 1 with no gaps.
+    // Anchored per line: the amounts contain dots too ("$123.45").
+    const card = buildCardFromItems("CJ", "2026-08-20", rebuilt.items, 0);
+    assert.match(card.text, /^1\. /m);
+    assert.match(card.text, /^2\. /m);
+    assert.doesNotMatch(card.text, /^3\. /m, "no gap, and no third line");
+});
+
+test("nothing left to ask about produces an EMPTY rebuild, which cancels the card", () => {
+    const items = [cardItem("a", 1), cardItem("b", 2)];
+    const truth = new Map<string, CardItemTruth>([
+        ["a", truthOf({ clearedAt: new Date() })],
+        ["b", truthOf({ resolved: true })],
+    ]);
+    assert.deepEqual(rebuildCardItems(items, truth, "CJ").items, []);
+});
+
+test("an untouched snapshot rebuilds to itself, byte for byte", () => {
+    // The common case must not churn the row or renumber anything.
+    const items = [cardItem("a", 1), cardItem("b", 2)];
+    const truth = new Map<string, CardItemTruth>([["a", truthOf()], ["b", truthOf()]]);
+    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    assert.deepEqual(rebuilt.items, items);
+    assert.deepEqual(rebuilt.dropped, []);
 });
