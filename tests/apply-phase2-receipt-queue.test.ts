@@ -100,3 +100,37 @@ test("the target guard is exact on BOTH db and host — no degenerate substring 
     assert.equal(targetMatches(null, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches({ db: "postgres" }, "postgres", ""), true);
 });
+
+test("column verification checks type, nullability and default — not just names", () => {
+    // A name-only check passes against a column of the wrong type, and against
+    // a NOT NULL column added to a populated table with no default (where the
+    // DDL succeeds and every later INSERT fails at runtime instead).
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+    assert.match(source, /data_type, is_nullable, column_default/);
+    assert.match(source, /actual\.data_type !== column\.type/);
+    assert.match(source, /is_nullable === "YES"/);
+    assert.match(source, /column_default/);
+});
+
+test("the round-2 columns are in the script, the migration AND schema.prisma", async t => {
+    const cases: Array<[string, string, RegExp]> = [
+        ["ReceiptRequestCard.claimedAt", '"claimedAt" TIMESTAMP(3)', /claimedAt\s+DateTime\?/],
+        ["ReceiptRequestCard.claimToken", '"claimToken" TEXT', /claimToken\s+String\?/],
+        ["ReceiptIntake.postVoidQbPurchaseId", '"postVoidQbPurchaseId" TEXT', /postVoidQbPurchaseId\s+String\?/],
+    ];
+    for (const [label, ddl, prismaField] of cases) {
+        await t.test(label, () => {
+            assert.ok((statements as string[]).some(s => s.includes(ddl)), `apply script missing ${ddl}`);
+            assert.ok(normalize(migrationSql).includes(normalize(ddl)), `migration missing ${ddl}`);
+            assert.match(schemaPrisma, prismaField, `schema.prisma missing ${label}`);
+        });
+    }
+});
+
+test("the three-column BankLine index exists in all three places", () => {
+    // Declared in schema.prisma too, or `prisma migrate diff` proposes creating
+    // it on every future run and the committed migrations stop being TRUE.
+    assert.ok((statements as string[]).some(s => s.includes("BankLine_account_postedDate_amountCents_idx")));
+    assert.ok(normalizedMigration.includes("bankline_account_posteddate_amountcents_idx"));
+    assert.match(schemaPrisma, /@@index\(\[account, postedDate, amountCents\]\)/);
+});

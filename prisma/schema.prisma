@@ -2752,6 +2752,12 @@ model ReceiptRequestCard {
   itemsJson   String
   /// Items that did not fit on this card; they are tomorrow's first candidates.
   overflow    Int       @default(0)
+  /// When a run took the post-claim, and the token identifying THAT run. Only
+  /// the holder may mark the row posted, so an overlapping run can never
+  /// complete a post it did not make. A claim older than the lease is up for
+  /// grabs again, which is what makes a crashed run recoverable.
+  claimedAt   DateTime?
+  claimToken  String?
   postedAt    DateTime?
   threadName  String?
   messageName String?
@@ -2862,6 +2868,11 @@ model BankLine {
   refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
 
   @@index([account, postedDate])
+  /// Adoption and minting both look a line up by its full identity prefix.
+  /// Declared here as well as in the migration and the apply script, or
+  /// `prisma migrate diff` proposes creating it forever (CLAUDE.md: the
+  /// committed migrations must be TRUE).
+  @@index([account, postedDate, amountCents])
   @@index([qbTxnId])
 }
 
@@ -3142,6 +3153,12 @@ model ReceiptIntake {
   /// the boundary, because "old" is not proof anybody booked anything.
   archivedByV1       Boolean  @default(false)
   qbPurchaseId       String?
+  /// A QuickBooks Purchase that WAS created, for a row somebody voided while
+  /// the send was in flight. Deliberately NOT `qbPurchaseId`: that column means
+  /// "this row is booked", and this row is not — the money exists in QBO and a
+  /// human has to go void it there. Paired with stateReason
+  /// "booked-after-void" so the queue surfaces it.
+  postVoidQbPurchaseId String?
   expenseId          String?   @unique
   expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
   archiveDriveFileId String?

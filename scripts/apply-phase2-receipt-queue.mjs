@@ -113,13 +113,53 @@ export const statements = [
     // The 14-day retention scan and the threads endpoint both read by date.
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
        ON "ReceiptRequestCard"("pacificDate")`,
+
+    // 3. The POST-claim, distinct from the row itself. Only the run holding
+    // `claimToken` may mark the row posted, so an overlapping run can never
+    // complete a post it did not make. Added as ALTERs rather than folded into
+    // the CREATE TABLE above, because CREATE TABLE IF NOT EXISTS is a no-op
+    // against a table an earlier run of this script already made — that is the
+    // whole reason the script is re-runnable.
+    `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
+    `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
+
+    // 4. A Purchase QuickBooks created for a receipt somebody voided while the
+    // send was in flight. NOT qbPurchaseId — that column means "this row is
+    // booked", and this row is not; the money exists in QBO and a human has to
+    // void it there.
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT`,
 ];
 
+/**
+ * Verified on TYPE, NULLABILITY and DEFAULT, not just presence.
+ *
+ * A name-only check passes against a column of the wrong type, and — the case
+ * that actually bites — against a NOT NULL column added to a populated table
+ * with NO default, where the DDL succeeds and every later INSERT fails at
+ * runtime instead. `default: null` means "no default expected".
+ */
 const expectedColumns = {
-    BankLine: ["sourceOfRecord"],
+    BankLine: [
+        { name: "sourceOfRecord", type: "text", nullable: false, default: "'STATEMENT'::text" },
+    ],
     ReceiptRequestCard: [
-        "id", "owner", "pacificDate", "itemsJson", "overflow", "postedAt",
-        "threadName", "messageName", "attempts", "lastError", "createdAt", "updatedAt",
+        { name: "id", type: "text", nullable: false, default: null },
+        { name: "owner", type: "text", nullable: false, default: null },
+        { name: "pacificDate", type: "text", nullable: false, default: null },
+        { name: "itemsJson", type: "text", nullable: false, default: null },
+        { name: "overflow", type: "integer", nullable: false, default: "0" },
+        { name: "claimedAt", type: "timestamp without time zone", nullable: true, default: null },
+        { name: "claimToken", type: "text", nullable: true, default: null },
+        { name: "postedAt", type: "timestamp without time zone", nullable: true, default: null },
+        { name: "threadName", type: "text", nullable: true, default: null },
+        { name: "messageName", type: "text", nullable: true, default: null },
+        { name: "attempts", type: "integer", nullable: false, default: "0" },
+        { name: "lastError", type: "text", nullable: true, default: null },
+        { name: "createdAt", type: "timestamp without time zone", nullable: false, default: "CURRENT_TIMESTAMP" },
+        { name: "updatedAt", type: "timestamp without time zone", nullable: false, default: null },
+    ],
+    ReceiptIntake: [
+        { name: "postVoidQbPurchaseId", type: "text", nullable: true, default: null },
     ],
 };
 
@@ -171,16 +211,33 @@ async function main() {
 
         for (const [table, columns] of Object.entries(expectedColumns)) {
             const rows = await prisma.$queryRawUnsafe(
-                `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
+                `SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name=$1`,
                 table,
             );
-            const found = new Set(rows.map(r => r.column_name));
-            const missing = columns.filter(c => !found.has(c));
-            if (missing.length) {
-                console.error(`VERIFY FAILED: ${table} missing columns: ${missing.join(", ")}`);
-                process.exit(1);
+            const found = new Map(rows.map(r => [r.column_name, r]));
+            for (const column of columns) {
+                const actual = found.get(column.name);
+                if (!actual) {
+                    console.error(`VERIFY FAILED: ${table}.${column.name} is missing`);
+                    process.exit(1);
+                }
+                if (actual.data_type !== column.type) {
+                    console.error(`VERIFY FAILED: ${table}.${column.name} is ${actual.data_type}, expected ${column.type}`);
+                    process.exit(1);
+                }
+                const nullable = actual.is_nullable === "YES";
+                if (nullable !== column.nullable) {
+                    console.error(`VERIFY FAILED: ${table}.${column.name} is ${nullable ? "NULL" : "NOT NULL"}, expected ${column.nullable ? "NULL" : "NOT NULL"}`);
+                    process.exit(1);
+                }
+                if (column.default !== null && String(actual.column_default ?? "") !== column.default) {
+                    console.error(`VERIFY FAILED: ${table}.${column.name} default is ${actual.column_default}, expected ${column.default}`);
+                    process.exit(1);
+                }
             }
-            console.log(`verified ${table}: ${columns.length} column(s)`);
+            console.log(`verified ${table}: ${columns.length} column(s) by name, type, nullability and default`);
         }
 
         for (const { name, table } of expectedConstraints) {

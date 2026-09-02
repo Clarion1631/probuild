@@ -54,3 +54,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_pacificDate_key"
 
 CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
   ON "ReceiptRequestCard"("pacificDate");
+
+-- 3. The POST-claim, distinct from the row itself. Only the run holding
+-- `claimToken` may mark the row posted, so an overlapping run can never
+-- complete a post it did not make. ALTERs rather than columns folded into the
+-- CREATE above, because CREATE TABLE IF NOT EXISTS is a no-op against a table
+-- an earlier run already made — that is what keeps this re-runnable.
+ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
+ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
+
+-- 4. A Purchase QuickBooks created for a receipt somebody voided while the send
+-- was in flight. NOT qbPurchaseId — that column means "this row is booked", and
+-- this row is not; the money exists in QBO and a human has to void it there.
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT;

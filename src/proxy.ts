@@ -142,15 +142,29 @@ function hasNextAuthSessionCookie(req: any) {
 }
 
 export default async function proxy(req: any, event: any) {
+    const pathname = req.nextUrl?.pathname;
+    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
+
+    // FIRST, before every other branch including the development bypass.
+    //
+    // Next's action IDs are GLOBAL, so any path the proxy waves through is a
+    // place an anonymous caller can POST a `next-action` header and have Next
+    // dispatch someone else's action — the endpoint's own shared-secret check
+    // never runs for an action dispatch, so its gate protects nothing. This has
+    // to be evaluated BEFORE any bypass returns `next()`, and the dev bypass is
+    // the earliest of those: it returns for everything, so a check placed after
+    // it is simply absent in development. Ordinary page/API Server Actions are
+    // untouched — only machine endpoints are refused.
+    if (isServerAction && typeof pathname === "string" && isMachineOnlyBypass(pathname)) {
+        return new NextResponse("Forbidden", { status: 403 });
+    }
+
     // Bypass authentication entirely during development for local testing
     if (process.env.NODE_ENV === 'development') {
         // Allow all requests to pass through without authentication in development
         // The client-side AppLayout will then mock the session.
         return NextResponse.next();
     }
-
-    const pathname = req.nextUrl?.pathname;
-    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
 
     // Public portal routes must remain reachable without a staff session, but a
     // stale staff cookie must never use those routes to bypass the production

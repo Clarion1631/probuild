@@ -50,41 +50,86 @@ test("the bypass is exact-match — nothing else under /api/automation inherits 
     }
 });
 
-test("every bypassed machine endpoint refuses a Server Action dispatch", async () => {
+test("every machine bypass refuses a Server Action dispatch", async () => {
     const { isMachineOnlyBypass, isPublicProxyBypass } = await loadProxy();
     for (const path of [
+        // Phase 2's own.
         "/api/automation/receipt-requests/threads",
-        "/api/automation/receipt-requests/threads/",
-        "/api/automation/receipt-requests/answers",
         "/api/automation/receipt-requests/answers/",
-        // Phase 1's endpoints carry the identical hole; the fix is shared.
+        // Phase 1's, same hole, same shared fix.
         "/api/receipts/intake",
-        "/api/receipts/intake/",
         "/api/receipts/intake/abc123/archived",
         "/api/office-tasks/ingest",
+        // Whole machine prefixes — a cron or an integration endpoint is never
+        // an action target, and every one of them is on the bypass.
+        "/api/cron/receipt-intake-worker",
+        "/api/cron/bank-register-pull",
+        "/api/cron/drain-notifications",
+        "/api/integrations/bank-ledger/ingest",
+        "/api/integrations/bank-ledger/reconcile",
+        "/api/integrations/qbo-expenses/sync",
+        "/api/webhook/stripe",
+        "/api/twilio/inbound",
+        "/api/health",
+        "/api/version",
     ]) {
         assert.equal(isMachineOnlyBypass(path), true, path);
-        // Every one must ALSO be on the bypass — otherwise this guard is
-        // protecting a path the proxy was never waving through anyway.
+        // Each must ALSO be on the bypass — a guard over a path the proxy was
+        // never waving through would prove nothing.
         assert.equal(isPublicProxyBypass(path), true, `${path} must be a bypass path`);
     }
 });
 
-test("the Server-Action refusal is exact-match — it neither over- nor under-reaches", async () => {
+test("machine paths NOT on the bypass are still refused an action dispatch", async () => {
+    // Belt and braces. `/api/mcp/mcp` is not matched by the public bypass (the
+    // bypass's own `mcp` alternative only reaches `/api/mcp/`), and the plural
+    // `/api/webhooks/...` form likewise — but both are unambiguously machine
+    // surfaces, so the guard covers them regardless of how the bypass evolves.
+    const { isMachineOnlyBypass } = await loadProxy();
+    for (const path of ["/api/mcp/mcp", "/api/webhooks/stripe"]) {
+        assert.equal(isMachineOnlyBypass(path), true, path);
+    }
+});
+
+test("surfaces with genuinely anonymous Server Actions keep working", async () => {
     const { isMachineOnlyBypass } = await loadProxy();
     for (const path of [
+        // The portal accepts the anonymous-action tradeoff on purpose.
+        "/portal/projects/abc",
+        "/sub-portal/projects/abc",
+        "/share/room/tok",
+        "/api/portal/verify",
+        "/api/sub-portal/login",
+        "/api/selections/item-comments",
+        "/api/pdf/invoices/abc",
+        "/api/mobile/login",
+        "/api/auth/session",
+        // Ordinary app routes are untouched.
+        "/projects/abc",
+        "/automation",
+        "/api/automation/review-issues/mark-reviewed",
+        // Near-misses on the exact forms.
+        "/api/receipts/parse",
         "/api/receipts/intake/abc123",
-        "/api/receipts/intake/abc123/archived/extra",
-        "/api/office-tasks/ingest/extra",
         "/api/office-tasks",
         "/api/automation/receipt-requests",
-        "/api/automation/receipt-requests/threads/extra",
-        // Genuinely anonymous-action surfaces keep their bypass.
-        "/portal/projects/abc",
-        "/share/room/tok",
     ]) {
         assert.equal(isMachineOnlyBypass(path), false, path);
     }
+});
+
+test("the refusal is evaluated BEFORE every bypass, including the development one", async () => {
+    // The dev bypass returns next() for everything, so a check placed after it
+    // is simply absent in development — where the machine secrets are usually
+    // weakest. This asserts the ORDER in the handler, which no unit-level call
+    // of isMachineOnlyBypass can show.
+    const source = readFileSync(join(repoRoot, "src/proxy.ts"), "utf8");
+    const guardAt = source.indexOf("isMachineOnlyBypass(pathname)");
+    const devBypassAt = source.indexOf("process.env.NODE_ENV === 'development'");
+    const publicBypassAt = source.indexOf("isPublicProxyBypass(pathname)");
+    assert.ok(guardAt > 0 && devBypassAt > 0 && publicBypassAt > 0);
+    assert.ok(guardAt < devBypassAt, "the guard must precede the development bypass");
+    assert.ok(guardAt < publicBypassAt, "the guard must precede the public bypass");
 });
 
 test("no Phase 2 module imports a mail helper — nothing here ever emails a PDF", () => {
