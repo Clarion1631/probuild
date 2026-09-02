@@ -27,11 +27,32 @@ export interface QboPurchaseFacts {
     id: string;
     /** POSITIVE cents. A Purchase's TotalAmt is a magnitude. */
     totalCents: number | null;
+    /**
+     * The Purchase's PrivateNote. Every Purchase this pipeline creates carries
+     * `[gtr-file:<fileId>]` there (qbo-receipt-push.ts) — it is the only thing
+     * that ties a Purchase back to the exact document that produced it.
+     */
+    privateNote: string | null;
+}
+
+/** `[gtr-file:<fileId>]` — the marker qbo-receipt-push writes into PrivateNote. */
+export function gtrFileMarker(fileId: string): string {
+    return `[gtr-file:${fileId}]`;
+}
+
+/** The fileId a Purchase's PrivateNote claims, or null when it carries no marker. */
+export function markedFileId(privateNote: string | null): string | null {
+    const match = /\[gtr-file:([^\]]+)\]/.exec(privateNote ?? "");
+    return match ? match[1] : null;
 }
 
 export type OrphanClaimVerdict =
     | { ok: true; purchaseId: string }
-    | { ok: false; reason: "not-found" | "amount-mismatch" | "unreadable" | "invalid-id"; detail?: string };
+    | {
+        ok: false;
+        reason: "not-found" | "amount-mismatch" | "marker-missing" | "marker-mismatch" | "unreadable" | "invalid-id";
+        detail?: string;
+    };
 
 /** QBO ids are digits in this realm; anything else is a paste error, not a lookup. */
 export function isQboPurchaseId(value: unknown): value is string {
@@ -51,6 +72,7 @@ export function isQboPurchaseId(value: unknown): value is string {
 export function verifyOrphanClaim(
     facts: QboPurchaseFacts | null,
     expectedTotalCents: number | null,
+    expectedFileId: string | null,
 ): OrphanClaimVerdict {
     if (facts === null) return { ok: false, reason: "not-found" };
     if (facts.totalCents === null) {
@@ -66,6 +88,35 @@ export function verifyOrphanClaim(
             ok: false,
             reason: "amount-mismatch",
             detail: `That purchase is ${(facts.totalCents / 100).toFixed(2)}; this receipt is ${(expectedTotalCents / 100).toFixed(2)}`,
+        };
+    }
+
+    // THE MARKER, and this is the check that actually identifies the document.
+    //
+    // An amount match is weak on its own: this business posts several purchases
+    // for the same amount to the same vendor in a week, and the operator is
+    // typing an id read off a different screen. Every Purchase this pipeline
+    // creates carries `[gtr-file:<fileId>]` in its PrivateNote, so a Purchase
+    // that is genuinely THIS receipt's says so in its own note. One that says
+    // nothing was not created by us; one that names a different file belongs to
+    // a different receipt, and recording it would attach this receipt's history
+    // to that one and mis-report both.
+    if (!expectedFileId) {
+        return { ok: false, reason: "unreadable", detail: "This receipt has no file identity to check against" };
+    }
+    const marked = markedFileId(facts.privateNote);
+    if (marked === null) {
+        return {
+            ok: false,
+            reason: "marker-missing",
+            detail: "That purchase carries no ProBuild file marker, so it was not created for this receipt",
+        };
+    }
+    if (marked !== expectedFileId) {
+        return {
+            ok: false,
+            reason: "marker-mismatch",
+            detail: "That purchase belongs to a different receipt (its file marker names another document)",
         };
     }
     return { ok: true, purchaseId: facts.id };

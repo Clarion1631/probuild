@@ -21,7 +21,8 @@ import { parsePaymentDateInput } from "./payment-date";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
-import { planParkWrites, type ParkPlan } from "./receipt-intake/park";
+import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
+import { driveFileIdOf } from "./receipt-intake/book";
 import { parseChatDelivery } from "./receipt-request-cards";
 import {
     ORPHAN_AUDIT_KIND,
@@ -15268,10 +15269,18 @@ async function receiptIntakeWriteFailure(id: string, allowedStates: readonly str
  * clean case takes exactly one write, and the fallback only runs for a row
  * whose send had already started.
  */
-async function runParkWrites(plan: ParkPlan, id: string, expected: string, now: Date): Promise<void> {
-    const released = await prisma.receiptIntake.updateMany(plan.release);
+async function runParkWrites(
+    plan: ParkPlan,
+    id: string,
+    expected: string,
+    now: Date,
+    // Defaults to the global client; mark-duplicate passes its transaction so
+    // the writes land under the same row locks its validation was done with.
+    client: Pick<typeof prisma, "receiptIntake"> = prisma,
+): Promise<void> {
+    const released = await client.receiptIntake.updateMany(plan.release);
     if (released.count === 1) return;
-    const kept = await prisma.receiptIntake.updateMany(plan.keep);
+    const kept = await client.receiptIntake.updateMany(plan.keep);
     if (kept.count === 1) return;
     await receiptIntakeWriteFailure(id, [expected], now);
 }
@@ -15384,40 +15393,73 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
     if (typeof duplicateOfId !== "string" || !duplicateOfId) throw new Error("duplicateOfId is required");
     if (id === duplicateOfId) throw new Error("A receipt can't be a duplicate of itself");
 
-    // THE TARGET MUST BE A REAL ORIGINAL. Pointing at a row that is itself
-    // DUPLICATE builds a chain nobody can follow ("a duplicate of a duplicate
-    // of..."), and pointing at a VOID row files this receipt behind something
-    // that was cancelled — in both cases the original it claims to duplicate
-    // does not exist as far as the pipeline is concerned.
-    const original = await prisma.receiptIntake.findUnique({
-        where: { id: duplicateOfId },
-        select: { id: true, state: true, duplicateOfId: true },
-    });
-    if (!original) throw new Error("That original receipt no longer exists");
-    if (original.state === "DUPLICATE") throw new Error("That receipt is itself a duplicate — point at the original instead");
-    if (original.state === "VOID") throw new Error("That receipt was voided — it can't be the original");
-    // NO CYCLES. A points at B while B points at A is unresolvable, and the
-    // chain check above does not catch it on its own.
-    if (original.duplicateOfId === id) throw new Error("Those two receipts already point at each other");
-
     const now = new Date();
     const expected = assertExpectedState(expectedState);
     if (["BOOKED", "ARCHIVED", "VOID"].includes(expected)) {
         // A BOOKED row is money history — it is never reclassified from here.
         throw new Error("That receipt can't be marked a duplicate");
     }
-    // CAS on the exact state the view saw. The lease fence matters most on this
-    // path: BOOKING is a legal source state, and BOOKING is where the worker is
-    // mid-send. The strong key goes back ONLY if the send had not started —
-    // see planParkWrites.
-    await runParkWrites(planParkWrites({
-        id,
-        expectedState: expected,
-        targetState: "DUPLICATE",
-        stateReason: `manual-dup:${duplicateOfId}`,
-        extraData: { duplicateOfId },
-        claimFence: { updatedAt: assertExpectedUpdatedAt(expectedUpdatedAt), ...notClaimedByWorker(now) },
-    }), id, expected, now);
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+
+    /**
+     * ONE TRANSACTION, BOTH ROWS LOCKED, VALIDATED AFTER THE LOCK.
+     *
+     * The check that the target is a real original has to happen while holding
+     * it, or the classic pair race gets through: Marge marks A→B while Richard
+     * marks B→A. Both validations pass (neither row is a duplicate YET), both
+     * writes land, and the two rows now point at each other — a cycle nothing
+     * downstream can resolve, and neither receipt has an original.
+     *
+     * LOCKED IN ID ORDER, which is the whole reason this cannot deadlock: two
+     * transactions wanting the same pair ask for it in the same sequence, so
+     * one waits rather than both holding half of what the other needs. Postgres
+     * would detect a deadlock and abort one, but "we designed for an abort" is
+     * not the same as "this cannot happen".
+     *
+     * `FOR UPDATE` on a plain SELECT of both ids, ordered — one statement, so
+     * there is no window between taking the first lock and the second.
+     */
+    const [first, second] = [id, duplicateOfId].sort();
+    await prisma.$transaction(async tx => {
+        await tx.$queryRaw`
+            SELECT "id" FROM "ReceiptIntake"
+            WHERE "id" IN (${first}, ${second})
+            ORDER BY "id"
+            FOR UPDATE`;
+
+        // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
+        // the page; under the lock it is read again because that is the only
+        // version that can still be true when the write lands.
+        const original = await tx.receiptIntake.findUnique({
+            where: { id: duplicateOfId },
+            select: { id: true, state: true, duplicateOfId: true },
+        });
+        if (!original) throw new Error("That original receipt no longer exists");
+        // THE TARGET MUST BE A REAL ORIGINAL. Pointing at a row that is itself
+        // DUPLICATE builds a chain nobody can follow ("a duplicate of a
+        // duplicate of..."), and pointing at a VOID row files this receipt
+        // behind something that was cancelled — in both cases the original it
+        // claims to duplicate does not exist as far as the pipeline is
+        // concerned.
+        if (original.state === "DUPLICATE") throw new Error("That receipt is itself a duplicate — point at the original instead");
+        if (original.state === "VOID") throw new Error("That receipt was voided — it can't be the original");
+        // NO CYCLES. A points at B while B points at A is unresolvable, and the
+        // chain check above does not catch it on its own.
+        if (original.duplicateOfId === id) throw new Error("Those two receipts already point at each other");
+
+        // CAS on the exact state the view saw. The lease fence matters most on
+        // this path: BOOKING is a legal source state, and BOOKING is where the
+        // worker is mid-send. The strong key goes back ONLY if the send had not
+        // started — see planParkWrites.
+        await runParkWrites(planParkWrites({
+            id,
+            expectedState: expected,
+            targetState: "DUPLICATE",
+            stateReason: `manual-dup:${duplicateOfId}`,
+            extraData: { duplicateOfId },
+            claimFence: { updatedAt: seenAt, ...notClaimedByWorker(now) },
+        }), id, expected, now, tx);
+    });
     revalidateReceiptQueue();
     return { success: true };
 }
@@ -15575,14 +15617,20 @@ async function readQboPurchase(purchaseId: string): Promise<QboPurchaseFacts | n
     // the answer an operator's typo produces, so it must not read as an outage.
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`QuickBooks returned ${response.status}`);
-    const body = await parseJsonOrNull<{ Purchase?: { Id?: string; TotalAmt?: number } }>(response);
+    const body = await parseJsonOrNull<{ Purchase?: { Id?: string; TotalAmt?: number; PrivateNote?: string } }>(response);
     const purchase = body?.Purchase;
     if (!purchase?.Id) return null;
     // TotalAmt is dollars as a float; cents is what everything here compares in.
     const totalCents = typeof purchase.TotalAmt === "number" && Number.isFinite(purchase.TotalAmt)
         ? Math.round(purchase.TotalAmt * 100)
         : null;
-    return { id: String(purchase.Id), totalCents };
+    // PrivateNote carries `[gtr-file:<fileId>]` on everything this pipeline
+    // creates — the only field that ties a Purchase to one document.
+    return {
+        id: String(purchase.Id),
+        totalCents,
+        privateNote: typeof purchase.PrivateNote === "string" ? purchase.PrivateNote : null,
+    };
 }
 
 /**
@@ -15628,13 +15676,37 @@ export async function resolveUnknownOrphan(
         where: { id },
         select: {
             state: true, stateReason: true, totalCents: true, vendor: true,
+            source: true, sourceRef: true,
             sendAttempted: true, dedupStrongKey: true, postVoidQbPurchaseId: true,
         },
     });
     if (!row) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
-    if (!row.sendAttempted) {
-        return { success: false, stale: true as const, reason: "Nothing was ever sent for this receipt — there is no purchase to find." };
-    }
+
+    /**
+     * THE WHOLE ORPHAN PREDICATE, IN THE WHERE CLAUSE.
+     *
+     * Read-then-write is not enough here and the gap is not theoretical: every
+     * one of these conditions can change between the page render and the click
+     * (the worker re-claims the row, a re-send books it, another operator
+     * resolves it). Re-checking them in JavaScript proves what was true a
+     * moment ago; putting them in the UPDATE proves what is true at the write.
+     *
+     * A BOOKED or ARCHIVED row is not in the permitted set at all — it booked,
+     * it has its Purchase id, and the orphan path must not be able to rewrite
+     * money history even when called directly.
+     */
+    const orphanWhere = {
+        id,
+        state: { in: [...UNKNOWN_ORPHAN_STATES] },
+        stateReason: { endsWith: `:${POSSIBLE_ORPHAN_REASON}` },
+        sendAttempted: true,
+        // An UNKNOWN-id orphan by definition has no id recorded. A row that has
+        // one is the other kind, and "mark resolved" is its path.
+        postVoidQbPurchaseId: null,
+        // The worker must not be mid-anything with this row.
+        claimToken: null,
+        updatedAt: seenAt,
+    };
 
     let purchaseId: string | null = null;
     if (decision === "located") {
@@ -15654,7 +15726,9 @@ export async function resolveUnknownOrphan(
                 reason: `QuickBooks did not answer, so that id is unverified: ${error instanceof Error ? error.message : "unknown error"}`,
             };
         }
-        const verdict = verifyOrphanClaim(facts, row.totalCents);
+        // The SAME fileId book.ts stamps into the Purchase's PrivateNote.
+        const expectedFileId = driveFileIdOf({ source: row.source, sourceRef: row.sourceRef }) ?? id;
+        const verdict = verifyOrphanClaim(facts, row.totalCents, expectedFileId);
         if (!verdict.ok) {
             return { success: false, stale: false as const, reason: verdict.detail ?? `That purchase ${verdict.reason.replace("-", " ")}.` };
         }
@@ -15675,12 +15749,17 @@ export async function resolveUnknownOrphan(
             dedupStrongKey: null,
             stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.noPurchase}`.slice(0, 400),
         };
-    const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: row.state, updatedAt: seenAt },
-        data,
-    });
+    const result = await prisma.receiptIntake.updateMany({ where: orphanWhere, data });
     if (result.count === 0) {
-        return { success: false, stale: true as const, reason: "This receipt changed underneath you — refresh and try again." };
+        // TYPED, so the caller can tell "somebody else got here first" from
+        // "this row was never an unknown-id orphan" — the second one is a bug
+        // or a direct call, not a race.
+        return {
+            success: false,
+            stale: true as const,
+            code: "not-an-unknown-orphan" as const,
+            reason: "This receipt is not an unresolved unknown-id orphan any more — refresh and look again.",
+        };
     }
 
     // AUDITED, and after the write: an event describing a decision that did not

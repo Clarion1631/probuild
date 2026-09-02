@@ -1002,3 +1002,61 @@ export function appendCardRecord(
     merged.card = record;
     return merged;
 }
+
+// ── Loading a competition component to closure ─────────────────────────────
+
+/** Raised when a component is too large to load honestly. Never swallowed. */
+export class ComponentTooLargeError extends Error {
+    constructor(readonly count: number, readonly cap: number) {
+        super(`competing component exceeded ${cap} lines (${count})`);
+        this.name = "ComponentTooLargeError";
+    }
+}
+
+/**
+ * Widen a same-amount window by the link rule until nothing new joins.
+ *
+ * A FIXED WINDOW IS THE WRONG SHAPE, in both directions at once. `±8 days`
+ * around the seed is too wide (it drags in lines that compete with nothing) and
+ * too narrow (a chain of same-amount charges four days apart reaches further
+ * than any fixed span). Matching a FRAGMENT of a component gives a different
+ * answer from the batch, which is exactly the disagreement a recompute exists
+ * to avoid.
+ *
+ * Termination is a property of the data: a gap wider than the link rule stops
+ * the walk. `maxNodes` is the guard for data that has no such gap — a card on a
+ * daily subscription chains arbitrarily far — and it ABORTS rather than
+ * truncating, because a truncated component is a wrong answer wearing a right
+ * one's clothes.
+ *
+ * PURE: the caller supplies `load`, so the walk is testable without a database.
+ */
+export async function loadComponentToClosure<T extends { id: string; postedDate: string }>(
+    seedDate: string,
+    load: (fromYmd: string, toYmd: string) => Promise<T[]>,
+    options: { maxNodes: number; linkDays?: number } = { maxNodes: 200 },
+): Promise<T[]> {
+    const linkDays = options.linkDays ?? COMPETING_LINE_ADJACENCY_DAYS;
+    const seed = dayNumber(seedDate);
+    if (seed === null) return [];
+
+    let from = seed;
+    let to = seed;
+    let loaded: T[] = [];
+
+    // Each pass either grows the extent or stops, and `maxNodes` bounds it a
+    // second way, so this cannot spin.
+    for (let pass = 0; pass <= options.maxNodes; pass++) {
+        const rows = await load(ymdOf(from - linkDays), ymdOf(to + linkDays));
+        if (rows.length > options.maxNodes) throw new ComponentTooLargeError(rows.length, options.maxNodes);
+        if (rows.length === loaded.length) return rows;
+        loaded = rows;
+        const days = rows
+            .map(row => dayNumber(row.postedDate))
+            .filter((value): value is number => value !== null);
+        if (days.length === 0) return rows;
+        from = Math.min(from, ...days);
+        to = Math.max(to, ...days);
+    }
+    throw new ComponentTooLargeError(loaded.length, options.maxNodes);
+}

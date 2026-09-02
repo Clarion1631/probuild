@@ -652,16 +652,71 @@ const handlers = createBankLedgerIngestHandlers({
     refreshQboDescriptors: async (account, rows) => {
         let touched = 0;
         for (const row of rows) {
-            const result = await prisma.bankLineObservation.updateMany({
-                where: {
-                    source: "QBO_REGISTER",
-                    account,
-                    sourceDocumentId: "QBO_REGISTER",
-                    sourceLineId: row.qbTxnId,
-                },
-                data: { rawDescriptor: row.rawDescriptor },
+            // ONE TRANSACTION PER OBSERVATION, because the canonical line it
+            // minted has to move with it. Half of this landing is the bug it
+            // fixes, one layer down.
+            touched += await prisma.$transaction(async tx => {
+                const result = await tx.bankLineObservation.updateMany({
+                    where: {
+                        source: "QBO_REGISTER",
+                        account,
+                        sourceDocumentId: "QBO_REGISTER",
+                        sourceLineId: row.qbTxnId,
+                    },
+                    data: { rawDescriptor: row.rawDescriptor },
+                });
+                if (result.count === 0) return 0;
+
+                /**
+                 * AND THE LINE IT MINTED, if it minted one.
+                 *
+                 * A QBO-minted BankLine copies the observation's descriptor at
+                 * mint time. When the pull stopped appending the transaction
+                 * type, every stored observation refreshed to the real bank
+                 * text — the one that carries `C#8516` — while the canonical
+                 * line kept the old, tail-less copy. The missing-receipt chaser
+                 * reads the LINE, so every one of those charges resolved to
+                 * `office`, the crew was never asked, and the descriptors on
+                 * screen disagreed with the descriptors in the ledger.
+                 *
+                 * Narrow on purpose:
+                 *   - `sourceOfRecord: "QBO"` — a STATEMENT line is bank truth
+                 *     and a QBO edit may never rewrite it.
+                 *   - one observation only — a line carrying several QBO
+                 *     observations has no single "its" descriptor.
+                 *   - `state: "POSTED"` — an unmatched line. Once it is matched
+                 *     or reconciled its text is part of a decision somebody has
+                 *     already made against it.
+                 */
+                const observations = await tx.bankLineObservation.findMany({
+                    where: {
+                        source: "QBO_REGISTER",
+                        account,
+                        sourceDocumentId: "QBO_REGISTER",
+                        sourceLineId: row.qbTxnId,
+                        bankLineId: { not: null },
+                    },
+                    select: { bankLineId: true },
+                });
+                const lineIds = [...new Set(observations.map(o => o.bankLineId as string))];
+                for (const lineId of lineIds) {
+                    const observationCount = await tx.bankLineObservation.count({
+                        where: { bankLineId: lineId, source: "QBO_REGISTER" },
+                    });
+                    if (observationCount !== 1) continue;
+                    await tx.bankLine.updateMany({
+                        where: { id: lineId, sourceOfRecord: "QBO", state: "POSTED" },
+                        data: {
+                            rawDescriptor: row.rawDescriptor,
+                            // The payee is DERIVED, so it has to be re-derived
+                            // — a refreshed descriptor with a stale normalized
+                            // payee is the same disagreement in a second column.
+                            normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
+                        },
+                    });
+                }
+                return result.count;
             });
-            touched += result.count;
         }
         return touched;
     },

@@ -406,7 +406,10 @@ test("the sweep holds a DURABLE lease, not a released advisory claim", () => {
     assert.ok(takeAt > 0 && workAt > takeAt && releaseAt > workAt);
     // And the retry path recomputes the SET.
     assert.match(source, /competingLineFilter\(/);
-    assert.match(source, /prisma\.bankLine\.findMany\(\{[\s\S]{0,200}?where: \{ amountCents: competing\.amountCents/);
+    // The retry path now walks the component to closure rather than querying a
+    // fixed window — same intent, and the walk carries the seed's amount.
+    assert.match(source, /loadComponentToClosure\(/);
+    assert.match(source, /amountCents: seed\.amountCents,/);
 });
 
 test("the sweep resumes from a durable cursor, oldest-first", () => {
@@ -463,7 +466,9 @@ test("the sweep expands each page to its competing cohort before matching", () =
     assert.match(source, /const cohortFilters = batch\.map\(row => competingLineFilter\(/);
     // COHORT, then EVIDENCE for the cohort's span, then DECIDE — in that order.
     const cohortAt = source.indexOf("const cohortRows =");
-    const evidenceAt = source.indexOf("const \[expenseRows, intakeRows\] = await Promise.all([".replace(/\\/g, ""));
+    // Searched AFTER the cohort: the recompute path has its own evidence load,
+    // earlier in the file, and this test is about the BATCH path's ordering.
+    const evidenceAt = source.indexOf("const \[expenseRows, intakeRows\] = await Promise.all([".replace(/\\/g, ""), cohortAt);
     const planAt = source.indexOf("const fullPlan = planReceiptRequests({", cohortAt);
     assert.ok(cohortAt > 0 && evidenceAt > cohortAt, "evidence must be loaded AFTER the cohort is known");
     assert.ok(planAt > evidenceAt, "and the decision comes last");

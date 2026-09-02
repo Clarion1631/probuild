@@ -11,7 +11,9 @@ import {
     RECEIPT_MATCH_DATE_SLOP_DAYS,
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
+    ComponentTooLargeError,
     competingLineFilter,
+    loadComponentToClosure,
     groupCompetingLines,
     isComponentKey,
     pageComponents,
@@ -307,6 +309,46 @@ export async function applyReceiptRequestPlan(
  * path, since the next full sweep reopens anything it got wrong, whereas a
  * wrongly-reapplied stale open nags a human tonight.
  */
+/**
+ * The most competing lines one recompute will load before it gives up.
+ *
+ * A cap is not optional: the walk follows real data, and a run of identical
+ * daily charges (a card on a subscription, a fuel card at the same pump) chains
+ * arbitrarily far. 200 is far past any genuine competition set and still a
+ * query Postgres answers instantly.
+ */
+const MAX_COMPONENT_LINES = 200;
+
+/**
+ * Load the TRUE competing component around one line, by iterating the link rule
+ * to closure — the walk itself is `loadComponentToClosure`, which is pure and
+ * tested; this supplies the query.
+ */
+async function loadCompetingComponent(seed: {
+    id: string;
+    postedDate: Date;
+    amountCents: number;
+}) {
+    return loadComponentToClosure(
+        seed.postedDate.toISOString().slice(0, 10),
+        (fromYmd, toYmd) => prisma.bankLine.findMany({
+            where: {
+                amountCents: seed.amountCents,
+                // `BankLine.postedDate` is `@db.Date` — calendar bounds.
+                postedDate: {
+                    gte: new Date(`${fromYmd}T00:00:00Z`),
+                    lte: new Date(`${toYmd}T00:00:00Z`),
+                },
+            },
+            // One past the cap, so an oversized component is DETECTED rather
+            // than silently truncated into a wrong answer.
+            take: MAX_COMPONENT_LINES + 1,
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        }).then(rows => rows.map(row => ({ ...row, postedDate: row.postedDate.toISOString().slice(0, 10) }))),
+        { maxNodes: MAX_COMPONENT_LINES },
+    );
+}
+
 async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     const [line, issue] = await Promise.all([
         prisma.bankLine.findUnique({
@@ -328,18 +370,34 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     // differently depending on which is considered first, so recomputing one
     // row in isolation saw "a receipt exists" and closed a charge whose receipt
     // had already been given to its twin.
-    const competing = competingLineFilter({
-        amountCents: line.amountCents,
-        postedDate: line.postedDate.toISOString().slice(0, 10),
-    });
-    const range = await evidenceRange(competing.from, competing.to);
+    let loadedLines: Array<{ id: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null }>;
+    try {
+        loadedLines = await loadCompetingComponent(line);
+    } catch (error) {
+        if (error instanceof ComponentTooLargeError) {
+            // NO VERDICT. Returning [] would CLEAR the issue, which is the one
+            // wrong answer available here: it closes a chase because we could
+            // not look, not because a receipt exists. Keeping the code leaves
+            // the chase open for a human, which is what a run of hundreds of
+            // identical charges needs anyway.
+            console.error("[cron/receipt-requests] component too large; leaving the chase open", targetKey, error.message);
+            return ["MISSING_RECEIPT"];
+        }
+        throw error;
+    }
+    // The component that actually contains this line — the loaded window may
+    // hold same-amount lines that chain to nothing.
+    const component = groupCompetingLines(loadedLines).find(group => group.lineIds.includes(targetKey));
+    const componentIds = new Set(component?.lineIds ?? [targetKey]);
+    const lines = loadedLines.filter(row => componentIds.has(row.id));
 
-    const [lines, expenseRows, intakeRows] = await Promise.all([
-        prisma.bankLine.findMany({
-            // `BankLine.postedDate` is `@db.Date` as well — calendar bounds.
-            where: { amountCents: competing.amountCents, postedDate: range.calendar },
-            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-        }),
+    // Evidence for the component's own span, widened by the match window.
+    const componentDays = lines.map(row => Date.parse(`${row.postedDate}T00:00:00Z`));
+    const fromYmd = new Date(Math.min(...componentDays) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const toYmd = new Date(Math.max(...componentDays) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const range = await evidenceRange(fromYmd, toYmd);
+
+    const [expenseRows, intakeRows] = await Promise.all([
         prisma.expense.findMany({
             where: { date: range.timestamp },
             select: {
@@ -361,13 +419,7 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     });
 
     const plan = planReceiptRequests({
-        bankLines: lines.map(row => ({
-            id: row.id,
-            postedDate: row.postedDate.toISOString().slice(0, 10),
-            amountCents: row.amountCents,
-            rawDescriptor: row.rawDescriptor,
-            checkNumber: row.checkNumber,
-        })),
+        bankLines: lines,
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
@@ -391,11 +443,10 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
             // A row parked because its bytes are gone is not evidence.
             stateReason: row.stateReason,
         })),
-        // The cohort query below loaded exactly [from, to], so declare it: a
-        // line whose window pokes outside that emits no decision rather than a
-        // guess (item 8).
-        evidenceLoadedFrom: competing.from,
-        evidenceLoadedTo: competing.to,
+        // Exactly the span the evidence queries above covered, so a line whose
+        // window pokes outside it emits no decision rather than a guess.
+        evidenceLoadedFrom: fromYmd,
+        evidenceLoadedTo: toYmd,
         openIssueKeys: siblingIssues.filter(i => i.clearedAt === null).map(i => i.targetKey),
         resolvedIssueKeys: siblingIssues
             .filter(i => hasResolution(parseMissingReceiptDetails(i.displayDetails)))

@@ -23,6 +23,7 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 const loadProxy = () => import("../src/proxy");
 import { computeQboLineContentHash, isDescriptorOnlyChange } from "../src/lib/bank-ledger";
+import { resolveReceiptOwner } from "../src/lib/receipt-policy";
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 test("the two bridge endpoints bypass the proxy so a machine caller gets a clean 401", async () => {
@@ -686,4 +687,42 @@ test("the card snapshot is re-verified under the claim, immediately before the s
     // The retry pass goes through the SAME loop, so it rebuilds too: it posts
     // from `toPost`, which every path feeds.
     assert.match(source, /for \(const \{ card: claimedCard, rowId, token, resumed \} of toPost\.slice\(0, CARD_RATE_CEILING\)\)/);
+});
+
+test("mint-then-refresh: the canonical line's descriptor moves with the observation", () => {
+    // THE BUG, end to end. The pull mints a canonical BankLine from a QBO
+    // observation, copying its descriptor. Later the pull stops appending the
+    // transaction type, so the observation refreshes to the real bank text —
+    // the one carrying `C#8516` — while the minted line keeps the tail-less
+    // copy. The chaser reads the LINE, so the charge resolves to `office`, and
+    // the crew is never asked for that receipt.
+    const source = readFileSync(join(repoRoot, "src/app/api/integrations/bank-ledger/ingest/route.ts"), "utf8");
+    const refresh = source.slice(source.indexOf("refreshQboDescriptors: async (account, rows) =>"));
+    const body = refresh.slice(0, refresh.indexOf("\n    createQboObservations:"));
+
+    // Both writes in ONE transaction — half of this landing is the same bug.
+    assert.match(body, /await prisma\.\$transaction\(async tx => \{/);
+    assert.match(body, /tx\.bankLineObservation\.updateMany\(/);
+    assert.match(body, /tx\.bankLine\.updateMany\(/);
+    // NARROW: QBO-owned, unmatched, and the sole observation on that line.
+    assert.match(body, /where: \{ id: lineId, sourceOfRecord: "QBO", state: "POSTED" \}/);
+    assert.match(body, /if \(observationCount !== 1\) continue;/);
+    // The derived payee is re-derived, or the disagreement just moves columns.
+    assert.match(body, /normalizedPayee: bankLineIdentityPayee\(\{ memo: row\.rawDescriptor \}\)/);
+});
+
+test("and the refreshed descriptor is what gives the chaser the card tail", () => {
+    // The observable consequence, not the mechanism: the old text resolves to
+    // nobody, the refreshed text resolves to the person who spent the money.
+    const stale = "LOWES #02516 Expense";
+    const refreshed = "LOWES #02516 POS DEB C#8516";
+    assert.equal(resolveReceiptOwner(stale).cardTail, null, "no tail: nobody is asked");
+    assert.equal(resolveReceiptOwner(refreshed).cardTail, "8516");
+    assert.notEqual(resolveReceiptOwner(refreshed).owner, resolveReceiptOwner(stale).owner);
+    // And both texts are still the SAME transaction, so the refresh is not a
+    // restatement — that is what makes updating in place legitimate.
+    assert.equal(
+        computeQboLineContentHash({ postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: stale, checkNumber: null }),
+        computeQboLineContentHash({ postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: refreshed, checkNumber: null }),
+    );
 });

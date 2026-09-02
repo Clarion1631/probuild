@@ -77,3 +77,14 @@ export function planParkWrites(input: ParkInput): ParkPlan {
 export function isPossibleOrphanReason(stateReason: string | null | undefined): boolean {
     return typeof stateReason === "string" && stateReason.endsWith(`:${POSSIBLE_ORPHAN_REASON}`);
 }
+
+/**
+ * The states an UNKNOWN-ID orphan can legitimately be sitting in.
+ *
+ * The `:possible-orphan-purchase` suffix is written by exactly one place — the
+ * keep branch above — and that branch only ever targets VOID or DUPLICATE. So
+ * these two are the whole permitted set, and a BOOKED or ARCHIVED row is not an
+ * orphan under any circumstances: it booked, it has its Purchase id, and
+ * touching it from the orphan path would rewrite money history.
+ */
+export const UNKNOWN_ORPHAN_STATES: readonly string[] = ["VOID", "DUPLICATE"];

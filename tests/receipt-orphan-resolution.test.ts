@@ -6,9 +6,12 @@ import { dirname, join } from "node:path";
 import {
     ORPHAN_AUDIT_KIND,
     ORPHAN_RESOLUTIONS,
+    gtrFileMarker,
     isQboPurchaseId,
+    markedFileId,
     verifyOrphanClaim,
 } from "../src/lib/receipt-intake/orphan-purchase";
+import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES } from "../src/lib/receipt-intake/park";
 import {
     chatSpaceOf,
     isChatMessageName,
@@ -64,13 +67,21 @@ test("no thread identity means the card STAYS uncertain", () => {
 
 // ── The unknown-ID orphan (round-14 item 3) ────────────────────────────────
 
+const FILE_ID = "1sEISJBJaGRYpivooQJBR";
+const facts = (over: Partial<{ id: string; totalCents: number | null; privateNote: string | null }> = {}) => ({
+    id: "6625",
+    totalCents: 12_345,
+    privateNote: `Receipt via ProBuild ${gtrFileMarker(FILE_ID)}`,
+    ...over,
+});
+
 test("a located purchase must match this receipt's amount, to the cent", () => {
     // The operator is reading a list in one window and typing an id into
     // another. A transposed digit lands on somebody else's purchase, and
     // recording it would attach this receipt's history to theirs.
-    assert.deepEqual(verifyOrphanClaim({ id: "6625", totalCents: 12_345 }, 12_345), { ok: true, purchaseId: "6625" });
+    assert.deepEqual(verifyOrphanClaim(facts(), 12_345, FILE_ID), { ok: true, purchaseId: "6625" });
 
-    const off = verifyOrphanClaim({ id: "6625", totalCents: 12_344 }, 12_345);
+    const off = verifyOrphanClaim(facts({ totalCents: 12_344 }), 12_345, FILE_ID);
     assert.equal(off.ok, false);
     if (!off.ok) {
         assert.equal(off.reason, "amount-mismatch");
@@ -78,10 +89,73 @@ test("a located purchase must match this receipt's amount, to the cent", () => {
     }
 
     // A 404 from QBO is an ANSWER — that id is not a purchase here.
-    assert.deepEqual(verifyOrphanClaim(null, 12_345), { ok: false, reason: "not-found" });
+    assert.deepEqual(verifyOrphanClaim(null, 12_345, FILE_ID), { ok: false, reason: "not-found" });
     // And anything we cannot check is refused rather than trusted.
-    assert.equal(verifyOrphanClaim({ id: "1", totalCents: null }, 12_345).ok, false);
-    assert.equal(verifyOrphanClaim({ id: "1", totalCents: 12_345 }, null).ok, false);
+    assert.equal(verifyOrphanClaim(facts({ totalCents: null }), 12_345, FILE_ID).ok, false);
+    assert.equal(verifyOrphanClaim(facts(), null, FILE_ID).ok, false);
+});
+
+test("a located purchase must carry THIS receipt's file marker", () => {
+    // The amount alone is weak: this business posts several purchases for the
+    // same amount to the same vendor in a week. Every Purchase the pipeline
+    // creates says which document it came from, so one that says nothing was
+    // not ours, and one that names another file is another receipt's.
+    const noMarker = verifyOrphanClaim(facts({ privateNote: "Paid at the counter" }), 12_345, FILE_ID);
+    assert.equal(noMarker.ok, false);
+    if (!noMarker.ok) assert.equal(noMarker.reason, "marker-missing");
+
+    const nullNote = verifyOrphanClaim(facts({ privateNote: null }), 12_345, FILE_ID);
+    assert.equal(nullNote.ok, false);
+    if (!nullNote.ok) assert.equal(nullNote.reason, "marker-missing");
+
+    const otherFile = verifyOrphanClaim(facts({ privateNote: gtrFileMarker("some-other-file-id") }), 12_345, FILE_ID);
+    assert.equal(otherFile.ok, false);
+    if (!otherFile.ok) assert.equal(otherFile.reason, "marker-mismatch");
+
+    // No file identity on our side is not a reason to accept on trust.
+    assert.equal(verifyOrphanClaim(facts(), 12_345, null).ok, false);
+
+    // The marker parser, on its own.
+    assert.equal(markedFileId(`x ${gtrFileMarker("abc")} y`), "abc");
+    assert.equal(markedFileId("no marker here"), null);
+    assert.equal(markedFileId(null), null);
+    // Amount is checked BEFORE the marker, so a wrong amount still reports as
+    // a wrong amount rather than as a marker problem.
+    const bothWrong = verifyOrphanClaim(facts({ totalCents: 1, privateNote: null }), 12_345, FILE_ID);
+    assert.equal(bothWrong.ok, false);
+    if (!bothWrong.ok) assert.equal(bothWrong.reason, "amount-mismatch");
+});
+
+test("the orphan write carries the WHOLE predicate, so a BOOKED row is untouchable", () => {
+    // Re-checking in JavaScript proves what was true a moment ago. These
+    // conditions can all change between the render and the click, so they
+    // belong in the UPDATE — and a direct call against a BOOKED or ARCHIVED row
+    // must change nothing even though the operator never saw such a row.
+    const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    const whereAt = actions.indexOf("const orphanWhere = {");
+    assert.ok(whereAt > 0, "the predicate is one object, not scattered checks");
+    const predicate = actions.slice(whereAt, actions.indexOf("};", whereAt));
+    for (const clause of [
+        /state: \{ in: \[\.\.\.UNKNOWN_ORPHAN_STATES\] \}/,
+        /stateReason: \{ endsWith: `:\$\{POSSIBLE_ORPHAN_REASON\}` \}/,
+        /sendAttempted: true/,
+        /postVoidQbPurchaseId: null/,
+        /claimToken: null/,
+        /updatedAt: seenAt/,
+    ]) {
+        assert.match(predicate, clause);
+    }
+    // BOOKED and ARCHIVED are not in the permitted set, at all.
+    assert.deepEqual([...UNKNOWN_ORPHAN_STATES], ["VOID", "DUPLICATE"]);
+    for (const state of ["BOOKED", "ARCHIVED", "READ", "NEEDS_REVIEW", "BOOKING"]) {
+        assert.ok(!UNKNOWN_ORPHAN_STATES.includes(state), `${state} is never an unknown-id orphan`);
+    }
+    // The write uses it, and a miss is a TYPED refusal rather than a generic one.
+    assert.match(actions, /await prisma\.receiptIntake\.updateMany\(\{ where: orphanWhere, data \}\)/);
+    assert.match(actions, /code: "not-an-unknown-orphan" as const/);
+    // The only reason string that can reach the predicate is the one the park
+    // plan writes.
+    assert.equal(POSSIBLE_ORPHAN_REASON, "possible-orphan-purchase");
 });
 
 test("a purchase id is digits — a paste error is not a lookup", () => {
@@ -110,7 +184,7 @@ test("both answers are audited, and only ONE of them frees the dedup key", () =>
     // AUDITED with who decided, after the write committed.
     assert.match(actions, /kind: ORPHAN_AUDIT_KIND,/);
     assert.match(actions, /decidedBy: user\.email \?\? user\.id,/);
-    const writeAt = actions.indexOf("where: { id, state: row.state, updatedAt: seenAt }");
+    const writeAt = actions.indexOf("updateMany({ where: orphanWhere, data })");
     const auditAt = actions.indexOf("kind: ORPHAN_AUDIT_KIND,");
     assert.ok(writeAt > 0 && auditAt > writeAt, "an event describing a decision that did not commit is worse than none");
     // QuickBooks stays READ-only.

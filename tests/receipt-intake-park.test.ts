@@ -197,8 +197,10 @@ test("the queue actions go through the plan, and the tab surfaces the result", (
     for (const call of [
         /targetState: "VOID",/,
         /targetState: "DUPLICATE",/,
-        /const released = await prisma\.receiptIntake\.updateMany\(plan\.release\);/,
-        /const kept = await prisma\.receiptIntake\.updateMany\(plan\.keep\);/,
+        // The client is injectable now: mark-duplicate passes its transaction
+        // so the park writes land under the same row locks its validation used.
+        /const released = await client\.receiptIntake\.updateMany\(plan\.release\);/,
+        /const kept = await client\.receiptIntake\.updateMany\(plan\.keep\);/,
     ]) {
         assert.match(actions, call);
     }
@@ -252,8 +254,10 @@ test("every queue action CASes on updatedAt, and the page hands it over", () => 
     // And each one reaches the WHERE clause, not just the signature.
     const wheres = actions.match(/where: \{ id[^}]*updatedAt: seenAt/g) ?? [];
     assert.ok(wheres.length >= 4, `expected the direct updateMany paths to pin it, saw ${wheres.length}`);
-    const parked = actions.match(/claimFence: \{ updatedAt: assertExpectedUpdatedAt\(expectedUpdatedAt\)/g) ?? [];
-    assert.equal(parked.length, 2, "void and mark-duplicate go through the park plan");
+    // void takes it inline; mark-duplicate resolves it before opening its
+    // transaction, and both reach the park plan's claim fence.
+    assert.match(actions, /claimFence: \{ updatedAt: assertExpectedUpdatedAt\(expectedUpdatedAt\), \.\.\.notClaimedByWorker\(now\) \}/);
+    assert.match(actions, /claimFence: \{ updatedAt: seenAt, \.\.\.notClaimedByWorker\(now\) \}/);
 
     // The rendered row carries it, and every control is handed it.
     const data = readFileSync(join(repoRoot, "src/app/automation/receipts-data.ts"), "utf8");

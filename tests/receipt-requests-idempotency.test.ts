@@ -321,8 +321,9 @@ test("the sweep sends each bound to the column it belongs to", () => {
     );
     assert.match(source, /where: \{ date: range\.timestamp \}/);
     assert.match(source, /where: \{ txnDate: range\.calendar, state:/);
-    // BankLine.postedDate is `@db.Date` too.
-    assert.match(source, /postedDate: range\.calendar/);
+    // BankLine.postedDate is `@db.Date` too — the component walk builds its own
+    // calendar bounds from the same rule.
+    assert.match(source, /gte: new Date\(`\$\{fromYmd\}T00:00:00Z`\),/);
     assert.doesNotMatch(source, /where: \{ date: range \}/, "one shared range is the bug");
 });
 
