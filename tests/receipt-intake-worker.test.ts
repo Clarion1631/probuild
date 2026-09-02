@@ -71,6 +71,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         sendAttempted: false,
         claimToken: "claim-1",
         fileSha256: "s".repeat(64),
+        stateReason: null,
         ...overrides,
     };
 }

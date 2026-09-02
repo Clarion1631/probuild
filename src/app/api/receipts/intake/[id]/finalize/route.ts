@@ -429,11 +429,27 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // or a captured value changed underneath a row that is still waiting to
         // publish, in which case nothing was published and saying otherwise
         // would be a lie the client acts on.
+        //
+        // "Not STAGING" is NOT enough evidence of the first case. A concurrent
+        // /start rearm can move a recoverable NEEDS_REVIEW row onto a fresh
+        // upload lease without ever publishing it — the row is still
+        // NEEDS_REVIEW, but a re-armed upload can genuinely be present at the
+        // (new) storagePath, so `confirmStoredCopy` alone cannot tell "someone
+        // published" from "someone is mid re-upload of something else". The
+        // only positive proof that ANOTHER publisher published THIS content is
+        // that the row's canonical path now equals the one this call itself
+        // just verified (sealAndPublish names it after id+sha+mime) — that
+        // string can only be written by a successful sealAndPublish commit, and
+        // only with these exact bytes.
         const current = await prisma.receiptIntake.findUnique({
             where: { id },
-            select: { state: true, sourceRef: true, projectId: true, dryRun: true },
+            select: { state: true, sourceRef: true, projectId: true, dryRun: true, storagePath: true, fileSha256: true },
         });
-        if (!current || current.state === "STAGING") {
+        const positivelyPublished = !!current
+            && current.state !== "STAGING"
+            && current.storagePath === outcome.canonicalPath
+            && current.fileSha256 === fileSha256;
+        if (!positivelyPublished) {
             return NextResponse.json(
                 {
                     ok: false,
@@ -444,14 +460,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 { status: 409 },
             );
         }
-        // Another publisher won. Same outcome for the caller — but the late
-        // fields still have to be reconciled against what that publisher wrote,
-        // and the same "do we actually hold it" rule applies: the winner sealed
-        // the object to a new path, so this checks where the row points NOW.
-        const settled = await prisma.receiptIntake.findUnique({
-            where: { id }, select: { storagePath: true },
-        });
-        const missing = settled ? await confirmStoredCopy(settled.storagePath) : null;
+        // Another publisher won, with the SAME content this call verified.
+        // Same outcome for the caller — but the late fields still have to be
+        // reconciled against what that publisher wrote, and the same "do we
+        // actually hold it" rule applies.
+        const missing = await confirmStoredCopy(current.storagePath);
         if (missing) return missing;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;

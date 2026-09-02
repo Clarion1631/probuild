@@ -75,7 +75,7 @@ const WORKER_ROW_SELECT = {
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
-    createdAt: true, dedupWeakKey: true, busyPasses: true,
+    createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
 } as const;
 
 /**
@@ -690,9 +690,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // hands the row straight to bookReceipt in this same pass, and both
             // its send mark and its BOOKED commit CAS on this token. Releasing
             // here would admit a second worker to the same booking.
+            //
+            // stateReason is left UNTOUCHED, not cleared: finishRouting is the
+            // ONLY path to READ (see worker.ts), and it never writes anything
+            // to this column besides null or "tax-implausible" — so whatever a
+            // READ row is carrying here is exactly that warning, and it must
+            // survive into BOOKING/BOOKED or an automatically booked receipt
+            // with a bad tax read becomes indistinguishable from one with no
+            // tax read at all.
             const { count } = await tx.receiptIntake.updateMany({
                 where: { id: rowId, state: "READ", claimToken },
-                data: { state: "BOOKING", stateReason: null },
+                data: { state: "BOOKING" },
             });
             if (count === 0) return { promoted: false, stale: true };
             return { promoted: true };

@@ -188,20 +188,40 @@ export async function POST(req: Request) {
             // A ROW THE SWEEPER PARKED AS RECOVERABLE GETS A NEW URL, NOT
             // "alreadyReceived".
             //
-            // file-missing and sha-mismatch both mean the bytes we hold are not
-            // the document (or are not there at all), and the row never
-            // published. Answering alreadyReceived told the forwarder we had a
-            // receipt we did not have — and it deletes its only copy on that
-            // answer — leaving the row parked forever with nothing to recover
-            // from. So the upload is re-armed instead: a fresh signed URL, and
-            // the sha the caller is about to upload becomes the expected one.
+            // file-missing and sha-mismatch both mean the bytes we hold RIGHT
+            // NOW are not the document (or are not there at all), and the row
+            // never published. Answering alreadyReceived told the forwarder we
+            // had a receipt we did not have — and it deletes its only copy on
+            // that answer — leaving the row parked forever with nothing to
+            // recover from. So the upload is re-armed instead: a fresh signed
+            // URL, and the sha the caller is about to upload becomes the
+            // expected one.
             //
-            // The identity check below is deliberately skipped for these two:
-            // it exists to stop receipt B overwriting receipt A's VERIFIED
-            // bytes, and here there are none to protect.
+            // BUT a row can be "recoverable" and still remember a REAL,
+            // previously verified identity — file-missing in particular is
+            // reached from a row that was already published (RECEIVED) and
+            // later found to have lost its object; its fileSha256 records the
+            // document that was actually published, not a stale guess. A
+            // recovery must not silently rebind that identity to different
+            // bytes: skipping the check entirely (as before) let a receipt
+            // published once, then physically lost, be "recovered" with an
+            // entirely unrelated document. Only a row with NO recorded hash at
+            // all (nothing to protect) may rearm without proving identity.
             const recoverable = existing.state !== "STAGING"
                 && finalizeDisposition(existing) === "publish";
             if (recoverable) {
+                const knownForRecovery = (existing.fileSha256 || existing.expectedSha256 || "").toLowerCase();
+                if (knownForRecovery && knownForRecovery !== expectedSha256) {
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "sourceRef-conflict",
+                            reason: "this sourceRef's previously recorded document has a different hash; it cannot be rebound to different bytes",
+                            existingId: existing.id,
+                        },
+                        { status: 409 },
+                    );
+                }
                 // THE ROW MOVES FIRST, THEN THE URL IS SIGNED.
                 //
                 // The claim on the lease is made in ONE checked update: the

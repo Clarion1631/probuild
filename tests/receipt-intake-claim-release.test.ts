@@ -81,7 +81,13 @@ test("EVERY completed, deferred or terminal transition releases the claim", () =
         // bookReceipt in the same pass, and both its send mark and its BOOKED
         // commit CAS on this same token. Releasing here would admit a second
         // worker to the same booking.
-        const isPromotion = /state: "BOOKING", stateReason: null/.test(block.data) && !setsRetry;
+        //
+        // stateReason is deliberately absent from this write (not set to
+        // null): a READ row's stateReason can only ever be null or
+        // "tax-implausible" (finishRouting is the ONLY path to READ), and that
+        // warning must survive into BOOKING/BOOKED rather than being cleared
+        // on the way through — see preservedTaxWarning in route-state.ts.
+        const isPromotion = /state: "BOOKING" \}/.test(block.data) && !setsRetry;
         if (isPromotion) continue;
 
         const releases = /claimToken: null/.test(block.data) || /RELEASE_CLAIM/.test(block.data);

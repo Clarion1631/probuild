@@ -37,7 +37,7 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS } from "./route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, preservedTaxWarning } from "./route-state";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -70,6 +70,13 @@ export interface BookableRow {
     attempts: number;
     /** Carries a previous attachment failure across a retry — see below. */
     lastError: string | null;
+    /**
+     * Whatever this row currently holds. It is not booking's to interpret in
+     * general — but the BOOKED write needs it to know whether a
+     * "tax-implausible" warning has to survive the transition (see
+     * preservedTaxWarning in route-state.ts).
+     */
+    stateReason: string | null;
     /**
      * True once a QBO create has been ATTEMPTED for this row. It is the only
      * honest answer to "could a Purchase exist?", and it is what decides whether
@@ -667,7 +674,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 where: { id: row.id, state: "BOOKING", claimToken: row.claimToken },
                 data: {
                     state: "BOOKED",
-                    stateReason: null,
+                    // Every OTHER value this column carries at BOOKING (a
+                    // defer reason like "push-paused", a retry note) is
+                    // transient and must not survive into BOOKED — but a
+                    // dropped-tax-reading warning is a fact about the
+                    // DOCUMENT, not about why booking was delayed, and must.
+                    stateReason: preservedTaxWarning(row.stateReason),
                     qbPurchaseId: result.qbPurchaseId,
                     expenseId: expense.id,
                     bookedAt: now,

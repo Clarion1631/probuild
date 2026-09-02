@@ -97,6 +97,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         sendAttempted: false,
         fileSha256: "s".repeat(64),
         claimToken: "claim-1",
+        stateReason: null,
         ...overrides,
     };
 }
@@ -233,6 +234,26 @@ test("a successful booking creates the Expense at the gross amount and marks the
     assert.equal(r.events[0].source, "intake-worker");
     assert.equal(r.events[0].amountCents, 36498);
     assert.equal(r.events[0].taxCents, 2920, "the tax that actually posted");
+});
+
+test("a tax-implausible warning survives into BOOKED", async () => {
+    // Codex gate: READ->BOOKING used to clear stateReason unconditionally, and
+    // BOOKED cleared it again — so an automatically booked receipt with a bad
+    // tax read became indistinguishable from one with no tax read at all.
+    const r = recorder();
+    const result = await bookReceipt(row({ stateReason: "tax-implausible" }), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.intakeUpdates[0].state, "BOOKED");
+    assert.equal(r.intakeUpdates[0].stateReason, "tax-implausible");
+});
+
+test("a transient BOOKING reason (e.g. a past defer) does NOT survive into BOOKED", async () => {
+    const r = recorder();
+    const result = await bookReceipt(row({ stateReason: "push-paused" }), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.intakeUpdates[0].stateReason, null, "only the tax warning is meant to survive");
 });
 
 test("an explicitly chosen cost code beats the model's suggestion", async () => {
