@@ -50,7 +50,6 @@ export interface BookableRow {
     suggestedCostCodeId: string | null;
     /** The model's confidence in that phase suggestion, 0..1. */
     suggestedConfidence: number | null;
-    suggestedConfidence: number | null;
     /** Phase 3: the read found sales tax paid at the register. */
     taxAtSource: boolean;
     /** Phase 3: installed at a customer job (deductible) — null = unknown. */

@@ -130,7 +130,9 @@ function tooLargeForInline(limit: number, encoding: "json" | "multipart") {
         },
         { status: 413 },
     );
+}
 
+/**
  * Accept a boolean from either a JSON body (real boolean) or a multipart form
  * (everything is a string). Anything else is "the caller did not say".
  */
