@@ -20,7 +20,8 @@ import { isValidChatWebhookUrl, postTextToWebhook } from "@/lib/chat-webhook";
 import { sendNotification } from "@/lib/email";
 import { computeProjectFinancials } from "@/lib/project-financials";
 import { listActiveJobsWithPercentComplete } from "@/lib/percent-complete-db";
-import { percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { formatPercentCompleteDate, percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { resolveActualCostCodeId } from "@/lib/job-variance";
 import { formatCurrency } from "@/lib/utils";
 
@@ -28,10 +29,7 @@ function appBaseUrl(): string {
     return (process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com").replace(/\/+$/, "");
 }
 
-function shortDate(date: Date | null): string | null {
-    if (!date) return null;
-    return `${date.getMonth() + 1}/${date.getDate()}`;
-}
+
 
 export interface MarginDigestJob {
     id: string;
@@ -40,9 +38,10 @@ export interface MarginDigestJob {
     percentComplete: number | null;
     source: "AUTO" | "MANUAL" | null;
     auto: number | null;
-    asOf: Date | null;
     needsReview: boolean;
     earnedMargin: number | null;
+    /** Pre-formatted in the COMPANY time zone — this renders on Vercel, whose local zone is UTC. */
+    asOfLabel: string | null;
 }
 
 /**
@@ -51,7 +50,12 @@ export interface MarginDigestJob {
  * about which job is doing worst.
  */
 export async function loadMarginDigestJobs(): Promise<MarginDigestJob[]> {
-    const jobs = await listActiveJobsWithPercentComplete();
+    const [jobs, timeZone] = await Promise.all([
+        listActiveJobsWithPercentComplete(),
+        // Never the runtime's local zone: on Vercel that is UTC, so a 5pm
+        // Pacific override renders as the NEXT day in Monday's card.
+        resolveCompanyTimeZone(),
+    ]);
     const base = appBaseUrl();
 
     const rows: MarginDigestJob[] = [];
@@ -64,7 +68,6 @@ export async function loadMarginDigestJobs(): Promise<MarginDigestJob[]> {
             percentComplete: job.percentComplete,
             source: job.percentCompleteSource,
             auto: job.percentCompleteAuto,
-            asOf: job.percentCompleteAsOf,
             needsReview: percentCompleteNeedsReview({
                 source: job.percentCompleteSource,
                 auto: job.percentCompleteAuto,
@@ -72,6 +75,7 @@ export async function loadMarginDigestJobs(): Promise<MarginDigestJob[]> {
                 manual: job.percentComplete,
             }),
             earnedMargin: fin.earnedMargin,
+            asOfLabel: formatPercentCompleteDate(job.percentCompleteAsOf, timeZone),
         });
     }
     return rows;
@@ -92,7 +96,7 @@ export function buildMarginCardText(jobs: MarginDigestJob[], today = new Date())
         // the gap between machine and judgement is visible at a glance.
         const parts: string[] = [job.auto === null ? "auto —" : `auto ${job.auto}%`];
         if (job.source === "MANUAL") {
-            const when = shortDate(job.asOf);
+            const when = job.asOfLabel;
             parts.push(`manual ${job.percentComplete}%${when ? ` (${when})` : ""}`);
         }
         const margin = job.earnedMargin === null ? "earned margin —" : `earned margin ${formatCurrency(job.earnedMargin)}`;

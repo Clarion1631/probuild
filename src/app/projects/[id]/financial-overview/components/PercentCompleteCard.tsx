@@ -11,8 +11,15 @@ export interface PercentCompleteCardProps {
     /** The EFFECTIVE value — auto or manual. Null when the job cannot be measured yet. */
     percentComplete: number | null;
     source: "AUTO" | "MANUAL" | null;
-    /** ISO string; the server component serializes the Date. */
-    asOf: string | null;
+    /**
+     * Already formatted, on the SERVER, in the company time zone.
+     *
+     * Formatting here instead would use the VIEWER's browser zone, which the
+     * server cannot know at render time — so an evening Pacific override showed
+     * one date in the server HTML and another after hydration, and a different
+     * one again to a colleague in another zone.
+     */
+    asOfLabel: string | null;
     /** Latest machine estimate, shown alongside a manual value so the gap is visible. */
     auto: number | null;
     needsReview: boolean;
@@ -20,12 +27,6 @@ export interface PercentCompleteCardProps {
     editorName: string | null;
     /** ADMIN/MANAGER only — everyone else gets the same card, read-only. */
     canEdit: boolean;
-}
-
-function formatDate(iso: string | null): string | null {
-    if (!iso) return null;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d.toLocaleDateString();
 }
 
 /**
@@ -43,7 +44,7 @@ export default function PercentCompleteCard(props: PercentCompleteCardProps) {
     const [pending, startTransition] = useTransition();
     const [draft, setDraft] = useState(props.percentComplete === null ? "" : String(props.percentComplete));
 
-    const asOfLabel = formatDate(props.asOf);
+    const asOfLabel = props.asOfLabel;
     const sourceLabel = props.source === "MANUAL" ? "Manual" : props.source === "AUTO" ? "Auto" : null;
 
     function save() {

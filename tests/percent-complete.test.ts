@@ -30,6 +30,7 @@ import {
     percentCompleteNeedsReview,
     phaseProgress,
     phasesMentionedInLogs,
+    formatPercentCompleteDate,
 } from "../src/lib/percent-complete";
 
 function phase(over: Partial<Parameters<typeof phaseProgress>[0]> & { costCodeId?: string; budget?: number } = {}) {
@@ -279,6 +280,55 @@ test("drift is measured against the auto SNAPSHOT, not the manual value", () => 
 
 test("reset to auto clears the review flag (source AUTO, snapshot null)", () => {
     assert.equal(percentCompleteNeedsReview({ source: "AUTO", auto: 82, autoAtOverride: null }), false);
+});
+
+// ── override date formatting (time zone) ────────────────────────────────────
+
+const PACIFIC = "America/Los_Angeles";
+
+test("an evening Pacific override keeps its Pacific date, not the UTC next day", () => {
+    // 2026-08-25 17:30 Pacific is 2026-08-26 00:30 UTC. The Monday card renders
+    // on Vercel, whose local zone IS UTC, so the ambient getters reported 8/26
+    // for an override the owner made on the 25th.
+    const instant = new Date("2026-08-26T00:30:00Z");
+    assert.equal(formatPercentCompleteDate(instant, PACIFIC), "8/25");
+    assert.equal(formatPercentCompleteDate(instant, "UTC"), "8/26");
+});
+
+test("just after Pacific midnight rolls the date forward", () => {
+    // 2026-08-26 00:15 Pacific = 07:15 UTC — same calendar day in both, and the
+    // pair above plus this one bracket the boundary from either side.
+    const instant = new Date("2026-08-26T07:15:00Z");
+    assert.equal(formatPercentCompleteDate(instant, PACIFIC), "8/26");
+});
+
+test("the last second before Pacific midnight is still the earlier day", () => {
+    // 2026-08-25 23:59:59 Pacific = 2026-08-26 06:59:59 UTC.
+    assert.equal(formatPercentCompleteDate(new Date("2026-08-26T06:59:59Z"), PACIFIC), "8/25");
+});
+
+test("the date is DST-correct across a fall-back boundary", () => {
+    // 2026-11-01 is the US DST end. 2026-11-01 18:00 Pacific (PST, UTC-8) is
+    // 2026-11-02 02:00 UTC — a fixed -7 offset would have answered 11/1 here by
+    // luck and 11/2 an hour later; the zone-aware formatter is right either way.
+    assert.equal(formatPercentCompleteDate(new Date("2026-11-02T02:00:00Z"), PACIFIC), "11/1");
+});
+
+test("an ISO string and a Date give the same answer", () => {
+    assert.equal(
+        formatPercentCompleteDate("2026-08-26T00:30:00Z", PACIFIC),
+        formatPercentCompleteDate(new Date("2026-08-26T00:30:00Z"), PACIFIC)
+    );
+});
+
+test("no timestamp, or an unparseable one, formats to null rather than a fake date", () => {
+    assert.equal(formatPercentCompleteDate(null, PACIFIC), null);
+    assert.equal(formatPercentCompleteDate(undefined, PACIFIC), null);
+    assert.equal(formatPercentCompleteDate("not a date", PACIFIC), null);
+});
+
+test("the month and day carry no leading zeros", () => {
+    assert.equal(formatPercentCompleteDate(new Date("2026-01-05T18:00:00Z"), PACIFIC), "1/5");
 });
 
 // ── daily-log phase evidence (the task-less fallback) ───────────────────────

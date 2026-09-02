@@ -102,7 +102,7 @@ function job(over: Partial<MarginDigestJob> = {}): MarginDigestJob {
         percentComplete: 62,
         source: "AUTO",
         auto: 62,
-        asOf: null,
+        asOfLabel: null,
         needsReview: false,
         earnedMargin: 12_400,
         ...over,
@@ -121,7 +121,7 @@ test("an auto job reads auto %, earned margin, and a link", () => {
 
 test("a manual override shows BOTH the auto value and the manual one with its date", () => {
     const text = buildMarginCardText(
-        [job({ source: "MANUAL", percentComplete: 60, auto: 62, asOf: new Date("2026-08-25T12:00:00Z") })],
+        [job({ source: "MANUAL", percentComplete: 60, auto: 62, asOfLabel: "8/25" })],
         MONDAY
     );
     assert.match(text, /auto 62%/);

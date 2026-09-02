@@ -3,7 +3,8 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { currentStaffUserOrNull, isAdminOrManager } from "@/lib/permissions";
-import { percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { formatPercentCompleteDate, percentCompleteNeedsReview } from "@/lib/percent-complete";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import FinancialOverviewContent from "./components/financial-overview-content";
 import PercentCompleteCard from "./components/PercentCompleteCard";
 
@@ -30,7 +31,7 @@ export default async function FinancialOverviewPage({ params }: { params: Promis
   // Editing percent complete is ADMIN/MANAGER. Everyone else who can reach this
   // page still SEES the card — read-only — because the number explains the
   // earned-margin figures below it.
-  const viewer = await currentStaffUserOrNull();
+  const [viewer, timeZone] = await Promise.all([currentStaffUserOrNull(), resolveCompanyTimeZone()]);
   const canEdit = !!viewer && isAdminOrManager(viewer);
 
   // Decimal columns must not cross to the client component as Prisma Decimals.
@@ -50,7 +51,7 @@ export default async function FinancialOverviewPage({ params }: { params: Promis
           projectId={project.id}
           percentComplete={percentComplete}
           source={source}
-          asOf={project.percentCompleteAsOf ? project.percentCompleteAsOf.toISOString() : null}
+          asOfLabel={formatPercentCompleteDate(project.percentCompleteAsOf, timeZone)}
           auto={percentCompleteAuto}
           needsReview={percentCompleteNeedsReview({
             source,

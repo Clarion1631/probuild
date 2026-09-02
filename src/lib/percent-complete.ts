@@ -1,3 +1,5 @@
+import { dayKeyInTimeZone } from "@/lib/tz-date";
+
 // Percent complete — the pure formula behind earned revenue and earned margin
 // (docs/plans/PHASE-4-EARNED-MARGIN-SPEC.md §3).
 //
@@ -108,6 +110,31 @@ export function phaseProgress(phase: Pick<PhaseProgressInput, "totalTasks" | "do
     }
     const done = Number.isFinite(phase.doneTasks) ? Math.max(0, Math.trunc(phase.doneTasks)) : 0;
     return Math.min(1, done / total);
+}
+
+/**
+ * "8/25" for a percent-complete timestamp, in the COMPANY's time zone.
+ *
+ * Both surfaces that show this date must agree, and neither may use ambient
+ * local time:
+ *   - the Monday Chat card renders on Vercel, whose local zone is UTC, so a
+ *     5pm Pacific override read as the NEXT day;
+ *   - the project card is a client component, so `toLocaleDateString()` there
+ *     used the viewer's browser zone — a different answer again, and one the
+ *     server could not match during hydration.
+ *
+ * Pure (takes the zone, never resolves it) so the UTC-boundary cases are
+ * testable without a database or a browser.
+ */
+export function formatPercentCompleteDate(
+    instant: Date | string | null | undefined,
+    timeZone: string
+): string | null {
+    if (!instant) return null;
+    const dayKey = dayKeyInTimeZone(instant, timeZone);
+    if (!dayKey) return null;
+    const [, month, day] = dayKey.split("-");
+    return `${Number(month)}/${Number(day)}`;
 }
 
 /**
