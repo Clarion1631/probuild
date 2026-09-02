@@ -71,6 +71,63 @@ jobs:
         env:
           MIGRATION_HISTORY_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+  # Fail-closed gate against the incident class described in
+  # scripts/check-schema-drift.mjs's header (2026-07-20 company-schedule,
+  # 2026-08-29 PR #406 Inspection table): a PR whose Prisma schema changes
+  # were merged and auto-deployed before its scripts/apply-*.mjs ran against
+  # prod, leaving every project page crashing on the generic error boundary.
+  #
+  # Path filtering is done with a diff step inside the job, not a
+  # workflow-level `paths:` filter, because a workflow-level filter would
+  # skip the whole file (including the other jobs above) rather than just
+  # this one when a PR doesn't touch these paths.
+  schema-drift:
+    name: Schema drift check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether this PR touches schema-relevant paths
+        id: filter
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -Eq '^(prisma/schema\.prisma|prisma/migrations/|scripts/apply-.*\.mjs)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.filter.outputs.relevant == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.filter.outputs.relevant == 'true'
+        run: npm ci
+
+      - name: Generate Prisma client
+        if: steps.filter.outputs.relevant == 'true'
+        run: npx prisma generate
+
+      - name: Check for schema drift against production
+        if: steps.filter.outputs.relevant == 'true'
+        run: node scripts/check-schema-drift.mjs
+
+      - name: On failure
+        if: failure() && steps.filter.outputs.relevant == 'true'
+        run: |
+          echo "::error::Production is missing tables/columns this PR's Prisma schema expects. Run this PR's scripts/apply-*.mjs against prod first (see .claude/skills/deploy-probuild/SKILL.md), then re-run this job."
+          exit 1
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
