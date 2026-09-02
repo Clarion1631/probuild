@@ -35,7 +35,7 @@ import {
     type QboReceiptGroup,
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
-import type { DocBytesResult } from "@/lib/secure-storage";
+import type { VerifiedBytes } from "./stored-object";
 import { backoffMs, MAX_BOOK_ATTEMPTS } from "./route-state";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
@@ -59,6 +59,8 @@ export interface BookableRow {
     docType: string | null;
     refNumber: string | null;
     memo: string | null;
+    /** What finalize recorded; every download of this row is checked against it. */
+    fileSha256: string;
     attempts: number;
     /** Carries a previous attachment failure across a retry — see below. */
     lastError: string | null;
@@ -188,7 +190,7 @@ export interface BookDependencies {
      * Reads the stored file back out of the private bucket. TAGGED, because a
      * confirmed 404 and a transient storage fault must not book the same way.
      */
-    downloadBytes: (secureRef: string) => Promise<DocBytesResult>;
+    downloadBytes: (storagePath: string, expectedSha256: string) => Promise<VerifiedBytes>;
     logEvent: (event: AutomationEventInput) => Promise<void>;
     now: () => Date;
 }
@@ -358,9 +360,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // A transient storage fault retries (the document is fine, Supabase was
     // not); an affirmative 404 is terminal and pre-send, so the strong key goes
     // back for a corrected re-upload.
-    const download = await deps.downloadBytes(toSecureRef(row.storagePath));
+    const download = await deps.downloadBytes(row.storagePath, row.fileSha256);
     if (!download.ok) {
-        if (download.kind === "not-found") return parkedBeforeSend("receipt-bytes-missing");
+        if (download.kind === "missing") return parkedBeforeSend("receipt-bytes-missing");
+        // The attachment about to ride along with a real Purchase is NOT the
+        // document this row was verified as. Refuse — a Purchase carrying the
+        // wrong receipt is worse than one carrying none.
+        if (download.kind === "sha-mismatch") return parkedBeforeSend("content-changed");
         return retry(row, deps, now, `storage:${download.message}`);
     }
     const bytes = download.bytes;
@@ -376,6 +382,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // exists in the real books without its receipt.
     const blocker = attachmentBlocker(row.mimeType, bytes.length);
     if (blocker) return parkedBeforeSend(`unsupported-attachment:${blocker}`);
+
+    // Phase check ONE: immediately before the QBO create. The project can be
+    // reassigned while this row sits in the queue, and a stale phase should be
+    // caught before the books are touched, not only on the way to the Expense.
+    const phaseBeforeSend = await resolvePhase(row, project.id, deps);
 
     // NOTE: a previous attachment failure deliberately does NOT short-circuit
     // here. createQBReceiptPurchase re-checks and re-uploads the file for an
@@ -399,12 +410,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         fileContentType: row.mimeType,
     };
 
-    // RECORDED BEFORE THE CALL, and persisted, because the question it answers
-    // is "might QuickBooks hold a Purchase for this row?" — and a process that
-    // dies mid-create must still answer yes. Setting it after would make the
-    // one case that matters look like a row that never sent.
-    await deps.markSendAttempted(row.id);
-    const sent = { attempted: true };
+    const sent = { attempted: false };
 
     let result: CreateQBReceiptPurchaseResult;
     try {
@@ -415,6 +421,19 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // Last gate before the books are touched: the refresh may have consumed
         // what was left.
         if (outOfRunway()) return { outcome: "deferred", reason: "out-of-budget" };
+
+        // MARKED HERE — after the tokens and after the final budget check, and
+        // IMMEDIATELY before the create.
+        //
+        // Earlier was wrong in the direction that costs money to undo: a token
+        // refresh that threw, or a budget check that deferred, would have left
+        // sendAttempted=true on a row that never reached QuickBooks, and its
+        // strong key would then be held forever against a Purchase that does
+        // not exist. Persisted rather than in-memory, because the case the flag
+        // exists for is the process dying mid-create.
+        await deps.markSendAttempted(row.id);
+        sent.attempted = true;
+
         result = await deps.createPurchase(tokens, input, deps.deadline);
     } catch (error) {
         const terminal = terminalReasonFor(error);
@@ -484,7 +503,18 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // NOT a failure: the receipt is fine and its total is right, so it books
     // UNCODED and says why. A bookkeeper assigning a phase is routine; an
     // expense silently attached to the wrong one is not.
+    // Phase check TWO: immediately before the Expense write, INSIDE the same
+    // window as the row's own commit. The create above is a network round trip
+    // that can take seconds, and the answer that matters is the one true when
+    // the money is recorded — a project reassignment that lands in between must
+    // not be written into job cost.
     const phaseCheck = await resolvePhase(row, project.id, deps);
+    if (phaseCheck.costCodeId !== phaseBeforeSend.costCodeId) {
+        console.warn(
+            "[receipt-intake] phase changed across the QBO create",
+            JSON.stringify({ rowId: row.id, before: phaseBeforeSend.costCodeId, after: phaseCheck.costCodeId }),
+        );
+    }
     const costCodeId = phaseCheck.costCodeId;
     const driveFileId = driveFileIdOf(row);
     const receiptUrl = driveFileId

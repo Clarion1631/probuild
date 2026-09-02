@@ -436,6 +436,28 @@ PDFs carrying embedded JavaScript (never opened server-side — the bytes go to 
 QBO as an attachment).
 
 
+### Objects are sealed on finalize
+
+The upload path is writable by whoever holds the signed URL, and that URL is `upsert: true`
+so a resumed `/start` can replace its own partial upload. Both are necessary, and together
+they mean the bytes at the upload path can change AFTER verification.
+
+So `/finalize` verifies, then **copies** the bytes to `receipts/<id>/<sha256>.<ext>` — a
+content-addressed path the client was never given a URL for — deletes the upload path, and
+points the row there. Every later reader (the Gemini read step, the booker) re-hashes what
+it downloads and refuses on a mismatch: `content-changed`, terminal. A hash stored once and
+never re-checked proves nothing about what is being served now.
+
+A failed delete of the upload path is an orphan, not a correctness problem (the row already
+points at the sealed copy), so it goes on the `storage-cleanup-pending` queue.
+
+**Sweeper timing.** A `STAGING` row is only parked `file-missing` once the signed upload
+URL's **2-hour** lifetime has passed — parking at the 15-minute sweep window declared
+receipts missing while their own upload link was still usable. A late `/finalize` on a row
+the sweeper already parked re-validates and **recovers** it rather than reporting
+`alreadyFinalized`, which would leave a real receipt parked while telling the caller it was
+fine.
+
 ### Two machine secrets, not one
 
 They belong to different programs, so they are different keys and rotate independently.
@@ -528,11 +550,15 @@ an overlap safe in general.
      (`kind: receipt-push`, status `created`/`already-exists`) whose `driveFileId` matches
      the row — v1's pushes go through ProBuild's create route, which logs them — or the
      forwarder sending `archivedByV1: true` on the forward.
-   - everything else, including rows before the boundary with NO evidence -> handed to v2.
-     "Received before the boundary" says when the file arrived, not that anything booked
-     it: v1 skips documents constantly, and retiring those would drop real expenses. This
-     is safe because a Drive row books under the **Drive file id**, so a v1/v2 overlap on
-     the same file collapses to one Purchase through QBO's DocNumber/requestid idempotency.
+   - before the boundary, NO evidence, and a **Drive** row -> handed to v2. Safe precisely
+     because a Drive row books under the **Drive file id**, so if v1 did book it after all,
+     QBO's DocNumber/requestid idempotency collapses the two into one Purchase.
+   - before the boundary, NO evidence, and **not** a Drive row -> `SHADOW_QUARANTINE`.
+     There is no shared identity here: v2 would book under the intake UUID, which v1 never
+     saw, so a duplicate would go through silently. Booking risks double-paying; retiring
+     risks losing a real expense. Terminal, never auto-requeued — it surfaces on the
+     Receipts tab with a "book anyway" action for whoever has checked QuickBooks.
+   - after the boundary -> handed to v2. v1 had already stopped, so nobody booked these.
    With no boundary recorded in live mode the worker **halts the entire pass before
    claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking
    anything while we cannot tell what v1 already booked is the double-booking this whole

@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "qbPurchaseId" TEXT,
     "expenseId" TEXT,
     "archiveDriveFileId" TEXT,
+    "claimToken" TEXT,
+    "claimedAt" TIMESTAMP(3),
     "attempts" INTEGER NOT NULL DEFAULT 0,
     "busyPasses" INTEGER NOT NULL DEFAULT 0,
     "lastError" TEXT,
@@ -64,6 +66,8 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NU
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
 
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
@@ -74,6 +78,8 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_state_nextRetryAt_idx" ON "ReceiptInta
 CREATE INDEX IF NOT EXISTS "ReceiptIntake_projectId_idx" ON "ReceiptIntake"("projectId");
 CREATE INDEX IF NOT EXISTS "ReceiptIntake_dedupWeakKey_idx" ON "ReceiptIntake"("dedupWeakKey");
 CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("createdAt");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_costCodeId_idx" ON "ReceiptIntake"("costCodeId");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdById_idx" ON "ReceiptIntake"("createdById");
 
 DO $$
 BEGIN
@@ -85,7 +91,7 @@ BEGIN
         ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
             CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                                'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
-                               'SHADOW_DONE'));
+                               'SHADOW_DONE', 'SHADOW_QUARANTINE'));
     END IF;
 END $$;
 

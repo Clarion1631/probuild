@@ -131,3 +131,56 @@ test.after(async () => {
         await db.$disconnect();
     }
 });
+
+test("the finishRouting adapter is fenced on BOTH state and token", { skip }, async () => {
+    // The production adapter, against a real database — the mocked worker
+    // suites cannot see this, and the failure it prevents is a zombie worker
+    // publishing READ over the state its successor already produced.
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+
+    const finishRouting = async (rowId: string, claimToken: string | null, stateReason: string | null) => {
+        const { count } = await db!.receiptIntake.updateMany({
+            where: { id: rowId, state: "RECEIVED", claimToken },
+            data: { state: "READ", stateReason, nextRetryAt: null, claimToken: null, claimedAt: null },
+        });
+        return count;
+    };
+
+    // The happy path: the holder of the current token publishes and BOTH claim
+    // fields are cleared.
+    await seed("claimdb-fence", { claimToken: "token-1", claimedAt: new Date(), nextRetryAt: new Date() });
+    assert.equal(await finishRouting("claimdb-fence", "token-1", null), 1);
+    const published = await db!.receiptIntake.findUnique({ where: { id: "claimdb-fence" } });
+    assert.equal(published?.state, "READ");
+    assert.equal(published?.claimToken, null, "the token is released");
+    assert.equal(published?.claimedAt, null, "and so is claimedAt");
+    assert.equal(published?.nextRetryAt, null, "and the lease");
+
+    // The zombie: a stale token writes NOTHING, even though the row is back in
+    // RECEIVED and looks claimable to a state-only check.
+    await db!.receiptIntake.update({
+        where: { id: "claimdb-fence" },
+        data: { state: "RECEIVED", claimToken: "token-2", stateReason: null },
+    });
+    assert.equal(await finishRouting("claimdb-fence", "token-1", "zombie"), 0, "stale token is fenced out");
+    const afterZombie = await db!.receiptIntake.findUnique({ where: { id: "claimdb-fence" } });
+    assert.equal(afterZombie?.state, "RECEIVED", "the successor's state survives");
+    assert.equal(afterZombie?.claimToken, "token-2", "and its claim is untouched");
+
+    // The state fence still holds independently: right token, wrong state.
+    await db!.receiptIntake.update({
+        where: { id: "claimdb-fence" },
+        data: { state: "NEEDS_REVIEW", claimToken: "token-3" },
+    });
+    assert.equal(await finishRouting("claimdb-fence", "token-3", null), 0, "a routed row is not re-published");
+
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+});
+
+test("SHADOW_QUARANTINE is writable — the CHECK allows it", { skip }, async () => {
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+    await seed("claimdb-quar", { state: "SHADOW_QUARANTINE", stateReason: "no-v1-evidence" });
+    const row = await db!.receiptIntake.findUnique({ where: { id: "claimdb-quar" } });
+    assert.equal(row?.state, "SHADOW_QUARANTINE");
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+});

@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
-import { inspectStoredObject } from "@/lib/receipt-intake/stored-object";
+import { downloadVerified, inspectStoredObject } from "@/lib/receipt-intake/stored-object";
 import { deleteObjectOrRecord, retryPendingCleanups } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
@@ -13,7 +14,7 @@ import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import { resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
@@ -22,6 +23,7 @@ import {
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
     RUN_HARD_BUDGET_MS,
+    SIGNED_UPLOAD_TTL_MS,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
     type ClaimResult,
@@ -64,7 +66,7 @@ const WORKER_ROW_SELECT = {
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
-    suggestedConfidence: true, sendAttempted: true,
+    suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true,
 } as const;
 
@@ -104,6 +106,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         // The rows keep their read results and dedup keys, so a post-cutover
         // resend of the same receipt still collides with them and is caught.
         let shadowRetired = 0;
+        let shadowQuarantined = 0;
         let requeued = 0;
         if (opts.run) {
             // runIntakeWorker halts before ever calling claim() without one, so
@@ -159,14 +162,34 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     )
                     : new Set<string>();
 
+                // Three outcomes, not two. The middle one is the honest answer
+                // to a question we cannot settle from data:
+                //
+                //   evidenced      -> v1 booked it. Retire.
+                //   no evidence,
+                //     DRIVE row    -> hand to v2. Safe BECAUSE it books under
+                //                     the Drive file id, so if v1 did book it
+                //                     after all, QBO's DocNumber/requestid
+                //                     idempotency collapses the two into one
+                //                     Purchase.
+                //   no evidence,
+                //     NOT a Drive  -> quarantine. There is no shared identity
+                //     row             here: v2 would book under the intake
+                //                     UUID, which v1 never saw, so a duplicate
+                //                     would go through silently. Booking risks
+                //                     double-paying; retiring risks losing a
+                //                     real expense. A human checks QBO and uses
+                //                     "book anyway".
                 const evidenced: string[] = [];
                 const unevidenced: string[] = [];
+                const quarantined: string[] = [];
                 for (const row of candidates) {
                     const driveId = row.source === "drive" && row.sourceRef.startsWith("drive:")
                         ? row.sourceRef.slice("drive:".length)
                         : null;
                     if (row.archivedByV1 || (driveId && bookedByV1.has(driveId))) evidenced.push(row.id);
-                    else unevidenced.push(row.id);
+                    else if (driveId) unevidenced.push(row.id);
+                    else quarantined.push(row.id);
                 }
 
                 if (evidenced.length) {
@@ -175,6 +198,21 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                         data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
                     });
                     shadowRetired = retired.count;
+                }
+
+                if (quarantined.length) {
+                    const held = await tx.receiptIntake.updateMany({
+                        where: { id: { in: quarantined } },
+                        data: {
+                            state: "SHADOW_QUARANTINE",
+                            stateReason: "no-v1-evidence",
+                            // Terminal: it must never come back round on a
+                            // retry timer. Only a human moves it.
+                            nextRetryAt: null,
+                            dryRun: false,
+                        },
+                    });
+                    shadowQuarantined = held.count;
                 }
 
                 // Everything else — after the boundary, or before it with no
@@ -190,10 +228,10 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 });
                 requeued = handed.count;
 
-                if (shadowRetired > 0 || requeued > 0) {
+                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
-                        boundary: opts.boundary.toISOString(), shadowRetired, requeued,
-                        unevidenced: unevidenced.length,
+                        boundary: opts.boundary.toISOString(),
+                        shadowRetired, requeued, shadowQuarantined,
                     }));
                 }
             }
@@ -212,15 +250,25 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             take: BATCH_SIZE,
             select: WORKER_ROW_SELECT,
         });
-        if (due.length === 0) return { rows: [], shadowRetired, requeued };
+        if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
 
         // THE claim. Anything this run took is invisible to the next one for
-        // the lease, whether or not the advisory lock held.
+        // the lease, whether or not the advisory lock held — AND it is stamped
+        // with a fresh token, so a completing write can prove it still owns the
+        // row rather than merely having owned it once.
+        const claimToken = randomUUID();
         await tx.receiptIntake.updateMany({
             where: { id: { in: due.map(r => r.id) } },
-            data: { nextRetryAt: new Date(now.getTime() + LEASE_MS) },
+            data: { nextRetryAt: new Date(now.getTime() + LEASE_MS), claimToken, claimedAt: now },
         });
-        return { rows: due as WorkerRow[], shadowRetired, requeued };
+        // The rows were SELECTed before the stamp, so hand back the token this
+        // pass just wrote rather than whatever they were carrying before.
+        return {
+            rows: due.map(row => ({ ...row, claimToken })) as WorkerRow[],
+            shadowRetired,
+            requeued,
+            shadowQuarantined,
+        };
     });
 }
 
@@ -242,7 +290,10 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
             const stale = await prisma.receiptIntake.findMany({
                 where: { state: "STAGING", createdAt: { lt: cutoff } },
-                select: { id: true, storagePath: true, mimeType: true },
+                select: {
+                    id: true, storagePath: true, mimeType: true,
+                    createdAt: true, expectedSha256: true,
+                },
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
                 // spends the invocation on housekeeping.
@@ -264,6 +315,18 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 const check = await inspectStoredObject(row.storagePath, row.mimeType);
 
                 if (check.ok) {
+                    // The bytes that landed must be the document /start was told
+                    // about. Otherwise the sweep would publish whatever happened
+                    // to be at that path — which is the same overwrite the seal
+                    // exists to close, arriving by a different door.
+                    if (row.expectedSha256 && row.expectedSha256 !== check.fileSha256) {
+                        await prisma.receiptIntake.updateMany({
+                            where: { id: row.id, state: "STAGING" },
+                            data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
+                        });
+                        parked++;
+                        continue;
+                    }
                     await prisma.receiptIntake.updateMany({
                         where: { id: row.id, state: "STAGING" },
                         data: {
@@ -279,6 +342,12 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 }
                 if (check.kind === "transient") continue; // unknown is not a verdict
                 if (check.kind === "missing") {
+                    // The signed upload URL is good for two hours. Parking at 15
+                    // minutes declared a receipt missing while its own upload
+                    // link was still perfectly usable — a slow phone on a bad
+                    // connection came back to find its row already in the review
+                    // queue. Wait until the URL cannot possibly land any more.
+                    if (row.createdAt.getTime() > Date.now() - SIGNED_UPLOAD_TTL_MS) continue;
                     await prisma.receiptIntake.updateMany({
                         where: { id: row.id, state: "STAGING" },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
@@ -298,13 +367,25 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             return published + parked + rejected;
         },
 
-        loadPhases: async () => prisma.costCode.findMany({
-            where: { isActive: true },
-            select: { id: true, code: true, name: true },
-            orderBy: { code: "asc" },
-        }),
+        // ONLY this project's phases — no company-wide fallback, and an empty
+        // list is a real answer.
+        //
+        // Returning every active cost code meant the model was offered phases
+        // the job does not have, so it confidently suggested one, and booking
+        // then had to throw that suggestion away (isCostCodeAllowedForProject).
+        // The visible symptom was receipts arriving uncoded for no stated
+        // reason; the real cost is that a plausible-but-wrong phase is exactly
+        // the kind of thing a reviewer accepts without checking.
+        //
+        // A row with no project has no phases at all. Suggesting one from the
+        // whole company would be a guess with nothing behind it.
+        loadPhases: async projectId => {
+            if (!projectId) return [];
+            const phases = await resolveProjectPhaseCodes(prismaPhaseDataSource, projectId);
+            return phases.map(phase => ({ id: phase.id, code: phase.code, name: phase.name }));
+        },
 
-        downloadBytes: (storagePath: string) => downloadDocBytesResult(toSecureRef(storagePath)),
+        downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
 
         read: (bytes, mime, phases) => readReceipt(bytes, mime, phases),
 
@@ -369,11 +450,28 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         },
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
-        finishRouting: async (rowId, stateReason) => {
-            await prisma.receiptIntake.updateMany({
-                where: { id: rowId, state: "RECEIVED" },
-                data: { state: "READ", stateReason, nextRetryAt: null },
+        finishRouting: async (rowId, claimToken, stateReason) => {
+            // FENCED on state AND token, and it clears both claim fields.
+            //
+            // The state alone is not enough: a worker whose invocation was
+            // killed mid-routing can resume after its row has been re-claimed
+            // and re-read, find it back in RECEIVED, and publish READ over the
+            // successor's work — including over a NEEDS_REVIEW the successor
+            // had every reason to set. Matching the token makes that write
+            // affect zero rows instead.
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: { id: rowId, state: "RECEIVED", claimToken },
+                data: {
+                    state: "READ",
+                    stateReason,
+                    nextRetryAt: null,
+                    claimToken: null,
+                    claimedAt: null,
+                },
             });
+            if (count === 0) {
+                console.warn("[cron/receipt-intake-worker] finishRouting fenced out", rowId);
+            }
         },
 
         companyTimeZone: resolveCompanyTimeZone,
@@ -471,7 +569,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             getTokens: deadline => getFreshQBTokens(deadline),
             createPurchase: (tokens, input, deadline) =>
                 createQBReceiptPurchase(tokens, input, {}, deadline),
-            downloadBytes: downloadDocBytesResult,
+            downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),

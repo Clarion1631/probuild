@@ -3027,7 +3027,7 @@ model ReceiptIntake {
   /// yet, so the worker's claim predicate excludes it. The intake route flips
   /// it to RECEIVED in one UPDATE after the upload lands. A row that never gets
   /// there is swept to NEEDS_REVIEW after 15 minutes.
-  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT SHADOW_DONE
+  state       String  @default("STAGING") // STAGING RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT SHADOW_DONE SHADOW_QUARANTINE
   dryRun      Boolean @default(true)
   /// no-estimate | multi-doc | zero-total | weak-dup:<id> |
   /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |
@@ -3084,6 +3084,15 @@ model ReceiptIntake {
   expenseId          String?   @unique
   expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
   archiveDriveFileId String?
+  /// Fencing token for the worker's claim, rewritten on every claim.
+  ///
+  /// `nextRetryAt` is a time-based lease and cannot tell a LIVE worker from a
+  /// stale one whose invocation was killed and resumed: both hold the same row
+  /// id and both believe they own it. The token can — a completing transition
+  /// matches on it, so a worker whose claim was superseded writes nothing
+  /// instead of overwriting the state its successor just produced.
+  claimToken         String?
+  claimedAt          DateTime?
   attempts           Int       @default(0)
   /// Consecutive passes where the AI service was UNAVAILABLE (never the
   /// document's fault, so it must not spend `attempts`). Ported from v3.4:
@@ -3103,6 +3112,10 @@ model ReceiptIntake {
   // baseline notes). Keep this comment; never regenerate it away.
   @@index([state, nextRetryAt])
   @@index([projectId])
+  /// Both are FK targets the queue filters and joins on; without these a
+  /// cost-code or user-scoped read scans the whole table once it has volume.
+  @@index([costCodeId])
+  @@index([createdById])
   @@index([dedupWeakKey])
   @@index([createdAt])
 }

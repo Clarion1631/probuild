@@ -31,7 +31,7 @@ import {
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
 import type { ProjectPhase, ReadOutcome } from "./read";
-import type { DocBytesResult } from "@/lib/secure-storage";
+import type { VerifiedBytes } from "./stored-object";
 
 /**
  * ONE global constant, deliberately not derived from anything per-row or
@@ -68,6 +68,13 @@ export const STAGING_SWEEP_MINUTES = 15;
 /** Storage round trips per sweep. Small: the sweep runs before any real work. */
 export const STAGING_SWEEP_BATCH = 10;
 /**
+ * Supabase signed upload URLs are valid for two hours. A STAGING row younger
+ * than that may still have its bytes arrive, so declaring it file-missing at
+ * the 15-minute sweep window was premature — the row went to review while its
+ * own upload link was still usable.
+ */
+export const SIGNED_UPLOAD_TTL_MS = 2 * 60 * 60_000;
+/**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
  * from v3.4: an outage that never ends still has to end somewhere, and 20
  * passes at 5 minutes each is over an hour of "we tried".
@@ -77,6 +84,10 @@ export const MAX_BUSY_PASSES = 20;
 /** The columns a pass needs. A superset of BookableRow. */
 export interface WorkerRow extends BookableRow {
     state: string;
+    /** What finalize recorded. Every download is checked against it. */
+    fileSha256: string;
+    /** The token this pass claimed the row with. Completing writes are fenced on it. */
+    claimToken: string | null;
     fileSize: number;
     readAt: Date | null;
     dedupWeakKey: string | null;
@@ -116,8 +127,12 @@ export interface WorkerDependencies {
     /** Retry storage deletes that failed when a row was rejected. */
     retryStorageCleanups: (shouldStop: () => boolean) => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
-    /** Tagged: a confirmed 404 and a transient storage fault are NOT the same answer. */
-    downloadBytes: (storagePath: string) => Promise<DocBytesResult>;
+    /**
+     * Tagged, and VERIFIED: the bytes must hash to what the row recorded at
+     * finalize. A sha stored once and never re-checked proves nothing about
+     * what is being read now.
+     */
+    downloadBytes: (storagePath: string, expectedSha256: string) => Promise<VerifiedBytes>;
     read: (bytes: Buffer, mime: string, phases: ProjectPhase[]) => Promise<ReadOutcome>;
     /**
      * Persist the read + routing. Returns the strong-key owner when the partial
@@ -141,11 +156,17 @@ export interface WorkerDependencies {
     /** A transient fault anywhere else: spend an attempt and back off. */
     retryRow: (rowId: string, attempts: number, nextRetryAt: Date, reason: string) => Promise<void>;
     /**
-     * RECEIVED -> READ, and the release of the claim lease. Called ONCE, after
-     * every dedup net has answered — never before, or an overlapping run could
-     * reclaim a half-routed row and book it.
+     * RECEIVED -> READ, the release of the claim lease, AND the release of the
+     * claim token. Called ONCE, after every dedup net has answered — never
+     * before, or an overlapping run could reclaim a half-routed row and book it.
+     *
+     * FENCED on both the state and the token: a worker whose invocation was
+     * killed and whose row has since been re-claimed must not be able to
+     * publish READ over whatever its successor produced. Time-based leases
+     * cannot express that, because the zombie and the live worker hold
+     * identical row ids.
      */
-    finishRouting: (rowId: string, stateReason: string | null) => Promise<void>;
+    finishRouting: (rowId: string, claimToken: string | null, stateReason: string | null) => Promise<void>;
     now: () => Date;
     /** Elapsed-time source for the soft deadline. */
     monotonicMs: () => number;
@@ -188,6 +209,8 @@ export interface WorkerRunSummary {
     shadowRetired?: number;
     /** Rows received AFTER v1 stopped: nobody booked these, so they are handed to v2. */
     requeued?: number;
+    /** Held for a human: no v1 evidence AND no Drive identity to make v2 idempotent. */
+    shadowQuarantined?: number;
     /** The cutover could not run because no boundary is recorded. */
     cutoverBlocked?: "cutover-boundary-missing";
     /** STAGING rows whose upload never landed, parked for a human. */
@@ -293,6 +316,8 @@ export interface ClaimResult {
     rows: WorkerRow[];
     shadowRetired: number;
     requeued: number;
+    /** Pre-boundary, no evidence, and no Drive identity — a human decides. */
+    shadowQuarantined: number;
 }
 
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
@@ -337,7 +362,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, shadowRetired, requeued } = claimed;
+    const { rows, shadowRetired, requeued, shadowQuarantined } = claimed;
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
@@ -399,6 +424,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         ...(deferredToNextRun ? { deferredToNextRun } : {}),
         ...(shadowRetired ? { shadowRetired } : {}),
         ...(requeued ? { requeued } : {}),
+        ...(shadowQuarantined ? { shadowQuarantined } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
         ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };
@@ -472,14 +498,21 @@ function stateForBookResult(result: BookResult): string {
 }
 
 async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promise<string> {
-    const download = await deps.downloadBytes(row.storagePath);
+    const download = await deps.downloadBytes(row.storagePath, row.fileSha256);
     if (!download.ok) {
         // "The object is gone" and "storage was briefly unreachable" demand
         // opposite answers, and collapsing them to null meant a Supabase blip
         // parked good receipts as file-missing, permanently, for a human to
         // untangle. Only an AFFIRMATIVE not-found is terminal.
-        if (download.kind === "not-found") {
+        if (download.kind === "missing") {
             await deps.applyState(row.id, "NEEDS_REVIEW", "file-missing");
+            return "NEEDS_REVIEW";
+        }
+        // The stored bytes are not the ones this row was published with.
+        // Terminal, and loud: it means the object was replaced after
+        // verification, which is the exact thing sealing exists to prevent.
+        if (download.kind === "sha-mismatch") {
+            await deps.applyState(row.id, "NEEDS_REVIEW", "content-changed");
             return "NEEDS_REVIEW";
         }
         return retryTransient(row, deps, `storage:${download.message}`);
@@ -671,7 +704,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     // Routing is complete. This is the ONLY path to READ, and the only place
     // the claim lease is released.
-    await deps.finishRouting(row.id, note(null));
+    await deps.finishRouting(row.id, row.claimToken, note(null));
     return "READ";
 }
 

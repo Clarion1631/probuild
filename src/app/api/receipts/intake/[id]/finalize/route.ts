@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateIntake, STAFF_READ_ROLES } from "@/lib/receipt-intake/intake-auth";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { inspectStoredObject } from "@/lib/receipt-intake/stored-object";
-import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
+import { canonicalStoragePath, inspectStoredObject } from "@/lib/receipt-intake/stored-object";
+import { deleteObjectOrRecord, sealObject } from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -37,9 +37,9 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
         select: {
-            id: true, state: true, sourceRef: true, storagePath: true, mimeType: true,
-            projectId: true, dryRun: true, createdById: true, fileSha256: true,
-            expectedSha256: true,
+            id: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
+            mimeType: true, projectId: true, dryRun: true, createdById: true,
+            fileSha256: true, expectedSha256: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
@@ -53,9 +53,17 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         STAFF_READ_ROLES.includes(auth.user.role);
     if (!maySee) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
 
+    // A LATE finalize on a row the sweeper already parked file-missing is a
+    // RECOVERY, not a duplicate: the upload landed after the sweep looked. It
+    // must re-validate and republish rather than report alreadyFinalized, which
+    // would leave a real receipt parked forever while telling the caller it was
+    // fine.
+    const recoverable = row.state === "STAGING"
+        || (row.state === "NEEDS_REVIEW" && row.stateReason === "file-missing");
+
     // Idempotent: finalizing an already-published row is a success, not an error
     // — the client's retry after a lost response must not look like a failure.
-    if (row.state !== "STAGING") {
+    if (!recoverable) {
         return NextResponse.json({
             ok: true, alreadyFinalized: true, id: row.id, state: row.state,
             sourceRef: row.sourceRef, projectId: row.projectId, dryRun: row.dryRun,
@@ -114,9 +122,28 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         }
     }
 
+    // SEAL. Copy the verified bytes to a content-addressed path the client was
+    // never handed a URL for, and point the row at that. Publishing while the
+    // row still referenced the upload path would leave the verified content
+    // replaceable by anyone holding the signed URL — the row asserting one sha
+    // while storage served different bytes.
+    const canonicalPath = canonicalStoragePath(id, fileSha256, mimeType);
+    const sealed = await sealObject(row.storagePath, canonicalPath, check.bytes, mimeType);
+    if (!sealed) {
+        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+    }
+
     const published = await prisma.receiptIntake.updateMany({
-        where: { id, state: "STAGING" },
-        data: { state: "RECEIVED", mimeType, fileSize, fileSha256 },
+        where: { id, state: { in: ["STAGING", "NEEDS_REVIEW"] } },
+        data: {
+            state: "RECEIVED",
+            stateReason: null,
+            storagePath: sealed,
+            mimeType,
+            fileSize,
+            fileSha256,
+            nextRetryAt: null,
+        },
     });
     if (published.count === 0) {
         // Another finalize won the race and published it. Same outcome.

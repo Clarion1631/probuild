@@ -14,12 +14,65 @@
  */
 import { createHash } from "node:crypto";
 import { downloadDocBytesResult, toSecureRef, type DocBytesResult } from "@/lib/secure-storage";
-import { sniffMime } from "./file-type";
+import { EXT_BY_MIME, sniffMime } from "./file-type";
 import { MAX_STORED_BYTES } from "./intake-core";
 
+/**
+ * Where a VERIFIED object lives, keyed by its own content hash.
+ *
+ * The upload path is writable by whoever holds the signed URL, and that URL is
+ * `upsert: true` so a resumed /start can replace its own partial upload. Both
+ * are necessary and together they mean the upload path can change AFTER we
+ * verified it. Sealing copies the bytes somewhere the client was never given a
+ * URL for, and names it after the sha — so the path itself asserts the content,
+ * and re-verifying on download is a comparison against a value that cannot have
+ * been rewritten in place.
+ */
+export function canonicalStoragePath(id: string, sha256: string, mimeType: string): string {
+    const ext = EXT_BY_MIME[mimeType] ?? "bin";
+    return `receipts/${id}/${sha256}.${ext}`;
+}
+
+/**
+ * Read bytes and REFUSE them if they are not what the row recorded.
+ *
+ * Every consumer of a stored receipt (the reader, the booker) goes through
+ * this. A hash stored at finalize is worthless if nothing ever checks it again.
+ */
+export type VerifiedBytes =
+    | { ok: true; bytes: Buffer }
+    | { ok: false; kind: "missing" | "transient" | "sha-mismatch"; message?: string };
+
+export async function downloadVerified(
+    storagePath: string,
+    expectedSha256: string,
+    download: (ref: string) => Promise<DocBytesResult> = downloadDocBytesResult,
+): Promise<VerifiedBytes> {
+    const result = await download(toSecureRef(storagePath));
+    if (!result.ok) {
+        return result.kind === "not-found"
+            ? { ok: false, kind: "missing" }
+            : { ok: false, kind: "transient", message: result.message };
+    }
+    // An empty expectation means a legacy row written before sealing existed;
+    // there is nothing to compare against, so pass the bytes through rather
+    // than refuse a receipt for a reason that is our fault.
+    if (!expectedSha256) return { ok: true, bytes: result.bytes };
+
+    const actual = createHash("sha256").update(result.bytes).digest("hex");
+    if (actual !== expectedSha256) {
+        return { ok: false, kind: "sha-mismatch", message: `expected ${expectedSha256}, stored ${actual}` };
+    }
+    return { ok: true, bytes: result.bytes };
+}
+
 export type StoredObjectCheck =
-    /** Valid: these are the values the row must be published with. */
-    | { ok: true; mimeType: string; fileSize: number; fileSha256: string }
+    /**
+     * Valid: these are the values the row must be published with, plus the
+     * exact bytes that produced them — so the sealed copy is provably the
+     * content that was verified, not a second download that could differ.
+     */
+    | { ok: true; mimeType: string; fileSize: number; fileSha256: string; bytes: Buffer }
     /** The object is not there. Terminal for the sweep; retryable for a client. */
     | { ok: false; kind: "missing" }
     /** Storage could not answer. Never a verdict — come back later. */
@@ -62,5 +115,6 @@ export async function inspectStoredObject(
         mimeType,
         fileSize: bytes.length,
         fileSha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes,
     };
 }

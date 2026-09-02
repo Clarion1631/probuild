@@ -64,6 +64,8 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         lastError: null,
         suggestedConfidence: null,
         sendAttempted: false,
+        claimToken: "claim-1",
+        fileSha256: "s".repeat(64),
         ...overrides,
     };
 }
@@ -92,7 +94,7 @@ interface Harness {
     applied: ReadPatch[];
     states: { id: string; state: string; reason: string | null; patch?: Partial<ReadPatch> }[];
     promoted: string[];
-    finished: { id: string; stateReason: string | null }[];
+    finished: { id: string; claimToken: string | null; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
     claimOpts: CutoverRequest[];
@@ -113,7 +115,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
     h.deps = {
         claim: async opts => {
             h.claimOpts.push(opts);
-            return { rows, shadowRetired: 0, requeued: 0, boundaryMissing: false };
+            return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
         },
         cutoverBoundary: async () => h.boundary,
         isDryRunEnabled: () => true,
@@ -125,7 +127,9 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
         findWeakHit: async () => null,
         applyState: async (id, state, reason, patch) => { h.states.push({ id, state, reason, patch }); },
-        finishRouting: async (id, stateReason) => { h.finished.push({ id, stateReason }); },
+        finishRouting: async (id, claimToken, stateReason) => {
+            h.finished.push({ id, claimToken, stateReason });
+        },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
         book: async () => {
@@ -152,7 +156,7 @@ test("DRY RUN: a received row is read, deduped and routed — and never booked",
     // The claim leaves the row RECEIVED and holding its lease; finishRouting is
     // the only thing that publishes READ, after every dedup net has answered.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
     assert.equal(h.applied[0].vendor, "Lowes");
     assert.equal(h.applied[0].totalCents, 36498);
     assert.equal(h.applied[0].taxCents, 2920);
@@ -245,7 +249,7 @@ test("a document the model answered on but could not read goes to a human", asyn
 
 test("a missing storage object is terminal, not an infinite read loop", async () => {
     const h = harness([workerRow()], {
-        downloadBytes: async () => ({ ok: false as const, kind: "not-found" as const }),
+        downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }),
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "file-missing");
@@ -322,7 +326,7 @@ test("CUTOVER: the boundary is passed to the claim so the backlog can be split",
         claim: async opts => {
             h.claimOpts.push(opts);
             // Rows BEFORE the boundary were booked by v1; rows after it by nobody.
-            return { rows: [], shadowRetired: 7, requeued: 2, boundaryMissing: false };
+            return { rows: [], shadowRetired: 7, requeued: 2, shadowQuarantined: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -343,7 +347,7 @@ test("CUTOVER refuses entirely when no boundary is recorded", async () => {
         claim: async opts => {
             h.claimOpts.push(opts);
             assert.equal(opts.boundary, null);
-            return { rows: [], shadowRetired: 0, requeued: 0, boundaryMissing: true };
+            return { rows: [], shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -586,7 +590,7 @@ test("the strong claim is attempted with the key, before any weak lookup", async
     // The claim writes the KEYS but leaves the row RECEIVED and holding its
     // lease. READ is reached only by finishRouting, once every net has spoken.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
 });
 
 test("the lease is held through routing and released only at the end", async () => {
@@ -691,7 +695,7 @@ test("a plausible tax is stored and the row carries no note", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, 2920, "29.20 of 364.98 is ~8%");
     assert.equal(h.applied[0].stateReason, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
 });
 
 test("an implausible tax nulls taxCents, notes the row, and does NOT park it", async () => {
@@ -705,7 +709,7 @@ test("an implausible tax nulls taxCents, notes the row, and does NOT park it", a
     assert.equal(h.applied[0].taxCents, null, "the bad reading is dropped, not booked");
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
     assert.deepEqual(summary.byState, { READ: 1 }, "READ, not NEEDS_REVIEW");
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
 });
 
 test("the tax note survives alongside a dedup reason", async () => {
@@ -730,7 +734,7 @@ test("the row stores only the tax BOOKING accepted, never a rejected reading", a
     await runIntakeWorker(h.deps);
     // buildGroups refuses to split tax on a check, so nothing was accepted.
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
 });
 
 test("a check with no tax reading books clean, with no note", async () => {
@@ -742,7 +746,7 @@ test("a check with no tax reading books clean, with no note", async () => {
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
 });
 
 test("a tax equal to the total is refused end to end", async () => {
@@ -752,7 +756,7 @@ test("a tax equal to the total is refused end to end", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
-    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
 });
 
 // ── Fail-closed classifier (round-5 item 4) ────────────────────────────────
@@ -908,4 +912,60 @@ test("a row that DID send keeps its key at the retry limit", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "max-retries");
     assert.equal(h.states[0].patch, undefined, "no patch, so the key is untouched");
+});
+
+// ── Content changed under us (round-8 item 2) ──────────────────────────────
+
+test("a read whose bytes no longer match the recorded sha is TERMINAL", async () => {
+    // Sealing makes this nearly impossible; the check exists because "nearly"
+    // is not a guarantee, and reading whatever happens to be at a path is how a
+    // receipt for one job ends up booked against another.
+    const h = harness([workerRow()], {
+        downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }),
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "content-changed");
+    assert.equal(h.reads, 0, "the model never sees bytes we cannot vouch for");
+});
+
+test("the recorded sha is what the download is checked against", async () => {
+    const asked: Array<[string, string]> = [];
+    const h = harness([workerRow({ fileSha256: "abc".padEnd(64, "0") })], {
+        downloadBytes: async (p, sha) => {
+            asked.push([p, sha]);
+            return { ok: true as const, bytes: Buffer.from("bytes") };
+        },
+    });
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(asked, [["receipts/intake/row-1.jpg", "abc".padEnd(64, "0")]]);
+});
+
+// ── SHADOW_QUARANTINE (round-8 item 1) ─────────────────────────────────────
+
+test("the cutover reports quarantined rows separately from retired and requeued", async () => {
+    // Three outcomes, because "we cannot tell" is a real answer and collapsing
+    // it into either of the other two either double-books or loses an expense.
+    const h = harness([], {
+        isDryRunEnabled: () => false,
+        claim: async opts => {
+            h.claimOpts.push(opts);
+            return { rows: [], shadowRetired: 4, requeued: 2, shadowQuarantined: 3 };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.shadowRetired, 4);
+    assert.equal(summary.requeued, 2);
+    assert.equal(summary.shadowQuarantined, 3);
+});
+
+// ── The claim token fences the completing write (Phase 2 gate, a) ──────────
+
+test("finishRouting is handed the token the pass claimed with", async () => {
+    // A zombie worker resuming after its row was re-claimed must write nothing.
+    // The adapter matches on this token; the worker's job is to pass the one it
+    // actually holds.
+    const h = harness([workerRow({ claimToken: "token-abc" })]);
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null }]);
 });

@@ -14,9 +14,54 @@
  */
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
-import { removeSecureDoc, toSecureRef } from "@/lib/secure-storage";
+import { SECURE_BUCKET, removeSecureDoc, toSecureRef } from "@/lib/secure-storage";
+import { getSupabase } from "@/lib/supabase";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
+
+/**
+ * Copy verified bytes to their canonical path and drop the upload path.
+ *
+ * The upload path stays writable by whoever holds the signed URL (which is
+ * `upsert: true`, deliberately, so a resumed /start can replace its own partial
+ * upload). Leaving the row pointed at it means the bytes we verified can be
+ * replaced afterwards by anyone who kept the URL — the row would still claim
+ * the old sha while storage held something else.
+ *
+ * Returns null when the copy fails, so the caller can refuse rather than
+ * publish a row pointing at a path that may not exist.
+ */
+export async function sealObject(
+    uploadPath: string,
+    canonicalPath: string,
+    bytes: Buffer,
+    contentType: string,
+): Promise<string | null> {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    try {
+        // upsert: the canonical path is content-addressed, so a re-seal of the
+        // SAME bytes is a no-op by construction and must not fail.
+        const { error } = await supabase.storage
+            .from(SECURE_BUCKET)
+            .upload(canonicalPath, bytes, { contentType, upsert: true });
+        if (error) {
+            console.error("[receipts/intake] seal failed", error.message);
+            return null;
+        }
+    } catch (error) {
+        console.error("[receipts/intake] seal threw", error instanceof Error ? error.name : "error");
+        return null;
+    }
+
+    // The upload path has served its purpose. A failure to remove it is an
+    // orphan, not a correctness problem — the row already points at the sealed
+    // copy — so it goes on the cleanup queue rather than failing the publish.
+    if (uploadPath !== canonicalPath) {
+        await deleteObjectOrRecord(uploadPath, "sealed");
+    }
+    return canonicalPath;
+}
 
 /**
  * Delete the object. If that fails, record the path so the sweep can retry.

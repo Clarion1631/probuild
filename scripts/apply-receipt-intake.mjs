@@ -74,6 +74,9 @@ export const RECEIPT_INTAKE_STATES = [
     "BOOKED", "ARCHIVED", "DUPLICATE", "VOID", "NON_RECEIPT",
     // Received during the shadow week, therefore booked by v1 and NEVER by v2.
     "SHADOW_DONE",
+    // Pre-boundary, no v1 evidence, and no Drive identity to make a v2 booking
+    // idempotent. A HUMAN decides.
+    "SHADOW_QUARANTINE",
 ];
 
 export const statements = [
@@ -112,6 +115,8 @@ export const statements = [
        "qbPurchaseId"        TEXT,
        "expenseId"           TEXT,
        "archiveDriveFileId"  TEXT,
+       "claimToken"          TEXT,
+       "claimedAt"           TIMESTAMP(3),
        "attempts"            INTEGER NOT NULL DEFAULT 0,
        "busyPasses"          INTEGER NOT NULL DEFAULT 0,
        "lastError"           TEXT,
@@ -130,6 +135,8 @@ export const statements = [
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
 
     // Intake idempotency: one row per caller-supplied sourceRef. A forwarder
     // replaying the same Drive file / Gmail message is a no-op.
@@ -161,6 +168,13 @@ export const statements = [
     `CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx"
        ON "ReceiptIntake"("createdAt")`,
 
+    // Both are FK targets the queue filters and joins on.
+    `CREATE INDEX IF NOT EXISTS "ReceiptIntake_costCodeId_idx"
+       ON "ReceiptIntake"("costCodeId")`,
+
+    `CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdById_idx"
+       ON "ReceiptIntake"("createdById")`,
+
     // state is a closed set — a typo must fail loudly rather than create a
     // silent eleventh state that no query ever selects.
     // The state set GROWS. `IF NOT EXISTS` alone is wrong for that: a database
@@ -174,7 +188,7 @@ export const statements = [
     // set that would orphan live data fails loudly here rather than later.
     `DO $$
      DECLARE current_def TEXT;
-             wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''SHADOW_DONE''::text])))';
+             wanted_def  TEXT := 'CHECK ((state = ANY (ARRAY[''STAGING''::text, ''RECEIVED''::text, ''READ''::text, ''NEEDS_JOB''::text, ''NEEDS_REVIEW''::text, ''BOOKING''::text, ''BOOKED''::text, ''ARCHIVED''::text, ''DUPLICATE''::text, ''VOID''::text, ''NON_RECEIPT''::text, ''SHADOW_DONE''::text, ''SHADOW_QUARANTINE''::text])))';
      BEGIN
        SELECT pg_get_constraintdef(oid) INTO current_def
          FROM pg_constraint
@@ -185,7 +199,7 @@ export const statements = [
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
-                              'SHADOW_DONE'));
+                              'SHADOW_DONE', 'SHADOW_QUARANTINE'));
        ELSIF current_def IS DISTINCT FROM wanted_def THEN
          -- One statement each, in the SAME transaction as everything else this
          -- script runs, so the table is never briefly unconstrained.
@@ -193,7 +207,7 @@ export const statements = [
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('STAGING', 'RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT',
-                              'SHADOW_DONE'));
+                              'SHADOW_DONE', 'SHADOW_QUARANTINE'));
        END IF;
      END $$`,
 
@@ -260,7 +274,8 @@ const expectedColumns = {
         "vendor", "txnDate", "totalCents", "taxCents", "docType",
         "refNumber", "memo", "readJson", "readAt", "dedupStrongKey",
         "dedupWeakKey", "duplicateOfId", "qbPurchaseId", "expenseId",
-        "archiveDriveFileId", "attempts", "busyPasses", "lastError", "nextRetryAt",
+        "archiveDriveFileId", "claimToken", "claimedAt",
+        "attempts", "busyPasses", "lastError", "nextRetryAt",
         "bookedAt", "createdAt", "updatedAt",
     ],
 };

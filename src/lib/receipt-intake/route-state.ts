@@ -16,6 +16,17 @@ export const RECEIPT_INTAKE_STATES = [
      * docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §7.
      */
     "SHADOW_DONE",
+    /**
+     * Terminal, and it needs a person.
+     *
+     * Pre-boundary, no evidence v1 booked it, and NOT a Drive row — so there is
+     * no shared identity that would make a v2 booking idempotent against a
+     * Purchase v1 may or may not have created. Booking it risks a duplicate;
+     * retiring it risks losing a real expense. Neither is ours to guess, so it
+     * surfaces on the Receipts tab with a "book anyway" action for whoever has
+     * checked QuickBooks. NEVER auto-requeued.
+     */
+    "SHADOW_QUARANTINE",
 ] as const;
 
 export type ReceiptIntakeState = (typeof RECEIPT_INTAKE_STATES)[number];

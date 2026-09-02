@@ -53,6 +53,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         attempts: 0,
         lastError: null,
         sendAttempted: false,
+        fileSha256: "s".repeat(64),
         ...overrides,
     };
 }
@@ -474,7 +475,7 @@ test("a MISSING receipt file refuses the booking outright", async () => {
     // attachment — the one failure the bookkeeper cannot fix later, because the
     // Purchase looks complete and nothing flags it. The receipt IS the evidence
     // for the expense.
-    const r = recorder({ downloadBytes: async () => ({ ok: false, kind: "not-found" }) });
+    const r = recorder({ downloadBytes: async () => ({ ok: false, kind: "missing" }) });
     const result = await bookReceipt(row(), r.deps);
     assert.deepEqual(result, {
         outcome: "needs-review",
@@ -614,8 +615,28 @@ test("the SUGGESTED code is checked against the final project too", async () => 
         },
     });
     await bookReceipt(row({ costCodeId: null }), r.deps);
-    assert.deepEqual(asked, [["proj-1", "cc-plumb"]], "asked about the FINAL project");
+    // TWICE: once immediately before the QBO create, once immediately before
+    // the Expense write. The create is a network round trip, and a project
+    // reassignment that lands in between must not reach job cost.
+    assert.deepEqual(asked, [["proj-1", "cc-plumb"], ["proj-1", "cc-plumb"]]);
     assert.equal(r.expenses[0].costCodeId, null);
+});
+
+test("the phase is re-checked AFTER the create, not just before it", async () => {
+    // The window that matters is the one around the money write. This proves
+    // the second check is real: the same row, answered differently the second
+    // time, must produce the LATER answer.
+    let call = 0;
+    const r = recorder({
+        isCostCodeAllowed: async () => {
+            call++;
+            return call === 1; // allowed before the send, revoked after it
+        },
+    });
+    await bookReceipt(row({ costCodeId: "cc-demo" }), r.deps);
+    assert.equal(call, 2, "asked on both sides of the create");
+    assert.equal(r.expenses[0].costCodeId, null, "the post-create answer wins");
+    assert.match(r.expenses[0].description, /phase cleared/);
 });
 
 test("unassigned during READ, assigned before BOOKING: the phase is re-checked", async () => {
@@ -657,4 +678,53 @@ test("a human's explicit pick is not labelled a suggestion", async () => {
     assert.equal(r.expenses[0].costCodeId, "cc-chosen");
     assert.ok(!/phase suggested/.test(r.expenses[0].description));
     assert.equal(r.events[0].detail.suggestedConfidence, undefined);
+});
+
+// ── sendAttempted is marked at the LAST possible moment (round-8 item 4) ────
+
+test("a token failure leaves sendAttempted UNSET, so the key is released", async () => {
+    // Marking before the token refresh meant a refresh that threw left
+    // sendAttempted=true on a row that never reached QuickBooks — and its
+    // strong key was then held forever against a Purchase that does not exist.
+    const r = recorder({
+        getTokens: async () => { throw new Error("QBNotConnectedError"); },
+    });
+    const result = await bookReceipt(row({ attempts: 19 }), r.deps);
+    assert.deepEqual(r.sendMarks, [], "never marked — nothing was sent");
+    assert.equal(result.outcome, "needs-review");
+    assert.equal((result as any).reason, "max-retries");
+    assert.equal((result as any).releaseStrongKey, true, "so the key goes back");
+});
+
+test("budget exhausted AFTER the token refresh also leaves it unset", async () => {
+    // The final runway check sits between the tokens and the create. A deferral
+    // there must not look like an attempted send.
+    const deadline = { startedAt: Date.now(), budgetMs: 55_000 };
+    const r = recorder({
+        deadline,
+        getTokens: async () => {
+            // Burn the remaining budget during the refresh.
+            deadline.startedAt = Date.now() - 60_000;
+            return { accessToken: "t", realmId: "r" } as any;
+        },
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.deepEqual(result, { outcome: "deferred", reason: "out-of-budget" });
+    assert.deepEqual(r.sendMarks, [], "never marked");
+    assert.equal(r.purchaseCalls.length, 0);
+});
+
+test("a real create DOES mark it, before the call", async () => {
+    const order: string[] = [];
+    const r = recorder({
+        createPurchase: async (_t, input) => {
+            order.push("create");
+            r.purchaseCalls.push(input);
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "attached" } as any;
+        },
+        markSendAttempted: async id => { order.push("mark"); r.sendMarks.push(id); },
+    });
+    await bookReceipt(row(), r.deps);
+    assert.deepEqual(order, ["mark", "create"], "marked FIRST, so a mid-create death still records it");
+    assert.deepEqual(r.sendMarks, ["intake-1"]);
 });
