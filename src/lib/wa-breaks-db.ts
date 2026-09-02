@@ -6,6 +6,7 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { dayLockKey, isPeriodLockedError } from "@/lib/payroll-period";
+import { ZERO_RATE_REVIEW_NOTE } from "@/lib/pay-rate-guard";
 
 function dayWindow(dayKey: string) {
     const dayStartUtc = new Date(`${dayKey}T00:00:00.000Z`).getTime();
@@ -77,6 +78,21 @@ export async function settleDay(
  * Errors are NOT swallowed here (unlike settleDay): the caller's transaction
  * must roll back with them.
  */
+/**
+ * The company day keys a write touches, de-duplicated.
+ *
+ * An edit that moves an entry touches TWO days — the one it left and the one it
+ * joined — and each is re-planned from everything left on it. Uses the same
+ * toCompanyDayKey() that settleDayInTx filters rows by, so a key produced here
+ * always selects the rows settlement expects.
+ */
+export function settlementDays(instants: Array<Date | null | undefined>): string[] {
+    const keys = instants
+        .filter((value): value is Date => value instanceof Date && !Number.isNaN(value.getTime()))
+        .map((value) => toCompanyDayKey(value));
+    return Array.from(new Set(keys)).sort();
+}
+
 export async function settleDayWithinTx(
     tx: Tx,
     userId: string,
@@ -119,10 +135,26 @@ async function settleDayInTx(
                 await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
             }
 
-            const owner = await tx.user.findUnique({ where: { id: userId }, select: { hourlyRate: true, burdenRate: true } });
+            // The whole owner, not just the numbers: settlement REPRICES every
+            // row it touches, so it is a first-pass pricing decision in its own
+            // right and answers to the same $0-rate policy. Writing
+            // laborCost = paidHours * 0 here was the one path that could book a
+            // free shift without anybody choosing to — the clock-out guard
+            // refuses it, and then a later re-plan quietly did it anyway.
+            const owner = await tx.user.findUnique({
+                where: { id: userId },
+                select: { email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
+            });
             if (!owner) return 0;
             const hourlyRate = toNum(owner.hourlyRate);
             const burdenRate = toNum(owner.burdenRate);
+            const { appendZeroRateReview, zeroRateBlocks } = await import("./pay-rate-guard");
+            const zeroRate = zeroRateBlocks({
+                role: owner.role,
+                email: owner.email,
+                payType: owner.payType,
+                hourlyRate,
+            });
 
             const rows = await tx.timeEntry.findMany({
                 where: { userId, endTime: { not: null }, startTime: dayWindow(dayKey) },
@@ -150,11 +182,26 @@ async function settleDayInTx(
                     (update.reviewReason !== undefined && update.reviewReason !== (row.reviewReason ?? "")) ||
                     (update.needsReview !== undefined && update.needsReview !== row.needsReview);
                 const same =
+                    !zeroRate &&
                     Math.abs((row.durationHours ?? -1) - update.paidHours) < 1e-9 &&
                     Math.abs((row.mealDeductionHours ?? 0) - update.mealDeductionHours) < 1e-9 &&
                     row.mealOutcome === update.mealOutcome &&
                     !flagsChange;
-                if (same) continue;
+                // A $0-rate row is only skipped once it already carries the flag —
+                // otherwise the shortcut would leave it unflagged forever.
+                if (same || (zeroRate && row.needsReview && (row.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE))) continue;
+                // At a $0 rate the hours are still re-planned — the WA meal rule
+                // does not care what anybody is paid — but the COSTS are left
+                // exactly as they were and the row is flagged. Overwriting them
+                // with paidHours * 0 would erase a real cost and hand payroll a
+                // free shift; leaving them stale is visible, and the flag is
+                // what stops the export running past it.
+                const pricing = zeroRate
+                    ? appendZeroRateReview(update.reviewReason ?? row.reviewReason)
+                    : {
+                          laborCost: update.paidHours * hourlyRate,
+                          burdenCost: update.paidHours * burdenRate,
+                      };
                 await tx.timeEntry.update({
                     where: { id: update.id },
                     data: {
@@ -162,10 +209,13 @@ async function settleDayInTx(
                         mealDeductionHours: update.mealDeductionHours,
                         durationHours: update.paidHours,
                         mealOutcome: update.mealOutcome,
-                        laborCost: update.paidHours * hourlyRate,
-                        burdenCost: update.paidHours * burdenRate,
-                        ...(update.reviewReason !== undefined ? { reviewReason: update.reviewReason } : {}),
-                        ...(update.needsReview !== undefined ? { needsReview: update.needsReview } : {}),
+                        ...pricing,
+                        ...(update.reviewReason !== undefined && !zeroRate
+                            ? { reviewReason: update.reviewReason }
+                            : {}),
+                        ...(update.needsReview !== undefined && !zeroRate
+                            ? { needsReview: update.needsReview }
+                            : {}),
                     },
                 });
                 written += 1;

@@ -72,7 +72,10 @@ export async function assertManualEntryDelete(entryId: string) {
     const user = await getCurrentUserWithPermissions();
     const entry = await prisma.timeEntry.findUnique({
         where: { id: entryId },
-        select: { id: true, userId: true, projectId: true, durationHours: true, laborCost: true, invoiceId: true, invoicedAt: true },
+        select: {
+            id: true, userId: true, projectId: true, startTime: true, endTime: true,
+            durationHours: true, laborCost: true, invoiceId: true, invoicedAt: true,
+        },
     });
     if (!entry) throw new Error("Not found");
 
@@ -113,6 +116,36 @@ export function assertNotLegacyUnitEntry(entry: { durationHours: number | null; 
             "This is a legacy flat-cost entry. Editing it would reprice it from hours it does not have — delete it and re-enter the time, or ask Justin to convert it."
         );
         (error as Error & { code?: string }).code = LEGACY_UNIT_ENTRY_CODE;
+        throw error;
+    }
+}
+
+/** Coded refusal for "this row came from the clock, not from a form". */
+export const CLOCK_GENERATED_ENTRY_CODE = "clock-generated-entry";
+
+/**
+ * A clock-generated row: one with a real endTime.
+ *
+ * The manual actions take `durationHours` straight from a form and write it as
+ * the paid hours. On a clocked shift that is a lie the rest of the system then
+ * believes: startTime/endTime still span the original punch, but durationHours
+ * no longer derives from them, so shiftHours, the WA meal deduction and
+ * mealOutcome all describe a shift that no longer exists — and the next
+ * settlement of that day would silently overwrite the typed number anyway.
+ *
+ * Clocked time is edited through PATCH /api/time-entries/[id], which moves the
+ * punch itself and re-settles the day. These actions refuse it.
+ */
+export function isClockGeneratedEntry(entry: { endTime: Date | null }): boolean {
+    return entry.endTime instanceof Date && !Number.isNaN(entry.endTime.getTime());
+}
+
+export function assertNotClockGeneratedEntry(entry: { endTime: Date | null }): void {
+    if (isClockGeneratedEntry(entry)) {
+        const error = new Error(
+            "This entry came from the time clock. Edit the punch itself on the time-entries screen so the shift hours and meal break stay consistent."
+        );
+        (error as Error & { code?: string }).code = CLOCK_GENERATED_ENTRY_CODE;
         throw error;
     }
 }

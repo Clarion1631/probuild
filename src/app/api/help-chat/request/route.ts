@@ -6,6 +6,7 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   claimProviderLease,
+  helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
   isMobileSubmission,
@@ -102,7 +103,15 @@ export async function POST(req: NextRequest) {
     // return what exists, so a double-tap never files twice.
     if (reserved.existing && !reserved.resume) {
       const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
-      return NextResponse.json({ request: prior, githubIssue: null, duplicate: true });
+      // A replay of a report that IS filed is terminal; a replay of one that is
+      // still pending is not. Answering 200 for both told the app to drop a
+      // draft whose issue had never been created, which is how a report gets
+      // lost quietly.
+      return helpChatResponse({
+        body: { request: prior, githubIssue: null, duplicate: true },
+        filed: reserved.providerState === "created",
+        submissionId,
+      });
     }
     const requestId = reserved.id;
 
@@ -114,7 +123,14 @@ export async function POST(req: NextRequest) {
     // would file, because neither issue exists yet when they both search.
     if (!(await claimProviderLease(requestId))) {
       const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
-      return NextResponse.json({ request: inFlight, duplicate: true, inFlight: true });
+      // Somebody else holds the lease and is filing right now. This attempt
+      // does not know the outcome, so it must not report one — 202 unless the
+      // holder has already finished.
+      return helpChatResponse({
+        body: { request: inFlight, duplicate: true, inFlight: true },
+        filed: inFlight?.providerState === "created",
+        submissionId,
+      });
     }
 
     const marker = submissionMarker(requestId);
@@ -149,11 +165,13 @@ export async function POST(req: NextRequest) {
       RETURNING *
     `;
 
-    return NextResponse.json({
-      request,
-      githubIssue: ghIssue
-        ? { number: ghIssue.number, url: ghIssue.url }
-        : null,
+    return helpChatResponse({
+      body: {
+        request,
+        githubIssue: ghIssue ? { number: ghIssue.number, url: ghIssue.url } : null,
+      },
+      filed: !!ghIssue,
+      submissionId,
     });
   } catch (error) {
     console.error("Feature request error:", error);

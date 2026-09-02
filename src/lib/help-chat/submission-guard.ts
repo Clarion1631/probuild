@@ -9,6 +9,7 @@
 // are testable without a database.
 
 import { randomUUID } from "crypto";
+import { NextResponse } from "next/server";
 import { prisma } from "../prisma";
 
 export const HELP_TITLE_MAX = 200;
@@ -165,8 +166,41 @@ export function hourBucket(now: Date = new Date()): Date {
     return bucket;
 }
 
+/**
+ * 200 when the report reached GitHub, 202 when it is only saved here.
+ *
+ * The report row is durable either way, so 5xx would be a lie — but so is 200,
+ * which the crew app treats as terminal and uses to discard the local draft. A
+ * pending 202 carries the submissionId back so the app can retry the SAME
+ * submission later; that retry resumes the existing row (reserveHelpRequest's
+ * `resume`) and finishes it rather than filing a second report.
+ */
+export function helpChatResponse(options: {
+  body: Record<string, unknown>;
+  filed: boolean;
+  submissionId: string | null;
+}): NextResponse {
+  if (options.filed) return NextResponse.json({ ...options.body, status: "filed" });
+  return NextResponse.json(
+    { ...options.body, status: "pending", submissionId: options.submissionId },
+    { status: 202 }
+  );
+}
+
 export type ReserveResult =
-    | { ok: true; id: string; existing: boolean; resume: boolean }
+    | {
+          ok: true;
+          id: string;
+          existing: boolean;
+          resume: boolean;
+          /**
+           * What the stored row says about the GitHub side: "created" once an
+           * issue exists, "pending" while it does not. The route answers 202
+           * rather than 200 on anything that is not "created", so a client can
+           * tell "filed" from "saved, not filed yet".
+           */
+          providerState: string | null;
+      }
     | { ok: false; reason: "throttled" }
     | { ok: false; reason: "in-flight" };
 
@@ -240,33 +274,71 @@ export async function reserveHelpRequest(input: {
     currentPage: string | null;
     conversationId: string | null;
     submissionId: string | null;
-}): Promise<ReserveResult> {
-    if (input.submissionId) {
-        // Scoped by userId. A lookup on the key alone would return another
-        // user's report the moment two clients picked the same value — and
-        // clients pick these, so collisions are a matter of time.
-        const existing = await prisma.helpRequest.findUnique({
-            where: { userId_submissionId: { userId: input.userId, submissionId: input.submissionId } },
-            select: { id: true, status: true, createdAt: true, providerState: true },
-        });
-        if (existing) {
-            const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
-            // Resume ANY row whose issue was never created — providerState is
-            // the only reliable signal. Keying off status === "submitting"
-            // stranded every 'submitted_no_issue' row: GitHub was down, the
-            // report was saved, and no retry would ever finish it because the
-            // status had already moved on.
-            const stale = existing.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS;
-            return { ok: true, id: existing.id, existing: true, resume: stale };
-        }
-    }
-
+},
+/**
+ * The database client. Injected so the CONFLICT branch can be exercised without
+ * two live Postgres connections — the losing side of a race is exactly the path
+ * that used to 500, and it is the one a single-threaded test can never reach by
+ * accident.
+ */
+client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prisma as never
+): Promise<ReserveResult> {
     const bucket = hourBucket();
     try {
-        const id = await prisma.$transaction(async (tx) => {
-            // Insert-on-missing, then the conditional increment. The decision is
-            // entirely in the UPDATE: five concurrent callers all read the same
-            // count under the old count-then-insert and all passed.
+        return await client.$transaction(async (tx) => {
+            // ONE statement decides "new report" vs "replay". The old shape read
+            // first and inserted second, so two requests carrying the same
+            // submissionId both found nothing, both inserted, and the loser got
+            // a unique-violation 500 — exactly the double-tap the key exists to
+            // absorb. DO NOTHING makes the loser's INSERT return no row instead.
+            //
+            // Scoped by (userId, submissionId): clients pick these values, so a
+            // conflict on the key alone would collide across accounts.
+            const inserted = await tx.$queryRaw<Array<{ id: string }>>`
+                INSERT INTO "HelpRequest" ("userId", "type", "question", "response", "currentPage", "status", "conversationId", "submissionId")
+                VALUES (${input.userId}, ${input.type}, ${input.question}, ${input.response},
+                        ${input.currentPage}, 'submitting', ${input.conversationId}, ${input.submissionId})
+                ON CONFLICT ("userId", "submissionId") DO NOTHING
+                RETURNING "id"
+            `;
+
+            if (inserted.length === 0) {
+                // Lost the race, or a genuine retry. Either way the row the
+                // winner committed is the answer. (A null submissionId never
+                // conflicts — Postgres treats NULLs as distinct — so this branch
+                // only runs for a keyed submission.)
+                const existing = input.submissionId
+                    ? await tx.helpRequest.findUnique({
+                          where: {
+                              userId_submissionId: { userId: input.userId, submissionId: input.submissionId },
+                          },
+                          select: { id: true, status: true, createdAt: true, providerState: true },
+                      })
+                    : null;
+                if (!existing) throw new HelpReserveRaceError();
+                const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
+                // Resume ANY row whose issue was never created — providerState is
+                // the only reliable signal. Keying off status === "submitting"
+                // stranded every 'submitted_no_issue' row: GitHub was down, the
+                // report was saved, and no retry would ever finish it because the
+                // status had already moved on.
+                const stale = existing.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS;
+                return {
+                    ok: true,
+                    id: existing.id,
+                    existing: true,
+                    resume: stale,
+                    providerState: existing.providerState ?? null,
+                } as ReserveResult;
+            }
+
+            // Quota is charged only for a report that is genuinely NEW. A retry
+            // takes the branch above and never reaches here, so replaying a
+            // submission can never throttle the user out of their own report.
+            //
+            // The decision is entirely in the UPDATE: five concurrent callers
+            // all read the same count under the old count-then-insert and all
+            // passed. Throwing rolls the INSERT above back with it.
             await tx.$executeRaw`
                 INSERT INTO "HelpSubmissionQuota" ("id", "userId", "hourBucket", "count")
                 VALUES (gen_random_uuid()::text, ${input.userId}, ${bucket}, 0)
@@ -282,18 +354,23 @@ export async function reserveHelpRequest(input: {
             `;
             if (claimed.length === 0) throw new HelpThrottledError();
 
-            const rows = await tx.$queryRaw<Array<{ id: string }>>`
-                INSERT INTO "HelpRequest" ("userId", "type", "question", "response", "currentPage", "status", "conversationId", "submissionId")
-                VALUES (${input.userId}, ${input.type}, ${input.question}, ${input.response},
-                        ${input.currentPage}, 'submitting', ${input.conversationId}, ${input.submissionId})
-                RETURNING "id"
-            `;
-            return rows[0].id;
+            return { ok: true, id: inserted[0].id, existing: false, resume: false, providerState: null };
         });
-        return { ok: true, id, existing: false, resume: false };
     } catch (error) {
         if (error instanceof HelpThrottledError) return { ok: false, reason: "throttled" };
         throw error;
+    }
+}
+
+/**
+ * The conflicting row vanished between the INSERT and the SELECT — only
+ * possible if something deleted it in that window. Distinct from a throttle so
+ * the route does not report a deletion as "you have filed too many".
+ */
+class HelpReserveRaceError extends Error {
+    constructor() {
+        super("help request reservation raced");
+        this.name = "HelpReserveRaceError";
     }
 }
 

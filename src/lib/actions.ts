@@ -15286,8 +15286,16 @@ export async function previewGustoRateImport(csvText: string) {
         };
     }
 
-    const rows = diffRates(parsed.rows, users, signRateRow);
-    return { success: true as const, rows, errors: parsed.errors };
+    // Every row token is bound to THIS file. Apply re-hashes the CSV it is
+    // handed and re-signs from it, so a token cannot be carried across to a
+    // different file and applied against rows nobody previewed.
+    const rows = diffRates(parsed.rows, users, signRateRow, hashImportCsv(csvText));
+    return { success: true as const, rows, errors: parsed.errors, csvHash: hashImportCsv(csvText) };
+}
+
+/** sha256 of the pasted CSV, verbatim. Not normalised — a different file is a different decision. */
+function hashImportCsv(csvText: string): string {
+    return createHash("sha256").update(csvText, "utf8").digest("hex");
 }
 
 /**
@@ -15305,7 +15313,10 @@ function signRateRow(input: RowFingerprintInput): string {
 /** Everyone the import may write to, with rates as canonical decimal TEXT (never a float). */
 async function importableUsers() {
     const users = await prisma.user.findMany({
-        select: { id: true, name: true, email: true, hourlyRate: true, status: true, payType: true },
+        select: {
+            id: true, name: true, email: true, hourlyRate: true, status: true,
+            payType: true, lastRateSyncAt: true,
+        },
     });
     return users.map((u) => ({
         id: u.id,
@@ -15316,6 +15327,9 @@ async function importableUsers() {
         hourlyRate: u.hourlyRate.toFixed(2),
         status: u.status,
         payType: u.payType ?? null,
+        // ISO text, so the value signed at preview time and the value re-read at
+        // apply time are compared as the same thing.
+        lastRateSyncAt: u.lastRateSyncAt ? u.lastRateSyncAt.toISOString() : null,
     }));
 }
 
@@ -15340,24 +15354,33 @@ async function importableUsers() {
 export async function applyGustoRateImport(
     rows: Array<{ userId: string; newHourly: string | null; payType?: string | null; rowHash: string }>,
     /**
-     * Re-parsed here, not trusted from the browser: a file with unreadable rows
-     * is a file somebody has to look at again. Importing the rows that happened
-     * to parse leaves a half-applied pay change nobody reviewed, and the errors
-     * were on the screen they clicked Save from.
+     * REQUIRED. Re-parsed and re-hashed here, never trusted from the browser.
+     *
+     * It used to be optional, which meant the whole file check could be skipped
+     * by simply not sending it — the rows were then applied on their tokens
+     * alone. A file with unreadable rows is a file somebody has to look at
+     * again: importing the rows that happened to parse leaves a half-applied pay
+     * change nobody reviewed, and the errors were on the screen they clicked
+     * Save from.
      */
-    csvText?: string
+    csvText: string
 ) {
     await requirePayrollAccess();
-    if (typeof csvText === "string" && csvText.trim()) {
-        const { parseGustoRateCsv } = await import("./rate-import");
-        const reparsed = parseGustoRateCsv(csvText);
-        if (reparsed.errors.length > 0) {
-            return {
-                success: false as const,
-                error: `That file still has ${reparsed.errors.length} row${reparsed.errors.length === 1 ? "" : "s"} that could not be read. Fix the file and preview it again — nothing was saved.`,
-            };
-        }
+    if (typeof csvText !== "string" || !csvText.trim()) {
+        return { success: false as const, error: "Re-run the preview — the file this import came from was not sent." };
     }
+    const { parseGustoRateCsv } = await import("./rate-import");
+    const reparsed = parseGustoRateCsv(csvText);
+    if (reparsed.errors.length > 0) {
+        return {
+            success: false as const,
+            error: `That file still has ${reparsed.errors.length} row${reparsed.errors.length === 1 ? "" : "s"} that could not be read. Fix the file and preview it again — nothing was saved.`,
+        };
+    }
+    // The hash the row tokens must have been signed with. Computed from the file
+    // the SERVER just parsed, so it can only match tokens this server issued for
+    // this exact file.
+    const csvHash = hashImportCsv(csvText);
     if (!Array.isArray(rows) || rows.length === 0) {
         return { success: false as const, error: "Nothing to save." };
     }
@@ -15397,7 +15420,7 @@ export async function applyGustoRateImport(
 
     const known = await prisma.user.findMany({
         where: { id: { in: clean.map((r) => r.userId) } },
-        select: { id: true, status: true, hourlyRate: true, payType: true },
+        select: { id: true, status: true, hourlyRate: true, payType: true, lastRateSyncAt: true },
     });
     if (known.length !== clean.length) {
         return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
@@ -15416,6 +15439,11 @@ export async function applyGustoRateImport(
             userId: row.userId,
             oldHourly: live.hourlyRate.toFixed(2),
             oldPayType: live.payType ?? null,
+            // The stamp closes the A -> B -> A replay: setting a rate back by
+            // hand restores the rate and pay type this token was signed over,
+            // but never the stamp, so the old approval stops verifying.
+            oldLastRateSyncAt: live.lastRateSyncAt ? live.lastRateSyncAt.toISOString() : null,
+            csvHash,
             newHourly: row.newHourly,
             payType: row.payType,
         });
@@ -15424,7 +15452,7 @@ export async function applyGustoRateImport(
         if (a.length !== b.length || !timingSafeEqual(a, b)) {
             return {
                 success: false as const,
-                error: "One of those team members changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
+                error: "One of those team members changed since the preview was generated, or this file is not the one that was previewed. Nothing was saved — re-run the preview and check it again.",
             };
         }
     }
@@ -15444,6 +15472,10 @@ export async function applyGustoRateImport(
                         id: row.userId,
                         hourlyRate: live.hourlyRate,
                         payType: live.payType,
+                        // Same three values the token was verified against, so
+                        // the check and the write cannot be split by a
+                        // concurrent import landing in between.
+                        lastRateSyncAt: live.lastRateSyncAt,
                         status: { not: "DISABLED" },
                     },
                     data: {

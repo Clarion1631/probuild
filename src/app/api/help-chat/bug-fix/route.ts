@@ -6,6 +6,7 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   claimProviderLease,
+  helpChatResponse,
   HELP_THROTTLED_MESSAGE,
   isMobileClient,
   MOBILE_SUBMISSION_ID_REQUIRED,
@@ -100,7 +101,12 @@ export async function POST(req: NextRequest) {
     // See the request route: a stale `submitting` row is resumed, not returned.
     if (reserved.existing && !reserved.resume) {
       const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
-      return NextResponse.json({ request: prior, duplicate: true });
+      // Same rule as /request: a replay is only terminal once the issue exists.
+      return helpChatResponse({
+        body: { request: prior, duplicate: true },
+        filed: reserved.providerState === "created",
+        submissionId,
+      });
     }
     const requestId = reserved.id;
 
@@ -113,7 +119,11 @@ export async function POST(req: NextRequest) {
     // would file, because neither issue exists yet when they both search.
     if (!(await claimProviderLease(requestId))) {
       const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
-      return NextResponse.json({ request: inFlight, duplicate: true, inFlight: true });
+      return helpChatResponse({
+        body: { request: inFlight, duplicate: true, inFlight: true },
+        filed: inFlight?.providerState === "created",
+        submissionId,
+      });
     }
 
     const marker = submissionMarker(requestId);

@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
+    appendZeroRateReview,
     isSalariedOwner,
     ZERO_RATE_REVIEW_NOTE,
     ZERO_RATE_WORKER_MESSAGE,
@@ -352,4 +353,86 @@ test("a FIELD_CREW acknowledgement is ignored by the route", async () => {
     const res = await createClockOutHandler(dependencies).PUT(putReq({ acknowledgeZeroRate: true }));
     assert.equal(res.status, 422);
     assert.equal(updateCalls.length, 0);
+});
+
+
+// ---------------------------------------------------------------------------
+// Review round 15, items 1 and 2: settlement is a PRICING decision, and the
+// manual actions do not touch clocked rows.
+// ---------------------------------------------------------------------------
+
+function settlementSource(): string {
+    return readFileSync(path.join(process.cwd(), "src/lib/wa-breaks-db.ts"), "utf8");
+}
+
+test("settlement never writes laborCost = 0 for an hourly member at a $0 rate", () => {
+    const fn = settlementSource();
+    const body = fn.slice(fn.indexOf("async function settleDayInTx"));
+    // The policy is the SAME one the clock-out guard uses — not a second,
+    // divergent copy of "is this rate ok".
+    assert.match(body, /zeroRateBlocks\(\{/);
+    assert.match(body, /appendZeroRateReview\(/);
+    // The costs are only written on the non-blocked branch. Multiplying
+    // paidHours by a zero rate was the one path that could book a free shift
+    // without anybody choosing to.
+    assert.match(body, /const pricing = zeroRate\s*\?\s*appendZeroRateReview/);
+    assert.match(body, /:\s*\{\s*laborCost: update\.paidHours \* hourlyRate/);
+    assert.doesNotMatch(
+        body.slice(body.indexOf("tx.timeEntry.update")),
+        /^\s*laborCost: update\.paidHours \* hourlyRate,$/m,
+        "the unconditional cost write must be gone"
+    );
+});
+
+test("the zero-rate policy reads the whole owner, not just the number", () => {
+    const fn = settlementSource();
+    const body = fn.slice(fn.indexOf("async function settleDayInTx"));
+    // role / email / payType are what exempt a salaried owner. Selecting only
+    // the rates would make every salaried $0 look like a blocked hourly one.
+    assert.match(body, /select: \{ email: true, role: true, payType: true, hourlyRate: true, burdenRate: true \}/);
+});
+
+test("a $0-rate row is not skipped by the no-op shortcut until it carries the flag", () => {
+    const fn = settlementSource();
+    const body = fn.slice(fn.indexOf("async function settleDayInTx"));
+    // Otherwise a day whose hours already match would never get flagged, and
+    // the export would run straight past it.
+    assert.match(body, /const same =\s*\n\s*!zeroRate &&/);
+    assert.match(body, /zeroRate && row\.needsReview && \(row\.reviewReason \?\? ""\)\.includes\(ZERO_RATE_REVIEW_NOTE\)/);
+});
+
+test("the salaried are exempt, so settlement still prices them", () => {
+    // The flip side of the rule: a salaried MANAGER has a CORRECT $0 rate and
+    // must not be flagged every time their day is re-planned.
+    assert.equal(zeroRateBlocks({ role: "MANAGER", email: "cj@goldentouchremodeling.com", payType: "SALARY", hourlyRate: 0 }), false);
+    assert.equal(zeroRateBlocks({ role: "FIELD_CREW", email: "garrett@example.com", payType: "HOURLY", hourlyRate: 0 }), true);
+    // A real rate settles it for anybody.
+    assert.equal(zeroRateBlocks({ role: "FIELD_CREW", email: "garrett@example.com", payType: "HOURLY", hourlyRate: 25 }), false);
+});
+
+test("a DEFERRED day settled at a $0 rate is flagged, not priced at zero", () => {
+    // The deferred path settles LATER, when the answer arrives — by then the
+    // clock-out guard is long gone, so settlement is the only thing standing
+    // between a $0 rate and a free shift.
+    const flagged = appendZeroRateReview("Meal break not taken — deferred");
+    assert.equal(flagged.needsReview, true);
+    assert.match(flagged.reviewReason, /Meal break not taken — deferred/);
+    assert.match(flagged.reviewReason, /\$0 pay rate/);
+    // The existing notice is composed onto, never replaced: both reasons matter.
+    assert.equal(flagged.reviewReason.split("; ").length, 2);
+});
+
+test("every entry on a multi-entry day gets the flag, not just the closing one", () => {
+    // settleDayInTx loops the whole plan, and the pricing branch is inside the
+    // loop — so two shifts on one day both come back flagged.
+    const fn = settlementSource();
+    const body = fn.slice(fn.indexOf("async function settleDayInTx"));
+    const loop = body.slice(body.indexOf("for (const update of plan)"));
+    assert.ok(loop.indexOf("const pricing = zeroRate") > -1, "pricing is decided per ROW, inside the loop");
+    assert.ok(loop.indexOf("const pricing") < loop.indexOf("tx.timeEntry.update"));
+    // And appending is idempotent, so a second pass over the same row does not
+    // stack the note twice.
+    const once = appendZeroRateReview(null);
+    const twice = appendZeroRateReview(once.reviewReason);
+    assert.equal(twice.reviewReason, once.reviewReason);
 });

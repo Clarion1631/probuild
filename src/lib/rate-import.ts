@@ -77,6 +77,16 @@ export type ImportableUser = {
     hourlyRate: string;
     status?: string | null;
     payType?: string | null;
+    /**
+     * ISO text of User.lastRateSyncAt, or null if a rate was never imported.
+     *
+     * Part of the row's identity, not decoration: it is what makes an A -> B -> A
+     * replay detectable. Rate and pay type both return to their old values when
+     * somebody sets them back by hand, so an old preview's token would verify
+     * again and silently re-apply a decision nobody made twice. The stamp only
+     * moves forward.
+     */
+    lastRateSyncAt?: string | null;
 };
 
 /** Highest rate the import will accept without a human overriding it by hand — a typo like "5500" instead of "55.00" must not reach payroll. */
@@ -353,7 +363,13 @@ export function diffRates(
     parsed: ParsedRateRow[],
     users: ImportableUser[],
     /** Signer for each matched row. Defaults to the unsigned fingerprint so pure tests stay pure. */
-    signRow: (input: RowFingerprintInput) => string = rowFingerprint
+    signRow: (input: RowFingerprintInput) => string = rowFingerprint,
+    /**
+     * sha256 of the file this diff was built from, bound into every row token.
+     * Apply re-hashes the CSV it is given, so a token cannot be lifted out of
+     * one preview and posted alongside a different file.
+     */
+    csvHash: string = ""
 ): RateDiffRow[] {
     const byEmail = new Map<string, ImportableUser>();
     for (const user of users) byEmail.set(user.email.trim().toLowerCase(), user);
@@ -439,6 +455,8 @@ export function diffRates(
                       userId: user.id,
                       oldHourly,
                       oldPayType,
+                      oldLastRateSyncAt: user.lastRateSyncAt ?? null,
+                      csvHash,
                       newHourly: row.hourlyRate,
                       payType: row.payType,
                   })
@@ -501,6 +519,10 @@ export type RowFingerprintInput = {
     oldHourly: string | null;
     /** The member's pay type when the preview was built. */
     oldPayType: string | null;
+    /** ISO text of the member's lastRateSyncAt when the preview was built, or null. */
+    oldLastRateSyncAt: string | null;
+    /** sha256 of the CSV this preview was built from. Binds the row to one file. */
+    csvHash: string;
     /** The rate about to be written, or null for a pay-type-only row. */
     newHourly: string | null;
     /** The pay type about to be written (null = leave it alone). */
@@ -524,6 +546,11 @@ export function rowFingerprint(input: RowFingerprintInput): string {
         input.oldPayType ?? "",
         input.newHourly ?? "",
         input.payType ?? "",
+        // "null" rather than "": an absent stamp is a real, distinct state (a
+        // member whose rate was never imported), and collapsing it into the
+        // empty string would make it indistinguishable from a missing field.
+        input.oldLastRateSyncAt ?? "null",
+        input.csvHash,
     ].join(":");
 }
 

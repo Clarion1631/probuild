@@ -18,11 +18,13 @@ import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import {
     assertManualEntryDelete,
     assertManualEntryWrite,
+    assertNotClockGeneratedEntry,
     assertNotLegacyUnitEntry,
     assertUsableDuration,
     canWriteHoursFor,
 } from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
+import { settleDayWithinTx, settlementDays } from "@/lib/wa-breaks-db";
 import { toNum } from "@/lib/prisma-helpers";
 import {
     appendZeroRateReview,
@@ -132,7 +134,7 @@ export async function updateTimeEntry(
     const current = await prisma.timeEntry.findUnique({
         where: { id },
         select: {
-            projectId: true, userId: true, startTime: true, invoiceId: true, invoicedAt: true,
+            projectId: true, userId: true, startTime: true, endTime: true, invoiceId: true, invoicedAt: true,
             estimateItemId: true, durationHours: true, laborCost: true,
         },
     });
@@ -140,6 +142,7 @@ export async function updateTimeEntry(
     // Authorized against the STORED row's project and owner, and against the
     // person this edit would move it to.
     assertNotLegacyUnitEntry(current);
+    assertNotClockGeneratedEntry(current);
     const actor = await assertManualEntryWrite(current.projectId, current.userId);
     await assertManualEntryWrite(current.projectId, data.userId);
     if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
@@ -163,8 +166,13 @@ export async function updateTimeEntry(
     // period that was already exported. The row's STORED startTime is re-read
     // and row-locked inside the transaction — the value captured above is not
     // trusted, because another writer may have moved the row since.
-    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.updateMany({
+    // Both days: the one this entry is leaving and the one it is joining. Their
+    // advisory locks are taken up front by withPayrollWriteTx, keeping the
+    // documented payroll -> day -> row order.
+    const days = settlementDays([current.startTime, startTime]);
+    const owners = Array.from(new Set([current.userId, data.userId]));
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime], dayKeys: days }, async (tx) => {
+        const result = await (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id, invoiceId: null, invoicedAt: null },
             data: {
                 userId: data.userId,
@@ -185,8 +193,16 @@ export async function updateTimeEntry(
                     acknowledgeZeroRate
                 )),
             },
-        })
-    );
+        });
+        // Only re-settle if the edit actually landed — a no-op updateMany means
+        // the row was billed out from under us and nothing on the day moved.
+        if (result.count === 1) {
+            for (const owner of owners) {
+                for (const dayKey of days) await settleDayWithinTx(tx as never, owner, dayKey);
+            }
+        }
+        return result;
+    });
     if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
@@ -196,13 +212,22 @@ export async function updateTimeEntry(
 export async function deleteTimeEntry(id: string) {
     // Authorized against the STORED row: its project AND its owner.
     const { entry } = await assertManualEntryDelete(id);
+    assertNotClockGeneratedEntry(entry);
     if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
 
     // Deleting a punch out of an exported period changes hours that were paid —
     // check and delete in one transaction under the shared advisory lock.
-    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
-    );
+    const days = settlementDays([entry.startTime]);
+    const deleted = await withPayrollWriteTx({ entryIds: [id], dayKeys: days }, async (tx) => {
+        const result = await (tx as unknown as typeof prisma).timeEntry.deleteMany({
+            where: { id, invoiceId: null, invoicedAt: null },
+        });
+        // Removing hours can drop the day back under the meal-break threshold.
+        if (result.count === 1) {
+            for (const dayKey of days) await settleDayWithinTx(tx as never, entry.userId, dayKey);
+        }
+        return result;
+    });
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/time-expenses`);

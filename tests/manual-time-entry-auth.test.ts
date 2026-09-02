@@ -15,13 +15,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
+    assertNotClockGeneratedEntry,
     assertNotLegacyUnitEntry,
     assertUsableDuration,
     canWriteHoursFor,
     isLegacyUnitEntry,
     isOfficeTimeRole,
+    isClockGeneratedEntry,
+    CLOCK_GENERATED_ENTRY_CODE,
     LEGACY_UNIT_ENTRY_CODE,
 } from "../src/lib/manual-time-entry-auth";
+import { settleDayPlan } from "../src/lib/wa-breaks";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-manual-entry-auth";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -117,4 +121,106 @@ test("both pricing helpers honour the shared acknowledge predicate", () => {
         const source = readFileSync(path.join(__dirname, "..", ...file), "utf8");
         assert.match(source, /canAcknowledgeZeroRate\(actor, data\.userId\)/, file.join("/"));
     }
+});
+
+
+// ---------------------------------------------------------------------------
+// Review round 15, item 2: the manual actions refuse clocked rows, and they
+// re-settle the day they touched inside the same transaction.
+// ---------------------------------------------------------------------------
+
+const MANUAL_ACTION_FILES = [
+    "src/lib/time-expense-actions.ts",
+    "src/app/projects/[id]/timeclock/actions.ts",
+];
+
+function actionSource(file: string): string {
+    return readFileSync(path.join(process.cwd(), file), "utf8");
+}
+
+test("a clocked row is one with a real endTime; a manual row has none", () => {
+    assert.equal(isClockGeneratedEntry({ endTime: new Date("2026-09-01T17:00:00Z") }), true);
+    assert.equal(isClockGeneratedEntry({ endTime: null }), false);
+    // An unparseable date is not evidence of a punch.
+    assert.equal(isClockGeneratedEntry({ endTime: new Date("nonsense") }), false);
+});
+
+test("the manual actions refuse a clocked row with a CODED error", () => {
+    let error: (Error & { code?: string }) | null = null;
+    try {
+        assertNotClockGeneratedEntry({ endTime: new Date("2026-09-01T17:00:00Z") });
+    } catch (thrown) {
+        error = thrown as Error & { code?: string };
+    }
+    assert.ok(error, "a clocked row must be refused");
+    assert.equal(error!.code, CLOCK_GENERATED_ENTRY_CODE);
+    // Says where to go instead, rather than just refusing.
+    assert.match(error!.message, /time clock/i);
+    // A manual row passes.
+    assert.doesNotThrow(() => assertNotClockGeneratedEntry({ endTime: null }));
+});
+
+test("BOTH manual update/delete paths call the clocked-row guard", () => {
+    for (const file of MANUAL_ACTION_FILES) {
+        const source = actionSource(file);
+        const update = source.slice(source.indexOf("export async function updateTimeEntry"));
+        assert.match(
+            update.slice(0, update.indexOf("export async function deleteTimeEntry")),
+            /assertNotClockGeneratedEntry\(/,
+            `${file}: update`
+        );
+        const del = source.slice(source.indexOf("export async function deleteTimeEntry"));
+        assert.match(del, /assertNotClockGeneratedEntry\(entry\)/, `${file}: delete`);
+        // Which means both must READ endTime — a guard cannot fire on a column
+        // that was never selected.
+        assert.match(source, /endTime: true/, `${file}: selects endTime`);
+    }
+});
+
+test("both paths re-settle the affected day INSIDE the same transaction", () => {
+    for (const file of MANUAL_ACTION_FILES) {
+        const source = actionSource(file);
+        assert.match(source, /settleDayWithinTx\(tx as never/, `${file}: settles on the tx, not a new connection`);
+        // The day keys are handed to withPayrollWriteTx so their advisory locks
+        // are taken UP FRONT — payroll, then day, then row. Taking the day lock
+        // after the rows are locked is the deadlock this avoids.
+        assert.match(source, /dayKeys: days/, `${file}: locks the days up front`);
+        assert.match(source, /settlementDays\(/, `${file}`);
+        // An edit can MOVE an entry, so both days are settled, not just the new one.
+        assert.match(source, /settlementDays\(\[(current|existing)\.startTime, startTime\]\)/, `${file}: old day AND new day`);
+    }
+});
+
+test("deleting one of two shifts drops the meal deduction the day no longer earns", () => {
+    // Two shifts, 4h and 3h, on one day: 7h worked, which is over the WA
+    // threshold, so the day carries a meal deduction.
+    const day = (id: string, from: string, to: string) => ({
+        id,
+        startTime: new Date(from),
+        endTime: new Date(to),
+        mealOutcome: null,
+        mealSkipStatus: null,
+        reviewReason: null,
+    });
+    const both = settleDayPlan({
+        entries: [
+            // A SHORT gap: anything over PUNCHED_MEAL_GAP_MINUTES would count
+            // as the break already taken, and the day would owe nothing.
+            day("a", "2026-09-01T15:00:00Z", "2026-09-01T19:00:00Z"),
+            day("b", "2026-09-01T19:10:00Z", "2026-09-01T22:10:00Z"),
+        ],
+    });
+    const deductedTogether = both.reduce((sum, row) => sum + row.mealDeductionHours, 0);
+    assert.ok(deductedTogether > 0, "7 worked hours earn a meal deduction");
+
+    // Now shift "b" is deleted. What is LEFT is 4 hours, under the threshold —
+    // so the deduction must come off. Without a re-settle the surviving row
+    // would keep a deduction for a break the day no longer requires, and the
+    // member would be short-paid half an hour.
+    const remaining = settleDayPlan({
+        entries: [day("a", "2026-09-01T15:00:00Z", "2026-09-01T19:00:00Z")],
+    });
+    const deductedAlone = remaining.reduce((sum, row) => sum + row.mealDeductionHours, 0);
+    assert.equal(deductedAlone, 0, "4 hours alone earn none");
+    assert.equal(remaining[0].paidHours, 4, "and the paid hours go back up");
 });

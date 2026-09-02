@@ -253,13 +253,23 @@ test("row claims are SIGNED — an unsigned fingerprint is not evidence", () => 
         userId: "u1",
         oldHourly: "25.00",
         oldPayType: null,
+        oldLastRateSyncAt: null,
+        csvHash: "",
         newHourly: "32.50",
         payType: null,
     });
     assert.equal(signed.rowHash, `sig(${payload})`);
     assert.notEqual(
         payload,
-        rowFingerprint({ userId: "u1", oldHourly: "25.00", oldPayType: "SALARY", newHourly: "32.50", payType: null })
+        rowFingerprint({
+            userId: "u1",
+            oldHourly: "25.00",
+            oldPayType: "SALARY",
+            oldLastRateSyncAt: null,
+            csvHash: "",
+            newHourly: "32.50",
+            payType: null,
+        })
     );
 });
 
@@ -565,4 +575,80 @@ test("properly quoted fields still parse, including embedded commas and quotes",
             ['He said "hi"', "29.00"],
         ]
     );
+});
+
+
+// ---------------------------------------------------------------------------
+// Review round 15, item 5: the row token is bound to the FILE and to the
+// member's last-sync stamp.
+// ---------------------------------------------------------------------------
+
+const A_TO_B_CSV = ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,32.50"].join("\n");
+
+test("A -> B -> A: a spent approval does not verify again once the rate is set back by hand", () => {
+    // Tim is on 25.00 and has never been imported, so his stamp is null.
+    const before: ImportableUser[] = [
+        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", lastRateSyncAt: null },
+    ];
+    const approved = diffRates(parseGustoRateCsv(A_TO_B_CSV).rows, before, rowFingerprint, "file-hash")[0];
+    assert.equal(approved.rowHash, rowFingerprint({
+        userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
+        oldLastRateSyncAt: null, csvHash: "file-hash",
+        // The file has no pay-type column, so the row writes a rate only.
+        newHourly: "32.50", payType: null,
+    }));
+
+    // The import runs: 25.00 -> 32.50, and the stamp is set. Then somebody puts
+    // the rate back to 25.00 by hand on the team page. Rate and pay type are
+    // now EXACTLY what the old approval was signed over.
+    const backToA: ImportableUser[] = [
+        { id: "u1", name: "Tim Brennan", email: "tim@example.com", hourlyRate: "25.00", status: "ACTIVE", payType: "HOURLY", lastRateSyncAt: "2026-09-02T00:00:00.000Z" },
+    ];
+    const reSigned = diffRates(parseGustoRateCsv(A_TO_B_CSV).rows, backToA, rowFingerprint, "file-hash")[0];
+
+    // Without the stamp the old token would verify and silently re-apply a
+    // decision that was already made, and already undone.
+    assert.notEqual(reSigned.rowHash, approved.rowHash, "the spent approval must not verify against the restored rate");
+});
+
+test("an absent stamp is bound as the literal \"null\", never as an empty field", () => {
+    const never = rowFingerprint({
+        userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
+        oldLastRateSyncAt: null, csvHash: "h", newHourly: "32.50", payType: null,
+    });
+    assert.match(never, /:null:h$/);
+    // and it is a DIFFERENT claim from any real stamp
+    assert.notEqual(never, rowFingerprint({
+        userId: "u1", oldHourly: "25.00", oldPayType: "HOURLY",
+        oldLastRateSyncAt: "2026-09-02T00:00:00.000Z", csvHash: "h", newHourly: "32.50", payType: null,
+    }));
+});
+
+test("a row token is bound to the FILE it was previewed from", () => {
+    const same = parseGustoRateCsv(A_TO_B_CSV).rows;
+    const fromFileA = diffRates(same, users, rowFingerprint, "sha-of-file-a")[0];
+    const fromFileB = diffRates(same, users, rowFingerprint, "sha-of-file-b")[0];
+    // Identical rows, identical members, different source file: a token lifted
+    // out of one preview cannot be posted alongside another file.
+    assert.notEqual(fromFileA.rowHash, fromFileB.rowHash);
+});
+
+test("apply REQUIRES the csv and re-parses it — the check cannot be skipped by omitting it", () => {
+    const source = readFileSync(path.join(process.cwd(), "src/lib/actions.ts"), "utf8");
+    const apply = source.slice(source.indexOf("export async function applyGustoRateImport"));
+    const body = apply.slice(0, apply.indexOf("\nexport "));
+    // Required, not optional — `csvText?: string` let a caller skip the whole
+    // file check by simply not sending it.
+    assert.match(body, /csvText: string/);
+    assert.doesNotMatch(body, /csvText\?: string/);
+    assert.match(body, /typeof csvText !== "string" \|\| !csvText\.trim\(\)/);
+    assert.match(body, /parseGustoRateCsv\(csvText\)/);
+    assert.match(body, /reparsed\.errors\.length > 0/);
+    // The hash comes from the file the SERVER parsed, and is what the tokens
+    // are re-signed with.
+    assert.match(body, /const csvHash = hashImportCsv\(csvText\)/);
+    assert.match(body, /csvHash,/);
+    // The stamp is in the signature AND in the compare-and-set.
+    assert.match(body, /oldLastRateSyncAt: live\.lastRateSyncAt/);
+    assert.match(body, /lastRateSyncAt: live\.lastRateSyncAt,/);
 });

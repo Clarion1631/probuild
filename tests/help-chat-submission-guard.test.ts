@@ -14,7 +14,9 @@ import path from "node:path";
 const LF = String.fromCharCode(10);
 import {
     checkHelpSubmission,
+    helpChatResponse,
     hourBucket,
+    reserveHelpRequest,
     isMobileSubmission,
     HELP_DESCRIPTION_MAX,
     HELP_SUBMISSIONS_PER_HOUR,
@@ -231,9 +233,15 @@ test("the slot and the row commit together, or neither does", () => {
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
     // They were two separate statements: a failure in between either burned a
     // slot with no row to show for it, or created a row the counter never saw.
-    assert.match(fn, /prisma\.\$transaction\(async \(tx\) => \{/);
+    // One transaction, over an injectable client that defaults to prisma.
+    assert.match(fn, /client\.\$transaction\(async \(tx\) => \{/);
+    assert.match(fn, /= prisma as never/);
     const tx = fn.slice(fn.indexOf("$transaction"));
-    assert.ok(tx.indexOf('UPDATE "HelpSubmissionQuota"') < tx.indexOf('INSERT INTO "HelpRequest"'));
+    // The order INVERTED in review round 15, deliberately: the HelpRequest
+    // insert now comes FIRST so that a replay (which conflicts and returns no
+    // row) never reaches the counter. Charging the quota first meant a client
+    // retrying its own report could throttle itself out of it.
+    assert.ok(tx.indexOf('INSERT INTO "HelpRequest"') < tx.indexOf('UPDATE "HelpSubmissionQuota"'));
     // Throwing is what rolls the slot back when the limit is gone.
     assert.match(fn, /throw new HelpThrottledError\(\)/);
 });
@@ -372,4 +380,140 @@ test("the provider lease is a compare-and-set, taken before any GitHub call", ()
             `${route}: claim the lease before creating`
         );
     }
+});
+
+
+// ---------------------------------------------------------------------------
+// Review round 15, items 3 and 4: one atomic reservation, and a 202 for a
+// report that is saved but not filed.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake client standing in for one Postgres connection. `insertWins` is what
+ * that connection's `INSERT ... ON CONFLICT DO NOTHING` returns: a row when it
+ * won the race, nothing when another connection got there first.
+ */
+function fakeClient(options: { insertWins: boolean; existing?: any; quota?: boolean }) {
+    const sql: string[] = [];
+    const tx = {
+        $queryRaw: (strings: TemplateStringsArray) => {
+            const text = strings.join("?");
+            sql.push(text);
+            if (text.includes('INSERT INTO "HelpRequest"')) {
+                return Promise.resolve(options.insertWins ? [{ id: "new-row" }] : []);
+            }
+            if (text.includes('"HelpSubmissionQuota"')) {
+                return Promise.resolve(options.quota === false ? [] : [{ count: 1 }]);
+            }
+            return Promise.resolve([]);
+        },
+        $executeRaw: (strings: TemplateStringsArray) => {
+            sql.push(strings.join("?"));
+            return Promise.resolve(1);
+        },
+        helpRequest: {
+            findUnique: () => Promise.resolve(options.existing ?? null),
+        },
+    };
+    return {
+        sql,
+        client: { $transaction: <T,>(fn: (t: any) => Promise<T>) => fn(tx) },
+    };
+}
+
+const SUBMISSION = {
+    userId: "u1",
+    type: "bug",
+    question: "t",
+    response: "d",
+    currentPage: "mobile:Time Clock",
+    conversationId: null,
+    submissionId: "abc123",
+};
+
+test("two concurrent requests with the same submissionId BOTH succeed on one row", async () => {
+    // The winner inserts.
+    const winner = fakeClient({ insertWins: true });
+    const first = await reserveHelpRequest(SUBMISSION, winner.client as never);
+
+    // The loser's INSERT returns nothing (ON CONFLICT DO NOTHING) and it reads
+    // the committed row instead. Under the old read-then-insert BOTH callers
+    // found nothing, both inserted, and the loser got a unique-violation 500.
+    const loser = fakeClient({
+        insertWins: false,
+        existing: { id: "new-row", status: "submitting", createdAt: new Date(), providerState: "pending" },
+    });
+    const second = await reserveHelpRequest(SUBMISSION, loser.client as never);
+
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, true);
+    assert.equal(first.ok && first.id, "new-row");
+    assert.equal(second.ok && second.id, "new-row", "both callers end up on the SAME report");
+    assert.equal(second.ok && second.existing, true);
+
+    // And the reservation really is one statement, not a read followed by a write.
+    assert.match(winner.sql[0], /INSERT INTO "HelpRequest"[\s\S]*ON CONFLICT \("userId", "submissionId"\) DO NOTHING[\s\S]*RETURNING/);
+});
+
+test("a replay does not spend a quota slot — only a genuinely new report does", async () => {
+    const fresh = fakeClient({ insertWins: true });
+    await reserveHelpRequest(SUBMISSION, fresh.client as never);
+    assert.ok(fresh.sql.some((s) => s.includes('"HelpSubmissionQuota"')), "a new report charges the quota");
+
+    const replay = fakeClient({
+        insertWins: false,
+        existing: { id: "new-row", status: "submitting", createdAt: new Date(), providerState: "pending" },
+    });
+    await reserveHelpRequest(SUBMISSION, replay.client as never);
+    assert.ok(
+        !replay.sql.some((s) => s.includes('"HelpSubmissionQuota"')),
+        "a retry must not be able to throttle the user out of their own report"
+    );
+});
+
+test("the quota rolls the new row back with it when the slot is gone", async () => {
+    const throttled = fakeClient({ insertWins: true, quota: false });
+    const result = await reserveHelpRequest(SUBMISSION, throttled.client as never);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "throttled");
+    // Both statements ran in ONE $transaction callback, so the throw undoes the insert.
+    assert.ok(throttled.sql.some((s) => s.includes('INSERT INTO "HelpRequest"')));
+});
+
+test("a report that is saved but NOT filed answers 202, not 200", () => {
+    const pending = helpChatResponse({ body: { request: { id: "r1" } }, filed: false, submissionId: "abc123" });
+    assert.equal(pending.status, 202);
+
+    const filed = helpChatResponse({ body: { request: { id: "r1" } }, filed: true, submissionId: "abc123" });
+    assert.equal(filed.status, 200);
+});
+
+test("the 202 carries back the submissionId the client must retry with", async () => {
+    const pending = helpChatResponse({ body: {}, filed: false, submissionId: "abc123" });
+    const body = await pending.json();
+    assert.equal(body.status, "pending");
+    assert.equal(body.submissionId, "abc123", "without this the client cannot resume the SAME report");
+
+    const filed = await helpChatResponse({ body: {}, filed: true, submissionId: "abc123" }).json();
+    assert.equal(filed.status, "filed");
+});
+
+test("every not-yet-filed exit of BOTH help routes goes through the 202 helper", () => {
+    for (const route of ["src/app/api/help-chat/request/route.ts", "src/app/api/help-chat/bug-fix/route.ts"]) {
+        const source = readFileSync(path.join(process.cwd(), route), "utf8");
+        // The duplicate branch and the lease branch are the two places a report
+        // that may not be filed was reported as terminal.
+        assert.match(source, /reserved\.existing && !reserved\.resume[\s\S]{0,400}helpChatResponse\(/, route);
+        assert.match(source, /claimProviderLease\(requestId\)[\s\S]{0,400}helpChatResponse\(/, route);
+        // Both decide on the STORED providerState, never on "we got this far".
+        assert.match(source, /filed: (reserved\.providerState|inFlight\?\.providerState) === "created"/, route);
+    }
+});
+
+test("a pending row stays resumable, so a later retry finishes it", () => {
+    const source = readFileSync(path.join(process.cwd(), "src/lib/help-chat/submission-guard.ts"), "utf8");
+    // The durable completion path: providerState is the signal, and anything
+    // that is not "created" is picked back up by the next attempt carrying the
+    // same submissionId.
+    assert.match(source, /existing\.providerState !== "created" && age > HELP_SUBMITTING_STALE_MS/);
 });
