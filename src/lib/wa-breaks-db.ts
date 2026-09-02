@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
-import { isPeriodLockedError } from "@/lib/payroll-period";
+import { dayLockKey, isPeriodLockedError } from "@/lib/payroll-period";
 
 function dayWindow(dayKey: string) {
     const dayStartUtc = new Date(`${dayKey}T00:00:00.000Z`).getTime();
@@ -55,7 +55,7 @@ export async function settleDay(
             // waiting on payroll, against a locker holding payroll and waiting
             // on this day.
             await assertSettlementDayUnlocked(tx, userId, dayKey);
-            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${dayKey}`);
+            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, dayKey));
             return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
         });
     } catch (error) {
@@ -85,7 +85,7 @@ export async function settleDayWithinTx(
 ): Promise<number> {
     // Payroll lock first, then the day lock (see LOCK ORDER in payroll-period.ts).
     await assertSettlementDayUnlocked(tx, userId, dayKey);
-    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${dayKey}`);
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, dayKey));
     return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
 }
 
@@ -198,14 +198,14 @@ export async function deleteEntryAndSettle(
 ): Promise<void> {
     await prisma.$transaction(async (tx) => {
         if (options.guard) await options.guard(tx);
-        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(userId, knownDayKey));
         const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
         if (!victim) return; // already gone
         const actualDay = toCompanyDayKey(victim.startTime);
         if (actualDay !== knownDayKey) {
             // Moved since the caller read it — take that day's lock as well
             // (deterministic order: keys sorted, so two deletes cannot deadlock).
-            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
+            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(victim.userId, actualDay));
         }
         await tx.timeEntry.delete({ where: { id: entryId } });
         for (const dayKey of new Set([knownDayKey, actualDay])) {

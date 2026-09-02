@@ -8,9 +8,13 @@
 // Pure except for the throttle's row count, which is injected — so the limits
 // are testable without a database.
 
+import { prisma } from "../prisma";
+
 export const HELP_TITLE_MAX = 200;
 export const HELP_DESCRIPTION_MAX = 5_000;
 export const HELP_STEPS_MAX = 5_000;
+export const HELP_CURRENT_PAGE_MAX = 500;
+export const HELP_CONVERSATION_ID_MAX = 64;
 /** Submissions per user per hour. A human reporting bugs never approaches this; a retry loop does. */
 export const HELP_SUBMISSIONS_PER_HOUR = 5;
 export const HELP_THROTTLE_WINDOW_MS = 60 * 60 * 1000;
@@ -24,7 +28,14 @@ export type HelpSubmissionInput = {
 };
 
 export type HelpSubmissionCheck =
-    | { ok: true; title: string; description: string; steps: string | null; currentPage: string | null }
+    | {
+          ok: true;
+          title: string;
+          description: string;
+          steps: string | null;
+          currentPage: string | null;
+          conversationId: string | null;
+      }
     | { ok: false; status: number; error: string };
 
 function readString(value: unknown): string | null {
@@ -56,8 +67,34 @@ export function checkHelpSubmission(body: HelpSubmissionInput): HelpSubmissionCh
     if (steps && steps.length > HELP_STEPS_MAX) {
         return { ok: false, status: 400, error: `Steps must be ${HELP_STEPS_MAX} characters or fewer.` };
     }
+    // currentPage is echoed into a GitHub issue, so it is bounded and has to
+    // look like a route rather than arbitrary text or a URL to somewhere else.
     const currentPage = readString(body.currentPage);
-    return { ok: true, title, description, steps: steps || null, currentPage: currentPage || null };
+    if (currentPage) {
+        if (currentPage.length > HELP_CURRENT_PAGE_MAX) {
+            return { ok: false, status: 400, error: `currentPage must be ${HELP_CURRENT_PAGE_MAX} characters or fewer.` };
+        }
+        if (!/^\/[\w\-./[\]%?=&#:+,~]*$/.test(currentPage)) {
+            return { ok: false, status: 400, error: "currentPage must be an app path beginning with /." };
+        }
+    }
+
+    // conversationId is an opaque id, never free text.
+    const conversationId = readString(body.conversationId);
+    if (conversationId) {
+        if (conversationId.length > HELP_CONVERSATION_ID_MAX || !/^[A-Za-z0-9_-]+$/.test(conversationId)) {
+            return { ok: false, status: 400, error: "conversationId is not a valid id." };
+        }
+    }
+
+    return {
+        ok: true,
+        title,
+        description,
+        steps: steps || null,
+        currentPage: currentPage || null,
+        conversationId: conversationId || null,
+    };
 }
 
 /** Instant the throttle window opens. Callers count this user's submissions since then. */
@@ -68,6 +105,41 @@ export function throttleWindowStart(now: Date = new Date()): Date {
 export function isThrottled(recentCount: number): boolean {
     return recentCount >= HELP_SUBMISSIONS_PER_HOUR;
 }
+
+/**
+ * Claim a submission slot AND create the row in ONE statement.
+ *
+ * The count-then-insert version was a check-then-act: five concurrent requests
+ * all read four and all inserted. Here the INSERT only produces a row when the
+ * count inside the same statement is still under the limit, so the database
+ * decides, once. Returns the new row id, or null when the caller is over.
+ *
+ * The row exists BEFORE the GitHub call so a failure there cannot lose the
+ * report — the row is updated with the issue reference afterwards, which also
+ * makes a retry update rather than duplicate.
+ */
+export async function reserveHelpRequest(input: {
+    userId: string;
+    type: string;
+    question: string;
+    response: string;
+    currentPage: string | null;
+    conversationId: string | null;
+}): Promise<string | null> {
+    const windowStart = throttleWindowStart();
+    const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+        INSERT INTO "HelpRequest" ("userId", "type", "question", "response", "currentPage", "status", "conversationId")
+        SELECT ${input.userId}, ${input.type}, ${input.question}, ${input.response},
+               ${input.currentPage}, 'submitting', ${input.conversationId}
+        WHERE (
+            SELECT count(*) FROM "HelpRequest"
+            WHERE "userId" = ${input.userId} AND "createdAt" >= ${windowStart}
+        ) < ${HELP_SUBMISSIONS_PER_HOUR}
+        RETURNING "id"
+    `;
+    return rows[0]?.id ?? null;
+}
+
 
 export const HELP_THROTTLED_MESSAGE = `That's ${HELP_SUBMISSIONS_PER_HOUR} reports in an hour — give it a few minutes before sending another. Nothing was lost.`;
 

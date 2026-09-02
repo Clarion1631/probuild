@@ -12,6 +12,7 @@ import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 import {
     assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
+    dayLockKey,
     isPeriodLockedError,
     periodLockedResponse,
     withPayrollWriteTx,
@@ -360,7 +361,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // `newStart` is checked as the value about to be written.
     let updated;
     try {
-        updated = await withPayrollWriteTx({ entryIds: [id], instants: [newStart] }, async (tx) => {
+        // Every lock this write needs, declared up front and taken in the
+        // global order (payroll -> days -> rows). Both days: the edit can move
+        // the punch, and settlement then re-plans the old day AND the new one.
+        updated = await withPayrollWriteTx(
+            {
+                entryIds: [id],
+                instants: [newStart],
+                dayKeys: [
+                    dayLockKey(existing.userId, toCompanyDayKey(existing.startTime)),
+                    dayLockKey(existing.userId, toCompanyDayKey(newStart)),
+                ],
+            },
+            async (tx) => {
             const client = tx as unknown as typeof prisma;
             const row = await client.timeEntry.update({ where: { id }, data });
             // Re-plan every day this edit touched (the row may have moved days),
@@ -376,8 +389,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 );
                 if (result < 0) await client.timeEntry.update({ where: { id }, data: { needsReview: true } });
             }
-            return row;
-        });
+                return row;
+            }
+        );
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         throw error;
@@ -418,7 +432,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
             // Re-reads the row FOR UPDATE inside the delete transaction and
             // validates its STORED startTime — the value read above is stale
             // the moment another writer moves the row.
-            guard: (tx) => assertEntriesUnlockedInTx(tx, [id]),
+            guard: (tx) =>
+                assertEntriesUnlockedInTx(tx, [id], {
+                    dayKeys: [dayLockKey(existing.userId, toCompanyDayKey(existing.startTime))],
+                }),
         });
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);

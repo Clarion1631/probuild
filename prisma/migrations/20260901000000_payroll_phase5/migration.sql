@@ -139,4 +139,25 @@ DO $$ BEGIN
  END $$;
 
 ALTER TABLE "PayrollPeriod" ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON TABLE "PayrollPeriod" FROM anon, authenticated;
+
+-- User carries hourlyRate / burdenRate / payType, so it needs the same
+-- treatment as PayrollPeriod. Prisma connects as the table OWNER and owners
+-- bypass RLS, so the app is unaffected; the Supabase client in this codebase is
+-- storage-only (CLAUDE.md), so nothing reads User through the Data API. This
+-- only closes the door on a leaked anon/authenticated key.
+ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;
+
+-- The Supabase roles do not exist on a vanilla Postgres (CI builds a throwaway
+-- database from these migrations), and REVOKE on a missing role is a hard
+-- error. Guarded so the same DDL runs in both places.
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+     REVOKE ALL ON TABLE "PayrollPeriod" FROM anon;
+     REVOKE ALL ON TABLE "User" FROM anon;
+   END IF;
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+     REVOKE ALL ON TABLE "PayrollPeriod" FROM authenticated;
+     REVOKE ALL ON TABLE "User" FROM authenticated;
+   END IF;
+END $$;

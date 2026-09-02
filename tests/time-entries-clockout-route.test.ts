@@ -68,7 +68,11 @@ function createDeps(overrides: {
         findDayEntries: async () => overrides.dayEntries ?? [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, data, _guard) => {
+        closeTimeEntry: async (id, userId, buildData, guard) => {
+            // The real dependency re-reads the row under FOR UPDATE and prices
+            // the close from its STORED startTime; the fixture entry never moves.
+            void guard;
+            const data = await buildData(overrides.entry?.startTime ?? START);
             updateCalls.push({ id, userId, data });
             if (overrides.closeRaceLost) {
                 const current = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });

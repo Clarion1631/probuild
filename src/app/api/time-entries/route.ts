@@ -13,6 +13,7 @@ import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } fr
 import {
     assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
+    dayLockKey,
     isPeriodLockedError,
     periodLockedResponse,
     withPayrollWriteTx,
@@ -320,6 +321,18 @@ export interface ClockOutTimeEntryRow {
     mealSkipStatus?: string | null;
 }
 
+/** Bad input discovered only once the STORED startTime is known, inside the close transaction. */
+class ClockOutInputError extends Error {
+    readonly status: number;
+    readonly code?: string;
+    constructor(status: number, message: string, code?: string) {
+        super(message);
+        this.name = "ClockOutInputError";
+        this.status = status;
+        this.code = code;
+    }
+}
+
 /** Client clock skew allowance for a supplied endTime — see the PUT handler. */
 const CLOCK_OUT_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
@@ -367,7 +380,13 @@ export interface ClockOutDependencies {
     closeTimeEntry(
         id: string,
         userId: string,
-        data: Record<string, unknown>,
+        /**
+         * Builds the update from the entry's STORED startTime, read inside the
+         * transaction. Duration, the meal deduction and both costs all derive
+         * from that instant, so computing them from a value read before the
+         * transaction would price a shift that had since been moved.
+         */
+        buildData: (storedStartTime: Date) => Promise<Record<string, unknown>>,
         /**
          * Everything the close transaction must do atomically:
          *  - re-read + row-lock this entry and check its STORED startTime
@@ -376,9 +395,17 @@ export interface ClockOutDependencies {
          *  - re-settle the worker's day IN THE SAME TRANSACTION, so a period
          *    cannot be locked between the close and the settlement.
          */
-        guard: { entryId: string; settle: { dayKey: string; closing: { id: string; mealSkipped: unknown } } | null }
+        guard: {
+            entryId: string;
+            /** Day key the caller EXPECTS this entry to be on — locked before the row is read. */
+            expectedDayKey: string;
+            settle: { closing: { id: string; mealSkipped: unknown } } | null;
+        }
     ): Promise<
-        { ok: true; entry: unknown } | { ok: false; current: unknown | null } | { ok: false; locked: LockedPeriodRow }
+        | { ok: true; entry: unknown }
+        | { ok: false; current: unknown | null }
+        | { ok: false; locked: LockedPeriodRow }
+        | { ok: false; moved: true }
     >;
 }
 
@@ -489,23 +516,6 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
-            // WA automatic-break model (src/lib/wa-breaks.ts): the meal is deducted
-            // HERE, at clock-out, against the whole company-local day — unless a
-            // punched meal, a manager-approved skip, or the worker's own
-            // worked-through attestation covers it. durationHours is PAID hours
-            // (what payroll/export/summary read); shiftHours keeps the raw span.
-            const dayEntries = await dependencies.findDayEntries(existing.userId, toCompanyDayKey(existing.startTime), existing.id);
-            const meal = computeMealDeduction({
-                dayEntries,
-                closing: { startTime: existing.startTime, endTime: end },
-                mealSkipped,
-                mealSkipStatus: existing.mealSkipStatus ?? null,
-                // Intermediate close (meal break / Switch Task / duplicate cleanup):
-                // nothing settles here — see wa-breaks.ts MealDeductionInput.deferMeal.
-                deferMeal: deferMeal === true,
-            });
-            const durationHours = meal.paidHours;
-
             // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
             // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
             const closerIsOwner = existing.userId === user.id;
@@ -515,99 +525,150 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
 
             // A $0 hourly rate on an hourly worker would stamp a $0 shift onto
-            // payroll and job costing, invisibly.
-            //
-            // The WORKER is refused and stays on the clock — a phone cannot fix
-            // a pay rate. A MANAGER is NOT refused: blocking the office too left
-            // a punch nobody could close (past MAX_SHIFT_HOURS every path
-            // refuses it, and nothing sweeps a stranded punch). Their close is
-            // flagged instead, which the payroll export then refuses to run
-            // through (src/lib/pay-rate-guard.ts, spec G2).
+            // payroll and job costing, invisibly. Refused for EVERYONE unless
+            // the caller explicitly acknowledged it; a worker can never
+            // acknowledge (a phone cannot fix a rate), so the flag is only
+            // honoured for a manager closing someone else's punch
+            // (src/lib/pay-rate-guard.ts, spec G2).
             const zeroRate = zeroRateBlocks(owner);
-            // Refused for EVERYONE unless the caller explicitly acknowledged it.
-            // A worker can never acknowledge (a phone cannot fix a rate), so the
-            // flag is only honoured for a manager closing someone else's punch.
             const acknowledged = acknowledgeZeroRate && !closerIsOwner && (user.role === "MANAGER" || user.role === "ADMIN");
             if (zeroRate && !acknowledged) {
                 return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
             }
 
-            const laborCost = durationHours * owner.hourlyRate;
-            const burdenCost = durationHours * owner.burdenRate;
-
-            const updateData: Record<string, unknown> = {
-                endTime: end,
-                durationHours,
-                shiftHours: meal.shiftHours,
-                mealDeductionHours: meal.mealDeductionHours,
-                mealOutcome: meal.outcome,
-                laborCost,
-                burdenCost,
-            };
-
-            if (latitude) updateData.latitude = latitude;
-            if (longitude) updateData.longitude = longitude;
-            if (logisticsCheck.notes !== undefined) updateData.notes = logisticsCheck.notes;
-
-            // WA meal-break voluntary waiver attestation — PUT always closes the
-            // entry, so this is always a clock-out. A manager-APPROVED skip is
-            // express permission already on record: it is paid without a review
-            // flag, so the worked-through attestation is not applied on top of it
-            // (the outcome column still says WAIVED_APPROVED for the audit trail).
-            // The waiver note is only meaningful when a meal was actually owed and
-            // worked through — a "worked through" answer on a 4h day is not a
-            // waiver of anything, and an APPROVED skip is permission already on
-            // record (WAIVED_APPROVED, paid, unflagged).
-            const mealWaiver = applyMealSkippedWaiver({
-                mealSkipped: meal.outcome === "WORKED_THROUGH" ? true : mealSkipped === false ? false : undefined,
-                settingEndTime: true,
-                existingReviewReason: existing.reviewReason,
-            });
-            Object.assign(updateData, mealWaiver);
-            // Rest-break attestation composes onto the same reviewReason string
-            // (rest breaks are paid — this only ever documents and flags).
-            const rest = applyRestBreakAttestation({
-                restBreaksMissed,
-                settingEndTime: true,
-                existingReviewReason: mealWaiver.reviewReason ?? existing.reviewReason,
-            });
-            Object.assign(updateData, rest);
-            // A deduction the worker was never asked about is flagged, never silent.
-            Object.assign(
-                updateData,
-                applyNoAttestationNotice({
-                    outcome: meal.outcome,
-                    mealSkipped,
-                    existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
-                })
-            );
-
-            // Runs LAST so it composes onto whatever reason the meal/rest
-            // notices above already wrote, and cannot be overwritten by them.
-            if (zeroRate) {
-                Object.assign(updateData, appendZeroRateReview(updateData.reviewReason ?? existing.reviewReason));
-            }
-
-            if (user.role === "MANAGER" || user.role === "ADMIN") {
-                if (existing.userId !== user.id) {
-                    updateData.editedByManagerId = user.id;
-                    updateData.editedAt = new Date();
+            // EVERYTHING below derives from the entry's STORED startTime, which
+            // is read inside the close transaction under FOR UPDATE and handed
+            // to this builder. Duration, the WA meal deduction and both costs
+            // are all functions of that instant, so computing them out here
+            // from a value read before the transaction would price a shift that
+            // had since been moved to another day.
+            const buildData = async (storedStart: Date): Promise<Record<string, unknown>> => {
+                // Re-validate against the value that is actually stored.
+                if (end.getTime() <= storedStart.getTime()) {
+                    throw new ClockOutInputError(400, "endTime must be after the clock-in time");
                 }
-            }
+                if (exceedsMaxShift(storedStart, end)) {
+                    throw new ClockOutInputError(
+                        400,
+                        `Shift would be longer than ${MAX_SHIFT_HOURS} hours — check the day`,
+                        "SHIFT_TOO_LONG"
+                    );
+                }
+
+                // WA automatic-break model (src/lib/wa-breaks.ts): the meal is deducted
+                // HERE, at clock-out, against the whole company-local day — unless a
+                // punched meal, a manager-approved skip, or the worker's own
+                // worked-through attestation covers it. durationHours is PAID hours
+                // (what payroll/export/summary read); shiftHours keeps the raw span.
+                const dayEntries = await dependencies.findDayEntries(
+                    existing.userId,
+                    toCompanyDayKey(storedStart),
+                    existing.id
+                );
+                const meal = computeMealDeduction({
+                    dayEntries,
+                    closing: { startTime: storedStart, endTime: end },
+                    mealSkipped,
+                    mealSkipStatus: existing.mealSkipStatus ?? null,
+                    // Intermediate close (meal break / Switch Task / duplicate cleanup):
+                    // nothing settles here — see wa-breaks.ts MealDeductionInput.deferMeal.
+                    deferMeal: deferMeal === true,
+                });
+                const durationHours = meal.paidHours;
+
+                const updateData: Record<string, unknown> = {
+                    endTime: end,
+                    durationHours,
+                    shiftHours: meal.shiftHours,
+                    mealDeductionHours: meal.mealDeductionHours,
+                    mealOutcome: meal.outcome,
+                    laborCost: durationHours * owner.hourlyRate,
+                    burdenCost: durationHours * owner.burdenRate,
+                };
+
+                if (latitude) updateData.latitude = latitude;
+                if (longitude) updateData.longitude = longitude;
+                if (logisticsCheck.notes !== undefined) updateData.notes = logisticsCheck.notes;
+
+                // WA meal-break voluntary waiver attestation — PUT always closes the
+                // entry, so this is always a clock-out. A manager-APPROVED skip is
+                // express permission already on record: it is paid without a review
+                // flag, so the worked-through attestation is not applied on top of it
+                // (the outcome column still says WAIVED_APPROVED for the audit trail).
+                const mealWaiver = applyMealSkippedWaiver({
+                    mealSkipped: meal.outcome === "WORKED_THROUGH" ? true : mealSkipped === false ? false : undefined,
+                    settingEndTime: true,
+                    existingReviewReason: existing.reviewReason,
+                });
+                Object.assign(updateData, mealWaiver);
+                // Rest-break attestation composes onto the same reviewReason string
+                // (rest breaks are paid — this only ever documents and flags).
+                const rest = applyRestBreakAttestation({
+                    restBreaksMissed,
+                    settingEndTime: true,
+                    existingReviewReason: mealWaiver.reviewReason ?? existing.reviewReason,
+                });
+                Object.assign(updateData, rest);
+                // A deduction the worker was never asked about is flagged, never silent.
+                Object.assign(
+                    updateData,
+                    applyNoAttestationNotice({
+                        outcome: meal.outcome,
+                        mealSkipped,
+                        existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
+                    })
+                );
+
+                // Runs LAST so it composes onto whatever reason the meal/rest
+                // notices above already wrote, and cannot be overwritten by them.
+                if (zeroRate) {
+                    Object.assign(updateData, appendZeroRateReview(updateData.reviewReason ?? existing.reviewReason));
+                }
+
+                if (user.role === "MANAGER" || user.role === "ADMIN") {
+                    if (existing.userId !== user.id) {
+                        updateData.editedByManagerId = user.id;
+                        updateData.editedAt = new Date();
+                    }
+                }
+                return updateData;
+            };
 
             // The real guard: the check happens inside the SAME transaction as
             // the update, under the shared payroll advisory lock. The fail-fast
             // check at the top of this handler is an optimisation, not the
             // protection (see payroll-period.ts).
-            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData, {
-                entryId: existing.id,
-                // Settlement rides along in the same transaction (deferMeal
-                // closes settle nothing — the day settles on the final punch).
-                settle:
-                    deferMeal !== true
-                        ? { dayKey: toCompanyDayKey(existing.startTime), closing: { id: existing.id, mealSkipped } }
-                        : null,
-            });
+            let closeResult;
+            try {
+                closeResult = await dependencies.closeTimeEntry(id, existing.userId, buildData, {
+                    entryId: existing.id,
+                    // The day we EXPECT this entry to be on. Locked before the
+                    // row is read; if the stored row turns out to be on another
+                    // day, a concurrent edit moved it and we bail rather than
+                    // settle the wrong day.
+                    expectedDayKey: toCompanyDayKey(existing.startTime),
+                    // Settlement rides along in the same transaction (deferMeal
+                    // closes settle nothing — the day settles on the final punch).
+                    settle: deferMeal !== true ? { closing: { id: existing.id, mealSkipped } } : null,
+                });
+            } catch (error) {
+                if (error instanceof ClockOutInputError) {
+                    return NextResponse.json(
+                        { error: error.message, ...(error.code ? { code: error.code } : {}) },
+                        { status: error.status }
+                    );
+                }
+                throw error;
+            }
+            if (!closeResult.ok && "moved" in closeResult) {
+                return NextResponse.json(
+                    {
+                        error: "This punch was changed while you were clocking out. Reload and try again.",
+                        code: "ENTRY_MOVED",
+                    },
+                    { status: 409 }
+                );
+            }
             if (!closeResult.ok && "locked" in closeResult) {
                 return periodLockedResponse(closeResult.locked);
             }
@@ -686,45 +747,72 @@ const clockOutHandler = createClockOutHandler({
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,
-    closeTimeEntry: async (id, userId, data, guard) => {
-        return prisma.$transaction(async (t) => {
-            // Payroll advisory lock FIRST, then the row lock, then the check —
-            // the shared guard enforces that order (see payroll-period.ts).
-            // The row's STORED startTime is what gets validated: a concurrent
-            // writer may have moved it since this request read it, and a locker
-            // may have locked the period it moved into.
-            try {
-                await assertEntriesUnlockedInTx(t as unknown as PayrollTxClient, [guard.entryId]);
-            } catch (error) {
-                if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
-                throw error;
-            }
-            // The guard: only rows still open (endTime IS NULL), scoped to
-            // the entry's own stored userId, actually get closed. Two
-            // concurrent PUTs can both pass the in-memory already-closed
-            // check above — only one of these updateMany calls can match.
-            const claim = await t.timeEntry.updateMany({
-                where: { id, userId, endTime: null },
-                data,
-            });
-            if (claim.count === 0) {
-                const current = await t.timeEntry.findUnique({ where: { id } });
-                return { ok: false as const, current };
-            }
-            // Re-plan the day in THIS transaction, so the close and the
-            // settlement commit together under one payroll advisory lock.
-            if (guard.settle) {
-                try {
-                    const settled = await settleDayWithinTx(t, userId, guard.settle.dayKey, guard.settle.closing);
-                    if (settled < 0) await t.timeEntry.update({ where: { id }, data: { needsReview: true } });
-                } catch (error) {
-                    if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
-                    throw error;
+    closeTimeEntry: async (id, userId, buildData, guard) => {
+        // PeriodLockedError is allowed to propagate OUT of the transaction so
+        // the write rolls back, and is converted to a result by the caller —
+        // catching it inside and returning normally would COMMIT the
+        // transaction that had already been judged illegal.
+        try {
+            return await prisma.$transaction(async (t) => {
+                const client = t as unknown as PayrollTxClient;
+
+                // THE GLOBAL LOCK ORDER (see payroll-period.ts): payroll
+                // advisory lock, then this worker's day, then the row. All of
+                // them are collected up front — the day comes from what the
+                // caller expects, because the row cannot be read before its own
+                // lock is taken.
+                await assertEntriesUnlockedInTx(client, [guard.entryId], {
+                    dayKeys: [dayLockKey(userId, guard.expectedDayKey)],
+                });
+
+                // The row, re-read under the FOR UPDATE taken above. Everything
+                // priced below derives from THIS instant.
+                const [stored] = (await client.$queryRawUnsafe(
+                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                    id
+                )) as Array<{ startTime: Date }>;
+                if (!stored) return { ok: false as const, current: null };
+
+                // If it moved to a different day we hold the WRONG day lock, so
+                // settling would re-plan a day we never serialised. Bail and let
+                // the client retry against the row's real state.
+                if (toCompanyDayKey(stored.startTime) !== guard.expectedDayKey) {
+                    return { ok: false as const, moved: true as const };
                 }
-            }
-            const entry = await t.timeEntry.findUniqueOrThrow({ where: { id } });
-            return { ok: true as const, entry };
-        });
+
+                const data = await buildData(stored.startTime);
+
+                // Compare-and-set on startTime as well as the open check: a
+                // concurrent edit that moved the punch within the same day
+                // would otherwise have its change priced away by this close.
+                const claim = await t.timeEntry.updateMany({
+                    where: { id, userId, endTime: null, startTime: stored.startTime },
+                    data,
+                });
+                if (claim.count === 0) {
+                    const current = await t.timeEntry.findUnique({ where: { id } });
+                    return { ok: false as const, current };
+                }
+
+                // Re-plan the day in THIS transaction, so the close and the
+                // settlement commit together under one payroll advisory lock.
+                if (guard.settle) {
+                    const settled = await settleDayWithinTx(
+                        t,
+                        userId,
+                        guard.expectedDayKey,
+                        guard.settle.closing
+                    );
+                    if (settled < 0) await t.timeEntry.update({ where: { id }, data: { needsReview: true } });
+                }
+
+                const entry = await t.timeEntry.findUniqueOrThrow({ where: { id } });
+                return { ok: true as const, entry };
+            });
+        } catch (error) {
+            if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
+            throw error;
+        }
     },
 });
 

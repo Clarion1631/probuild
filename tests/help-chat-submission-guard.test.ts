@@ -61,6 +61,7 @@ test("accepted fields come back trimmed, with optionals normalised to null", () 
         description: "It broke",
         steps: null,
         currentPage: null,
+        conversationId: null,
     });
 });
 
@@ -94,13 +95,40 @@ test("both routes parse safely, validate, and throttle before creating an issue"
         );
         assert.match(source, /readJsonBody\(req\)/, route);
         assert.match(source, /checkHelpSubmission\(parsed\.body\)/, route);
-        assert.match(source, /isThrottled\(recent\)/, route);
+        assert.match(source, /reserveHelpRequest\(/, route);
         assert.doesNotMatch(source, /await req\.json\(\)/, `${route} must not parse the body unguarded`);
         // The throttle has to come BEFORE the GitHub call, or the limit does
         // not actually limit anything expensive.
+        // The row must exist BEFORE the external call: a GitHub failure then
+        // cannot lose the report, and a retry updates that row instead of
+        // filing a duplicate.
         assert.ok(
-            source.indexOf("isThrottled(recent)") < source.indexOf("createHelpChatGitHubIssue("),
-            `${route}: throttle must precede issue creation`
+            source.indexOf("reserveHelpRequest(") < source.indexOf("createHelpChatGitHubIssue("),
+            `${route}: the throttle+row reservation must precede issue creation`
         );
+        assert.match(source, /UPDATE "HelpRequest"/, `${route} must update the reserved row, not insert a second`);
     }
+});
+
+test("currentPage and conversationId are bounded and shape-checked", () => {
+    // Both are echoed into a GitHub issue, so neither is free text.
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "/projects/abc?tab=1" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "https://evil.test" }).ok, false);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "not-a-path" }).ok, false);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "/" + "x".repeat(600) }).ok, false);
+
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", conversationId: "ckabc123" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", conversationId: "x".repeat(65) }).ok, false);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", conversationId: "has spaces" }).ok, false);
+});
+
+test("the throttle claims its slot in ONE statement, so concurrent requests cannot all pass", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
+    // count-then-insert is a check-then-act: five concurrent callers all read
+    // four and all insert. The INSERT ... SELECT ... WHERE (count) < limit lets
+    // the database decide, once.
+    assert.match(fn, /INSERT INTO "HelpRequest"/);
+    assert.match(fn, /WHERE \(\s*SELECT count\(\*\)/);
+    assert.match(fn, /< \$\{HELP_SUBMISSIONS_PER_HOUR\}/);
 });

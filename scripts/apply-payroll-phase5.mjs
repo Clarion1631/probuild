@@ -97,10 +97,27 @@ const STATEMENTS = [
             ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present" CHECK ("periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL) NOT VALID;
         END IF;
      END $$`,
-    // A leaked anon/authenticated Supabase key must not read payroll periods or
-    // their frozen CSVs. Same pattern as StatementImport/BankLine.
+    // A leaked anon/authenticated Supabase key must not read payroll periods,
+    // their frozen CSVs, or the pay columns on User. Prisma connects as the
+    // table OWNER and owners bypass RLS, so the app is unaffected; the Supabase
+    // client here is storage-only (CLAUDE.md), so nothing reads these through
+    // the Data API.
     `ALTER TABLE "PayrollPeriod" ENABLE ROW LEVEL SECURITY`,
-    `REVOKE ALL ON TABLE "PayrollPeriod" FROM anon, authenticated`,
+    `ALTER TABLE "User" ENABLE ROW LEVEL SECURITY`,
+    // The Supabase roles do not exist on a vanilla Postgres and REVOKE on a
+    // missing role is a hard error — guarded so CI's throwaway DB runs the same
+    // statements.
+    `DO $$
+     BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON TABLE "PayrollPeriod" FROM anon;
+            REVOKE ALL ON TABLE "User" FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON TABLE "PayrollPeriod" FROM authenticated;
+            REVOKE ALL ON TABLE "User" FROM authenticated;
+        END IF;
+     END $$`,
 ];
 
 try {

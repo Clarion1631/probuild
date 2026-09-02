@@ -34,19 +34,28 @@
 // 409/403 because the row is fine and the caller is authorized — the resource
 // is simply frozen, which is exactly what 423 means.
 //
-// LOCK ORDER — PAYROLL ADVISORY LOCK FIRST, THEN ROW / DAY LOCKS.
+// THE GLOBAL LOCK ORDER. Every payroll path takes these in exactly this order,
+// and nothing takes them in any other:
 //
 //   1. pg_advisory_xact_lock_shared('payroll-period')   (writers)
 //      pg_advisory_xact_lock('payroll-period')          (lock creation)
-//   2. SELECT ... FOR UPDATE on the TimeEntry rows being written
-//   3. pg_advisory_xact_lock('wa-breaks:<user>:<day>')  (meal settlement)
+//   2. pg_advisory_xact_lock('wa-breaks:<user>:<day>')  — ALL affected days,
+//      in sorted key order
+//   3. SELECT ... FOR UPDATE on ALL affected TimeEntry rows, in sorted id order
 //
-// Every path takes them in that order, and nothing takes them in any other, so
-// two transactions can never hold one another's next lock. Taking a row lock
-// first was the specific hazard: a writer holding a row while waiting on the
-// payroll lock, against a locker holding the payroll lock and waiting on that
-// row, is a deadlock — Postgres would abort one of them at random, and the one
-// it aborts might be the payroll lock.
+// A path therefore has to COLLECT every day key and row id it will touch BEFORE
+// it locks anything — acquirePayrollLocks() below is the only place that takes
+// them, so the order cannot drift per call site.
+//
+// Why it matters: any two transactions that take the same locks in different
+// orders can each hold what the other needs next. Deadlock detection then
+// aborts one at random, and the one it aborts might be the payroll lock — the
+// thing protecting an already-paid period. Sorting within each tier removes the
+// same hazard between two writers touching an overlapping set.
+//
+// Day locks come BEFORE row locks because meal settlement is day-scoped and can
+// rewrite rows the caller never named: it has to be serialised before any row
+// is pinned, not after.
 //
 // TIME OF CHECK vs TIME OF USE: the check is not a transaction. A period can be
 // locked between the check and the write, so the hot routes check AGAIN
@@ -81,6 +90,16 @@ export type LockedPeriodRow = {
      */
     timeZone?: string | null;
 };
+
+/**
+ * The wa-breaks day advisory-lock key. Formatted HERE so the payroll lock
+ * sequencer and src/lib/wa-breaks-db.ts cannot drift into two different key
+ * spaces — if they did, tier 2 of the global lock order would silently stop
+ * serialising anything.
+ */
+export function dayLockKey(userId: string, dayKey: string): string {
+    return `wa-breaks:${userId}:${dayKey}`;
+}
 
 /** Advisory-lock key. ONE key for the whole payroll-period mechanism — see acquirePayrollWriteLock. */
 export const PAYROLL_ADVISORY_LOCK_KEY = "payroll-period";
@@ -193,22 +212,40 @@ export async function loadLockedPeriodsTx(tx: PayrollTxClient): Promise<LockedPe
  * Lock order is enforced here: the payroll advisory lock is taken BEFORE the
  * row locks (see the header).
  */
-export async function assertEntriesUnlockedInTx(
-    tx: PayrollTxClient,
-    entryIds: string[],
-    options: { timeZone?: string; weekStart?: PayrollWeekStart; alsoCheck?: Array<Date | null | undefined> } = {}
-): Promise<void> {
-    const ids = entryIds.filter((id): id is string => typeof id === "string" && !!id);
-    const extra = (options.alsoCheck ?? []).filter(
-        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
-    );
-    if (ids.length === 0 && extra.length === 0) return;
+export type PayrollLockTarget = {
+    /** Company-local day keys whose settlement this write can trigger. */
+    dayKeys?: string[];
+    /** Existing rows the write touches. Their STORED startTime is what gets validated. */
+    entryIds?: string[];
+    /** Instants the write is about to introduce (a new startTime, a create date). */
+    instants?: Array<Date | null | undefined>;
+};
 
-    // 1. payroll advisory lock, ALWAYS before any row lock.
+/**
+ * Take every lock this write needs, in THE GLOBAL ORDER (see the header), and
+ * return the STORED startTimes of the targeted rows.
+ *
+ * This is the only function that acquires payroll/day/row locks, so no call
+ * site can invent its own ordering.
+ */
+export async function acquirePayrollLocks(
+    tx: PayrollTxClient,
+    target: PayrollLockTarget
+): Promise<Date[]> {
+    const dayKeys = [...new Set((target.dayKeys ?? []).filter((key): key is string => typeof key === "string" && !!key))].sort();
+    const ids = [...new Set((target.entryIds ?? []).filter((id): id is string => typeof id === "string" && !!id))].sort();
+
+    // 1. payroll advisory lock — always first.
     await acquirePayrollWriteLock(tx);
 
-    // 2. row locks, in a deterministic id order so two concurrent writers
-    //    touching the same set cannot deadlock against each other.
+    // 2. day locks, sorted. Same key format as src/lib/wa-breaks-db.ts, because
+    //    it is the same lock: a settlement running inside this transaction must
+    //    not try to take it again in a different position.
+    for (const dayKey of dayKeys) {
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayKey);
+    }
+
+    // 3. row locks, sorted by id.
     const stored: Date[] = [];
     if (ids.length > 0) {
         const rows = (await tx.$queryRawUnsafe(
@@ -219,6 +256,36 @@ export async function assertEntriesUnlockedInTx(
             if (row.startTime instanceof Date && !Number.isNaN(row.startTime.getTime())) stored.push(row.startTime);
         }
     }
+    return stored;
+}
+
+/**
+ * Acquire the locks, then assert nothing this write touches is frozen.
+ *
+ * A caller's captured startTime is never trusted: between reading a row and
+ * writing it, another writer can MOVE that row into a different period, and a
+ * locker can then lock it. The STORED value, read under FOR UPDATE, is what
+ * gets validated.
+ */
+export async function assertEntriesUnlockedInTx(
+    tx: PayrollTxClient,
+    entryIds: string[],
+    options: {
+        timeZone?: string;
+        weekStart?: PayrollWeekStart;
+        alsoCheck?: Array<Date | null | undefined>;
+        /** Day keys whose settlement this write may trigger — locked before the rows. */
+        dayKeys?: string[];
+    } = {}
+): Promise<void> {
+    const extra = (options.alsoCheck ?? []).filter(
+        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
+    );
+    const ids = entryIds.filter((id): id is string => typeof id === "string" && !!id);
+    const dayKeys = options.dayKeys ?? [];
+    if (ids.length === 0 && extra.length === 0 && dayKeys.length === 0) return;
+
+    const stored = await acquirePayrollLocks(tx, { dayKeys, entryIds: ids, instants: extra });
 
     const periods = await loadLockedPeriodsTx(tx);
     if (periods.length === 0) return;
@@ -354,6 +421,7 @@ export async function withPayrollWriteTx<T>(
             ...options,
             timeZone,
             alsoCheck: target.instants,
+            dayKeys: target.dayKeys,
         });
         return write(client);
     });
@@ -366,12 +434,7 @@ export async function withPayrollWriteTx<T>(
  * values the write is about to introduce (a new startTime, a date being
  * created) which have no stored row yet.
  */
-export type PayrollWriteTarget = {
-    /** Existing rows the write touches. Their STORED startTime is what gets validated. */
-    entryIds?: string[];
-    /** Instants the write is about to write (new startTime on an edit, the date on a create). */
-    instants?: Array<Date | null | undefined>;
-};
+export type PayrollWriteTarget = PayrollLockTarget;
 
 
 /**

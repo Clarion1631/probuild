@@ -15523,6 +15523,26 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                 WHERE "periodStart" < ${periodEnd} AND "periodEnd" > ${periodStart}
                 FOR UPDATE
             `;
+            // Envelope overlap, re-checked INSIDE the transaction now that the
+            // exclusive advisory lock is held. The pre-check outside is
+            // advisory: two locks racing each other both passed it, and only
+            // this one is serialised.
+            const envelopeConflicts = (await tx.$queryRaw<Array<{ periodStartKey: string | null; periodEndKey: string | null }>>`
+                SELECT "periodStartKey", "periodEndKey"
+                FROM "PayrollPeriod"
+                WHERE "lockedAt" IS NOT NULL
+                  AND "periodStart" < ${envelope.end}
+                  AND "periodEnd" > ${envelope.start}
+                  AND NOT ("periodStartKey" = ${range.startKey} AND "periodEndKey" = ${range.endKey})
+                FOR UPDATE
+            `);
+            if (envelopeConflicts.length > 0) {
+                const listed = envelopeConflicts.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
+                throw new Error(
+                    `This period's workweeks overlap an already-locked period (${listed}). Unlock that one first, or pick the exact period.`
+                );
+            }
+
             const conflicting = overlapping.filter(
                 (row) =>
                     row.periodStart.getTime() !== periodStart.getTime() ||

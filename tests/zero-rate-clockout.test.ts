@@ -119,7 +119,11 @@ function deps(options: {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, data, _guard) => {
+        closeTimeEntry: async (id, userId, buildData, guard) => {
+            // The real dependency reads the STORED startTime under FOR UPDATE
+            // and prices the close from it; the fixture entry never moves.
+            const data = await buildData(START);
+            void guard;
             updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },

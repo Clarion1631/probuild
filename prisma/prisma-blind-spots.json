@@ -288,6 +288,10 @@
     {
       "name": "TaskPunchItem",
       "forced": false
+    },
+    {
+      "name": "User",
+      "forced": false
     }
   ],
   "policies": [],

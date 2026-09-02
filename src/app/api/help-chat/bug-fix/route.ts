@@ -6,9 +6,8 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   HELP_THROTTLED_MESSAGE,
-  isThrottled,
   readJsonBody,
-  throttleWindowStart,
+  reserveHelpRequest,
 } from "@/lib/help-chat/submission-guard";
 
 function buildBugFixDetails(description: string, steps?: string) {
@@ -44,16 +43,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: submission.error }, { status: submission.status });
   }
 
-  // Per-user throttle. Every submission opens a GitHub issue, and this endpoint
-  // is now reachable by every activated staff account and by the phone.
-  const recent = await prisma.helpRequest.count({
-    where: { userId, createdAt: { gte: throttleWindowStart() } },
-  });
-  if (isThrottled(recent)) {
-    return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
-  }
-  const { title, description, steps, currentPage } = submission;
-  const conversationId = parsed.body.conversationId;
+  const { title, description, steps, currentPage, conversationId } = submission;
   if (!conversationId) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
@@ -72,6 +62,23 @@ export async function POST(req: NextRequest) {
 
   try {
     const issueDetails = buildBugFixDetails(description, steps ?? undefined);
+
+    // Claim a slot and create the row FIRST, in one statement. The report is
+    // durable before anything external is called, so a GitHub failure cannot
+    // lose it, and the throttle is decided by the database rather than by a
+    // read-then-write that five concurrent requests all pass.
+    const requestId = await reserveHelpRequest({
+      userId,
+      type: "bug_fix",
+      question: title,
+      response: issueDetails,
+      currentPage,
+      conversationId,
+    });
+    if (!requestId) {
+      return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
+    }
+
     const ghIssue = await createHelpChatGitHubIssue({
       title,
       description: issueDetails,
@@ -85,42 +92,29 @@ export async function POST(req: NextRequest) {
     });
 
     if (!ghIssue) {
+      // The report is already saved; only the Phantom hand-off failed.
+      await prisma.$executeRaw`
+        UPDATE "HelpRequest" SET "status" = 'submitted_no_issue' WHERE "id" = ${requestId}
+      `;
       return NextResponse.json(
         { error: "Failed to create GitHub issue for Phantom" },
         { status: 502 }
       );
     }
 
-    const externalIssueRef = `github-issue:${ghIssue.number}`;
-
-    const result = await prisma.$queryRaw<any[]>`
-      INSERT INTO "HelpRequest" (
-        "userId",
-        "type",
-        "question",
-        "response",
-        "currentPage",
-        "status",
-        "changeLocation",
-        "externalIssueRef",
-        "conversationId"
-      )
-      VALUES (
-        ${userId},
-        'bug_fix',
-        ${title},
-        ${issueDetails},
-        ${currentPage || null},
-        'submitted',
-        ${ghIssue.url},
-        ${externalIssueRef},
-        ${conversationId}
-      )
+    // Attach the issue to the row that already exists — a retry updates it
+    // instead of filing a second report.
+    const [request] = await prisma.$queryRaw<any[]>`
+      UPDATE "HelpRequest"
+      SET "status" = 'submitted',
+          "changeLocation" = ${ghIssue.url},
+          "externalIssueRef" = ${`github-issue:${ghIssue.number}`}
+      WHERE "id" = ${requestId}
       RETURNING *
     `;
 
     return NextResponse.json({
-      request: result[0],
+      request,
       issueNumber: ghIssue.number,
       issueUrl: ghIssue.url,
     });

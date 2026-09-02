@@ -4,7 +4,7 @@ import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
-import { applyRateChange } from "@/lib/pay-rate-write";
+import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
 
 const VALID_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
 const VALID_STATUSES = new Set(["PENDING", "ACTIVATED", "DISABLED"]);
@@ -69,42 +69,51 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const data: Record<string, unknown> = {};
     if (typeof body.role === "string") data.role = body.role;
     if (typeof body.status === "string") data.status = body.status;
-    // Rates go through the ONE validated path: payroll permission, exact
-    // decimal, lastRateSyncAt stamped. This route used to write them as raw JS
-    // numbers with no stamp and only a manager-level gate.
-    const rateResult = await applyRateChange(rateActor, id, {
-        hourlyRate: body.hourlyRate,
-        burdenRate: body.burdenRate,
-        payType: body.payType,
-    });
-    if (!rateResult.ok) {
-        return NextResponse.json({ error: rateResult.error }, { status: rateResult.status });
-    }
-
-    if (Object.keys(data).length === 0) {
-        if (rateResult.changed) {
-            const row = await prisma.user.findUnique({
-                where: { id },
-                select: { id: true, email: true, name: true, role: true, status: true },
-            });
-            return NextResponse.json(row);
-        }
+    const touchesRates =
+        body.hourlyRate !== undefined || body.burdenRate !== undefined || body.payType !== undefined;
+    if (Object.keys(data).length === 0 && !touchesRates) {
         return NextResponse.json({ error: "No mutable fields supplied" }, { status: 400 });
     }
 
-    const updated = await prisma.user.update({
-        where: { id },
-        data,
-        select: {
-            id: true,
-            email: true,
-            name: true,
-            role: true,
-            status: true,
-            hourlyRate: true,
-            burdenRate: true,
-        },
-    });
+    // Profile fields and rates commit TOGETHER. Rates go through the one
+    // validated path (payroll permission, exact decimal, lastRateSyncAt); a
+    // refusal rolls the profile half back rather than leaving a half-applied
+    // update behind.
+    let updated;
+    try {
+        updated = await prisma.$transaction(async (tx) => {
+            const rateResult = await applyRateChange(
+                rateActor,
+                id,
+                { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType },
+                tx as never
+            );
+            if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+
+            if (Object.keys(data).length === 0) {
+                return tx.user.findUniqueOrThrow({
+                    where: { id },
+                    select: {
+                        id: true, email: true, name: true, role: true, status: true,
+                        hourlyRate: true, burdenRate: true,
+                    },
+                });
+            }
+            return tx.user.update({
+                where: { id },
+                data,
+                select: {
+                    id: true, email: true, name: true, role: true, status: true,
+                    hourlyRate: true, burdenRate: true,
+                },
+            });
+        });
+    } catch (error) {
+        if (error instanceof RateChangeError) {
+            return NextResponse.json({ error: error.message }, { status: error.status });
+        }
+        throw error;
+    }
 
     // Newly ACTIVATED FIELD_CREW (or CJ) joins every "In Progress" project.
     // Fail-soft inside the helper; never blocks the save.
