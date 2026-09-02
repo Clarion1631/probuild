@@ -223,15 +223,14 @@ const GATED_WRITERS: Array<{ file: string; mustMatch: RegExp[] }> = [
         file: "src/app/api/time-entries/route.ts",
         mustMatch: [
             /withPayrollWriteTx\(\{ instants: \[entryStartTime\] \}/, // POST clock-in (client-supplied startTime)
-            /assertPeriodUnlockedInTx\(/, // PUT clock-out, inside the close transaction
-            /FOR UPDATE/, // and the row is re-read there, not trusted from earlier
+            /assertEntriesUnlockedInTx\(t as unknown as PayrollTxClient, \[guard\.entryId\]\)/, // PUT clock-out, inside the close transaction
         ],
     },
     {
         file: "src/app/api/time-entries/[id]/route.ts",
         mustMatch: [
             /withPayrollWriteTx\(\{ entryIds: \[id\], instants: \[newStart\] \}/, // PATCH
-            /guard: \(tx\) => assertPeriodUnlockedInTx\(tx, \[existing\.startTime\]\)/, // DELETE
+            /guard: \(tx\) => assertEntriesUnlockedInTx\(tx, \[id\]\)/, // DELETE
         ],
     },
 ];
@@ -362,7 +361,7 @@ test("PATCH and DELETE on /api/time-entries/[id] both still call the lock guard"
     // The edit and the day re-plan it triggers commit together.
     assert.match(patchHalf, /settleDayWithinTx\(/);
     // DELETE: the guard runs inside deleteEntryAndSettle's own transaction.
-    assert.match(deleteHalf, /guard: \(tx\) => assertPeriodUnlockedInTx\(tx, \[existing\.startTime\]\)/);
+    assert.match(deleteHalf, /guard: \(tx\) => assertEntriesUnlockedInTx\(tx, \[id\]\)/);
 });
 
 test("assertPeriodUnlockedOrThrow throws with the same message the routes return", async () => {
@@ -409,7 +408,7 @@ test("a write validates the row's STORED startTime, not the caller's stale copy"
     // FOR UPDATE inside the transaction, so the stale value cannot be used.
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "payroll-period.ts"), "utf8");
     assert.match(source, /FOR UPDATE/);
-    assert.match(source, /resolveGuardInstants/);
+    assert.match(source, /export async function assertEntriesUnlockedInTx/);
     // The public shape takes entry IDS, not pre-read dates, so a caller cannot
     // pass a stale timestamp even by accident.
     assert.match(source, /export type PayrollWriteTarget = \{/);
@@ -436,4 +435,79 @@ test("lock and unlock are keyed on stable day keys, and a locked period is not r
     assert.match(unlockBody, /periodStartKey: range\.startKey/);
     assert.match(unlockBody, /unlocked\.count === 0/);
     assert.doesNotMatch(unlockBody, /startOfDateInTimeZone/, "unlock must not reconstruct timestamps");
+});
+
+test("LOCK ORDER: payroll advisory lock is taken BEFORE any row lock", async () => {
+    // A writer holding a row while waiting on the payroll lock, against a
+    // locker holding payroll and waiting on that row, is a deadlock. Postgres
+    // would abort one at random — possibly the lock. Order is the whole defence.
+    const order: string[] = [];
+    const tx = {
+        $executeRawUnsafe: async (query: string) => {
+            order.push(query.includes("_shared") ? "payroll-shared" : "advisory-other");
+            return 0;
+        },
+        $queryRawUnsafe: async (query: string) => {
+            if (String(query).includes("FOR UPDATE")) order.push("row-lock");
+            return [{ startTime: INSIDE }];
+        },
+        payrollPeriod: {
+            findMany: async () => {
+                order.push("read-periods");
+                return [];
+            },
+        },
+    };
+    const { assertEntriesUnlockedInTx } = await import("../src/lib/payroll-period");
+    await assertEntriesUnlockedInTx(tx, ["te1"]);
+    assert.deepEqual(order, ["payroll-shared", "row-lock", "read-periods"]);
+});
+
+test("the entry guard validates the row's STORED startTime, not anything passed in", async () => {
+    const { assertEntriesUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
+    const tx = {
+        $executeRawUnsafe: async () => 0,
+        // The DB says this row sits INSIDE the locked period, whatever the
+        // caller believed when it read the row earlier.
+        $queryRawUnsafe: async () => [{ startTime: INSIDE }],
+        payrollPeriod: { findMany: async () => [period()] },
+    };
+    await assert.rejects(() => assertEntriesUnlockedInTx(tx, ["te1"]), (e: Error) => isPeriodLockedError(e));
+
+    // And an unlocked row passes.
+    const free = { ...tx, payrollPeriod: { findMany: async () => [period({ lockedAt: null })] } };
+    await assertEntriesUnlockedInTx(free, ["te1"]);
+});
+
+test("DELETE guards on the entry ID, so the stored time is re-read inside the transaction", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const deleteHalf = source.slice(source.indexOf("export async function DELETE"));
+    assert.match(deleteHalf, /guard: \(tx\) => assertEntriesUnlockedInTx\(tx, \[id\]\)/);
+    assert.doesNotMatch(deleteHalf, /existing\.startTime\]\)/, "a captured timestamp is stale by definition");
+});
+
+test("settlement takes the payroll lock BEFORE the wa-breaks day lock", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "wa-breaks-db.ts"), "utf8");
+    for (const fn of ["export async function settleDay(", "export async function settleDayWithinTx("]) {
+        const body = source.slice(source.indexOf(fn));
+        const guardAt = body.indexOf("assertSettlementDayUnlocked");
+        const dayLockAt = body.indexOf("wa-breaks:");
+        assert.ok(guardAt > 0 && dayLockAt > 0, fn);
+        assert.ok(guardAt < dayLockAt, `${fn}: payroll lock must precede the day lock`);
+    }
+});
+
+test("a period cannot be locked until its whole OT envelope has elapsed", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const lock = source.slice(source.indexOf("export async function lockPayrollPeriod"));
+    const body = lock.slice(0, lock.indexOf(String.fromCharCode(10) + "export "));
+    // Hours still to be worked in the trailing workweek change how much of the
+    // period is overtime, so freezing now freezes an unfinished number.
+    assert.match(body, /envelope\.end\.getTime\(\) > Date\.now\(\)/);
+    assert.match(body, /not over yet/);
+    // And overlapping ENVELOPES are refused, not just overlapping periods.
+    assert.match(body, /precheck\.overlappingLocks\.length > 0/);
 });

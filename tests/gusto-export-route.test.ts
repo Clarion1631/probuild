@@ -41,6 +41,7 @@ function loaded(blocking: BlockingEntry[] = [], snapshot: LoadedGustoExport["sna
         period: null,
         overlappingLocks: [],
         locked: false,
+        overlapsLockWithoutBeingIt: false,
     };
 }
 
@@ -218,4 +219,36 @@ test("the loader is always given the request's day keys, on the live path too", 
     });
     await handler.GET(url());
     assert.deepEqual(seen, [{ startKey: "2026-08-17", endKey: "2026-08-31" }]);
+});
+
+test("a range that OVERLAPS a locked period without being it is a 409", async () => {
+    // Such a range has no snapshot, so any CSV built for it would disagree with
+    // what was already paid for the overlapping days. There is no right answer
+    // to return — the caller has to ask for the locked period itself.
+    const result = {
+        ...loaded(),
+        overlapsLockWithoutBeingIt: true,
+        overlappingLocks: [
+            {
+                id: "pp1",
+                periodStart: new Date("2026-08-17T07:00:00.000Z"),
+                periodEnd: new Date("2026-08-31T07:00:00.000Z"),
+                periodStartKey: "2026-08-17",
+                periodEndKey: "2026-08-31",
+                lockedAt: new Date(),
+                lockedById: "u1",
+                exportHash: "h",
+                timeZone: "America/Los_Angeles",
+                summaryCsvSnapshot: null,
+                detailCsvSnapshot: null,
+                lockedBy: null,
+            },
+        ],
+    } as unknown as LoadedGustoExport;
+
+    const res = await createGustoExportHandler(deps({ result })).GET(url());
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, "OVERLAPS_LOCKED_PERIOD");
+    assert.deepEqual(body.lockedPeriods, [{ periodStart: "2026-08-17", periodEnd: "2026-08-31" }]);
 });

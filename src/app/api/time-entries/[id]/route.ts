@@ -10,8 +10,8 @@ import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, 
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 import {
+    assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
-    assertPeriodUnlockedInTx,
     isPeriodLockedError,
     periodLockedResponse,
     withPayrollWriteTx,
@@ -203,12 +203,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             payType: owner.payType ?? null,
             hourlyRate: toNum(owner.hourlyRate),
         });
-    // The OWNER is refused (a phone cannot fix a rate); the OFFICE is not, or a
-    // $0-rate punch becomes unclosable once it passes MAX_SHIFT_HOURS. A
-    // manager close is flagged instead, and the payroll export refuses to run
-    // while the flag is set.
-    if (zeroRate && isOwner) {
-        return zeroRateBlockedResponse({ closerIsOwner: true, ownerName: owner.name });
+    // Refused for EVERYONE unless the office explicitly acknowledged it. The
+    // escape exists so a $0 punch cannot become unclosable past
+    // MAX_SHIFT_HOURS, but it is a deliberate separate action, not the default
+    // outcome of an ordinary close. The acknowledged close is flagged, and the
+    // payroll export refuses to run while that flag is set.
+    const acknowledgedZeroRate =
+        body.acknowledgeZeroRate === true && !isOwner && isPrivileged;
+    if (zeroRate && !acknowledgedZeroRate) {
+        return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
     }
 
     // Automatic-break model (src/lib/wa-breaks.ts): the meal is re-settled on
@@ -412,7 +415,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     // were already paid.
     try {
         await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId, {
-            guard: (tx) => assertPeriodUnlockedInTx(tx, [existing.startTime]),
+            // Re-reads the row FOR UPDATE inside the delete transaction and
+            // validates its STORED startTime — the value read above is stale
+            // the moment another writer moves the row.
+            guard: (tx) => assertEntriesUnlockedInTx(tx, [id]),
         });
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);

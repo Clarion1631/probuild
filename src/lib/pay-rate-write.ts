@@ -14,6 +14,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { hasPermission } from "./access-rules";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
+import { isKnownPayType } from "./pay-rate-guard";
 
 export type RateActor = { role: string; permissions?: unknown } | null | undefined;
 
@@ -22,6 +23,16 @@ export type RateChange = {
     burdenRate?: unknown;
     payType?: unknown;
 };
+
+/** Thrown inside a transaction so a rate refusal rolls the whole write back, carrying its HTTP status. */
+export class RateChangeError extends Error {
+    readonly status: number;
+    constructor(status: number, message: string) {
+        super(message);
+        this.name = "RateChangeError";
+        this.status = status;
+    }
+}
 
 export type RateWriteResult = { ok: true; changed: boolean } | { ok: false; status: number; error: string };
 
@@ -84,7 +95,9 @@ export async function applyRateChange(
 
     if (touchesPayType) {
         const payType = change.payType;
-        if (payType !== "HOURLY" && payType !== "SALARY" && payType !== null) {
+        // Mirrors the DB CHECK User_payType_check — the constraint is the real
+        // guarantee, this is the good error message.
+        if (payType !== null && !isKnownPayType(payType)) {
             return { ok: false, status: 400, error: "Pay type must be hourly or salary." };
         }
         data.payType = payType;

@@ -86,6 +86,23 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 );
             }
 
+            // A range that overlaps a locked period without BEING it has no
+            // snapshot, so any CSV built for it would disagree with what was
+            // already paid for the overlapping days.
+            if (result.overlapsLockWithoutBeingIt) {
+                return NextResponse.json(
+                    {
+                        error: "That range overlaps a locked pay period. Ask for the locked period itself — a range that only partly covers it cannot be exported.",
+                        code: "OVERLAPS_LOCKED_PERIOD",
+                        lockedPeriods: result.overlappingLocks.map((row) => ({
+                            periodStart: row.periodStartKey,
+                            periodEnd: row.periodEndKey,
+                        })),
+                    },
+                    { status: 409 }
+                );
+            }
+
             if (result.blocking.length > 0) {
                 return NextResponse.json(
                     {

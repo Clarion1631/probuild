@@ -74,6 +74,15 @@ export type LoadedGustoExport = GustoExport & {
      */
     overlappingLocks: PayrollPeriodRow[];
     locked: boolean;
+    /**
+     * The requested range OVERLAPS a locked period but is not that period.
+     *
+     * Such a range has no snapshot of its own, so serving it would recompute
+     * numbers that are already frozen somewhere else and hand back a file that
+     * disagrees with what payroll was paid. There is no correct CSV to return —
+     * the caller has to ask for the locked period itself.
+     */
+    overlapsLockWithoutBeingIt: boolean;
 };
 
 export type PayrollPeriodRow = {
@@ -229,11 +238,18 @@ export async function loadGustoExport(
     // Everyone paid by the hour appears even with no hours (Gusto still wants a
     // 0.00 row), plus anyone who actually punched in the window regardless of
     // role — an ADMIN/FINANCE punch belongs in the DETAIL csv for job costing.
+    //
+    // "Paid by the hour" is payType HOURLY, whatever their ROLE: an hourly ADMIN
+    // or FINANCE user is a real arrangement, and keying the zero-hour roster off
+    // role alone dropped them from the file entirely. The role list stays as a
+    // fallback for accounts whose payType nobody has set yet — they are blocked
+    // by unknownPayTypeBlockers anyway, and appearing is how they get noticed.
     const punchedUserIds = [...new Set(entries.map((entry) => entry.userId))];
     const userRows = await client.user.findMany({
         where: {
             OR: [
-                { status: "ACTIVATED", role: { in: [...HOURLY_PAID_ROLES] } },
+                { status: "ACTIVATED", payType: "HOURLY" },
+                { status: "ACTIVATED", payType: null, role: { in: [...HOURLY_PAID_ROLES] } },
                 { id: { in: punchedUserIds } },
             ],
         },
@@ -277,9 +293,14 @@ export async function loadGustoExport(
               }
             : null;
 
+    // "Locked" for THIS range means the exact period is locked. An ad-hoc range
+    // that merely overlaps one is a different, unanswerable question.
+    const exactLocked = !!period?.lockedAt;
+
     return {
         ...built,
         snapshot,
+        overlapsLockWithoutBeingIt: !exactLocked && overlappingLocks.length > 0,
         periodStart,
         periodEnd,
         envelopeStart: envelope.start,

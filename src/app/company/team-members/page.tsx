@@ -32,8 +32,6 @@ type User = {
     email: string;
     role: string;
     status: string;
-    hourlyRate: number;
-    burdenRate: number;
     showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
@@ -54,6 +52,7 @@ function rateSyncLabel(lastRateSyncAt: string | null): { text: string; stale: bo
 export default function TeamPage() {
     const [users, setUsers] = useState<User[]>([]);
     const [roster, setRoster] = useState<PayrollRosterRow[]>([]);
+    const rosterById = new Map(roster.map(row => [row.id, row]));
     const [loading, setLoading] = useState(true);
     const [isAddingUser, setIsAddingUser] = useState(false);
     const [addForm, setAddForm] = useState<Partial<User>>({ role: 'FIELD_CREW' });
@@ -245,7 +244,14 @@ export default function TeamPage() {
                                                     ]).size}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
-                                                {formatCurrency(user.hourlyRate ?? 0)}
+                                                {/* From the payroll roster, which is gated on payroll
+                                                    access — /api/users no longer returns pay. `?? 0`
+                                                    here used to render "$0.00" for every member to a
+                                                    viewer who simply could not see rates, which reads
+                                                    as "this person is unpaid". */}
+                                                {rosterById.get(user.id)
+                                                    ? `$${rosterById.get(user.id)!.hourlyRate}/h`
+                                                    : <span className="text-hui-textMuted" title="Payroll access is required to see pay rates">—</span>}
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell text-center" title={user.showOnDispatch ? "Shows on the dispatch board" : "Not on the dispatch board"}>
                                                 {user.showOnDispatch ? "✓" : "—"}

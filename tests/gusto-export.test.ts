@@ -511,3 +511,25 @@ test("the settle button and the readiness check look at the SAME window", () => 
     assert.match(body, /payrollLockEnvelope\(/, "the settle action must use the envelope, not the raw period");
     assert.match(body, /startTime: \{ gte: envelope\.start, lt: envelope\.end \}/);
 });
+
+test("an UNRECOGNISED payType is unknown, never a default", () => {
+    // The DB CHECK rejects these, but a value that somehow exists must block the
+    // export rather than being quietly treated as hourly or salaried.
+    const odd: ExportUser = { id: "u-odd", name: "Odd One", email: "odd@example.com", payType: "CONTRACT" };
+    const result = buildGustoExport({
+        entries: [entry({ userId: odd.id, startTime: at8am("2026-08-18"), durationHours: 8 })],
+        users: [odd],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["unknownPayType"]);
+});
+
+test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    // An hourly ADMIN or FINANCE user is a real arrangement; keying the roster
+    // off role alone dropped them from the file entirely.
+    assert.match(source, /status: "ACTIVATED", payType: "HOURLY"/);
+    assert.match(source, /status: "ACTIVATED", payType: null, role: \{ in: \[\.\.\.HOURLY_PAID_ROLES\] \}/);
+});

@@ -11,8 +11,8 @@ import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
 import {
+    assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
-    assertPeriodUnlockedInTx,
     isPeriodLockedError,
     periodLockedResponse,
     withPayrollWriteTx,
@@ -391,6 +391,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
 
             const body = await req.json();
             const { id, endTime, latitude, longitude, notes, deferMeal } = body;
+            // The DELIBERATE $0 escape. Never sent by the crew app; the manager
+            // UI sends it only from its explicit "close at $0" control, so a
+            // silent $0 close can never be the default outcome.
+            const acknowledgeZeroRate = body.acknowledgeZeroRate === true;
             // Attestations are the WORKER's word: a manager closing someone
             // else's punch cannot answer the lunch/rest questions for them —
             // those land as "no answer" and get the review flag instead.
@@ -520,7 +524,11 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // flagged instead, which the payroll export then refuses to run
             // through (src/lib/pay-rate-guard.ts, spec G2).
             const zeroRate = zeroRateBlocks(owner);
-            if (zeroRate && closerIsOwner) {
+            // Refused for EVERYONE unless the caller explicitly acknowledged it.
+            // A worker can never acknowledge (a phone cannot fix a rate), so the
+            // flag is only honoured for a manager closing someone else's punch.
+            const acknowledged = acknowledgeZeroRate && !closerIsOwner && (user.role === "MANAGER" || user.role === "ADMIN");
+            if (zeroRate && !acknowledged) {
                 return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
             }
 
@@ -680,19 +688,13 @@ const clockOutHandler = createClockOutHandler({
     flagSettlementFailed,
     closeTimeEntry: async (id, userId, data, guard) => {
         return prisma.$transaction(async (t) => {
-            // Shared advisory lock, then RE-READ the row under FOR UPDATE and
-            // check its STORED startTime — a concurrent writer may have moved
-            // it since this request read it, and a locker may have locked the
-            // period it moved into.
+            // Payroll advisory lock FIRST, then the row lock, then the check —
+            // the shared guard enforces that order (see payroll-period.ts).
+            // The row's STORED startTime is what gets validated: a concurrent
+            // writer may have moved it since this request read it, and a locker
+            // may have locked the period it moved into.
             try {
-                const [row] = await t.$queryRawUnsafe<Array<{ startTime: Date }>>(
-                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1 FOR UPDATE`,
-                    guard.entryId
-                );
-                await assertPeriodUnlockedInTx(
-                    t as unknown as PayrollTxClient,
-                    row ? [row.startTime] : []
-                );
+                await assertEntriesUnlockedInTx(t as unknown as PayrollTxClient, [guard.entryId]);
             } catch (error) {
                 if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
                 throw error;

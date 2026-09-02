@@ -30,6 +30,7 @@
 
 import { bucketWorkweeks, type OvertimeTimeEntry } from "./overtime";
 import { dayKeyInTimeZone } from "./tz-date";
+import { isKnownPayType } from "./pay-rate-guard";
 
 /**
  * Gusto's hours-import header. ASSUMPTION (spec section 7 risk 1): this is
@@ -241,8 +242,9 @@ export function unknownPayTypeBlockers(
         const user = byId.get(entry.userId);
         // A punch by somebody not on the roster is already impossible (the
         // roster includes everyone who punched), but if it happened we cannot
-        // vouch for their pay type either.
-        if (user && user.payType) continue;
+        // vouch for their pay type either. An UNRECOGNISED value counts as
+        // unknown, exactly like null — never as a default.
+        if (user && isKnownPayType(user.payType)) continue;
         const seen = firstEntryFor.get(entry.userId);
         if (!seen || entry.startTime < seen.startTime) {
             firstEntryFor.set(entry.userId, { id: entry.id, startTime: entry.startTime });

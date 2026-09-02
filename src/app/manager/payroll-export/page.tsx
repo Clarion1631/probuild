@@ -85,7 +85,9 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     // unlocked while half of it was frozen.
     const locked = result.locked;
     const exactLock = result.period?.lockedAt ? result.period : null;
-    const blocked = result.blocking.length > 0;
+    // Either reason disables the downloads; they are different problems.
+    const overlapsLock = result.overlapsLockWithoutBeingIt;
+    const blocked = result.blocking.length > 0 || overlapsLock;
     const deferredCount = result.blocking.filter((row) => row.reason === "deferred").length;
     const unknownPayTypeCount = result.blocking.filter((row) => row.reason === "unknownPayType").length;
 
@@ -147,7 +149,23 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                 )}
             </form>
 
-            {blocked && (
+            {overlapsLock && (
+                <div className="hui-card p-5 border-amber-300 bg-amber-50/40">
+                    <h2 className="text-base font-semibold text-hui-textMain mb-2">
+                        This range overlaps a locked pay period
+                    </h2>
+                    <p className="text-sm text-hui-textMuted">
+                        {result.overlappingLocks
+                            .map((row) => `${row.periodStartKey} to ${row.periodEndKey}`)
+                            .join(", ")}{" "}
+                        {result.overlappingLocks.length === 1 ? "is" : "are"} already locked. A range that only partly
+                        covers a locked period has no frozen export of its own, so any CSV built for it would disagree
+                        with what payroll was already paid. Pick the locked period itself to see or download it.
+                    </p>
+                </div>
+            )}
+
+            {result.blocking.length > 0 && (
                 <div className="hui-card p-5 border-red-300 bg-red-50/40">
                     <h2 className="text-base font-semibold text-hui-textMain mb-2">
                         {result.blocking.length} entr{result.blocking.length === 1 ? "y is" : "ies are"} not ready to export

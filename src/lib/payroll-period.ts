@@ -34,6 +34,20 @@
 // 409/403 because the row is fine and the caller is authorized — the resource
 // is simply frozen, which is exactly what 423 means.
 //
+// LOCK ORDER — PAYROLL ADVISORY LOCK FIRST, THEN ROW / DAY LOCKS.
+//
+//   1. pg_advisory_xact_lock_shared('payroll-period')   (writers)
+//      pg_advisory_xact_lock('payroll-period')          (lock creation)
+//   2. SELECT ... FOR UPDATE on the TimeEntry rows being written
+//   3. pg_advisory_xact_lock('wa-breaks:<user>:<day>')  (meal settlement)
+//
+// Every path takes them in that order, and nothing takes them in any other, so
+// two transactions can never hold one another's next lock. Taking a row lock
+// first was the specific hazard: a writer holding a row while waiting on the
+// payroll lock, against a locker holding the payroll lock and waiting on that
+// row, is a deadlock — Postgres would abort one of them at random, and the one
+// it aborts might be the payroll lock.
+//
 // TIME OF CHECK vs TIME OF USE: the check is not a transaction. A period can be
 // locked between the check and the write, so the hot routes check AGAIN
 // immediately before the write call. That narrows the window; it does not close
@@ -140,6 +154,9 @@ export async function acquirePayrollLockCreationLock(tx: PayrollTxClient): Promi
  *
  * `dayKey` is interpreted in the caller's zone; a locked period is still
  * evaluated in the zone it was locked in (see lockedPeriodFor).
+ *
+ * MUST be called before the wa-breaks day advisory lock is taken — payroll
+ * lock first, always (see the LOCK ORDER note in the header).
  */
 export async function assertDayUnlockedInTx(
     tx: PayrollTxClient,
@@ -162,6 +179,54 @@ export async function loadLockedPeriodsTx(tx: PayrollTxClient): Promise<LockedPe
         where: { lockedAt: { not: null } },
         select: { id: true, periodStart: true, periodEnd: true, lockedAt: true, timeZone: true },
     });
+}
+
+/**
+ * Re-read the given entries FOR UPDATE inside this transaction and assert none
+ * of their STORED startTimes is frozen.
+ *
+ * This is the guard every write path shares. A caller's captured startTime is
+ * never trusted: between reading a row and writing it, another writer can MOVE
+ * that row into a different period, and a locker can then lock it. FOR UPDATE
+ * additionally pins the rows for the rest of the transaction.
+ *
+ * Lock order is enforced here: the payroll advisory lock is taken BEFORE the
+ * row locks (see the header).
+ */
+export async function assertEntriesUnlockedInTx(
+    tx: PayrollTxClient,
+    entryIds: string[],
+    options: { timeZone?: string; weekStart?: PayrollWeekStart; alsoCheck?: Array<Date | null | undefined> } = {}
+): Promise<void> {
+    const ids = entryIds.filter((id): id is string => typeof id === "string" && !!id);
+    const extra = (options.alsoCheck ?? []).filter(
+        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
+    );
+    if (ids.length === 0 && extra.length === 0) return;
+
+    // 1. payroll advisory lock, ALWAYS before any row lock.
+    await acquirePayrollWriteLock(tx);
+
+    // 2. row locks, in a deterministic id order so two concurrent writers
+    //    touching the same set cannot deadlock against each other.
+    const stored: Date[] = [];
+    if (ids.length > 0) {
+        const rows = (await tx.$queryRawUnsafe(
+            `SELECT "startTime" FROM "TimeEntry" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR UPDATE`,
+            ids
+        )) as Array<{ startTime: Date }>;
+        for (const row of rows) {
+            if (row.startTime instanceof Date && !Number.isNaN(row.startTime.getTime())) stored.push(row.startTime);
+        }
+    }
+
+    const periods = await loadLockedPeriodsTx(tx);
+    if (periods.length === 0) return;
+    const timeZone = options.timeZone ?? (await resolveEnforcementTimeZone());
+    for (const instant of [...stored, ...extra]) {
+        const period = lockedPeriodFor(periods, instant, { timeZone, weekStart: options.weekStart });
+        if (period) throw new PeriodLockedError(period);
+    }
 }
 
 /**
@@ -283,9 +348,13 @@ export async function withPayrollWriteTx<T>(
     const timeZone = options.timeZone ?? (await resolveCompanyTimeZone());
     return prisma.$transaction(async (tx) => {
         const client = tx as unknown as PayrollTxClient;
-        await acquirePayrollWriteLock(client);
-        const instants = await resolveGuardInstants(client, target);
-        await assertPeriodUnlockedInTx(client, instants, { ...options, timeZone });
+        // Payroll advisory lock, then row locks, then the write (see the
+        // LOCK ORDER note in the header).
+        await assertEntriesUnlockedInTx(client, target.entryIds ?? [], {
+            ...options,
+            timeZone,
+            alsoCheck: target.instants,
+        });
         return write(client);
     });
 }
@@ -304,32 +373,6 @@ export type PayrollWriteTarget = {
     instants?: Array<Date | null | undefined>;
 };
 
-/**
- * Re-read every targeted row inside the transaction with SELECT ... FOR UPDATE
- * and return the instants to validate.
- *
- * The caller's captured startTime is NOT trusted: between reading a row and
- * writing it, another writer can MOVE that row to a different day, and a locker
- * can then lock the period it moved into. Validating the stale value would let
- * the write land in a locked period. FOR UPDATE also blocks a concurrent writer
- * from moving the row out from under this transaction after the check.
- */
-async function resolveGuardInstants(tx: PayrollTxClient, target: PayrollWriteTarget): Promise<Date[]> {
-    const instants: Date[] = (target.instants ?? []).filter(
-        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
-    );
-    const ids = (target.entryIds ?? []).filter((id): id is string => typeof id === "string" && !!id);
-    if (ids.length > 0) {
-        const rows = (await tx.$queryRawUnsafe(
-            `SELECT "startTime" FROM "TimeEntry" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR UPDATE`,
-            ids
-        )) as Array<{ startTime: Date }>;
-        for (const row of rows) {
-            if (row.startTime instanceof Date && !Number.isNaN(row.startTime.getTime())) instants.push(row.startTime);
-        }
-    }
-    return instants;
-}
 
 /**
  * Returns a 423 response when ANY of `instants` falls inside a locked period,

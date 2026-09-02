@@ -94,3 +94,49 @@ BEGIN
             FOREIGN KEY ("lockedById") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
     END IF;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- Integrity constraints + RLS (Phase 5 review round 5, items 7 and 9).
+--
+-- CHECK constraints, not just application validation: payType and the period
+-- bounds are money-critical, every one of them is reachable from more than one
+-- code path, and Prisma's diff engine cannot see CHECKs — which is why they are
+-- also recorded in prisma/prisma-blind-spots.json.
+--
+-- RLS + REVOKE follow the same pattern as StatementImport/BankLine (Phase 1):
+-- the app connects as the table owner and is unaffected, but a leaked anon or
+-- authenticated Supabase key cannot read payroll periods or their frozen CSVs.
+-- ---------------------------------------------------------------------------
+
+DO $$ BEGIN
+   IF NOT EXISTS (
+     SELECT 1 FROM pg_constraint WHERE conname = 'User_payType_check' AND conrelid = '"User"'::regclass
+   ) THEN
+     ALTER TABLE "User" ADD CONSTRAINT "User_payType_check"
+       CHECK ("payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY'));
+   END IF;
+ END $$;
+
+DO $$ BEGIN
+   IF NOT EXISTS (
+     SELECT 1 FROM pg_constraint WHERE conname = 'PayrollPeriod_range_check' AND conrelid = '"PayrollPeriod"'::regclass
+   ) THEN
+     ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_range_check"
+       CHECK ("periodEnd" > "periodStart");
+   END IF;
+ END $$;
+
+-- Stable keys are NOT NULL for NEW rows only: rows written before the columns
+-- existed are backfilled above, but the constraint is NOT VALID so the
+-- migration never fails on legacy data it cannot see.
+DO $$ BEGIN
+   IF NOT EXISTS (
+     SELECT 1 FROM pg_constraint WHERE conname = 'PayrollPeriod_keys_present' AND conrelid = '"PayrollPeriod"'::regclass
+   ) THEN
+     ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present"
+       CHECK ("periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL) NOT VALID;
+   END IF;
+ END $$;
+
+ALTER TABLE "PayrollPeriod" ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE "PayrollPeriod" FROM anon, authenticated;

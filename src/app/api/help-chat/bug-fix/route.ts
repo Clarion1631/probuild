@@ -3,6 +3,13 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { prisma } from "@/lib/prisma";
 import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
 import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
+import {
+  checkHelpSubmission,
+  HELP_THROTTLED_MESSAGE,
+  isThrottled,
+  readJsonBody,
+  throttleWindowStart,
+} from "@/lib/help-chat/submission-guard";
 
 function buildBugFixDetails(description: string, steps?: string) {
   const details = [description.trim()];
@@ -26,14 +33,29 @@ export async function POST(req: NextRequest) {
   if (!allowed.ok) return NextResponse.json({ error: allowed.error }, { status: allowed.status });
 
   const userId = auth.user.id;
-  const { title, description, steps, currentPage, conversationId } =
-    await req.json();
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) {
+    // 400, not a 500 — the crew app retries 5xx, so an unparseable body would
+    // become a retry loop.
+    return NextResponse.json({ error: "Malformed request body" }, { status: 400 });
+  }
+  const submission = checkHelpSubmission(parsed.body);
+  if (!submission.ok) {
+    return NextResponse.json({ error: submission.error }, { status: submission.status });
+  }
 
-  if (!title || !description || !conversationId) {
-    return NextResponse.json(
-      { error: "Missing required fields" },
-      { status: 400 }
-    );
+  // Per-user throttle. Every submission opens a GitHub issue, and this endpoint
+  // is now reachable by every activated staff account and by the phone.
+  const recent = await prisma.helpRequest.count({
+    where: { userId, createdAt: { gte: throttleWindowStart() } },
+  });
+  if (isThrottled(recent)) {
+    return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
+  }
+  const { title, description, steps, currentPage } = submission;
+  const conversationId = parsed.body.conversationId;
+  if (!conversationId) {
+    return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
 
   const conversation = await prisma.chatConversation.findFirst({
@@ -49,7 +71,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const issueDetails = buildBugFixDetails(description, steps);
+    const issueDetails = buildBugFixDetails(description, steps ?? undefined);
     const ghIssue = await createHelpChatGitHubIssue({
       title,
       description: issueDetails,
@@ -57,7 +79,7 @@ export async function POST(req: NextRequest) {
       labelPrefix: "Bug Fix",
       labels: ["bug-fix", "agent-task"],
       metadata: [
-        steps?.trim() ? `**Steps to Reproduce:**\n${steps.trim()}` : "",
+        steps ? `**Steps to Reproduce:**\n${steps}` : "",
         `**Conversation ID:** \`${conversationId}\``,
       ],
     });

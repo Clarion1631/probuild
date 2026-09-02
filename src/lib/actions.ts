@@ -15447,6 +15447,21 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
     const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
     const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
 
+    // A period cannot be locked while any of it is still running. The OT
+    // ENVELOPE has to be past too: hours still to be worked in the trailing
+    // workweek change how much of the period counts as overtime, so freezing
+    // now would freeze a number that has not finished happening.
+    const { payrollLockEnvelope } = await import("./payroll-config");
+    const { dayKeyInTimeZone } = await import("./tz-date");
+    const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
+    if (envelope.end.getTime() > Date.now()) {
+        const lastDay = dayKeyInTimeZone(new Date(envelope.end.getTime() - 1), timeZone);
+        return {
+            success: false as const,
+            error: `This period is not over yet. Its workweeks run through ${lastDay} — wait until after that before locking.`,
+        };
+    }
+
     // Pass 1, OUTSIDE the transaction: readiness. Cheap, and it gives the human
     // a useful message instead of a rolled-back transaction.
     const precheck = await loadGustoExport(periodStart, periodEnd, {
@@ -15461,6 +15476,16 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
         return {
             success: false as const,
             error: "That period is already locked. An admin has to unlock it before it can be locked again.",
+        };
+    }
+    // Overlapping ENVELOPES, not just overlapping periods: two locks whose
+    // workweek envelopes overlap would each freeze — and each claim a different
+    // exportHash for — the same punches.
+    if (precheck.overlappingLocks.length > 0) {
+        const listed = precheck.overlappingLocks.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
+        return {
+            success: false as const,
+            error: `This period's workweeks overlap an already-locked period (${listed}). Unlock that one first, or pick the exact period.`,
         };
     }
     if (precheck.blocking.length > 0) {

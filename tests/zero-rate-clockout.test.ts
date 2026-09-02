@@ -128,10 +128,14 @@ function deps(options: {
     return { dependencies, updateCalls };
 }
 
-function putReq() {
+function putReq(extra: Record<string, unknown> = {}) {
     return new Request("https://example.test/api/time-entries", {
         method: "PUT",
-        body: JSON.stringify({ id: "te1", endTime: new Date(START.getTime() + 4 * 3_600_000).toISOString() }),
+        body: JSON.stringify({
+            id: "te1",
+            endTime: new Date(START.getTime() + 4 * 3_600_000).toISOString(),
+            ...extra,
+        }),
     });
 }
 
@@ -146,6 +150,21 @@ test("a $0-rate worker clocking themselves out gets 422 ZERO_RATE_BLOCKED and st
     assert.equal(updateCalls.length, 0, "the punch must stay OPEN — no time is lost");
 });
 
+test("a MANAGER's ORDINARY close at $0 is refused too — the silent $0 was the bug", async () => {
+    // The escape must not be the default outcome of a normal manager close.
+    const { dependencies, updateCalls } = deps({
+        selfRole: "MANAGER",
+        selfRate: 45,
+        ownerId: "owner-1",
+        ownerRates: { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com", payType: "HOURLY" },
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq());
+    assert.equal(res.status, 422);
+    assert.equal((await res.json()).code, "ZERO_RATE_BLOCKED");
+    assert.equal(updateCalls.length, 0);
+});
+
 test("a MANAGER closing someone else's $0-rate punch is ALLOWED, and flagged", async () => {
     // Blocking the office too created a punch nobody could close: past
     // MAX_SHIFT_HOURS every path refuses it and nothing sweeps a stranded punch.
@@ -158,7 +177,9 @@ test("a MANAGER closing someone else's $0-rate punch is ALLOWED, and flagged", a
         ownerRates: { hourlyRate: 0, burdenRate: 0, role: "FIELD_CREW", name: "Tim Brennan", email: "tim@example.com", payType: "HOURLY" },
     });
     const { createClockOutHandler } = await routeModulePromise;
-    const res = await createClockOutHandler(dependencies).PUT(putReq());
+    // The DELIBERATE escape: an explicit acknowledgement, sent only by the
+    // manager UI's "close at $0 and flag for payroll" control.
+    const res = await createClockOutHandler(dependencies).PUT(putReq({ acknowledgeZeroRate: true }));
     assert.equal(res.status, 200, "the office must always have a way to close a stranded punch");
     assert.equal(updateCalls.length, 1);
     const data = updateCalls[0].data;
@@ -209,7 +230,7 @@ test("the PATCH edit path still mirrors the block, and only on an OPEN -> CLOSED
     assert.match(source, /payType: owner\.payType/, "and the stored payType, which beats both");
     // Owner-only refusal, and a flag on the manager path — the same shape the
     // PUT tests above exercise for real.
-    assert.match(source, /if \(zeroRate && isOwner\)/);
+    assert.match(source, /if \(zeroRate && !acknowledgedZeroRate\)/);
     assert.match(source, /appendZeroRateReview\(/);
 });
 
@@ -223,4 +244,23 @@ test("clearing the zero-rate review flag requires a real rate and reprices the e
     assert.match(body, /zeroRateBlocks\(/, "and re-check the rate before clearing it");
     assert.match(body, /reprice/, "and reprice the entry rather than leaving the $0 cost");
     assert.match(body, /laborCost: hours \* toNum\(owner\.hourlyRate\)/);
+});
+
+test("a WORKER cannot acknowledge their own $0 rate", async () => {
+    // A phone cannot fix a pay rate, so the escape is not theirs to take —
+    // otherwise the crew app could opt itself out of the guard entirely.
+    const { dependencies, updateCalls } = deps({ selfRate: 0 });
+    const { createClockOutHandler } = await routeModulePromise;
+    const res = await createClockOutHandler(dependencies).PUT(putReq({ acknowledgeZeroRate: true }));
+    assert.equal(res.status, 422);
+    assert.equal(updateCalls.length, 0);
+});
+
+test("the PATCH mirror also refuses by default and needs the same explicit flag", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /body\.acknowledgeZeroRate === true && !isOwner && isPrivileged/);
+    assert.match(source, /if \(zeroRate && !acknowledgedZeroRate\)/);
 });

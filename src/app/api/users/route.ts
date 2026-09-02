@@ -3,6 +3,7 @@ import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { applyRateChange, RateChangeError } from "@/lib/pay-rate-write";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -48,7 +49,12 @@ export async function POST(req: Request) {
         const session = await getServerSession(authOptions);
         if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        // `permissions` is loaded because applyRateChange asks whether this
+        // caller has financialReports, not just whether they are a manager.
+        const currentUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            include: { permissions: true },
+        });
         if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
@@ -62,18 +68,38 @@ export async function POST(req: Request) {
         const existingUser = await prisma.user.findUnique({ where: { email: exactEmailLower } });
         if (existingUser) return NextResponse.json({ error: "User with this email already exists" }, { status: 400 });
 
-        const newUser = await prisma.user.create({
-            data: {
-                name: name || null,
-                email: exactEmailLower,
-                role: role || "FIELD_CREW",
-                status: "PENDING",
-                hourlyRate: Number(hourlyRate) || 0,
-                burdenRate: Number(burdenRate) || 0,
-                pinCode: pinCode ? await bcrypt.hash(pinCode, 10) : null,
-                invitedAt: new Date(),
-            },
-        });
+        // Create + set rates in ONE transaction. Rates go through
+        // applyRateChange (permission, exact decimal, lastRateSyncAt); creating
+        // the user with an inline Number() was a fourth, unguarded rate writer.
+        const hashedPin = pinCode ? await bcrypt.hash(pinCode, 10) : null;
+        let newUser;
+        try {
+            newUser = await prisma.$transaction(async (tx) => {
+                const created = await tx.user.create({
+                    data: {
+                        name: name || null,
+                        email: exactEmailLower,
+                        role: role || "FIELD_CREW",
+                        status: "PENDING",
+                        pinCode: hashedPin,
+                        invitedAt: new Date(),
+                    },
+                });
+                const rateResult = await applyRateChange(
+                    currentUser,
+                    created.id,
+                    { hourlyRate, burdenRate, payType: body.payType },
+                    tx as never
+                );
+                if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                return created;
+            });
+        } catch (error) {
+            if (error instanceof RateChangeError) {
+                return NextResponse.json({ error: error.message }, { status: error.status });
+            }
+            throw error;
+        }
 
         // Create default permissions record
         const permission = await prisma.userPermission.create({ data: { userId: newUser.id } });
@@ -132,7 +158,10 @@ export async function PATCH(req: Request) {
         const session = await getServerSession(authOptions);
         if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-        const currentUser = await prisma.user.findUnique({ where: { email: session.user.email } });
+        const currentUser = await prisma.user.findUnique({
+            where: { email: session.user.email },
+            include: { permissions: true },
+        });
         if (!currentUser || !["MANAGER", "ADMIN"].includes(currentUser.role)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
@@ -146,15 +175,35 @@ export async function PATCH(req: Request) {
         if (name !== undefined) data.name = name;
         if (role !== undefined) data.role = role;
         if (status !== undefined) data.status = status;
-        if (hourlyRate !== undefined) data.hourlyRate = Number(hourlyRate);
-        if (burdenRate !== undefined) data.burdenRate = Number(burdenRate);
         if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
 
-        const { pinCode: _pin, ...user } = await prisma.user.update({
-            where: { id },
-            data,
-            include: { permissions: true, projectAccess: { select: { projectId: true } } },
-        });
+        // Rates through the one validated path, in the same transaction as the
+        // rest of the patch — this route used to write them as raw JS numbers
+        // with no permission check and no lastRateSyncAt stamp.
+        let user;
+        let _pin;
+        try {
+            const updated = await prisma.$transaction(async (tx) => {
+                const rateResult = await applyRateChange(
+                    currentUser,
+                    id,
+                    { hourlyRate, burdenRate, payType: body.payType },
+                    tx as never
+                );
+                if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                return tx.user.update({
+                    where: { id },
+                    data,
+                    include: { permissions: true, projectAccess: { select: { projectId: true } } },
+                });
+            });
+            ({ pinCode: _pin, ...user } = updated);
+        } catch (error) {
+            if (error instanceof RateChangeError) {
+                return NextResponse.json({ error: error.message }, { status: error.status });
+            }
+            throw error;
+        }
 
         // A user who just became ACTIVATED FIELD_CREW (or is CJ) joins every
         // "In Progress" project. Fail-soft inside the helper; never blocks the save.

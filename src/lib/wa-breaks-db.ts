@@ -49,8 +49,14 @@ export async function settleDay(
 ): Promise<number> {
     try {
         return await prisma.$transaction(async (tx) => {
+            // Payroll advisory lock FIRST, then the day lock — the order every
+            // path uses (see the LOCK ORDER note in src/lib/payroll-period.ts).
+            // Taking the day lock first would let a settlement hold it while
+            // waiting on payroll, against a locker holding payroll and waiting
+            // on this day.
+            await assertSettlementDayUnlocked(tx, userId, dayKey);
             await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${dayKey}`);
-            return settleDayInTx(tx, userId, dayKey, closing);
+            return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
         });
     } catch (error) {
         if (isPeriodLockedError(error)) throw error;
@@ -77,8 +83,18 @@ export async function settleDayWithinTx(
     dayKey: string,
     closing?: { id: string; mealSkipped: unknown } | null
 ): Promise<number> {
+    // Payroll lock first, then the day lock (see LOCK ORDER in payroll-period.ts).
+    await assertSettlementDayUnlocked(tx, userId, dayKey);
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${dayKey}`);
-    return settleDayInTx(tx, userId, dayKey, closing);
+    return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
+}
+
+/** Payroll guard for a settlement: takes the shared payroll advisory lock and refuses a locked day. */
+async function assertSettlementDayUnlocked(tx: Tx, userId: string, dayKey: string): Promise<void> {
+    void userId;
+    const { assertDayUnlockedInTx } = await import("./payroll-period");
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
 }
 
 type Tx = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
@@ -88,17 +104,20 @@ async function settleDayInTx(
     tx: Tx,
     userId: string,
     dayKey: string,
-    closing?: { id: string; mealSkipped: unknown } | null
+    closing?: { id: string; mealSkipped: unknown } | null,
+    options: { alreadyGuarded?: boolean } = {}
 ): Promise<number> {
     {
         {
             // A re-plan rewrites durationHours / laborCost / burdenCost for the
             // whole day, so it is a payroll write like any other and must not
-            // touch a locked period. Takes the SHARED payroll advisory lock on
-            // this transaction before deciding (src/lib/payroll-period.ts).
-            const { assertDayUnlockedInTx } = await import("./payroll-period");
-            const { resolveCompanyTimeZone } = await import("./company-timezone");
-            await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
+            // touch a locked period. Callers that already took the payroll lock
+            // (in the right order, BEFORE the day lock) pass alreadyGuarded.
+            if (!options.alreadyGuarded) {
+                const { assertDayUnlockedInTx } = await import("./payroll-period");
+                const { resolveCompanyTimeZone } = await import("./company-timezone");
+                await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
+            }
 
             const owner = await tx.user.findUnique({ where: { id: userId }, select: { hourlyRate: true, burdenRate: true } });
             if (!owner) return 0;

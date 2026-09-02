@@ -7,6 +7,14 @@
 // instead, and leave the punch OPEN so no time is lost: the worker is still on
 // the clock and gets paid once the rate is entered.
 //
+// THE $0 CLOSE IS REFUSED FOR EVERYONE, worker and office alike. An earlier
+// revision let a manager close at $0 automatically and merely flagged it; that
+// made the silent-$0-shift the DEFAULT outcome of an ordinary manager close,
+// which is the thing this guard exists to prevent. The office still has a way
+// out, but it is now a DELIBERATE, separate action — the caller has to pass
+// `acknowledgeZeroRate`, which is only reachable from the manager UI's explicit
+// "close at $0 and flag for payroll" control, and which stamps needsReview.
+//
 // THE RULE IS BLOCK-BY-DEFAULT, EXEMPT BY EXCEPTION. An earlier version listed
 // the roles that ARE hourly and blocked only those, which fails OPEN for any
 // role added later — a new role would silently book $0 shifts. Now anything
@@ -54,7 +62,7 @@ export const ZERO_RATE_WORKER_MESSAGE =
     "Your pay rate isn't set up yet, so this shift can't be closed from here. Tell the office — they can set your rate or close the punch for you. Your time is safe and you'll be paid once the rate is in.";
 
 export function zeroRateManagerMessage(ownerName: string | null | undefined): string {
-    return `Set an hourly rate for ${ownerName?.trim() || "this team member"} on Company → Team Members before closing this entry.`;
+    return `Set an hourly rate for ${ownerName?.trim() || "this team member"} on Company → Team Members before closing this entry, or close it explicitly at $0 and flag it for payroll.`;
 }
 
 /** Review note stamped on a punch a MANAGER closed at a $0 rate, so payroll cannot miss it. */
@@ -93,6 +101,18 @@ export const PAY_TYPE_HOURLY = "HOURLY";
 export const PAY_TYPE_SALARY = "SALARY";
 
 /**
+ * The ONLY two values User.payType may hold, mirrored by the DB CHECK
+ * `User_payType_check`. Anything else is treated as UNKNOWN, never as a
+ * default — an unrecognised value must block the export, not silently pick a
+ * side and mis-pay somebody.
+ */
+export const PAY_TYPES = [PAY_TYPE_HOURLY, PAY_TYPE_SALARY] as const;
+
+export function isKnownPayType(value: unknown): value is "HOURLY" | "SALARY" {
+    return value === PAY_TYPE_HOURLY || value === PAY_TYPE_SALARY;
+}
+
+/**
  * Order matters: the STORED column wins over the env list, and both win over
  * role. `User.payType` is the answer a human gave; PAYROLL_SALARIED_EMAILS is a
  * fallback for rows nobody has answered yet, and it is fail-open by nature (an
@@ -108,6 +128,8 @@ export function isSalariedOwner(owner: {
 }): boolean {
     if (owner.payType === PAY_TYPE_SALARY) return true;
     if (owner.payType === PAY_TYPE_HOURLY) return false;
+    // Anything else (including a value the DB CHECK would reject) falls through
+    // to role/env rather than being trusted.
     if (owner.role && (SALARIED_BY_ROLE as readonly string[]).includes(owner.role)) return true;
     // A salaried MANAGER (CJ, Richard) has a CORRECT $0 hourly rate.
     return isSalariedEmail(owner.email);

@@ -76,6 +76,31 @@ const STATEMENTS = [
                 FOREIGN KEY ("lockedById") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
         END IF;
      END $$`,
+    // ---- Integrity + RLS (review round 5, items 7 and 9) ----------------
+    // CHECKs because payType and the period bounds are money-critical and
+    // reachable from several code paths; Prisma cannot see them, so they are
+    // also recorded in prisma/prisma-blind-spots.json.
+    `DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'User_payType_check' AND conrelid = '"User"'::regclass) THEN
+            ALTER TABLE "User" ADD CONSTRAINT "User_payType_check" CHECK ("payType" IS NULL OR "payType" IN ('HOURLY', 'SALARY'));
+        END IF;
+     END $$`,
+    `DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'PayrollPeriod_range_check' AND conrelid = '"PayrollPeriod"'::regclass) THEN
+            ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_range_check" CHECK ("periodEnd" > "periodStart");
+        END IF;
+     END $$`,
+    // NOT VALID: new rows must carry the stable keys, legacy rows are backfilled
+    // above and never fail the migration.
+    `DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'PayrollPeriod_keys_present' AND conrelid = '"PayrollPeriod"'::regclass) THEN
+            ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present" CHECK ("periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL) NOT VALID;
+        END IF;
+     END $$`,
+    // A leaked anon/authenticated Supabase key must not read payroll periods or
+    // their frozen CSVs. Same pattern as StatementImport/BankLine.
+    `ALTER TABLE "PayrollPeriod" ENABLE ROW LEVEL SECURITY`,
+    `REVOKE ALL ON TABLE "PayrollPeriod" FROM anon, authenticated`,
 ];
 
 try {
