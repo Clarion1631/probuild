@@ -18,10 +18,19 @@
 //
 //   node scripts/apply-expense-attribution.mjs --yes --expect-db <name> --expect-host <host>
 //
-// AND AGAIN, WITH --post-deploy, once the new build is live: the old build
-// keeps writing NULL-projectId, UTC-midnight rows until it drains, and those
-// arrive after the pre-deploy backfill has passed. See the POST-DEPLOY note
-// above `PROJECT_ID_BACKFILL`.
+// THIS DEPLOY IS TWO PASSES, NOT ONE. The --post-deploy pass below is not an
+// optional cleanup — skipping it leaves every Expense the old build wrote
+// while it drained permanently NULL-projectId and UTC-midnight, silently
+// dropped from the variance report and the tax-paid-at-source report with no
+// error anywhere. Run it AFTER the new build is live and the old one has
+// drained (Vercel: previous deployment no longer serving traffic):
+//
+//   node scripts/apply-expense-attribution.mjs --post-deploy --yes --expect-db <name> --expect-host <host>
+//
+// The run itself proves it worked: the verify step at the end reports the
+// count of rows still unattributed / still unanchored, and a --post-deploy
+// pass is not done until both read 0. See the POST-DEPLOY note above
+// `PROJECT_ID_BACKFILL`.
 //
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
@@ -543,6 +552,23 @@ async function main() {
             process.exit(1);
         }
         console.log("verified backfill: 0 expenses left unattributed against a known estimate project");
+
+        // The re-anchor's own assertion, same reasoning as the one above: after
+        // this script, no row may still sit at UTC midnight unanchored. This is
+        // the number a --post-deploy pass exists to drive to zero — it is what
+        // proves the old build's live-write gap has actually closed, not just
+        // that the script ran without error.
+        const [unanchored] = await prisma.$queryRawUnsafe(
+            `SELECT COUNT(*)::int AS n FROM "Expense"
+               WHERE "date" IS NOT NULL
+                 AND "attributionAnchoredAt" IS NULL
+                 AND "date"::time = TIME '00:00:00'`,
+        );
+        if (unanchored.n !== 0) {
+            console.error(`VERIFY FAILED: ${unanchored.n} expense(s) still sitting at UTC midnight, unanchored`);
+            process.exit(1);
+        }
+        console.log("verified re-anchor: 0 expenses left at UTC midnight");
 
         // Phase 1's table may legitimately not exist yet (see the guard above).
         const [intake] = await prisma.$queryRawUnsafe(

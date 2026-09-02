@@ -1178,18 +1178,18 @@ test("a re-attributed row settles to unchanged instead of updating forever", asy
 
 // ── the pair is re-read under lock, at write time (round 21, item 1) ────────
 
-test("an estimate MOVED mid-sync is imported onto its new job, not the matcher's", async () => {
+test("an estimate MOVED mid-sync is refused, not silently imported onto its new job", async () => {
     // The matcher resolved estimate-1 -> project-1, then wrote a
     // classification row and made a QBO round trip. If the estimate joined
-    // another job in that window, persisting `write.projectId` next to
-    // `write.estimateId` puts one expense on two jobs at once —
-    // `resolveExpenseProjectId` says project-1, every join through the
-    // estimate says project-moved, and no report can be right about it.
+    // another job in that window, `write` — vendor, description, amount — was
+    // still matched and shaped for project-1, not for wherever the estimate
+    // has since moved to. Silently swapping in the lock's project-moved would
+    // land a purchase classified for one job on another job's books, so the
+    // write is refused instead: nothing is created, and the next sync
+    // re-matches against the estimate's current project.
     const fake = createFakePrisma([], new Map([["estimate-1", "project-moved"]]));
-    assert.equal(await upsertQboExpense(fake.client, WRITE), "imported");
-    const row = fake.rows.get("purchase-1");
-    assert.equal(row?.projectId, "project-moved", "the LOCKED read is the authority");
-    assert.equal(row?.estimateId, "estimate-1");
+    assert.equal(await upsertQboExpense(fake.client, WRITE), "unchanged");
+    assert.equal(fake.rows.get("purchase-1"), undefined, "nothing is created on a mismatch");
 });
 
 test("an estimate that lost its project imports UNattributed, never half a pair", async () => {
@@ -1201,18 +1201,21 @@ test("an estimate that lost its project imports UNattributed, never half a pair"
     assert.equal(fake.rows.get("purchase-1")?.projectId, null);
 });
 
-test("the catch-up FILL follows the estimate too, not the matcher's project", async () => {
-    // The legacy fill path had the same shape: `plan.fill` carried the
-    // matcher's projectId, and the row it lands on is the one the pre-Phase-3
-    // sync left with projectId NULL.
+test("the catch-up FILL refuses too, when the estimate moved out from under the plan", async () => {
+    // The legacy fill path has the same shape as create: `plan.fill.projectId`
+    // was computed for project-1, not for whichever job the estimate happens
+    // to be on by the time this transaction locks it. The fill is skipped —
+    // the row stays unattributed for the next sync to retry — but the rest of
+    // the plan (here, the new qbSyncToken) still lands.
     const fake = createFakePrisma(
         [{ ...WRITE, id: "expense-1", projectId: null, receiptUrl: null }],
         new Map([["estimate-1", "project-moved"]]),
     );
     assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
     const row = fake.rows.get("purchase-1");
-    assert.equal(row?.projectId, "project-moved");
-    assert.equal(row?.estimateId, "estimate-1", "the pair moves together or not at all");
+    assert.equal(row?.projectId, null, "the fill is skipped, not silently re-pointed");
+    assert.equal(row?.estimateId, "estimate-1", "unchanged — it already matched the write");
+    assert.equal(row?.qbSyncToken, "1", "the rest of the plan still lands");
 });
 
 test("a fill onto a project-less estimate writes the estimate alone, not a stale job", async () => {

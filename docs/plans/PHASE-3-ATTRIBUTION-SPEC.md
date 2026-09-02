@@ -85,6 +85,18 @@ Planner output for the executor: build exactly this; do not guess.
    + `installedAtCustomer`. Verify: `node scripts/apply-expense-attribution.mjs` twice
    (second run all "already exists" / 0 rows updated); CI `migrations` job green;
    `prisma generate` + `npx tsc --noEmit` clean.
+   **DEPLOYMENT IS NOT DONE AT MERGE.** The pre-deploy run above has to happen
+   BEFORE the build that selects these columns ships (CLAUDE.md pre-deploy rule
+   #2), which means it necessarily runs before the OLD build has stopped
+   writing. Every Expense the old build creates or updates in that window lands
+   NULL-projectId and UTC-midnight, after the backfills already passed over the
+   table. Closing that gap is a MANDATORY second pass, not an optional
+   follow-up: once the new build is live and the previous Vercel deployment has
+   drained, run
+   `node scripts/apply-expense-attribution.mjs --post-deploy --yes --expect-db <name> --expect-host <host>`.
+   Verify: the script's own output — "verified backfill: 0 expenses left
+   unattributed" and "verified re-anchor: 0 expenses left at UTC midnight" —
+   both reporting zero is the proof, not merely that the command exited 0.
 2. **Every writer stamps projectId** (§3): after deploy, a new expense from each writer has
    `projectId` set. Verify: writer unit tests + one prod row per path spot-checked.
 3. **Capture/manual codes are never overwritten** (§3): the QBO sync and the backfill only

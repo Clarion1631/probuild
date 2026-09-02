@@ -918,10 +918,26 @@ export async function upsertQboExpense(
             // answer differently.
             //
             // The estimate row is the only thing that can say which job it is
-            // on right now, so the locked answer wins over the matcher's. A
-            // project-less estimate leaves the row unattributed rather than
-            // stamped with a job it has left: half a pair is the bug.
+            // on right now, so the locked answer is the only one ever WRITTEN.
+            // But `write` — vendor, description, amount — was matched and
+            // shaped for the job the matcher saw, not for wherever the estimate
+            // has since moved to. Silently swapping in the lock's project would
+            // land a purchase classified for one job on another job's books, so
+            // a disagreement refuses the write instead: the row stays
+            // unimported and the next sync re-matches against the estimate's
+            // current project. A project-less estimate still leaves the row
+            // unattributed rather than stamped with a job it has left: half a
+            // pair is the bug.
+            const plannedProjectId = write.projectId ?? null;
             const pair = await lockEstimateAttribution(transaction, write.estimateId);
+            if (pair && plannedProjectId !== null && pair.projectId !== plannedProjectId) {
+                console.warn(
+                    "QBO expense import skipped: estimate moved between match and write",
+                    write.qbPurchaseId,
+                    write.estimateId,
+                );
+                return "unchanged";
+            }
             await transaction.expense.create({
                 data: { ...write, projectId: pair?.projectId ?? null },
             });
@@ -944,15 +960,33 @@ export async function upsertQboExpense(
         if (plan.fill !== null) {
             // Same locked re-read as the create path. The plan decided WHETHER
             // to fill from what the row holds; only the estimate row can say
-            // WHICH job it is on at this instant, and writing the matcher's
-            // stale answer is how a catch-up fill lands a split-job row.
+            // WHICH job it is on at this instant. Writing the matcher's stale
+            // answer is how a catch-up fill lands a split-job row — and so is
+            // silently writing the lock's newer answer when it disagrees with
+            // what the fill was actually planned for: `plan.fill.projectId`
+            // was computed for a specific job, not for whichever job the
+            // estimate happens to be on by the time this transaction locks it.
+            const plannedProjectId = plan.fill.projectId ?? null;
             const pair = await lockEstimateAttribution(transaction, plan.fill.estimateId);
-            await transaction.expense.updateMany({
-                where: { id: existing.id, projectId: null },
-                data: pair
-                    ? { projectId: pair.projectId, estimateId: pair.estimateId }
-                    : { estimateId: plan.fill.estimateId },
-            });
+            if (pair && plannedProjectId !== null && pair.projectId !== plannedProjectId) {
+                // The estimate moved between the plan and this lock. Skip the
+                // fill — the row stays unattributed and the next sync retries
+                // against the estimate's current project — but still apply the
+                // rest of `plan.data` below (tax/amount reconciliation is
+                // independent of attribution).
+                console.warn(
+                    "QBO expense attribution fill skipped: estimate moved between plan and lock",
+                    write.qbPurchaseId,
+                    plan.fill.estimateId,
+                );
+            } else {
+                await transaction.expense.updateMany({
+                    where: { id: existing.id, projectId: null },
+                    data: pair
+                        ? { projectId: pair.projectId, estimateId: pair.estimateId }
+                        : { estimateId: plan.fill.estimateId },
+                });
+            }
         }
         // CAS when the client supports it: a tax correction committing between
         // the read above and this write would otherwise be clobbered by a plan
