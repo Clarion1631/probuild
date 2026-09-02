@@ -111,7 +111,11 @@ export async function computeProjectFinancials(
         }),
         prisma.estimate.findMany({
             where: { projectId, status: { in: validEstimateStatuses } },
-            select: { id: true, status: true, totalAmount: true, balanceDue: true },
+            // `archivedAt` is SELECTED but not filtered on: adding it to the
+            // `where` would change every existing field's value on a job with an
+            // archived estimate, and this phase is additive only. It is applied
+            // in the contractValue loop below and nowhere else.
+            select: { id: true, status: true, totalAmount: true, balanceDue: true, archivedAt: true },
         }),
         prisma.retainer.findMany({ where: { projectId, status: { in: validRetainerStatuses } } }),
         prisma.expense.findMany({ where: { estimate: { projectId } } }),
@@ -240,9 +244,15 @@ export async function computeProjectFinancials(
     // Committed contract value. Accepted estimate statuses only — "Sent"/"Viewed"
     // are proposals, and `validEstimateStatuses` above is a superset of what
     // counts here, so the filter is explicit rather than reusing that list.
+    //
+    // ARCHIVED estimates are excluded, matching `PHASE_ELIGIBLE_ESTIMATE_WHERE`
+    // in project-phases.ts. A superseded estimate keeps its accepted status
+    // after being archived, so counting it would double the contract on any job
+    // that was re-estimated.
     const acceptedEstimateStatuses = ["Approved", "Invoiced", "Partially Paid", "Paid"];
     let contractValue = 0;
     for (const est of estimates) {
+        if (est.archivedAt) continue;
         if (acceptedEstimateStatuses.includes(est.status)) contractValue += Number(est.totalAmount);
     }
     for (const co of approvedChangeOrders) {
@@ -305,6 +315,7 @@ export async function computeProjectFinancials(
             source: percentCompleteSource,
             auto: percentCompleteAuto,
             autoAtOverride: percentCompleteAutoAtOverride,
+            manual: percentComplete,
         }),
         contractValue,
         earnedRevenue,

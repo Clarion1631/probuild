@@ -59,7 +59,7 @@ function resetFixture() {
             },
         ],
         estimates: [
-            { id: "e1", status: "Approved", totalAmount: D(20_000), balanceDue: D(0) },
+            { id: "e1", status: "Approved", totalAmount: D(20_000), balanceDue: D(0), archivedAt: null },
         ],
         retainers: [],
         expenses: [
@@ -200,9 +200,34 @@ test("contractValue = accepted estimates + APPROVED change orders", async () => 
 });
 
 test("a Sent estimate is a proposal, not contract value", async () => {
-    fixture.estimates = [{ id: "e1", status: "Sent", totalAmount: D(20_000), balanceDue: D(0) }];
+    fixture.estimates = [{ id: "e1", status: "Sent", totalAmount: D(20_000), balanceDue: D(0), archivedAt: null }];
     const fin = await computeProjectFinancials("p1");
     assert.equal(fin.contractValue, 5_000); // the approved CO only
+});
+
+test("an ARCHIVED accepted estimate is not contract value", async () => {
+    // A superseded estimate keeps its accepted status after archiving. Counting
+    // it would double the contract on any job that was re-estimated -- while
+    // leaving every EXISTING field untouched, because archivedAt is selected
+    // but deliberately not filtered on in the query.
+    fixture.estimates = [
+        { id: "e1", status: "Approved", totalAmount: D(20_000), balanceDue: D(0), archivedAt: null },
+        { id: "e0", status: "Approved", totalAmount: D(18_000), balanceDue: D(0), archivedAt: new Date("2026-07-01") },
+    ];
+    const fin = await computeProjectFinancials("p1");
+    assert.equal(fin.contractValue, 25_000);
+    // The pre-Phase-4 field still counts BOTH, exactly as it did before.
+    assert.equal(fin.forecastedIncomingFromEstimates, 38_000);
+});
+
+test("a manual override with no auto snapshot still reviews when auto disagrees", async () => {
+    // Overridden before the cron had ever produced an auto value, so there was
+    // nothing to snapshot. The manual value becomes the comparison baseline.
+    fixture.project.percentCompleteAutoAtOverride = null;
+    fixture.project.percentComplete = D(60);
+    fixture.project.percentCompleteAuto = D(90);
+    const fin = await computeProjectFinancials("p1");
+    assert.equal(fin.percentCompleteNeedsReview, true);
 });
 
 test("earned revenue and margin follow contract value × percent complete", async () => {
