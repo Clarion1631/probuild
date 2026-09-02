@@ -23,7 +23,7 @@ let authorizeFinalization: (
     auth: unknown,
     rowProjectId: string | null,
     lateFields: Record<string, unknown>,
-) => Promise<Response | null>;
+) => Promise<{ status: number; body: Record<string, unknown> } | null>;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -74,7 +74,7 @@ test("a session caller cannot file a receipt against a job they cannot see", asy
     const denied = await authorizeFinalization(session, null, { projectId: "job-theirs" });
     assert.ok(denied, "it must be refused");
     assert.equal(denied!.status, 403);
-    assert.equal((await denied!.json()).reason, "forbidden");
+    assert.equal(denied!.body.reason, "forbidden");
 });
 
 test("a session caller CAN file against a job they can see", async () => {
@@ -95,7 +95,7 @@ test("a late phase must belong to the EFFECTIVE project", async () => {
     const denied = await authorizeFinalization(session, "job-mine", { costCodeId: "cc-frame" });
     assert.ok(denied);
     assert.equal(denied!.status, 400);
-    assert.equal((await denied!.json()).error, "cost-code-not-a-phase");
+    assert.equal(denied!.body.error, "cost-code-not-a-phase");
 });
 
 test("the effective project is the LATE one when both are supplied", async () => {
@@ -116,7 +116,7 @@ test("a phase with no job to check it against is refused", async () => {
     const denied = await authorizeFinalization(session, null, { costCodeId: "cc-plumb" });
     assert.ok(denied);
     assert.equal(denied!.status, 400);
-    assert.equal((await denied!.json()).error, "cost-code-without-project");
+    assert.equal(denied!.body.error, "cost-code-without-project");
 });
 
 test("a secret forwarder skips the per-user check but NOT the phase check", async () => {
