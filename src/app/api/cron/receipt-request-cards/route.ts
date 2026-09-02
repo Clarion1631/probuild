@@ -312,6 +312,11 @@ export async function GET(request: Request) {
     const uncertainTransitions: string[] = [];
     // A healthy run is mid-send on this owner's card. Left strictly alone.
     const inFlight: string[] = [];
+    // A claimed row whose itemsJson parsed to nothing (bad JSON, or an empty
+    // array). Left in place it would sit forever: the unique (owner,
+    // pacificDate) key blocks any replacement, so every later run today
+    // would re-claim the same dead row and fail the same way.
+    const invalidRows: string[] = [];
 
     for (const owner of CARD_OWNERS_ASKED) {
         const existing = await prisma.receiptRequestCard.findUnique({
@@ -365,7 +370,18 @@ export async function GET(request: Request) {
             if (taken.count === 0) continue;
 
             const items = parseItems(existing.itemsJson);
-            if (items.length === 0) continue;
+            if (items.length === 0) {
+                // The stored row is unusable and this run just claimed it.
+                // Deleting it (rather than leaving it claimed, or merely
+                // `continue`-ing) frees the owner/date slot so a fresh
+                // selection can run for this owner today instead of
+                // repeating this same no-op claim on every future pass.
+                await prisma.receiptRequestCard.deleteMany({
+                    where: { id: existing.id, claimToken: token, postedAt: null },
+                });
+                invalidRows.push(owner);
+                continue;
+            }
             // THE ROW'S OWN overflowExact, not this run's scan flag. A retry
             // pass does not scan at all, so `scan.exhausted` is trivially true
             // there — and a card claimed by a run whose scan stopped early
@@ -628,6 +644,9 @@ export async function GET(request: Request) {
         // resolve on the Receipts tab, not a reason to fail every later run.
         uncertainTransitions,
         inFlightOwners: inFlight,
+        // Rows deleted this run because their stored itemsJson parsed to
+        // nothing. Worth seeing, not worth failing the run over.
+        invalidRows,
         date,
         retryOnly,
         scanned: scan.candidates.length,
