@@ -266,7 +266,7 @@ test("a configured webhook that fails to deliver FAILS the run", () => {
     assert.match(source, /status: summary\.ok \? 200 : 500/);
     // The row is left UNPOSTED with its claim released, so the retry pass can
     // take it straight away rather than waiting out a lease.
-    assert.match(source, /status: "PENDING",[\s\S]{0,120}lastError: "post-failed"/);
+    assert.match(source, /status: "PENDING",[\s\S]{0,200}lastError: `rejected:\$\{result\.reason\}`/);
 });
 
 test("the retry pass re-posts unposted rows and never selects new work", () => {
@@ -385,7 +385,7 @@ test("the evidence upper bound is EXCLUSIVE and in the company timezone", () => 
 test("open issues get their OWN pass, independent of the cursor", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // The pass runs BEFORE the cursor is even read.
-    const passAt = source.indexOf("const openPass =");
+    const passAt = source.indexOf("const openPass:");
     const cursorAt = source.indexOf("let cursor = await readCursor();");
     assert.ok(passAt > 0 && cursorAt > passAt, "closing must not wait for the cursor to lap round");
     // And they are no longer bolted onto every batch.
@@ -458,4 +458,70 @@ test("cost codes must be a phase of the job, in all three write paths", () => {
     const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
     assert.match(actions, /costCodeId: costCodeId \?\? \(keepExisting \? existing!\.costCodeId : null\)/);
     assert.match(actions, /suggestedCostCodeId: null/);
+});
+
+test("an ACTIVE claim on a POSTING row is honoured; only an EXPIRED one goes UNCERTAIN", () => {
+    // Converting an in-flight row would pull it out from under a healthy run
+    // and lose the thread ids it is about to write.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(source, /const claimLive = existing\.claimedAt !== null/);
+    assert.match(source, /if \(claimLive\) \{[\s\S]{0,600}inFlight\.push\(owner\);/);
+    // The UNCERTAIN conversion sits AFTER that guard, on the expired path.
+    const liveAt = source.indexOf("if (claimLive) {");
+    const convertAt = source.indexOf('data: { status: "UNCERTAIN", lastError: "uncertain-delivery"');
+    assert.ok(liveAt > 0 && convertAt > liveAt);
+});
+
+test("only a REJECTED send returns to PENDING; UNKNOWN is never auto-retried", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(source, /if \(result\.kind === "rejected"\) \{[\s\S]{0,600}status: "PENDING"/);
+    assert.match(source, /if \(result\.kind === "unknown"\) \{[\s\S]{0,700}status: "UNCERTAIN"/);
+    // An unknown outcome must never be handed back to the retry pass.
+    const unknownAt = source.indexOf('if (result.kind === "unknown")');
+    const block = source.slice(unknownAt, unknownAt + 700);
+    assert.doesNotMatch(block, /status: "PENDING"/, "an unknown send is not retryable");
+});
+
+test("open issues are paged with their OWN cursor and budget", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const OPEN_ISSUE_BATCH_SIZE = 100;/);
+    assert.match(source, /const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";/);
+    assert.notEqual(
+        source.indexOf('const OPEN_CURSOR_KEY'),
+        source.indexOf('const CURSOR_KEY'),
+        "sharing one cursor would make each pass corrupt the other's resume point",
+    );
+    // Same wall clock as the line pass, and it never checkpoints past a failure.
+    assert.match(source, /while \(Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
+    assert.match(source, /if \(outcome\.summary\.errors > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
+});
+
+test("an issue whose BankLine is gone is CLOSED as target-missing", () => {
+    // The matcher has nothing to match, so it would be skipped — and nag —
+    // forever. A deleted or re-imported statement line really happens.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const orphaned = page\.filter\(issue => !present\.has\(issue\.targetKey\)\)/);
+    assert.match(source, /resolution: "target-missing"/);
+    // Closed with EMPTY codes — that is the lifecycle's clear step.
+    assert.match(source, /issue\.targetKey,\s*\n\s*\[\],\s*\n\s*\{ \.\.\.details, resolution: "target-missing" \}/);
+});
+
+test("a cursor write failure is a 500, never ok:true", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /class CursorWriteError extends Error/);
+    assert.match(source, /throw new CursorWriteError\(message\);/);
+    assert.match(source, /if \(error instanceof CursorWriteError\)[\s\S]{0,300}status: 500/);
+    assert.match(source, /error: "cursor-write-failed"/);
+    // Both cursors fail the same way.
+    const throws = source.match(/throw new CursorWriteError\(message\);/g) ?? [];
+    assert.equal(throws.length, 2, "the line cursor and the open-issue cursor");
+});
+
+test("the bank pull plans its window from a persisted high-water mark", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(source, /const WINDOW_STATE_KEY = "bankRegisterPullWindow";/);
+    assert.match(source, /const PULL_BUDGET_MS = 50_000;/);
+    assert.match(source, /windowState,\s*\n\s*saveWindowState,\s*\n\s*budgetMs: PULL_BUDGET_MS,/);
+    // A corrupt state plans the WIDEST safe window, never a narrow one.
+    assert.match(source, /return \{ highWater: null, lastFullSweep: null \};/);
 });

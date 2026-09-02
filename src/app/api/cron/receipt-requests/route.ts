@@ -77,6 +77,10 @@ const RUN_LEASE_MS = 15 * 60_000;
 /** Where the lease and the resume cursor live (AutomationSetting is a KV table). */
 const LEASE_KEY = "receiptRequestsRunLease";
 const CURSOR_KEY = "receiptRequestsCursor";
+/** The open-issue pass keeps its OWN resume point; sharing one would corrupt both. */
+const OPEN_CURSOR_KEY = "receiptRequestsOpenIssueCursor";
+/** Open issues per batch. Smaller than the line batch: each one costs a lookup. */
+const OPEN_ISSUE_BATCH_SIZE = 100;
 
 /** The resume cursor: the last BankLine id this sweep finished, oldest-first. */
 async function readCursor(): Promise<string | null> {
@@ -88,6 +92,45 @@ async function readCursor(): Promise<string | null> {
     }
 }
 
+/**
+ * Thrown when the resume cursor cannot be persisted.
+ *
+ * A swallowed cursor write is the worst failure this sweep has: the batch's
+ * work committed, the checkpoint did not, so the NEXT run redoes the same
+ * ground — and if the write keeps failing, the sweep never advances past batch
+ * one while reporting a cheerful 200 every time. The run must fail loudly
+ * instead.
+ */
+class CursorWriteError extends Error {
+    constructor(cause: string) {
+        super(`cursor write failed: ${cause}`);
+        this.name = "CursorWriteError";
+    }
+}
+
+async function readOpenCursor(): Promise<string | null> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: OPEN_CURSOR_KEY } });
+        return row?.value ? row.value : null;
+    } catch {
+        return null;
+    }
+}
+
+async function writeOpenCursor(value: string | null): Promise<void> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: OPEN_CURSOR_KEY },
+            update: { value: value ?? "" },
+            create: { key: OPEN_CURSOR_KEY, value: value ?? "" },
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "UnknownError";
+        console.error("[cron/receipt-requests] open-issue cursor write failed", message);
+        throw new CursorWriteError(message);
+    }
+}
+
 async function writeCursor(value: string | null): Promise<void> {
     try {
         await prisma.automationSetting.upsert({
@@ -96,7 +139,9 @@ async function writeCursor(value: string | null): Promise<void> {
             create: { key: CURSOR_KEY, value: value ?? "" },
         });
     } catch (error) {
-        console.error("[cron/receipt-requests] cursor write failed", error instanceof Error ? error.message : "UnknownError");
+        const message = error instanceof Error ? error.message : "UnknownError";
+        console.error("[cron/receipt-requests] cursor write failed", message);
+        throw new CursorWriteError(message);
     }
 }
 
@@ -474,6 +519,17 @@ export async function GET(request: Request) {
     }
     try {
         return await runSweep(now);
+    } catch (error) {
+        // A cursor that will not persist is an INVOCATION ERROR, not a quiet
+        // note in the log. Whatever this run committed stays committed, but the
+        // checkpoint did not move — so the platform must show the run as failed
+        // rather than reporting ok:true while the sweep silently redoes the
+        // same batch forever.
+        if (error instanceof CursorWriteError) {
+            console.error("[cron/receipt-requests]", error.message);
+            return NextResponse.json({ ok: false, error: "cursor-write-failed", detail: error.message }, { status: 500 });
+        }
+        throw error;
     } finally {
         await releaseLease(LEASE_KEY, leaseToken);
     }
@@ -511,35 +567,108 @@ async function runSweep(now: Date) {
     // whatever is left.
     const startedAt = Date.now();
 
-    // PASS 1: EVERY OPEN ISSUE, every run, whatever the cursor says.
+    // PASS 1: EVERY OPEN ISSUE, every run, whatever the recent-line cursor says.
     //
-    // The cursor walks recent lines. An issue opened 90 days ago sits behind it
-    // for the whole sweep, so the receipt that finally answers it could arrive
-    // and the chase would keep nagging until the cursor happened to lap round —
-    // which, with a `?continue=1` resume, might be never. Closing is the half
-    // that must not depend on where the cursor is, so it runs first and alone.
-    const openPass = openIssues.length === 0
-        ? { summary: { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] as string[] }, undecided: 0 }
-        : await processBatch(
-            await prisma.bankLine.findMany({
-                where: { id: { in: openIssues.map(issue => issue.targetKey) } },
-                select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
-            }),
-            openIssues, resolvedIssueKeys, detailsByKey, now,
-        );
+    // The line cursor walks recent lines. An issue opened 90 days ago sits
+    // behind it for the whole sweep, so the receipt that finally answers it
+    // could arrive and the chase would keep nagging until the cursor happened
+    // to lap round — which, with a `?continue=1` resume, might be never.
+    // Closing is the half that must not depend on where the cursor is.
+    //
+    // PAGED, under the same wall clock, with its OWN checkpoint: a backlog of
+    // open issues is exactly as capable of blowing the budget as a backlog of
+    // lines, and sharing the line cursor would make each pass corrupt the
+    // other's resume point.
+    const openPass: ReceiptRequestApplySummary = {
+        opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [],
+    };
+    let openUndecided = 0;
+    let openCursor = await readOpenCursor();
+    let openExhausted = false;
+    let openBatches = 0;
+    let targetMissing = 0;
+
+    while (Date.now() - startedAt < RUN_BUDGET_MS) {
+        const page = await prisma.reviewIssue.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
+            orderBy: [{ firstObservedAt: "asc" }, { id: "asc" }],
+            take: OPEN_ISSUE_BATCH_SIZE,
+            ...(openCursor ? { cursor: { id: openCursor }, skip: 1 } : {}),
+            select: { id: true, targetKey: true, displayDetails: true },
+        });
+        if (page.length === 0) { openExhausted = true; break; }
+        openBatches++;
+
+        const lines = await prisma.bankLine.findMany({
+            where: { id: { in: page.map(issue => issue.targetKey) } },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        });
+
+        // AN ISSUE WHOSE BANK LINE IS GONE can never be answered: the matcher
+        // has nothing to match, so it would be skipped forever and nag forever.
+        // A deleted or re-imported statement line is a real thing that happens.
+        // Close it with a reason a human can read rather than leaving a chase
+        // pointing at nothing.
+        const present = new Set(lines.map(line => line.id));
+        const orphaned = page.filter(issue => !present.has(issue.targetKey));
+        for (const issue of orphaned) {
+            try {
+                const details = detailsByKey.get(issue.targetKey) ?? {};
+                await evaluateReviewIssue(
+                    RECEIPT_REQUEST_TARGET_TYPE,
+                    issue.targetKey,
+                    [],
+                    { ...details, resolution: "target-missing" },
+                    { episodeStatus: "SUPPRESSED" },
+                );
+                openPass.closed++;
+                targetMissing++;
+            } catch (error) {
+                openPass.errors++;
+                openPass.failedTargets.push(issue.targetKey);
+                console.error("[cron/receipt-requests] target-missing close failed", issue.targetKey,
+                    error instanceof Error ? error.message : "UnknownError");
+            }
+        }
+
+        if (lines.length > 0) {
+            const outcome = await processBatch(
+                lines,
+                page.map(issue => ({ targetKey: issue.targetKey })),
+                resolvedIssueKeys,
+                detailsByKey,
+                now,
+            );
+            openPass.opened += outcome.summary.opened;
+            openPass.closed += outcome.summary.closed;
+            openPass.touched += outcome.summary.touched;
+            openPass.skipped += outcome.summary.skipped;
+            openPass.errors += outcome.summary.errors;
+            openPass.failedTargets.push(...outcome.summary.failedTargets);
+            openUndecided += outcome.undecided;
+            // Same rule as the line pass: never checkpoint past a failure.
+            if (outcome.summary.errors > 0) break;
+        }
+
+        openCursor = page[page.length - 1].id;
+        await writeOpenCursor(openCursor);
+        if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
+    }
+    // A finished pass starts over next run — that is what re-checks everything.
+    if (openExhausted && openPass.errors === 0) await writeOpenCursor(null);
 
     let cursor = await readCursor();
     const totals: ReceiptRequestApplySummary = {
-        opened: openPass.summary.opened,
-        closed: openPass.summary.closed,
-        touched: openPass.summary.touched,
-        skipped: openPass.summary.skipped,
-        errors: openPass.summary.errors,
-        failedTargets: [...openPass.summary.failedTargets],
+        opened: openPass.opened,
+        closed: openPass.closed,
+        touched: openPass.touched,
+        skipped: openPass.skipped,
+        errors: openPass.errors,
+        failedTargets: [...openPass.failedTargets],
     };
     let batches = 0;
     let linesSeen = 0;
-    let undecided = openPass.undecided;
+    let undecided = openUndecided;
     let exhausted = false;
 
     while (Date.now() - startedAt < RUN_BUDGET_MS) {
@@ -583,6 +712,10 @@ async function runSweep(now: Date) {
         ok: totals.errors === 0,
         window: { start: windowStart, end: windowEnd },
         batches,
+        openBatches,
+        openIssueCursor: openCursor,
+        openIssuesExhausted: openExhausted,
+        targetMissing,
         bankLines: linesSeen,
         undecided,
         exhausted,

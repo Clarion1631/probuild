@@ -338,58 +338,79 @@ export function isValidChatWebhookUrl(value: string): boolean {
     }
 }
 
-export interface PostedCard {
-    owner: string;
-    /** Chat's `thread.name`. Never null — a response without it is a failure. */
-    threadName: string;
-    /** Chat's `message.name`. Never null — a response without it is a failure. */
-    messageName: string;
-}
+/**
+ * What we know about a send, and the difference matters enormously.
+ *
+ *  - `delivered` — Chat accepted it AND gave us both bridge identities. Only
+ *    this writes POSTED.
+ *  - `rejected` — Chat provably did NOT take the message (a refused URL, a 4xx,
+ *    a rate-limit). Nothing is in the space, so the row goes back to PENDING and
+ *    the retry pass may send it.
+ *  - `unknown` — a timeout, a network error, a 5xx, or a 2xx with no message
+ *    name. The card may well be sitting in the crew's space right now. This is
+ *    NEVER auto-retried: a second identical card is worse than a missing one,
+ *    because it teaches people the list is noise.
+ *
+ * Collapsing the last two into "failed" is what made a timeout look retryable.
+ */
+export type PostOutcome =
+    | { kind: "delivered"; owner: string; threadName: string; messageName: string }
+    | { kind: "rejected"; owner: string; reason: string }
+    | { kind: "unknown"; owner: string; reason: string };
 
 /**
  * Post one owner card to the Receipts Need Review space via an incoming
  * webhook. `threadKey` is the deterministic request id, so a retried cron
  * replies into the same thread instead of starting a new one.
  *
- * Fails SOFT and never throws: an unset or invalid `RECEIPTS_CHAT_WEBHOOK`
- * returns null, and the cron reports `{skipped:"no-webhook"}` rather than
- * failing. A chase card is not worth taking a cron down for.
+ * Never throws — every failure mode is one of the three outcomes above.
  */
-export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promise<PostedCard | null> {
-    if (!isValidChatWebhookUrl(webhookUrl)) return null;
+export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promise<PostOutcome> {
+    // Never sent: not a Chat webhook at all.
+    if (!isValidChatWebhookUrl(webhookUrl)) {
+        return { kind: "rejected", owner: card.owner, reason: "invalid-webhook-url" };
+    }
+    let res: Response;
     try {
         const url = new URL(webhookUrl.trim());
         url.searchParams.set("threadKey", card.requestId);
         url.searchParams.set("messageReplyOption", "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
-        const res = await fetch(url, {
+        res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json; charset=UTF-8" },
             body: JSON.stringify({ text: card.text }),
             signal: AbortSignal.timeout(POST_TIMEOUT_MS),
         });
-        if (!res.ok) {
-            console.error("[receipt-request-cards] post failed", { owner: card.owner, status: res.status });
-            return null;
-        }
-        const body = (await res.json().catch(() => null)) as { name?: unknown; thread?: { name?: unknown } } | null;
-        const threadName = typeof body?.thread?.name === "string" && body.thread.name ? body.thread.name : null;
-        const messageName = typeof body?.name === "string" && body.name ? body.name : null;
-        // BOTH, or it is a FAILURE. Without them the bridge has no identity to
-        // export: the threads endpoint silently drops the card, so every reply
-        // in that Chat thread is orphaned — while the row was marked posted and
-        // nothing was ever retried. A 200 with no names is worse than a 500,
-        // because it looks like it worked.
-        if (!threadName || !messageName) {
-            console.error("[receipt-request-cards] post lacked a bridge identity", {
-                owner: card.owner,
-                hasThread: threadName !== null,
-                hasMessage: messageName !== null,
-            });
-            return null;
-        }
-        return { owner: card.owner, threadName, messageName };
     } catch (error) {
-        console.error("[receipt-request-cards] post failed", { owner: card.owner, error });
-        return null;
+        // A timeout or a socket error says nothing about whether Chat processed
+        // the request. UNKNOWN, and therefore never resent.
+        console.error("[receipt-request-cards] post did not complete", { owner: card.owner, error });
+        return { kind: "unknown", owner: card.owner, reason: "network-or-timeout" };
     }
+
+    if (!res.ok) {
+        // 4xx (and an explicit rate-limit) mean Chat DECLINED: nothing is in the
+        // space. 5xx means it may have been processed before it fell over.
+        const definitivelyRejected = res.status >= 400 && res.status < 500;
+        console.error("[receipt-request-cards] post failed", { owner: card.owner, status: res.status });
+        return definitivelyRejected
+            ? { kind: "rejected", owner: card.owner, reason: `http-${res.status}` }
+            : { kind: "unknown", owner: card.owner, reason: `http-${res.status}` };
+    }
+
+    const body = (await res.json().catch(() => null)) as { name?: unknown; thread?: { name?: unknown } } | null;
+    const threadName = typeof body?.thread?.name === "string" && body.thread.name ? body.thread.name : null;
+    const messageName = typeof body?.name === "string" && body.name ? body.name : null;
+    if (!threadName || !messageName) {
+        // Chat ACCEPTED it — the message is very probably in the space — but we
+        // cannot bridge it, so the sweep can never find replies to it. Unknown,
+        // not rejected: reposting would double up on a card that did land.
+        console.error("[receipt-request-cards] post lacked a bridge identity", {
+            owner: card.owner,
+            hasThread: threadName !== null,
+            hasMessage: messageName !== null,
+        });
+        return { kind: "unknown", owner: card.owner, reason: "no-bridge-identity" };
+    }
+    return { kind: "delivered", owner: card.owner, threadName, messageName };
 }

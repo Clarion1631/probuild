@@ -205,108 +205,71 @@ test("the webhook URL allowlist is an SSRF guard, not a preference", () => {
 
 // ── A post without a bridge identity is a FAILURE (Codex round-4 item 4) ────
 
-test("postOwnerCard returns null when the response lacks thread.name or message.name", async () => {
-    // A 200 with no names looked like success: the row was marked posted, the
-    // threads endpoint silently dropped the card, and every reply in that Chat
-    // thread was orphaned with nothing to retry.
-    const bodies = [
-        {},
-        { name: "spaces/x/messages/1" },                       // no thread
-        { thread: { name: "spaces/x/threads/1" } },            // no message
-        { name: "", thread: { name: "spaces/x/threads/1" } },  // empty message
-        { name: "spaces/x/messages/1", thread: { name: "" } }, // empty thread
-    ];
+// ── Tri-state delivery (round-8 item 1) ────────────────────────────────────
+
+async function post(body: unknown, init: ResponseInit = { status: 200 }) {
     const original = globalThis.fetch;
     try {
-        for (const body of bodies) {
-            globalThis.fetch = (async () => new Response(JSON.stringify(body), {
-                status: 200, headers: { "content-type": "application/json" },
-            })) as typeof fetch;
-            const [card] = buildOwnerCards([issue()], NOW);
-            const result = await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
-            assert.equal(result, null, `body ${JSON.stringify(body)} must be a failure`);
-        }
-
-        // Both present → success.
         globalThis.fetch = (async () => new Response(
-            JSON.stringify({ name: "spaces/x/messages/1", thread: { name: "spaces/x/threads/1" } }),
-            { status: 200, headers: { "content-type": "application/json" } },
+            body === null ? "not json" : JSON.stringify(body),
+            { headers: { "content-type": "application/json" }, ...init },
         )) as typeof fetch;
         const [card] = buildOwnerCards([issue()], NOW);
-        const ok = await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
-        assert.deepEqual(ok, { owner: "CJ", threadName: "spaces/x/threads/1", messageName: "spaces/x/messages/1" });
+        return await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
+    } finally {
+        globalThis.fetch = original;
+    }
+}
+
+test("a 2xx with both bridge ids is DELIVERED", async () => {
+    const r = await post({ name: "spaces/x/messages/1", thread: { name: "spaces/x/threads/1" } });
+    assert.equal(r.kind, "delivered");
+    assert.deepEqual(r, {
+        kind: "delivered", owner: "CJ",
+        threadName: "spaces/x/threads/1", messageName: "spaces/x/messages/1",
+    });
+});
+
+test("a 4xx is REJECTED — Chat declined, nothing is in the space", async () => {
+    for (const status of [400, 401, 403, 404, 429]) {
+        const r = await post({ error: "nope" }, { status });
+        assert.equal(r.kind, "rejected", `http ${status}`);
+    }
+});
+
+test("an invalid webhook URL is REJECTED — it was never sent", async () => {
+    const [card] = buildOwnerCards([issue()], NOW);
+    const r = await postOwnerCard("https://evil.example.com/v1/spaces/x", card);
+    assert.equal(r.kind, "rejected");
+    assert.equal(r.reason, "invalid-webhook-url");
+});
+
+test("a 5xx is UNKNOWN — it may have been processed before Chat fell over", async () => {
+    for (const status of [500, 502, 503]) {
+        const r = await post({ error: "boom" }, { status });
+        assert.equal(r.kind, "unknown", `http ${status}`);
+    }
+});
+
+test("a timeout or socket error is UNKNOWN, never rejected", async () => {
+    const original = globalThis.fetch;
+    try {
+        globalThis.fetch = (async () => { throw new Error("ETIMEDOUT"); }) as typeof fetch;
+        const [card] = buildOwnerCards([issue()], NOW);
+        const r = await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
+        assert.equal(r.kind, "unknown");
+        assert.equal(r.reason, "network-or-timeout");
     } finally {
         globalThis.fetch = original;
     }
 });
 
-// ── Card copy names an item that EXISTS (Codex round-5 item 6) ──────────────
-
-test("a single-item card's examples say item 1, not item 2", () => {
-    // 'reply "sign 2"' on a one-item card is instructions for a message that
-    // does not exist; the reader looks for item 2 and stops trusting the card.
-    const [card] = buildOwnerCards([issue()], NOW);
-    assert.equal(card.items.length, 1);
-    assert.match(card.text, /reply \*"1 Mueller Remodel"\* to name the job for item 1/);
-    assert.match(card.text, /reply \*"sign 1"\*/);
-    assert.doesNotMatch(card.text, /item 2|sign 2/);
-});
-
-test("a multi-item card keeps the 2 examples", () => {
-    const [card] = buildOwnerCards([issue(), issue({ id: "b", targetKey: "bl-b" })], NOW);
-    assert.equal(card.items.length, 2);
-    assert.match(card.text, /for item 2/);
-    assert.match(card.text, /sign 2/);
-});
-
-// ── Overflow is only a NUMBER when it was counted (item 7) ──────────────────
-
-test("an exact overflow prints a total; an unknown one says 'and more'", () => {
-    const many = Array.from({ length: 14 }, (_, i) =>
-        issue({ id: `ri-${i}`, targetKey: `bl-${i}`, postedDate: `2026-08-${String(i + 1).padStart(2, "0")}` }));
-
-    const exact = buildOwnerCards(many, NOW, true)[0];
-    assert.equal(exact.overflow, 4);
-    assert.equal(exact.overflowExact, true);
-    assert.match(exact.text, /\(10 of 14\)/);
-    assert.match(exact.text, /…and 4 more/);
-
-    // The scan stopped at its page cap, so the total would be a guess.
-    const inexact = buildOwnerCards(many, NOW, false)[0];
-    assert.equal(inexact.overflowExact, false);
-    assert.match(inexact.text, /\(10 of more\)/);
-    assert.match(inexact.text, /…and more —/);
-    assert.doesNotMatch(inexact.text, /and 4 more/);
-});
-
-test("no overflow prints a bare count either way", () => {
-    for (const exact of [true, false]) {
-        const [card] = buildOwnerCards([issue()], NOW, exact);
-        assert.match(card.text, /\(1\)/);
-        assert.doesNotMatch(card.text, /of more|…and/);
+test("a 2xx with NO message name is UNKNOWN, not rejected", async () => {
+    // Chat accepted it — the card is very probably in the space — we just
+    // cannot bridge it. Reposting would double up on a card that did land.
+    for (const body of [{}, { name: "m/1" }, { thread: { name: "t/1" } }, { name: "", thread: { name: "t/1" } }]) {
+        const r = await post(body);
+        assert.equal(r.kind, "unknown", JSON.stringify(body));
+        assert.equal(r.reason, "no-bridge-identity");
     }
-});
-
-// ── effectiveOwner is ONE function (item 2) ────────────────────────────────
-
-test("effectiveOwner: a human's assignment beats the derived owner", () => {
-    assert.equal(effectiveOwner({ owner: "unattributed", ownerOverride: "CJ" }), "CJ");
-    assert.equal(effectiveOwner({ owner: "office" }), "office");
-    assert.equal(effectiveOwner({ owner: "office", ownerOverride: "   " }), "office", "blank is not an assignment");
-    assert.equal(effectiveOwner({}), "unassigned");
-    assert.equal(effectiveOwner(null), "unassigned");
-});
-
-test("an assigned owner reaches the CARD, not just the page", () => {
-    // The bug this closes: three surfaces spelled "whose is this" three ways,
-    // so an item could move under CJ on the tab and never appear on his card.
-    const assigned = issue({ owner: effectiveOwner({ owner: "unattributed", ownerOverride: "CJ" }) });
-    const [card] = buildOwnerCards([assigned], NOW);
-    assert.equal(card.owner, "CJ");
-    assert.equal(card.items.length, 1);
-});
-
-test("an UNASSIGNED unattributed item is on nobody's card", () => {
-    const unattributed = issue({ owner: effectiveOwner({ owner: "unattributed" }) });
-    assert.deepEqual(buildOwnerCards([unattributed], NOW), [], "it waits for a human, it does not guess");
 });

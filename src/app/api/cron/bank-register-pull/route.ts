@@ -9,6 +9,7 @@ import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import {
     BANK_REGISTER_ACCOUNT,
+    type PullWindowState,
     BANK_REGISTER_PULL_DAYS,
     runBankRegisterPull,
     type BankRegisterIngestLine,
@@ -52,6 +53,41 @@ const CLAIM_LOCK_KEY = "bank-register-pull";
  * tomorrow night.
  */
 const RUN_LEASE_MS = 20 * 60_000;
+
+/**
+ * Outer wall-clock budget across fetch + ingest + reconcile + mint.
+ * `maxDuration` is 60s; stopping at 50 leaves room to persist the window state
+ * and return a real answer instead of being killed with nothing recorded.
+ */
+const PULL_BUDGET_MS = 50_000;
+
+/** Where the pull window's high-water mark and last deep sweep live. */
+const WINDOW_STATE_KEY = "bankRegisterPullWindow";
+
+async function readWindowState(): Promise<PullWindowState> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
+        if (!row?.value) return { highWater: null, lastFullSweep: null };
+        const parsed = JSON.parse(row.value) as Partial<PullWindowState>;
+        return {
+            highWater: typeof parsed.highWater === "string" ? parsed.highWater : null,
+            lastFullSweep: typeof parsed.lastFullSweep === "string" ? parsed.lastFullSweep : null,
+        };
+    } catch {
+        // A corrupt or unreadable state is "we know nothing", which plans the
+        // widest safe window — never a narrow one built on a bad mark.
+        return { highWater: null, lastFullSweep: null };
+    }
+}
+
+async function saveWindowState(next: PullWindowState): Promise<void> {
+    const value = JSON.stringify(next);
+    await prisma.automationSetting.upsert({
+        where: { key: WINDOW_STATE_KEY },
+        update: { value },
+        create: { key: WINDOW_STATE_KEY, value },
+    });
+}
 
 export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
@@ -186,9 +222,15 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
 class ObservationClaimedError extends Error {}
 
 async function runPull() {
+    const startedAt = Date.now();
+    const windowState = await readWindowState();
     const summary = await runBankRegisterPull({
         account: BANK_REGISTER_ACCOUNT,
         days: BANK_REGISTER_PULL_DAYS,
+        windowState,
+        saveWindowState,
+        budgetMs: PULL_BUDGET_MS,
+        elapsedMs: () => Date.now() - startedAt,
 
         fetchRows: async (startDate, endDate) => {
             // Tokens are fetched lazily INSIDE fetchBankRegister (only on a

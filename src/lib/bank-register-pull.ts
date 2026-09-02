@@ -177,6 +177,92 @@ export function isYmd(value: unknown): value is string {
     return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === value;
 }
 
+
+/** Overlap re-pulled on every run, so an edit near the boundary is not missed. */
+export const PULL_OVERLAP_DAYS = 3;
+/** The most one run will ask QBO for. Bigger windows time out; this one continues. */
+export const PULL_MAX_WINDOW_DAYS = 60;
+/** The periodic deep sweep, to catch entries BACKDATED behind the high-water mark. */
+export const PULL_FULL_SWEEP_DAYS = 60;
+
+export interface PullWindowState {
+    /** Latest TxnDate we have successfully pulled, YYYY-MM-DD, or null. */
+    highWater: string | null;
+    /** When the last full 60-day sweep ran, YYYY-MM-DD, or null. */
+    lastFullSweep: string | null;
+}
+
+export interface PullWindow {
+    startDate: string;
+    endDate: string;
+    /** True when this run is the weekly deep sweep. */
+    fullSweep: boolean;
+    /** True when the window was capped and more history remains behind it. */
+    continues: boolean;
+}
+
+/**
+ * Decide what to ask QuickBooks for.
+ *
+ * A FIXED "last 7 days" window is wrong in both directions. It re-derives the
+ * same week every night (so a backlog behind it is never reached), and it
+ * silently misses anything QuickBooks records with an OLDER TxnDate after the
+ * fact — a backdated expense, a re-entered check. So:
+ *
+ *  - normally, from (high-water − 3 days) to today. The overlap re-pulls the
+ *    boundary, because an entry edited on the day we last stopped would
+ *    otherwise fall in the seam.
+ *  - capped at 60 days per run. A wider ask times out at QBO, and the cap sets
+ *    `continues` so the next invocation picks up where this one stopped rather
+ *    than starting over.
+ *  - once a week, a full 60-day sweep regardless of the high-water mark. That
+ *    is the only thing that finds a BACKDATED entry, which by definition sits
+ *    behind a mark that has already moved past it.
+ */
+export function planPullWindow(state: PullWindowState, now: Date): PullWindow {
+    const today = new Date(now).toISOString().slice(0, 10);
+    const dayMs = 86_400_000;
+    const ymd = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    const todayMs = Date.parse(`${today}T00:00:00Z`);
+
+    const sweepDue = state.lastFullSweep === null
+        || todayMs - Date.parse(`${state.lastFullSweep}T00:00:00Z`) >= 7 * dayMs;
+    if (sweepDue) {
+        return {
+            startDate: ymd(todayMs - (PULL_FULL_SWEEP_DAYS - 1) * dayMs),
+            endDate: today,
+            fullSweep: true,
+            continues: false,
+        };
+    }
+
+    const fromMark = state.highWater === null
+        ? todayMs - (PULL_MAX_WINDOW_DAYS - 1) * dayMs
+        : Date.parse(`${state.highWater}T00:00:00Z`) - PULL_OVERLAP_DAYS * dayMs;
+    const startMs = Math.min(fromMark, todayMs);
+    const spanDays = Math.floor((todayMs - startMs) / dayMs) + 1;
+    if (spanDays > PULL_MAX_WINDOW_DAYS) {
+        // Too much history for one ask: take the OLDEST slice first, so the
+        // backlog drains forward and the high-water mark advances each run.
+        return {
+            startDate: ymd(startMs),
+            endDate: ymd(startMs + (PULL_MAX_WINDOW_DAYS - 1) * dayMs),
+            fullSweep: false,
+            continues: true,
+        };
+    }
+    return { startDate: ymd(startMs), endDate: today, fullSweep: false, continues: false };
+}
+
+/** The newest TxnDate in a converted batch — the new high-water mark. */
+export function highWaterOf(lines: readonly BankRegisterIngestLine[], previous: string | null): string | null {
+    let best = previous;
+    for (const line of lines) {
+        if (best === null || line.postedDate > best) best = line.postedDate;
+    }
+    return best;
+}
+
 // ── Orchestration ───────────────────────────────────────────────────────────
 
 export interface BankRegisterIngestResult {
@@ -209,6 +295,14 @@ export interface BankRegisterPullDependencies {
     now?(): number;
     account?: string;
     days?: number;
+    /** The persisted window state; omitted, the caller gets the legacy fixed window. */
+    windowState?: PullWindowState;
+    /** Persists the advanced high-water mark and sweep date. Errors fail the run. */
+    saveWindowState?(next: PullWindowState): Promise<void>;
+    /** Outer wall-clock budget for the whole pull. */
+    budgetMs?: number;
+    /** Monotonic clock, injectable so the budget is testable. */
+    elapsedMs?(): number;
 }
 
 export interface BankRegisterPullSummary {
@@ -235,6 +329,13 @@ export interface BankRegisterPullSummary {
      */
     conflictQbTxnIds?: string[];
     reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number } | null;
+    /** True when the run stopped on its own budget with work left behind. */
+    continues?: boolean;
+    /** Batches not attempted this invocation — the durable continuation point. */
+    remainingBatches?: number;
+    /** This run's window, and whether it was the weekly deep sweep. */
+    fullSweep?: boolean;
+    highWater?: string | null;
     /** Why minting was held back this run, when it was. */
     mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed";
     minted?: { minted: number; skipped: Record<string, number> } | null;
@@ -255,8 +356,14 @@ export async function runBankRegisterPull(
     const account = dependencies.account ?? BANK_REGISTER_ACCOUNT;
     const nowMs = dependencies.now ? dependencies.now() : Date.now();
     const days = dependencies.days ?? BANK_REGISTER_PULL_DAYS;
-    const endDate = new Date(nowMs).toISOString().slice(0, 10);
-    const startDate = ymdDaysAgo(days - 1, nowMs);
+    // The window is PLANNED from the persisted high-water mark when the caller
+    // keeps one; the fixed-days form is the fallback for tests and one-offs.
+    const planned = dependencies.windowState
+        ? planPullWindow(dependencies.windowState, new Date(nowMs))
+        : { startDate: ymdDaysAgo(days - 1, nowMs), endDate: new Date(nowMs).toISOString().slice(0, 10), fullSweep: false, continues: false };
+    const { startDate, endDate } = planned;
+    const elapsed = dependencies.elapsedMs ?? (() => 0);
+    const budgetMs = dependencies.budgetMs ?? Number.POSITIVE_INFINITY;
 
     const fetched = await dependencies.fetchRows(startDate, endDate);
     const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
@@ -289,11 +396,26 @@ export async function runBankRegisterPull(
         summary.error = "qbo-duplicate-conflict";
         summary.conflictQbTxnIds = [...conflicts];
     }
+    summary.fullSweep = planned.fullSweep;
     // NOTE: no early return on an empty fetch. Reconciliation still has to run —
     // yesterday's observations may be waiting for a canonical line that only
     // arrived today, and skipping the backlog because TONIGHT'S register was
     // empty is how those sat unlinked indefinitely.
-    for (const batch of chunkLines(lines, BANK_REGISTER_CHUNK_SIZE)) {
+    // ── OUTER WALL-CLOCK BUDGET ──────────────────────────────────────────────
+    // The fetch already happened; ingest, reconcile and mint all still have to
+    // fit. Being killed by the platform mid-ingest wrote no high-water mark at
+    // all, so the next run re-fetched the same window and died at the same
+    // point. Now the run stops on its own terms, records how far it got, and
+    // says so.
+    const batches = chunkLines(lines, BANK_REGISTER_CHUNK_SIZE);
+    let batchIndex = 0;
+    for (const batch of batches) {
+        if (elapsed() >= budgetMs) {
+            summary.continues = true;
+            summary.remainingBatches = batches.length - batchIndex;
+            break;
+        }
+        batchIndex++;
         const { status, body } = await dependencies.ingest(account, batch);
         if (status === 200 && body?.ok) {
             summary.inserted += body.inserted ?? 0;
@@ -358,6 +480,30 @@ export async function runBankRegisterPull(
             summary.error = summary.error ?? "mint-failed";
             console.error("[bank-register-pull] mint failed", error instanceof Error ? error.message : "UnknownError");
         }
+    }
+
+    // THE HIGH-WATER MARK MOVES ONLY ON A CLEAN, COMPLETE RUN. Advancing it
+    // after a partial or conflicted pull would step the next run's window past
+    // rows this one never actually stored.
+    if (dependencies.saveWindowState && dependencies.windowState && summary.ok && !summary.continues) {
+        const highWater = highWaterOf(lines, dependencies.windowState.highWater);
+        summary.highWater = highWater;
+        try {
+            await dependencies.saveWindowState({
+                highWater,
+                lastFullSweep: planned.fullSweep
+                    ? endDate
+                    : dependencies.windowState.lastFullSweep,
+            });
+        } catch (error) {
+            // Same reasoning as the sweep's cursor: work committed, the
+            // checkpoint did not, so the run must not report success.
+            summary.ok = false;
+            summary.error = summary.error ?? "window-state-write-failed";
+            console.error("[bank-register-pull] window state write failed", error instanceof Error ? error.message : "UnknownError");
+        }
+    } else if (planned.continues) {
+        summary.continues = true;
     }
 
     return summary;
