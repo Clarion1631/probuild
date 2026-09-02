@@ -16,6 +16,36 @@ import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
 
+/**
+ * The route reaches Prisma through specifiers this file's require() patch does
+ * not intercept (`./prisma` from inside src/lib), so a real client is
+ * constructed at import time. It never connects: every query here is faked.
+ * But constructing it DEMANDS the variable, and CI has no `.env` to fall back
+ * on.
+ *
+ * `pgbouncer=true` is REQUIRED, not decoration: src/lib/prisma.ts refuses a
+ * URL without it (the Supabase transaction pooler needs it, and shipping
+ * without it once took the site down). The bare value other tests use is
+ * enough for them because they never reach that module.
+ */
+process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test?pgbouncer=true";
+
+/**
+ * EVERY specifier that resolves to the Prisma singleton, not just the alias.
+ *
+ * 33 modules under src/lib import it as `./prisma`, and one of them is
+ * company-timezone — which this route calls to date the expense. Patching only
+ * `@/lib/prisma` left that call on the REAL client: with a populated `.env` it
+ * queried the live database, and in CI it hung for four seconds and then
+ * failed. `@prisma/client` is deliberately NOT in this set.
+ */
+const PRISMA_SPECIFIERS = new Set([
+    "@/lib/prisma",
+    "./prisma",
+    "../prisma",
+    "../lib/prisma",
+]);
+
 /** What the LOCKED estimate read answers. A test moves this to model a race. */
 let lockedEstimateProject: string | null;
 let created: Record<string, unknown>[];
@@ -54,7 +84,14 @@ before(async () => {
         this: NodeModule,
         id: string,
     ) {
-        if (id === "@/lib/prisma") return { prisma: fakePrisma };
+        // EVERY specifier that resolves to our Prisma singleton, not just the
+        // alias. 33 modules under src/lib import it as `./prisma`, and one of
+        // them is company-timezone, which this route calls on every request.
+        // Patching only the alias left that call on the REAL client: with a
+        // populated .env it queried the live database, and in CI it hung for
+        // four seconds before failing. `@prisma/client` is deliberately not
+        // matched here.
+        if (PRISMA_SPECIFIERS.has(id)) return { prisma: fakePrisma };
         if (id === "@/lib/mobile-auth") {
             return {
                 authenticateMobileOrSession: async () => ({ ok: true, user: { id: "u1" } }),
