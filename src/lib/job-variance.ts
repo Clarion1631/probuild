@@ -139,6 +139,24 @@ export interface VarianceCoverage {
     unattributedGross: number;
 }
 
+/**
+ * Which phase a single actual cost lands on: its own cost code if it has one,
+ * otherwise the cost code of the estimate item it is linked to, otherwise
+ * nothing (unattributed).
+ *
+ * THE definition of "is this cost attributed", used both by the variance
+ * reconciliation below and by the earned-margin digest's "biggest unattributed
+ * cost". A second copy would drift: an expense with a null `costCodeId` but an
+ * `itemId` pointing at a coded item IS attributed, and a naive
+ * `costCodeId IS NULL` filter reports it as a hole that does not exist.
+ */
+export function resolveActualCostCodeId(
+    explicitCostCodeId: string | null | undefined,
+    linkedItemCostCodeId: string | null | undefined
+): string | null {
+    return explicitCostCodeId ?? linkedItemCostCodeId ?? null;
+}
+
 /** "Labor" vs everything else. A null cost type falls back to the legacy `type` string. */
 export function isLaborItem(item: Pick<VarianceEstimateItem, "costTypeName" | "type">): boolean {
     return (item.costTypeName ?? item.type ?? "") === "Labor";
@@ -268,7 +286,7 @@ export function computeProjectVariance(input: {
         explicitCostCodeId: string | null | undefined,
         linkedItem: (ItemVariance & { costCodeId: string | null }) | undefined
     ): { costCodeId: string | null; item: (ItemVariance & { costCodeId: string | null }) | undefined } => {
-        const costCodeId = explicitCostCodeId ?? linkedItem?.costCodeId ?? null;
+        const costCodeId = resolveActualCostCodeId(explicitCostCodeId, linkedItem?.costCodeId);
         if (!costCodeId) return { costCodeId: null, item: undefined };
         // Only credit the item when it lives under the phase being charged.
         const item = linkedItem && linkedItem.costCodeId === costCodeId ? linkedItem : undefined;
