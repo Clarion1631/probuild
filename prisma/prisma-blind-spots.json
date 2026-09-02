@@ -80,6 +80,11 @@
       "def": "CHECK ((((source = 'STATEMENT'::text) AND (\"statementImportId\" IS NOT NULL) AND (\"bankLineId\" IS NOT NULL)) OR ((source = 'QBO_REGISTER'::text) AND (\"statementImportId\" IS NULL))))"
     },
     {
+      "name": "BankLine_sourceOfRecord_check",
+      "table": "\"BankLine\"",
+      "def": "CHECK ((\"sourceOfRecord\" = ANY (ARRAY['STATEMENT'::text, 'QBO'::text])))"
+    },
+    {
       "name": "BankLine_state_check",
       "table": "\"BankLine\"",
       "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
