@@ -106,6 +106,15 @@ Phase 3 note (not Phase 5 work): `apps/mobile/app/(tabs)/expenses.tsx` will be r
 
 ## 7. Risks / open questions (max 5)
 
+> **Implementation note (2026-09-01).** The three HUMAN DECISION items below did not block the build. They now live as
+> env-overridable **defaults** in `src/lib/payroll-config.ts`, labelled there and in `.env.example` as pending Justin:
+> `PAYROLL_PERIOD=biweekly`, `PAYROLL_WEEK_START=monday`, and `PAYROLL_SALARIED_EMAILS` defaulting to CJ + Richard.
+> Changing any of them is an env change, not a code change. The Gusto tier question (risk 1) only affects the CSV
+> header names, which are one exported constant each in `src/lib/gusto-export-core.ts`
+> (`GUSTO_SUMMARY_CSV_HEADER` / `GUSTO_DETAIL_CSV_HEADER`). The endpoint and the `PayrollPeriod` table take an
+> arbitrary half-open range regardless, so none of this constrains what a period can be.
+
+
 1. ASSUMPTION — Gusto import format. Plus/Premium hours CSV is assumed to be one row per employee per pay period (regular / overtime / double overtime / PTO / sick); the Simple tier may only offer per-employee manual Hours entry. Parent-plan open question 3 (which tier?) is still unanswered; the parallel run (section 4, step 4) validates against the real template before anything depends on header names.
 2. HUMAN DECISION REQUIRED — pay period definition: weekly or biweekly, and which weekday it starts on. Schema and endpoint take an arbitrary range so the build is not blocked, but the /manager/payroll-export default and the parallel comparison need Justin's answer before go-live.
 3. Salaried staff (CJ at $92k, Richard at $80k — see memory gtr-labor-rates-co-pricing): they punch the clock for job costing, but Gusto pays them salary. The summary CSV should EXCLUDE salaried users while the detail CSV keeps them for costing. Needs Justin to confirm exactly who is salaried in Gusto (proposal: exclude role ADMIN plus a per-user flag if needed).
