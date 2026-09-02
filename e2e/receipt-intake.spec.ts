@@ -217,9 +217,13 @@ test.describe("intake POST", () => {
             data: { state: "STAGING", storagePath: `receipts/intake/${created.body.id}-never-uploaded.png` },
         });
 
+        // 409, NEVER a 2xx. The forwarders retry only non-2xx: a 202 read as
+        // "accepted" would make a Drive script move its source file out of the
+        // pickup folder while nothing durable existed on our side.
         const retry = await postIntake(request, intakeBody({ sourceRef: ref }));
-        expect(retry.res.status()).toBe(202);
-        expect(retry.body.status).toBe("staging");
+        expect(retry.res.status()).toBe(409);
+        expect(retry.body.ok).toBe(false);
+        expect(retry.body.error).toBe("staging-incomplete");
         expect(retry.body.id).toBe(created.body.id);
         expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.state).toBe("STAGING");
     });
@@ -578,6 +582,13 @@ test.describe("archive callback", () => {
         const replay = await archive("DRIVE1");
         expect(replay.status()).toBe(200);
         expect((await replay.json()).alreadyArchived).toBe(true);
+
+        // Concurrent identical callbacks: both read BOOKED, the winner archives
+        // and the loser's conditional update matches nothing. The loser must
+        // re-read and report success — a 409 there made the mirror treat its
+        // OWN successful archive as a failure.
+        const [a, b] = await Promise.all([archive("DRIVE1"), archive("DRIVE1")]);
+        expect([a.status(), b.status()]).toEqual([200, 200]);
 
         // A DIFFERENT file id on an archived row is not a replay — two Drive
         // copies exist and somebody has to say which one counts.

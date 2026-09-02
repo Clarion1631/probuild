@@ -15,6 +15,7 @@
  */
 import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
+import { startOfDateInTimeZone } from "@/lib/tz-date";
 import { backoffMs, MAX_BOOK_ATTEMPTS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
 import { resolveSuggestedCostCodeId, type BookableRow, type BookResult } from "./book";
 import { QBTimeoutError } from "@/lib/quickbooks";
@@ -119,9 +120,17 @@ export interface WorkerDependencies {
     deferRead: (rowId: string, busyPasses: number, reason: string) => Promise<void>;
     /** A transient fault anywhere else: spend an attempt and back off. */
     retryRow: (rowId: string, attempts: number, nextRetryAt: Date, reason: string) => Promise<void>;
+    /**
+     * RECEIVED -> READ, and the release of the claim lease. Called ONCE, after
+     * every dedup net has answered — never before, or an overlapping run could
+     * reclaim a half-routed row and book it.
+     */
+    finishRouting: (rowId: string, stateReason: string | null) => Promise<void>;
     now: () => Date;
     /** Elapsed-time source for the soft deadline. */
     monotonicMs: () => number;
+    /** The company's configured time zone — business dates are anchored to it, never UTC. */
+    companyTimeZone: () => Promise<string>;
 }
 
 export interface StrongOwner {
@@ -166,11 +175,58 @@ function centsOf(amount: string): number | null {
     return Math.round(n * 100);
 }
 
-/** "YYYY-MM-DD" at UTC midnight — the shape a @db.Date column round-trips. */
-export function dateOnly(value: string): Date | null {
+/**
+ * The calendar day the receipt was written, anchored in the COMPANY's time
+ * zone — not UTC.
+ *
+ * A receipt read as 2026-08-03 was stored as 2026-08-03T00:00:00Z, which in
+ * America/Los_Angeles is 5pm on August 2nd. Every date-range report that
+ * bounds by local midnight (job cost by month, the WA tax period, variance by
+ * week) therefore put roughly a third of receipts in the wrong bucket, and the
+ * error is invisible unless you already suspect it. Everything else in the app
+ * anchors business dates with startOfDateInTimeZone; this now does too.
+ */
+export function dateOnly(value: string, timeZone: string): Date | null {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
-    const parsed = new Date(`${value}T00:00:00.000Z`);
-    return Number.isFinite(parsed.getTime()) ? parsed : null;
+    try {
+        const at = startOfDateInTimeZone(value, timeZone);
+        return Number.isFinite(at.getTime()) ? at : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * The most sales tax a receipt can plausibly carry, as a fraction of the total.
+ *
+ * Washington's highest combined rate is about 10.6%; 12% leaves headroom for a
+ * local surcharge without accepting nonsense. The model reads the TAX line off
+ * a photo, and a misread decimal point ("$2.92" as "$292") or a grabbed
+ * subtotal posts real money to the reimbursable-sales-tax account and inflates
+ * a state filing. This is a SANITY bound, not a tax calculation — the tax that
+ * survives it is still whatever the document said.
+ */
+export const MAX_PLAUSIBLE_TAX_RATE = 0.12;
+
+/**
+ * Accept the OCR'd tax only when it is between zero and MAX_PLAUSIBLE_TAX_RATE
+ * of the total, rounded UP to the cent so a legitimate rounding artefact at the
+ * boundary is not rejected.
+ *
+ * An implausible value is DROPPED, not parked: the receipt itself is fine and
+ * its total is what the bank charge will match, so booking it is right. The row
+ * simply books as a single un-split line and carries a note, which is exactly
+ * what happens for a receipt with no readable tax line at all.
+ */
+export function validateTaxCents(
+    taxCents: number | null,
+    totalCents: number | null,
+): { taxCents: number | null; implausible: boolean } {
+    if (taxCents === null || taxCents <= 0) return { taxCents: null, implausible: false };
+    if (totalCents === null || totalCents <= 0) return { taxCents: null, implausible: true };
+    const ceiling = Math.ceil(totalCents * MAX_PLAUSIBLE_TAX_RATE);
+    if (taxCents > ceiling) return { taxCents: null, implausible: true };
+    return { taxCents, implausible: false };
 }
 
 export function toDateStr(date: Date): string {
@@ -359,11 +415,16 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     const totalCents = centsOf(keys.amount);
     const taxCentsRaw = centsOf(read.taxAmount || "0.00");
-    const taxCents = taxCentsRaw && taxCentsRaw > 0 ? taxCentsRaw : null;
+    const tax = validateTaxCents(
+        taxCentsRaw && taxCentsRaw > 0 ? taxCentsRaw : null,
+        totalCents,
+    );
+    const taxCents = tax.taxCents;
+    const timeZone = await deps.companyTimeZone();
 
     const base = {
         vendor: read.vendor || null,
-        txnDate: dateOnly(keys.dateStr),
+        txnDate: dateOnly(keys.dateStr, timeZone),
         totalCents,
         taxCents,
         docType: read.docType || null,
@@ -396,6 +457,16 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // is the only net that can answer DUPLICATE on its own; and only if the
     // strong net is silent do we fall back to the weak one, which by design
     // never decides anything itself.
+    // A dropped tax reading is recorded, never parked: the receipt is fine and
+    // its TOTAL is what the bank charge matches, so it must still book. The note
+    // rides along with whatever state routing picks so the row shows it in the
+    // queue. `note()` is applied to every write below rather than to one branch,
+    // because a document can be both a duplicate and a bad tax read.
+    const note = (reason: string | null): string | null => {
+        if (!tax.implausible) return reason;
+        return reason ? `${reason};tax-implausible` : "tax-implausible";
+    };
+
     const gate = routeState(routeInput, { strong: null, weak: null }, !!row.projectId);
     if (gate.state !== "READ") {
         // A multi-doc, a non-receipt, or a $0/negative misread must never hold
@@ -404,7 +475,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         await deps.applyRead(row.id, {
             ...base,
             state: gate.state,
-            stateReason: gate.stateReason,
+            stateReason: note(gate.stateReason),
             dedupStrongKey: null,
             duplicateOfId: gate.duplicateOfId,
         });
@@ -412,17 +483,29 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     }
 
     // The strong claim IS the partial unique index: a rejection is the hit.
+    //
+    // The row deliberately stays RECEIVED here, and keeps its claim lease.
+    // Publishing READ at this point was wrong twice over:
+    //   - the lease was cleared before the weak lookup ran, so an overlapping
+    //     invocation could reclaim the row and BOOK it while this one was still
+    //     routing — and this one would then regress it to NEEDS_REVIEW.
+    //   - if the weak lookup then threw, the row was left in READ having never
+    //     been weak-checked. In shadow mode READ is a terminal parking state,
+    //     so it would sit there forever while the daily comparison counted it
+    //     as fully deduped. A silent false negative in the one report the
+    //     cutover decision rests on.
+    // READ is now reached only by finishRouting(), after every net has spoken.
     const applied = await deps.applyRead(row.id, {
         ...base,
-        state: "READ",
-        stateReason: null,
+        state: "RECEIVED",
+        stateReason: note(null),
         dedupStrongKey: keys.strong,
         duplicateOfId: null,
     });
 
     if (applied.strongOwner) {
         const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, !!row.projectId);
-        await deps.applyState(row.id, second.state, second.stateReason, {
+        await deps.applyState(row.id, second.state, note(second.stateReason), {
             ...base,
             dedupStrongKey: null,
             duplicateOfId: second.duplicateOfId,
@@ -434,15 +517,23 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // is a plain query and never a claim (:1591-1596); a hit only ever asks a
     // human, because two genuine same-day purchases from one vendor for the
     // same amount do happen.
+    //
+    // A THROW here leaves the row RECEIVED with its keys already written, which
+    // is exactly right: the next pass re-runs the identical claim (updating a
+    // row to the strong key it already holds is a no-op, not a conflict) and
+    // re-checks the weak net.
     const weak = await deps.findWeakHit(row.id, keys.weak);
     if (weak) {
         const third = routeState(routeInput, { strong: null, weak }, !!row.projectId);
         // The strong key stays claimed: this row is still the live owner of
         // that date|ref, and releasing it would let a third copy book.
-        await deps.applyState(row.id, third.state, third.stateReason);
+        await deps.applyState(row.id, third.state, note(third.stateReason));
         return third.state;
     }
 
+    // Routing is complete. This is the ONLY path to READ, and the only place
+    // the claim lease is released.
+    await deps.finishRouting(row.id, note(null));
     return "READ";
 }
 

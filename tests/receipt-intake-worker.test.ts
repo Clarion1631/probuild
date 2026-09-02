@@ -17,6 +17,8 @@ import {
     isUniqueViolation,
     toDateStr,
     MAX_BUSY_PASSES,
+    MAX_PLAUSIBLE_TAX_RATE,
+    validateTaxCents,
     RUN_SOFT_DEADLINE_MS,
     type ReadPatch,
     type WorkerDependencies,
@@ -58,6 +60,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         createdAt: new Date("2026-08-20T09:00:00.000Z"),
         dedupWeakKey: null,
         busyPasses: 0,
+        lastError: null,
         ...overrides,
     };
 }
@@ -85,6 +88,7 @@ interface Harness {
     applied: ReadPatch[];
     states: { id: string; state: string; reason: string | null }[];
     promoted: string[];
+    finished: { id: string; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
     claimOpts: { requeueDryRunParked: boolean }[];
@@ -94,7 +98,7 @@ interface Harness {
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
-        reads: 0, books: 0, applied: [], states: [], promoted: [], deferred: [],
+        reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
         retried: [], claimOpts: [], sweepCalls: 0, clock: 0,
         deps: null as unknown as WorkerDependencies,
     };
@@ -108,6 +112,8 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
         findWeakHit: async () => null,
         applyState: async (id, state, reason) => { h.states.push({ id, state, reason }); },
+        finishRouting: async (id, stateReason) => { h.finished.push({ id, stateReason }); },
+        companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
         book: async () => { h.books++; return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult; },
         applyBookResult: async () => {},
@@ -127,7 +133,10 @@ test("DRY RUN: a received row is read, deduped and routed — and never booked",
     assert.equal(h.reads, 1, "the reader DOES run in shadow mode — that is the point");
     assert.equal(h.books, 0, "zero booking calls");
     assert.equal(h.applied.length, 1);
-    assert.equal(h.applied[0].state, "READ");
+    // The claim leaves the row RECEIVED and holding its lease; finishRouting is
+    // the only thing that publishes READ, after every dedup net has answered.
+    assert.equal(h.applied[0].state, "RECEIVED");
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
     assert.equal(h.applied[0].vendor, "Lowes");
     assert.equal(h.applied[0].totalCents, 36498);
     assert.equal(h.applied[0].taxCents, 2920);
@@ -456,11 +465,48 @@ test("isUniqueViolation is about the ERROR CODE, not Prisma's meta text", () => 
     assert.equal(isUniqueViolation(new Error("plain")), false);
 });
 
-test("dateOnly keeps a calendar day at UTC midnight, the way @db.Date round-trips", () => {
-    assert.equal(dateOnly("2026-08-03")!.toISOString(), "2026-08-03T00:00:00.000Z");
-    assert.equal(dateOnly("2026-13-03"), null);
-    assert.equal(dateOnly("nope"), null);
+test("dateOnly anchors the calendar day in the COMPANY time zone, not UTC", () => {
+    // The bug: 2026-08-03 was stored as 2026-08-03T00:00:00Z, which in
+    // America/Los_Angeles is 5pm on August 2nd. Every report that bounds by
+    // LOCAL midnight — job cost by month, the WA tax period, variance by week —
+    // put roughly a third of receipts one day early, invisibly.
+    const pacific = dateOnly("2026-08-03", "America/Los_Angeles")!;
+    assert.equal(pacific.toISOString(), "2026-08-03T07:00:00.000Z", "local midnight PDT");
+
+    // The proof that matters: read back IN the company zone it is still the 3rd.
+    const asLocalDay = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(pacific);
+    assert.equal(asLocalDay, "2026-08-03");
+
+    // The old UTC-midnight value would have read as the 2nd — the regression.
+    const utcMidnight = new Date("2026-08-03T00:00:00.000Z");
+    assert.equal(
+        new Intl.DateTimeFormat("en-CA", {
+            timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(utcMidnight),
+        "2026-08-02",
+        "control: this is exactly what was wrong",
+    );
+
+    // Winter, so the offset differs (PST, -08:00) — a hardcoded offset would fail here.
+    assert.equal(dateOnly("2026-01-15", "America/Los_Angeles")!.toISOString(), "2026-01-15T08:00:00.000Z");
+    // A zone east of UTC moves the other way.
+    assert.equal(dateOnly("2026-08-03", "Europe/Berlin")!.toISOString(), "2026-08-02T22:00:00.000Z");
+
+    assert.equal(dateOnly("2026-13-03", "America/Los_Angeles"), null);
+    assert.equal(dateOnly("nope", "America/Los_Angeles"), null);
     assert.equal(toDateStr(new Date("2026-08-03T23:59:00.000Z")), "2026-08-03");
+});
+
+test("a receipt read just before midnight Pacific keeps its own calendar day", async () => {
+    // The end-to-end version of the above, through the worker.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, date: "2026-08-03" } } as ReadOutcome),
+        companyTimeZone: async () => "America/Los_Angeles",
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].txnDate!.toISOString(), "2026-08-03T07:00:00.000Z");
 });
 
 // ── Dedup ORDER: strong before weak (Codex round 3, item 1) ─────────────────
@@ -496,7 +542,35 @@ test("the strong claim is attempted with the key, before any weak lookup", async
     await runIntakeWorker(h.deps);
     assert.deepEqual(order, ["strong-claim", "weak-lookup"]);
     assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766", "the claim carries the key");
-    assert.equal(h.applied[0].state, "READ");
+    // The claim writes the KEYS but leaves the row RECEIVED and holding its
+    // lease. READ is reached only by finishRouting, once every net has spoken.
+    assert.equal(h.applied[0].state, "RECEIVED");
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+});
+
+test("the lease is held through routing and released only at the end", async () => {
+    // Clearing it at claim time let an overlapping invocation reclaim a
+    // half-routed row and BOOK it, after which this invocation would regress it.
+    const h = harness([workerRow()]);
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied.length, 1);
+    assert.ok(!("nextRetryAt" in h.applied[0]), "applyRead must not touch the lease");
+    assert.equal(h.finished.length, 1, "exactly one release, at the end");
+});
+
+test("a weak lookup that THROWS leaves the row RECEIVED, retryable, never READ", async () => {
+    // READ is terminal for a dry-run row, so a row parked there without a weak
+    // check would sit for the whole shadow week while the daily comparison
+    // counted it as fully deduped — a silent false negative in the one report
+    // the cutover decision rests on.
+    const h = harness([workerRow({ attempts: 0 })], {
+        findWeakHit: async () => { throw new Error("connection reset"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { RETRY: 1 });
+    assert.deepEqual(h.finished, [], "never published to READ");
+    assert.equal(h.applied[0].state, "RECEIVED");
+    assert.equal(h.retried[0].attempts, 1);
 });
 
 test("a weak-only hit still asks a human, and KEEPS the strong key", async () => {
@@ -523,8 +597,64 @@ test("a document-level gate short-circuits BOTH nets and claims no key", async (
             findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
         });
         await runIntakeWorker(h.deps);
-        assert.equal(h.applied[0].stateReason, reason);
+        // The tax note rides along with whatever state routing picked — a
+        // document can be both a bad tax read and a refund.
+        assert.ok(h.applied[0].stateReason?.startsWith(reason), `${reason}: ${h.applied[0].stateReason}`);
         assert.equal(h.applied[0].dedupStrongKey, null, reason);
         assert.equal(weakCalls, 0, `${reason}: dedup is not consulted at all`);
     }
+});
+
+// ── OCR'd tax is a reading, not a fact (Phase 3 gate, item b) ───────────────
+
+test("an implausible tax is DROPPED and noted, and the receipt still books", () => {
+    // A misread decimal ("$2.92" as "$292") or a grabbed subtotal posts real
+    // money to the reimbursable-sales-tax account and inflates a state filing.
+    // WA's highest combined rate is ~10.6%, so 12% is the sanity bound.
+    assert.deepEqual(validateTaxCents(29_20, 36_498), { taxCents: 2920, implausible: false });
+    // Exactly at the ceiling, rounded UP to the cent so a legitimate rounding
+    // artefact at the boundary is not rejected.
+    assert.deepEqual(validateTaxCents(1200, 10_000), { taxCents: 1200, implausible: false });
+    assert.deepEqual(validateTaxCents(1201, 10_000), { taxCents: null, implausible: true });
+    // The decimal-point misread.
+    assert.deepEqual(validateTaxCents(29_200, 36_498), { taxCents: null, implausible: true });
+    // Tax larger than the total is nonsense.
+    assert.deepEqual(validateTaxCents(40_000, 36_498), { taxCents: null, implausible: true });
+    // Absent or zero tax is normal, not implausible — most receipts here.
+    assert.deepEqual(validateTaxCents(null, 36_498), { taxCents: null, implausible: false });
+    assert.deepEqual(validateTaxCents(0, 36_498), { taxCents: null, implausible: false });
+    // A tax with no usable total cannot be judged, so it is not trusted.
+    assert.deepEqual(validateTaxCents(500, null), { taxCents: null, implausible: true });
+    assert.equal(MAX_PLAUSIBLE_TAX_RATE, 0.12);
+});
+
+test("a plausible tax is stored and the row carries no note", async () => {
+    const h = harness([workerRow()]);
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].taxCents, 2920, "29.20 of 364.98 is ~8%");
+    assert.equal(h.applied[0].stateReason, null);
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+});
+
+test("an implausible tax nulls taxCents, notes the row, and does NOT park it", async () => {
+    // The receipt is fine and its TOTAL is what the bank charge matches, so it
+    // must still book — as a single un-split line, exactly like a receipt whose
+    // tax line was never readable.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].taxCents, null, "the bad reading is dropped, not booked");
+    assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
+    assert.deepEqual(summary.byState, { READ: 1 }, "READ, not NEEDS_REVIEW");
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+});
+
+test("the tax note survives alongside a dedup reason", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+        findWeakHit: async () => ({ id: "row-twin" }),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible");
 });

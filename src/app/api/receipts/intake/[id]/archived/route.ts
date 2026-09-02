@@ -72,7 +72,23 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         data: { state: "ARCHIVED", archiveDriveFileId: driveFileId },
     });
     if (updated.count === 0) {
-        return NextResponse.json({ ok: false, reason: "not-booked" }, { status: 409 });
+        // We lost a race. Two identical callbacks (the mirror retrying a lost
+        // response) can both read BOOKED; the winner archives and the loser's
+        // conditional update matches nothing. Returning 409 on that made the
+        // mirror treat its OWN successful archive as a failure. Re-read: if the
+        // row is now ARCHIVED with the same Drive id, the outcome the caller
+        // asked for is exactly what happened.
+        const now = await prisma.receiptIntake.findUnique({
+            where: { id },
+            select: { state: true, archiveDriveFileId: true },
+        });
+        if (now?.state === "ARCHIVED" && now.archiveDriveFileId === driveFileId) {
+            return NextResponse.json({ ok: true, id, state: "ARCHIVED", archiveDriveFileId: driveFileId, alreadyArchived: true });
+        }
+        return NextResponse.json(
+            { ok: false, reason: "not-booked", state: now?.state ?? "gone" },
+            { status: 409 },
+        );
     }
     return NextResponse.json({ ok: true, id, state: "ARCHIVED", archiveDriveFileId: driveFileId });
 }

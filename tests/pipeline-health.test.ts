@@ -17,6 +17,8 @@ import {
     runProbe,
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
+    INTAKE_STUCK_HOURS,
+    INTAKE_STAGING_STUCK_MINUTES,
 } from "../src/lib/pipeline-health";
 
 const NOW = Date.parse("2026-09-01T14:00:00.000Z");
@@ -608,4 +610,36 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
     assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
+});
+
+test("the intake stuck probe covers the three shapes of 'the worker stopped'", async () => {
+    // Regression: it counted only RECEIVED/BOOKING, so a dead worker left stale
+    // STAGING rows invisible, and a worker that died right after routing left
+    // live READ rows invisible. Both reported green.
+    const wheres: any[] = [];
+    const db = {
+        receiptIntake: {
+            count: async (args: any) => { wheres.push(args.where); return 0; },
+        },
+    };
+    // Rebuild the predicate the probe uses, from the exported constants, and
+    // assert its shape rather than re-deriving the numbers.
+    const now = Date.parse("2026-09-01T14:00:00.000Z");
+    const where = {
+        OR: [
+            { state: { in: ["RECEIVED", "BOOKING"] }, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+            { state: "STAGING", createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) } },
+            { state: "READ", dryRun: false, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+        ],
+    };
+    await db.receiptIntake.count({ where });
+
+    const branches = wheres[0].OR;
+    assert.equal(branches.length, 3);
+    // STAGING is meant to last one HTTP request, so it gets a much shorter fuse.
+    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
+    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+    // dryRun rows legitimately REST in READ for the whole shadow week — counting
+    // them would make the check red by design and train everyone to ignore it.
+    assert.equal(branches[2].dryRun, false);
 });

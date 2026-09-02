@@ -12,6 +12,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     appliedTaxCents,
+    attachmentBlocker,
     bookReceipt,
     buildGroups,
     driveFileIdOf,
@@ -48,6 +49,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         refNumber: "82766",
         memo: null,
         attempts: 0,
+        lastError: null,
         ...overrides,
     };
 }
@@ -262,15 +264,92 @@ test("QBO business-rule faults are TERMINAL, never retried", async () => {
     }
 });
 
-test("an ok:false result is a deterministic refusal, so it goes to a human too", async () => {
+test("EVERY ok:false happens before the create, so all of them RELEASE the key", async () => {
+    // The list is exhaustive on purpose: project-not-matched, missing-vendor,
+    // invalid-date, amount-mismatch, duplicate-name and the overhead cases are
+    // all decided before qbCreateFn runs, and docnumber-conflict is the
+    // idempotency QUERY finding somebody ELSE'S Purchase. So no Purchase exists
+    // for this row, and holding the strong key would quarantine the corrected
+    // re-submission against a booking that never happened.
+    const reasons = [
+        "docnumber-conflict", "project-not-matched", "missing-vendor", "invalid-date",
+        "amount-mismatch", "duplicate-name", "invalid-group-amount",
+        "overhead-account-not-matched", "overhead-tax-unsupported",
+    ];
+    for (const reason of reasons) {
+        const r = recorder({ createPurchase: async () => ({ ok: false, reason }) as any });
+        assert.deepEqual(await bookReceipt(row(), r.deps), {
+            outcome: "needs-review",
+            reason: `qbo-fault:${reason}`,
+            releaseStrongKey: true,
+        }, reason);
+        assert.equal(r.expenses.length, 0, reason);
+    }
+});
+
+// ── Never a Purchase without its receipt ON it (round-3 gate, item 4) ───────
+
+test("a format QBO cannot attach is refused BEFORE the Purchase is created", async () => {
+    // The QBO core returns ok:true with attachment:"skipped" for these, and the
+    // old code marked that BOOKED — a Purchase in the real books with no
+    // receipt, which a bookkeeper cannot spot because it looks complete. Every
+    // accepted .txt receipt hit this.
+    const r = recorder();
+    const result = await bookReceipt(row({ mimeType: "text/plain" }), r.deps);
+    assert.equal(result.outcome, "needs-review");
+    assert.match((result as any).reason, /^unsupported-attachment:mime:text\/plain/);
+    assert.equal((result as any).releaseStrongKey, true, "nothing was sent");
+    assert.equal(r.purchaseCalls.length, 0, "no Purchase is created");
+});
+
+test("a file over QBO's 8MB attachment ceiling is refused before the create", async () => {
+    // Our intake ceiling is 15MB and QBO's attachment ceiling is 8MB, so this
+    // gap is reachable by a real phone photo.
+    const big = Buffer.alloc(9 * 1024 * 1024, 1);
+    const r = recorder({ downloadBytes: async () => ({ ok: true, bytes: big }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.match((result as any).reason, /^unsupported-attachment:size:/);
+    assert.equal(r.purchaseCalls.length, 0);
+});
+
+test("attachmentBlocker mirrors QBO's own ceilings", () => {
+    assert.equal(attachmentBlocker("image/jpeg", 1000), null);
+    assert.equal(attachmentBlocker("application/pdf", 1000), null);
+    assert.equal(attachmentBlocker("image/heic", 1000), null);
+    assert.equal(attachmentBlocker("image/jpeg; charset=binary", 1000), null, "parameters are stripped");
+    assert.match(attachmentBlocker("text/plain", 1000)!, /^mime:/);
+    assert.match(attachmentBlocker("image/tiff", 1000)!, /^mime:/);
+    // Exactly 8MB is allowed; one byte more is not.
+    assert.equal(attachmentBlocker("image/jpeg", 8 * 1024 * 1024), null);
+    assert.match(attachmentBlocker("image/jpeg", 8 * 1024 * 1024 + 1)!, /^size:/);
+});
+
+test("an attachment upload that FAILED is retried, never reported as booked", async () => {
     const r = recorder({
-        createPurchase: async () => ({ ok: false, reason: "docnumber-conflict", docNumber: "abc" }) as any,
+        createPurchase: async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: false, attachment: "failed:500",
+        }) as any,
     });
-    assert.deepEqual(await bookReceipt(row(), r.deps), {
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "retry");
+    assert.match((result as any).reason, /^attachment-failed:failed:500/);
+    assert.equal(r.expenses.length, 0, "no Expense until the receipt is actually on the Purchase");
+});
+
+test("the retry after an attachment failure asks a human instead of silently succeeding", async () => {
+    // The retry hits QBO's idempotency and comes back alreadyExists:true, which
+    // carries NO attachment status — so booking it would declare success for a
+    // Purchase we KNOW has no receipt on it.
+    const r = recorder({
+        createPurchase: async () => ({ ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true }) as any,
+    });
+    const result = await bookReceipt(row({ lastError: "attachment-failed:failed:500" }), r.deps);
+    assert.deepEqual(result, {
         outcome: "needs-review",
-        reason: "qbo-fault:docnumber-conflict",
+        reason: "attachment-unconfirmed",
         releaseStrongKey: false,
     });
+    assert.equal(r.purchaseCalls.length, 0, "not even re-queried — the answer is already known");
 });
 
 test("a QBTimeoutError retries on the backoff schedule", async () => {

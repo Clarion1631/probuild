@@ -8,6 +8,7 @@ import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
@@ -52,7 +53,7 @@ const WORKER_ROW_SELECT = {
     projectId: true, costCodeId: true, suggestedCostCodeId: true,
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
-    docType: true, refNumber: true, memo: true, attempts: true, readAt: true,
+    docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true,
 } as const;
 
@@ -127,13 +128,43 @@ function buildDeps(): WorkerDependencies {
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
 
         sweepStaleStaging: async () => {
+            // NEVER a blanket "old therefore missing". A STAGING row that is old
+            // because its publish UPDATE failed HAS its object in the bucket,
+            // and declaring that receipt file-missing would hand a human a
+            // problem that does not exist while the real file sits there. Ask
+            // storage about each one, and let a transient storage fault mean
+            // "come back next pass" rather than either verdict.
             const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
-            const { count } = await prisma.receiptIntake.updateMany({
+            const stale = await prisma.receiptIntake.findMany({
                 where: { state: "STAGING", createdAt: { lt: cutoff } },
-                data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
+                select: { id: true, storagePath: true },
+                take: 50,
             });
-            if (count > 0) console.log("[cron/receipt-intake-worker] stale STAGING swept", count);
-            return count;
+
+            let published = 0;
+            let parked = 0;
+            for (const row of stale) {
+                const probe = await downloadDocBytesResult(toSecureRef(row.storagePath));
+                if (probe.ok) {
+                    // The upload landed; only the publish was lost. Finish it.
+                    await prisma.receiptIntake.updateMany({
+                        where: { id: row.id, state: "STAGING" },
+                        data: { state: "RECEIVED", nextRetryAt: null },
+                    });
+                    published++;
+                    continue;
+                }
+                if (probe.kind === "transient") continue; // unknown is not a verdict
+                await prisma.receiptIntake.updateMany({
+                    where: { id: row.id, state: "STAGING" },
+                    data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
+                });
+                parked++;
+            }
+            if (published || parked) {
+                console.log("[cron/receipt-intake-worker] STAGING sweep", JSON.stringify({ published, parked }));
+            }
+            return published + parked;
         },
 
         loadPhases: async () => prisma.costCode.findMany({
@@ -148,9 +179,14 @@ function buildDeps(): WorkerDependencies {
 
         applyRead: async (rowId, patch: ReadPatch) => {
             try {
+                // nextRetryAt is deliberately UNTOUCHED: the claim lease must
+                // survive until routing finishes. Clearing it here let an
+                // overlapping invocation reclaim a half-routed row and book it
+                // while this one was still deciding — and then this one would
+                // regress it. finishRouting()/applyState() release the lease.
                 await prisma.receiptIntake.update({
                     where: { id: rowId },
-                    data: { ...patch, lastError: null, nextRetryAt: null },
+                    data: { ...patch, lastError: null },
                 });
                 return { strongOwner: null };
             } catch (error) {
@@ -200,6 +236,16 @@ function buildDeps(): WorkerDependencies {
                 data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null },
             });
         },
+
+        // RECEIVED -> READ, and the ONLY place the routing lease is released.
+        finishRouting: async (rowId, stateReason) => {
+            await prisma.receiptIntake.updateMany({
+                where: { id: rowId, state: "RECEIVED" },
+                data: { state: "READ", stateReason, nextRetryAt: null },
+            });
+        },
+
+        companyTimeZone: resolveCompanyTimeZone,
 
         promoteToBooking: async (rowId, weakKey) => prisma.$transaction(async tx => {
             // LAST weak-dedup check, taken INSIDE the transition. The check at

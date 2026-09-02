@@ -52,6 +52,42 @@ export interface BookableRow {
     refNumber: string | null;
     memo: string | null;
     attempts: number;
+    /** Carries a previous attachment failure across a retry — see below. */
+    lastError: string | null;
+}
+
+/**
+ * MIRRORS the private ATTACHABLE_CONTENT_TYPES / MAX_ATTACHMENT_BYTES in
+ * qbo-receipt-push.ts (:236, :202), which are not exported and which this
+ * branch must not modify.
+ *
+ * The duplication is deliberate and is the lesser evil: without a PREFLIGHT the
+ * QBO core happily creates the Purchase and then reports `attachment:"skipped"`
+ * for a file it cannot take, and `bookReceipt` marked that BOOKED. The result is
+ * a Purchase in the real books with no receipt attached — the one failure a
+ * bookkeeper cannot spot later, because the Purchase looks complete and nothing
+ * flags it. Every accepted .txt receipt hit this, as did anything between our
+ * 15 MB intake ceiling and QBO's 8 MB attachment ceiling.
+ *
+ * If either constant changes over there, this must change with it; the test
+ * asserts the two ceilings against each other so the gap cannot silently widen.
+ */
+const QBO_ATTACHABLE_MIMES = new Set([
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "image/heic", "image/heif", "application/pdf",
+]);
+const MAX_QBO_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Can QuickBooks take this file at all? Deterministic, so it is answered BEFORE
+ * the Purchase is created and no money moves on a document that would arrive
+ * without its evidence.
+ */
+export function attachmentBlocker(mimeType: string, byteLength: number): string | null {
+    const essence = mimeType.split(";")[0].trim().toLowerCase();
+    if (!QBO_ATTACHABLE_MIMES.has(essence)) return `mime:${essence}`;
+    if (byteLength > MAX_QBO_ATTACHMENT_BYTES) return `size:${byteLength}`;
+    return null;
 }
 
 export type BookResult =
@@ -272,6 +308,21 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     }
     const bytes = download.bytes;
 
+    // PREFLIGHT, before anything is created. A format or size QBO cannot accept
+    // is a fact about this file, known now — so refuse now, rather than
+    // discovering it from `attachment:"skipped"` after a Purchase already
+    // exists in the real books without its receipt.
+    const blocker = attachmentBlocker(row.mimeType, bytes.length);
+    if (blocker) return parkedBeforeSend(`unsupported-attachment:${blocker}`);
+
+    // A previous attempt created the Purchase but could not attach the file.
+    // The retry below returns alreadyExists:true, which carries NO attachment
+    // status — so booking it now would silently declare success for a Purchase
+    // we know has no receipt on it. Hand it to a human instead.
+    if (row.lastError?.startsWith(ATTACHMENT_FAILED_PREFIX)) {
+        return { outcome: "needs-review", reason: "attachment-unconfirmed", releaseStrongKey: false };
+    }
+
     const input: CreateQBReceiptPurchaseInput = {
         projectName: project.name,
         docType: isCheck ? "check" : "receipt",
@@ -303,11 +354,29 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     }
 
     if (!result.ok) {
-        // Every ok:false reason from createQBReceiptPurchase is a deterministic
-        // refusal (project-not-matched, docnumber-conflict, amount-mismatch,
-        // missing-vendor, invalid-date, duplicate-name, ...). None becomes true
-        // by waiting.
-        return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: false };
+        // Every ok:false reason is a deterministic refusal, and — this is the
+        // part that was wrong — EVERY one of them is decided BEFORE qbCreateFn
+        // runs: project-not-matched, missing-vendor, invalid-date,
+        // invalid-group-amount, amount-mismatch, duplicate-name,
+        // overhead-*, and docnumber-conflict (which is the idempotency QUERY
+        // finding somebody else's Purchase, not one of ours).
+        //
+        // So no Purchase exists for this row, and holding the strong key would
+        // quarantine the corrected re-submission against a booking that never
+        // happened. Release it. A THROWN fault is different — it can come from
+        // inside the create — and keeps the key.
+        return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: true };
+    }
+
+    // The Purchase exists. If the receipt did NOT make it on, that is not a
+    // success: `failed:*` is an HTTP/transport fault on the upload leg and is
+    // worth another pass; `skipped` after a passing preflight means the two
+    // ceilings have drifted apart and a human must look.
+    if (!result.alreadyExists && result.attachment !== "attached") {
+        if (result.attachment === "skipped") {
+            return { outcome: "needs-review", reason: "unsupported-attachment:skipped", releaseStrongKey: false };
+        }
+        return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`);
     }
 
     // 5. One transaction: the Expense and the row's BOOKED state land together
@@ -409,6 +478,9 @@ function describe(error: unknown): string {
     if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 400);
     return "UnknownError";
 }
+
+/** Marks a retry as "the Purchase exists but its receipt did not attach". */
+export const ATTACHMENT_FAILED_PREFIX = "attachment-failed:";
 
 /** A refusal reached WITHOUT any QBO call — the strong key goes back. */
 function parkedBeforeSend(reason: string): BookResult {

@@ -100,6 +100,13 @@ export interface PipelineHealth {
 
 /** A row this old in a working state has not been picked up, it has jammed. */
 export const INTAKE_STUCK_HOURS = 6;
+/**
+ * STAGING is meant to last one HTTP request. Half an hour of it means the
+ * intake route died mid-upload or the sweeper is not running — and since
+ * STAGING is invisible to the worker's claim by design, nothing else would
+ * ever notice.
+ */
+export const INTAKE_STAGING_STUCK_MINUTES = 30;
 
 /**
  * Intuit's own status page.
@@ -424,13 +431,36 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // ReceiptIntake: the v2 queue. STAGING is excluded on purpose — those
         // rows are mid-upload and the intake route's own 15-minute sweeper owns
         // them; counting them here would flag every in-flight request.
+        // Three shapes of "the worker stopped", all of which used to read green:
+        //   RECEIVED/BOOKING overdue  — the classic jam.
+        //   STAGING overdue           — the route died mid-upload, or the
+        //                               sweeper is dead. Excluded before,
+        //                               which hid a dead worker completely.
+        //   READ overdue, LIVE only   — a worker that died right after routing
+        //                               leaves a bookable row parked forever.
+        //                               dryRun rows legitimately rest in READ
+        //                               for the whole shadow week, so they are
+        //                               excluded or the check is red by design.
         probe<number>(
             "intakeStuck",
             () =>
                 prisma.receiptIntake.count({
                     where: {
-                        state: { in: ["RECEIVED", "BOOKING"] },
-                        createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                        OR: [
+                            {
+                                state: { in: ["RECEIVED", "BOOKING"] },
+                                createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                            },
+                            {
+                                state: "STAGING",
+                                createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) },
+                            },
+                            {
+                                state: "READ",
+                                dryRun: false,
+                                createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                            },
+                        ],
                     },
                 }),
             0,

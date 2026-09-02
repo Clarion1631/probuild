@@ -376,9 +376,20 @@ async function respondToSourceRefConflict(
         if (await secureObjectExists(existing.storagePath)) {
             return publishStagedRow(existing.id);
         }
+        // 409, NOT 202. The forwarders retry only non-2xx: a 202 told the
+        // caller "accepted", so a Drive script would move its source file out
+        // of the pickup folder and the ORIGINAL document would be gone while
+        // nothing durable existed on our side. Any 2xx here is a promise we
+        // cannot keep until the object is confirmed.
         return NextResponse.json(
-            { ok: true, status: "staging", alreadyReceived: true, id: existing.id, sourceRef: existing.sourceRef },
-            { status: 202 },
+            {
+                ok: false,
+                error: "staging-incomplete",
+                reason: "the previous upload for this sourceRef never landed; retry",
+                id: existing.id,
+                sourceRef: existing.sourceRef,
+            },
+            { status: 409 },
         );
     }
 
