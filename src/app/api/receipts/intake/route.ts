@@ -16,6 +16,7 @@ import {
     MAX_INLINE_UPLOAD_BYTES,
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
+import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -414,9 +415,6 @@ async function storeObject(storagePath: string, bytes: Buffer, mimeType: string)
     }
 }
 
-/** The only two parked reasons a later, correct upload may recover from. */
-export const RECOVERABLE_REASONS = ["file-missing", "sha-mismatch"];
-
 async function publishStagedRow(id: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
         // EXACT-state CAS. `update` by id alone would publish a row that had
@@ -531,22 +529,21 @@ async function respondToSourceRefConflict(
         // for a vendor mismatch, a zero total, or a QBO fault would be dragged
         // back to RECEIVED and re-read, discarding the decision a human had
         // already made about it.
-        const healable = existing.state === "STAGING"
-            || (existing.state === "NEEDS_REVIEW" && RECOVERABLE_REASONS.includes(existing.stateReason ?? ""));
+        // ONE list, shared with /finalize (stored-object.ts). Two copies of
+        // "which parks a re-upload may clear" is how the two publishers come to
+        // disagree about whether a human's decision can be overwritten.
+        const healable = finalizeDisposition(existing) === "publish";
         if (healable) {
             const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
             if (!healed) {
                 return NextResponse.json({ ok: false, error: "storage-failed" }, { status: 503 });
             }
-            // EXACT state AND reason. Losing this race means somebody moved the
-            // row while we were uploading, so the object we just wrote is
+            // The SAME fence /finalize publishes under: exact state, exact
+            // reason, unclaimed. Losing this race means somebody moved the row
+            // while we were uploading, so the object we just wrote is
             // unreferenced — clean it up rather than orphan it.
             const { count } = await prisma.receiptIntake.updateMany({
-                where: {
-                    id: existing.id,
-                    state: existing.state,
-                    ...(existing.state === "NEEDS_REVIEW" ? { stateReason: existing.stateReason } : {}),
-                },
+                where: { id: existing.id, ...publishFence(existing) },
                 data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
             });
             if (count === 0) {

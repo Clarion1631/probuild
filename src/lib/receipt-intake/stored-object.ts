@@ -190,3 +190,49 @@ export async function inspectStoredObject(
         bytes,
     };
 }
+
+/**
+ * The only two parked reasons a later, correct upload may recover from.
+ *
+ * "Any NEEDS_REVIEW row" is far too broad: a row parked for a vendor mismatch,
+ * a zero total or a QBO fault would be dragged back to RECEIVED and re-read,
+ * discarding a decision a human already made about it — and, past BOOKING, that
+ * re-read is a second Purchase waiting to happen.
+ */
+export const RECOVERABLE_PARK_REASONS = ["file-missing", "sha-mismatch"];
+
+export interface ObservedRow {
+    state: string;
+    stateReason: string | null;
+}
+
+/** What a finalize may do with the row it just read. */
+export type FinalizeDisposition = "publish" | "not-recoverable" | "settled";
+
+export function finalizeDisposition(row: ObservedRow): FinalizeDisposition {
+    if (row.state === "STAGING") return "publish";
+    if (row.state === "NEEDS_REVIEW") {
+        return RECOVERABLE_PARK_REASONS.includes(row.stateReason ?? "") ? "publish" : "not-recoverable";
+    }
+    return "settled";
+}
+
+/**
+ * The CAS a publish must carry: the EXACT state and reason that were observed,
+ * and an unclaimed row.
+ *
+ * `state: { in: [...] }` was not enough. Inspecting the object and sealing it
+ * takes seconds, and in that window the reason can change — a row parked
+ * `file-missing` can be re-parked `vendor-mismatch`, or the worker can claim it.
+ * A publish fenced only on the state SET would then reset a reason it never
+ * looked at back to RECEIVED, discarding the newer decision and republishing a
+ * row somebody else now owns. Pinning the reason makes that update match zero
+ * rows, which is a 409 the client can retry rather than a silent overwrite.
+ */
+export function publishFence(row: ObservedRow): {
+    state: string;
+    stateReason: string | null;
+    claimToken: null;
+} {
+    return { state: row.state, stateReason: row.stateReason, claimToken: null };
+}

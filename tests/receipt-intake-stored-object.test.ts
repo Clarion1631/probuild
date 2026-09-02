@@ -8,10 +8,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     canonicalStoragePath,
     downloadVerified,
+    finalizeDisposition,
     inspectStoredObject,
+    publishFence,
+    RECOVERABLE_PARK_REASONS,
     sealAndPublish,
 } from "../src/lib/receipt-intake/stored-object";
 import { MAX_STORED_BYTES } from "../src/lib/receipt-intake/intake-core";
@@ -239,8 +244,7 @@ test("the sweeper's two parks are the ones /finalize recovers from", () => {
     // is a retry in progress, not an error state. Parking it would turn the
     // client's own next request into a review item — and the correct bytes
     // arriving a minute later would find the row already out of STAGING.
-    const { readFileSync } = require("node:fs") as typeof import("node:fs");
-    const path = require("node:path") as typeof import("node:path");
+    // node:fs and node:path are imported at the top of this file now.
     const root = path.resolve(__dirname, "..");
 
     const sweeper = readFileSync(
@@ -257,5 +261,143 @@ test("the sweeper's two parks are the ones /finalize recovers from", () => {
     const finalize = readFileSync(
         path.join(root, "src/app/api/receipts/intake/[id]/finalize/route.ts"), "utf8",
     );
-    assert.match(finalize, /stateReason === "file-missing" \|\| row\.stateReason === "sha-mismatch"/);
+    // Both sweeper parks are the ones /finalize may recover from, and it asks
+    // the shared rule rather than carrying its own copy of the list.
+    assert.match(finalize, /finalizeDisposition\(row\)/);
+    assert.deepEqual(RECOVERABLE_PARK_REASONS, ["file-missing", "sha-mismatch"]);
+});
+
+// ── Which parks a re-upload may clear, and the fence it publishes under ─────
+
+test("only the two SWEEPER parks are recoverable; a human's park is not", () => {
+    assert.equal(finalizeDisposition({ state: "STAGING", stateReason: null }), "publish");
+    for (const reason of RECOVERABLE_PARK_REASONS) {
+        assert.equal(finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }), "publish", reason);
+    }
+    // Everything else parked for review is somebody's decision. Republishing it
+    // drags the row back to RECEIVED and re-reads it, discarding that decision.
+    for (const reason of ["vendor-mismatch", "weak-dup:row-9", "qbo-fault:6210", "amount-mismatch", null]) {
+        assert.equal(
+            finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }),
+            "not-recoverable",
+            String(reason),
+        );
+    }
+    // And a row that already moved on is simply settled — not an error.
+    for (const state of ["RECEIVED", "READ", "BOOKING", "BOOKED", "ARCHIVED", "DUPLICATE"]) {
+        assert.equal(finalizeDisposition({ state, stateReason: null }), "settled", state);
+    }
+});
+
+test("the publish fence pins the exact state, the exact reason and an unclaimed row", () => {
+    assert.deepEqual(publishFence({ state: "NEEDS_REVIEW", stateReason: "file-missing" }), {
+        state: "NEEDS_REVIEW",
+        stateReason: "file-missing",
+        claimToken: null,
+    });
+    assert.deepEqual(publishFence({ state: "STAGING", stateReason: null }), {
+        state: "STAGING",
+        stateReason: null,
+        claimToken: null,
+    });
+});
+
+/** Enough of Prisma's updateMany semantics to run a CAS against one row. */
+function rowStore(row: Record<string, unknown>) {
+    const store = { ...row };
+    return {
+        get: () => store,
+        set: (patch: Record<string, unknown>) => Object.assign(store, patch),
+        updateMany: (where: Record<string, unknown>, data: Record<string, unknown>) => {
+            const matches = Object.entries(where).every(([k, v]) => store[k] === v);
+            if (!matches) return 0;
+            Object.assign(store, data);
+            return 1;
+        },
+    };
+}
+
+test("RACE: a reason that changes during sealing loses the publish, and writes nothing", async () => {
+    // The window is real: inspecting the object and sealing it takes seconds,
+    // and the worker can re-park the row in that time. Fenced only on the state
+    // SET (`state: { in: ["STAGING", "NEEDS_REVIEW"] }`) the stale finalizer
+    // would reset a reason it never looked at back to RECEIVED — discarding the
+    // newer decision and republishing a row somebody else now owns.
+    const store = rowStore({
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "file-missing", claimToken: null,
+    });
+    const observed = { state: store.get().state as string, stateReason: store.get().stateReason as string };
+    assert.equal(finalizeDisposition(observed), "publish", "it was recoverable when we read it");
+    const fence = publishFence(observed);
+
+    let dropped = false;
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+        seal: async (_u: string, canonical: string) => {
+            // THE RACE, in the exact window it happens: the worker re-parks the
+            // row while we are copying the bytes.
+            store.set({ stateReason: "vendor-mismatch" });
+            return canonical;
+        },
+        commit: async (canonicalPath: string) =>
+            store.updateMany(
+                { id: "row-1", ...fence },
+                { state: "RECEIVED", stateReason: null, storagePath: canonicalPath },
+            ),
+        dropUpload: async () => { dropped = true; },
+    } as never);
+
+    assert.equal(outcome?.published, false, "zero rows updated");
+    assert.equal(store.get().state, "NEEDS_REVIEW", "the row is untouched");
+    assert.equal(store.get().stateReason, "vendor-mismatch", "the newer decision survives");
+    assert.equal(dropped, false, "and the upload object is kept for the retry");
+});
+
+test("RACE: a worker claim taken during sealing also loses the publish", async () => {
+    const store = rowStore({
+        id: "row-1", state: "STAGING", stateReason: null, claimToken: null,
+    });
+    const fence = publishFence({ state: "STAGING", stateReason: null });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+        seal: async (_u: string, canonical: string) => {
+            store.set({ claimToken: "sweeper-1" });
+            return canonical;
+        },
+        commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED" }),
+        dropUpload: async () => {},
+    } as never);
+    assert.equal(outcome?.published, false);
+    assert.equal(store.get().state, "STAGING", "the sweeper's row is left alone");
+});
+
+test("an unchanged row still publishes — the control", async () => {
+    const store = rowStore({
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null,
+    });
+    const fence = publishFence({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch" });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
+        seal: async (_u: string, canonical: string) => canonical,
+        commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null }),
+        dropUpload: async () => {},
+    } as never);
+    assert.equal(outcome?.published, true);
+    assert.equal(store.get().state, "RECEIVED");
+});
+
+test("both publishers use the shared fence, and finalize refuses the other parks", () => {
+    const finalize = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    const intake = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
+        "utf8",
+    );
+    assert.match(finalize, /where: \{ id, \.\.\.publishFence\(row\), \.\.\.merged\.guard \}/);
+    assert.match(intake, /where: \{ id: existing\.id, \.\.\.publishFence\(existing\) \}/);
+    assert.ok(
+        !/state: \{ in: \["STAGING", "NEEDS_REVIEW"\] \}/.test(finalize),
+        "the state-SET fence is gone",
+    );
+    assert.match(finalize, /error: "not-recoverable"/);
+    assert.match(finalize, /disposition === "not-recoverable"/);
 });

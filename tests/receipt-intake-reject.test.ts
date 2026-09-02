@@ -13,6 +13,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { RECOVERABLE_PARK_REASONS } from "../src/lib/receipt-intake/stored-object";
 import {
     rejectRowAndQueueCleanup,
     type RejectClient,
@@ -121,13 +122,14 @@ test("recovery is restricted to the two reasons a re-upload can actually fix", (
     // "Any NEEDS_REVIEW row" would drag a row parked for a vendor mismatch, a
     // zero total, or a QBO fault back to RECEIVED and re-read it, discarding a
     // decision a human had already made.
-    assert.match(intake, /RECOVERABLE_REASONS = \["file-missing", "sha-mismatch"\]/);
-    assert.match(intake, /RECOVERABLE_REASONS\.includes\(existing\.stateReason \?\? ""\)/);
-    assert.match(
-        finalize,
-        /row\.stateReason === "file-missing" \|\| row\.stateReason === "sha-mismatch"/,
-        "the finalize route uses the same two reasons",
-    );
+    // ONE list, in the lib, asked by both publishers — two copies is how they
+    // come to disagree about whether a human's decision can be overwritten.
+    assert.deepEqual(RECOVERABLE_PARK_REASONS, ["file-missing", "sha-mismatch"]);
+    assert.match(intake, /finalizeDisposition\(existing\) === "publish"/);
+    assert.match(finalize, /finalizeDisposition\(row\)/, "the finalize route asks the same rule");
+    for (const source of [intake, finalize]) {
+        assert.ok(!/"file-missing" \|\| /.test(source), "no hand-rolled copy of the list");
+    }
 });
 
 test("a heal that loses its CAS deletes the object it just uploaded", () => {

@@ -5,7 +5,12 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
+import {
+    finalizeDisposition,
+    inspectStoredObject,
+    publishFence,
+    sealAndPublish,
+} from "@/lib/receipt-intake/stored-object";
 import {
     authorizePhase,
     mergeCapturedFields,
@@ -154,13 +159,24 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // RECOVERY, not a duplicate: the upload landed after the sweep looked. It
     // must re-validate and republish rather than report alreadyFinalized, which
     // would leave a real receipt parked forever while telling the caller it was
-    // fine.
-    // Both sweeper parks are recoverable by a later, correct upload: the bytes
-    // arriving after the sweep looked is the normal shape of a slow client, not
-    // an error state a human should have to clear.
-    const recoverable = row.state === "STAGING"
-        || (row.state === "NEEDS_REVIEW"
-            && (row.stateReason === "file-missing" || row.stateReason === "sha-mismatch"));
+    // fine. Both sweeper parks are recoverable that way — bytes arriving after
+    // the sweep looked is the normal shape of a slow client, not an error state
+    // a human has to clear. Every OTHER park is a human's decision, and this
+    // path must not launder it into RECEIVED.
+    const disposition = finalizeDisposition(row);
+    if (disposition === "not-recoverable") {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "not-recoverable",
+                reason: "this row is parked for review; a re-upload does not clear it",
+                state: row.state,
+                stateReason: row.stateReason,
+            },
+            { status: 409 },
+        );
+    }
+    const recoverable = disposition === "publish";
 
     // Idempotent: finalizing an already-published row is a success, not an error
     // — the client's retry after a lost response must not look like a failure.
@@ -295,12 +311,13 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         seal: sealObject,
         commit: async (canonicalPath, values) => {
             const { count } = await prisma.receiptIntake.updateMany({
-                // Fenced on the state AND on every captured value this publish
-                // was validated against. A concurrent writer that filled in the
-                // job or the phase underneath us invalidates the tuple checked
-                // above, so this publish must lose rather than write a row it
-                // never authorized.
-                where: { id, state: { in: ["STAGING", "NEEDS_REVIEW"] }, ...merged.guard },
+                // Fenced on the EXACT state and reason observed, on the row
+                // being unclaimed, and on every captured value this publish was
+                // validated against. Anything that moved between the read and
+                // this write — a re-park under a different reason, a worker
+                // claim, a job filled in — invalidates what was checked above,
+                // so the publish must lose rather than overwrite it.
+                where: { id, ...publishFence(row), ...merged.guard },
                 data: {
                     state: "RECEIVED",
                     stateReason: null,
