@@ -1,0 +1,222 @@
+// One-off additive migration for Phase 2 (docs/plans/PHASE-2-QUEUE-AND-MEMOS-SPEC.md):
+//
+//   1. BankLine."sourceOfRecord" — which source MINTED the canonical line.
+//      Defaults to 'STATEMENT', which is true for every row that exists today,
+//      so the backfill is the default and no UPDATE is needed. 'QBO' marks a
+//      line minted by the nightly register pull because QuickBooks had a
+//      posted, cleared row and no statement had arrived yet (Justin, decision
+//      3: the QBO bank feed is bank truth). It flips back to 'STATEMENT' when
+//      the statement observation lands and is adopted.
+//
+//   2. "ReceiptRequestCard" — the durable outbox for the per-owner Chat digest.
+//      UNIQUE (owner, pacificDate) is the whole point: the row is created in
+//      the same transaction as selection, so two concurrent cron runs cannot
+//      both claim a day and both post.
+//
+// The SQL here is byte-equivalent to
+// prisma/migrations/20260901120000_phase2_receipt_queue/migration.sql — that
+// file is what a fresh CI/dev database gets; this script is what production
+// gets, BEFORE the build that selects these columns deploys (CLAUDE.md
+// pre-deploy rule #2 — otherwise every page touching them throws P2022).
+//
+// The CHECK on "sourceOfRecord" is invisible to Prisma (it has no
+// check-constraint concept) and must be created here, not by the generator.
+// It is not decoration: 'QBO' vs 'STATEMENT' decides whether a line is
+// adoptable, and a typo'd third value would make a line permanently
+// un-adoptable while looking fine.
+//
+// Additive and idempotent: ADD COLUMN / CREATE TABLE / CREATE INDEX IF NOT
+// EXISTS plus a guarded constraint add. Safe to re-run; a second run reports
+// every statement "ok" and changes nothing. No existing row is modified.
+//
+//   node scripts/apply-phase2-receipt-queue.mjs --yes --expect-db <name> --expect-host <host>
+//
+// --expect-db and --expect-host are BOTH required alongside --yes, matching
+// scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
+// something, and a database NAME alone doesn't prove which SERVER it's on.
+import { PrismaClient } from "@prisma/client";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+
+export function resolveDatabaseUrl() {
+    if (process.env.DATABASE_URL) return { url: process.env.DATABASE_URL, from: "process.env.DATABASE_URL" };
+    for (const file of [".env.local", ".env"]) {
+        if (!fs.existsSync(file)) continue;
+        const match = fs.readFileSync(file, "utf8").match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+        if (match) return { url: match[1], from: file };
+    }
+    throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
+}
+
+export function maskUrl(url) {
+    return url.replace(/:[^:@]*@/, ":****@");
+}
+
+function readFlagValue(flag) {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 ? process.argv[idx + 1] : undefined;
+}
+
+/** Pure comparison, exported for unit testing without a live DB. Both values EXACT. */
+export function targetMatches(actual, expectDb, expectHost) {
+    if (!actual || typeof actual !== "object") return false;
+    if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
+    return String(actual.host ?? "") === String(expectHost ?? "");
+}
+
+/** The closed set the CHECK allows. Exported for tests. */
+export const BANK_LINE_SOURCES_OF_RECORD = ["STATEMENT", "QBO"];
+
+export const statements = [
+    // 1. BankLine.sourceOfRecord. NOT NULL with a DEFAULT, so existing rows are
+    // backfilled by the DDL itself — every line that exists today WAS minted
+    // from a statement, so the default is a true statement about them.
+    `ALTER TABLE "BankLine" ADD COLUMN IF NOT EXISTS "sourceOfRecord" TEXT NOT NULL DEFAULT 'STATEMENT'`,
+
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'BankLine_sourceOfRecord_check'
+                         AND conrelid = '"BankLine"'::regclass) THEN
+         ALTER TABLE "BankLine" ADD CONSTRAINT "BankLine_sourceOfRecord_check"
+           CHECK ("sourceOfRecord" IN ('STATEMENT', 'QBO'));
+       END IF;
+     END $$`,
+
+    // Adoption looks lines up by (account, postedDate, amountCents,
+    // normalizedPayee) and then filters on sourceOfRecord — index the lookup,
+    // not the flag.
+    `CREATE INDEX IF NOT EXISTS "BankLine_account_postedDate_amountCents_idx"
+       ON "BankLine"("account", "postedDate", "amountCents")`,
+
+    // 2. The Chat digest outbox.
+    `CREATE TABLE IF NOT EXISTS "ReceiptRequestCard" (
+       "id"          TEXT NOT NULL,
+       "owner"       TEXT NOT NULL,
+       "pacificDate" TEXT NOT NULL,
+       "itemsJson"   TEXT NOT NULL,
+       "overflow"    INTEGER NOT NULL DEFAULT 0,
+       "postedAt"    TIMESTAMP(3),
+       "threadName"  TEXT,
+       "messageName" TEXT,
+       "attempts"    INTEGER NOT NULL DEFAULT 0,
+       "lastError"   TEXT,
+       "createdAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       "updatedAt"   TIMESTAMP(3) NOT NULL,
+       CONSTRAINT "ReceiptRequestCard_pkey" PRIMARY KEY ("id")
+     )`,
+
+    // THE CLAIM. One card per owner per Pacific day; the insert IS the lock, so
+    // a second concurrent run loses it and posts nothing.
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_pacificDate_key"
+       ON "ReceiptRequestCard"("owner", "pacificDate")`,
+
+    // The 14-day retention scan and the threads endpoint both read by date.
+    `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
+       ON "ReceiptRequestCard"("pacificDate")`,
+];
+
+const expectedColumns = {
+    BankLine: ["sourceOfRecord"],
+    ReceiptRequestCard: [
+        "id", "owner", "pacificDate", "itemsJson", "overflow", "postedAt",
+        "threadName", "messageName", "attempts", "lastError", "createdAt", "updatedAt",
+    ],
+};
+
+const expectedConstraints = [
+    { name: "BankLine_sourceOfRecord_check", table: "BankLine" },
+];
+
+// The unique index is the one object a "table exists" check cannot vouch for,
+// and it is not an optimisation: it IS the per-day claim. Verified on both
+// properties that matter — it must EXIST and be UNIQUE (a non-unique index
+// claims nothing, so every concurrent run would sail through and double-post).
+const expectedUniqueIndexes = [{
+    name: "ReceiptRequestCard_owner_pacificDate_key",
+    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "pacificDate"\)/],
+}];
+
+async function main() {
+    if (!process.argv.includes("--yes")) {
+        console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
+        process.exit(1);
+    }
+    const expectDb = readFlagValue("--expect-db") ?? process.env.PHASE2_EXPECT_DB;
+    const expectHost = readFlagValue("--expect-host") ?? process.env.PHASE2_EXPECT_HOST;
+    if (!expectDb || !expectHost) {
+        console.error("Both --expect-db and --expect-host are required (or PHASE2_EXPECT_DB / PHASE2_EXPECT_HOST).");
+        process.exit(1);
+    }
+
+    const { url, from } = resolveDatabaseUrl();
+    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
+    const prisma = new PrismaClient({ datasources: { db: { url } } });
+
+    try {
+        const [actual] = await prisma.$queryRawUnsafe(
+            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
+        );
+        console.log(`connected to db="${actual.db}" host="${actual.host}"`);
+        if (!targetMatches(actual, expectDb, expectHost)) {
+            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
+            process.exit(1);
+        }
+
+        for (const sql of statements) {
+            const label = sql.replace(/\s+/g, " ").slice(0, 84);
+            process.stdout.write(`  ${label} ... `);
+            await prisma.$executeRawUnsafe(sql);
+            console.log("ok");
+        }
+
+        for (const [table, columns] of Object.entries(expectedColumns)) {
+            const rows = await prisma.$queryRawUnsafe(
+                `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
+                table,
+            );
+            const found = new Set(rows.map(r => r.column_name));
+            const missing = columns.filter(c => !found.has(c));
+            if (missing.length) {
+                console.error(`VERIFY FAILED: ${table} missing columns: ${missing.join(", ")}`);
+                process.exit(1);
+            }
+            console.log(`verified ${table}: ${columns.length} column(s)`);
+        }
+
+        for (const { name, table } of expectedConstraints) {
+            const [row] = await prisma.$queryRawUnsafe(`SELECT 1 AS ok FROM pg_constraint WHERE conname = $1`, name);
+            if (!row) {
+                console.error(`VERIFY FAILED: constraint ${name} missing on ${table}`);
+                process.exit(1);
+            }
+            console.log(`verified constraint ${name}`);
+        }
+
+        for (const { name, mustMatch } of expectedUniqueIndexes) {
+            const [row] = await prisma.$queryRawUnsafe(`SELECT indexdef FROM pg_indexes WHERE indexname = $1`, name);
+            if (!row) {
+                console.error(`VERIFY FAILED: index ${name} missing`);
+                process.exit(1);
+            }
+            for (const pattern of mustMatch) {
+                if (!pattern.test(row.indexdef)) {
+                    console.error(`VERIFY FAILED: index ${name} does not match ${pattern}\n  got: ${row.indexdef}`);
+                    process.exit(1);
+                }
+            }
+            console.log(`verified unique index ${name}`);
+        }
+
+        console.log("done.");
+    } finally {
+        await prisma.$disconnect();
+    }
+}
+
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMainModule) {
+    main().catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+    });
+}
