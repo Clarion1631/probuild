@@ -8,6 +8,24 @@ import { toast } from "sonner";
 import RatesImport from "./RatesImport";
 import { setUserPayType } from "@/lib/actions";
 
+/**
+ * The Payroll rates panel's own row shape, from GET /api/payroll/roster — a
+ * payroll-scoped endpoint (ADMIN or financialReports), not the MANAGER-level
+ * /api/users. Rates arrive as exact decimal TEXT so money never round-trips
+ * through a float.
+ */
+type PayrollRosterRow = {
+    id: string;
+    name: string | null;
+    email: string;
+    role: string;
+    payType: string | null;
+    hourlyRate: string;
+    burdenRate: string;
+    lastRateSyncAt: string | null;
+    salaried: boolean;
+};
+
 type User = {
     id: string;
     name: string | null;
@@ -16,12 +34,6 @@ type User = {
     status: string;
     hourlyRate: number;
     burdenRate: number;
-    /** ISO string over the wire — last time this rate was confirmed (import or manual save). */
-    lastRateSyncAt: string | null;
-    /** Resolved server-side (/api/users) — the salaried list is env-configurable and the browser cannot read it. */
-    salaried: boolean;
-    /** "HOURLY" | "SALARY" | null. NULL blocks the payroll export until somebody answers. */
-    payType: string | null;
     showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
@@ -41,6 +53,7 @@ function rateSyncLabel(lastRateSyncAt: string | null): { text: string; stale: bo
 
 export default function TeamPage() {
     const [users, setUsers] = useState<User[]>([]);
+    const [roster, setRoster] = useState<PayrollRosterRow[]>([]);
     const [loading, setLoading] = useState(true);
     const [isAddingUser, setIsAddingUser] = useState(false);
     const [addForm, setAddForm] = useState<Partial<User>>({ role: 'FIELD_CREW' });
@@ -49,7 +62,15 @@ export default function TeamPage() {
 
     useEffect(() => {
         fetchUsers();
+        fetchRoster();
     }, []);
+
+    // Payroll data comes from the payroll-scoped endpoint. A viewer without
+    // payroll access simply gets no panel rather than a broken one.
+    async function fetchRoster() {
+        const res = await fetch('/api/payroll/roster');
+        if (res.ok) setRoster(await res.json());
+    }
 
     async function fetchUsers() {
         const res = await fetch('/api/users');
@@ -103,10 +124,6 @@ export default function TeamPage() {
         return matchesSearch && matchesStatus;
     });
 
-    // Payroll rates panel: ACTIVATED members only. A pending invite has no
-    // hours yet and a disabled account is off payroll — neither belongs in a
-    // list whose job is "what will Gusto pay".
-    const activeUsers = users.filter(user => getStatus(user) === "Activated");
 
     const getInitials = (name: string | null, email: string) => {
         if (name) {
@@ -265,7 +282,7 @@ export default function TeamPage() {
                                 job costing and is edited on each member&apos;s page.
                             </p>
                         </div>
-                        <RatesImport onImported={fetchUsers} />
+                        <RatesImport onImported={fetchRoster} />
                     </div>
                     <table className="w-full text-left border-collapse text-sm">
                         <thead>
@@ -279,11 +296,11 @@ export default function TeamPage() {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-hui-border">
-                            {activeUsers.map(user => {
+                            {roster.map(user => {
                                 const sync = rateSyncLabel(user.lastRateSyncAt);
-                                // Mirrors zeroRateBlocks on the server: an explicit SALARY answer
-                                // is exempt, and `salaried` already folds in role + the env fallback.
-                                const noRate = user.payType !== "SALARY" && !user.salaried && !((user.hourlyRate ?? 0) > 0);
+                                // Mirrors zeroRateBlocks on the server: `salaried` already folds in
+                                // payType, role and the env fallback.
+                                const noRate = !user.salaried && !(Number(user.hourlyRate) > 0);
                                 return (
                                     <tr key={user.id} className="hover:bg-slate-50 transition-colors">
                                         <td className="px-6 py-3">
@@ -316,7 +333,7 @@ export default function TeamPage() {
                                                     const result = await setUserPayType(user.id, value);
                                                     if (result.success) {
                                                         toast.success("Pay type saved.");
-                                                        fetchUsers();
+                                                        fetchRoster();
                                                     } else {
                                                         toast.error(result.error);
                                                     }
@@ -329,10 +346,11 @@ export default function TeamPage() {
                                             </select>
                                         </td>
                                         <td className="px-6 py-3 text-right tabular-nums text-hui-textMain">
-                                            {formatCurrency(user.hourlyRate ?? 0)}/h
+                                            {/* Exact decimal text from the server, not a re-formatted float. */}
+                                            ${user.hourlyRate}/h
                                         </td>
                                         <td className="px-6 py-3 text-right tabular-nums text-hui-textMuted">
-                                            {formatCurrency(user.burdenRate ?? 0)}/h
+                                            ${user.burdenRate}/h
                                         </td>
                                         <td className={`px-6 py-3 ${sync.stale ? "text-red-700" : "text-hui-textMuted"}`}>
                                             {sync.text}
@@ -342,8 +360,10 @@ export default function TeamPage() {
                             })}
                         </tbody>
                     </table>
-                    {activeUsers.length === 0 && (
-                        <div className="p-6 text-center text-hui-textMuted">No activated team members yet.</div>
+                    {roster.length === 0 && (
+                        <div className="p-6 text-center text-hui-textMuted">
+                            No payroll rates to show. (This panel needs payroll access.)
+                        </div>
                     )}
                 </div>
             </div>

@@ -125,6 +125,14 @@ test("an unlocked period lets the same edit through", async () => {
 
 function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
     const updateCalls: Array<{ id: string }> = [];
+    // Mirrors the real dependency: the guard runs INSIDE the close transaction,
+    // so a locked period comes back as a result, not as a pre-check.
+    const guardedClose = (id: string, userId: string, data: Record<string, unknown>, instants: Date[]) => {
+        const hit = instants.map((instant) => lockedPeriodFor(lockedPeriods, instant)).find(Boolean);
+        if (hit) return { ok: false as const, locked: hit };
+        updateCalls.push({ id });
+        return { ok: true as const, entry: { id, userId, ...data } };
+    };
     const entry: ClockOutTimeEntryRow = {
         id: "te1",
         userId: "u1",
@@ -142,10 +150,7 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[]) {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, data) => {
-            updateCalls.push({ id });
-            return { ok: true, entry: { id, userId, ...data } };
-        },
+        closeTimeEntry: async (id, userId, data, guard) => guardedClose(id, userId, data, guard),
         loadLockedPeriods: async () => lockedPeriods,
     };
     return { dependencies, updateCalls };
@@ -194,29 +199,36 @@ const GATED_WRITERS: Array<{ file: string; mustMatch: RegExp[] }> = [
         file: "src/lib/time-expense-core.ts",
         // createTimeEntryCore — the canonical manual create, and the reason
         // gating it here covers createTimeEntry in time-expense-actions too.
-        mustMatch: [/assertPeriodUnlockedOrThrow\(\[startTime\]\)/],
+        mustMatch: [/withPayrollWriteTx\(\[startTime\]/],
     },
     {
         file: "src/lib/time-expense-actions.ts",
         mustMatch: [
-            /assertPeriodUnlockedOrThrow\(\[current\.startTime, startTime\]\)/, // updateTimeEntry
-            /assertPeriodUnlockedOrThrow\(\[entry\.startTime\]\)/, // deleteTimeEntry
-            /assertPeriodUnlockedOrThrow\(allowed\.map\(e => e\.startTime\)\)/, // deleteTimeEntries
+            /withPayrollWriteTx\(\[current\.startTime, startTime\]/, // updateTimeEntry
+            /withPayrollWriteTx\(\[entry\.startTime\]/, // deleteTimeEntry
+            /withPayrollWriteTx\(allowed\.map\(e => e\.startTime\)/, // deleteTimeEntries
         ],
     },
     {
         file: "src/app/projects/[id]/timeclock/actions.ts",
         mustMatch: [
-            /assertPeriodUnlockedOrThrow\(\[startTime\]\)/, // createTimeEntry
-            /assertPeriodUnlockedOrThrow\(\[existing\.startTime, startTime\]\)/, // updateTimeEntry
-            /assertPeriodUnlockedOrThrow\(\[entry\.startTime\]\)/, // deleteTimeEntry
+            /withPayrollWriteTx\(\[startTime\]/, // createTimeEntry
+            /withPayrollWriteTx\(\[existing\.startTime, startTime\]/, // updateTimeEntry
+            /withPayrollWriteTx\(\[entry\.startTime\]/, // deleteTimeEntry
         ],
     },
     {
         file: "src/app/api/time-entries/route.ts",
         mustMatch: [
-            /assertPeriodUnlocked\(\[entryStartTime\]\)/, // POST clock-in (client-supplied startTime)
-            /assertPeriodUnlocked\(\[existing\.startTime\], dependencies\.loadLockedPeriods\)/, // PUT clock-out
+            /withPayrollWriteTx\(\[entryStartTime\]/, // POST clock-in (client-supplied startTime)
+            /assertPeriodUnlockedInTx\(/, // PUT clock-out, inside the close transaction
+        ],
+    },
+    {
+        file: "src/app/api/time-entries/[id]/route.ts",
+        mustMatch: [
+            /withPayrollWriteTx\(\[existing\.startTime, newStart\]/, // PATCH
+            /guard: \(tx\) => assertPeriodUnlockedInTx\(tx, \[existing\.startTime\]\)/, // DELETE
         ],
     },
 ];
@@ -230,24 +242,103 @@ test("every payroll-hours writer calls a lock assertion", () => {
     }
 });
 
-test("the PUT clock-out re-checks the lock immediately before the write", async () => {
-    // TOCTOU: the first check happens before several awaited round trips. A
-    // loader that answers "unlocked" and then "locked" simulates a lock taken in
-    // that window; the row must not be closed.
-    let call = 0;
+test("a lock taken AFTER the fail-fast check still stops the write (in-transaction guard)", async () => {
+    // The injected-sequence pattern: the stand-alone loader says "unlocked"
+    // (the fail-fast check passes), but by the time the close transaction runs,
+    // the period is locked. Only the in-transaction guard can catch that, and
+    // the row must not be closed.
+    //
+    // This simulates the race on ONE connection. A true two-connection test —
+    // proving pg_advisory_xact_lock_shared actually blocks a concurrent lock
+    // creation — needs a real Postgres and belongs in the CI database job.
     const { dependencies, updateCalls } = clockOutDeps([]);
-    dependencies.loadLockedPeriods = async () => {
-        call += 1;
-        return call === 1 ? [] : [period()];
+    dependencies.loadLockedPeriods = async () => [];
+    dependencies.closeTimeEntry = async (id, userId, data, instants) => {
+        const hit = instants.map((instant) => lockedPeriodFor([period()], instant)).find(Boolean);
+        if (hit) return { ok: false as const, locked: hit };
+        updateCalls.push({ id });
+        return { ok: true as const, entry: { id, userId, ...data } };
     };
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());
-    assert.ok(call >= 2, "the handler only checked once — the write window is unguarded");
     assert.equal(res.status, 423);
+    assert.equal((await res.json()).code, "PERIOD_LOCKED");
     assert.equal(updateCalls.length, 0, "the entry was closed into a period that had just been locked");
 });
 
-test("PATCH and DELETE on /api/time-entries/[id] both still call assertPeriodUnlocked", () => {
+test("the advisory locks are the documented pair, on one key", async () => {
+    const calls: string[] = [];
+    const tx = {
+        $executeRawUnsafe: async (query: string, key: string) => {
+            calls.push(`${query.includes("_shared") ? "shared" : "exclusive"}:${key}`);
+            return 0;
+        },
+        payrollPeriod: { findMany: async () => [] },
+    };
+    const { acquirePayrollWriteLock, acquirePayrollLockCreationLock, PAYROLL_ADVISORY_LOCK_KEY } = await import(
+        "../src/lib/payroll-period"
+    );
+    await acquirePayrollWriteLock(tx);
+    await acquirePayrollLockCreationLock(tx);
+    // Writers take SHARED (they do not conflict with each other), lock creation
+    // takes EXCLUSIVE (it must wait for every in-flight writer). Same key, or
+    // they would not serialize against each other at all.
+    assert.deepEqual(calls, [`shared:${PAYROLL_ADVISORY_LOCK_KEY}`, `exclusive:${PAYROLL_ADVISORY_LOCK_KEY}`]);
+});
+
+test("assertPeriodUnlockedInTx takes the shared lock BEFORE reading, and throws inside the tx", async () => {
+    const order: string[] = [];
+    const tx = {
+        $executeRawUnsafe: async () => {
+            order.push("lock");
+            return 0;
+        },
+        payrollPeriod: {
+            findMany: async () => {
+                order.push("read");
+                return [period()];
+            },
+        },
+    };
+    const { assertPeriodUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
+    await assert.rejects(
+        () => assertPeriodUnlockedInTx(tx, [INSIDE]),
+        (error: Error) => {
+            assert.ok(isPeriodLockedError(error));
+            return true;
+        }
+    );
+    // Reading first would let a lock commit between the read and the write.
+    assert.deepEqual(order, ["lock", "read"]);
+});
+
+test("a locked period is enforced in the zone it was LOCKED in, not today's company zone", async () => {
+    // Same period row, two different stored zones. The envelope is derived from
+    // a time zone, so re-deriving it after a CompanySettings change would move
+    // the boundaries of a period that was already paid.
+    const utcLocked = period({ timeZone: "UTC" });
+    const laLocked = period({ timeZone: "America/Los_Angeles" });
+    // 2026-08-17T02:00Z is still Sunday 08-16 in Los Angeles (the week before)
+    // but already Monday 08-17 in UTC.
+    const boundary = new Date("2026-08-17T02:00:00.000Z");
+    assert.equal(lockedPeriodFor([utcLocked], boundary, { timeZone: "America/Los_Angeles" })?.id, "pp1");
+    assert.equal(lockedPeriodFor([laLocked], boundary, { timeZone: "UTC" }), null);
+});
+
+test("every gated write happens in the SAME transaction as its lock check", () => {
+    // The guard is only a guard if the check and the write share a transaction.
+    // A stand-alone assertPeriodUnlocked() before a bare prisma write is the
+    // shape this test exists to catch.
+    const bare = readFileSync(path.join(__dirname, "..", "src", "lib", "time-expense-actions.ts"), "utf8");
+    assert.doesNotMatch(bare, /await prisma\.timeEntry\.(deleteMany|updateMany|update|delete)\(/);
+    const timeclock = readFileSync(
+        path.join(__dirname, "..", "src", "app", "projects", "[id]", "timeclock", "actions.ts"),
+        "utf8"
+    );
+    assert.doesNotMatch(timeclock, /await prisma\.timeEntry\.(create|update|delete)\(/);
+});
+
+test("PATCH and DELETE on /api/time-entries/[id] both still call the lock guard", () => {
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
@@ -256,15 +347,11 @@ test("PATCH and DELETE on /api/time-entries/[id] both still call assertPeriodUnl
     assert.ok(splitAt > 0, "DELETE handler not found — this check needs updating");
     const patchHalf = source.slice(0, splitAt);
     const deleteHalf = source.slice(splitAt);
+    // PATCH: a cheap fail-fast check, then the real in-transaction guard.
     assert.match(patchHalf, /assertPeriodUnlocked\(\[existing\.startTime, newStart\]\)/);
-    assert.match(deleteHalf, /assertPeriodUnlocked\(\[existing\.startTime\]\)/);
-    // PATCH checks twice: once early (fail fast) and once immediately before the
-    // write, for the same TOCTOU reason the PUT test above exercises for real.
-    assert.equal(
-        (patchHalf.match(/assertPeriodUnlocked\(\[existing\.startTime, newStart\]\)/g) ?? []).length,
-        2,
-        "PATCH must re-check the lock immediately before prisma.timeEntry.update"
-    );
+    assert.match(patchHalf, /withPayrollWriteTx\(\[existing\.startTime, newStart\]/);
+    // DELETE: the guard runs inside deleteEntryAndSettle's own transaction.
+    assert.match(deleteHalf, /guard: \(tx\) => assertPeriodUnlockedInTx\(tx, \[existing\.startTime\]\)/);
 });
 
 test("assertPeriodUnlockedOrThrow throws with the same message the routes return", async () => {

@@ -279,6 +279,33 @@ test("readiness looks at the whole workweek ENVELOPE, not just the period", () =
     assert.deepEqual(withoutEnvelope.blocking, []);
 });
 
+test("a manual entry with hours but no endTime is COMPLETED, not open", () => {
+    // Manual entries recorded durationHours with endTime NULL. Treating that as
+    // "still clocked in" blocked every export containing one, and dropped its
+    // hours from the totals. OPEN now means endTime null AND no duration.
+    const manual = entry({ userId: alice.id, id: "manual", startTime: at8am("2026-08-18"), durationHours: 8 });
+    const result = buildGustoExport({
+        entries: [{ ...manual, endTime: null }],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking, [], "a completed manual entry must not block payroll");
+    assert.equal(totalsFor(alice.id, result).totalHours, 8, "and its hours must be exported");
+});
+
+test("a genuinely open punch — no endTime AND no duration — still blocks", () => {
+    const result = buildGustoExport({
+        entries: [entry({ userId: alice.id, id: "open", startTime: at8am("2026-08-18"), durationHours: 0, endTime: null })],
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking.map((row) => row.reason), ["open"]);
+});
+
 test("a zero-hour entry is dropped from the totals — which is why blocking has to catch it", () => {
     const entries = [entry({ userId: alice.id, id: "zero-1", startTime: at8am("2026-08-20"), durationHours: 0 })];
     const result = buildGustoExport({ entries, users: [alice], periodStart: PERIOD_START, periodEnd: PERIOD_END, timeZone: TZ });

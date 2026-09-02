@@ -131,8 +131,22 @@ async function settleDayInTx(
  * too), then deleted, then every affected day re-planned. Throws on failure
  * (the caller answers 500 and nothing is deleted).
  */
-export async function deleteEntryAndSettle(entryId: string, knownDayKey: string, userId: string): Promise<void> {
+export async function deleteEntryAndSettle(
+    entryId: string,
+    knownDayKey: string,
+    userId: string,
+    options: {
+        /**
+         * Runs FIRST, inside this transaction, before anything is deleted. The
+         * payroll-period guard uses it so its lock check and this delete cannot
+         * be split by a concurrent lock creation (src/lib/payroll-period.ts).
+         * Throwing aborts the whole transaction, which is the point.
+         */
+        guard?: (tx: any) => Promise<void>;
+    } = {}
+): Promise<void> {
     await prisma.$transaction(async (tx) => {
+        if (options.guard) await options.guard(tx);
         await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
         const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
         if (!victim) return; // already gone

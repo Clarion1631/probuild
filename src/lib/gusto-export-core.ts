@@ -187,8 +187,12 @@ export function blockingEntries(
         // export settles what it can first; anything still DEFERRED afterwards
         // (the worker is mid-shift, or settlement failed) would export at FULL
         // pay with no meal deduction. Refuse rather than overpay.
+        // OPEN means "nobody has said how long this shift was": endTime null AND
+        // no duration. A manual entry carries durationHours with (historically)
+        // no endTime — a COMPLETED shift — and calling that "still clocked in"
+        // blocked every export that contained one.
         const reason: BlockingReason | null =
-            entry.endTime == null
+            entry.endTime == null && !(Number.isFinite(entry.durationHours) && entry.durationHours > 0)
                 ? "open"
                 : entry.needsReview
                   ? "needsReview"
@@ -281,9 +285,9 @@ export function buildGustoExport(input: {
     const employeeMappings = input.employeeMappings ?? {};
     const isSalaried = input.isSalaried ?? (() => false);
 
-    const closed = entries.filter(
-        (entry) => entry.endTime != null && Number.isFinite(entry.durationHours) && entry.durationHours > 0
-    );
+    // Countable = has real paid hours. endTime is not required: a manual entry
+    // records durationHours directly (see blockingEntries on what "open" means).
+    const closed = entries.filter((entry) => Number.isFinite(entry.durationHours) && entry.durationHours > 0);
 
     const byUser = new Map<string, ExportEntry[]>();
     for (const entry of closed) {

@@ -71,6 +71,8 @@ export type PayrollPeriodRow = {
     lockedAt: Date | null;
     lockedById: string | null;
     exportHash: string | null;
+    /** The zone the period was locked in — enforcement uses it, not today's company zone. */
+    timeZone: string | null;
     lockedBy: { name: string | null; email: string } | null;
 };
 
@@ -81,6 +83,7 @@ const PAYROLL_PERIOD_SELECT = {
     lockedAt: true,
     lockedById: true,
     exportHash: true,
+    timeZone: true,
     lockedBy: { select: { name: true, email: true } },
 } as const;
 

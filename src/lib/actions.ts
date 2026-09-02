@@ -15185,21 +15185,31 @@ async function requirePayrollAccess() {
 
 /**
  * Step 1 of the rate import: parse a pasted Gusto employee export and return
- * the diff for a human to look at, plus a FINGERPRINT of exactly what they are
- * being shown. WRITES NOTHING.
- *
- * The preview and the save both run the same pure code
- * (src/lib/rate-import.ts), so what is approved is what is applied.
+ * the diff for a human to look at, each row carrying its own fingerprint.
+ * WRITES NOTHING.
  */
 export async function previewGustoRateImport(csvText: string) {
     await requirePayrollAccess();
     if (typeof csvText !== "string" || !csvText.trim()) {
         return { success: false as const, error: "Paste the CSV first." };
     }
-    const { parseGustoRateCsv, diffRates, previewFingerprint } = await import("./rate-import");
+    const { parseGustoRateCsv, diffRates, hasDuplicateTargets } = await import("./rate-import");
     const parsed = parseGustoRateCsv(csvText);
-    const rows = diffRates(parsed.rows, await importableUsers());
-    return { success: true as const, rows, errors: parsed.errors, previewHash: previewFingerprint(rows) };
+    const users = await importableUsers();
+
+    // The WHOLE preview is refused when the file claims one person twice: if it
+    // lists somebody with two different rates, nobody can say which the office
+    // meant, and importing the other rows while dropping the ambiguous one
+    // leaves a half-applied payroll change nobody reviewed.
+    if (hasDuplicateTargets(parsed.rows, users)) {
+        return {
+            success: false as const,
+            error: "That file lists the same team member more than once. Fix the file and import it again — nothing was previewed.",
+        };
+    }
+
+    const rows = diffRates(parsed.rows, users);
+    return { success: true as const, rows, errors: parsed.errors };
 }
 
 /** Everyone the import may write to, with rates as canonical decimal TEXT (never a float). */
@@ -15222,34 +15232,38 @@ async function importableUsers() {
 /**
  * Step 2: apply the approved rows.
  *
- * The rows are NOT trusted: a server action argument is an HTTP body, so this
- * is re-derived and re-checked against the live database. `previewHash` ties
- * the write to the exact preview a human approved — including each user's rate
- * AS IT WAS THEN, so a replay after somebody else changed a rate is refused
- * rather than silently overwriting them.
+ * Three independent guards, because a server action argument is an HTTP body,
+ * not the preview's return value:
+ *
+ *  1. each row carries its OWN fingerprint (userId + the rate at preview time +
+ *     what is about to be written), re-derived here from live data. Per row, so
+ *     a human can tick a SUBSET without the save being rejected;
+ *  2. disabled accounts are refused;
+ *  3. the write itself is `updateMany where id AND hourlyRate = previewedOld`
+ *     inside one transaction — if anybody changed that rate between preview and
+ *     save, the count is 0 and the WHOLE batch is rolled back. That is the
+ *     guard that actually holds; the fingerprint is what produces a good error.
  *
  * hourlyRate is written from canonical decimal TEXT through Prisma.Decimal, so
- * the value never passes through a JS float. Burden is untouched (it is not in
- * the Gusto export — spec section 7 risk 4).
+ * the value never passes through a JS float.
  */
 export async function applyGustoRateImport(
-    rows: Array<{ userId: string; newHourly: string; payType?: string | null }>,
-    previewHash: string
+    rows: Array<{ userId: string; newHourly: string; payType?: string | null; rowHash: string }>
 ) {
     await requirePayrollAccess();
     if (!Array.isArray(rows) || rows.length === 0) {
         return { success: false as const, error: "Nothing to save." };
     }
-    if (typeof previewHash !== "string" || !previewHash) {
-        return { success: false as const, error: "Run the preview again before saving." };
-    }
-    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } = await import("./rate-import");
+    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue, rowFingerprint } = await import("./rate-import");
     const { Prisma } = await import("@prisma/client");
 
     const seen = new Set<string>();
-    const clean: Array<{ userId: string; newHourly: string; payType: string | null }> = [];
+    const clean: Array<{ userId: string; newHourly: string; payType: string | null; rowHash: string }> = [];
     for (const row of rows) {
         if (!row || typeof row.userId !== "string" || !row.userId) continue;
+        if (typeof row.rowHash !== "string" || !row.rowHash) {
+            return { success: false as const, error: "Run the preview again before saving." };
+        }
         if (seen.has(row.userId)) return { success: false as const, error: "The same team member appears twice." };
         const rate = parseRateValue(String(row.newHourly));
         if (rate == null || rate.startsWith("-") || Number(rate) > MAX_IMPORTABLE_HOURLY_RATE) {
@@ -15260,7 +15274,7 @@ export async function applyGustoRateImport(
         }
         const payType = row.payType === "SALARY" || row.payType === "HOURLY" ? row.payType : null;
         seen.add(row.userId);
-        clean.push({ userId: row.userId, newHourly: rate, payType });
+        clean.push({ userId: row.userId, newHourly: rate, payType, rowHash: row.rowHash });
     }
     if (clean.length === 0) return { success: false as const, error: "Nothing to save." };
 
@@ -15271,54 +15285,53 @@ export async function applyGustoRateImport(
     if (known.length !== clean.length) {
         return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
     }
-    const disabled = known.filter((u) => u.status === "DISABLED");
-    if (disabled.length > 0) {
+    if (known.some((u) => u.status === "DISABLED")) {
         return { success: false as const, error: "One of those accounts is disabled — re-run the preview." };
     }
 
-    // Re-derive the fingerprint from LIVE rows. Any drift (someone edited a rate
-    // on the team page, an account was disabled, the body was replayed) fails
-    // here instead of overwriting a decision nobody saw.
-    const { previewFingerprint } = await import("./rate-import");
     const byId = new Map(known.map((u) => [u.id, u]));
-    const liveHash = previewFingerprint(
-        clean.map((row) => {
-            const live = byId.get(row.userId)!;
+    for (const row of clean) {
+        const live = byId.get(row.userId)!;
+        const expected = rowFingerprint({
+            userId: row.userId,
+            oldHourly: live.hourlyRate.toFixed(2),
+            newHourly: row.newHourly,
+            payType: row.payType,
+        });
+        if (expected !== row.rowHash) {
             return {
-                userId: row.userId,
-                name: "",
-                email: null,
-                oldHourly: live.hourlyRate.toFixed(2),
-                newHourly: row.newHourly,
-                payType: row.payType,
-                matched: true,
-                matchedBy: null,
-                changed: true,
-                note: null,
+                success: false as const,
+                error: "One of those rates changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
             };
-        })
-    );
-    if (liveHash !== previewHash) {
-        return {
-            success: false as const,
-            error: "These rates changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
-        };
+        }
     }
 
     const syncedAt = new Date();
-    await prisma.$transaction(
-        clean.map((row) =>
-            prisma.user.update({
-                where: { id: row.userId },
-                data: {
-                    // Exact decimal from text — never a JS float.
-                    hourlyRate: new Prisma.Decimal(row.newHourly),
-                    lastRateSyncAt: syncedAt,
-                    ...(row.payType ? { payType: row.payType } : {}),
-                },
-            })
-        )
-    );
+    try {
+        await prisma.$transaction(async (tx) => {
+            for (const row of clean) {
+                const previousRate = byId.get(row.userId)!.hourlyRate;
+                // Compare-and-set on the rate we showed the human. A concurrent
+                // edit makes count 0, the throw rolls the whole batch back, and
+                // nobody ends up half-imported.
+                const result = await tx.user.updateMany({
+                    where: { id: row.userId, hourlyRate: previousRate, status: { not: "DISABLED" } },
+                    data: {
+                        hourlyRate: new Prisma.Decimal(row.newHourly),
+                        lastRateSyncAt: syncedAt,
+                        ...(row.payType ? { payType: row.payType } : {}),
+                    },
+                });
+                if (result.count !== 1) {
+                    throw new Error(
+                        "Somebody changed one of these pay rates while this import was being saved. Nothing was saved — re-run the preview."
+                    );
+                }
+            }
+        });
+    } catch (error: any) {
+        return { success: false as const, error: error?.message || "Could not save those rates." };
+    }
 
     revalidatePath("/company/team-members");
     revalidatePath("/manager/time-entries");
@@ -15365,6 +15378,7 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
     const { startOfDateInTimeZone } = await import("./tz-date");
     const { validatePayrollRange } = await import("./payroll-config");
     const { loadGustoExport } = await import("./gusto-export-db");
+    const { acquirePayrollLockCreationLock } = await import("./payroll-period");
 
     // ONE validator, shared with the endpoint and the page (day-key shape, real
     // calendar day, positive length, 62-day cap) - a lock must never cover a
@@ -15400,6 +15414,14 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
             // punch" would have two answers. FOR UPDATE (raw - Prisma has no
             // row-lock option) serialises two concurrent locks of overlapping
             // ranges rather than letting both commit.
+            // EXCLUSIVE payroll advisory lock, FIRST. It waits for every
+            // in-flight hours writer holding the shared lock and blocks new
+            // ones until this transaction commits, so the recompute below
+            // cannot race a write. It also serialises two concurrent lock
+            // creations, which is what makes the overlap check below sound —
+            // FOR UPDATE cannot lock a row nobody has inserted yet.
+            await acquirePayrollLockCreationLock(tx as never);
+
             const overlapping = await tx.$queryRaw<Array<{ id: string; periodStart: Date; periodEnd: Date }>>`
                 SELECT "id", "periodStart", "periodEnd"
                 FROM "PayrollPeriod"
@@ -15422,8 +15444,11 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
 
             await tx.payrollPeriod.upsert({
                 where: { periodStart_periodEnd: { periodStart, periodEnd } },
-                create: { periodStart, periodEnd, lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
-                update: { lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
+                // timeZone is persisted so enforcement can rebuild this
+                // period's workweek envelope exactly as it was, even if
+                // CompanySettings.timeZone changes later.
+                create: { periodStart, periodEnd, lockedAt, lockedById: user.id, exportHash: precheck.exportHash, timeZone },
+                update: { lockedAt, lockedById: user.id, exportHash: precheck.exportHash, timeZone },
             });
 
             const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx });

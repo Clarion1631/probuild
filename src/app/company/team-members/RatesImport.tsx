@@ -16,9 +16,9 @@ import type { RateDiffRow } from "@/lib/rate-import";
 export default function RatesImport({ onImported }: { onImported: () => void }) {
     const [open, setOpen] = useState(false);
     const [csvText, setCsvText] = useState("");
+    // Each row carries its own fingerprint (see rowFingerprint) so a human can
+    // tick a SUBSET without the save being rejected wholesale.
     const [rows, setRows] = useState<RateDiffRow[] | null>(null);
-    // Ties the save to the exact preview that was shown (see previewFingerprint).
-    const [previewHash, setPreviewHash] = useState("");
     const [errors, setErrors] = useState<string[]>([]);
     const [selected, setSelected] = useState<Record<string, boolean>>({});
     const [busy, setBusy] = useState(false);
@@ -29,7 +29,6 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
         setRows(null);
         setErrors([]);
         setSelected({});
-        setPreviewHash("");
     };
 
     const close = () => {
@@ -54,7 +53,6 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
             }
             setRows(result.rows);
             setErrors(result.errors);
-            setPreviewHash(result.previewHash);
             // Pre-tick exactly the rows that would actually change something.
             // Pre-tick only EMAIL-matched changes. A name-only match is exactly
             // the row a human should have to look at before it writes a pay
@@ -75,14 +73,19 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
     async function handleSave() {
         const payload = (rows ?? [])
             .filter((row) => row.userId && selected[row.userId])
-            .map((row) => ({ userId: row.userId as string, newHourly: row.newHourly, payType: row.payType }));
+            .map((row) => ({
+                userId: row.userId as string,
+                newHourly: row.newHourly,
+                payType: row.payType,
+                rowHash: row.rowHash as string,
+            }));
         if (payload.length === 0) {
             toast.error("Tick at least one rate to save.");
             return;
         }
         setBusy(true);
         try {
-            const result = await applyGustoRateImport(payload, previewHash);
+            const result = await applyGustoRateImport(payload);
             if (!result.success) {
                 toast.error(result.error);
                 return;

@@ -34,6 +34,24 @@ CREATE INDEX IF NOT EXISTS "PayrollPeriod_lockedAt_idx" ON "PayrollPeriod"("lock
 -- CreateIndex
 CREATE INDEX IF NOT EXISTS "PayrollPeriod_lockedById_idx" ON "PayrollPeriod"("lockedById");
 
+-- AlterTable: the IANA zone the period was locked in. Enforcement reads it back
+-- so a later CompanySettings.timeZone change cannot move the workweek envelope
+-- of a period that was already paid.
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "timeZone" TEXT;
+
+-- CreateIndex: every payroll read is a startTime RANGE scan (whole workweeks
+-- for the export, a period for the lock check and the settlement planner) and
+-- none of TimeEntry's FK indexes serve a bare range predicate.
+CREATE INDEX IF NOT EXISTS "TimeEntry_startTime_idx" ON "TimeEntry"("startTime");
+
+-- Backfill: manual time entries were created with durationHours set but
+-- endTime NULL, which every "is this punch still open?" reader has to treat as
+-- open. They are COMPLETED rows — give them the end time their duration
+-- implies. Idempotent (only touches rows still NULL) and additive.
+UPDATE "TimeEntry"
+SET "endTime" = "startTime" + make_interval(secs => "durationHours" * 3600)
+WHERE "endTime" IS NULL AND "durationHours" IS NOT NULL AND "durationHours" > 0;
+
 -- AddForeignKey (guarded — ADD CONSTRAINT has no IF NOT EXISTS on Postgres 15).
 DO $$
 BEGIN

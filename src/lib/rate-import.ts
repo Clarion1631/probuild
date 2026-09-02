@@ -41,6 +41,8 @@ export type RateImportParse = {
 
 export type RateDiffRow = {
     userId: string | null;
+    /** Per-ROW fingerprint (see rowFingerprint). Only set on a matched row. */
+    rowHash: string | null;
     name: string;
     email: string | null;
     /** Canonical decimal TEXT (2 places), or null when nothing matched. */
@@ -308,6 +310,7 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             // nobody reviewed.
             return {
                 userId: null,
+                rowHash: null,
                 name: user.name ?? row.name,
                 email: user.email,
                 oldHourly: null,
@@ -324,6 +327,7 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             // The same person twice in one file: take neither silently.
             return {
                 userId: null,
+                rowHash: null,
                 name: row.name,
                 email: row.email,
                 oldHourly: null,
@@ -337,15 +341,24 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
         }
         if (user) claimed.add(user.id);
 
+        const oldHourly = user ? canonicalRateText(user.hourlyRate) : null;
         return {
             userId: user?.id ?? null,
+            rowHash: user
+                ? rowFingerprint({
+                      userId: user.id,
+                      oldHourly,
+                      newHourly: row.hourlyRate,
+                      payType: row.payType,
+                  })
+                : null,
             name: user?.name ?? row.name,
             // The MATCHED member's email wins. Showing the CSV's address for a
             // NAME match is how a human approves a write to the wrong person:
             // the row would display an email that belongs to nobody in
             // ProBuild while the rate lands on whoever shares the name.
             email: user ? user.email : row.email,
-            oldHourly: user ? canonicalRateText(user.hourlyRate) : null,
+            oldHourly,
             newHourly: row.hourlyRate,
             payType: row.payType,
             matched: !!user,
@@ -376,7 +389,39 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
 export function previewFingerprint(rows: RateDiffRow[]): string {
     return rows
         .filter((row) => row.userId)
-        .map((row) => [row.userId, row.oldHourly ?? "", row.newHourly, row.payType ?? ""].join(":"))
+        .map((row) => row.rowHash ?? "")
         .sort()
         .join("|");
+}
+
+/**
+ * PER-ROW fingerprint: the target user, the rate they had when the preview was
+ * built, and the rate/pay type about to be written.
+ *
+ * Per row rather than per file, because a human can tick a SUBSET of the
+ * preview. A whole-file hash forces an all-or-nothing save: tick three of ten
+ * rows and the recomputed hash never matches, so a legitimate partial import is
+ * rejected. Each submitted row now carries its own hash and is validated on its
+ * own, and the DB write is additionally guarded on the previewed old rate.
+ */
+export function rowFingerprint(input: {
+    userId: string;
+    oldHourly: string | null;
+    newHourly: string;
+    payType: string | null;
+}): string {
+    return [input.userId, input.oldHourly ?? "", input.newHourly, input.payType ?? ""].join(":");
+}
+
+/**
+ * True when any ProBuild member is claimed by more than one row of the file.
+ *
+ * The whole PREVIEW is rejected in that case, not just the duplicate rows: if a
+ * file lists somebody twice with different rates, nobody can say which one the
+ * office meant, and importing the other nine people while silently dropping the
+ * ambiguous one leaves a half-applied payroll change nobody reviewed.
+ */
+export function hasDuplicateTargets(parsed: ParsedRateRow[], users: ImportableUser[]): boolean {
+    const rows = diffRates(parsed, users);
+    return rows.some((row) => (row.note ?? "").includes("more than once"));
 }

@@ -57,7 +57,109 @@ export type LockedPeriodRow = {
     periodStart: Date;
     periodEnd: Date;
     lockedAt: Date | null;
+    /**
+     * The IANA zone this period was LOCKED in. Enforcement uses it in
+     * preference to whatever the company zone resolves to today: the workweek
+     * envelope is derived from a time zone, so re-deriving it after a
+     * CompanySettings.timeZone change would silently move the boundaries of a
+     * period that was already paid. Null on rows written before the column
+     * existed — those fall back to the resolved company zone.
+     */
+    timeZone?: string | null;
 };
+
+/** Advisory-lock key. ONE key for the whole payroll-period mechanism — see acquirePayrollWriteLock. */
+export const PAYROLL_ADVISORY_LOCK_KEY = "payroll-period";
+
+/** Minimal shape of a Prisma transaction client — kept structural so tests can inject a fake. */
+export type PayrollTxClient = {
+    $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+    payrollPeriod: { findMany(args: unknown): Promise<LockedPeriodRow[]> };
+};
+
+/** Thrown by the in-transaction assertion so a server action refuses the same way every other guard does. */
+export class PeriodLockedError extends Error {
+    readonly period: LockedPeriodRow;
+    constructor(period: LockedPeriodRow) {
+        super(periodLockedMessage(period));
+        this.name = "PeriodLockedError";
+        this.period = period;
+    }
+}
+
+export function isPeriodLockedError(error: unknown): error is PeriodLockedError {
+    return error instanceof Error && error.name === "PeriodLockedError";
+}
+
+/**
+ * SHARED advisory lock, taken by every hours WRITER inside its own write
+ * transaction, immediately before it checks the lock.
+ *
+ * Why an advisory lock at all: the check and the write are two statements, and
+ * "is this period locked?" reads a DIFFERENT row from the one being written, so
+ * no row lock can serialize them. Two connections could therefore interleave as
+ *   writer: check (unlocked) -> locker: insert lock, recompute -> writer: write
+ * and the locked period's stored exportHash would describe hours that changed
+ * immediately afterwards. Postgres advisory locks are the standard answer for
+ * serializing against a predicate rather than a row.
+ *
+ * Shared, not exclusive, because writers do not conflict with EACH OTHER here —
+ * only with a lock being created. Concurrent clock-outs stay concurrent.
+ *
+ * `pg_advisory_xact_lock*` releases at COMMIT or ROLLBACK, so there is no leak
+ * path: it cannot outlive the transaction even if the handler throws.
+ */
+export async function acquirePayrollWriteLock(tx: PayrollTxClient): Promise<void> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock_shared(hashtext($1))`, PAYROLL_ADVISORY_LOCK_KEY);
+}
+
+/**
+ * EXCLUSIVE advisory lock, taken by lock CREATION inside its transaction before
+ * it inserts or recomputes. It waits for every in-flight writer holding the
+ * shared lock, and blocks new ones until the lock row is committed.
+ *
+ * It also serializes two concurrent lock creations against each other, which is
+ * what makes the overlapping-period check (a predicate over rows that may not
+ * exist yet) actually sound — SELECT ... FOR UPDATE cannot lock a row nobody
+ * has inserted.
+ */
+export async function acquirePayrollLockCreationLock(tx: PayrollTxClient): Promise<void> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, PAYROLL_ADVISORY_LOCK_KEY);
+}
+
+/** Locked periods read THROUGH a transaction client, so the check sees the same snapshot as the write. */
+export async function loadLockedPeriodsTx(tx: PayrollTxClient): Promise<LockedPeriodRow[]> {
+    return tx.payrollPeriod.findMany({
+        where: { lockedAt: { not: null } },
+        select: { id: true, periodStart: true, periodEnd: true, lockedAt: true, timeZone: true },
+    });
+}
+
+/**
+ * Take the shared lock, then assert none of `instants` is frozen — INSIDE the
+ * caller's write transaction. Throws PeriodLockedError.
+ *
+ * This is the guard that actually holds. assertPeriodUnlocked() (the
+ * NextResponse variant) is still useful as a cheap fail-fast before expensive
+ * work, but on its own it is only a check, not a guarantee.
+ */
+export async function assertPeriodUnlockedInTx(
+    tx: PayrollTxClient,
+    instants: Array<Date | null | undefined>,
+    options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
+): Promise<void> {
+    const candidates = instants.filter(
+        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
+    );
+    if (candidates.length === 0) return;
+    await acquirePayrollWriteLock(tx);
+    const periods = await loadLockedPeriodsTx(tx);
+    if (periods.length === 0) return;
+    for (const instant of candidates) {
+        const period = lockedPeriodFor(periods, instant, options);
+        if (period) throw new PeriodLockedError(period);
+    }
+}
 
 /** Loader for the candidate periods. Injectable so the lock rules can be tested without a database. */
 export type LockedPeriodLoader = () => Promise<LockedPeriodRow[]>;
@@ -78,11 +180,18 @@ export function lockedPeriodFor(
     options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
 ): LockedPeriodRow | null {
     if (!instant || Number.isNaN(instant.getTime())) return null;
-    const timeZone = options.timeZone ?? COMPANY_TIME_ZONE;
+    // The caller's zone is only a FALLBACK. A locked period carries the zone it
+    // was locked in, and that is what its envelope must be computed from.
+    const fallbackZone = options.timeZone ?? COMPANY_TIME_ZONE;
     const at = instant.getTime();
     for (const period of periods) {
         if (!period.lockedAt) continue;
-        const envelope = payrollLockEnvelope(period.periodStart, period.periodEnd, timeZone, options.weekStart);
+        const envelope = payrollLockEnvelope(
+            period.periodStart,
+            period.periodEnd,
+            period.timeZone || fallbackZone,
+            options.weekStart
+        );
         if (at >= envelope.start.getTime() && at < envelope.end.getTime()) return period;
     }
     return null;
@@ -122,7 +231,31 @@ export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
     const { prisma } = await import("./prisma");
     return prisma.payrollPeriod.findMany({
         where: { lockedAt: { not: null } },
-        select: { id: true, periodStart: true, periodEnd: true, lockedAt: true },
+        select: { id: true, periodStart: true, periodEnd: true, lockedAt: true, timeZone: true },
+    });
+}
+
+/**
+ * Open a transaction, take the shared advisory lock, assert the instants are
+ * not frozen, and run the write — all in ONE transaction, which is the only
+ * arrangement where the check actually protects the write.
+ *
+ * Throws PeriodLockedError, which routes map to 423 and server actions surface
+ * as their usual thrown error.
+ */
+export async function withPayrollWriteTx<T>(
+    instants: Array<Date | null | undefined>,
+    write: (tx: PayrollTxClient) => Promise<T>,
+    options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
+): Promise<T> {
+    const { prisma } = await import("./prisma");
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    // The SAME zone the export and the lock action use — never the hardcoded
+    // company-day constant, which ignores CompanySettings.
+    const timeZone = options.timeZone ?? (await resolveCompanyTimeZone());
+    return prisma.$transaction(async (tx) => {
+        await assertPeriodUnlockedInTx(tx as unknown as PayrollTxClient, instants, { ...options, timeZone });
+        return write(tx as unknown as PayrollTxClient);
     });
 }
 
@@ -142,11 +275,27 @@ export async function assertPeriodUnlocked(
     if (candidates.length === 0) return null;
     const periods = await loader();
     if (periods.length === 0) return null;
+    const timeZone = await resolveEnforcementTimeZone();
     for (const instant of candidates) {
-        const period = lockedPeriodFor(periods, instant);
+        const period = lockedPeriodFor(periods, instant, { timeZone });
         if (period) return periodLockedResponse(period);
     }
     return null;
+}
+
+/**
+ * The zone enforcement falls back to when a period predates the stored column.
+ * Resolved from CompanySettings, exactly like the export and the lock action —
+ * the hardcoded COMPANY_TIME_ZONE constant would disagree with both the moment
+ * the company zone is changed.
+ */
+async function resolveEnforcementTimeZone(): Promise<string> {
+    try {
+        const { resolveCompanyTimeZone } = await import("./company-timezone");
+        return await resolveCompanyTimeZone();
+    } catch {
+        return COMPANY_TIME_ZONE;
+    }
 }
 
 /**
@@ -166,8 +315,9 @@ export async function assertPeriodUnlockedOrThrow(
     if (candidates.length === 0) return;
     const periods = await loader();
     if (periods.length === 0) return;
+    const timeZone = await resolveEnforcementTimeZone();
     for (const instant of candidates) {
-        const period = lockedPeriodFor(periods, instant);
-        if (period) throw new Error(periodLockedMessage(period));
+        const period = lockedPeriodFor(periods, instant, { timeZone });
+        if (period) throw new PeriodLockedError(period);
     }
 }

@@ -119,7 +119,7 @@ function deps(options: {
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, data) => {
+        closeTimeEntry: async (id, userId, data, _guard) => {
             updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },

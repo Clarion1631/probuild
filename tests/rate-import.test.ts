@@ -13,6 +13,7 @@ import {
     diffRates,
     parseCsvGrid,
     parseGustoRateCsv,
+    hasDuplicateTargets,
     parseRateValue,
     previewFingerprint,
     MAX_IMPORTABLE_HOURLY_RATE,
@@ -169,6 +170,55 @@ test("a DISABLED account is never written to", () => {
     assert.equal(row.matched, false);
     assert.equal(row.userId, null);
     assert.match(row.note ?? "", /disabled/i);
+});
+
+test("each row carries its OWN fingerprint, so a SUBSET can be applied", () => {
+    // A whole-file hash forced all-or-nothing: tick three of ten rows and the
+    // recomputed hash never matched, rejecting a legitimate partial import.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            "Tim Brennan,tim@example.com,32.50",
+            "Garrett Lane,garrett@example.com,29.00",
+        ].join("\n")
+    );
+    const rows = diffRates(parsed.rows, users);
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((row) => row.rowHash));
+
+    // Each row's hash depends only on ITS OWN user/old/new values, so taking one
+    // row and leaving the other does not disturb it.
+    const [tim, garrett] = rows;
+    assert.notEqual(tim.rowHash, garrett.rowHash);
+    const timAlone = diffRates(
+        parseGustoRateCsv(["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,32.50"].join("\n")).rows,
+        users
+    );
+    assert.equal(timAlone[0].rowHash, tim.rowHash, "a row's hash must not depend on its neighbours");
+
+    // But it DOES depend on the old rate: a concurrent edit changes it.
+    const moved = users.map((u) => (u.id === "u1" ? { ...u, hourlyRate: "27.00" } : u));
+    assert.notEqual(diffRates(parsed.rows, moved)[0].rowHash, tim.rowHash);
+});
+
+test("a file listing the same person twice poisons the WHOLE preview", () => {
+    // Two rates for one person: nobody can say which the office meant, and
+    // importing the others while dropping this one leaves a half-applied
+    // payroll change nobody reviewed.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            "Tim Brennan,tim@example.com,31",
+            "Tim Brennan,tim@example.com,44",
+            "Garrett Lane,garrett@example.com,29",
+        ].join("\n")
+    );
+    assert.equal(hasDuplicateTargets(parsed.rows, users), true);
+
+    const clean = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,31"].join("\n")
+    );
+    assert.equal(hasDuplicateTargets(clean.rows, users), false);
 });
 
 test("the preview fingerprint covers the OLD rate, so a stale approval is refused", () => {

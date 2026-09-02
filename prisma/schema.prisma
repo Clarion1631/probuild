@@ -81,6 +81,13 @@ model PayrollPeriod {
   lockedById  String?
   lockedBy    User?     @relation("PayrollPeriodLocker", fields: [lockedById], references: [id], onDelete: SetNull)
   exportHash  String?
+  /// IANA zone the period was LOCKED in. Enforcement reads it back rather than
+  /// resolving the company zone fresh: the workweek envelope is computed from a
+  /// time zone, so if CompanySettings.timeZone ever changes, re-deriving it
+  /// would silently move the boundaries of a period that was already paid.
+  /// Null on rows written before this column existed — those fall back to the
+  /// resolved company zone.
+  timeZone    String?
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
 
   @@unique([periodStart, periodEnd])
@@ -1005,6 +1012,10 @@ model TimeEntry {
   @@index([estimateItemId])
   @@index([scheduleTaskId])
   @@index([changeOrderId])
+  /// Every payroll read is a startTime RANGE scan (the export fetches whole
+  /// workweeks, the lock check and the settlement planner both scan a period),
+  /// and none of the FK indexes above help a bare range predicate.
+  @@index([startTime])
 }
 
 model Contract {

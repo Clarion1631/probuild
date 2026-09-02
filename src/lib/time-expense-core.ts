@@ -3,7 +3,8 @@ import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
-import { assertPeriodUnlockedOrThrow } from "./payroll-period";
+import { appendZeroRateReview, zeroRateBlocks } from "./pay-rate-guard";
+import { withPayrollWriteTx } from "./payroll-period";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -50,6 +51,9 @@ async function resolveChangeOrder(changeOrderId: string, projectId?: string) {
 }
 
 export type CreateTimeEntryCoreInput = {
+    /** Set by callers that detected something payroll must look at (e.g. a $0 rate). */
+    needsReview?: boolean;
+    reviewReason?: string | null;
     projectId?: string;
     userId: string;
     costCodeId?: string | null;
@@ -73,11 +77,6 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
         ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
         : new Date(data.date);
     if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
-    // The canonical manual-create. Creating hours AT a date puts them in that
-    // period, so a locked period refuses the create outright — gating here
-    // covers every caller instead of each server action separately
-    // (src/lib/payroll-period.ts).
-    await assertPeriodUnlockedOrThrow([startTime]);
 
     const changeOrder = data.changeOrderId ? await resolveChangeOrder(data.changeOrderId, data.projectId) : null;
     const projectId = changeOrder?.projectId ?? data.projectId;
@@ -100,21 +99,30 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
         estimateItemId: null,
     });
 
-    return prisma.timeEntry.create({
-        data: {
-            projectId,
-            scheduleTaskId,
-            userId: data.userId,
-            costCodeId: data.costCodeId || null,
-            startTime,
-            durationHours: data.durationHours,
-            laborCost: dollars(data.laborCost),
-            burdenCost: dollars(data.burdenCost ?? 0),
-            changeOrderId: changeOrder?.id ?? null,
-            isBillable: data.isBillable ?? false,
-            notes: data.notes?.trim() || null,
-        },
-    });
+    // The canonical manual-create. Creating hours AT a date puts them in that
+    // period, so gating HERE covers every caller instead of each server action
+    // separately. Check + write in one transaction under the shared advisory
+    // lock (src/lib/payroll-period.ts).
+    return withPayrollWriteTx([startTime], (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.create({
+            data: {
+                projectId,
+                scheduleTaskId,
+                userId: data.userId,
+                costCodeId: data.costCodeId || null,
+                startTime,
+                // A manual entry is a COMPLETED shift, not an open punch.
+                endTime: new Date(startTime.getTime() + data.durationHours * 3_600_000),
+                durationHours: data.durationHours,
+                laborCost: dollars(data.laborCost),
+                burdenCost: dollars(data.burdenCost ?? 0),
+                changeOrderId: changeOrder?.id ?? null,
+                isBillable: data.isBillable ?? false,
+                notes: data.notes?.trim() || null,
+                ...(data.needsReview ? { needsReview: true, reviewReason: data.reviewReason ?? null } : {}),
+            },
+        })
+    );
 }
 
 export type CreateTimeEntryFromStoredRatesInput = Omit<CreateTimeEntryCoreInput, "laborCost" | "burdenCost">;
@@ -122,11 +130,25 @@ export type CreateTimeEntryFromStoredRatesInput = Omit<CreateTimeEntryCoreInput,
 export async function createTimeEntryFromStoredRatesCore(data: CreateTimeEntryFromStoredRatesInput, actor: string) {
     const member = await prisma.user.findUnique({
         where: { id: data.userId },
-        select: { id: true, hourlyRate: true, burdenRate: true },
+        select: { id: true, name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
     });
     if (!member) throw new Error("Crew member not found");
     const costs = calculateCrewTimeCosts(data.durationHours, Number(member.hourlyRate), Number(member.burdenRate));
-    return createTimeEntryCore({ ...data, ...costs }, actor);
+
+    // Same $0-rate rule as the clock-out paths (src/lib/pay-rate-guard.ts): this
+    // creator prices the entry from the member's STORED rates, so a $0 rate
+    // books a free shift here exactly as it would at clock-out. It is always an
+    // office action (there is no worker-side manual create), so it follows the
+    // manager branch: allowed, and flagged, rather than refused into a dead end.
+    const zeroRate = zeroRateBlocks({
+        role: member.role,
+        email: member.email,
+        payType: member.payType,
+        hourlyRate: Number(member.hourlyRate),
+    });
+    const review = zeroRate ? appendZeroRateReview(null) : null;
+
+    return createTimeEntryCore({ ...data, ...costs, ...(review ?? {}) }, actor);
 }
 
 export type CreateExpenseCoreInput = {

@@ -2,8 +2,8 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { addDaysToKey, daysBetweenDayKeys, startOfDateInTimeZone } from "@/lib/tz-date";
-import { MAX_PAY_PERIOD_RANGE_DAYS } from "@/lib/pay-period-summary-core";
+import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
+import { validatePayrollRange } from "@/lib/payroll-config";
 import { loadGustoExport, type LoadedGustoExport } from "@/lib/gusto-export-db";
 
 /**
@@ -41,8 +41,6 @@ export interface GustoExportDependencies {
     load(periodStart: Date, periodEnd: Date): Promise<LoadedGustoExport>;
 }
 
-const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
-
 export function createGustoExportHandler(dependencies: GustoExportDependencies) {
     return {
         async GET(req: Request) {
@@ -57,26 +55,16 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             const endKey = searchParams.get("periodEnd");
             const format = searchParams.get("format") === "detail" ? "detail" : "summary";
 
-            if (!startKey || !endKey || !DAY_KEY.test(startKey) || !DAY_KEY.test(endKey)) {
-                return NextResponse.json(
-                    { error: "periodStart and periodEnd are required as YYYY-MM-DD (periodEnd is exclusive)" },
-                    { status: 400 }
-                );
-            }
-            const rangeDays = daysBetweenDayKeys(startKey, endKey);
-            if (!Number.isFinite(rangeDays) || rangeDays <= 0) {
-                return NextResponse.json({ error: "periodEnd must be after periodStart" }, { status: 400 });
-            }
-            if (rangeDays > MAX_PAY_PERIOD_RANGE_DAYS) {
-                return NextResponse.json(
-                    { error: `Period must not exceed ${MAX_PAY_PERIOD_RANGE_DAYS} days` },
-                    { status: 400 }
-                );
-            }
+            // The SAME validator the lock action and the review page use. Its
+            // day-key check is a real calendar check, so 2026-02-31 is a 400
+            // here rather than being silently rolled forward to 2026-03-03 by
+            // Date and exporting a period nobody asked for.
+            const range = validatePayrollRange(startKey, endKey);
+            if (!range.ok) return NextResponse.json({ error: range.error }, { status: 400 });
 
             const timeZone = await dependencies.resolveTimeZone();
-            const periodStart = startOfDateInTimeZone(startKey, timeZone);
-            const periodEnd = startOfDateInTimeZone(endKey, timeZone);
+            const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+            const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
 
             const result = await dependencies.load(periodStart, periodEnd);
 
@@ -97,8 +85,8 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             }
 
             const csv = format === "detail" ? result.detailCsv : result.summaryCsv;
-            const lastDayKey = addDaysToKey(endKey, -1);
-            const filename = `gusto-${format}-${startKey}_to_${lastDayKey}.csv`;
+            const lastDayKey = addDaysToKey(range.endKey, -1);
+            const filename = `gusto-${format}-${range.startKey}_to_${lastDayKey}.csv`;
 
             return new NextResponse(csv, {
                 headers: {

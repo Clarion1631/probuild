@@ -3,7 +3,6 @@ import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { isSalariedOwner } from "@/lib/pay-rate-guard";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -25,7 +24,7 @@ export async function GET(req: NextRequest) {
             orderBy: [{ role: "asc" }, { name: "asc" }],
             select: {
                 id: true, name: true, email: true, role: true, status: true,
-                hourlyRate: true, burdenRate: true, lastRateSyncAt: true, payType: true, showOnDispatch: true, pinCode: true, invitedAt: true,
+                hourlyRate: true, burdenRate: true, showOnDispatch: true, pinCode: true, invitedAt: true,
                 permissions: true,
                 projectAccess: { select: { projectId: true } },
                 assignedProjects: { select: { id: true } },
@@ -33,15 +32,10 @@ export async function GET(req: NextRequest) {
         });
 
         // Never expose PIN hash to clients; replace with a boolean indicator.
-        // `salaried` is resolved HERE rather than in the browser: the salaried
-        // list is env-configurable (PAYROLL_SALARIED_EMAILS) and a client bundle
-        // cannot read it, so a client-side copy of the rule would ignore an
-        // override and paint a false "No pay rate" badge on a salaried manager.
-        const safeUsers = users.map(({ pinCode, ...u }) => ({
-            ...u,
-            hasPin: !!pinCode,
-            salaried: isSalariedOwner({ role: u.role, email: u.email, payType: u.payType }),
-        }));
+        // Payroll fields deliberately do NOT live here — this is a MANAGER-level
+        // roster endpoint, and the Payroll rates panel reads its own
+        // payroll-scoped GET /api/payroll/roster instead.
+        const safeUsers = users.map(({ pinCode, ...u }) => ({ ...u, hasPin: !!pinCode }));
         return NextResponse.json(safeUsers);
     } catch (error: any) {
         console.error("GET /api/users error:", error);

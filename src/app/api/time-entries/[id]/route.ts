@@ -9,7 +9,13 @@ import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logis
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
-import { assertPeriodUnlocked } from "@/lib/payroll-period";
+import {
+    assertPeriodUnlocked,
+    assertPeriodUnlockedInTx,
+    isPeriodLockedError,
+    periodLockedResponse,
+    withPayrollWriteTx,
+} from "@/lib/payroll-period";
 import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
@@ -341,13 +347,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         });
     }
 
-    // Re-check immediately before the write — the first check happened before
-    // several awaited round trips (day load, meal settlement, task re-binding),
-    // and a period can be locked inside that window.
-    const lockedNow = await assertPeriodUnlocked([existing.startTime, newStart]);
-    if (lockedNow) return lockedNow;
-
-    const updated = await prisma.timeEntry.update({ where: { id }, data });
+    // The real guard: check and write in ONE transaction under the shared
+    // payroll advisory lock. The check at the top of this handler is fail-fast
+    // only — everything between it and here is awaited work (day load, meal
+    // settlement, task re-binding) during which a period can be locked.
+    let updated;
+    try {
+        updated = await withPayrollWriteTx([existing.startTime, newStart], (tx) =>
+            (tx as unknown as typeof prisma).timeEntry.update({ where: { id }, data })
+        );
+    } catch (error) {
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        throw error;
+    }
 
     // Re-plan every day this edit touched (the row may have moved days).
     const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
@@ -377,14 +389,21 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
-    // Deleting a punch out of an exported period changes hours that were
-    // already paid — same 423 as the edit path (src/lib/payroll-period.ts).
-    const locked = await assertPeriodUnlocked([existing.startTime]);
-    if (locked) return locked;
-
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
     // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    //
+    // The payroll guard runs INSIDE that same transaction, via the `guard` hook,
+    // so the lock check and the delete cannot be split by a concurrent lock
+    // creation. Deleting a punch out of an exported period changes hours that
+    // were already paid.
+    try {
+        await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId, {
+            guard: (tx) => assertPeriodUnlockedInTx(tx, [existing.startTime]),
+        });
+    } catch (error) {
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        throw error;
+    }
     return NextResponse.json({ ok: true });
 }

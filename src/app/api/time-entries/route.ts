@@ -10,7 +10,16 @@ import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/li
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
-import { assertPeriodUnlocked, type LockedPeriodLoader } from "@/lib/payroll-period";
+import {
+    assertPeriodUnlocked,
+    assertPeriodUnlockedInTx,
+    isPeriodLockedError,
+    periodLockedResponse,
+    withPayrollWriteTx,
+    type LockedPeriodLoader,
+    type LockedPeriodRow,
+    type PayrollTxClient,
+} from "@/lib/payroll-period";
 import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 export async function GET(req: Request) {
@@ -237,13 +246,6 @@ export async function POST(req: Request) {
     const validSources = ["daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
-    // startTime is CLIENT-supplied here, so a clock-in can land in a locked
-    // period. The close would be refused later anyway, but that leaves an
-    // unclosable open punch — refuse at the door instead
-    // (src/lib/payroll-period.ts).
-    const clockInLocked = await assertPeriodUnlocked([entryStartTime]);
-    if (clockInLocked) return clockInLocked;
-
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
@@ -259,7 +261,14 @@ export async function POST(req: Request) {
         );
     }
 
-    const timeEntry = await prisma.timeEntry.create({
+    // startTime is CLIENT-supplied here, so a clock-in can land in a locked
+    // period. The close would be refused later anyway, but that leaves an
+    // unclosable open punch — refuse at the door instead. Check + create in ONE
+    // transaction under the shared advisory lock (src/lib/payroll-period.ts).
+    let timeEntry;
+    try {
+        timeEntry = await withPayrollWriteTx([entryStartTime], (tx) =>
+            (tx as unknown as typeof prisma).timeEntry.create({
         data: {
             userId: user.id,
             projectId,
@@ -278,7 +287,12 @@ export async function POST(req: Request) {
             suggestionSource: validSources.includes(suggestionSource) ? suggestionSource : null,
             suggestionOverridden: suggestionOverridden === true,
         }
-    });
+            })
+        );
+    } catch (error) {
+        if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        throw error;
+    }
 
     return NextResponse.json(timeEntry);
 }
@@ -353,8 +367,16 @@ export interface ClockOutDependencies {
     closeTimeEntry(
         id: string,
         userId: string,
-        data: Record<string, unknown>
-    ): Promise<{ ok: true; entry: unknown } | { ok: false; current: unknown | null }>;
+        data: Record<string, unknown>,
+        /**
+         * Instants the write must not touch a locked period at. Checked INSIDE
+         * the same transaction as the update, under the shared payroll advisory
+         * lock — the earlier stand-alone checks are fail-fast only.
+         */
+        lockGuardInstants: Date[]
+    ): Promise<
+        { ok: true; entry: unknown } | { ok: false; current: unknown | null } | { ok: false; locked: LockedPeriodRow }
+    >;
 }
 
 export function createClockOutHandler(dependencies: ClockOutDependencies) {
@@ -562,13 +584,14 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 }
             }
 
-            // Re-check immediately before the write: everything between the
-            // first check and here is awaited work, and a period can be locked
-            // in that window (see the TOCTOU note in payroll-period.ts).
-            const lockedNow = await assertPeriodUnlocked([existing.startTime], dependencies.loadLockedPeriods);
-            if (lockedNow) return lockedNow;
-
-            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData);
+            // The real guard: the check happens inside the SAME transaction as
+            // the update, under the shared payroll advisory lock. The fail-fast
+            // check at the top of this handler is an optimisation, not the
+            // protection (see payroll-period.ts).
+            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData, [existing.startTime]);
+            if (!closeResult.ok && "locked" in closeResult) {
+                return periodLockedResponse(closeResult.locked);
+            }
             if (!closeResult.ok) {
                 // Lost the race to a concurrent PUT that closed the entry
                 // between the check above and this call — same 409 shape as
@@ -646,8 +669,17 @@ const clockOutHandler = createClockOutHandler({
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,
-    closeTimeEntry: async (id, userId, data) => {
+    closeTimeEntry: async (id, userId, data, lockGuardInstants) => {
         return prisma.$transaction(async (t) => {
+            // Shared advisory lock + lock check, in the SAME transaction as the
+            // claim below. A lock being created concurrently either waits for
+            // this transaction or is seen by it.
+            try {
+                await assertPeriodUnlockedInTx(t as unknown as PayrollTxClient, lockGuardInstants);
+            } catch (error) {
+                if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
+                throw error;
+            }
             // The guard: only rows still open (endTime IS NULL), scoped to
             // the entry's own stored userId, actually get closed. Two
             // concurrent PUTs can both pass the in-memory already-closed
