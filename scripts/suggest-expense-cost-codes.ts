@@ -69,7 +69,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: join(__dirname, "..", ".env.local") });
 config({ path: join(__dirname, "..", ".env") });
 
-const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+// CONSTRUCTED LAZILY, inside main and after the --help branch. Building it at
+// module scope threw on any machine without DATABASE_URL — including CI, where
+// --help is the smoke test that this file still loads at all.
+let prisma: PrismaClient | null = null;
 
 const csvIdx = process.argv.indexOf("--csv");
 const CSV = csvIdx > -1 ? process.argv[csvIdx + 1] : null;
@@ -101,13 +104,15 @@ async function main() {
         return;
     }
 
-    const codes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
+    prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+
+    const codes = await prisma!.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
     const codeId = new Map(codes.map((c) => [c.code, c.id]));
 
     // Attribution resolved the ONE way, and the overhead bucket excluded by id.
     // A row re-attributed to a live job used to be invisible here (its estimate
     // still named the old one), so the report understated the work to be done.
-    const rows = await prisma.expense.findMany({
+    const rows = await prisma!.expense.findMany({
         where: {
             costCodeId: null,
             ...expenseNotOnProjectWhere(OVERHEAD_PROJECT_ID),
@@ -123,7 +128,7 @@ async function main() {
     // The PROJECT'S OWN PHASES, same rule the writer applies. A suggestion the
     // job could never accept is not a suggestion, and listing it as one sends a
     // bookkeeper to check something that was never on the table.
-    const phaseRows = await prisma.estimateItem.findMany({
+    const phaseRows = await prisma!.estimateItem.findMany({
         where: {
             costCodeId: { not: null },
             costCode: { isActive: true },
@@ -198,4 +203,5 @@ async function main() {
 
 main()
     .catch((e) => { console.error("FAILED:", e); process.exit(1); })
-    .finally(() => prisma.$disconnect());
+    // Nothing to disconnect when --help returned before the client was built.
+    .finally(() => prisma?.$disconnect());
