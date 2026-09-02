@@ -34,7 +34,13 @@
 // `resolveTaxAtSourceFilters` touch Prisma.
 import { prisma } from "@/lib/prisma";
 import { resolveCompanyTimeZone } from "./company-timezone";
-import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
+import {
+    DEFAULT_COMPANY_TIME_ZONE,
+    addDaysToKey,
+    dayKeyInTimeZone,
+    startOfDateInTimeZone,
+    validTimeZone,
+} from "./tz-date";
 import { resolveExpenseProjectId } from "./expense-attribution";
 import { csvCell, csvDocument, csvNumber } from "./csv-safe";
 
@@ -120,8 +126,24 @@ export function currentQuarterKeys(now: Date, timeZone: string): { fromKey: stri
     return { fromKey, toKey };
 }
 
+/**
+ * A REAL calendar day, not merely a well-shaped string.
+ *
+ * `/^\d{4}-\d{2}-\d{2}$/` accepts "2026-02-31" and "2026-13-01", and
+ * `startOfDateInTimeZone` THROWS on both — which turns a typo in a URL into a
+ * 500 on a finance page. Construct the date and compare the fields back.
+ */
 function isDayKey(value: string | undefined): value is string {
-    return !!value && /^\d{4}-\d{2}-\d{2}$/.test(value);
+    if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const year = Number(value.slice(0, 4));
+    const month = Number(value.slice(5, 7));
+    const day = Number(value.slice(8, 10));
+    const probe = new Date(Date.UTC(year, month - 1, day));
+    return (
+        probe.getUTCFullYear() === year &&
+        probe.getUTCMonth() === month - 1 &&
+        probe.getUTCDate() === day
+    );
 }
 
 /**
@@ -145,24 +167,47 @@ export function parseTaxAtSourceFilters(
     const fallback = currentQuarterKeys(now, timeZone);
     const rawFrom = get("from");
     const rawTo = get("to");
-    let fromKey = isDayKey(rawFrom) ? rawFrom : fallback.fromKey;
-    let toKey = isDayKey(rawTo) ? rawTo : fallback.toKey;
-    if (toKey < fromKey) {
-        fromKey = fallback.fromKey;
-        toKey = fallback.toKey;
+
+    // EITHER endpoint being unusable discards BOTH. Keeping the good half and
+    // defaulting the other silently invents a range the user never asked for —
+    // a quarter that starts where they said and ends three months later reads
+    // as a real answer, and its total would be reported to the state.
+    let fromKey = fallback.fromKey;
+    let toKey = fallback.toKey;
+    if (isDayKey(rawFrom) && isDayKey(rawTo) && rawTo >= rawFrom) {
+        fromKey = rawFrom;
+        toKey = rawTo;
+    } else if (rawFrom === undefined && rawTo === undefined) {
+        // No params at all is the normal first visit, not a bad request.
     }
 
-    return {
-        fromKey,
-        toKey,
-        from: startOfDateInTimeZone(fromKey, timeZone),
-        // `toKey` is the last day a human means to include, so the exclusive
-        // bound is the start of the NEXT company day. Taken literally, an
-        // exclusive bound would silently drop everything bought on the last day
-        // of the quarter.
-        to: startOfDateInTimeZone(addDaysToKey(toKey, 1), timeZone),
-        timeZone,
-    };
+    try {
+        return {
+            fromKey,
+            toKey,
+            from: startOfDateInTimeZone(fromKey, timeZone),
+            // `toKey` is the last day a human means to include, so the
+            // exclusive bound is the start of the NEXT company day. Taken
+            // literally, an exclusive bound would silently drop everything
+            // bought on the last day of the quarter.
+            to: startOfDateInTimeZone(addDaysToKey(toKey, 1), timeZone),
+            timeZone,
+        };
+    } catch {
+        // Belt and braces. `isDayKey` has already ruled out every input
+        // `startOfDateInTimeZone` rejects, so reaching here means an invalid
+        // TIME ZONE — and a finance page must degrade to the default quarter
+        // rather than 500.
+        const zone = validTimeZone(timeZone) ? timeZone : DEFAULT_COMPANY_TIME_ZONE;
+        const safe = currentQuarterKeys(now, zone);
+        return {
+            fromKey: safe.fromKey,
+            toKey: safe.toKey,
+            from: startOfDateInTimeZone(safe.fromKey, zone),
+            to: startOfDateInTimeZone(addDaysToKey(safe.toKey, 1), zone),
+            timeZone: zone,
+        };
+    }
 }
 
 /** Resolve the company zone, then parse. The one Prisma-touching entry point. */

@@ -601,7 +601,7 @@ function createFakePrisma(initial: StoredExpense[] = []) {
         // whole guarantee the split-out project fill is buying.
         async updateMany(args: {
             where: { id: string; projectId: null };
-            data: { projectId: string };
+            data: { projectId?: string; estimateId: string };
         }) {
             const current = [...rows.values()].find(row => row.id === args.where.id);
             if (!current) return { count: 0 };
@@ -1239,6 +1239,29 @@ test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", 
         { costCodeSource: null },
         { costCodeSource: { notIn: ["capture", "manual"] } },
     ]);
+    // Everything the decision depended on is re-asserted at write time, so a
+    // row re-attributed between the read and the write is skipped rather than
+    // coded on stale reasoning.
+    assert.equal(where.projectId, "project-1");
+});
+
+test("the write requires the SAME attribution the suggestion was scoped to", async () => {
+    // A row whose project came from the estimate (column still NULL) must be
+    // written under `projectId: null` — "still unattributed" is the state the
+    // decision was made in, and it is just as much a precondition as a
+    // populated id.
+    const fake = fakeSuggestionClient({
+        projectId: null,
+        costCodeId: null,
+        costCodeSource: null,
+        estimate: { projectId: "project-1" },
+    });
+    await applyQboExpenseCostCodeSuggestion(
+        fake.client,
+        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+        COST_CODE_IDS,
+    );
+    assert.equal(fake.calls[0].where.projectId, null);
 });
 
 test("a row a human already coded is refused on the STORED source, before any write", async () => {
@@ -1382,28 +1405,56 @@ test("the sync asks for a phase on a matched job, by purchase id only", async ()
 
 // ── the split project fill (Codex round 1, blocker 1) ──────────────────────
 
-test("the project fill is its OWN statement, guarded on projectId being NULL", () => {
-    const plan = planQboExpenseUpdate({ projectId: null }, WRITE);
-    assert.equal(plan.fillProjectId, "project-1");
+test("projectId and estimateId move TOGETHER, in one statement guarded on NULL", () => {
+    // They are the same fact said twice, so a statement that could write one
+    // without the other is a statement that can leave the row incoherent.
+    const plan = planQboExpenseUpdate({ projectId: null, estimateId: "stale-estimate" }, WRITE);
+    assert.deepEqual(plan.fill, { projectId: "project-1", estimateId: "estimate-1" });
     assert.ok(!("projectId" in plan.data), "the main UPDATE never carries projectId");
-    assert.equal(plan.data.estimateId, "estimate-1");
-});
-
-test("a row already on a project is never re-projected, and keeps its estimate", () => {
-    // Both halves matter: leaving projectId alone while still writing the QBO
-    // match's estimateId would put the row on job B for every reader and on
-    // job A's estimate for cascade-delete and billing.
-    const plan = planQboExpenseUpdate({ projectId: "moved-by-hand" }, WRITE);
-    assert.equal(plan.fillProjectId, null);
-    assert.ok(!("projectId" in plan.data));
-    assert.ok(!("estimateId" in plan.data), "the estimate belongs to the OTHER job");
+    assert.ok(!("estimateId" in plan.data), "nor estimateId");
     assert.equal(plan.data.amount, WRITE.amount, "the rest of the write still lands");
 });
 
-test("when the stored project AGREES with the match, the estimate still tracks it", () => {
-    const plan = planQboExpenseUpdate({ projectId: "project-1" }, { ...WRITE, estimateId: "estimate-2" });
-    assert.equal(plan.fillProjectId, null);
-    assert.equal(plan.data.estimateId, "estimate-2", "same job, newer estimate — that is the old behaviour");
+test("a row already on a project is never re-projected AND never re-estimated", () => {
+    const plan = planQboExpenseUpdate({ projectId: "moved-by-hand", estimateId: "estimate-of-job-b" }, WRITE);
+    assert.equal(plan.fill, null);
+    assert.ok(!("projectId" in plan.data));
+    assert.ok(!("estimateId" in plan.data), "the estimate belongs to the OTHER job");
+    assert.equal(plan.data.amount, WRITE.amount);
+});
+
+test("attribution is write-ONCE: even the SAME job does not get a newer estimate", () => {
+    // The dropped carve-out (Codex round 2). An earlier version refreshed
+    // estimateId when the stored project and the incoming match agreed. It
+    // bought very little — a row following its job to a newer estimate — and
+    // paid by making the rule conditional, which is how the original bug got
+    // in. Re-pointing an estimate is a job for an explicit re-attribution path,
+    // not for an import.
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1" },
+        { ...WRITE, estimateId: "estimate-2" },
+    );
+    assert.equal(plan.fill, null);
+    assert.ok(!("estimateId" in plan.data), "never after the first write");
+});
+
+test("an unattributed row still gets its estimate corrected, even with no project to fill", () => {
+    // projectId null on both sides: nothing to attribute to, but the estimate
+    // link is still write-once-not-yet-written, so it may land.
+    const plan = planQboExpenseUpdate(
+        { projectId: null, estimateId: "stale" },
+        { ...WRITE, projectId: null },
+    );
+    assert.deepEqual(plan.fill, { estimateId: "estimate-1" });
+    assert.ok(!("projectId" in (plan.fill ?? {})));
+});
+
+test("nothing to fill is reported as nothing, not as an empty write", () => {
+    const plan = planQboExpenseUpdate(
+        { projectId: null, estimateId: "estimate-1" },
+        { ...WRITE, projectId: null },
+    );
+    assert.equal(plan.fill, null);
 });
 
 test("a re-attributed row's estimateId survives a real re-sync", async () => {
@@ -1418,4 +1469,16 @@ test("a re-attributed row's estimateId survives a real re-sync", async () => {
     assert.equal(row?.projectId, "moved-by-hand");
     assert.equal(row?.estimateId, "estimate-of-job-b");
     assert.equal(row?.amount, 300);
+});
+
+test("an ALREADY-attributed row keeps its estimate when QBO points at a newer one", async () => {
+    const fake = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: "project-1", estimateId: "estimate-1", receiptUrl: null },
+    ]);
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", estimateId: "estimate-2", amount: 300 }),
+        "updated",
+    );
+    assert.equal(fake.rows.get("purchase-1")?.estimateId, "estimate-1", "write-once, no exceptions");
+    assert.equal(fake.rows.get("purchase-1")?.amount, 300);
 });

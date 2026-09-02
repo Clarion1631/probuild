@@ -266,3 +266,36 @@ test("csv-safe: numbers stay numbers, text gets neutralized", () => {
     assert.equal(csvCell(null), '""');
     assert.equal(csvCell("\tlead-tab"), '"\'\tlead-tab"');
 });
+
+test("INVISIBLE leading whitespace does not smuggle a formula past the check", () => {
+    // A spreadsheet trims before deciding, so " =1+1" is every bit as live as
+    // "=1+1" while sailing past a naive first-character test.
+    assert.equal(csvCell(" =1+1"), `"' =1+1"`);
+    assert.equal(csvCell("\n=1+1"), `"'\n=1+1"`);
+    assert.equal(csvCell("  @SUM(A1)"), `"'  @SUM(A1)"`);
+    // The whitespace itself is DATA and is preserved — neutralizing must not
+    // quietly edit the export.
+    assert.match(csvCell(" =1+1"), / =1\+1/);
+    // A leading space in front of harmless text stays untouched.
+    assert.equal(csvCell(" Harbor Freight"), `" Harbor Freight"`);
+    // ...and a bare leading TAB is still caught, even though trimming would
+    // make it vanish before the test could see it.
+    assert.equal(csvCell("\tlead-tab"), `"'\tlead-tab"`);
+});
+
+test("csvNumber accepts a Decimal-like or boxed value, and never emits exponent form", () => {
+    // Prisma Decimal has its OWN toFixed, so a caller handing one straight in
+    // is the likeliest mistake; everything is normalized through String/Number.
+    const decimalLike = { toString: () => "207.74" };
+    assert.equal(csvNumber(decimalLike), "207.74");
+    // eslint-disable-next-line no-new-wrappers
+    assert.equal(csvNumber(new Number(16.5)), "16.50");
+    assert.equal(csvNumber("16.555", 2), "16.56");
+    // toFixed flips to "1e+21" here; a CSV cell reading "1e+21" is not a number
+    // anyone can sum.
+    const huge = csvNumber(1e21);
+    assert.ok(!/[eE]/.test(huge), `exponent notation leaked: ${huge}`);
+    assert.match(huge, /^\d+\.\d{2}$/);
+    assert.equal(csvNumber(undefined), "");
+    assert.equal(csvNumber("not a number"), "");
+});

@@ -171,6 +171,18 @@ backfill > null. Nothing but a human edit may change a row whose `costCodeSource
    posture as the deliberate receiptUrl omission, :578-580 comment). Extend the
    `findUnique` select with `projectId` and adjust `expenseMatchesQboWrite` so "unchanged"
    detection stays correct (compare projectId only when the update would write it).
+   **AS BUILT — stricter than the line above (Codex round 2). ATTRIBUTION IS
+   WRITE-ONCE.** `projectId` and `estimateId` are the same fact said twice, so they are
+   written *together*, by one `updateMany` whose own predicate is `projectId: null`, and
+   never again afterwards. The guarantee lives in the SQL rather than in a value read
+   earlier in the transaction. An interim version also refreshed `estimateId` when the
+   stored project and the incoming QBO match *agreed* — "same job, newer estimate", the
+   sync's long-standing attach-to-the-active-estimate behaviour. **That carve-out was
+   dropped.** It bought a row following its job to a newer estimate, and paid for it by
+   making the rule conditional, which is exactly how the original cross-job bug got in
+   (`projectId` kept, `estimateId` overwritten → the row on job B for every reader and on
+   job A's estimate for cascade-delete and billing). Re-pointing an estimate belongs to an
+   explicit re-attribution path, not to an import.
    **Cost-code suggestion**: extract `VENDOR_RULES`, `LINE_RULES`, `suggestCode` from
    `scripts/suggest-expense-cost-codes.mjs` into a new pure module
    `src/lib/expense-cost-suggest.ts` (the script imports it back — one copy). After a

@@ -123,21 +123,25 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
         // "backfill" — a wrong code is worse than an absent one, and this is
         // exactly the kind of wrong that no one would notice.
         //
-        // Accepted: the item belongs to the expense's OWN estimate, or to
-        // another estimate of the SAME project (which is how change-order and
-        // revised-estimate work reaches an item — CO line items live on the
-        // project's estimates, and `createExpenseCore` already requires a CO
-        // and its estimate to share the project). Anything else is skipped and
-        // listed for a human with reason "item-outside-estimate".
+        // THE TEST IS THE PROJECT, and only the project (Codex round 2). An
+        // earlier version also accepted `item.estimateId === expense.estimateId`
+        // as a shortcut. That shortcut is unsound in the one case it uniquely
+        // covers: a shared estimate whose own `projectId` is NULL or has moved
+        // means two rows can agree on an estimate while the expense resolves to
+        // a different job — and the shortcut would accept exactly then, because
+        // the project check had already failed. Same-estimate is a SUBSET of
+        // same-project whenever both are known, so dropping it loses nothing
+        // real and removes the branch where the two disagree.
         const item = expense.itemId ? items.get(expense.itemId) : undefined;
         if (expense.itemId && !item) {
             // A link to an item that is gone, or to an item with no cost code:
             // no answer either way, so fall through to the rules below.
         } else if (item && item.costCodeId) {
-            const sameEstimate = item.estimateId === expense.estimateId;
             const sameProject =
-                item.projectId !== null && item.projectId === resolvedProjectId;
-            if (!sameEstimate && !sameProject) {
+                resolvedProjectId !== null &&
+                item.projectId !== null &&
+                item.projectId === resolvedProjectId;
+            if (!sameProject) {
                 add(expense, "item-outside-estimate");
                 continue;
             }
@@ -146,7 +150,8 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
                 costCodeId: item.costCodeId,
                 costCodeSource: "backfill",
                 costCodeConfidence: null,
-                why: sameEstimate ? "item cost code (own estimate)" : "item cost code (same project)",
+                why: "item cost code (same project)",
+                expectedProjectId: expense.projectId ?? null,
                 expense,
             });
             continue;
@@ -170,6 +175,10 @@ export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectI
                 costCodeSource: "ai",
                 costCodeConfidence: suggestion.confidence,
                 why: suggestion.why,
+                // The attribution the decision was scoped BY, so the write can
+                // require it is unchanged. `null` is a real expectation: it
+                // means the row was still unattributed when the plan was made.
+                expectedProjectId: expense.projectId ?? null,
                 expense,
             });
         } else {
@@ -362,9 +371,20 @@ export async function runBackfill({
     }
 
     let costCodesWritten = 0;
+    let costCodesSkipped = 0;
     for (const fill of plan.codeFills) {
         const result = await db.expense.updateMany({
-            where: { id: fill.id, costCodeId: null, ...notHumanCodedExpenseWhere() },
+            where: {
+                id: fill.id,
+                // Everything the plan depended on, re-asserted at write time.
+                // The plan is a snapshot taken before pass (a) ran and before
+                // any concurrent sync or bookkeeper edit; the predicate is what
+                // makes it safe to act on. A row that moved is skipped, not
+                // coded on stale reasoning.
+                projectId: fill.expectedProjectId,
+                costCodeId: null,
+                ...notHumanCodedExpenseWhere(),
+            },
             data: {
                 costCodeId: fill.costCodeId,
                 costCodeSource: fill.costCodeSource,
@@ -372,10 +392,17 @@ export async function runBackfill({
             },
         });
         costCodesWritten += result.count;
+        if (result.count === 0) costCodesSkipped += 1;
     }
 
     log("");
     log(`applied ${projectIdsWritten} projectId and ${costCodesWritten} cost code(s).`);
+    if (costCodesSkipped > 0) {
+        // Not an error: it means a row changed between the plan and the write,
+        // and the predicate did its job. Reported because a LARGE number would
+        // mean the plan was stale enough to re-run.
+        log(`${costCodesSkipped} planned cost code(s) skipped — the row moved after the plan was made.`);
+    }
     log(`${plan.remainder.length} rows left NULL for human review. Re-run (dry) — it must report 0 planned writes.`);
     return {
         plan,

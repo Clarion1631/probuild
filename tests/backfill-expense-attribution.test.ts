@@ -174,6 +174,40 @@ test("an item on ANOTHER estimate of the SAME job is accepted", () => {
     assert.match(plan.codeFills[0].why, /same project/);
 });
 
+test("the PROJECT decides, and a matching estimateId is no longer a shortcut", () => {
+    // Codex round 2, blocker 1. The old code accepted
+    // `item.estimateId === expense.estimateId` as an alternative to the project
+    // check. The one case that shortcut uniquely covered is the unsound one:
+    // the two rows agree on an estimate whose own projectId is NULL or has
+    // moved, so the expense resolves to one job and the item to none — and the
+    // shortcut fired precisely BECAUSE the project check had already failed.
+    const plan = planBackfill({
+        expenses: [expense({ id: "e1", estimateId: "shared-est", projectId: "job-1", itemId: "item-x" })],
+        items: new Map([["item-x", { costCodeId: "cc-frame", estimateId: "shared-est", projectId: null }]]),
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+    });
+    assert.deepEqual(plan.codeFills, []);
+    assert.equal(plan.remainder[0].reason, "item-outside-estimate");
+});
+
+test("an expense with no resolvable job cannot borrow a phase from an item", () => {
+    // Nothing to compare the item against, so there is no evidence the link is
+    // on the right job. A guess here is a wrong cost code with "backfill"
+    // provenance on it.
+    const plan = planBackfill({
+        expenses: [expense({
+            id: "e1", estimateId: "est-job-1", projectId: null,
+            estimate: { projectId: null }, itemId: "item-1",
+        })],
+        items: new Map([["item-1", { costCodeId: "cc-frame", estimateId: "est-job-1", projectId: "job-1" }]]),
+        costCodeIdByCode: COST_CODE_IDS,
+        scopedProjectIds: ["job-1"],
+    });
+    assert.deepEqual(plan.codeFills, []);
+    assert.equal(plan.remainder[0].reason, "item-outside-estimate");
+});
+
 test("a dangling itemId falls through to the rules rather than being skipped", () => {
     // The item is gone (or carries no code). That is no evidence either way,
     // so it must not consume the row — the suggester still gets its turn.
@@ -314,11 +348,26 @@ test("apply writes both passes, each behind its own predicate", async () => {
         { costCodeSource: null },
         { costCodeSource: { notIn: ["capture", "manual"] } },
     ]);
+    // The attribution the plan was made under, re-asserted at write time. The
+    // plan is a snapshot; the predicate is what makes acting on it safe.
+    assert.equal(codeWrite.where.projectId, null);
     assert.deepEqual(codeWrite.data, {
         costCodeId: "cc-plumb",
         costCodeSource: "ai",
         costCodeConfidence: 0.9,
     });
+});
+
+test("a cost-code write requires the project the plan was scoped to", async () => {
+    // A row that was ALREADY attributed when the plan was made must be written
+    // under that same id — not under `null`, which would silently match a
+    // different set of rows.
+    const stub = createStub([
+        expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing" }),
+    ]);
+    await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
+    assert.equal(codeWrite.where.projectId, "job-1");
 });
 
 test("the write predicate re-checks NULL, not just the plan", async () => {
@@ -330,6 +379,10 @@ test("the write predicate re-checks NULL, not just the plan", async () => {
         const guardsNull =
             write.where.projectId === null || write.where.costCodeId === null;
         assert.ok(guardsNull, `unguarded write: ${JSON.stringify(write.where)}`);
+        assert.ok(
+            "projectId" in write.where,
+            `write without an attribution predicate: ${JSON.stringify(write.where)}`,
+        );
     }
 });
 

@@ -101,8 +101,12 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
     assert.ok(fk);
     assert.match(fk!, /pg_get_constraintdef\(oid\)/);
     assert.match(fk!, /ON DELETE SET NULL ON UPDATE CASCADE/);
-    assert.match(fk!, /NOT LIKE '%ON DELETE SET NULL%'/);
+    // The in-database guard must check the SAME four properties the post-run
+    // verifier does, or the two can disagree about what "correct" means.
+    assert.match(fk!, /NOT LIKE '%FOREIGN KEY \("projectId"\)%'/);
     assert.match(fk!, /NOT LIKE '%REFERENCES "Project"\(id\)%'/);
+    assert.match(fk!, /NOT LIKE '%ON DELETE SET NULL%'/);
+    assert.match(fk!, /NOT LIKE '%ON UPDATE CASCADE%'/);
     assert.match(fk!, /RAISE EXCEPTION/);
     assert.ok(
         !/IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(fk!),
@@ -118,6 +122,15 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
     const rendered = 'FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE SET NULL';
     for (const pattern of constraint.mustMatch) {
         assert.match(rendered, pattern, `pg_get_constraintdef output must satisfy ${pattern}`);
+    }
+    // Both halves check the same four things — the SQL guard by LIKE, the
+    // verifier by regex — so a constraint either guard accepts, the other does.
+    for (const property of ['FOREIGN KEY ("projectId")', 'REFERENCES "Project"(id)', "ON DELETE SET NULL", "ON UPDATE CASCADE"]) {
+        assert.ok(fk!.includes(`NOT LIKE '%${property}%'`), `SQL guard does not check ${property}`);
+        assert.ok(
+            constraint.mustMatch.some(pattern => pattern.test(property)),
+            `verifier does not check ${property}`,
+        );
     }
     // A CASCADE wearing the right name must fail every one of those checks.
     const cascade = 'FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE CASCADE';

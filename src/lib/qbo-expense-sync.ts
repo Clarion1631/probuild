@@ -542,7 +542,7 @@ type ExpenseTransaction = {
         }): Promise<unknown>;
         updateMany(args: {
             where: { id: string; projectId: null };
-            data: { projectId: string };
+            data: { projectId?: string; estimateId: string };
         }): Promise<{ count: number }>;
     };
 };
@@ -573,40 +573,43 @@ type ExistingQboExpense =
 
 export interface QboExpenseUpdatePlan {
     /**
-     * Written by its OWN guarded statement, not by the main UPDATE. Null when
-     * the row already has a project (or the write has none to give).
+     * The ATTRIBUTION fill, applied by its own statement under a
+     * `projectId: null` predicate — so the project and the estimate that
+     * belongs to it land together or neither does. Null when there is nothing
+     * to fill.
      */
-    fillProjectId: string | null;
-    /** Everything the main UPDATE may write. NEVER contains `projectId`. */
+    fill: { projectId?: string; estimateId: string } | null;
+    /**
+     * Everything the main UPDATE may write. NEVER contains `projectId` or
+     * `estimateId` — both are attribution and both go in `fill`.
+     */
     data: Partial<QboExpenseWrite>;
 }
 
 /**
  * Decide what a re-sync is allowed to change on a row that already exists.
  *
- * TWO SEPARATE RULES, and they used to be one read-then-unconditional-update:
+ * ONE RULE, and it used to be a read-then-unconditional-update:
  *
- *  1. `projectId` is only ever FILLED, never overwritten, and it is filled by a
- *     statement whose own predicate says `projectId: null`. Deciding from a
- *     value read earlier in the transaction is not the same as deciding from
- *     the row's state at write time, and the guarantee belongs in the SQL.
+ *   ATTRIBUTION IS WRITE-ONCE. `projectId` and `estimateId` are the same fact
+ *   said twice, so they move together and only while the row has no project
+ *   yet. The write happens under a `projectId: null` predicate, so the
+ *   guarantee lives in the SQL rather than in a value read earlier in the
+ *   transaction. Once a row is attributed — by this sync, by the backfill, or
+ *   by a bookkeeper — QuickBooks never re-points it.
  *
- *  2. `estimateId` follows it. The estimate in `write` is the one the QBO
- *     customer match picked; if a bookkeeper has since re-attributed the row to
- *     a DIFFERENT job, writing that estimate back would leave `projectId` and
- *     `estimateId` pointing at two different jobs — an expense that is on job B
- *     for every reader and on job A's estimate for cascade-delete and billing.
- *     So the estimate is left alone exactly when the projects disagree.
- *
- * Note rule 2 is scoped to DISAGREEMENT rather than to "projectId is set".
- * When the stored project and the incoming match are the SAME job, moving
- * `estimateId` to that job's newest estimate is what the sync has always done
- * and is still correct — it is the pre-existing "attach to the active estimate"
- * behaviour, and suppressing it there would strand rows on superseded
- * estimates for no safety gain.
+ * An earlier version of this refreshed `estimateId` when the stored project and
+ * the incoming match AGREED, on the reasoning that "same job, newer estimate"
+ * was the sync's long-standing attach-to-the-active-estimate behaviour. That
+ * carve-out is GONE (Codex round 2). It bought a marginal benefit — a row
+ * following its job to a newer estimate — and paid for it by making the rule
+ * conditional, which is how the original bug got in. A rule that is simply
+ * "never after the first write" cannot be reasoned about wrongly at a call
+ * site, and re-pointing an estimate is a job for an explicit re-attribution
+ * path, not for an import.
  */
 export function planQboExpenseUpdate(
-    existing: Pick<ExistingQboExpense, "projectId">,
+    existing: Pick<ExistingQboExpense, "projectId" | "estimateId">,
     write: QboExpenseWrite,
 ): QboExpenseUpdatePlan {
     const existingProjectId = existing.projectId ?? null;
@@ -614,12 +617,19 @@ export function planQboExpenseUpdate(
 
     const data: Partial<QboExpenseWrite> = { ...write };
     delete data.projectId;
-    if (existingProjectId !== null && existingProjectId !== incomingProjectId) {
-        delete data.estimateId;
-    }
+    delete data.estimateId;
+
+    if (existingProjectId !== null) return { fill: null, data };
+
+    const wantsProjectId = incomingProjectId !== null;
+    const wantsEstimateId = existing.estimateId !== write.estimateId;
+    if (!wantsProjectId && !wantsEstimateId) return { fill: null, data };
 
     return {
-        fillProjectId: existingProjectId === null ? incomingProjectId : null,
+        fill: {
+            ...(incomingProjectId !== null ? { projectId: incomingProjectId } : {}),
+            estimateId: write.estimateId,
+        },
         data,
     };
 }
@@ -631,10 +641,9 @@ export function planQboExpenseUpdate(
  * `qbSyncedAt` is excluded because it changes on every run by construction.
  */
 function planIsNoop(existing: ExistingQboExpense, plan: QboExpenseUpdatePlan): boolean {
-    if (plan.fillProjectId !== null) return false;
+    if (plan.fill !== null) return false;
     const data = plan.data;
     if (data.qbSyncToken !== undefined && existing.qbSyncToken !== data.qbSyncToken) return false;
-    if (data.estimateId !== undefined && existing.estimateId !== data.estimateId) return false;
     if (data.amount !== undefined && Number(existing.amount) !== data.amount) return false;
     if (data.vendor !== undefined && existing.vendor !== data.vendor) return false;
     if (data.date !== undefined && !datesEqual(existing.date, data.date)) return false;
@@ -694,13 +703,14 @@ export async function upsertQboExpense(
         const plan = planQboExpenseUpdate(existing, write);
         if (planIsNoop(existing, plan)) return "unchanged";
 
-        // The project fill is its OWN statement, and its predicate — not a
+        // The attribution fill is its OWN statement, and its predicate — not a
         // value read a few lines above — is what guarantees a human's
-        // re-attribution survives.
-        if (plan.fillProjectId !== null) {
+        // re-attribution survives. projectId and estimateId land together or
+        // neither does.
+        if (plan.fill !== null) {
             await transaction.expense.updateMany({
                 where: { id: existing.id, projectId: null },
-                data: { projectId: plan.fillProjectId },
+                data: plan.fill,
             });
         }
         await transaction.expense.update({
@@ -861,6 +871,11 @@ export async function applyQboExpenseCostCodeSuggestion(
     const projectId = resolveExpenseProjectId(stored);
     if (!projectId) return "skipped-no-project";
     if (isOverheadProject(projectId)) return "skipped-overhead";
+    // The attribution this decision was MADE on, so the write can require that
+    // it has not changed underneath. `null` is itself a meaningful expectation:
+    // it means the row was still unattributed when we scoped the suggestion,
+    // and a row that has since been attributed must be re-scoped, not written.
+    const expectedProjectId = stored.projectId ?? null;
 
     const suggestion = suggestCode({ vendor: input.vendor, description: input.description });
     if (!suggestion) return "no-match";
@@ -871,6 +886,10 @@ export async function applyQboExpenseCostCodeSuggestion(
     const written = await client.expense.updateMany({
         where: {
             qbPurchaseId: input.qbPurchaseId,
+            // Everything the decision depended on, re-asserted at write time.
+            // A row re-attributed or coded between the read above and here is
+            // skipped rather than written on stale reasoning.
+            projectId: expectedProjectId,
             costCodeId: null,
             ...notHumanCodedExpenseWhere(),
         },

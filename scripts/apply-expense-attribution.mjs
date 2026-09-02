@@ -84,8 +84,10 @@ BEGIN
     ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
       FOREIGN KEY ("projectId") REFERENCES "Project"("id")
       ON DELETE SET NULL ON UPDATE CASCADE;
-  ELSIF existing_def NOT LIKE '%REFERENCES "Project"(id)%'
-     OR existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+  ELSIF existing_def NOT LIKE '%FOREIGN KEY ("projectId")%'
+     OR existing_def NOT LIKE '%REFERENCES "Project"(id)%'
+     OR existing_def NOT LIKE '%ON DELETE SET NULL%'
+     OR existing_def NOT LIKE '%ON UPDATE CASCADE%' THEN
     RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
   END IF;
 END $$`,
