@@ -163,12 +163,10 @@ export interface VarianceCoverage {
  * `itemId` pointing at a coded item IS attributed, and a naive
  * `costCodeId IS NULL` filter reports it as a hole that does not exist.
  */
-export function resolveActualCostCodeId(
-    explicitCostCodeId: string | null | undefined,
-    linkedItemCostCodeId: string | null | undefined
-): string | null {
-    return explicitCostCodeId ?? linkedItemCostCodeId ?? null;
-}
+// ONE definition, in src/lib/expense-attribution.ts. Re-exported here so
+// margin-digest.ts and every existing `from "@/lib/job-variance"` importer keep
+// working unchanged — and so this rule can never be edited in one place only.
+export { resolveActualCostCodeId } from "@/lib/expense-attribution";
 
 /** "Labor" vs everything else. A null cost type falls back to the legacy `type` string. */
 export function isLaborItem(item: Pick<VarianceEstimateItem, "costTypeName" | "type">): boolean {

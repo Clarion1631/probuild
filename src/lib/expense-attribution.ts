@@ -63,9 +63,26 @@ export function resolveExpenseCostCodeId(
     expense: ExpenseCostCodeFacts,
     itemCostCodeById: ReadonlyMap<string, string | null>,
 ): string | null {
-    if (expense.costCodeId) return expense.costCodeId;
-    if (!expense.itemId) return null;
-    return itemCostCodeById.get(expense.itemId) ?? null;
+    return resolveActualCostCodeId(
+        expense.costCodeId,
+        expense.itemId ? itemCostCodeById.get(expense.itemId) : null,
+    );
+}
+
+/**
+ * The same rule, one level down: an explicit code, else the linked item's, else
+ * nothing. Phase 0 introduced this as `resolveActualCostCodeId` in
+ * job-variance.ts while Phase 3 introduced the map-taking wrapper above, and
+ * the two branches met at the rebase with one rule written twice. It lives HERE
+ * — the pure module with no job-variance import — and job-variance re-exports
+ * it, so margin-digest and the variance report keep their import path and there
+ * is no cycle.
+ */
+export function resolveActualCostCodeId(
+    explicitCostCodeId: string | null | undefined,
+    linkedItemCostCodeId: string | null | undefined,
+): string | null {
+    return explicitCostCodeId ?? linkedItemCostCodeId ?? null;
 }
 
 /**
