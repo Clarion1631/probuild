@@ -6,6 +6,7 @@ import { formatCurrency } from "@/lib/utils";
 import Link from "next/link";
 import { toast } from "sonner";
 import RatesImport from "./RatesImport";
+import { setUserPayType } from "@/lib/actions";
 
 type User = {
     id: string;
@@ -19,6 +20,8 @@ type User = {
     lastRateSyncAt: string | null;
     /** Resolved server-side (/api/users) — the salaried list is env-configurable and the browser cannot read it. */
     salaried: boolean;
+    /** "HOURLY" | "SALARY" | null. NULL blocks the payroll export until somebody answers. */
+    payType: string | null;
     showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
@@ -269,6 +272,7 @@ export default function TeamPage() {
                             <tr className="bg-slate-50 border-b border-hui-border text-xs font-semibold text-hui-textMuted whitespace-nowrap">
                                 <th className="px-6 py-3 font-normal">Name</th>
                                 <th className="px-6 py-3 font-normal">Role</th>
+                                <th className="px-6 py-3 font-normal">Pay type</th>
                                 <th className="px-6 py-3 font-normal text-right">Hourly rate</th>
                                 <th className="px-6 py-3 font-normal text-right">Burden rate</th>
                                 <th className="px-6 py-3 font-normal">Last synced</th>
@@ -277,7 +281,9 @@ export default function TeamPage() {
                         <tbody className="divide-y divide-hui-border">
                             {activeUsers.map(user => {
                                 const sync = rateSyncLabel(user.lastRateSyncAt);
-                                const noRate = !user.salaried && !((user.hourlyRate ?? 0) > 0);
+                                // Mirrors zeroRateBlocks on the server: an explicit SALARY answer
+                                // is exempt, and `salaried` already folds in role + the env fallback.
+                                const noRate = user.payType !== "SALARY" && !user.salaried && !((user.hourlyRate ?? 0) > 0);
                                 return (
                                     <tr key={user.id} className="hover:bg-slate-50 transition-colors">
                                         <td className="px-6 py-3">
@@ -297,6 +303,30 @@ export default function TeamPage() {
                                             {(user.role === 'FIELD_CREW' || user.role === 'EMPLOYEE') ? 'Field Crew' :
                                                 user.role === 'MANAGER' ? 'Manager' :
                                                     user.role === 'FINANCE' ? 'Finance' : 'Admin'}
+                                        </td>
+                                        <td className="px-6 py-3">
+                                            {/* NULL is not "hourly by default" — the payroll export
+                                                refuses to run until somebody answers, because guessing
+                                                either way is a wrong paycheque. */}
+                                            <select
+                                                value={user.payType ?? ""}
+                                                onChange={async (e) => {
+                                                    const value = e.target.value;
+                                                    if (value !== "HOURLY" && value !== "SALARY") return;
+                                                    const result = await setUserPayType(user.id, value);
+                                                    if (result.success) {
+                                                        toast.success("Pay type saved.");
+                                                        fetchUsers();
+                                                    } else {
+                                                        toast.error(result.error);
+                                                    }
+                                                }}
+                                                className={`hui-input text-xs py-1 ${user.payType ? "" : "border-red-300 text-red-700"}`}
+                                            >
+                                                <option value="">Not set</option>
+                                                <option value="HOURLY">Hourly</option>
+                                                <option value="SALARY">Salary</option>
+                                            </select>
                                         </td>
                                         <td className="px-6 py-3 text-right tabular-nums text-hui-textMain">
                                             {formatCurrency(user.hourlyRate ?? 0)}/h

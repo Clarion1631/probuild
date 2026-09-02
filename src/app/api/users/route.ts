@@ -25,7 +25,7 @@ export async function GET(req: NextRequest) {
             orderBy: [{ role: "asc" }, { name: "asc" }],
             select: {
                 id: true, name: true, email: true, role: true, status: true,
-                hourlyRate: true, burdenRate: true, lastRateSyncAt: true, showOnDispatch: true, pinCode: true, invitedAt: true,
+                hourlyRate: true, burdenRate: true, lastRateSyncAt: true, payType: true, showOnDispatch: true, pinCode: true, invitedAt: true,
                 permissions: true,
                 projectAccess: { select: { projectId: true } },
                 assignedProjects: { select: { id: true } },
@@ -40,7 +40,7 @@ export async function GET(req: NextRequest) {
         const safeUsers = users.map(({ pinCode, ...u }) => ({
             ...u,
             hasPin: !!pinCode,
-            salaried: isSalariedOwner({ role: u.role, email: u.email }),
+            salaried: isSalariedOwner({ role: u.role, email: u.email, payType: u.payType }),
         }));
         return NextResponse.json(safeUsers);
     } catch (error: any) {

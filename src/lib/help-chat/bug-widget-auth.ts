@@ -8,7 +8,11 @@
 // Pure (no prisma, no next-auth) so the whole matrix can be tested directly:
 // the routes hand it whatever authenticateMobileOrSession returned.
 
-export const BUG_WIDGET_ROLES = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"] as const;
+// EMPLOYEE is a LEGACY role value — absent from ROLE_LABELS/ROLES in
+// src/lib/permissions.ts (so nothing creates one now) but still a live branch in
+// access-rules.ts and schedule-core.ts, so rows can carry it. Someone stuck on
+// an old account must still be able to report the bug that is blocking them.
+export const BUG_WIDGET_ROLES = ["ADMIN", "MANAGER", "FIELD_CREW", "EMPLOYEE", "FINANCE"] as const;
 
 export type BugWidgetActor = { role: string; status: string } | null | undefined;
 

@@ -42,21 +42,72 @@ export const SALARIED_BY_ROLE = ["ADMIN", "FINANCE"] as const;
  * Roles that belong on the payroll roster even with no hours in a period (a
  * crew member who worked zero hours still gets a 0.00 row in the Gusto file).
  * A ROSTER question, not the block rule — do not reuse it as one.
+ *
+ * EMPLOYEE is a LEGACY role value. It is not in ROLE_LABELS/ROLES
+ * (src/lib/permissions.ts), so nothing can create one today, but it is a real
+ * branch in access-rules.ts's permission defaults and in schedule-core's
+ * financial redaction, which means rows can still carry it. It is hourly.
  */
-export const HOURLY_PAID_ROLES = ["FIELD_CREW", "MANAGER"] as const;
+export const HOURLY_PAID_ROLES = ["FIELD_CREW", "EMPLOYEE", "MANAGER"] as const;
 
 export const ZERO_RATE_WORKER_MESSAGE =
-    "Your pay rate isn't set up yet. Tell your manager — your time is still on the clock and will be paid once the rate is entered.";
+    "Your pay rate isn't set up yet, so this shift can't be closed from here. Tell the office — they can set your rate or close the punch for you. Your time is safe and you'll be paid once the rate is in.";
 
 export function zeroRateManagerMessage(ownerName: string | null | undefined): string {
     return `Set an hourly rate for ${ownerName?.trim() || "this team member"} on Company → Team Members before closing this entry.`;
+}
+
+/** Review note stamped on a punch a MANAGER closed at a $0 rate, so payroll cannot miss it. */
+export const ZERO_RATE_REVIEW_NOTE = "Closed at a $0 pay rate — set the rate and recheck this entry";
+
+/**
+ * A MANAGER closing someone else's $0-rate punch is ALLOWED, and flagged.
+ *
+ * The worker-side block is the right call (the phone cannot fix a rate), but
+ * applying it to the office too created a punch nobody could close: past
+ * MAX_SHIFT_HOURS the clock-out path refuses it as well, and nothing sweeps a
+ * stranded punch. So the office always has a way out, and the flag is what
+ * stops the $0 cost from being silent — /manager/time-entries surfaces it and
+ * the payroll export REFUSES to run while it is set.
+ *
+ * Composes onto whatever reviewReason the meal/rest notices already wrote,
+ * using the same "; " convention as src/lib/wa-breaks.ts.
+ */
+export function appendZeroRateReview(existingReviewReason: unknown): {
+    needsReview: true;
+    reviewReason: string;
+} {
+    const parts = String(existingReviewReason ?? "")
+        .split("; ")
+        .map((part) => part.trim())
+        .filter(Boolean);
+    if (!parts.includes(ZERO_RATE_REVIEW_NOTE)) parts.push(ZERO_RATE_REVIEW_NOTE);
+    return { needsReview: true, reviewReason: parts.join("; ") };
 }
 
 /**
  * True when closing this entry would stamp a $0 labor cost onto someone who is
  * supposed to be paid by the hour. Block by default; exempt only the salaried.
  */
-export function isSalariedOwner(owner: { role?: string | null; email?: string | null }): boolean {
+export const PAY_TYPE_HOURLY = "HOURLY";
+export const PAY_TYPE_SALARY = "SALARY";
+
+/**
+ * Order matters: the STORED column wins over the env list, and both win over
+ * role. `User.payType` is the answer a human gave; PAYROLL_SALARIED_EMAILS is a
+ * fallback for rows nobody has answered yet, and it is fail-open by nature (an
+ * email absent from a config string looks exactly like "hourly").
+ *
+ * An explicit HOURLY beats the role default too — that is the point of storing
+ * it. Somebody has to be able to say "this ADMIN really is paid by the hour".
+ */
+export function isSalariedOwner(owner: {
+    role?: string | null;
+    email?: string | null;
+    payType?: string | null;
+}): boolean {
+    if (owner.payType === PAY_TYPE_SALARY) return true;
+    if (owner.payType === PAY_TYPE_HOURLY) return false;
     if (owner.role && (SALARIED_BY_ROLE as readonly string[]).includes(owner.role)) return true;
     // A salaried MANAGER (CJ, Richard) has a CORRECT $0 hourly rate.
     return isSalariedEmail(owner.email);
@@ -65,6 +116,7 @@ export function isSalariedOwner(owner: { role?: string | null; email?: string | 
 export function zeroRateBlocks(owner: {
     role?: string | null;
     email?: string | null;
+    payType?: string | null;
     hourlyRate: number;
 }): boolean {
     // A real rate settles it, whoever they are.

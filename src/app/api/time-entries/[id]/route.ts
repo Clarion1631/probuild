@@ -10,7 +10,7 @@ import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, 
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 import { assertPeriodUnlocked } from "@/lib/payroll-period";
-import { zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
+import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -189,8 +189,20 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // a forgotten punch, and closing it at a $0 rate books a free shift. Only a
     // genuine OPEN -> CLOSED transition is gated; re-editing an already-closed
     // entry is left alone so an old punch never becomes uneditable.
-    if (closingOpenEntry && zeroRateBlocks({ role: owner.role, email: owner.email, hourlyRate: toNum(owner.hourlyRate) })) {
-        return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
+    const zeroRate =
+        closingOpenEntry &&
+        zeroRateBlocks({
+            role: owner.role,
+            email: owner.email,
+            payType: owner.payType ?? null,
+            hourlyRate: toNum(owner.hourlyRate),
+        });
+    // The OWNER is refused (a phone cannot fix a rate); the OFFICE is not, or a
+    // $0-rate punch becomes unclosable once it passes MAX_SHIFT_HOURS. A
+    // manager close is flagged instead, and the payroll export refuses to run
+    // while the flag is set.
+    if (zeroRate && isOwner) {
+        return zeroRateBlockedResponse({ closerIsOwner: true, ownerName: owner.name });
     }
 
     // Automatic-break model (src/lib/wa-breaks.ts): the meal is re-settled on
@@ -297,6 +309,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         if (!parts.includes(CLOSED_LATE_NOTE)) parts.push(CLOSED_LATE_NOTE);
         data.reviewReason = parts.join("; ");
         data.needsReview = true;
+    }
+
+    // Runs after the meal/rest notices so it composes onto their reason.
+    if (zeroRate) {
+        Object.assign(data, appendZeroRateReview(data.reviewReason ?? existing.reviewReason));
     }
 
     // Capture the as-clocked values exactly once. Subsequent edits update the latest

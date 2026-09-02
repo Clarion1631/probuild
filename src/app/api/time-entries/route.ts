@@ -11,7 +11,7 @@ import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { assertPeriodUnlocked, type LockedPeriodLoader } from "@/lib/payroll-period";
-import { zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
+import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -289,7 +289,7 @@ export async function POST(req: Request) {
 // edit-flow clock-out check is defense in depth for a different call site,
 // not the primary one).
 
-type ClockOutAuthedUser = { id: string; role: string; email: string; hourlyRate: number; burdenRate: number };
+type ClockOutAuthedUser = { id: string; role: string; email: string; payType: string | null; hourlyRate: number; burdenRate: number };
 type ClockOutAuthResult =
     | { ok: true; user: ClockOutAuthedUser }
     | { ok: false; status: number; error: string };
@@ -321,7 +321,7 @@ export interface ClockOutDependencies {
      */
     findOwnerRates(
         userId: string
-    ): Promise<{ hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string } | null>;
+    ): Promise<{ hourlyRate: number; burdenRate: number; role: string; name: string | null; email: string; payType: string | null } | null>;
     /** Locked pay periods — a closed period freezes every punch that started inside it (src/lib/payroll-period.ts). */
     loadLockedPeriods: LockedPeriodLoader;
     /**
@@ -486,10 +486,16 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
 
             // A $0 hourly rate on an hourly worker would stamp a $0 shift onto
-            // payroll and job costing, invisibly. Refuse the close and leave the
-            // punch OPEN — the worker stays on the clock and is paid once the
-            // rate is entered (src/lib/pay-rate-guard.ts, spec G2).
-            if (zeroRateBlocks(owner)) {
+            // payroll and job costing, invisibly.
+            //
+            // The WORKER is refused and stays on the clock — a phone cannot fix
+            // a pay rate. A MANAGER is NOT refused: blocking the office too left
+            // a punch nobody could close (past MAX_SHIFT_HOURS every path
+            // refuses it, and nothing sweeps a stranded punch). Their close is
+            // flagged instead, which the payroll export then refuses to run
+            // through (src/lib/pay-rate-guard.ts, spec G2).
+            const zeroRate = zeroRateBlocks(owner);
+            if (zeroRate && closerIsOwner) {
                 return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
             }
 
@@ -542,6 +548,12 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
                 })
             );
+
+            // Runs LAST so it composes onto whatever reason the meal/rest
+            // notices above already wrote, and cannot be overwritten by them.
+            if (zeroRate) {
+                Object.assign(updateData, appendZeroRateReview(updateData.reviewReason ?? existing.reviewReason));
+            }
 
             if (user.role === "MANAGER" || user.role === "ADMIN") {
                 if (existing.userId !== user.id) {
@@ -596,6 +608,7 @@ const clockOutHandler = createClockOutHandler({
                 id: result.user.id,
                 role: result.user.role,
                 email: result.user.email,
+                payType: result.user.payType ?? null,
                 hourlyRate: toNum(result.user.hourlyRate),
                 burdenRate: toNum(result.user.burdenRate),
             },
@@ -613,7 +626,7 @@ const clockOutHandler = createClockOutHandler({
     findOwnerRates: async (userId) => {
         const owner = await prisma.user.findUnique({
             where: { id: userId },
-            select: { hourlyRate: true, burdenRate: true, role: true, name: true, email: true },
+            select: { hourlyRate: true, burdenRate: true, role: true, name: true, email: true, payType: true },
         });
         if (!owner) return null;
         return {
@@ -622,6 +635,7 @@ const clockOutHandler = createClockOutHandler({
             role: owner.role,
             name: owner.name,
             email: owner.email,
+            payType: owner.payType ?? null,
         };
     },
     loadLockedPeriods: async () =>
