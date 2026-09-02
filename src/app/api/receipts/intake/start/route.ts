@@ -9,7 +9,7 @@ import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core
 import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
-import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
+import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -283,6 +283,34 @@ export async function POST(req: Request) {
             }
 
             if (existing.state !== "STAGING") {
+                // "We already have it" has to be TRUE: the forwarder deletes its
+                // only copy on this answer. Metadata only, and bounded — one
+                // small list call whatever the object weighs.
+                const present = await receiptObjectSize(existing.storagePath);
+                if (!present.ok && present.kind === "transient") {
+                    return NextResponse.json(
+                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { status: 503 },
+                    );
+                }
+                if (!present.ok) {
+                    // A settled row with no object. Recovering it is not this
+                    // endpoint's job — /start hands out an upload URL for rows
+                    // that are still STAGING or recoverably parked, and dragging
+                    // a BOOKED row back would rewrite a receipt behind a
+                    // Purchase. A 409 the sender can act on, never a 2xx.
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "file-missing",
+                            reason: "this sourceRef exists but its stored document is gone; escalate",
+                            retryable: true,
+                            existingId: existing.id,
+                            state: existing.state,
+                        },
+                        { status: 409 },
+                    );
+                }
                 return NextResponse.json(
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
                 );

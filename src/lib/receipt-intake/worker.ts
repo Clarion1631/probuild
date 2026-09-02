@@ -83,21 +83,26 @@ export function uploadLeaseExpiry(now: Date = new Date()): Date {
 /**
  * Could the object still arrive under a live upload URL?
  *
- * ROW AGE IS THE WRONG QUESTION. A row whose URL was re-issued (a resumed
- * /start, or a re-arm after the sweeper parked it) is older than its lease, and
- * judging it on createdAt declared a receipt missing — or destroyed one it
- * called unacceptable — while the client's own upload link was still live and
- * about to land. `uploadUrlExpiresAt` is what /start actually promised.
+ * ROW AGE IS THE WRONG QUESTION for a two-step row. One whose URL was re-issued
+ * (a resumed /start, or a re-arm after the sweeper parked it) is older than its
+ * lease, and judging it on createdAt declared a receipt missing — or destroyed
+ * one it called unacceptable — while the client's own upload link was still
+ * live and about to land. `uploadUrlExpiresAt` is what /start actually
+ * promised, so that is what is honoured.
  *
- * Null means no signed URL was ever issued for this row (the single-shot path
- * writes its bytes through the server), so the row's own age is all there is.
+ * NULL IS NOT A TWO-HOUR GRACE. It means no signed URL was ever issued: the
+ * single-shot path writes its bytes through the server inside one request, so
+ * such a row is either published or it failed mid-request. Giving it the
+ * SIGNED-URL TTL made every inline STAGING orphan invisible to the sweep for
+ * two hours, waiting on a URL that does not exist. Its grace is the stale-
+ * STAGING threshold, the same one the sweep selects on.
  */
 export function uploadLeaseActive(
     row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
     now: Date = new Date(),
 ): boolean {
     if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt.getTime() > now.getTime();
-    return row.createdAt.getTime() > now.getTime() - SIGNED_UPLOAD_TTL_MS;
+    return row.createdAt.getTime() > now.getTime() - STAGING_SWEEP_MINUTES * 60_000;
 }
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported

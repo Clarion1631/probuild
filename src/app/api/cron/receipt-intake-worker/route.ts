@@ -311,14 +311,34 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // problem that does not exist while the real file sits there. Ask
             // storage about each one, and let a transient storage fault mean
             // "come back next pass" rather than either verdict.
-            const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
+            const sweptAt = new Date();
+            const cutoff = new Date(sweptAt.getTime() - STAGING_SWEEP_MINUTES * 60_000);
             const stale = await prisma.receiptIntake.findMany({
-                where: { state: "STAGING", createdAt: { lt: cutoff } },
+                // A LIVE LEASE IS NOT SWEEPABLE, and it must not occupy one of
+                // the ten slots either. Selecting it and skipping it inside the
+                // loop meant a handful of clients still uploading could fill the
+                // whole batch every pass, so the orphans behind them were never
+                // reached — the queue looked busy and cleared nothing.
+                where: {
+                    state: "STAGING",
+                    createdAt: { lt: cutoff },
+                    OR: [
+                        { uploadUrlExpiresAt: null },
+                        { uploadUrlExpiresAt: { lte: sweptAt } },
+                    ],
+                },
                 select: {
                     id: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
                     uploadLeaseVersion: true,
                 },
+                // Rows that never had a signed URL first (an inline upload that
+                // died mid-request is an orphan NOW, and nothing is coming for
+                // it), then oldest-first among the expired leases.
+                orderBy: [
+                    { uploadUrlExpiresAt: { sort: "asc", nulls: "first" } },
+                    { createdAt: "asc" },
+                ],
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
                 // spends the invocation on housekeeping.
@@ -343,6 +363,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // object is a complete, correct object — but parking it as
                 // file-missing, or DELETING it as unacceptable, would destroy a
                 // receipt whose own upload link is still working.
+                // Belt and braces: the query already excluded live leases, but
+                // one can be re-armed between that SELECT and this check.
                 const leaseLive = uploadLeaseActive(row);
 
                 // THE SAME validator /finalize uses. Publishing on "the object

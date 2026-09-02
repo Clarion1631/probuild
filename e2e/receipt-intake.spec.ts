@@ -1112,6 +1112,72 @@ test.describe("round-9 intake contracts", () => {
         expect(rows).toHaveLength(0);
     });
 
+    test("a settled row whose object is GONE is 409 file-missing, never a cheerful 200", async ({ request }) => {
+        // Both replay paths used to answer success from the row alone. The
+        // forwarders treat that as permission to delete their only copy, so a
+        // row whose object had vanished got a 200 and the receipt ceased to
+        // exist anywhere.
+        const ref = `${REF_PREFIX}settled-gone`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("RECEIVED");
+
+        // Point the settled row at a path nothing was ever written to.
+        await prisma.receiptIntake.update({
+            where: { id },
+            data: { storagePath: `receipts/intake/${id}.vanished.png` },
+        });
+
+        // /finalize: the alreadyFinalized path.
+        const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(409);
+        const finalBody = await finalized.json();
+        expect(finalBody.error).toBe("file-missing");
+        expect(finalBody.retryable).toBe(true);
+
+        // /start: the alreadyReceived path, same sourceRef.
+        const started = await request.post(`${INTAKE_PATH}/start`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "drive", sourceRef: ref, mimeType: "image/png",
+                sha256: createHash("sha256").update(Buffer.from(PNG_BASE64, "base64")).digest("hex"),
+            }),
+            maxRedirects: 0,
+        });
+        expect(started.status()).toBe(409);
+        const startBody = await started.json();
+        expect(startBody.error).toBe("file-missing");
+        expect(startBody.retryable).toBe(true);
+        expect(startBody.uploadUrl).toBeUndefined();
+
+        // The row is untouched by either refusal.
+        const after = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(after?.state).toBe("RECEIVED");
+    });
+
+    test("a settled row that DOES still have its object replays as success", async ({ request }) => {
+        // The control: without it both refusals above would pass against an
+        // endpoint that had simply stopped answering 200 at all.
+        const ref = `${REF_PREFIX}settled-present`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const finalized = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(200);
+        expect((await finalized.json()).alreadyFinalized).toBe(true);
+    });
+
     test("a text receipt is refused with a 415 that says what to send instead", async ({ request }) => {
         // QuickBooks cannot attach a .txt, so accepting one meant reading it and
         // then stranding it unbookable mid-pipeline.

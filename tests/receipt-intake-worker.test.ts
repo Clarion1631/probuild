@@ -1315,3 +1315,47 @@ test("an unreadable send flag RETAINS the key", async () => {
     await runIntakeWorker(h.deps);
     assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
 });
+
+// ── An inline STAGING orphan is not waiting for a URL (round-15 item 3) ────
+
+test("a row that never had a signed URL gets the SWEEP threshold, not the URL TTL", () => {
+    // The single-shot path writes its bytes through the server inside one
+    // request: such a row is either published or it failed mid-request. Giving
+    // it the two-hour signed-URL grace made every inline orphan invisible to the
+    // sweep for two hours, waiting on a URL that does not exist.
+    const inlineAge = (minutes: number) => ({
+        uploadUrlExpiresAt: null,
+        createdAt: new Date(NOW.getTime() - minutes * 60_000),
+    });
+    assert.equal(uploadLeaseActive(inlineAge(5), NOW), true, "still inside the sweep threshold");
+    assert.equal(uploadLeaseActive(inlineAge(20), NOW), false, "past it — an orphan now, not in 2 hours");
+    assert.equal(uploadLeaseActive(inlineAge(90), NOW), false);
+
+    // A two-step row is still judged by the promise /start actually made.
+    assert.equal(
+        uploadLeaseActive({
+            uploadUrlExpiresAt: new Date(NOW.getTime() + 60_000),
+            createdAt: new Date(NOW.getTime() - 90 * 60_000),
+        }, NOW),
+        true,
+        "an old row with a live lease is still uploading",
+    );
+});
+
+test("the sweep query excludes live leases and orders null-lease rows first", () => {
+    const sweeper = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
+    const query = fn.slice(0, fn.indexOf("let published"));
+    // Filtered in SQL, not skipped in the loop: a handful of clients still
+    // uploading could otherwise fill all ten slots every pass, so the orphans
+    // behind them were never reached.
+    assert.match(query, /uploadUrlExpiresAt: null/);
+    assert.match(query, /uploadUrlExpiresAt: \{ lte: sweptAt \}/);
+    assert.match(query, /orderBy: \[/);
+    assert.match(query, /\{ uploadUrlExpiresAt: \{ sort: "asc", nulls: "first" \} \}/);
+    assert.match(query, /\{ createdAt: "asc" \}/);
+    assert.match(query, /take: STAGING_SWEEP_BATCH/);
+});

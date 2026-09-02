@@ -5,6 +5,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
+import { receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import {
     finalizeDisposition,
     inspectStoredObject,
@@ -27,6 +28,36 @@ import {
 } from "@/lib/receipt-intake/storage-cleanup";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * A "we already have it" answer has to be TRUE.
+ *
+ * Both replay paths used to return success from the row alone. The forwarders
+ * treat that as permission to delete their only copy — so a row whose object had
+ * gone missing (a bad publish, a cleanup that ran on the wrong path, a bucket
+ * incident) got a cheerful 200 and the receipt ceased to exist anywhere.
+ *
+ * Metadata only, and bounded: one small `list` regardless of the object's size.
+ * The three answers are deliberately different — an absence is a 409 the sender
+ * can act on by re-uploading, a storage fault is a 503 it should simply retry,
+ * and only a confirmed presence is success.
+ */
+async function confirmStoredCopy(storagePath: string): Promise<NextResponse | null> {
+    const present = await receiptObjectSize(storagePath);
+    if (present.ok) return null;
+    if (present.kind === "transient") {
+        return NextResponse.json({ ok: false, reason: "storage-unavailable", retryable: true }, { status: 503 });
+    }
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "file-missing",
+            reason: "this row exists but its stored document is gone; send the bytes again",
+            retryable: true,
+        },
+        { status: 409 },
+    );
+}
 
 /**
  * Route adapter over the late-field rules (src/lib/receipt-intake/late-fields.ts).
@@ -217,6 +248,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // floor while telling the caller it worked. Same behaviour as the
     // two-publisher path below, because a caller cannot tell which one it hit.
     if (!recoverable) {
+        // The object first: `alreadyFinalized` is what makes a forwarder drop
+        // its copy, so it must not be said about a row whose bytes are gone.
+        const missing = await confirmStoredCopy(row.storagePath);
+        if (missing) return missing;
         const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
         // PERSISTED values, re-read after the reconcile — the caller must be
@@ -410,7 +445,14 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             );
         }
         // Another publisher won. Same outcome for the caller — but the late
-        // fields still have to be reconciled against what that publisher wrote.
+        // fields still have to be reconciled against what that publisher wrote,
+        // and the same "do we actually hold it" rule applies: the winner sealed
+        // the object to a new path, so this checks where the row points NOW.
+        const settled = await prisma.receiptIntake.findUnique({
+            where: { id }, select: { storagePath: true },
+        });
+        const missing = settled ? await confirmStoredCopy(settled.storagePath) : null;
+        if (missing) return missing;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;
         return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current.state });

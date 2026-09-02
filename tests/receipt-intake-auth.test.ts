@@ -626,3 +626,68 @@ test("the ingest key's source list is exactly the machine sources", async () => 
         assert.ok(!INGEST_ALLOWED_SOURCES.has(source), source);
     }
 });
+
+// ── ONE provenance decision, not two (round-15 item 1) ────────────────────
+
+test("the inline endpoint calls decideSource itself — it does not re-implement it", () => {
+    // The single-shot route carried a hand-written twin of decideSource, and it
+    // had drifted in two ways that mattered: it checked the global machine-source
+    // set instead of the sources THIS key owns, and it validated only the
+    // namespace prefix — so `drive:` with an empty tail was accepted as a
+    // permanent, unique idempotency key that every later empty-tail forward then
+    // collided with. A forwarder must not be able to tell the two doors apart.
+    const inline = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
+        "utf8",
+    );
+    assert.match(inline, /import \{[\s\S]*?decideSource,[\s\S]*?\} from "@\/lib\/receipt-intake\/intake-core";/);
+    assert.match(inline, /const decided = decideSource\(auth, \{/);
+    assert.match(inline, /if \(!decided\.ok\) return bad\(decided\.reason\);/);
+
+    // And the copies are gone: no local sets, no hand-rolled namespace check,
+    // no second UUID pattern.
+    assert.ok(!/const MACHINE_SOURCES = new Set/.test(inline), "no local source set");
+    assert.ok(!/const USER_SOURCES = new Set/.test(inline), "no local user-source set");
+    assert.ok(!/const UUID_PATTERN =/.test(inline), "no second uuid pattern");
+    assert.ok(
+        !/sourceRef\.startsWith\(`\$\{parsed\.source\}:`\)/.test(inline),
+        "no hand-rolled namespace check",
+    );
+
+    // /start reaches the same function.
+    const start = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    );
+    assert.match(start, /decideSource\(auth, \{/);
+});
+
+test("both doors reject the same refs, through the same decision", async () => {
+    // The unit half of the e2e that drives real requests: every rejection the
+    // inline endpoint can now produce comes from decideSource, so this pins the
+    // reasons the routes will return.
+    const { decideSource } = await import("../src/lib/receipt-intake/intake-core");
+    const secret = {
+        ok: true, via: "secret", user: null, userVia: null,
+        capability: "ingest", allowedSources: new Set(["drive", "email", "chat"]),
+    } as any;
+    const cases: Array<[string, string]> = [
+        ["drive:", "invalid-sourceRef"],
+        ["drive:short", "invalid-sourceRef"],
+        [`drive:${"a".repeat(600)}`, "sourceRef-too-long"],
+        ["chat:spaces/AAA/messages/x", "sourceRef-namespace-mismatch"],
+    ];
+    for (const [sourceRef, reason] of cases) {
+        assert.deepEqual(
+            decideSource(secret, { source: "drive", sourceRef }),
+            { ok: false, reason },
+            sourceRef,
+        );
+    }
+    // A key that does not own the source is refused before any shape check.
+    const chatOnly = { ...secret, allowedSources: new Set(["chat"]) };
+    assert.deepEqual(
+        decideSource(chatOnly, { source: "drive", sourceRef: "drive:1AbCdEfGhIjKlMnOp_qR" }),
+        { ok: false, reason: "invalid-source" },
+    );
+});
