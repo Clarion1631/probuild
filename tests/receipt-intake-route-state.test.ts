@@ -11,15 +11,18 @@ import assert from "node:assert/strict";
 import { backoffMs, MAX_BOOK_ATTEMPTS, routeState } from "../src/lib/receipt-intake/route-state";
 
 const NO_HITS = { strong: null, weak: null };
-const clean = { docType: "receipt", amount: "364.98", totalCents: 36498 };
+const clean = { docType: "receipt", amount: "364.98", totalCents: 36498, canonicalVendor: "lowes" };
+/** The strong key is vendor-LESS, so an owner has to carry its vendor separately. */
+const owner = (over: Partial<{ id: string; totalCents: number | null; canonicalVendor: string | null }> = {}) =>
+    ({ id: "row-a", totalCents: 36498, canonicalVendor: "lowes", ...over });
 
 test("multi outranks everything, including a missing project", () => {
-    const d = routeState({ docType: "multi", amount: "0.00", totalCents: null }, NO_HITS, false);
+    const d = routeState({ docType: "multi", amount: "0.00", totalCents: null, canonicalVendor: "" }, NO_HITS, false);
     assert.deepEqual(d, { state: "NEEDS_REVIEW", stateReason: "multi-doc", duplicateOfId: null });
 });
 
 test("a non-receipt is its own terminal state, not a review item", () => {
-    const d = routeState({ docType: "non_receipt", amount: "0.00", totalCents: null }, NO_HITS, true);
+    const d = routeState({ docType: "non_receipt", amount: "0.00", totalCents: null, canonicalVendor: "" }, NO_HITS, true);
     assert.deepEqual(d, { state: "NON_RECEIPT", stateReason: null, duplicateOfId: null });
 });
 
@@ -27,11 +30,34 @@ test("a $0.00 total is a misread and is parked BEFORE any dedup or job check", (
     // :531 — you don't get a $0 receipt or write a $0 check. Letting this reach
     // a key would poison it for the real document.
     const d = routeState(
-        { docType: "receipt", amount: "0.00", totalCents: 0 },
-        { strong: { id: "owner", totalCents: 0 }, weak: { id: "other" } },
+        { docType: "receipt", amount: "0.00", totalCents: 0, canonicalVendor: "lowes" },
+        { strong: owner({ id: "owner", totalCents: 0 }), weak: { id: "other" } },
         true,
     );
-    assert.deepEqual(d, { state: "NEEDS_REVIEW", stateReason: "zero-total", duplicateOfId: null });
+    assert.deepEqual(d, { state: "NEEDS_REVIEW", stateReason: "refund-or-zero", duplicateOfId: null });
+});
+
+test("a NEGATIVE total is a refund: reviewed, and it claims no dedup key", () => {
+    // A refund is a legitimate document — v1 carried them all the way through
+    // rename/dedup/archive — but it must never book itself against the original
+    // purchase automatically, and it must not hold a key the original needs.
+    for (const [amount, cents] of [["-22.57", -2257], ["-1200.00", -120000]] as const) {
+        const d = routeState(
+            { docType: "receipt", amount, totalCents: cents, canonicalVendor: "lowes" },
+            NO_HITS,
+            true,
+        );
+        assert.deepEqual(d, { state: "NEEDS_REVIEW", stateReason: "refund-or-zero", duplicateOfId: null }, amount);
+    }
+});
+
+test("an unreadable total (null cents) is reviewed, not booked", () => {
+    const d = routeState(
+        { docType: "receipt", amount: "abc", totalCents: null, canonicalVendor: "lowes" },
+        NO_HITS,
+        true,
+    );
+    assert.equal(d.stateReason, "refund-or-zero");
 });
 
 test("no project means NEEDS_JOB — a queue, not a fault", () => {
@@ -39,13 +65,40 @@ test("no project means NEEDS_JOB — a queue, not a fault", () => {
     assert.deepEqual(d, { state: "NEEDS_JOB", stateReason: null, duplicateOfId: null });
 });
 
-test("a strong hit at the same total is the same purchase twice", () => {
-    const d = routeState(clean, { strong: { id: "row-a", totalCents: 36498 }, weak: null }, true);
+test("a strong hit at the same total AND the same vendor is the same purchase twice", () => {
+    const d = routeState(clean, { strong: owner(), weak: null }, true);
     assert.deepEqual(d, { state: "DUPLICATE", stateReason: null, duplicateOfId: "row-a" });
 });
 
+test("same total, DIFFERENT vendor is a key collision, not a duplicate", () => {
+    // The v3.6 key leaves the vendor out on purpose (one store spells its own
+    // name three ways). The cost is that two unrelated vendors reusing an
+    // invoice number on one day for the same amount collide — and quarantining
+    // one of those would silently drop a real expense. The vendor is not part
+    // of the KEY, but it is part of the CONFIRMATION.
+    const d = routeState(clean, { strong: owner({ canonicalVendor: "homedepot" }), weak: null }, true);
+    assert.deepEqual(d, {
+        state: "NEEDS_REVIEW",
+        stateReason: "vendor-mismatch:row-a",
+        duplicateOfId: "row-a",
+    });
+});
+
+test("an owner whose VENDOR is unknown is not a confirmed match either", () => {
+    const d = routeState(clean, { strong: owner({ canonicalVendor: null }), weak: null }, true);
+    assert.equal(d.state, "NEEDS_REVIEW");
+    assert.equal(d.stateReason, "vendor-mismatch:row-a");
+});
+
+test("a chain's spelling variants still collapse — canonicalVendor is what is compared", () => {
+    // "Lowe's Home Improvement" and "LOWES HOME CENTERS LLC" both canonicalise
+    // to "lowes", so the alias table (not the raw string) decides this.
+    const d = routeState(clean, { strong: owner({ canonicalVendor: "lowes" }), weak: null }, true);
+    assert.equal(d.state, "DUPLICATE");
+});
+
 test("a strong hit at a DIFFERENT total is ambiguous and goes to a human", () => {
-    const d = routeState(clean, { strong: { id: "row-a", totalCents: 20000 }, weak: null }, true);
+    const d = routeState(clean, { strong: owner({ totalCents: 20000 }), weak: null }, true);
     assert.deepEqual(d, {
         state: "NEEDS_REVIEW",
         stateReason: "strong-dup-amount-mismatch:row-a",
@@ -56,7 +109,7 @@ test("a strong hit at a DIFFERENT total is ambiguous and goes to a human", () =>
 test("an owner whose total is unknown is never treated as a match", () => {
     // A null total means "can't confirm the totals match" — reading it as a
     // match would silently quarantine a real expense.
-    const d = routeState(clean, { strong: { id: "row-a", totalCents: null }, weak: null }, true);
+    const d = routeState(clean, { strong: owner({ totalCents: null }), weak: null }, true);
     assert.equal(d.state, "NEEDS_REVIEW");
     assert.equal(d.stateReason, "strong-dup-amount-mismatch:row-a");
 });
@@ -67,7 +120,7 @@ test("a weak hit always asks a human, never quarantines on its own", () => {
 });
 
 test("the strong net is checked before the weak one", () => {
-    const d = routeState(clean, { strong: { id: "row-a", totalCents: 36498 }, weak: { id: "row-b" } }, true);
+    const d = routeState(clean, { strong: owner(), weak: { id: "row-b" } }, true);
     assert.equal(d.state, "DUPLICATE");
     assert.equal(d.duplicateOfId, "row-a");
 });

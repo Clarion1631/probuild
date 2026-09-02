@@ -58,8 +58,19 @@ export type BookResult =
     | { outcome: "booked"; qbPurchaseId: string; expenseId: string; alreadyExisted: boolean }
     /** A switch is off: stay BOOKING, try again in an hour, spend NO attempt. */
     | { outcome: "deferred"; reason: "push-disabled" | "push-paused" }
-    /** Terminal: a human must look at it. No further automatic attempt. */
-    | { outcome: "needs-review"; reason: string }
+    /**
+     * Terminal: a human must look at it. No further automatic attempt.
+     *
+     * `releaseStrongKey` mirrors the Apps Script v3.5 rule. A parked row keeps
+     * holding `dedupStrongKey` (the partial unique index covers every state
+     * except DUPLICATE/VOID), so if we park BEFORE ever reaching QuickBooks —
+     * the job has no estimate, the date is unusable — the key is being held by
+     * a document that never became a purchase. A corrected re-send of the same
+     * receipt would then be quarantined against a row that represents nothing.
+     * Release in exactly that case. Once a send was ATTEMPTED the key must be
+     * held: QBO may have created the Purchase and lost the response.
+     */
+    | { outcome: "needs-review"; reason: string; releaseStrongKey: boolean }
     /** Transport-class failure: attempts+1 and a backoff. */
     | { outcome: "retry"; attempts: number; nextRetryAt: Date; reason: string };
 
@@ -136,11 +147,36 @@ export function buildGroups(
     }];
 }
 
-/** The Expense amount mirrors the QBO COGS line: pre-tax when the tax was split. */
-export function expenseAmountCents(groups: QboReceiptGroup[], totalCents: number): number {
-    const nonTax = groups.filter(g => g.tax !== true);
-    if (nonTax.length === 0) return totalCents;
-    return Math.round(nonTax.reduce((sum, g) => sum + g.amount, 0) * 100);
+/**
+ * `Expense.amount` is the GROSS total paid, tax included — Justin's call
+ * (2026-09-01), overriding the plan's §4.5 "pre-tax" wording.
+ *
+ * The QBO Purchase still splits the tax onto its own reclaimable account; that
+ * is a QuickBooks-side concern and it is unchanged. But ProBuild's `Expense`
+ * has no tax column, and the expenses already imported from QBO
+ * (lib/qbo-expense-sync.ts) record the gross line total. Booking the pre-tax
+ * figure here would mean two intake paths writing the same table with two
+ * different meanings of `amount`, so job-cost and variance reports would
+ * silently under-count every receipt this pipeline touched.
+ *
+ * `ReceiptIntake.taxCents` keeps the split, so Phase 3 can add
+ * `Expense.taxAmount` and derive the pre-tax number without re-reading a single
+ * document.
+ */
+export function expenseAmountCents(_groups: QboReceiptGroup[], totalCents: number): number {
+    return totalCents;
+}
+
+/**
+ * The tax that was ACTUALLY applied, read back off the built groups — 0 when
+ * `buildGroups` rejected the read (a check, or tax >= total). The audit row must
+ * record what posted, not what the model asked for; otherwise the sales-tax
+ * filing report reconciles against a number no Purchase ever carried.
+ */
+export function appliedTaxCents(groups: QboReceiptGroup[]): number {
+    return groups
+        .filter(g => g.tax === true)
+        .reduce((sum, g) => sum + Math.round(g.amount * 100), 0);
 }
 
 /** @db.Date round-trips as UTC midnight; QBO wants a bare calendar day. */
@@ -183,11 +219,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     if (!deps.isPushEnabled()) return { outcome: "deferred", reason: "push-disabled" };
     if (await deps.isPushPaused()) return { outcome: "deferred", reason: "push-paused" };
 
-    if (!row.projectId) return { outcome: "needs-review", reason: "no-estimate" };
-    if (row.totalCents === null || row.totalCents <= 0) {
-        return { outcome: "needs-review", reason: "zero-total" };
-    }
-    if (!row.txnDate) return { outcome: "needs-review", reason: "invalid-date" };
+    // Everything down to the QBO call is a PRE-SEND refusal: nothing was ever
+    // sent, so the strong key must be handed back (see BookResult).
+    if (!row.projectId) return parkedBeforeSend("no-estimate");
+    if (row.totalCents === null || row.totalCents <= 0) return parkedBeforeSend("refund-or-zero");
+    if (!row.txnDate) return parkedBeforeSend("invalid-date");
 
     // 2. The project's LATEST estimate — the same "primary estimate" rule the
     //    v1 receipt-ingest endpoint uses (route.ts:69). Expense.estimateId is
@@ -201,9 +237,9 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             estimates: { orderBy: { createdAt: "desc" }, take: 1, select: { id: true } },
         },
     });
-    if (!project) return { outcome: "needs-review", reason: "no-estimate" };
+    if (!project) return parkedBeforeSend("no-estimate");
     const estimateId = project.estimates[0]?.id;
-    if (!estimateId) return { outcome: "needs-review", reason: "no-estimate" };
+    if (!estimateId) return parkedBeforeSend("no-estimate");
 
     // 3. Category groups (tax split).
     const groups = buildGroups(row.docType, row.totalCents, row.taxCents, row.refNumber);
@@ -237,7 +273,9 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         result = await deps.createPurchase(tokens, input);
     } catch (error) {
         const terminal = terminalReasonFor(error);
-        if (terminal) return { outcome: "needs-review", reason: terminal };
+        // A send WAS attempted: QBO may hold a Purchase whose response we lost,
+        // so the key stays claimed even though the row is parked.
+        if (terminal) return { outcome: "needs-review", reason: terminal, releaseStrongKey: false };
         // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
         // 429/5xx and DB errors are all transport-class: try again later.
         return retry(row, deps, now, describe(error));
@@ -248,7 +286,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // refusal (project-not-matched, docnumber-conflict, amount-mismatch,
         // missing-vendor, invalid-date, duplicate-name, ...). None becomes true
         // by waiting.
-        return { outcome: "needs-review", reason: `qbo-fault:${result.reason}` };
+        return { outcome: "needs-review", reason: `qbo-fault:${result.reason}`, releaseStrongKey: false };
     }
 
     // 5. One transaction: the Expense and the row's BOOKED state land together
@@ -256,6 +294,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    lost-response retry, and QBO's idempotency has already guaranteed
     //    there is exactly one Purchase.
     const amountCents = expenseAmountCents(groups, row.totalCents);
+    const taxApplied = appliedTaxCents(groups);
     const costCodeId = row.costCodeId ?? row.suggestedCostCodeId ?? null;
     const driveFileId = driveFileIdOf(row);
     const receiptUrl = driveFileId
@@ -286,7 +325,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     qbPurchaseId: result.qbPurchaseId,
                     description:
                         `[Receipt intake] ${docRef}` +
-                        (groups.length > 1 ? " · pre-tax (sales tax posted separately)" : "") +
+                        (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
                         ` · pending bookkeeper review`,
                 },
                 select: { id: true },
@@ -318,7 +357,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             docNumber: result.docNumber,
             fileName: row.fileName ?? undefined,
             amountCents,
-            taxCents: row.taxCents ?? undefined,
+            // What POSTED, not what was requested — buildGroups rejects a tax
+            // read on a check or when tax >= total, and the filing report has
+            // to reconcile against the Purchase.
+            taxCents: taxApplied,
             detail: {
                 fileId,
                 qbPurchaseId: result.qbPurchaseId,
@@ -347,10 +389,17 @@ function describe(error: unknown): string {
     return "UnknownError";
 }
 
+/** A refusal reached WITHOUT any QBO call — the strong key goes back. */
+function parkedBeforeSend(reason: string): BookResult {
+    return { outcome: "needs-review", reason, releaseStrongKey: true };
+}
+
 function retry(row: BookableRow, deps: BookDependencies, now: Date, reason: string): BookResult {
     const attempts = row.attempts + 1;
-    if (attempts > MAX_BOOK_ATTEMPTS) {
-        return { outcome: "needs-review", reason: "max-retries" };
+    // `>=`, so MAX_BOOK_ATTEMPTS reads as "20 attempts in total" rather than 21.
+    if (attempts >= MAX_BOOK_ATTEMPTS) {
+        // Sends were attempted to get here, so the key stays claimed.
+        return { outcome: "needs-review", reason: "max-retries", releaseStrongKey: false };
     }
     return {
         outcome: "retry",

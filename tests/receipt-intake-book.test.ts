@@ -11,6 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+    appliedTaxCents,
     bookReceipt,
     buildGroups,
     driveFileIdOf,
@@ -125,12 +126,24 @@ test("a nonsense or absent tax falls back to the single-line shape", () => {
     assert.equal(buildGroups("receipt", 10000, 20000, "1").length, 1);
 });
 
-test("the Expense amount is the PRE-TAX figure when the tax was split", () => {
-    // Mirrors the QBO COGS line: the sales tax posts to its own reclaimable
-    // account, so job cost must not double-count it.
-    const groups = buildGroups("receipt", 36498, 2920, "82766");
-    assert.equal(expenseAmountCents(groups, 36498), 33578);
+test("the Expense amount is the GROSS total, tax included, split or not", () => {
+    // Justin's call (2026-09-01), overriding the plan's pre-tax wording: the
+    // expenses already imported from QuickBooks record the gross line total, so
+    // booking pre-tax here would put two meanings of `amount` in one table and
+    // silently under-count every receipt this pipeline touched.
+    const split = buildGroups("receipt", 36498, 2920, "82766");
+    assert.equal(split.length, 2, "the QBO Purchase still splits the tax");
+    assert.equal(expenseAmountCents(split, 36498), 36498);
     assert.equal(expenseAmountCents(buildGroups("receipt", 10000, null, "1"), 10000), 10000);
+});
+
+test("appliedTaxCents reports what POSTED, not what the model asked for", () => {
+    assert.equal(appliedTaxCents(buildGroups("receipt", 36498, 2920, "82766")), 2920);
+    // buildGroups rejects both of these, so the audit row must say 0 — the
+    // filing report reconciles against the Purchase, not against the read.
+    assert.equal(appliedTaxCents(buildGroups("check", 120000, 9000, "Check4178")), 0);
+    assert.equal(appliedTaxCents(buildGroups("receipt", 10000, 20000, "1")), 0);
+    assert.equal(appliedTaxCents(buildGroups("receipt", 10000, null, "1")), 0);
 });
 
 test("only a drive row books under the Drive file id", () => {
@@ -139,7 +152,7 @@ test("only a drive row books under the Drive file id", () => {
     assert.equal(driveFileIdOf({ source: "drive", sourceRef: "drive:" }), null);
 });
 
-test("a successful booking creates the Expense at the pre-tax amount and marks the row BOOKED", async () => {
+test("a successful booking creates the Expense at the gross amount and marks the row BOOKED", async () => {
     const r = recorder();
     const result = await bookReceipt(row(), r.deps);
 
@@ -152,7 +165,7 @@ test("a successful booking creates the Expense at the pre-tax amount and marks t
     assert.equal(r.purchaseCalls[0].groups.length, 2);
 
     assert.equal(r.expenses.length, 1);
-    assert.equal(r.expenses[0].amount, 335.78);
+    assert.equal(r.expenses[0].amount, 364.98, "gross, tax included");
     assert.equal(r.expenses[0].estimateId, "est-1");
     assert.equal(r.expenses[0].costCodeId, "cc-plumb", "falls back to the model's phase suggestion");
     assert.equal(r.expenses[0].qbPurchaseId, "QB-1");
@@ -163,6 +176,8 @@ test("a successful booking creates the Expense at the pre-tax amount and marks t
     assert.equal(r.intakeUpdates[0].qbPurchaseId, "QB-1");
     assert.equal(r.events[0].kind, "receipt-push");
     assert.equal(r.events[0].source, "intake-worker");
+    assert.equal(r.events[0].amountCents, 36498);
+    assert.equal(r.events[0].taxCents, 2920, "the tax that actually posted");
 });
 
 test("an explicitly chosen cost code beats the model's suggestion", async () => {
@@ -178,12 +193,38 @@ test("a non-drive row books under its intake id and stores the secure ref", asyn
     assert.equal(r.expenses[0].receiptUrl, "secure:receipts/intake/intake-1.jpg");
 });
 
-test("a project with no estimate is terminal and spends NO attempt", async () => {
+test("a project with no estimate is terminal, spends NO attempt, and RELEASES the strong key", async () => {
+    // Nothing was ever sent, so the row is holding a dedup key on behalf of a
+    // document that never became a purchase. A corrected re-send of the same
+    // receipt would be quarantined against it (v3.5 rule).
     const r = recorder({}, { estimates: [] });
     const result = await bookReceipt(row(), r.deps);
-    assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate" });
+    assert.deepEqual(result, { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: true });
     assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
     assert.equal(r.expenses.length, 0);
+});
+
+test("every PRE-send refusal releases the key; every POST-send one holds it", async () => {
+    // Pre-send: nothing exists in QuickBooks, so the key must go back.
+    for (const [rowOverrides, reason] of [
+        [{ projectId: null }, "no-estimate"],
+        [{ totalCents: 0 }, "refund-or-zero"],
+        [{ totalCents: -2257 }, "refund-or-zero"],
+        [{ txnDate: null }, "invalid-date"],
+    ] as const) {
+        const r = recorder();
+        const result = await bookReceipt(row(rowOverrides), r.deps);
+        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: true }, reason);
+        assert.equal(r.purchaseCalls.length, 0, reason);
+    }
+
+    // Post-send: QBO may hold a Purchase whose response we lost, so the key
+    // stays claimed even though the row is parked.
+    const faulted = recorder({
+        createPurchase: async () => { throw new QboPurchaseFaultError(400, "closed period", "6210"); },
+    });
+    const result = await bookReceipt(row(), faulted.deps);
+    assert.equal((result as any).releaseStrongKey, false);
 });
 
 test("the push kill switch and the pause switch defer without spending an attempt", async () => {
@@ -216,7 +257,7 @@ test("QBO business-rule faults are TERMINAL, never retried", async () => {
     for (const [error, reason] of cases) {
         const r = recorder({ createPurchase: async () => { throw error; } });
         const result = await bookReceipt(row(), r.deps);
-        assert.deepEqual(result, { outcome: "needs-review", reason }, reason);
+        assert.deepEqual(result, { outcome: "needs-review", reason, releaseStrongKey: false }, reason);
         assert.equal(r.expenses.length, 0);
     }
 });
@@ -228,6 +269,7 @@ test("an ok:false result is a deterministic refusal, so it goes to a human too",
     assert.deepEqual(await bookReceipt(row(), r.deps), {
         outcome: "needs-review",
         reason: "qbo-fault:docnumber-conflict",
+        releaseStrongKey: false,
     });
 });
 
@@ -245,14 +287,21 @@ test("a QBTimeoutError retries on the backoff schedule", async () => {
     assert.equal((third as any).nextRetryAt.getTime(), NOW.getTime() + 60 * 60_000);
 });
 
-test("a plain network error retries; past 20 attempts it stops and asks a human", async () => {
+test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTAL", async () => {
     const transient = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
     assert.equal((await bookReceipt(row({ attempts: 5 }), transient.deps)).outcome, "retry");
 
+    // row.attempts 18 -> this is attempt 19: still retryable.
+    const nearly = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
+    assert.equal((await bookReceipt(row({ attempts: 18 }), nearly.deps)).outcome, "retry");
+
+    // row.attempts 19 -> this is attempt 20, the last one the constant allows.
     const exhausted = recorder({ createPurchase: async () => { throw new TypeError("fetch failed"); } });
-    assert.deepEqual(await bookReceipt(row({ attempts: 20 }), exhausted.deps), {
+    assert.deepEqual(await bookReceipt(row({ attempts: 19 }), exhausted.deps), {
         outcome: "needs-review",
         reason: "max-retries",
+        // Sends were attempted to get here, so the key is NOT released.
+        releaseStrongKey: false,
     });
 });
 
