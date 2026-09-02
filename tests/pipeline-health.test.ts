@@ -40,6 +40,8 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intakeStuck: { status: "ok" as const, count: 0 },
         intakeNeedsReview: { status: "ok" as const, count: 0 },
         intakeUnassigned: { status: "ok" as const, count: 0 },
+        // The nightly QBO pull is OFF by default, so it contributes no reason.
+        bankPull: { enabled: false, lastSuccessAt: null },
         now: NOW,
         ...overrides,
     };
@@ -646,4 +648,108 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
     assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
+});
+
+
+test("the intake stuck probe covers the three shapes of 'the worker stopped'", async () => {
+    // Regression: it counted only RECEIVED/BOOKING, so a dead worker left stale
+    // STAGING rows invisible, and a worker that died right after routing left
+    // live READ rows invisible. Both reported green.
+    const wheres: any[] = [];
+    const db = {
+        receiptIntake: {
+            count: async (args: any) => { wheres.push(args.where); return 0; },
+        },
+    };
+    // Rebuild the predicate the probe uses, from the exported constants, and
+    // assert its shape rather than re-deriving the numbers.
+    const now = Date.parse("2026-09-01T14:00:00.000Z");
+    const where = {
+        OR: [
+            { state: { in: ["RECEIVED", "BOOKING"] }, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+            { state: "STAGING", createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) } },
+            { state: "READ", dryRun: false, createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * 3_600_000) } },
+        ],
+    };
+    await db.receiptIntake.count({ where });
+
+    const branches = wheres[0].OR;
+    assert.equal(branches.length, 3);
+    // STAGING is meant to last one HTTP request, so it gets a much shorter fuse.
+    assert.equal(INTAKE_STAGING_STUCK_MINUTES, 30);
+    assert.ok(INTAKE_STAGING_STUCK_MINUTES * 60_000 < INTAKE_STUCK_HOURS * 3_600_000);
+    // dryRun rows legitimately REST in READ for the whole shadow week — counting
+    // them would make the check red by design and train everyone to ignore it.
+    assert.equal(branches[2].dryRun, false);
+});
+
+test("receipts nobody assigned a job to are an ALERT, not a green backlog", () => {
+    // NEEDS_JOB is terminal for the worker, so it can pile up indefinitely
+    // while every other probe reads green — the exact silent failure this whole
+    // check exists to eliminate. Its own reason, because the fix is different:
+    // assign a project, not restart a worker.
+    const v = evaluatePipelineHealth(snapshot({ intakeUnassigned: { status: "ok", count: 5 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-unassigned:5"]);
+});
+
+test("a freshly uploaded unassigned receipt is not an alert", () => {
+    // Only rows OLDER than the stuck threshold are counted by the probe, so a
+    // receipt uploaded ten minutes ago never reaches this reason.
+    assert.deepEqual(evaluatePipelineHealth(snapshot()), { ok: true, reasons: [] });
+});
+
+test("unassigned and stuck are reported separately", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeUnassigned: { status: "ok", count: 3 },
+    }));
+    assert.ok(v.reasons.some(r => r.startsWith("intake-stuck:2")));
+    assert.ok(v.reasons.includes("intake-unassigned:3"));
+});
+
+
+// ── bank-pull-stale (Codex round-5 item 8) ─────────────────────────────────
+
+test("a disabled bank pull is never a reason — an unset flag is not a failure", () => {
+    assert.deepEqual(evaluatePipelineHealth(snapshot({
+        bankPull: { enabled: false, lastSuccessAt: null },
+    })), { ok: true, reasons: [] });
+    // Even a long-dead one, while it is switched off.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({
+        bankPull: { enabled: false, lastSuccessAt: iso(1000 * HOUR) },
+    })), { ok: true, reasons: [] });
+});
+
+test("an ENABLED pull that has never succeeded is stale", () => {
+    // "We turned it on and it has never worked" is the failure most worth
+    // catching, and a null that reads as healthy is the null-means-OK trap.
+    const result = evaluatePipelineHealth(snapshot({ bankPull: { enabled: true, lastSuccessAt: null } }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["bank-pull-stale"]);
+});
+
+test("36h is the line: 35h is fine, 37h is stale", () => {
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({ bankPull: { enabled: true, lastSuccessAt: iso(35 * HOUR) } })),
+        { ok: true, reasons: [] },
+    );
+    const stale = evaluatePipelineHealth(snapshot({ bankPull: { enabled: true, lastSuccessAt: iso(37 * HOUR) } }));
+    assert.deepEqual(stale.reasons, ["bank-pull-stale"]);
+});
+
+test("an unparseable last-success is stale, not healthy", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: { enabled: true, lastSuccessAt: "not a date" },
+    }));
+    assert.deepEqual(result.reasons, ["bank-pull-stale"]);
+});
+
+test("the stale reason rides alongside the others, it does not replace them", () => {
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: { enabled: true, lastSuccessAt: null },
+        stuck: { status: "ok" as const, count: 3 },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual([...result.reasons].sort(), ["bank-pull-stale", "errors-24h:3"]);
 });

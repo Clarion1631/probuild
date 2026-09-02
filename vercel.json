@@ -67,6 +67,10 @@
     {
       "path": "/api/cron/receipt-request-cards",
       "schedule": "30 14 * * 1-5"
+    },
+    {
+      "path": "/api/cron/receipt-request-cards?retry=1",
+      "schedule": "30 16 * * 1-5"
     }
   ]
 }

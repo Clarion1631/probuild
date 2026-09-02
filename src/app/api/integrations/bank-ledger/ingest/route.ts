@@ -10,7 +10,7 @@ import {
     isValidCalendarDate,
     isSafeCents,
 } from "@/lib/bank-ledger";
-import { BANK_LINE_IDENTITY_LOCK, identityPayee, planStatementAdoption } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planStatementAdoption } from "@/lib/bank-line-mint";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -486,7 +486,7 @@ const handlers = createBankLedgerIngestHandlers({
                         sequence: line.sequence,
                         postedDate: line.postedDate,
                         amountCents: line.amountCents,
-                        normalizedPayee: identityPayee(line.rawDescriptor),
+                        normalizedPayee: bankLineIdentityPayee({ memo: line.rawDescriptor }),
                         checkNumber: line.checkNumber,
                     })),
                     adoptable.map(row => ({
@@ -495,8 +495,8 @@ const handlers = createBankLedgerIngestHandlers({
                         account: row.account,
                         postedDate: row.postedDate.toISOString().slice(0, 10),
                         amountCents: row.amountCents,
-                        // ONE identity function, both sides. See identityPayee.
-                        normalizedPayee: identityPayee(row.rawDescriptor),
+                        // ONE identity function, both sides.
+                        normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
                         checkNumber: row.checkNumber,
                         sourceOfRecord: row.sourceOfRecord,
                     })),

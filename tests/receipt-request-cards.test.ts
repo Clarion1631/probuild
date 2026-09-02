@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { effectiveOwner } from "../src/lib/receipt-requests";
 import {
     CARD_RATE_CEILING,
     MAX_ITEMS_PER_CARD,
@@ -129,7 +130,8 @@ test("the card text carries all three reply options and never mentions email", (
     const [card] = buildOwnerCards([issue()], NOW);
     assert.match(card.text, /photo/i);
     assert.match(card.text, /to name the job/i);
-    assert.match(card.text, /sign 2/i);
+    // A one-item card names item 1 — see the single-item test below.
+    assert.match(card.text, /sign 1/i);
     assert.doesNotMatch(card.text, /\bemail\b/i);
     assert.match(card.text, /1\. 2026-08-16 · LOWES #02516 · \$123\.45 · card …8516/);
 });
@@ -236,4 +238,75 @@ test("postOwnerCard returns null when the response lacks thread.name or message.
     } finally {
         globalThis.fetch = original;
     }
+});
+
+// ── Card copy names an item that EXISTS (Codex round-5 item 6) ──────────────
+
+test("a single-item card's examples say item 1, not item 2", () => {
+    // 'reply "sign 2"' on a one-item card is instructions for a message that
+    // does not exist; the reader looks for item 2 and stops trusting the card.
+    const [card] = buildOwnerCards([issue()], NOW);
+    assert.equal(card.items.length, 1);
+    assert.match(card.text, /reply \*"1 Mueller Remodel"\* to name the job for item 1/);
+    assert.match(card.text, /reply \*"sign 1"\*/);
+    assert.doesNotMatch(card.text, /item 2|sign 2/);
+});
+
+test("a multi-item card keeps the 2 examples", () => {
+    const [card] = buildOwnerCards([issue(), issue({ id: "b", targetKey: "bl-b" })], NOW);
+    assert.equal(card.items.length, 2);
+    assert.match(card.text, /for item 2/);
+    assert.match(card.text, /sign 2/);
+});
+
+// ── Overflow is only a NUMBER when it was counted (item 7) ──────────────────
+
+test("an exact overflow prints a total; an unknown one says 'and more'", () => {
+    const many = Array.from({ length: 14 }, (_, i) =>
+        issue({ id: `ri-${i}`, targetKey: `bl-${i}`, postedDate: `2026-08-${String(i + 1).padStart(2, "0")}` }));
+
+    const exact = buildOwnerCards(many, NOW, true)[0];
+    assert.equal(exact.overflow, 4);
+    assert.equal(exact.overflowExact, true);
+    assert.match(exact.text, /\(10 of 14\)/);
+    assert.match(exact.text, /…and 4 more/);
+
+    // The scan stopped at its page cap, so the total would be a guess.
+    const inexact = buildOwnerCards(many, NOW, false)[0];
+    assert.equal(inexact.overflowExact, false);
+    assert.match(inexact.text, /\(10 of more\)/);
+    assert.match(inexact.text, /…and more —/);
+    assert.doesNotMatch(inexact.text, /and 4 more/);
+});
+
+test("no overflow prints a bare count either way", () => {
+    for (const exact of [true, false]) {
+        const [card] = buildOwnerCards([issue()], NOW, exact);
+        assert.match(card.text, /\(1\)/);
+        assert.doesNotMatch(card.text, /of more|…and/);
+    }
+});
+
+// ── effectiveOwner is ONE function (item 2) ────────────────────────────────
+
+test("effectiveOwner: a human's assignment beats the derived owner", () => {
+    assert.equal(effectiveOwner({ owner: "unattributed", ownerOverride: "CJ" }), "CJ");
+    assert.equal(effectiveOwner({ owner: "office" }), "office");
+    assert.equal(effectiveOwner({ owner: "office", ownerOverride: "   " }), "office", "blank is not an assignment");
+    assert.equal(effectiveOwner({}), "unassigned");
+    assert.equal(effectiveOwner(null), "unassigned");
+});
+
+test("an assigned owner reaches the CARD, not just the page", () => {
+    // The bug this closes: three surfaces spelled "whose is this" three ways,
+    // so an item could move under CJ on the tab and never appear on his card.
+    const assigned = issue({ owner: effectiveOwner({ owner: "unattributed", ownerOverride: "CJ" }) });
+    const [card] = buildOwnerCards([assigned], NOW);
+    assert.equal(card.owner, "CJ");
+    assert.equal(card.items.length, 1);
+});
+
+test("an UNASSIGNED unattributed item is on nobody's card", () => {
+    const unattributed = issue({ owner: effectiveOwner({ owner: "unattributed" }) });
+    assert.deepEqual(buildOwnerCards([unattributed], NOW), [], "it waits for a human, it does not guess");
 });

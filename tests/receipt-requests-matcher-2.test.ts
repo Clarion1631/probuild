@@ -384,12 +384,12 @@ test("two concurrent sweeps cannot both give one receipt away", async () => {
 
 test("the sweep holds a DURABLE lease, not a released advisory claim", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /async function takeRunLease\(/);
-    assert.match(source, /RUN_LEASE_MS/);
+    // The lease now lives in the shared src/lib/cron-lease.ts helper.
+    assert.match(source, /takeLease\(LEASE_KEY, RUN_LEASE_MS, now, leaseToken\)/);
     // Taken before the work and released after it, not committed away first.
-    const takeAt = source.indexOf("const leaseToken = await takeRunLease(now);");
+    const takeAt = source.indexOf("await takeLease(LEASE_KEY");
     const workAt = source.indexOf("return await runSweep(now);");
-    const releaseAt = source.indexOf("await releaseRunLease(leaseToken);");
+    const releaseAt = source.indexOf("await releaseLease(LEASE_KEY");
     assert.ok(takeAt > 0 && workAt > takeAt && releaseAt > workAt);
     // And the retry path recomputes the SET.
     assert.match(source, /competingLineFilter\(/);
@@ -403,4 +403,49 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     assert.match(source, /const resumeFrom = await readCursor\(\);/);
     assert.match(source, /cursor: \{ id: resumeFrom \}, skip: 1/);
     assert.match(source, /await writeCursor\(batchWasFull \? lastId : null\);/);
+});
+
+// ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────
+
+test("a receipt allocated on one page cannot be re-allocated on the next", () => {
+    // Paging split competing lines across runs, so the same receipt satisfied a
+    // second charge and that chase closed for good. The cron expands every page
+    // to its cohort before the matcher runs; this is the property that buys.
+    const page1 = [line({ id: "bl-a", postedDate: "2026-08-16" })];
+    const page2 = [line({ id: "bl-b", postedDate: "2026-08-16" })];
+    const receipt = [expense()];
+
+    // Naive paging: each page sees the receipt and both close. That is the bug.
+    assert.deepEqual(plan({ bankLines: page1, expenses: receipt, openIssueKeys: ["bl-a"] }).close, ["bl-a"]);
+    assert.deepEqual(plan({ bankLines: page2, expenses: receipt, openIssueKeys: ["bl-b"] }).close, ["bl-b"]);
+
+    // Cohort-expanded: one closes, one keeps its chase.
+    const cohort = plan({ bankLines: [...page1, ...page2], expenses: receipt, openIssueKeys: ["bl-a", "bl-b"] });
+    assert.deepEqual(cohort.close, ["bl-a"]);
+    assert.equal(cohort.open.length, 1);
+    assert.equal(cohort.open[0].targetKey, "bl-b");
+});
+
+test("the cohort holds across a MAX_BANK_LINES-sized gap", () => {
+    // The two competitors are 2000 rows apart in id order but share an
+    // identity, so they must still be judged together.
+    const filler = Array.from({ length: 2_000 }, (_, i) =>
+        line({ id: `bl-filler-${String(i).padStart(4, "0")}`, amountCents: -900 - i, postedDate: "2026-08-16" }));
+    const result = plan({
+        bankLines: [line({ id: "bl-a" }), ...filler, line({ id: "bl-z" })],
+        expenses: [expense()],
+        openIssueKeys: ["bl-a", "bl-z"],
+    });
+    assert.deepEqual(result.close, ["bl-a"], "the first competitor takes the receipt");
+    assert.ok(result.open.some(o => o.targetKey === "bl-z"), "the far one is still chased");
+});
+
+test("the sweep expands each page to its competing cohort before matching", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /const cohortFilters = windowLines\.map\(row => competingLineFilter\(/);
+    // And the cohort is merged in before planReceiptRequests is called.
+    // lastIndexOf: recomputeCodesFor calls the matcher too, earlier in the file.
+    const cohortAt = source.indexOf("const cohortRows =");
+    const planAt = source.lastIndexOf("const plan = planReceiptRequests(");
+    assert.ok(cohortAt > 0 && planAt > cohortAt, "the cohort must be merged in BEFORE the sweep's match");
 });

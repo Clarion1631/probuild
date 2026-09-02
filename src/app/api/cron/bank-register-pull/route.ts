@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { releaseLease, takeLease } from "@/lib/cron-lease";
+import { BANK_PULL_LAST_SUCCESS_KEY } from "@/lib/pipeline-health";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import {
@@ -11,8 +14,7 @@ import {
     type BankRegisterIngestLine,
     type BankRegisterIngestResult,
 } from "@/lib/bank-register-pull";
-import { normalizePayee } from "@/lib/bank-ledger";
-import { BANK_LINE_IDENTITY_LOCK, identityPayee, planQboMint } from "@/lib/bank-line-mint";
+import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planQboMint } from "@/lib/bank-line-mint";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
 import { bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
 
@@ -43,6 +45,34 @@ export const maxDuration = 60;
  */
 
 const CLAIM_LOCK_KEY = "bank-register-pull";
+
+/**
+ * How long one pull owns the job. Comfortably longer than a maxDuration=60 run
+ * plus its QBO round trips, short enough that a crashed run does not block
+ * tomorrow night.
+ */
+const RUN_LEASE_MS = 20 * 60_000;
+
+export async function GET(request: Request) {
+    if (!isCronAuthorized(request)) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // A DURABLE lease, held for the WHOLE pull including the token refresh.
+    // The advisory claim it replaces committed — and so released — before the
+    // first QBO call, so two invocations could both fetch, both ingest and both
+    // mint against the same gap.
+    const now = new Date();
+    const token = randomUUID();
+    if (!(await takeLease(CLAIM_LOCK_KEY, RUN_LEASE_MS, now, token))) {
+        return NextResponse.json({ ok: true, skipped: "already-running" });
+    }
+    try {
+        return await runPull();
+    } finally {
+        await releaseLease(CLAIM_LOCK_KEY, token);
+    }
+}
 
 /** How far back a mint pass looks for still-unlinked QBO observations. */
 const MINT_LOOKBACK_DAYS = 45;
@@ -90,7 +120,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                 amountCents: row.amountCents,
                 rawDescriptor: row.rawDescriptor,
                 // ONE identity function, both sides. See identityPayee.
-                normalizedPayee: identityPayee(row.rawDescriptor),
+                normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
                 checkNumber: row.checkNumber,
                 bankLineId: row.bankLineId,
             })),
@@ -100,7 +130,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                 account: row.account,
                 postedDate: row.postedDate.toISOString().slice(0, 10),
                 amountCents: row.amountCents,
-                normalizedPayee: identityPayee(row.rawDescriptor),
+                normalizedPayee: bankLineIdentityPayee({ memo: row.rawDescriptor }),
                 checkNumber: row.checkNumber,
                 sourceOfRecord: row.sourceOfRecord,
             })),
@@ -121,7 +151,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
                     // STORED value keeps the conventional normalization, which
                     // is what reconcileObservations and the rest of the ledger
                     // read. `identityPayee` is a matching key, not a column.
-                    normalizedPayee: normalizePayee(observation.rawDescriptor),
+                    normalizedPayee: observation.normalizedPayee,
                     checkNumber: observation.checkNumber,
                     state: "POSTED",
                     sourceOfRecord: "QBO",
@@ -145,24 +175,7 @@ async function mintFromQbo(account: string): Promise<{ minted: number; skipped: 
 
 class ObservationClaimedError extends Error {}
 
-async function claim(): Promise<boolean> {
-    return prisma.$transaction(async tx => {
-        const [lock] = await tx.$queryRaw<{ locked: boolean }[]>(
-            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${CLAIM_LOCK_KEY}, 0)) AS locked`,
-        );
-        return lock?.locked === true;
-    });
-}
-
-export async function GET(request: Request) {
-    if (!isCronAuthorized(request)) {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    if (!(await claim())) {
-        return NextResponse.json({ ok: true, skipped: "locked" });
-    }
-
+async function runPull() {
     const summary = await runBankRegisterPull({
         account: BANK_REGISTER_ACCOUNT,
         days: BANK_REGISTER_PULL_DAYS,
@@ -202,6 +215,21 @@ export async function GET(request: Request) {
     // matcher working from incomplete truth — and a 200 meant the platform
     // never surfaced it, so nobody looked. Whatever committed stays committed
     // and re-running is a no-op for it.
+    // Record the last SUCCESS, not the last run: pipeline-health reads this to
+    // decide whether the chaser is being fed, and a failed run that stamped the
+    // clock would keep the health check green while the pull was dead.
+    if (summary.ok) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key: BANK_PULL_LAST_SUCCESS_KEY },
+                update: { value: new Date().toISOString() },
+                create: { key: BANK_PULL_LAST_SUCCESS_KEY, value: new Date().toISOString() },
+            });
+        } catch (error) {
+            console.error("[cron/bank-register-pull] last-success write failed", error instanceof Error ? error.message : "UnknownError");
+        }
+    }
+
     const status = summary.ok ? 200 : 500;
     return NextResponse.json(summary, { status });
 }

@@ -3,10 +3,11 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { registerRowToIngestLine } from "../src/lib/bank-register-pull";
 import {
     BANK_LINE_IDENTITY_LOCK,
     QBO_MINT_MIN_AGE_DAYS,
-    identityPayee,
+    bankLineIdentityPayee,
     bankLineIdentityKey,
     planQboMint,
     planStatementAdoption,
@@ -403,53 +404,57 @@ test("both write paths take the SAME lock key, and plan inside it", () => {
  * pull appends the QBO transaction type, so the two sides never matched in
  * production and every adoption missed.
  */
-const QBO_RAW = "LOWES #02516 Expense";
+const QBO_MEMO = "LOWES #02516 POS DEB C#8516 07/01/26";
 const STATEMENT_RAW = "LOWES #02516 POS DEB C#8516 07/01/26";
 
-test("identityPayee collapses the real QBO and statement forms to ONE key", () => {
-    assert.equal(identityPayee(QBO_RAW), "LOWES #02516");
-    assert.equal(identityPayee(STATEMENT_RAW), "LOWES #02516");
-    assert.equal(identityPayee(QBO_RAW), identityPayee(STATEMENT_RAW));
+test("the identity payee comes from the BANK FEED memo, not QuickBooks' name", () => {
+    // QBO's `name` is Intuit-normalized ("Lowes"); the statement's descriptor is
+    // not. Keying off the name produced two identities for one transaction.
+    assert.equal(bankLineIdentityPayee({ memo: STATEMENT_RAW, name: "Lowes" }), "LOWES #02516");
+    assert.equal(bankLineIdentityPayee({ memo: QBO_MEMO, name: "Lowes" }), "LOWES #02516");
+    assert.equal(
+        bankLineIdentityPayee({ memo: QBO_MEMO, name: "Lowes" }),
+        bankLineIdentityPayee({ memo: STATEMENT_RAW, name: "Lowes" }),
+        "the two sources must land on ONE key",
+    );
 });
 
-test("identityPayee strips every appended QBO type, longest first", async t => {
-    const cases: Array<[string, string]> = [
-        ["ACME Expense", "ACME"],
-        ["ACME Check", "ACME"],
-        ["ACME Deposit", "ACME"],
-        ["ACME Transfer", "ACME"],
-        ["ACME Bill Payment", "ACME"],
-        ["ACME Journal Entry", "ACME"],
-        ["ACME Credit Card Credit", "ACME"],
-        ["WA DEPT OF REVENUE Sales Tax Payment", "WA DEPT OF REVENUE"],
-    ];
-    for (const [raw, expected] of cases) {
-        await t.test(raw, () => assert.equal(identityPayee(raw), expected));
-    }
-    // "SALES TAX PAYMENT" must not be eaten as a bare "PAYMENT".
-    assert.notEqual(identityPayee("WA DEPT OF REVENUE Sales Tax Payment"), "WA DEPT OF REVENUE SALES TAX");
+test("the name is a FALLBACK, used only when the feed sent no memo", () => {
+    assert.equal(bankLineIdentityPayee({ memo: null, name: "Lowes" }), "LOWES");
+    assert.equal(bankLineIdentityPayee({ memo: "   ", name: "Lowes" }), "LOWES");
+    assert.equal(bankLineIdentityPayee({ memo: null, name: null }), "");
 });
 
-test("identityPayee leaves a payee that merely CONTAINS a type word alone", () => {
-    assert.equal(identityPayee("EXPENSE REDUCTION ANALYSTS"), "EXPENSE REDUCTION ANALYSTS");
-    assert.equal(identityPayee("CHECKERS DRIVE IN"), "CHECKERS DRIVE IN");
+test("the transaction type is NEVER part of identity", () => {
+    // Appending it is what made every comparison miss.
+    const line = registerRowToIngestLine({
+        date: "2026-08-16", qbType: "Expense", qbTxnId: "6625",
+        docNum: null, name: "Lowes", memo: QBO_MEMO, amountCents: -12_345,
+    });
+    assert.ok(line);
+    assert.equal(line.rawDescriptor, QBO_MEMO, "the memo verbatim, with no type appended");
+    assert.doesNotMatch(line.rawDescriptor, /Expense/);
 });
 
-test("an empty identity stays empty and can never match", () => {
-    assert.equal(identityPayee("C#8516 *****3255001"), "");
-    assert.equal(identityPayee(""), "");
+test("with no memo the descriptor is the bare name, still no type", () => {
+    const line = registerRowToIngestLine({
+        date: "2026-08-16", qbType: "Expense", qbTxnId: "6625",
+        docNum: null, name: "Lowes", memo: null, amountCents: -12_345,
+    });
+    assert.ok(line);
+    assert.equal(line.rawDescriptor, "Lowes");
 });
 
 test("CONVERGENCE with MISMATCHED raw descriptors: QBO first, statement second", () => {
     // 1. The pull mints from the QBO row.
-    const observation = obs({ rawDescriptor: QBO_RAW, normalizedPayee: identityPayee(QBO_RAW) });
+    const observation = obs({ rawDescriptor: QBO_MEMO, normalizedPayee: bankLineIdentityPayee({ memo: QBO_MEMO }) });
     const mintPlan = planQboMint([observation], [], NOW);
     assert.equal(mintPlan.mint.length, 1);
-    const minted = existing({ id: "bl-qbo", qbTxnId: "6625", sourceOfRecord: "QBO", normalizedPayee: identityPayee(QBO_RAW) });
+    const minted = existing({ id: "bl-qbo", qbTxnId: "6625", sourceOfRecord: "QBO", normalizedPayee: bankLineIdentityPayee({ memo: QBO_MEMO }) });
 
     // 2. The statement arrives with its OWN descriptor and must adopt it.
     const adoption = planStatementAdoption(
-        [stmt({ normalizedPayee: identityPayee(STATEMENT_RAW) })],
+        [stmt({ normalizedPayee: bankLineIdentityPayee({ memo: STATEMENT_RAW }) })],
         [minted],
         ACCOUNT,
     );
@@ -458,8 +463,8 @@ test("CONVERGENCE with MISMATCHED raw descriptors: QBO first, statement second",
 });
 
 test("CONVERGENCE with MISMATCHED raw descriptors: statement first, QBO second", () => {
-    const statementLine = existing({ id: "bl-stmt", sourceOfRecord: "STATEMENT", normalizedPayee: identityPayee(STATEMENT_RAW) });
-    const observation = obs({ rawDescriptor: QBO_RAW, normalizedPayee: identityPayee(QBO_RAW) });
+    const statementLine = existing({ id: "bl-stmt", sourceOfRecord: "STATEMENT", normalizedPayee: bankLineIdentityPayee({ memo: STATEMENT_RAW }) });
+    const observation = obs({ rawDescriptor: QBO_MEMO, normalizedPayee: bankLineIdentityPayee({ memo: QBO_MEMO }) });
     const plan = planQboMint([observation], [statementLine], NOW);
     assert.equal(plan.mint.length, 0, "the pull must SEE the statement's line, not mint beside it");
     assert.equal(plan.skipped.statementLineExists, 1);
@@ -483,6 +488,6 @@ test("both write paths derive identity from the RAW descriptor, not a stored col
         "src/app/api/integrations/bank-ledger/ingest/route.ts",
     ]) {
         const source = readFileSync(join(repoRoot, file), "utf8");
-        assert.match(source, /identityPayee\(/, `${file} must use the shared identity function`);
+        assert.match(source, /bankLineIdentityPayee\(/, `${file} must use the shared identity function`);
     }
 });

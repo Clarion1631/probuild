@@ -203,6 +203,11 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
  *  - `intuit-<indicator>` — Intuit itself reports degradation.
  *  - `errors-24h:<n>` — automation errored (any kind: a qbo-sync failure
  *    matters even on a day with no receipt traffic).
+ *  - `bank-pull-stale` — the nightly QBO register pull has not succeeded in
+ *    36h (or has never succeeded) WHILE it is enabled. The whole missing-receipt
+ *    chaser reads BankLine, so a dead pull silently starves it: every check
+ *    stays green while the queue quietly stops finding anything. Only reported
+ *    when the feature is actually on — an unset flag is not a failure.
  *  - `no-receipts-72h` — nothing has been booked in 72h. This used to
  *    auto-green as "a quiet week is quiet", which meant a permanently dead
  *    pipeline reported OK forever. It doesn't any more: the digest prints how
@@ -220,6 +225,11 @@ export function evaluatePipelineHealth(input: {
     intakeStuck: CountProbe;
     intakeNeedsReview: CountProbe;
     intakeUnassigned: CountProbe;
+    /**
+     * The nightly QBO register pull: whether it is switched on at all, and when
+     * it last SUCCEEDED (not merely ran).
+     */
+    bankPull: { enabled: boolean; lastSuccessAt: string | null };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -300,7 +310,47 @@ export function evaluatePipelineHealth(input: {
         if (stale) reasons.push("no-receipts-72h");
     }
 
+    if (input.bankPull.enabled) {
+        const at = input.bankPull.lastSuccessAt ? Date.parse(input.bankPull.lastSuccessAt) : null;
+        // Never succeeded counts as stale. "We turned it on and it has never
+        // worked" is the failure most worth catching, and a null that reads as
+        // healthy is exactly the null-means-OK trap this file already fixed
+        // elsewhere.
+        const stale = at === null || Number.isNaN(at) || input.now - at > BANK_PULL_STALE_HOURS * HOUR_MS;
+        if (stale) reasons.push("bank-pull-stale");
+    }
+
     return { ok: reasons.length === 0, reasons };
+}
+
+/**
+ * The nightly pull runs every 24h, so 36h is one missed run plus room for a
+ * late retry — long enough not to page on a single slow night, short enough
+ * that a dead pull is caught before the chaser has drifted a whole week.
+ */
+export const BANK_PULL_STALE_HOURS = 36;
+
+/** Where the pull records its last SUCCESS (AutomationSetting is a KV table). */
+export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
+
+/**
+ * Is the nightly pull on, and when did it last SUCCEED?
+ *
+ * A read failure reports `enabled: false` rather than "enabled and stale":
+ * inventing a failure out of a probe error would fire the alarm for the wrong
+ * reason, and the probe-failure reasons above already cover "we could not read
+ * it". The flag itself is env, so it cannot fail.
+ */
+async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null }> {
+    const enabled = process.env.BANK_LINE_MINT_FROM_QBO === "true"
+        || process.env.BANK_REGISTER_PULL_ENABLED === "true";
+    if (!enabled) return { enabled: false, lastSuccessAt: null };
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
+        return { enabled: true, lastSuccessAt: row?.value || null };
+    } catch {
+        return { enabled: false, lastSuccessAt: null };
+    }
 }
 
 /** A probe that has not answered within this long is treated as failed. */
@@ -546,6 +596,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: intakeUnassigned.reason,
             count: intakeUnassigned.value,
         },
+        bankPull: await readBankPullState(),
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });

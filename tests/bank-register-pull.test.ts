@@ -25,6 +25,9 @@ const row = (over: Partial<BankRegisterRowLike> = {}): BankRegisterRowLike => ({
     qbTxnId: "txn-1",
     docNum: null,
     name: "LOWES",
+    // The GL memo cell — the bank feed's own text. Absent on this base fixture,
+    // so the descriptor falls back to `name`.
+    memo: null,
     amountCents: -1234,
     ...over,
 });
@@ -42,10 +45,13 @@ function mapped(over: Partial<BankRegisterRowLike> = {}): BankRegisterIngestLine
 
 test("maps a normal expense row to an ingest line", () => {
     const line = mapped();
+    // The transaction type is NOT part of the descriptor: no statement carries
+    // " Expense" on the end, so appending it gave one transaction two
+    // identities and nothing ever reconciled (Codex round-5 item 1).
     assert.deepEqual(line, {
         postedDate: "2026-08-12",
         amountCents: -1234,
-        rawDescriptor: "LOWES Expense",
+        rawDescriptor: "LOWES",
         checkNumber: null,
         qbTxnId: "txn-1",
     });
@@ -67,20 +73,20 @@ test("descriptor carries the payee name — reconcile normalizes it into a payee
     // An empty normalizedPayee is the EXCEPTION case in bank-ledger and never
     // matches anything, so the name must survive into the descriptor.
     const line = mapped({ name: "HOME DEPOT #4718", qbType: "Expense" });
-    assert.ok(line.rawDescriptor.startsWith("HOME DEPOT #4718"));
+    assert.equal(line.rawDescriptor, "HOME DEPOT #4718");
 });
 
 test("internal whitespace is collapsed for hash stability", () => {
     // The daily CSV parser learned this the hard way: an unnormalized
     // descriptor turns a cosmetic spacing change into a false 409.
     const line = mapped({ name: "LOWES    #1632", qbType: "Expense" });
-    assert.equal(line.rawDescriptor, "LOWES #1632 Expense");
+    assert.equal(line.rawDescriptor, "LOWES #1632");
     assert.ok(!/ {2}/.test(line.rawDescriptor));
 });
 
 test("doc number is NOT appended (see the Drive-file-id suite below)", () => {
     const line = mapped({ docNum: "1027" });
-    assert.equal(line.rawDescriptor, "LOWES Expense");
+    assert.equal(line.rawDescriptor, "LOWES");
 });
 
 test("doc_num NEVER enters the descriptor — it holds a Drive file id here", async t => {
@@ -93,7 +99,7 @@ test("doc_num NEVER enters the descriptor — it holds a Drive file id here", as
     // never reconcile.
     await t.test("drive-file-id doc_num is absent from the descriptor", () => {
         const line = mapped({ docNum: "1sEISJBJaGRYpivooQJBR" });
-        assert.equal(line.rawDescriptor, "LOWES Expense");
+        assert.equal(line.rawDescriptor, "LOWES");
         assert.ok(!line.rawDescriptor.includes("1sEISJBJaGRYpivooQJBR"));
     });
     await t.test("and it is not mistaken for a check number", () => {
@@ -102,7 +108,7 @@ test("doc_num NEVER enters the descriptor — it holds a Drive file id here", as
     });
     await t.test("even a numeric doc_num stays out of the descriptor", () => {
         const line = mapped({ docNum: "1027" });
-        assert.equal(line.rawDescriptor, "LOWES Expense");
+        assert.equal(line.rawDescriptor, "LOWES");
     });
     await t.test("same vendor, different Drive ids → identical descriptor", () => {
         const a = mapped({ docNum: "1AAAAAAAAAAAAAAAAAAAA", qbTxnId: "6625" });
@@ -161,11 +167,11 @@ test("the posted date is passed through verbatim — no Date object, no tz shift
  * under the SAME qbTxnId.
  */
 const FIVE_ROW_FIXTURE: BankRegisterRowLike[] = [
-    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "LOWES #02516", amountCents: -12_345 },
-    { date: "2026-08-11", qbType: "Check", qbTxnId: "6610", docNum: "01027", name: "PACIFIC PLUMBING", amountCents: -250_000 },
-    { date: "2026-08-10", qbType: "Deposit", qbTxnId: "6598", docNum: null, name: "MUELLER REMODEL", amountCents: 565_760 },
-    { date: "2026-08-01", qbType: "", qbTxnId: null, docNum: null, name: null, amountCents: 0 },
-    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "LOWES #02516", amountCents: -12_345 },
+    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345 },
+    { date: "2026-08-11", qbType: "Check", qbTxnId: "6610", docNum: "01027", name: "PACIFIC PLUMBING", memo: null, amountCents: -250_000 },
+    { date: "2026-08-10", qbType: "Deposit", qbTxnId: "6598", docNum: null, name: "MUELLER REMODEL", memo: null, amountCents: 565_760 },
+    { date: "2026-08-01", qbType: "", qbTxnId: null, docNum: null, name: null, memo: null, amountCents: 0 },
+    { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345 },
 ];
 
 test("convertRegisterRows maps the fixture, skips identity-less rows, collapses split repeats", () => {
@@ -173,9 +179,10 @@ test("convertRegisterRows maps the fixture, skips identity-less rows, collapses 
     assert.equal(result.skipped, 1, "the balance/summary row carries no txn identity");
     assert.equal(result.collapsed, 1, "the repeated 6625 split is ONE observation");
     assert.deepEqual(result.lines, [
-        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 Expense", checkNumber: null, qbTxnId: "6625" },
-        { postedDate: "2026-08-11", amountCents: -250_000, rawDescriptor: "PACIFIC PLUMBING Check", checkNumber: "1027", qbTxnId: "6610" },
-        { postedDate: "2026-08-10", amountCents: 565_760, rawDescriptor: "MUELLER REMODEL Deposit", checkNumber: null, qbTxnId: "6598" },
+        // The memo wins over the name, and the type is never appended.
+        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625" },
+        { postedDate: "2026-08-11", amountCents: -250_000, rawDescriptor: "PACIFIC PLUMBING", checkNumber: "1027", qbTxnId: "6610" },
+        { postedDate: "2026-08-10", amountCents: 565_760, rawDescriptor: "MUELLER REMODEL", checkNumber: null, qbTxnId: "6598" },
     ]);
 });
 
@@ -269,11 +276,11 @@ test("runBankRegisterPull: a QBO restatement stops the run and is reported, neve
     assert.equal(summary.ok, false);
     assert.equal(summary.error, "qbo-txn-conflict");
     assert.deepEqual(summary.conflictQbTxnIds, ["6625"]);
-    assert.equal(store.stored.get("6625"), JSON.stringify(["2026-08-12", -12_345, "LOWES #02516 Expense", null]),
+    assert.equal(store.stored.get("6625"), JSON.stringify(["2026-08-12", -12_345, "LOWES #02516 POS DEB C#8516", null]),
         "the stored observation is never silently overwritten");
 });
 
-test("runBankRegisterPull: a reconcile failure never fails the pull", async () => {
+test("runBankRegisterPull: a reconcile failure FAILS the pull — unlinked observations starve the matcher", async () => {
     const store = fakeIngestStore();
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
@@ -292,9 +299,9 @@ test("runBankRegisterPull: a reconcile failure never fails the pull", async () =
 
 test("divergent repeats under one qbTxnId are a CONFLICT, never first-wins", async t => {
     const divergent: BankRegisterRowLike[] = [
-        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", amountCents: -12_345 },
-        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", amountCents: -99_999 },
-        { date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", amountCents: -500 },
+        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", memo: null, amountCents: -12_345 },
+        { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", memo: null, amountCents: -99_999 },
+        { date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", memo: null, amountCents: -500 },
     ];
 
     await t.test("neither sighting is posted — half a contradiction is still a guess", () => {

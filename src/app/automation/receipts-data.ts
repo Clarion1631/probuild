@@ -9,7 +9,7 @@
 import { prisma } from "@/lib/prisma";
 import { RECEIPT_INTAKE_LIST_SELECT } from "@/lib/receipt-intake/queries";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner } from "@/lib/receipt-requests";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
 import { missingReceiptMatchesFilters, ownerRank, type ReceiptFilters } from "./receipts-filters";
 
@@ -192,9 +192,8 @@ export function toMissingReceiptRow(issue: {
         // Mirrors decideLifecycle step 4 exactly — same test register-data.ts uses.
         acknowledged: currentCodes.length > 0 && currentCodes.every(code => acked.has(code)),
         targetKey: issue.targetKey,
-        // A human's assignment beats the derived one, always. The nightly
-        // sweep preserves ownerOverride precisely so this cannot be undone.
-        owner: str(details.ownerOverride) ?? str(details.owner) ?? "unassigned",
+        // ONE spelling of "whose is this", shared with the cron and matcher.
+        owner: effectiveOwner(details),
         ownerAssigned: str(details.ownerOverride) !== null,
         cardTail: str(details.cardTail),
         postedDate: str(details.postedDate) ?? "",
@@ -252,8 +251,7 @@ async function scanMissingReceiptIssues(owner: string | null) {
         cursor = rows[rows.length - 1].id;
         for (const row of rows) {
             if (matched.length >= RECEIPT_GROUP_TAKE) break;
-            const details = parseMissingReceiptDetails(row.displayDetails);
-            if ((typeof details.owner === "string" ? details.owner : "unassigned") === owner) matched.push(row);
+            if (effectiveOwner(parseMissingReceiptDetails(row.displayDetails)) === owner) matched.push(row);
         }
         if (rows.length < ISSUE_SCAN_PAGE) break;
     }

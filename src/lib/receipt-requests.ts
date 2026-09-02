@@ -132,6 +132,23 @@ export interface ReceiptRequestInput {
  */
 const OFFICE_RAIL = /\b(?:ACH|WIRE|CHECK|TRANSFER|DEPOSIT|ONLINE PMT|BILL PAY|EFT|DIRECT DEP|PAYROLL)\b/i;
 
+/**
+ * THE owner of a missing-receipt item: a human's assignment when there is one,
+ * otherwise the one derived from the descriptor.
+ *
+ * Three surfaces read this — the Receipts tab's filter, the nightly matcher and
+ * the cards cron — and each used to spell it its own way. When they disagreed,
+ * Marge could assign an owner, see the item move under that owner on the page,
+ * and it would still never reach their card: the cron was reading the derived
+ * value. One function, or it will drift again.
+ */
+export function effectiveOwner(details: { owner?: unknown; ownerOverride?: unknown } | null | undefined): string {
+    const override = typeof details?.ownerOverride === "string" ? details.ownerOverride.trim() : "";
+    if (override) return override;
+    const derived = typeof details?.owner === "string" ? details.owner.trim() : "";
+    return derived || "unassigned";
+}
+
 /** Owners a human may assign an unattributed charge to. */
 export const RECEIPT_OWNER_CHOICES: string[] = ["CJ", "Richard", "Justin", "office"];
 

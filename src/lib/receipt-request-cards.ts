@@ -84,6 +84,8 @@ export interface OwnerCard {
     items: CardItem[];
     /** Items not on this card. They are tomorrow's FIRST candidates. */
     overflow: number;
+    /** False when the scan stopped early, so `overflow` is a floor, not a total. */
+    overflowExact: boolean;
     text: string;
 }
 
@@ -106,21 +108,48 @@ export function requestIdFor(owner: string, date: string): string {
     return `receipt-req-${owner}-${date}`;
 }
 
-export function cardText(owner: string, date: string, items: readonly CardItem[], overflow: number): string {
+/**
+ * "3" or "3 of 14". A NUMBER is only printed when the scan reached the end of
+ * the queue and therefore knows the total; when it stopped at its page cap the
+ * total would be a guess, and a wrong number on a chase card is exactly the
+ * kind of small lie that stops people trusting the list.
+ */
+function countLabel(shown: number, overflow: number, overflowExact: boolean): string {
+    if (overflow <= 0) return String(shown);
+    return overflowExact ? `${shown} of ${shown + overflow}` : `${shown} of more`;
+}
+
+export function cardText(
+    owner: string,
+    date: string,
+    items: readonly CardItem[],
+    overflow: number,
+    overflowExact = true,
+): string {
+    // The examples name an item the card ACTUALLY HAS. A one-item card that
+    // says 'reply "sign 2"' is instructions for a message that does not exist,
+    // and the first thing a reader does is look for item 2 and lose confidence
+    // in the whole card. Item 1 always exists (a card with no items is never
+    // built); beyond that the placeholder N is honest about being a placeholder.
+    const example = items.length > 1 ? "2" : "1";
     const lines = [
-        `📸 *Receipts needed — ${owner}* (${items.length}${overflow > 0 ? ` of ${items.length + overflow}` : ""})`,
+        `📸 *Receipts needed — ${owner}* (${countLabel(items.length, overflow, overflowExact)})`,
         "",
         "Reply *in this thread*:",
         "• send a *photo* of the receipt",
-        `• reply *"2 Mueller Remodel"* to name the job for item 2`,
-        `• reply *"sign 2"* to sign a memo instead`,
+        `• reply *"${example} Mueller Remodel"* to name the job for item ${example}`,
+        `• reply *"sign ${example}"* to sign a memo instead`,
         "",
     ];
     for (const item of items) {
         const tail = item.cardTail ? ` · card …${item.cardTail}` : "";
         lines.push(`${item.n}. ${item.date} · ${item.vendor || "unnamed charge"} · $${item.amount}${tail}`);
     }
-    if (overflow > 0) lines.push("", `…and ${overflow} more — the rest come tomorrow.`);
+    if (overflow > 0) {
+        lines.push("", overflowExact
+            ? `…and ${overflow} more — the rest come tomorrow.`
+            : "…and more — the rest come tomorrow.");
+    }
     lines.push("", `_${date}_`);
     return lines.join("\n");
 }
@@ -166,8 +195,22 @@ export function selectOwnerItems(
 }
 
 /** Rebuild a card's text and request id from an already-claimed selection. */
-export function buildCardFromItems(owner: string, date: string, items: CardItem[], overflow: number): OwnerCard {
-    return { owner, requestId: requestIdFor(owner, date), date, items, overflow, text: cardText(owner, date, items, overflow) };
+export function buildCardFromItems(
+    owner: string,
+    date: string,
+    items: CardItem[],
+    overflow: number,
+    overflowExact = true,
+): OwnerCard {
+    return {
+        owner,
+        requestId: requestIdFor(owner, date),
+        date,
+        items,
+        overflow,
+        overflowExact,
+        text: cardText(owner, date, items, overflow, overflowExact),
+    };
 }
 
 /**
@@ -180,13 +223,17 @@ export function buildCardFromItems(owner: string, date: string, items: CardItem[
  * claim is now a unique (owner, pacificDate) row created in the same
  * transaction as selection; see the cron.
  */
-export function buildOwnerCards(candidates: readonly CardCandidateIssue[], now: Date = new Date()): OwnerCard[] {
+export function buildOwnerCards(
+    candidates: readonly CardCandidateIssue[],
+    now: Date = new Date(),
+    overflowExact = true,
+): OwnerCard[] {
     const date = pacificDate(now);
     const cards: OwnerCard[] = [];
     for (const owner of CARD_OWNERS_ASKED) {
         const { items, overflow } = selectOwnerItems(candidates, owner);
         if (items.length === 0) continue;
-        cards.push(buildCardFromItems(owner, date, items, overflow));
+        cards.push(buildCardFromItems(owner, date, items, overflow, overflowExact));
     }
     // Owners are two, so this can't bind today. Asserted anyway: a config
     // change that adds owners must not be able to turn one run into a flood.

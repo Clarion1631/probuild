@@ -82,15 +82,14 @@ export const BANK_REGISTER_PULL_DAYS = 7;
  */
 export function registerRowToIngestLine(row: BankRegisterRowLike): BankRegisterIngestLine | null {
     if (!row.qbTxnId) return null; // balance/summary rows carry no txn identity
-    const parts: string[] = [];
-    if (row.name && row.name.trim()) parts.push(row.name.trim());
-    // MEMO BEFORE TYPE. The bank feed usually parks the original POS descriptor
-    // here, and that is where `C#8516` lives — the only owner signal a QBO row
-    // has. `identityPayee` strips the trailing type word from both sides, so
-    // adding the memo does not break identity; dropping it lost the owner.
-    if (row.memo && row.memo.trim()) parts.push(row.memo.trim());
-    if (row.qbType && row.qbType.trim()) parts.push(row.qbType.trim());
-    const rawDescriptor = parts.join(" ").replace(/\s+/g, " ").trim();
+    // THE BANK FEED'S OWN TEXT, or QuickBooks' name when there is none. NOT a
+    // concatenation, and never the transaction type: no statement carries
+    // " Expense" on the end, so appending it gave the same transaction two
+    // identities and nothing ever reconciled. (Rows really are distinguishable
+    // without it — `qbTxnId` is the observation's identity, not the text.)
+    // The memo is also where `C#8516` lives, which is the only owner signal a
+    // QBO row has.
+    const rawDescriptor = ((row.memo ?? "").trim() || (row.name ?? "").trim()).replace(/\s+/g, " ").trim();
     if (rawDescriptor === "") return null; // nothing to normalize a payee from
     // Check number: only on check-type rows, only when doc_num is actually
     // numeric (a Drive file id is not), leading zeros stripped so "01027" and

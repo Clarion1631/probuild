@@ -304,12 +304,52 @@ export interface ReconcileResult {
     ambiguous: ReconcileAmbiguousGroup[];
 }
 
-function reconcileKey(row: { account: string; postedDate: string; amountCents: number; normalizedPayee: string; checkNumber: string | null }): string {
-    // JSON-encoded (not delimiter-joined) for the same reason versionedHash()
-    // is — an account/payee string containing "|" must never collide with a
-    // different field split across the delimiter.
+/**
+ * THE payee half of a bank-line identity.
+ *
+ * `memo` is the BANK FEED's own descriptor — the text the card network sent,
+ * "LOWES #02516 POS DEB C#8516". A statement line has it as its descriptor; a
+ * QBO register row has it in the GL memo cell. `name` is QuickBooks' cleaned-up
+ * counterparty ("Lowes"), which is a fallback, not an equal.
+ *
+ * Preferring the memo is what makes the two sources agree: QBO's `name` is
+ * normalized by Intuit and a statement's is not, so keying off `name` produced
+ * two identities for one transaction. Earlier versions also appended the
+ * TRANSACTION TYPE to the QBO side ("... Expense"), which no statement ever
+ * carries — every comparison missed, so nothing reconciled, nothing adopted,
+ * and minting produced twins. The type is not identity and never appears here.
+ */
+export function bankLineIdentityPayee(row: { memo?: string | null; name?: string | null }): string {
+    const source = (row.memo ?? "").trim() || (row.name ?? "").trim();
+    return normalizePayee(source);
+}
+
+/**
+ * THE identity of a bank transaction: account + posted date + signed amount +
+ * normalized payee + check number.
+ *
+ * One function, used by the ingest, reconcile, minting and adoption paths.
+ * Before this there were three spellings of "the same transaction" and they
+ * disagreed — a line could adopt in one place and stay unreconciled in another.
+ *
+ * JSON-encoded rather than delimiter-joined, for the same reason
+ * `versionedHash()` is: a payee containing the delimiter must never collide
+ * with a different field split across it.
+ *
+ * An EMPTY payee is not an identity (see normalizePayee) — callers must refuse
+ * to match on it rather than grouping every anonymous line together.
+ */
+export function bankLineIdentity(row: {
+    account: string;
+    postedDate: string;
+    amountCents: number;
+    checkNumber: string | null;
+    normalizedPayee: string;
+}): string {
     return JSON.stringify([row.account, row.postedDate, row.amountCents, row.normalizedPayee, row.checkNumber]);
 }
+
+const reconcileKey = bankLineIdentity;
 
 /**
  * Links not-yet-reconciled observations (bankLineId === null — in practice

@@ -4,11 +4,10 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord, effectiveOwner } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_RATE_CEILING,
-    MAX_ITEMS_PER_CARD,
     buildCardFromItems,
     isPacificWeekday,
     pacificDate,
@@ -97,7 +96,9 @@ function toCandidate(issue: {
     return {
         id: issue.id,
         targetKey: issue.targetKey,
-        owner: str(details.owner) ?? "unassigned",
+        // Same helper the page and the matcher use, so an assignment made on
+        // the tab actually reaches tomorrow's card.
+        owner: effectiveOwner(details),
         acknowledged: currentCodes.length > 0 && currentCodes.every(code => acked.has(code)),
         cardTail: str(details.cardTail),
         postedDate: str(details.postedDate) ?? "",
@@ -129,8 +130,6 @@ function toCandidate(issue: {
  */
 async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pages: number; exhausted: boolean }> {
     const candidates: CardCandidateIssue[] = [];
-    const perOwner = new Map<string, number>(CARD_OWNERS_ASKED.map(owner => [owner, 0]));
-    const neverCardedPerOwner = new Map<string, number>(CARD_OWNERS_ASKED.map(owner => [owner, 0]));
     let cursor: string | undefined;
     let pages = 0;
     let exhausted = false;
@@ -157,23 +156,15 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
             if (!CARD_OWNERS_ASKED.includes(candidate.owner as never)) continue;
             if (candidate.acknowledged) continue;
             candidates.push(candidate);
-            perOwner.set(candidate.owner, (perOwner.get(candidate.owner) ?? 0) + 1);
-            if (!candidate.everCarded) {
-                neverCardedPerOwner.set(candidate.owner, (neverCardedPerOwner.get(candidate.owner) ?? 0) + 1);
-            }
         }
         if (page.length < SCAN_PAGE_SIZE) { exhausted = true; break; }
-        // STOP CONDITION: every asked owner either has a NEVER-CARDED item in
-        // hand, or has nothing left to find. A fixed page budget was the wrong
-        // shape — with a long backlog of already-carded rows the scan could
-        // stop before reaching the one new charge that should lead the card,
-        // and the same frozen list would go out again. Selection prefers
-        // never-carded items, so the scan has to keep going until it has found
-        // one (or run out) for each owner.
-        const satisfied = CARD_OWNERS_ASKED.every(owner =>
-            (neverCardedPerOwner.get(owner) ?? 0) > 0
-            && (perOwner.get(owner) ?? 0) >= MAX_ITEMS_PER_CARD);
-        if (satisfied) break;
+        // RUNS TO EXHAUSTION. It used to stop as soon as each owner had a full
+        // card, which was enough to CHOOSE the items but not to COUNT the rest
+        // — so "and 4 more" was whatever the scan happened to have seen, which
+        // is a number that looks authoritative and isn't. The queue is small
+        // (page size 500) and this is one cheap indexed read per page; when the
+        // page cap does bite, `exhausted` stays false and the card drops the
+        // number rather than printing a guess.
     }
 
     return { candidates, pages, exhausted };
@@ -254,8 +245,15 @@ export async function GET(request: Request) {
     }
 
     const date = pacificDate(now);
+    // RETRY PASS (?retry=1, the 2-hours-later cron). It never SELECTS: it only
+    // re-posts rows an earlier run claimed and failed to deliver, so a webhook
+    // outage at 7:30 does not cost the crew their whole day.
+    const retryOnly = new URL(request.url).searchParams.get("retry") === "1";
     const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
-    const scan = await scanCandidates();
+    // The retry pass posts from the claimed snapshot, so it needs no scan.
+    const scan = retryOnly
+        ? { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true }
+        : await scanCandidates();
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
 
     for (const owner of CARD_OWNERS_ASKED) {
@@ -286,7 +284,7 @@ export async function GET(request: Request) {
 
             const items = parseItems(existing.itemsJson);
             if (items.length === 0) continue;
-            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow), rowId: existing.id, token, resumed: true });
+            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, scan.exhausted), rowId: existing.id, token, resumed: true });
             continue;
         }
 
@@ -297,6 +295,7 @@ export async function GET(request: Request) {
         // explicitly; the stale row is left as the record that the day failed.
         void yesterday;
 
+        if (retryOnly) continue; // nothing claimed today; the retry pass does not select
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
         const token = randomUUID();
@@ -314,7 +313,7 @@ export async function GET(request: Request) {
                 },
                 select: { id: true },
             });
-            toPost.push({ card: buildCardFromItems(owner, date, items, overflow), rowId: row.id, token, resumed: false });
+            toPost.push({ card: buildCardFromItems(owner, date, items, overflow, scan.exhausted), rowId: row.id, token, resumed: false });
         } catch (error) {
             if (isUniqueConstraintError(error)) continue; // the other run won the day
             throw error;
@@ -322,6 +321,10 @@ export async function GET(request: Request) {
     }
 
     const posted: Array<{ owner: string; items: number; threadName: string | null; resumed: boolean }> = [];
+    // A webhook IS configured and a delivery still failed. That is an outage,
+    // not a quiet day: a 200 here meant nobody was ever told the crew's card
+    // did not go out.
+    const failures: string[] = [];
     for (const { card, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
         // HISTORY IS WRITTEN AFTER A VALIDATED POST, and only then.
         //
@@ -333,12 +336,13 @@ export async function GET(request: Request) {
         // "there is a real thread to reply in".
         const result = await postOwnerCard(webhookUrl, card);
         if (!result) {
-            // Left UNPOSTED on purpose: a same-day retry can take the claim
-            // again once the lease expires.
+            // Left UNPOSTED on purpose, and the claim is RELEASED so the 2-hour
+            // retry pass can take it immediately rather than waiting out a lease.
             await prisma.receiptRequestCard.updateMany({
                 where: { id: rowId, claimToken: token },
                 data: { attempts: { increment: 1 }, lastError: "post-failed", claimedAt: null, claimToken: null },
             });
+            failures.push(card.owner);
             continue;
         }
         // COMPLETION IS TOKEN-FENCED: only the run that holds the claim may
@@ -359,14 +363,20 @@ export async function GET(request: Request) {
     }
 
     const summary = {
-        ok: true,
+        ok: failures.length === 0,
+        failedOwners: failures,
         date,
+        retryOnly,
         scanned: scan.candidates.length,
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
         claimed: toPost.length,
         posted,
     };
-    if (toPost.length > 0) console.log("[cron/receipt-request-cards]", JSON.stringify(summary));
-    return NextResponse.json(summary);
+    if (failures.length > 0) {
+        console.error("[cron/receipt-request-cards] delivery failed", JSON.stringify(summary));
+    } else if (toPost.length > 0) {
+        console.log("[cron/receipt-request-cards]", JSON.stringify(summary));
+    }
+    return NextResponse.json(summary, { status: summary.ok ? 200 : 500 });
 }

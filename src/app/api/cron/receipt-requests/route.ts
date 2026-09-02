@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
+import { releaseLease, takeLease } from "@/lib/cron-lease";
 import { evaluateReviewIssue, type EvaluateReviewIssueResult } from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
 import {
@@ -67,70 +68,6 @@ const RUN_LEASE_MS = 15 * 60_000;
 /** Where the lease and the resume cursor live (AutomationSetting is a KV table). */
 const LEASE_KEY = "receiptRequestsRunLease";
 const CURSOR_KEY = "receiptRequestsCursor";
-
-/**
- * Take a DURABLE run lease.
- *
- * The old `pg_try_advisory_xact_lock` claim committed immediately, releasing
- * the lock BEFORE any reconciliation ran — so it never excluded anything, and
- * two overlapping sweeps could apply contradictory snapshots (a stale open
- * winning after a newer close). A transaction-scoped lock cannot cover this
- * work either: the pass takes minutes of Gemini-free but query-heavy work, and
- * holding one transaction open that long on a pgbouncer pool is exactly what
- * the pooler cannot afford.
- *
- * So the lease is a ROW with a token and an expiry, taken in one short
- * transaction and released at the end. The insert/CAS is atomic; the work
- * happens outside it. A run that cannot take the lease does nothing.
- */
-async function takeRunLease(now: Date): Promise<string | null> {
-    const token = randomUUID();
-    const expiresAt = new Date(now.getTime() + RUN_LEASE_MS);
-    const payload = JSON.stringify({ token, expiresAt: expiresAt.toISOString() });
-
-    try {
-        return await prisma.$transaction(async tx => {
-            // The advisory lock is still taken — but only to serialize the
-            // CLAIM itself, which is all a transaction-scoped lock can honestly
-            // do. The lease is what covers the run.
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${CLAIM_LOCK_KEY}, 0))`;
-
-            const existing = await tx.automationSetting.findUnique({ where: { key: LEASE_KEY } });
-            if (existing) {
-                let held = false;
-                try {
-                    const parsed = JSON.parse(existing.value) as { expiresAt?: string };
-                    held = typeof parsed.expiresAt === "string" && new Date(parsed.expiresAt) > now;
-                } catch {
-                    // A corrupt lease is not a held lease; take it.
-                }
-                if (held) return null;
-                await tx.automationSetting.update({ where: { key: LEASE_KEY }, data: { value: payload } });
-                return token;
-            }
-            await tx.automationSetting.create({ data: { key: LEASE_KEY, value: payload } });
-            return token;
-        });
-    } catch (error) {
-        // Fail CLOSED: if the lease cannot be established, do not sweep.
-        console.error("[cron/receipt-requests] lease failed", error instanceof Error ? error.message : "UnknownError");
-        return null;
-    }
-}
-
-/** Release only if we still hold it — a run that overran must not free someone else's lease. */
-async function releaseRunLease(token: string): Promise<void> {
-    try {
-        const existing = await prisma.automationSetting.findUnique({ where: { key: LEASE_KEY } });
-        if (!existing) return;
-        const parsed = JSON.parse(existing.value) as { token?: string };
-        if (parsed.token !== token) return;
-        await prisma.automationSetting.update({ where: { key: LEASE_KEY }, data: { value: JSON.stringify({ token: null, expiresAt: new Date(0).toISOString() }) } });
-    } catch {
-        // The lease expires on its own; a failed release costs at most one
-        // skipped run.
-    }
-}
 
 /** The resume cursor: the last BankLine id this sweep finished, oldest-first. */
 async function readCursor(): Promise<string | null> {
@@ -321,14 +258,14 @@ export async function GET(request: Request) {
     const now = new Date();
     // A DURABLE lease, held for the whole reconciliation. The old advisory
     // claim released before any work began and excluded nothing.
-    const leaseToken = await takeRunLease(now);
-    if (!leaseToken) {
-        return NextResponse.json({ ok: true, skipped: "locked" });
+    const leaseToken = randomUUID();
+    if (!(await takeLease(LEASE_KEY, RUN_LEASE_MS, now, leaseToken))) {
+        return NextResponse.json({ ok: true, skipped: "already-running" });
     }
     try {
         return await runSweep(now);
     } finally {
-        await releaseRunLease(leaseToken);
+        await releaseLease(LEASE_KEY, leaseToken);
     }
 }
 
@@ -403,8 +340,34 @@ async function runSweep(now: Date) {
         }),
     ]);
 
-    // De-duplicate: an in-window line that also has an open issue appears twice.
-    const bankLineRows = [...new Map([...windowLines, ...openIssueLineRows].map(row => [row.id, row])).values()];
+    // THE COMPLETE COHORT, not just this page.
+    //
+    // Paging split competing lines across runs: a receipt allocated to a line
+    // on page 1 was invisible on page 2, so the same receipt satisfied a second
+    // charge and that charge's chase was closed for good. Allocation is a
+    // property of every line sharing an identity, so the page is EXPANDED to
+    // include its cohort — same amount, within twice the match window — before
+    // the matcher ever runs. Extra lines are harmless: each still gets its own
+    // correct verdict, and re-emitting an unchanged one is a lifecycle touch.
+    const cohortFilters = windowLines.map(row => competingLineFilter({
+        amountCents: row.amountCents,
+        postedDate: row.postedDate.toISOString().slice(0, 10),
+    }));
+    const cohortRows = cohortFilters.length === 0 ? [] : await prisma.bankLine.findMany({
+        where: {
+            OR: cohortFilters.map(f => ({
+                amountCents: f.amountCents,
+                postedDate: { gte: new Date(`${f.from}T00:00:00Z`), lte: new Date(`${f.to}T00:00:00Z`) },
+            })),
+        },
+        select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+    });
+
+    // De-duplicate: a line can arrive from the page, its cohort, and the
+    // open-issue set all at once.
+    const bankLineRows = [...new Map(
+        [...windowLines, ...cohortRows, ...openIssueLineRows].map(row => [row.id, row]),
+    ).values()];
 
     const plan = planReceiptRequests({
         bankLines: bankLineRows.map(row => ({

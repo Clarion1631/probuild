@@ -257,3 +257,33 @@ test("ReceiptRequestCard carries RLS in both DDL paths and the blind-spot snapsh
         "check-migrations-match compares against this snapshot",
     );
 });
+
+test("a configured webhook that fails to deliver FAILS the run", () => {
+    // A 200 here meant nobody was ever told the crew's card did not go out.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(source, /failures\.push\(card\.owner\);/);
+    assert.match(source, /ok: failures\.length === 0/);
+    assert.match(source, /status: summary\.ok \? 200 : 500/);
+    // The row is left UNPOSTED with its claim released, so the retry pass can
+    // take it straight away rather than waiting out a lease.
+    assert.match(source, /lastError: "post-failed", claimedAt: null, claimToken: null/);
+});
+
+test("the retry pass re-posts unposted rows and never selects new work", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(source, /const retryOnly = new URL\(request\.url\)\.searchParams\.get\("retry"\) === "1";/);
+    assert.match(source, /if \(retryOnly\) continue; \/\/ nothing claimed today/);
+    // It needs no scan at all — it posts from the claimed snapshot.
+    assert.match(source, /retryOnly\s*\n\s*\? \{ candidates: \[\] as CardCandidateIssue\[\]/);
+});
+
+test("the retry pass is scheduled two hours after the morning card", () => {
+    const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
+        crons: Array<{ path: string; schedule: string }>;
+    };
+    const first = vercel.crons.find(c => c.path === "/api/cron/receipt-request-cards");
+    const retry = vercel.crons.find(c => c.path === "/api/cron/receipt-request-cards?retry=1");
+    assert.ok(first && retry, "both passes must be scheduled");
+    assert.equal(first.schedule, "30 14 * * 1-5");
+    assert.equal(retry.schedule, "30 16 * * 1-5", "two hours later, weekdays only");
+});
