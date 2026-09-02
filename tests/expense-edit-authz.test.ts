@@ -213,9 +213,14 @@ test("PATCH reaches a QBO-managed row — the population the report is made of",
 
 test("PATCH touches NOTHING but the three ProBuild-only columns", async () => {
     await patch({ installedAtCustomer: true });
-    // `needsTaxReview` rides along because answering IS clearing the flag —
-    // still nothing outside the ProBuild-only set.
-    assert.deepEqual(Object.keys(updateArgs?.data ?? {}), ["installedAtCustomer", "needsTaxReview"]);
+    // `needsTaxReview` and `taxSource` ride along because answering IS
+    // clearing the flag and recording who answered — still nothing outside the
+    // ProBuild-only set.
+    assert.deepEqual(
+        Object.keys(updateArgs?.data ?? {}),
+        ["installedAtCustomer", "needsTaxReview", "taxSource"],
+    );
+    assert.equal(updateArgs?.data.taxSource, "manual", "a person answered, and booking must not undo it");
     // A caller sending a QBO-synced field is told, not silently ignored.
     const res = await patch({ amount: "1.00" });
     assert.equal(res.status, 400);
@@ -415,7 +420,7 @@ test("PUT rejects EVERY tax-return field, by name", async () => {
     // believe a deduction was recorded that never was.
     for (const field of [
         "taxAmount", "taxAtSource", "needsTaxReview",
-        "installedAtCustomer", "taxDeductibleBase",
+        "installedAtCustomer", "taxDeductibleBase", "taxSource",
     ]) {
         const res = await call({ [field]: field === "taxAtSource" ? true : 1 });
         assert.equal(res.status, 400, field);

@@ -27,6 +27,10 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,3
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30);
 -- Set when a re-sync invalidated a human tax classification (see the sync).
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false;
+-- WHO decided the tax fields: "ocr" or "manual". A manual decision includes
+-- "there is no tax here", which is a NULL taxAmount and so cannot be told from
+-- "nobody has looked" without this column. Booking never overwrites "manual".
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT;
 
 -- A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
 --
@@ -43,9 +47,9 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL
 --
 -- Every statement is independently re-runnable: IF NOT EXISTS, a
 -- predicate-bound UPDATE, and two ALTERs that are no-ops once applied.
-ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3);
-UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL;
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) DEFAULT now();
 ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET DEFAULT now();
+UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", now()) WHERE "updatedAt" IS NULL;
 ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");

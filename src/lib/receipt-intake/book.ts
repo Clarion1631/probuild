@@ -655,19 +655,36 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // A retry after a crash between the Purchase and this commit finds
             // its own Expense here (qbPurchaseId is @unique) — create it twice
             // and the insert would fail on that constraint anyway.
-            const existing = await tx.expense.findUnique({
+            // LOCK FIRST, THEN READ (Codex round 13, item 4).
+            //
+            // The id is all that is needed to take the lock, and taking it
+            // before the read that every decision below is made from is the
+            // difference between "the row cannot move while I decide" and "the
+            // row could have moved between my read and my lock". The second
+            // read happens inside the lock, so it sees the winner of any race
+            // against the tax PATCH or the QBO sync rather than a value from
+            // before it.
+            const found = await tx.expense.findUnique({
                 where: { qbPurchaseId: result.qbPurchaseId },
-                select: {
-                    id: true,
-                    projectId: true,
-                    costCodeId: true,
-                    costCodeSource: true,
-                    taxAmount: true,
-                    taxAtSource: true,
-                    installedAtCustomer: true,
-                    estimate: { select: { projectId: true } },
-                },
+                select: { id: true },
             });
+            if (found) await lockExpense(tx as any, found.id);
+            const existing = found
+                ? await tx.expense.findUnique({
+                    where: { id: found.id },
+                    select: {
+                        id: true,
+                        projectId: true,
+                        costCodeId: true,
+                        costCodeSource: true,
+                        taxAmount: true,
+                        taxAtSource: true,
+                        taxSource: true,
+                        installedAtCustomer: true,
+                        estimate: { select: { projectId: true } },
+                    },
+                })
+                : null;
 
             // AN ALREADY-BOOKED PURCHASE STILL NEEDS ITS PHASE 3 FIELDS.
             //
@@ -683,12 +700,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // already answered (true OR false) is a tax answer nobody but a
             // bookkeeper may change.
             if (existing) {
-                // The shared per-expense lock, so this fill is ORDERED against
-                // the tax PATCH and the QBO sync instead of racing them. The
-                // guarded predicates below stay: the lock orders the writers
-                // that take it, the predicate protects against one that does not.
-                await lockExpense(tx as any, existing.id);
-
+                // The lock taken above orders this fill against the tax PATCH
+                // and the QBO sync. The guarded predicates below stay anyway:
+                // the lock orders the writers that take it, the predicate
+                // protects against one that does not.
                 const existingProjectId = existing.projectId ?? existing.estimate?.projectId ?? null;
                 // ATTRIBUTION CONFLICT. The Purchase is already on a different
                 // job than this intake row claims. Filling fields would be
@@ -756,8 +771,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             id: existing.id,
                             projectId: expectedProjectId ?? row.projectId,
                             taxAmount: null,
+                            // A NULL taxAmount is NOT proof that nobody has
+                            // decided. A bookkeeper who looked at the receipt
+                            // and concluded there is no tax on it leaves
+                            // exactly that shape, and an OCR re-read would then
+                            // overwrite their answer with a number they had
+                            // already rejected. `taxSource` is what tells the
+                            // two apart. The explicit NULL branch is required:
+                            // SQL `<> 'manual'` is NULL for a NULL column, so a
+                            // bare not-equals would drop every legacy row.
+                            OR: [{ taxSource: null }, { taxSource: { not: "manual" } }],
                         },
-                        data: { taxAmount: taxApplied / 100, taxAtSource: true },
+                        data: {
+                            taxAmount: taxApplied / 100,
+                            taxAtSource: true,
+                            taxSource: "ocr",
+                        },
                     });
                 }
                 if (row.installedAtCustomer !== null) {
@@ -766,9 +795,36 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             id: existing.id,
                             projectId: expectedProjectId ?? row.projectId,
                             installedAtCustomer: null,
+                            // Same reason as the tax fill: a bookkeeper's
+                            // classification is not something a capture may
+                            // revisit, and a NULL column needs the explicit
+                            // branch.
+                            OR: [{ taxSource: null }, { taxSource: { not: "manual" } }],
                         },
                         data: { installedAtCustomer: row.installedAtCustomer },
                     });
+                }
+
+                // VERIFY THE ATTRIBUTION THAT WAS ACTUALLY WRITTEN.
+                //
+                // Every predicate above is guarded, so any one of them can
+                // legitimately match zero rows (a human answered first). What
+                // must NOT happen is marking this intake row BOOKED against an
+                // Expense that ended up on a DIFFERENT job than the row claims:
+                // that is the same money-moved-between-jobs failure the
+                // pre-fill conflict check exists to prevent, reached instead
+                // through a re-attribution that commits while this runs.
+                //
+                // So the final state is re-read and compared with the intent. A
+                // mismatch throws, which rolls the fills back with it, and the
+                // row is parked for a person.
+                if (row.projectId) {
+                    const after = await tx.expense.findUnique({
+                        where: { id: existing.id },
+                        select: { projectId: true, estimate: { select: { projectId: true } } },
+                    });
+                    const finalProjectId = after?.projectId ?? after?.estimate?.projectId ?? null;
+                    if (finalProjectId !== row.projectId) throw new AttributionConflictError();
                 }
             }
 
@@ -807,6 +863,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // carries a qbPurchaseId.
                     taxAmount: taxApplied > 0 ? taxApplied / 100 : null,
                     taxAtSource: taxApplied > 0,
+                    // Provenance for the tax columns. "ocr" is a re-readable
+                    // guess; "manual" (written by the tax PATCH) is a person's
+                    // answer, and this pipeline never writes over one. Null
+                    // when there was no tax to record, which leaves a later
+                    // bookkeeper free to answer without arguing with a machine.
+                    taxSource: taxApplied > 0 ? "ocr" : null,
                     installedAtCustomer: row.installedAtCustomer,
                     amount: amountCents / 100,
                     vendor: row.vendor || "Unknown",
@@ -918,6 +980,16 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // A lost CAS is not a fault: the successor owns this row and will book
         // it. Say so rather than spending an attempt on it.
         if (error instanceof StaleClaimError) return { outcome: "stale" };
+        // The Expense is on a different job than this row claims. A send WAS
+        // attempted, so the strong key stays claimed and the Purchase is not
+        // re-sent; a person decides which job is right.
+        if (error instanceof AttributionConflictError) {
+            return {
+                outcome: "needs-review",
+                reason: "attribution-conflict",
+                releaseStrongKey: false,
+            };
+        }
         // The Purchase EXISTS at this point. Retrying is correct and safe: the
         // DocNumber lookup will find it and return alreadyExists:true — and the
         // key must be RETAINED, which is why this attempt's send flag is passed
@@ -941,6 +1013,19 @@ function describe(error: unknown): string {
     if (error instanceof QBTimeoutError) return "QBTimeoutError";
     if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 400);
     return "UnknownError";
+}
+
+/**
+ * Thrown inside the commit transaction when the Expense ended up attributed to
+ * a different job than the intake row claims. Throwing rather than returning is
+ * deliberate: it rolls the guarded fills back with it, so the row is never left
+ * half-filled against a job it does not belong to.
+ */
+class AttributionConflictError extends Error {
+    constructor() {
+        super("the expense moved to another job while booking");
+        this.name = "AttributionConflictError";
+    }
 }
 
 /** Thrown inside the commit transaction when the claim token no longer matches. */

@@ -657,6 +657,12 @@ model Expense {
   /// total", which is only reached once installedAtCustomer is an explicit
   /// true. Set by a bookkeeper on the expense edit route.
   taxDeductibleBase   Decimal?
+  /// Who decided the tax fields on this row: "ocr" (read off the receipt by
+  /// the intake pipeline) or "manual" (a bookkeeper, through PATCH on the
+  /// expense route). Booking never overwrites a "manual" decision - including
+  /// the decision that there is NO tax, which is a null taxAmount and so
+  /// cannot be told from "nobody has looked" without this column.
+  taxSource           String?
   /// A re-sync changed the gross out from under a tax classification a human
   /// had made, so the tax fields were cleared and this row needs a person to
   /// look at it again. Additive and default-false; the tax report ignores it

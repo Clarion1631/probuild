@@ -189,6 +189,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             "needsTaxReview",
             "installedAtCustomer",
             "taxDeductibleBase",
+            // Provenance for the four above. Accepting it here would let a
+            // caller stamp "manual" on a row nobody answered, which is the one
+            // value booking treats as untouchable.
+            "taxSource",
         ];
         for (const field of TAX_FIELDS_OWNED_BY_PATCH) {
             if (Object.prototype.hasOwnProperty.call(body, field)) {
@@ -547,7 +551,17 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 // leave a window where the report sees an answered row it still
                 // refuses to count.
                 ...(editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource
-                    ? { needsTaxReview: false }
+                    ? {
+                        needsTaxReview: false,
+                        // WHO decided. Everything the intake pipeline writes is
+                        // "ocr" and re-readable; this is a person, and booking
+                        // must not write over it. It matters most in the case
+                        // that leaves no other trace: a bookkeeper deciding
+                        // there is NO tax on a receipt leaves a null taxAmount,
+                        // which without this column cannot be told from
+                        // "nobody has looked yet".
+                        taxSource: "manual",
+                    }
                     : {}),
                 ...(editsCostCode
                     ? {

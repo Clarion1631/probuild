@@ -87,20 +87,33 @@ export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30)`,
     // Set when a re-sync invalidated a human tax classification.
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false`,
+    // WHO decided the tax fields: "ocr" or "manual". A manual decision
+    // includes "there is no tax here", which is a NULL taxAmount and so cannot
+    // be told from "nobody has looked" without this column. Booking never
+    // overwrites "manual".
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT`,
 
-    // A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
+    // A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2;
+    // ordering fixed in round 13, item 6).
     //
-    // Nullable, backfill, DEFAULT, NOT NULL — and the DEFAULT is what makes the
-    // pre-deploy window survivable. This script runs BEFORE the build that
-    // knows about the column, so the OLD app is still inserting Expenses
-    // without it; NOT NULL with no default would fail every receipt, manual
-    // entry and QBO-sync insert until the deploy landed. Prisma declares the
-    // same default, so the migration check still sees them agree.
+    // THE DEFAULT ARRIVES WITH THE COLUMN, IN THE SAME STATEMENT.
     //
-    // Each step is independently re-runnable.
-    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3)`,
-    `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL`,
+    // The previous order added the column bare, backfilled, and only THEN set
+    // the default. That left a window in which the column existed, was
+    // nullable, and had no default — and this script runs against production
+    // BEFORE the build that knows about the column, so the OLD app is inserting
+    // Expenses through that window with no value for it. Every such row lands
+    // NULL after the backfill has already passed, and `SET NOT NULL` then
+    // aborts. Adding the column WITH the default means no insert can ever
+    // produce a NULL, so the last step cannot lose that race.
+    //
+    // The three statements after it are REPAIR for a database left in the old
+    // half-applied shape (column present, no default, NULLs from that window),
+    // and no-ops on a clean run. The whole array runs in one transaction, so a
+    // failure anywhere leaves the table exactly as it was.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) DEFAULT now()`,
     `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET DEFAULT now()`,
+    `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", now()) WHERE "updatedAt" IS NULL`,
     `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
 
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
@@ -202,7 +215,7 @@ export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
         "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
-        "updatedAt",
+        "taxSource", "updatedAt",
     ],
 };
 
@@ -286,14 +299,27 @@ async function main() {
         const companyTimeZone = settings?.timeZone || DEFAULT_COMPANY_TIME_ZONE;
         console.log(`company time zone for the date re-anchor: ${companyTimeZone}`);
 
-        for (const sql of [...statements, reanchorSql(companyTimeZone)]) {
-            const label = sql.replace(/\s+/g, " ").slice(0, 84);
-            process.stdout.write(`  ${label} ... `);
-            const affected = await prisma.$executeRawUnsafe(sql);
-            // Print the row count for the backfill: a SECOND run reporting 0 is
-            // the whole idempotency proof, and a silent "ok" would hide it.
-            console.log(sql.trimStart().startsWith("UPDATE") ? `ok (${affected} rows)` : "ok");
-        }
+        // ONE TRANSACTION FOR THE WHOLE THING (Codex round 13, item 6).
+        //
+        // Postgres is transactional for DDL, so there is no reason for this to
+        // be able to stop half-way: a network blip between the backfill and
+        // `SET NOT NULL` used to leave production with a column the next run
+        // had to repair, and one wrong statement used to leave every statement
+        // before it applied. Either the whole shape lands or none of it does.
+        //
+        // The timeout is generous because a backfill over the Expense table on
+        // a cold connection is not a five-second operation, and the default
+        // would roll the whole thing back for being slow.
+        await prisma.$transaction(async tx => {
+            for (const sql of [...statements, reanchorSql(companyTimeZone)]) {
+                const label = sql.replace(/\s+/g, " ").slice(0, 84);
+                process.stdout.write(`  ${label} ... `);
+                const affected = await tx.$executeRawUnsafe(sql);
+                // Print the row count for the backfill: a SECOND run reporting
+                // 0 is the whole idempotency proof, and a silent "ok" hides it.
+                console.log(sql.trimStart().startsWith("UPDATE") ? `ok (${affected} rows)` : "ok");
+            }
+        }, { timeout: 300_000, maxWait: 60_000 });
 
         // Verify shape rather than trusting the run.
         for (const [table, columns] of Object.entries(expectedColumns)) {

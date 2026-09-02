@@ -206,37 +206,67 @@ test("the tax-vs-gross CHECK is in both DDL paths and in the verifier", () => {
 
 // ── updatedAt must survive the PRE-DEPLOY window (round 10, item 1) ────────
 
-test("updatedAt is added nullable, backfilled, defaulted, THEN made NOT NULL", () => {
-    // Order is the whole point. The script runs against production BEFORE the
-    // build that knows about the column, so the OLD app is still inserting
-    // Expenses without it — NOT NULL with no default would fail every receipt,
-    // manual entry and QBO-sync insert until the deploy landed.
+test("updatedAt is added WITH its default, then repaired, THEN made NOT NULL", () => {
+    // Order is the whole point, and round 13 moved it. The script runs against
+    // production BEFORE the build that knows about the column, so the OLD app
+    // is still inserting Expenses without it. If the column arrives bare, every
+    // one of those inserts lands NULL — including ones that land AFTER the
+    // backfill has run — and `SET NOT NULL` then aborts. Arriving with the
+    // default means no insert can produce a NULL at all.
     const sql = (statements as string[]).filter(s => s.includes('"updatedAt"'));
-    assert.equal(sql.length, 4, "add, backfill, default, not-null");
-    assert.match(sql[0], /ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP\(3\)$/);
-    assert.ok(!/NOT NULL/.test(sql[0]), "it must land NULLABLE or the backfill cannot run");
-    assert.match(sql[1], /^UPDATE [\s\S]*SET "updatedAt" = COALESCE\("createdAt"/);
-    assert.match(sql[2], /SET DEFAULT now\(\)/);
+    assert.equal(sql.length, 4, "add-with-default, repair default, repair nulls, not-null");
+    assert.match(sql[0], /ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP\(3\) DEFAULT now\(\)$/);
+    assert.ok(!/NOT NULL/.test(sql[0]), "still nullable, so a repair backfill can run");
+    // Repair for a database left in the OLD half-applied shape: column present
+    // with no default, and NULLs from the window that shape allowed.
+    assert.match(sql[1], /ALTER COLUMN "updatedAt" SET DEFAULT now\(\)/);
+    assert.match(sql[2], /^UPDATE [\s\S]*SET "updatedAt" = COALESCE\("createdAt"/);
     assert.match(sql[3], /SET NOT NULL/);
-    // The default must be in place BEFORE NOT NULL, or an insert racing the two
-    // statements still fails.
-    assert.ok(
-        (statements as string[]).indexOf(sql[2]) < (statements as string[]).indexOf(sql[3]),
-        "DEFAULT has to precede NOT NULL",
-    );
+    // Both repairs must precede NOT NULL, or the old-shape database still fails.
+    const idx = (needle: string) => (statements as string[]).indexOf(needle);
+    assert.ok(idx(sql[1]) < idx(sql[3]) && idx(sql[2]) < idx(sql[3]), "repair before NOT NULL");
 });
 
 test("every updatedAt statement is re-runnable, and matches the migration", () => {
     const sql = (statements as string[]).filter(s => s.includes('"updatedAt"'));
-    // IF NOT EXISTS; a predicate-bound UPDATE; two idempotent ALTERs.
+    // IF NOT EXISTS; two idempotent ALTERs; a predicate-bound UPDATE.
     assert.match(sql[0], /IF NOT EXISTS/);
-    assert.match(sql[1], /WHERE "updatedAt" IS NULL/);
+    assert.match(sql[2], /WHERE "updatedAt" IS NULL/);
     for (const statement of sql) {
         assert.ok(
             normalizedMigration.includes(normalize(statement).replace(/;$/, "")),
-            `migration.sql is missing:\n  ${statement}`,
+            `migration.sql is missing:
+  ${statement}`,
         );
     }
+});
+
+test("the DDL runs inside ONE transaction", () => {
+    // A blip between the backfill and SET NOT NULL used to leave production
+    // half-migrated. Postgres is transactional for DDL; there is no reason to
+    // allow a partial apply.
+    const script = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    const run = script.slice(script.indexOf("for (const sql of [...statements"));
+    assert.match(script, /await prisma\.\$transaction\(async tx =>/);
+    assert.match(run, /await tx\.\$executeRawUnsafe\(sql\)/, "inside the transaction, not outside it");
+    assert.ok(
+        script.indexOf("$transaction(async tx =>") < script.indexOf("for (const sql of [...statements"),
+        "the loop is INSIDE the transaction",
+    );
+});
+
+test("taxSource is declared everywhere the other tax columns are", () => {
+    // Codex round 13, item 5. A column that exists only in the migration is a
+    // P2022 on production; one that exists only in the script is a fresh CI
+    // database that cannot reproduce prod.
+    assert.ok((statements as string[]).some(s => /ADD COLUMN IF NOT EXISTS "taxSource" TEXT/.test(s)));
+    assert.match(migrationSql, /ADD COLUMN IF NOT EXISTS "taxSource" TEXT/);
+    assert.ok(expectedColumns.Expense.includes("taxSource"), "and it is verified after the run");
+    const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+    assert.match(schema, /taxSource\s+String\?/);
 });
 
 test("Prisma declares the same default, so the migration check sees them agree", () => {

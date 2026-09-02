@@ -155,13 +155,24 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
                         return { count: 0 };
                     }
                 }
+                // OR branches, evaluated with SQL's NULL rules: `NOT IN` and
+                // `<> x` are both NULL (i.e. NOT a match) for a NULL column,
+                // which is exactly why every guard here carries an explicit
+                // `{ column: null }` branch. Modelling that is the only way a
+                // test can catch a guard that silently drops legacy rows.
                 if (Array.isArray(args.where.OR)) {
-                    const src = cur.costCodeSource ?? null;
-                    const ok = args.where.OR.some((b: any) =>
-                        b.costCodeSource === null
-                            ? src === null
-                            : src !== null && !(b.costCodeSource?.notIn ?? []).includes(src));
-                    if (!ok) return { count: 0 };
+                    const branchMatches = (branch: any) =>
+                        Object.entries(branch).every(([key, want]: [string, any]) => {
+                            const have = cur[key] ?? null;
+                            if (want && typeof want === "object" && "notIn" in want) {
+                                return have !== null && !want.notIn.includes(have);
+                            }
+                            if (want && typeof want === "object" && "not" in want) {
+                                return have !== null && have !== want.not;
+                            }
+                            return (want ?? null) === have;
+                        });
+                    if (!args.where.OR.some(branchMatches)) return { count: 0 };
                 }
                 if (state.existingExpense) Object.assign(state.existingExpense, args.data);
                 return { count: 1 };
@@ -579,7 +590,11 @@ test("alreadyExists books identically — the lost-response retry", async () => 
 
 test("an existing Expense for the same Purchase is reused, never duplicated", async () => {
     const r = recorder();
-    (r.deps.db as any).expense.findUnique = async () => ({ id: "exp-existing" });
+    // The row resolves to the job this receipt claims (through its estimate),
+    // which is what the post-fill attribution check re-reads.
+    (r.deps.db as any).expense.findUnique = async () => ({
+        id: "exp-existing", estimate: { projectId: "proj-1" },
+    });
     const result = await bookReceipt(row(), r.deps);
     assert.equal((result as any).expenseId, "exp-existing");
     assert.equal(r.expenses.length, 0, "no second Expense row");
@@ -1114,8 +1129,15 @@ test("a PATCH landing between the read and the fill is not overrun", async () =>
         estimate: { projectId: null },
     };
     const seenByBooking = { ...rec.existingExpense };
+    let reads = 0;
     (rec.deps.db as any).expense.findUnique = async () => {
-        // Hand booking the PRE-patch snapshot, then let the PATCH land.
+        reads += 1;
+        // Read 1 is the id lookup that the lock is taken on. Read 2 is the one
+        // every decision is made from — hand it the PRE-patch snapshot, and let
+        // the PATCH land in the same breath. Later reads (the post-fill
+        // attribution check) see the row as it really is.
+        if (reads === 1) return { id: "expense-1" };
+        if (reads > 2) return rec.existingExpense;
         rec.existingExpense = {
             ...rec.existingExpense,
             costCodeId: "cc-human",
@@ -1149,4 +1171,112 @@ test("a Purchase already on ANOTHER job parks instead of booking", async () => {
         assert.equal(result.reason, "attribution-conflict");
         assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
     }
+});
+
+// ── tax provenance and the post-fill attribution check (round 13, 4 and 5) ──
+
+test("a bookkeeper's NO-TAX decision is not overwritten by an OCR re-read", async () => {
+    // The case a null taxAmount cannot express on its own: a person looked at
+    // this receipt, concluded there is no sales tax on it, and left the column
+    // NULL. Without `taxSource` that is indistinguishable from "nobody has
+    // looked", and the next booking writes an OCR figure over their answer.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: "manual",
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(rec.existingExpense.taxAmount, null, "their answer stands");
+    assert.equal(rec.existingExpense.taxSource, "manual");
+    assert.equal(
+        rec.existingExpense.installedAtCustomer, null,
+        "and the capture does not answer the excise question for them either",
+    );
+});
+
+test("a legacy row with no provenance IS filled, and stamped ocr", async () => {
+    // The control for the test above: `taxSource` NULL is "nobody has looked",
+    // and SQL's `<> 'manual'` would drop exactly these rows without the
+    // explicit NULL branch in the guard.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    await bookReceipt(row(), rec.deps);
+    assert.ok(Number(rec.existingExpense.taxAmount) > 0, "the validated tax lands");
+    assert.equal(rec.existingExpense.taxSource, "ocr");
+    assert.equal(rec.existingExpense.taxAtSource, true);
+});
+
+test("a newly created Expense records where its tax came from", async () => {
+    const rec = recorder();
+    await bookReceipt(row(), rec.deps);
+    assert.equal(rec.expenses[0].taxSource, "ocr");
+    assert.ok(rec.expenses[0].taxAmount > 0);
+});
+
+test("no tax means no provenance, so a bookkeeper can still answer", async () => {
+    const rec = recorder();
+    await bookReceipt(row({ taxCents: 0 }), rec.deps);
+    assert.equal(rec.expenses[0].taxAmount, null);
+    assert.equal(rec.expenses[0].taxSource, null, "nobody has decided anything yet");
+});
+
+test("an Expense re-attributed DURING the fill parks instead of booking", async () => {
+    // The pre-fill conflict check passed, the guarded fills ran, and a
+    // re-attribution committed underneath. Marking the intake row BOOKED here
+    // would tie this receipt to an Expense on somebody else's job.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: null, costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        installedAtCustomer: null, estimate: { projectId: null },
+    };
+    let reads = 0;
+    (rec.deps.db as any).expense.findUnique = async () => {
+        reads += 1;
+        if (reads === 1) return { id: "expense-1" };
+        if (reads === 2) return rec.existingExpense;
+        // The post-fill re-read: somebody moved it.
+        return { projectId: "another-job", estimate: { projectId: "another-job" } };
+    };
+    const result = await bookReceipt(row(), rec.deps);
+    assert.equal(result.outcome, "needs-review");
+    if (result.outcome === "needs-review") {
+        assert.equal(result.reason, "attribution-conflict");
+        assert.equal(result.releaseStrongKey, false, "the Purchase exists — keep the key");
+    }
+    // Nothing was marked BOOKED: the throw rolled the whole transaction back.
+    assert.equal(
+        rec.intakeUpdates.filter((u: any) => u.state === "BOOKED").length, 0,
+        "no booking on a row that ended up on another job",
+    );
+});
+
+test("the per-expense lock is taken BEFORE the read the fill decides from", async () => {
+    // Reading first and locking second leaves the decision resting on a value
+    // from before the lock, which is the race the lock exists to close.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    const trace: string[] = [];
+    const realFind = (rec.deps.db as any).expense.findUnique;
+    (rec.deps.db as any).expense.findUnique = async (args: any) => {
+        trace.push("read");
+        return realFind(args);
+    };
+    (rec.deps.db as any).$queryRawUnsafe = async () => {
+        trace.push("lock");
+        return [{ lock_result: null }];
+    };
+    await bookReceipt(row(), rec.deps);
+    // read (the id lookup) -> lock -> read (everything the fill decides from)
+    assert.deepEqual(trace.slice(0, 3), ["read", "lock", "read"]);
 });
