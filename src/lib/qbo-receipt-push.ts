@@ -42,6 +42,20 @@ import {
 // it too); re-exported here because this module's callers already import it.
 export { QboRetryableError, isRetryableQboError, isRetryableQboStatus };
 
+/**
+ * Statuses where retrying the ATTACHMENT upload is worthwhile.
+ *
+ * Wider than isRetryableQboStatus on purpose: 408 (request timeout) and 401
+ * (expired access token, repaired by a refresh) used to be banked as a terminal
+ * `failed:<status>` on an ok:true response, which stops the Apps Script
+ * resending and leaves a freshly created Purchase without its receipt forever.
+ * A 4xx that means "QBO will never accept this file" (400/403/404/413/415)
+ * stays terminal - retrying that is a loop, not a repair.
+ */
+export function isTransientAttachmentStatus(status: number): boolean {
+    return status === 401 || status === 408 || isRetryableQboStatus(status);
+}
+
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
 export class QboVendorDuplicateError extends Error {
     constructor(name: string) {
@@ -320,6 +334,11 @@ export async function defaultUploadAttachment(
     tokens: QBTokens,
     purchaseId: string,
     file: { base64: string; contentType: string; fileName: string },
+    /** Injectable for tests; defaults to the real token refresh. */
+    refreshTokens: () => Promise<QBTokens> = async () => {
+        const { getFreshQBTokens } = await import("./quickbooks-payments");
+        return getFreshQBTokens();
+    },
 ): Promise<ReceiptAttachmentStatus> {
     const safeFileName = attachmentFileName(file.fileName);
     const fileBytes = Buffer.from(file.base64, "base64");
@@ -346,19 +365,31 @@ export async function defaultUploadAttachment(
         Buffer.from(`${CRLF}--${boundary}--${CRLF}`),
     ]);
 
-    const res = await qbTimedFetch(`${QB_API_BASE}/${tokens.realmId}/upload?minorversion=73`, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${tokens.accessToken}`,
-            Accept: "application/json",
-            "Content-Type": `multipart/form-data; boundary=${boundary}`,
-        },
-        body,
-    });
+    const post = (active: QBTokens) =>
+        qbTimedFetch(`${QB_API_BASE}/${active.realmId}/upload?minorversion=73`, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${active.accessToken}`,
+                Accept: "application/json",
+                "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            },
+            body,
+        });
+
+    let res = await post(tokens);
+    // A 401 here usually just means the access token aged out mid-push. One
+    // forced refresh repairs it in place; without this the receipt waited for a
+    // whole extra bot pass (or, before transient statuses were retryable at
+    // all, was abandoned entirely).
+    if (res.status === 401) {
+        const refreshed = await refreshTokens().catch(() => null);
+        if (refreshed) res = await post(refreshed);
+    }
     if (!res.ok) {
-        // 429/5xx: QBO is busy or broken, not refusing this file. Raise so the
-        // push is retried rather than banked as a terminal "failed:503".
-        if (isRetryableQboStatus(res.status)) {
+        // Busy, timed out, or still unauthorized: QBO is not refusing this
+        // file, so raise and let the push be retried rather than banking a
+        // terminal "failed:503" next to ok:true.
+        if (isTransientAttachmentStatus(res.status)) {
             throw new QboRetryableError(`QB attachment upload failed with status ${res.status}`, res.status);
         }
         return `failed:${res.status}`;

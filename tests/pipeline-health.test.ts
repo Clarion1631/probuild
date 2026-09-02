@@ -356,3 +356,26 @@ test("only a CRON-sourced run counts as the heartbeat", async () => {
     assert.equal(PAYMENTS_SYNC_CRON_SOURCE, "cron");
     assert.equal(PAYMENTS_SYNC_STALE_HOURS, 26);
 });
+
+
+// --- Lost-response recovery must be able to advance the clock ---
+
+test("a recovery that actually uploaded the file counts as a booking", async () => {
+    const { BOOKED_PUSH_STATUSES, RECOVERED_BOOKING_DETAIL } = await import("../src/lib/pipeline-health");
+
+    // A plain re-push still must not reset the clock...
+    assert.deepEqual(BOOKED_PUSH_STATUSES, ["created"]);
+
+    // ...but when the FIRST attempt's response was lost after QBO committed
+    // the Purchase, no "created" event exists at all and the recovery pass is
+    // the only record of that booking. It is recognised by having genuinely
+    // uploaded the attachment.
+    assert.equal(RECOVERED_BOOKING_DETAIL, '"attachment":"attached"');
+
+    const detailOf = (attachment: string) => JSON.stringify({ fileId: "f1", qbPurchaseId: "99", attachment });
+    assert.ok(detailOf("attached").includes(RECOVERED_BOOKING_DETAIL));
+    // The ordinary retries must NOT match: they attached nothing new.
+    assert.equal(detailOf("already-attached").includes(RECOVERED_BOOKING_DETAIL), false);
+    assert.equal(detailOf("skipped").includes(RECOVERED_BOOKING_DETAIL), false);
+    assert.equal(detailOf("failed:400").includes(RECOVERED_BOOKING_DETAIL), false);
+});

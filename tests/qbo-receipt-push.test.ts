@@ -1131,3 +1131,79 @@ test("429/5xx uploads are retryable; other 4xx stay terminal", async () => {
         assert.equal(await upload(jsonResponse(status, {})), `failed:${status}`);
     }
 });
+
+
+// --- Transient upload statuses ---
+
+test("408 and 401 are transient for attachments; hard 4xx stay terminal", async () => {
+    const { isTransientAttachmentStatus } = await import("../src/lib/qbo-receipt-push");
+    for (const status of [401, 408, 429, 500, 503]) {
+        assert.equal(isTransientAttachmentStatus(status), true, String(status));
+    }
+    for (const status of [400, 403, 404, 413, 415]) {
+        assert.equal(isTransientAttachmentStatus(status), false, String(status));
+    }
+});
+
+test("a 401 upload forces ONE token refresh and retries in place", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const seen: string[] = [];
+    let refreshes = 0;
+    const impl = (async (_url: string, init: RequestInit) => {
+        const auth = String((init.headers as Record<string, string>).Authorization);
+        seen.push(auth);
+        return auth.includes("fresh-token")
+            ? jsonResponse(200, { AttachableResponse: [{ Attachable: { Id: "att-9" } }] })
+            : new Response("{}", { status: 401 });
+    }) as unknown as typeof fetch;
+
+    const result = await withFetch(impl, () =>
+        defaultUploadAttachment(TOKENS, "99", uploadFile, async () => {
+            refreshes++;
+            return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+        }),
+    );
+
+    assert.equal(result, "attached");
+    assert.equal(refreshes, 1, "exactly one forced refresh");
+    assert.equal(seen.length, 2, "original attempt plus one retry");
+});
+
+test("a 401 that survives the refresh is retryable, not terminal", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    let refreshes = 0;
+    const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+
+    await assert.rejects(
+        () => withFetch(impl, () =>
+            defaultUploadAttachment(TOKENS, "99", uploadFile, async () => {
+                refreshes++;
+                return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
+            }),
+        ),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+    assert.equal(refreshes, 1, "must not retry the refresh in a loop");
+});
+
+test("a failing refresh does not crash the upload; the 401 becomes retryable", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
+    await assert.rejects(
+        () => withFetch(impl, () =>
+            defaultUploadAttachment(TOKENS, "99", uploadFile, async () => {
+                throw new Error("not connected");
+            }),
+        ),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+});
+
+test("a 408 upload is retryable rather than a terminal failed:408", async () => {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    const impl = (async () => new Response("{}", { status: 408 })) as unknown as typeof fetch;
+    await assert.rejects(
+        () => withFetch(impl, () => defaultUploadAttachment(TOKENS, "99", uploadFile, async () => TOKENS)),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+});

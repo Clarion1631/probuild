@@ -36,6 +36,18 @@ import {
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
 
+/**
+ * Intuit rotated the refresh token but we could not store the replacement.
+ * Distinct from a refresh failure: the OLD token is already spent, so there is
+ * no safe fallback and the connection needs human attention.
+ */
+export class QBTokenPersistenceError extends Error {
+    name = "QBTokenPersistenceError";
+    constructor() {
+        super("QuickBooks token was rotated but could not be saved; reconnect QuickBooks");
+    }
+}
+
 export class QBNotConnectedError extends Error {
     constructor() {
         super("QuickBooks is not connected (Settings → Integrations → QuickBooks)");
@@ -83,15 +95,35 @@ export async function refreshTokensOrFallBack(
     refresh: typeof refreshQBToken = refreshQBToken,
     save: typeof saveQBSettings = saveQBSettings,
 ): Promise<QBTokens> {
+    let fresh: { accessToken: string; refreshToken: string };
     try {
-        const fresh = await refresh(qb.refreshToken);
-        await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
-        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
+        fresh = await refresh(qb.refreshToken);
     } catch (error) {
         if (isQBTimeoutError(error)) throw error;
-        // Refresh can fail transiently; the old access token may still be valid.
+        // Refresh itself failed and Intuit rotated nothing, so the old access
+        // token may still be valid. This is the ONLY branch that may fall back.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
+
+    // A SAVE failure is a different animal and must never share the catch
+    // above. By this point Intuit has already rotated: the old refresh token is
+    // spent, so returning the stale pair would report a healthy connection
+    // while quietly stranding the integration until someone reconnects by hand.
+    // Retry once (a transient DB blip is the common case), then surface it.
+    try {
+        await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+    } catch (first) {
+        try {
+            await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+        } catch {
+            console.error(
+                "QBO token rotated but could NOT be persisted — reconnect QuickBooks if the next refresh fails",
+                first instanceof Error ? first.name : "UnknownError",
+            );
+            throw new QBTokenPersistenceError();
+        }
+    }
+    return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
 }
 
 /**
@@ -985,8 +1017,27 @@ export function classifyPreflightFailure(error: unknown): { reason: string; abor
     if (error instanceof QBNotConnectedError || (error instanceof Error && error.name === "QBNotConnectedError")) {
         return { reason: "quickbooks-not-connected", abortedOnQboOutage: false };
     }
+    if (error instanceof QBTokenPersistenceError || (error instanceof Error && error.name === "QBTokenPersistenceError")) {
+        return { reason: "token-not-persisted", abortedOnQboOutage: false };
+    }
     // Settings-store read failures, a rejected refresh, anything else.
     return { reason: "token-fetch-failed", abortedOnQboOutage: false };
+}
+
+/**
+ * The audit status for a finished run.
+ *
+ * "ok" is reserved for a run that actually completed ALL its work. A run that
+ * skipped rows or hit row-level errors did NOT verify those milestones, so
+ * calling it "ok" refreshed the health heartbeat on the strength of work that
+ * never happened — the digest would read green while payments went unchecked.
+ * Those runs are "partial": visible and heartbeat-ineligible, but not counted
+ * as hard errors, so one stubborn row does not read like a QBO outage.
+ */
+export function paymentsSyncRunStatus(result: QBPaymentSyncResult): "ok" | "partial" | "error" {
+    if (result.runFailed) return "error";
+    if (result.skipped > 0 || result.errors.length > 0) return "partial";
+    return "ok";
 }
 
 /** The AutomationEvent kind the payments cron writes once per run. */
@@ -1006,16 +1057,18 @@ async function recordPaymentsSyncEvent(
     result: QBPaymentSyncResult,
     source: SyncQuickBooksPaymentsOptions["source"],
 ): Promise<void> {
+    const status = paymentsSyncRunStatus(result);
     await logAutomationEvent({
         kind: QBO_PAYMENTS_SYNC_EVENT_KIND,
-        status: result.runFailed ? "error" : "ok",
-        reason: result.failureReason,
+        status,
+        reason: result.failureReason ?? (status === "partial" ? "incomplete-run" : undefined),
         // Only a real cron run may claim to be the heartbeat. An on-view or
         // manual refresh is recorded under its own source (or none) so it can
         // never mask an hourly job that has stopped running.
         source,
         detail: {
             runFailed: result.runFailed,
+            errorCount: result.errors.length,
             checked: result.checked,
             settled: result.settled,
             partiallyPaid: result.partiallyPaid,

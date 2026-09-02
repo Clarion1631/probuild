@@ -250,3 +250,97 @@ test("EVERY preflight failure marks the run failed, not just timeouts", () => {
         { reason: "token-fetch-failed", abortedOnQboOutage: false },
     );
 });
+
+
+// --- A run that skipped work is never "ok" ---
+
+test("run status: ok only when the run actually finished all its work", async () => {
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+
+    assert.equal(paymentsSyncRunStatus(emptyResult()), "ok");
+
+    // Codex gate: these two used to record "ok" and refresh the health
+    // heartbeat on the strength of milestones that were never checked.
+    assert.equal(paymentsSyncRunStatus({ ...emptyResult(), skipped: 3 }), "partial");
+    assert.equal(paymentsSyncRunStatus({ ...emptyResult(), errors: ["INV-1/Deposit: boom"] }), "partial");
+
+    assert.equal(paymentsSyncRunStatus({ ...emptyResult(), runFailed: true }), "error");
+    // A hard failure outranks a partial one.
+    assert.equal(
+        paymentsSyncRunStatus({ ...emptyResult(), runFailed: true, skipped: 9, errors: ["x"] }),
+        "error",
+    );
+});
+
+test("an aborted outage run reports error, not partial", async () => {
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    const result = emptyResult();
+    const { client } = fakeQbo({
+        probe: () => ({ state: "error", status: 0, connectionFailed: true, timedOut: true }),
+    });
+    await runQboRowLoop(rows(10), result, rowHandler(client, result), () => {}, "milestones");
+    assert.equal(paymentsSyncRunStatus(result), "error");
+});
+
+// --- Token rotation vs. persistence ---
+
+const STALE_QB = { accessToken: "stale-access", refreshToken: "stale-refresh", realmId: "realm-1" };
+
+test("a SAVE failure after a successful rotation is surfaced, never swallowed", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    // Codex gate: refresh and save shared one catch, so a rotation Intuit had
+    // already committed could fall back to the now-spent stale pair and report
+    // a healthy connection while the integration was stranded.
+    let saves = 0;
+    const error = await refreshTokensOrFallBack(
+        STALE_QB,
+        async () => ({ accessToken: "new-access", refreshToken: "new-refresh" }),
+        async () => {
+            saves++;
+            throw new Error("DB write failed");
+        },
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, "QBTokenPersistenceError");
+    assert.equal(saves, 2, "one retry before giving up");
+});
+
+test("a transient save blip is retried once and then succeeds", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    let saves = 0;
+    const tokens = await refreshTokensOrFallBack(
+        STALE_QB,
+        async () => ({ accessToken: "new-access", refreshToken: "new-refresh" }),
+        async () => {
+            saves++;
+            if (saves === 1) throw new Error("deadlock");
+        },
+    );
+    assert.deepEqual(tokens, { accessToken: "new-access", refreshToken: "new-refresh", realmId: "realm-1" });
+    assert.equal(saves, 2);
+});
+
+test("a REFRESH failure still falls back to the old access token (unchanged)", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    let saves = 0;
+    const tokens = await refreshTokensOrFallBack(
+        STALE_QB,
+        async () => {
+            throw new Error("500 from Intuit");
+        },
+        async () => {
+            saves++;
+        },
+    );
+    assert.deepEqual(tokens, STALE_QB);
+    assert.equal(saves, 0, "nothing was rotated, so nothing is saved");
+});
+
+test("a token-persistence failure marks the run failed with its own reason", async () => {
+    const { classifyPreflightFailure, QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+    assert.deepEqual(
+        classifyPreflightFailure(new QBTokenPersistenceError()),
+        { reason: "token-not-persisted", abortedOnQboOutage: false },
+    );
+});

@@ -110,15 +110,23 @@ export async function fetchIntuitStatus(): Promise<IntuitProbe> {
 }
 
 /**
- * "Last receipt booked" counts CREATES only.
+ * What counts as "a receipt got booked" for the freshness clock.
  *
- * "already-exists" is an idempotent re-push of a receipt that was created
- * earlier — often much earlier — so counting it here refreshed the freshness
- * clock without any new receipt entering the books, and a bot stuck retrying
- * one old file would have kept the pipeline looking alive indefinitely.
- * "fallback"/"error" are attempts, not bookings.
+ * A plain "already-exists" must NOT count: it is an idempotent re-push of a
+ * receipt created earlier, often much earlier, so counting it would let a bot
+ * stuck retrying one old file keep the pipeline looking alive indefinitely.
+ *
+ * But there is one real exception. When the FIRST attempt's response was lost
+ * after QBO committed the Purchase, no "created" event exists at all — the
+ * recovery pass is the only record of that booking, and it logs
+ * "already-exists". Counting it only when it actually UPLOADED the attachment
+ * (`attachment: "attached"`, which only happens once per receipt, on the pass
+ * that repaired it) captures exactly those recoveries without letting ordinary
+ * old retries — which report "already-attached" or "skipped" — reset the clock.
  */
 export const BOOKED_PUSH_STATUSES = ["created"];
+/** Marker for the recovery pass that genuinely stored the file. */
+export const RECOVERED_BOOKING_DETAIL = '"attachment":"attached"';
 
 /** The payments cron's per-run audit row (see quickbooks-payments.ts). */
 export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
@@ -268,7 +276,16 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             async () =>
                 (
                     await prisma.automationEvent.findFirst({
-                        where: { kind: "receipt-push", status: { in: BOOKED_PUSH_STATUSES } },
+                        where: {
+                            kind: "receipt-push",
+                            OR: [
+                                { status: { in: BOOKED_PUSH_STATUSES } },
+                                {
+                                    status: "already-exists",
+                                    detail: { contains: RECOVERED_BOOKING_DETAIL },
+                                },
+                            ],
+                        },
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     })

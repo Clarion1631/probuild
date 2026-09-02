@@ -97,3 +97,39 @@ test("test/CI is NOT a bypass", () => {
         assert.equal(isCronAuthorized(request()), false);
     });
 });
+
+
+// --- The payments cron route was the last fail-open caller ---
+
+test("the payments cron rejects an unauthenticated request outside development", async () => {
+    const previousEnv = process.env.NODE_ENV;
+    const previousVercel = process.env.VERCEL_ENV;
+    const previousSecret = process.env.CRON_SECRET;
+    (process.env as Record<string, string>).NODE_ENV = "production";
+    delete process.env.VERCEL_ENV; // the exact hole: no VERCEL_ENV used to mean "no check"
+    process.env.CRON_SECRET = "s3cret";
+    try {
+        const { GET } = await import("../src/app/api/cron/quickbooks-payments/route");
+        const call = (headers?: Record<string, string>) =>
+            GET(new Request("https://probuild.test/api/cron/quickbooks-payments", { headers }));
+
+        assert.equal((await call()).status, 401, "no header");
+        assert.equal((await call({ authorization: "Bearer wrong" })).status, 401, "wrong secret");
+        assert.equal((await call({ authorization: "Bearer" })).status, 401, "malformed header");
+        assert.equal((await call({ authorization: "Bearer undefined" })).status, 401, "literal undefined");
+    } finally {
+        if (previousEnv === undefined) delete (process.env as Record<string, string>).NODE_ENV;
+        else (process.env as Record<string, string>).NODE_ENV = previousEnv;
+        if (previousVercel === undefined) delete process.env.VERCEL_ENV;
+        else process.env.VERCEL_ENV = previousVercel;
+        if (previousSecret === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = previousSecret;
+    }
+});
+
+test("a missing CRON_SECRET cannot be satisfied by 'Bearer undefined'", () => {
+    withEnv({ CRON_SECRET: undefined, NODE_ENV: "production" }, () => {
+        assert.equal(isCronAuthorized(request("Bearer undefined")), false);
+        assert.equal(isCronAuthorized(request("Bearer ")), false);
+    });
+});
