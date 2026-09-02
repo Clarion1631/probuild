@@ -938,7 +938,7 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     const fresh = createDeps({ uploadAttachment: async () => timeout() });
     await assert.rejects(
         () => createQBReceiptPurchase(TOKENS, input, fresh.deps),
-        (error: unknown) => error instanceof QBTimeoutError,
+        (error: unknown) => (error as Error)?.name === "QBTimeoutError",
     );
 
     const existing = createDeps({
@@ -948,7 +948,7 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     });
     await assert.rejects(
         () => createQBReceiptPurchase(TOKENS, input, existing.deps),
-        (error: unknown) => error instanceof QBTimeoutError,
+        (error: unknown) => (error as Error)?.name === "QBTimeoutError",
     );
 });
 

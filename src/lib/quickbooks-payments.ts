@@ -19,7 +19,7 @@ import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
     type QBTokens,
     refreshQBToken,
-    QBTimeoutError,
+    isQBTimeoutError,
     ensureQBCustomer,
     ensureQBServiceItem,
     createQBMilestoneInvoice,
@@ -84,7 +84,7 @@ export async function refreshTokensOrFallBack(
         await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
         return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
     } catch (error) {
-        if (error instanceof QBTimeoutError) throw error;
+        if (isQBTimeoutError(error)) throw error;
         // Refresh can fail transiently; the old access token may still be valid.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }

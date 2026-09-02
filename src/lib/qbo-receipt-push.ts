@@ -30,7 +30,7 @@ import {
     QB_API_BASE,
     qbTimedFetch,
     parseJsonOrNull,
-    QBTimeoutError,
+    isQBTimeoutError,
     type QBTokens,
     type QBAttachable,
 } from "./quickbooks";
@@ -417,7 +417,7 @@ async function ensureAttachmentOnExistingPurchase(
     } catch (error) {
         // A timeout must NOT become a terminal "failed:..." on an ok:true
         // response — see the create path below for why.
-        if (error instanceof QBTimeoutError) throw error;
+        if (isQBTimeoutError(error)) throw error;
         return `failed:${error instanceof Error ? error.name : "error"}`;
     }
 }
@@ -732,7 +732,7 @@ export async function createQBReceiptPurchase(
             // it out gives the route a 503, the bot retries, and the next pass
             // finds the Purchase and attaches the file. Non-timeout failures
             // keep the old best-effort behaviour — they are not retryable.
-            if (error instanceof QBTimeoutError) throw error;
+            if (isQBTimeoutError(error)) throw error;
             attachment = `failed:${error instanceof Error ? error.name : "error"}`;
         }
     }

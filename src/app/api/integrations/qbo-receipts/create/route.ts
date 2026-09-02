@@ -9,7 +9,7 @@ import {
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
 } from "@/lib/qbo-receipt-push";
-import { QBTimeoutError, type QBTokens } from "@/lib/quickbooks";
+import { isQBTimeoutError, type QBTokens } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
 // Stays at 60. A single push does a lot of SERIAL QBO work on a healthy day —
@@ -212,7 +212,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "quickbooks-not-connected" }));
                     return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
                 }
-                if (error instanceof QBTimeoutError) {
+                if (isQBTimeoutError(error)) {
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
                     return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
                 }
@@ -249,7 +249,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 await logEvent(event);
                 return NextResponse.json(result);
             } catch (error) {
-                if (error instanceof QBTimeoutError) {
+                if (isQBTimeoutError(error)) {
                     // QBO is unreachable, not saying no — 503 so the Apps
                     // Script retries on its next pass instead of falling back
                     // to the email path. Safe to retry even if the create did

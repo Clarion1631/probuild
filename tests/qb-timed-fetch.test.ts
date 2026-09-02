@@ -13,7 +13,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { qbTimedFetch, QBTimeoutError, parseJsonOrNull } from "../src/lib/quickbooks";
+import { qbTimedFetch, QBTimeoutError, isQBTimeoutError, parseJsonOrNull } from "../src/lib/quickbooks";
 
 let server: Server;
 let base: string;
@@ -321,4 +321,27 @@ test("parseJsonOrNull RETHROWS a body-read timeout instead of reporting an empty
     const res = await qbTimedFetch(`${base}/v3/company/stall-body`, {}, 150);
     const error = await parseJsonOrNull(res).then(() => null, (e: unknown) => e as Error);
     assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
+});
+
+
+// ─── Cross-module identity ──────────────────────────────────────────────────
+
+test("isQBTimeoutError recognises a timeout from a DUPLICATE copy of this module", () => {
+    // CI (Node 20) proved this: a CJS/ESM interop split loaded quickbooks.ts
+    // twice, so `instanceof` was false across the boundary and every timeout
+    // branch quietly took the non-timeout path. Bundler chunk duplication does
+    // the same thing in production. Match the name too.
+    class ForeignQBTimeoutError extends Error {
+        name = "QBTimeoutError";
+    }
+    assert.equal(isQBTimeoutError(new ForeignQBTimeoutError("from another copy")), true);
+    assert.equal(isQBTimeoutError(new QBTimeoutError("native")), true);
+});
+
+test("isQBTimeoutError does not over-match", () => {
+    assert.equal(isQBTimeoutError(new Error("AbortError")), false);
+    assert.equal(isQBTimeoutError(Object.assign(new Error("x"), { name: "AbortError" })), false);
+    assert.equal(isQBTimeoutError(null), false);
+    assert.equal(isQBTimeoutError("QBTimeoutError"), false);
+    assert.equal(isQBTimeoutError({ name: "QBTimeoutError" }), false);
 });

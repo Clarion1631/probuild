@@ -32,6 +32,24 @@ export class QBTimeoutError extends Error {
     name = "QBTimeoutError";
 }
 
+/**
+ * Identity check for a QB timeout that does NOT depend on `instanceof`.
+ *
+ * A bare `instanceof` compares class IDENTITY, so it silently returns false
+ * whenever this module ends up loaded twice — different bundler chunks, a
+ * CJS/ESM interop split (CI on Node 20 proved this one), a duplicated copy in
+ * node_modules. The consequence is not cosmetic: every timeout branch in this
+ * codebase would quietly take the non-timeout path, which is precisely the
+ * misclassification the whole deadline effort exists to prevent. The name is
+ * set as a class field on every instance, so match on that too.
+ */
+export function isQBTimeoutError(error: unknown): error is QBTimeoutError {
+    return (
+        error instanceof QBTimeoutError ||
+        (error instanceof Error && error.name === "QBTimeoutError")
+    );
+}
+
 const QB_DEFAULT_TIMEOUT_MS = 20_000;
 
 /** Path only — never the query string (it can carry the realm/query) or a token. */
@@ -329,7 +347,7 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
         const data = await res.json();
         return { accessToken: data.access_token, refreshToken: data.refresh_token };
     } catch (error) {
-        if (error instanceof QBTimeoutError) {
+        if (isQBTimeoutError(error)) {
             const message =
                 "QBO token refresh timed out; the stored refresh token may be stale, reconnect QuickBooks if the next refresh fails";
             console.error(message, error.message);
@@ -400,7 +418,7 @@ export async function parseJsonOrNull<T = any>(res: Response): Promise<T | null>
     try {
         return (await res.json()) as T;
     } catch (error) {
-        if (error instanceof QBTimeoutError) throw error;
+        if (isQBTimeoutError(error)) throw error;
         return null;
     }
 }
