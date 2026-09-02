@@ -73,6 +73,23 @@ const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?
 // accept that tradeoff because they genuinely have anonymous actions, these don't.
 const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
 
+// The receipt-intake machine endpoints are route handlers that define no Server
+// Actions, and their ONLY gate is an in-handler `x-receipt-intake-secret` check.
+// That check never runs for an action dispatch: Next's action IDs are global, so
+// a `next-action` POST on a bypassed path invokes SOMEONE ELSE'S action and
+// never reaches this route's code at all. The stale-cookie guard above does not
+// cover it either — a machine caller carries no session cookie, so it takes the
+// anonymous path straight into the bypass.
+//
+// Same reasoning as LEGAL_PAGE_PATTERN, and the same conclusion: bypassing the
+// proxy is never allowed to also mean bypassing the Server Action boundary. The
+// portal/api routes above accept that tradeoff because they genuinely have
+// anonymous actions; these do not.
+//
+// Exact match, mirroring the bypass entries themselves — a descendant that is
+// NOT bypassed still hits withAuth and needs no special case here.
+const MACHINE_ENDPOINT_PATTERN = /^\/api\/receipts\/intake(?:\/[^/]+\/archived)?\/?$/;
+
 // Test-only action dispatchers that get the proxy bypass below. Explicit, not a
 // prefix match: the proxy checks only the environment gates, never the route's
 // `x-e2e-secret`, so a prefix would silently extend that bypass to any future
@@ -164,6 +181,12 @@ export default async function proxy(req: any, event: any) {
 
     // Legal pages are readable by anyone but are not an action endpoint.
     if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
+        return new NextResponse("Forbidden", { status: 403 });
+    }
+
+    // Neither are the machine endpoints, whose only gate lives in the handler
+    // that an action dispatch never reaches.
+    if (isServerAction && typeof pathname === "string" && MACHINE_ENDPOINT_PATTERN.test(pathname)) {
         return new NextResponse("Forbidden", { status: 403 });
     }
 

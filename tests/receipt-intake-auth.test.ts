@@ -92,3 +92,58 @@ test("the stored mime is decided on the BYTES, not the caller's header", async (
     assert.equal(sniffMime(Buffer.from("MZ\x90\x00"), "application/pdf"), null);
     assert.equal(sniffMime(Buffer.alloc(0), "text/plain"), null);
 });
+
+test("a Next-Action dispatch on a bypassed intake path is 403, not waved through", async () => {
+    // Phase 2's Codex review: the bypass returned NextResponse.next() for ANY
+    // request, including one carrying a `next-action` header. Next's action IDs
+    // are global, so such a POST invokes SOMEONE ELSE'S action and never reaches
+    // this route's code — meaning the in-handler x-receipt-intake-secret check,
+    // which is the only gate these paths have, never runs. A machine caller
+    // carries no session cookie, so the stale-cookie guard does not cover it
+    // either. Bypassing the proxy must never also bypass the action boundary.
+    const { default: proxy } = await loadProxy();
+    const { NextRequest } = await import("next/server");
+    const event = { waitUntil() {} } as any;
+    // The proxy short-circuits to next() in development, so the real path is
+    // only reachable with NODE_ENV=production.
+    // NODE_ENV is typed read-only; the proxy reads it at call time, so a cast
+    // is the only way to exercise the non-development branch here.
+    const env = process.env as Record<string, string | undefined>;
+    const prod = env.NODE_ENV;
+    env.NODE_ENV = "production";
+
+    try {
+        for (const path of [
+            "/api/receipts/intake",
+            "/api/receipts/intake/",
+            "/api/receipts/intake/abc123/archived",
+        ]) {
+            const res = await proxy(
+                new NextRequest(`https://probuild.test${path}`, {
+                    method: "POST",
+                    headers: { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+                }),
+                event,
+            );
+            assert.ok(res, `${path} produced no response`);
+            assert.equal(res.status, 403, `${path} must refuse an action dispatch`);
+            // NextResponse.next() carries x-middleware-next: 1. Anything else
+            // means the proxy kept control, which is the point.
+            assert.equal(res.headers.get("x-middleware-next"), null, path);
+        }
+
+        // A NORMAL request on the same paths still gets the bypass, so the
+        // machine callers this route exists for are unaffected.
+        const normal = await proxy(
+            new NextRequest("https://probuild.test/api/receipts/intake", {
+                method: "POST",
+                headers: { "x-receipt-intake-secret": "whatever" },
+            }),
+            event,
+        );
+        assert.ok(normal, "the normal request produced no response");
+        assert.equal(normal.headers.get("x-middleware-next"), "1", "the bypass still works without next-action");
+    } finally {
+        env.NODE_ENV = prod;
+    }
+});
