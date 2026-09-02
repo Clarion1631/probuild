@@ -137,7 +137,7 @@ jobs:
           echo "::error::Production is missing tables/columns/enum values this PR's Prisma schema expects. Run this PR's scripts/apply-*.mjs against prod first (see .claude/skills/deploy-probuild/SKILL.md), then re-run this job."
 
       - name: On other failure
-        if: failure() && steps.drift.outputs.exit_code != '2'
+        if: failure() && steps.drift.outcome == 'failure' && steps.drift.outputs.exit_code != '2'
         run: |
           echo "::error::Schema drift check failed for a reason other than drift — see the 'Check for schema drift against production' step's output above for the checker's own error message."
 
