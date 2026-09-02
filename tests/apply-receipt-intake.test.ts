@@ -97,9 +97,40 @@ test("every statement is idempotent — the script is safe to re-run", () => {
     }
 });
 
-test("the target guard needs BOTH the database name and the host", () => {
+test("the target guard needs BOTH the database name and the host, EXACTLY", () => {
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "10.0.0.5"), true);
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.9" }, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches({ db: "staging", host: "10.0.0.5" }, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches(null, "postgres", "10.0.0.5"), false);
+
+    // A substring match (which apply-bank-image.mjs uses) gets LOOSER the
+    // shorter the operator's input is: "1" would satisfy `host.includes`
+    // against 10.0.0.5, 172.16.1.1 and almost anything else. A guard whose
+    // whole job is to stop DDL landing on the wrong server must not have a
+    // degenerate case.
+    assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "1"), false);
+    assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "10.0.0.55"), false);
+    assert.equal(targetMatches({ db: "postgres", host: "" }, "postgres", "10.0.0.5"), false);
+});
+
+test("the partial-index verification checks UNIQUE and the exact predicate", () => {
+    // Existence alone is not enough: a NON-unique index of the same name claims
+    // nothing, so every duplicate would sail through while the script reported
+    // success.
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-intake.mjs"), "utf8");
+    assert.match(source, /CREATE UNIQUE INDEX/, "the verifier asserts uniqueness");
+    assert.match(source, /indpred IS NOT NULL/, "the verifier asserts the index is PARTIAL");
+    assert.ok(
+        source.includes(`WHERE \\(\\("dedupStrongKey" IS NOT NULL\\) AND \\(state <> ALL \\(ARRAY\\['DUPLICATE'::text, 'VOID'::text\\]\\)\\)\\)`),
+        "the verifier asserts the exact predicate, not merely that one exists",
+    );
+});
+
+test("the state CHECK guard is scoped to the ReceiptIntake table", () => {
+    // pg_constraint names are not globally unique — conname alone would let an
+    // identically-named constraint on ANOTHER table satisfy the guard, and the
+    // CHECK would silently never be created.
+    const check = statements.find((s: string) => s.includes("ReceiptIntake_state_check"));
+    assert.match(check!, /conrelid = '"ReceiptIntake"'::regclass/);
+    assert.match(migrationSql, /conrelid = '"ReceiptIntake"'::regclass/);
 });

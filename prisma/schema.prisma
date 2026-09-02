@@ -3068,6 +3068,11 @@ model ReceiptIntake {
   expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
   archiveDriveFileId String?
   attempts           Int       @default(0)
+  /// Consecutive passes where the AI service was UNAVAILABLE (never the
+  /// document's fault, so it must not spend `attempts`). Ported from v3.4:
+  /// an outage that never ends still has to end somewhere, so after 20 the
+  /// row is parked for a human instead of retrying forever.
+  busyPasses         Int       @default(0)
   lastError          String?
   nextRetryAt        DateTime?
   bookedAt           DateTime?

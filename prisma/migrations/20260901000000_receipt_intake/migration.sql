@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "expenseId" TEXT,
     "archiveDriveFileId" TEXT,
     "attempts" INTEGER NOT NULL DEFAULT 0,
+    "busyPasses" INTEGER NOT NULL DEFAULT 0,
     "lastError" TEXT,
     "nextRetryAt" TIMESTAMP(3),
     "bookedAt" TIMESTAMP(3),
@@ -65,7 +66,11 @@ CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("cre
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ReceiptIntake_state_check') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_state_check'
+          AND conrelid = '"ReceiptIntake"'::regclass
+    ) THEN
         ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
             CHECK ("state" IN ('RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                                'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));

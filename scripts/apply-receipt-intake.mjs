@@ -51,18 +51,21 @@ function readFlagValue(flag) {
 }
 
 /**
- * Pure comparison, exported for unit testing without a live DB (mirrors
- * apply-bank-image.mjs). Compares BOTH database name and server host.
+ * Pure comparison, exported for unit testing without a live DB. Compares BOTH
+ * database name and server host, and both EXACTLY.
+ *
+ * apply-bank-image.mjs accepts a substring match on the host "because a pooled
+ * Supabase host resolves to an IP". That is a guard which gets LOOSER the
+ * shorter the operator's input is: `--expect-host 1` satisfies `host.includes`
+ * against 10.0.0.5, 172.16.1.1, and almost anything else. A guard whose whole
+ * job is to stop DDL landing on the wrong server must not have a degenerate
+ * case, so this one is exact. Print `host(inet_server_addr())` (the script logs
+ * it before refusing) and pass that value.
  */
 export function targetMatches(actual, expectDb, expectHost) {
     if (!actual || typeof actual !== "object") return false;
     if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
-    const host = String(actual.host ?? "");
-    const wanted = String(expectHost ?? "");
-    if (host === wanted) return true;
-    // A pooled Supabase host resolves to an IP; accept either the literal
-    // host string or an address that the operator typed instead.
-    return host !== "" && wanted !== "" && (host.includes(wanted) || wanted.includes(host));
+    return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
 /** The closed set of states the CHECK constraint allows. Exported for tests. */
@@ -105,6 +108,7 @@ export const statements = [
        "expenseId"           TEXT,
        "archiveDriveFileId"  TEXT,
        "attempts"            INTEGER NOT NULL DEFAULT 0,
+       "busyPasses"          INTEGER NOT NULL DEFAULT 0,
        "lastError"           TEXT,
        "nextRetryAt"         TIMESTAMP(3),
        "bookedAt"            TIMESTAMP(3),
@@ -146,7 +150,9 @@ export const statements = [
     // state is a closed set — a typo must fail loudly rather than create a
     // silent eleventh state that no query ever selects.
     `DO $$ BEGIN
-       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ReceiptIntake_state_check') THEN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'ReceiptIntake_state_check'
+                         AND conrelid = '"ReceiptIntake"'::regclass) THEN
          ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
            CHECK ("state" IN ('RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));
@@ -204,7 +210,7 @@ const expectedColumns = {
         "fileSha256", "vendor", "txnDate", "totalCents", "taxCents", "docType",
         "refNumber", "memo", "readJson", "readAt", "dedupStrongKey",
         "dedupWeakKey", "duplicateOfId", "qbPurchaseId", "expenseId",
-        "archiveDriveFileId", "attempts", "lastError", "nextRetryAt",
+        "archiveDriveFileId", "attempts", "busyPasses", "lastError", "nextRetryAt",
         "bookedAt", "createdAt", "updatedAt",
     ],
 };
@@ -219,7 +225,19 @@ const expectedConstraints = [
 
 // The partial index is the one object a "table exists" check cannot vouch for
 // (Prisma would have created the table on its own; it would never create this).
-const expectedPartialIndexes = ["ReceiptIntake_dedupStrongKey_active_key"];
+// Verified on three properties, because any one of them alone can pass while
+// the index is useless: it must EXIST, be UNIQUE (a non-unique index claims
+// nothing, so every duplicate would sail through), and carry the EXACT
+// predicate (a wider one quarantines rows that were deliberately excluded; a
+// narrower one stops quarantining real duplicates).
+const expectedPartialIndexes = [{
+    name: "ReceiptIntake_dedupStrongKey_active_key",
+    mustMatch: [
+        /CREATE UNIQUE INDEX/,
+        /\("dedupStrongKey"\)/,
+        /WHERE \(\("dedupStrongKey" IS NOT NULL\) AND \(state <> ALL \(ARRAY\['DUPLICATE'::text, 'VOID'::text\]\)\)\)/,
+    ],
+}];
 
 async function main() {
     if (!process.argv.includes("--yes")) {
@@ -281,8 +299,8 @@ async function main() {
 
         // indpred IS NOT NULL is the whole point: a plain unique index of the
         // same name would silently quarantine nothing and reject legitimate
-        // re-reads, so assert the predicate exists rather than the name.
-        for (const name of expectedPartialIndexes) {
+        // re-reads, so assert the DEFINITION, not just the name.
+        for (const { name, mustMatch } of expectedPartialIndexes) {
             const [row] = await prisma.$queryRawUnsafe(
                 `SELECT pg_get_indexdef(i.indexrelid) AS def
                    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
@@ -293,6 +311,12 @@ async function main() {
             if (!row) {
                 console.error(`VERIFY FAILED: PARTIAL index ${name} missing (a non-partial index of that name is NOT the same thing)`);
                 process.exit(1);
+            }
+            for (const pattern of mustMatch) {
+                if (!pattern.test(row.def)) {
+                    console.error(`VERIFY FAILED: ${name} does not match ${pattern}\n  actual: ${row.def}`);
+                    process.exit(1);
+                }
             }
             console.log(`verified partial index ${name}: ${row.def}`);
         }
