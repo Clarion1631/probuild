@@ -1514,3 +1514,34 @@ test("the unlink write clears the marker", async () => {
     const unlinkWrite = src.slice(src.indexOf("export async function claimQBInvoiceUnlink"));
     assert.match(unlinkWrite.slice(0, 1600), /qbSyncError: null/);
 });
+
+// --- The in-flight marker survives a crash ---
+
+test("a row is refused while a send is in flight, and after a stale one", async () => {
+    const { isBlockedByAmbiguousCreate, isStaleInFlight, CREATE_IN_FLIGHT_MARKER, CREATE_IN_FLIGHT_STALE_MS } =
+        await import("../src/lib/quickbooks-payments");
+
+    // A process killed between the POST and the link write used to leave NO
+    // trace, so the next send saw a clean row and created a second invoice.
+    const fresh = { qbSyncError: CREATE_IN_FLIGHT_MARKER, updatedAt: new Date() };
+    assert.equal(isBlockedByAmbiguousCreate(fresh), true, "a peer is mid-send");
+    assert.equal(isStaleInFlight(fresh), false);
+
+    const stale = { qbSyncError: CREATE_IN_FLIGHT_MARKER, updatedAt: new Date(Date.now() - CREATE_IN_FLIGHT_STALE_MS - 1_000) };
+    assert.equal(isBlockedByAmbiguousCreate(stale), true, "nobody is coming back for it");
+    assert.equal(isStaleInFlight(stale), true, "and it is reported as an unknown outcome");
+
+    // A clean row, or an unrelated sync error, still sends.
+    assert.equal(isBlockedByAmbiguousCreate({ qbSyncError: null }), false);
+    assert.equal(isBlockedByAmbiguousCreate({ qbSyncError: "voided" }), false);
+});
+
+test("a linked-but-paylink-pending row is a success, not a failure", async () => {
+    const { PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    // The invoice exists and is correct; only the convenience link is missing,
+    // so the sweep finishes it rather than the operator being asked to act.
+    assert.equal(PAYLINK_PENDING_MARKER, "paylink-pending");
+    // It must NOT read as a blocked state — the row is linked.
+    const { isBlockedByAmbiguousCreate } = await import("../src/lib/quickbooks-payments");
+    assert.equal(isBlockedByAmbiguousCreate({ qbSyncError: PAYLINK_PENDING_MARKER }), false);
+});

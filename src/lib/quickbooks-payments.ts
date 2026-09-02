@@ -250,6 +250,50 @@ export interface MilestonePushResult {
  */
 export const AMBIGUOUS_CREATE_MARKER = "ambiguous-create";
 
+/**
+ * Set on the row BEFORE the create POST goes out, and replaced by the link
+ * write on success.
+ *
+ * A process killed between the POST and the link write left no trace at all:
+ * the next send saw a clean row and created a second invoice. The marker is
+ * written first precisely so a crash is still visible afterwards.
+ */
+export const CREATE_IN_FLIGHT_MARKER = "create-in-flight";
+
+/**
+ * Left over from a send that never came back. Beyond this age we stop assuming
+ * a peer is still working and treat it as an unknown outcome — the same
+ * fail-closed handling as an observed timeout.
+ */
+export const CREATE_IN_FLIGHT_STALE_MS = 5 * 60_000;
+
+/** Pay-link fetch failed AFTER the invoice was linked; the sweep retries it. */
+export const PAYLINK_PENDING_MARKER = "paylink-pending";
+
+/** Is this row blocked from sending because a previous attempt's outcome is unknown? */
+export function isBlockedByAmbiguousCreate(
+    row: { qbSyncError: string | null; updatedAt?: Date | null },
+    now: number = Date.now(),
+): boolean {
+    if (row.qbSyncError === AMBIGUOUS_CREATE_MARKER) return true;
+    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
+    // Both a fresh and a stale in-flight marker refuse the send: fresh means a
+    // peer is mid-flight, stale means nobody is coming back and the outcome is
+    // unknown. The age only decides what the operator is told.
+    void now;
+    return true;
+}
+
+/** A send that never came back — treated exactly like an observed timeout. */
+export function isStaleInFlight(
+    row: { qbSyncError: string | null; updatedAt?: Date | null },
+    now: number = Date.now(),
+): boolean {
+    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
+    const at = row.updatedAt ? row.updatedAt.getTime() : 0;
+    return now - at > CREATE_IN_FLIGHT_STALE_MS;
+}
+
 /** Raised when a send is refused because a previous attempt's outcome is unknown. */
 export class QBAmbiguousCreateError extends Error {
     name = "QBAmbiguousCreateError";
@@ -378,8 +422,9 @@ export async function pushMilestoneToQuickBooks(
         return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
     }
 
-    // Fail closed: a previous attempt may already have created the invoice.
-    if (schedule.qbSyncError === AMBIGUOUS_CREATE_MARKER) {
+    // Fail closed: a previous attempt may already have created the invoice, or
+    // another sender is mid-flight right now.
+    if (isBlockedByAmbiguousCreate(schedule)) {
         throw new QBAmbiguousCreateError(schedule.invoice.code);
     }
 
@@ -412,6 +457,18 @@ export async function pushMilestoneToQuickBooks(
 
     const description = `${projectName} — ${schedule.name}`;
     const privateNote = `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`;
+    // Claim the send BEFORE the request goes out. Losing this CAS means another
+    // sender got there first — refuse rather than race them into two invoices.
+    // A failure to WRITE the marker must abort: without it a crash mid-create
+    // is invisible, which is the whole failure this guards.
+    const claimedSend = await prisma.paymentSchedule.updateMany({
+        where: { id: schedule.id, qbInvoiceId: null, qbSyncError: null },
+        data: { qbSyncError: CREATE_IN_FLIGHT_MARKER },
+    });
+    if (claimedSend.count !== 1) {
+        throw new QBAmbiguousCreateError(schedule.invoice.code);
+    }
+
     let created: Awaited<ReturnType<typeof createQBMilestoneInvoice>>;
     try {
         created = await createQBMilestoneInvoice(tokens, {
@@ -426,14 +483,23 @@ export async function pushMilestoneToQuickBooks(
             privateNote,
         }, pushDeadline);
     } catch (error) {
-        if (isAmbiguousCreateFailure(error)) {
-            // The request went out and we never learned the outcome. Mark the
-            // row so the next send refuses rather than risking a duplicate
-            // bill, and tell the operator where to look.
+        if (!isAmbiguousCreateFailure(error)) {
+            // QuickBooks answered "no" and created nothing, so this row is
+            // freely re-sendable: release the in-flight claim.
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbSyncError: CREATE_IN_FLIGHT_MARKER },
+                data: { qbSyncError: null },
+            }).catch(() => {});
+            throw error;
+        }
+        {
+            // The request went out and we never learned the outcome. Promote
+            // the in-flight claim to the durable ambiguous marker so the next
+            // send refuses rather than risking a duplicate bill.
             await prisma.paymentSchedule.updateMany({
                 where: { id: schedule.id, qbInvoiceId: null },
                 data: { qbSyncError: AMBIGUOUS_CREATE_MARKER },
-            }).catch(() => {});
+            });
             await logAutomationEvent({
                 kind: "qbo-payments-sync",
                 status: "error",
@@ -444,7 +510,6 @@ export async function pushMilestoneToQuickBooks(
             });
             throw new QBAmbiguousCreateError(docNumber);
         }
-        throw error;
     }
 
     const { qbId, total } = created;
@@ -456,7 +521,41 @@ export async function pushMilestoneToQuickBooks(
         console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
     }
 
-    const payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
+    // Persist the link FIRST, before the pay-link fetch.
+    //
+    // The pay-link read is another remote call, and a timeout there used to
+    // abandon a real, created invoice: the row still said unlinked, so the next
+    // send made a second one. Recording the id immediately means the worst case
+    // is a linked row with no pay link yet, which the maintenance sweep can
+    // finish. CAS-guarded on the same content snapshot the final write uses.
+    const claimedLink = await prisma.paymentSchedule.updateMany({
+        where: {
+            id: schedule.id,
+            status: "Pending",
+            qbPaymentId: null,
+            qbInvoiceId: null,
+            amount: schedule.amount,
+            name: schedule.name,
+            dueDate: schedule.dueDate,
+        },
+        data: { qbInvoiceId: qbId, qbSyncError: PAYLINK_PENDING_MARKER },
+    });
+
+    let payLink: string | null = null;
+    if (claimedLink.count === 1) {
+        try {
+            payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline);
+        } catch (error) {
+            if (!isAmbiguousCreateFailure(error)) throw error;
+            // Linked but no pay link: leave PAYLINK_PENDING_MARKER for the
+            // sweep. The invoice exists and is correct; only the convenience
+            // link is missing, so this is not an error the operator must fix.
+            console.warn(`[quickbooks-payments] pay link pending for ${docNumber} (QBO id ${qbId})`);
+            return { qbInvoiceId: qbId, payLink: null, qbTotal: total };
+        }
+    } else {
+        payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline).catch(() => null);
+    }
 
     // Conditional link write: the milestone was read as unlinked and unpaid at
     // the top, but this function does several remote calls in between — a manual
@@ -488,7 +587,10 @@ export async function pushMilestoneToQuickBooks(
                 id: schedule.id,
                 status: "Pending",
                 qbPaymentId: null,
-                qbInvoiceId: null,
+                // Pinned to the id WE just wrote, not to null: the pre-pay-link
+                // write above already linked this row, and demanding null here
+                // would miss every time and compensate away a real invoice.
+                qbInvoiceId: claimedLink.count === 1 ? qbId : null,
                 amount: schedule.amount,
                 name: schedule.name,
                 dueDate: schedule.dueDate,
