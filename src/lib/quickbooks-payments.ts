@@ -75,6 +75,14 @@ export class QBNotConnectedError extends Error {
     }
 }
 
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBNotConnectedError(error: unknown): error is QBNotConnectedError {
+    return (
+        error instanceof QBNotConnectedError ||
+        (error instanceof Error && error.name === "QBNotConnectedError")
+    );
+}
+
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
 export async function getFreshQBTokens(deadline?: RouteDeadline): Promise<QBTokens> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts. The mock

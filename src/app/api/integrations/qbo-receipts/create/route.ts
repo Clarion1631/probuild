@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, isQBNotConnectedError } from "@/lib/quickbooks-payments";
 import { logAutomationEvent, type AutomationEventInput } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import {
@@ -293,7 +293,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-budget-exhausted" }));
                     return NextResponse.json({ ok: false, retry: true, reason: "qbo-budget-exhausted" }, { status: 503 });
                 }
-                if (error instanceof QBNotConnectedError) {
+                if (isQBNotConnectedError(error)) {
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "quickbooks-not-connected" }));
                     return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
                 }
