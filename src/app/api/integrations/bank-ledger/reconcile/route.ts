@@ -176,7 +176,38 @@ function ambiguousForResponse(ambiguous: ReconcileAmbiguousGroup[]) {
 }
 
 export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconcileHandlerDependencies) {
+    /**
+     * Plan + persist for one scope. `account: null` means every account.
+     * Split out of POST so an IN-PROCESS caller (the nightly
+     * `/api/cron/bank-register-pull`) runs the SAME planning and the SAME
+     * chunked writes rather than a second implementation. POST keeps every
+     * one of its body/scope validations — this is reached only after them.
+     */
+    async function runReconcile(account: string | null) {
+        const [observations, bankLines] = await Promise.all([
+            dependencies.findUnlinkedQboObservations(account),
+            dependencies.findCandidateBankLines(account),
+        ]);
+
+        const { links: proposed, ambiguous } = reconcileObservations(observations, bankLines);
+        if (proposed.length === 0) {
+            return { proposed: 0, linked: 0, exceptions: [] as ReconcileExceptionResult[], ambiguous, chunkErrors: [] as ReconcileChunkError[], remaining: 0 };
+        }
+
+        const result = await dependencies.persistLinks(proposed);
+        return {
+            proposed: proposed.length,
+            linked: result.linked.length,
+            exceptions: result.exceptions,
+            ambiguous,
+            chunkErrors: result.chunkErrors,
+            remaining: result.remaining,
+        };
+    }
+
     return {
+        runReconcile,
+
         async POST(request: Request) {
             const secret = dependencies.getIngestSecret();
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
@@ -232,23 +263,13 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
                 account = body.account.trim();
             }
 
-            const [observations, bankLines] = await Promise.all([
-                dependencies.findUnlinkedQboObservations(account),
-                dependencies.findCandidateBankLines(account),
-            ]);
-
-            const { links: proposed, ambiguous } = reconcileObservations(observations, bankLines);
-            if (proposed.length === 0) {
-                return NextResponse.json({ ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: ambiguousForResponse(ambiguous), chunkErrors: [], remaining: 0 });
-            }
-
-            const result = await dependencies.persistLinks(proposed);
+            const result = await runReconcile(account);
             return NextResponse.json({
                 ok: true,
-                proposed: proposed.length,
-                linked: result.linked.length,
+                proposed: result.proposed,
+                linked: result.linked,
                 exceptions: result.exceptions,
-                ambiguous: ambiguousForResponse(ambiguous),
+                ambiguous: ambiguousForResponse(result.ambiguous),
                 chunkErrors: result.chunkErrors,
                 // Codex round-4 fix 3: links not attempted this invocation
                 // because RECONCILE_MAX_CHUNKS_PER_INVOCATION was reached — the
@@ -348,6 +369,9 @@ const handlers = createBankLedgerReconcileHandlers({
         }, RECONCILE_MAX_CHUNKS_PER_INVOCATION);
     },
 });
+
+/** Production-wired handlers, exported for the in-process cron caller. */
+export const bankLedgerReconcileHandlers = handlers;
 
 export async function POST(request: Request) {
     return handlers.POST(request);

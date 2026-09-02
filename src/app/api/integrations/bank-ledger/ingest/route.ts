@@ -381,6 +381,17 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
     }
 
     return {
+        /**
+         * The QBO_REGISTER branch, exposed so an IN-PROCESS caller (the
+         * nightly `/api/cron/bank-register-pull`) runs the SAME validation,
+         * same content-conflict detection, and same writes the external
+         * `post-qbo-register.mjs` runner did over HTTP — rather than a second
+         * implementation that could drift. It deliberately skips only the
+         * shared-secret check, which exists to authenticate a NETWORK caller;
+         * the cron is already authorized by `isCronAuthorized`.
+         */
+        handleQboRegister,
+
         async POST(request: Request) {
             const secret = dependencies.getIngestSecret();
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
@@ -582,6 +593,9 @@ const handlers = createBankLedgerIngestHandlers({
         });
     },
 });
+
+/** Production-wired handlers, exported for the in-process cron caller. */
+export const bankLedgerIngestHandlers = handlers;
 
 export async function POST(request: Request) {
     return handlers.POST(request);
