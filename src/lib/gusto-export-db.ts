@@ -51,6 +51,18 @@ export type LoadedGustoExport = GustoExport & {
      * projects, an edit flag) would not have shown up at all.
      */
     exportHash: string;
+    /**
+     * The frozen export for this exact period, when it is locked. Downloads
+     * serve THIS, verbatim — a locked period is never recomputed, because the
+     * CSVs are built from mutable inputs (a member's name, email, payType, the
+     * Gusto id mapping, a punch's project and cost code after logistics
+     * recoding) and would not reproduce the file that was actually sent.
+     *
+     * `exportHash`, `summaryCsv` and `detailCsv` above stay LIVE, so the review
+     * page can show what the period looks like now and flag drift from the
+     * snapshot.
+     */
+    snapshot: { summaryCsv: string; detailCsv: string; exportHash: string } | null;
     /** The row for EXACTLY this range, if a human has reviewed it. Used for the stored hash and the lock button. */
     period: PayrollPeriodRow | null;
     /**
@@ -73,6 +85,9 @@ export type PayrollPeriodRow = {
     exportHash: string | null;
     /** The zone the period was locked in — enforcement uses it, not today's company zone. */
     timeZone: string | null;
+    /** THE EXPORT, FROZEN at lock time. Served verbatim; never recomputed. */
+    summaryCsvSnapshot: string | null;
+    detailCsvSnapshot: string | null;
     lockedBy: { name: string | null; email: string } | null;
 };
 
@@ -84,6 +99,8 @@ const PAYROLL_PERIOD_SELECT = {
     lockedById: true,
     exportHash: true,
     timeZone: true,
+    summaryCsvSnapshot: true,
+    detailCsvSnapshot: true,
     lockedBy: { select: { name: true, email: true } },
 } as const;
 
@@ -231,8 +248,18 @@ export async function loadGustoExport(
     const summaryCsv = toSummaryCsv(built.employees);
     const detailCsv = toDetailCsv(built.detail);
 
+    const snapshot =
+        period?.lockedAt && period.summaryCsvSnapshot != null && period.detailCsvSnapshot != null
+            ? {
+                  summaryCsv: period.summaryCsvSnapshot,
+                  detailCsv: period.detailCsvSnapshot,
+                  exportHash: period.exportHash ?? hashExport(period.summaryCsvSnapshot, period.detailCsvSnapshot),
+              }
+            : null;
+
     return {
         ...built,
+        snapshot,
         periodStart,
         periodEnd,
         envelopeStart: envelope.start,

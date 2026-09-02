@@ -85,10 +85,12 @@ export async function updateTimeEntry(
     });
 
     // Lock check and write in ONE transaction, under the shared payroll
-    // advisory lock (src/lib/payroll-period.ts). BOTH dates: this action writes
-    // startTime AND durationHours, so it can edit hours already paid or move
-    // hours into a period that was already exported.
-    const updated = await withPayrollWriteTx([current.startTime, startTime], (tx) =>
+    // advisory lock (src/lib/payroll-period.ts). This action writes startTime
+    // AND durationHours, so it can edit hours already paid or move hours into a
+    // period that was already exported. The row's STORED startTime is re-read
+    // and row-locked inside the transaction — the value captured above is not
+    // trusted, because another writer may have moved the row since.
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id, invoiceId: null, invoicedAt: null },
             data: {
@@ -98,10 +100,6 @@ export async function updateTimeEntry(
                 scheduleTaskId,
                 durationHours: data.durationHours,
                 laborCost: data.laborCost,
-                // A manual entry is a COMPLETED shift: give it the end time its
-                // duration implies rather than leaving endTime NULL, which every
-                // "is this punch open?" reader would treat as still clocked in.
-                endTime: new Date(startTime.getTime() + data.durationHours * 3_600_000),
             },
         })
     );
@@ -122,7 +120,7 @@ export async function deleteTimeEntry(id: string) {
 
     // Deleting a punch out of an exported period changes hours that were paid —
     // check and delete in one transaction under the shared advisory lock.
-    const deleted = await withPayrollWriteTx([entry.startTime], (tx) =>
+    const deleted = await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } })
     );
     if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
@@ -155,7 +153,7 @@ export async function deleteTimeEntries(
     // EVERY row, not a sample: a bulk delete that silently skipped the locked
     // ones would be worse than refusing outright, because the caller would be
     // told it succeeded.
-    const result = await withPayrollWriteTx(allowed.map(e => e.startTime), (tx) =>
+    const result = await withPayrollWriteTx({ entryIds: allowedIds }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.deleteMany({
             where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
         })

@@ -91,6 +91,14 @@ model PayrollPeriod {
   /// Null on rows written before this column existed — those fall back to the
   /// resolved company zone.
   timeZone    String?
+  /// THE EXPORT, FROZEN. Written at lock time and served verbatim afterwards.
+  /// Recomputing a locked period is not reproducible: the CSVs are built from
+  /// mutable inputs (a member's name, email, payType, the Gusto employee-id
+  /// mapping, a punch's project/cost code after logistics recoding), so the
+  /// same locked period could render differently tomorrow than the file that
+  /// was actually sent to payroll. Unlock deletes both columns.
+  summaryCsvSnapshot String?
+  detailCsvSnapshot  String?
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
 
   @@unique([periodStart, periodEnd])

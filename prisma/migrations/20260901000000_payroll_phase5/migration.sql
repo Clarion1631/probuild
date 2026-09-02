@@ -39,18 +39,32 @@ CREATE INDEX IF NOT EXISTS "PayrollPeriod_lockedById_idx" ON "PayrollPeriod"("lo
 -- of a period that was already paid.
 ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "timeZone" TEXT;
 
+-- AlterTable: the exported CSVs, frozen at lock time. A locked period is served
+-- from these verbatim rather than recomputed, because the CSVs are built from
+-- mutable inputs (name, email, payType, Gusto id mapping, a punch's project and
+-- cost code) and would not reproduce. Unlock clears them.
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "summaryCsvSnapshot" TEXT;
+ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "detailCsvSnapshot" TEXT;
+
 -- CreateIndex: every payroll read is a startTime RANGE scan (whole workweeks
 -- for the export, a period for the lock check and the settlement planner) and
 -- none of TimeEntry's FK indexes serve a bare range predicate.
 CREATE INDEX IF NOT EXISTS "TimeEntry_startTime_idx" ON "TimeEntry"("startTime");
 
--- Backfill: manual time entries were created with durationHours set but
--- endTime NULL, which every "is this punch still open?" reader has to treat as
--- open. They are COMPLETED rows — give them the end time their duration
--- implies. Idempotent (only touches rows still NULL) and additive.
-UPDATE "TimeEntry"
-SET "endTime" = "startTime" + make_interval(secs => "durationHours" * 3600)
-WHERE "endTime" IS NULL AND "durationHours" IS NOT NULL AND "durationHours" > 0;
+-- NOTE — no endTime backfill here, deliberately.
+--
+-- An earlier revision synthesised endTime = startTime + durationHours for
+-- manual entries so that "is this punch open?" readers stopped mistaking a
+-- completed manual entry for an open one. That was the wrong fix: WA meal
+-- settlement (src/lib/wa-breaks.ts settleDayPlan) reads endTime - startTime as
+-- the RAW worked span, so a synthesised span makes an 8h manual entry look like
+-- an 8h shift that owes a 30-minute meal, and re-persists it as 7.5 paid hours
+-- repriced at the member's CURRENT rate. That silently rewrites historical pay.
+--
+-- durationHours on a manual entry is PAID hours that a human entered directly;
+-- there is no span to deduct from. The readers were fixed instead: "open" now
+-- means endTime IS NULL *and* durationHours IS NULL (see
+-- src/lib/gusto-export-core.ts blockingEntries).
 
 -- AddForeignKey (guarded — ADD CONSTRAINT has no IF NOT EXISTS on Postgres 15).
 DO $$

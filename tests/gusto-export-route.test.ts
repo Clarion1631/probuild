@@ -24,7 +24,7 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 const SUMMARY = '"Employee Name"\n"Alice Field"\n';
 const DETAIL = '"Date"\n"2026-08-17"\n';
 
-function loaded(blocking: BlockingEntry[] = []): LoadedGustoExport {
+function loaded(blocking: BlockingEntry[] = [], snapshot: LoadedGustoExport["snapshot"] = null): LoadedGustoExport {
     return {
         employees: [],
         detail: [],
@@ -37,6 +37,7 @@ function loaded(blocking: BlockingEntry[] = []): LoadedGustoExport {
         summaryCsv: SUMMARY,
         detailCsv: DETAIL,
         exportHash: "deadbeef",
+        snapshot,
         period: null,
         overlappingLocks: [],
         locked: false,
@@ -131,4 +132,45 @@ test("bad or over-long ranges are refused before any query runs", async () => {
         assert.equal(res.status, 400, query);
         assert.equal(loads, 0, query);
     }
+});
+
+test("a LOCKED period serves its frozen snapshot, verbatim, and skips readiness", async () => {
+    // The whole point of the snapshot: the CSVs are built from mutable inputs
+    // (name, email, payType, Gusto id mapping, a punch's project/cost code), so
+    // recomputing a locked period could differ from the file payroll received.
+    const snapshot = { summaryCsv: "FROZEN-SUMMARY\n", detailCsv: "FROZEN-DETAIL\n", exportHash: "frozenhash" };
+    // Deliberately also blocking: a locked period must not be re-gated on
+    // readiness — it was already exported.
+    const blocking: BlockingEntry[] = [
+        { id: "te1", userId: "u1", userLabel: "Alice", startTime: new Date("2026-08-20T15:00:00.000Z"), reason: "open" },
+    ];
+    const handler = createGustoExportHandler(deps({ result: loaded(blocking, snapshot) }));
+
+    const summary = await handler.GET(url());
+    assert.equal(summary.status, 200);
+    assert.equal(await summary.text(), snapshot.summaryCsv);
+    assert.equal(summary.headers.get("x-export-hash"), "frozenhash");
+    assert.equal(summary.headers.get("x-export-source"), "snapshot");
+
+    const detail = await handler.GET(url("periodStart=2026-08-17&periodEnd=2026-08-31&format=detail"));
+    assert.equal(await detail.text(), snapshot.detailCsv);
+});
+
+test("an UNLOCKED period is computed live and still enforces readiness", async () => {
+    const blocking: BlockingEntry[] = [
+        { id: "te1", userId: "u1", userLabel: "Alice", startTime: new Date("2026-08-20T15:00:00.000Z"), reason: "open" },
+    ];
+    const res = await createGustoExportHandler(deps({ result: loaded(blocking) })).GET(url());
+    assert.equal(res.status, 409);
+});
+
+test("an impossible calendar date is a 400, not a silently rolled-forward period", async () => {
+    // Date("2026-02-31") rolls to 2026-03-03, which would have exported a period
+    // nobody asked for. validatePayrollRange checks the day is real.
+    let loads = 0;
+    const res = await createGustoExportHandler(deps({ onLoad: () => { loads += 1; } })).GET(
+        url("periodStart=2026-02-31&periodEnd=2026-03-31")
+    );
+    assert.equal(res.status, 400);
+    assert.equal(loads, 0);
 });

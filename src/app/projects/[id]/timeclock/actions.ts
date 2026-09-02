@@ -47,18 +47,15 @@ export async function createTimeEntry(data: {
     // Creating hours AT a date is moving hours INTO that period, so a create is
     // as much a payroll change as an edit. Check + write in one transaction
     // under the shared advisory lock (src/lib/payroll-period.ts).
-    await withPayrollWriteTx([startTime], (tx) =>
+    await withPayrollWriteTx({ instants: [startTime] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.create({
             data: {
                 projectId: data.projectId,
                 userId: data.userId,
                 costCodeId: data.costCodeId,
                 startTime,
-                // A manual entry is a COMPLETED shift — see the backfill in
-                // scripts/apply-payroll-phase5.mjs. Leaving endTime NULL made
-                // every "still clocked in?" reader, including the payroll
-                // readiness check, treat a finished shift as open.
-                endTime: new Date(startTime.getTime() + data.durationHours * 3_600_000),
+                // endTime stays NULL — durationHours is the paid time entered
+                // by hand, not a span (see time-expense-core.ts).
                 durationHours: data.durationHours,
                 laborCost: data.laborCost,
                 scheduleTaskId
@@ -100,14 +97,13 @@ export async function updateTimeEntry(id: string, data: {
     });
 
     // Both dates — editing inside a locked period, and moving a punch into one.
-    await withPayrollWriteTx([existing.startTime, startTime], (tx) =>
+    await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.update({
             where: { id },
             data: {
                 userId: data.userId,
                 costCodeId: data.costCodeId,
                 startTime,
-                endTime: new Date(startTime.getTime() + data.durationHours * 3_600_000),
                 durationHours: data.durationHours,
                 laborCost: data.laborCost,
                 scheduleTaskId
@@ -126,7 +122,7 @@ export async function deleteTimeEntry(id: string) {
     const entry = await prisma.timeEntry.findUnique({ where: { id }});
     if (!entry) throw new Error("Not found");
 
-    await withPayrollWriteTx([entry.startTime], (tx) =>
+    await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.delete({ where: { id } })
     );
 

@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
+import { isPeriodLockedError } from "@/lib/payroll-period";
 
 function dayWindow(dayKey: string) {
     const dayStartUtc = new Date(`${dayKey}T00:00:00.000Z`).getTime();
@@ -52,9 +53,32 @@ export async function settleDay(
             return settleDayInTx(tx, userId, dayKey, closing);
         });
     } catch (error) {
+        if (isPeriodLockedError(error)) throw error;
         console.error("[wa-breaks] settleDay failed", { userId, dayKey }, error);
         return -1;
     }
+}
+
+/**
+ * Settle a day inside a transaction the CALLER already owns.
+ *
+ * This is what the clock-out and edit paths use, so the write that triggers a
+ * re-plan and the re-plan itself commit together, under one payroll advisory
+ * lock. Running settlement in its own transaction afterwards left a window in
+ * which a period could be locked in between — and settlement then rewrote paid
+ * hours inside it.
+ *
+ * Errors are NOT swallowed here (unlike settleDay): the caller's transaction
+ * must roll back with them.
+ */
+export async function settleDayWithinTx(
+    tx: Tx,
+    userId: string,
+    dayKey: string,
+    closing?: { id: string; mealSkipped: unknown } | null
+): Promise<number> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${dayKey}`);
+    return settleDayInTx(tx, userId, dayKey, closing);
 }
 
 type Tx = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
@@ -68,6 +92,14 @@ async function settleDayInTx(
 ): Promise<number> {
     {
         {
+            // A re-plan rewrites durationHours / laborCost / burdenCost for the
+            // whole day, so it is a payroll write like any other and must not
+            // touch a locked period. Takes the SHARED payroll advisory lock on
+            // this transaction before deciding (src/lib/payroll-period.ts).
+            const { assertDayUnlockedInTx } = await import("./payroll-period");
+            const { resolveCompanyTimeZone } = await import("./company-timezone");
+            await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
+
             const owner = await tx.user.findUnique({ where: { id: userId }, select: { hourlyRate: true, burdenRate: true } });
             if (!owner) return 0;
             const hourlyRate = toNum(owner.hourlyRate);

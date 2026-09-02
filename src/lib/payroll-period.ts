@@ -74,6 +74,8 @@ export const PAYROLL_ADVISORY_LOCK_KEY = "payroll-period";
 /** Minimal shape of a Prisma transaction client — kept structural so tests can inject a fake. */
 export type PayrollTxClient = {
     $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+    /** Non-generic on purpose: a generic signature makes every test fake fail to structurally match. */
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
     payrollPeriod: { findMany(args: unknown): Promise<LockedPeriodRow[]> };
 };
 
@@ -125,6 +127,33 @@ export async function acquirePayrollWriteLock(tx: PayrollTxClient): Promise<void
  */
 export async function acquirePayrollLockCreationLock(tx: PayrollTxClient): Promise<void> {
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, PAYROLL_ADVISORY_LOCK_KEY);
+}
+
+/**
+ * Refuse to re-settle a company-local DAY that falls inside a locked period.
+ *
+ * WA meal settlement rewrites durationHours, laborCost and burdenCost for a
+ * whole day. It runs after a clock-out or an edit, and it is the one payroll
+ * write that is not initiated by a user touching that specific row — so it
+ * needs its own guard, under the same shared advisory lock, inside the same
+ * transaction as the write that triggered it.
+ *
+ * `dayKey` is interpreted in the caller's zone; a locked period is still
+ * evaluated in the zone it was locked in (see lockedPeriodFor).
+ */
+export async function assertDayUnlockedInTx(
+    tx: PayrollTxClient,
+    dayKey: string,
+    timeZone: string,
+    options: { weekStart?: PayrollWeekStart } = {}
+): Promise<void> {
+    if (!dayKey) return;
+    await acquirePayrollWriteLock(tx);
+    const periods = await loadLockedPeriodsTx(tx);
+    if (periods.length === 0) return;
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const period = lockedPeriodFor(periods, startOfDateInTimeZone(dayKey, timeZone), { timeZone, ...options });
+    if (period) throw new PeriodLockedError(period);
 }
 
 /** Locked periods read THROUGH a transaction client, so the check sees the same snapshot as the write. */
@@ -244,7 +273,7 @@ export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
  * as their usual thrown error.
  */
 export async function withPayrollWriteTx<T>(
-    instants: Array<Date | null | undefined>,
+    target: PayrollWriteTarget,
     write: (tx: PayrollTxClient) => Promise<T>,
     options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
 ): Promise<T> {
@@ -254,9 +283,53 @@ export async function withPayrollWriteTx<T>(
     // company-day constant, which ignores CompanySettings.
     const timeZone = options.timeZone ?? (await resolveCompanyTimeZone());
     return prisma.$transaction(async (tx) => {
-        await assertPeriodUnlockedInTx(tx as unknown as PayrollTxClient, instants, { ...options, timeZone });
-        return write(tx as unknown as PayrollTxClient);
+        const client = tx as unknown as PayrollTxClient;
+        await acquirePayrollWriteLock(client);
+        const instants = await resolveGuardInstants(client, target);
+        await assertPeriodUnlockedInTx(client, instants, { ...options, timeZone });
+        return write(client);
     });
+}
+
+/**
+ * What a write must be checked against.
+ *
+ * `entryIds` are re-read INSIDE the transaction and row-locked; `instants` are
+ * values the write is about to introduce (a new startTime, a date being
+ * created) which have no stored row yet.
+ */
+export type PayrollWriteTarget = {
+    /** Existing rows the write touches. Their STORED startTime is what gets validated. */
+    entryIds?: string[];
+    /** Instants the write is about to write (new startTime on an edit, the date on a create). */
+    instants?: Array<Date | null | undefined>;
+};
+
+/**
+ * Re-read every targeted row inside the transaction with SELECT ... FOR UPDATE
+ * and return the instants to validate.
+ *
+ * The caller's captured startTime is NOT trusted: between reading a row and
+ * writing it, another writer can MOVE that row to a different day, and a locker
+ * can then lock the period it moved into. Validating the stale value would let
+ * the write land in a locked period. FOR UPDATE also blocks a concurrent writer
+ * from moving the row out from under this transaction after the check.
+ */
+async function resolveGuardInstants(tx: PayrollTxClient, target: PayrollWriteTarget): Promise<Date[]> {
+    const instants: Date[] = (target.instants ?? []).filter(
+        (value): value is Date => value instanceof Date && !Number.isNaN(value.getTime())
+    );
+    const ids = (target.entryIds ?? []).filter((id): id is string => typeof id === "string" && !!id);
+    if (ids.length > 0) {
+        const rows = (await tx.$queryRawUnsafe(
+            `SELECT "startTime" FROM "TimeEntry" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR UPDATE`,
+            ids
+        )) as Array<{ startTime: Date }>;
+        for (const row of rows) {
+            if (row.startTime instanceof Date && !Number.isNaN(row.startTime.getTime())) instants.push(row.startTime);
+        }
+    }
+    return instants;
 }
 
 /**

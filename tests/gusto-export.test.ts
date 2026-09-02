@@ -500,3 +500,14 @@ test("the same period exports byte-identically twice — the lock's exportHash d
     assert.equal(toSummaryCsv(fixtureScenario().employees), toSummaryCsv(fixtureScenario({ shuffled: true }).employees));
     assert.equal(toDetailCsv(fixtureScenario().detail), toDetailCsv(fixtureScenario({ shuffled: true }).detail));
 });
+
+test("the settle button and the readiness check look at the SAME window", () => {
+    // Readiness blocks on a deferred day anywhere in the workweek envelope, so
+    // settling only the literal pay period left a blocker just outside a
+    // midweek or Sunday-start period that the button could never clear.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const action = source.slice(source.indexOf("export async function settleDeferredDaysForPeriod"));
+    const body = action.slice(0, action.indexOf("\nexport async function"));
+    assert.match(body, /payrollLockEnvelope\(/, "the settle action must use the envelope, not the raw period");
+    assert.match(body, /startTime: \{ gte: envelope\.start, lt: envelope\.end \}/);
+});

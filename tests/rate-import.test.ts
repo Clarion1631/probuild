@@ -15,6 +15,7 @@ import {
     parseGustoRateCsv,
     hasDuplicateTargets,
     parseRateValue,
+    rowFingerprint,
     previewFingerprint,
     MAX_IMPORTABLE_HOURLY_RATE,
     type ImportableUser,
@@ -219,6 +220,45 @@ test("a file listing the same person twice poisons the WHOLE preview", () => {
         ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,31"].join("\n")
     );
     assert.equal(hasDuplicateTargets(clean.rows, users), false);
+});
+
+test("the row claim includes the OLD PAY TYPE, so a concurrent correction invalidates it", () => {
+    // A null -> SALARY correction changes no RATE. Without the old pay type in
+    // the claim, a stale HOURLY preview would have sailed through the rate CAS
+    // and silently reverted it.
+    const parsed = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,32.50"].join("\n")
+    );
+    const before = diffRates(parsed.rows, users)[0];
+    assert.equal(before.oldPayType, null);
+
+    const corrected = users.map((u) => (u.id === "u1" ? { ...u, payType: "SALARY" } : u));
+    const after = diffRates(parsed.rows, corrected)[0];
+    assert.equal(after.oldPayType, "SALARY");
+    assert.notEqual(after.rowHash, before.rowHash, "the same approval must not survive the correction");
+});
+
+test("row claims are SIGNED — an unsigned fingerprint is not evidence", () => {
+    // Plain concatenation is reproducible by any caller, so on its own it lets a
+    // client fabricate an approval it was never shown. The server signs it.
+    const parsed = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", "Tim Brennan,tim@example.com,32.50"].join("\n")
+    );
+    const signed = diffRates(parsed.rows, users, (input) => `sig(${rowFingerprint(input)})`)[0];
+    assert.match(signed.rowHash ?? "", /^sig\(/);
+    // And the payload it signs pins every value the human approved.
+    const payload = rowFingerprint({
+        userId: "u1",
+        oldHourly: "25.00",
+        oldPayType: null,
+        newHourly: "32.50",
+        payType: null,
+    });
+    assert.equal(signed.rowHash, `sig(${payload})`);
+    assert.notEqual(
+        payload,
+        rowFingerprint({ userId: "u1", oldHourly: "25.00", oldPayType: "SALARY", newHourly: "32.50", payType: null })
+    );
 });
 
 test("the preview fingerprint covers the OLD rate, so a stale approval is refused", () => {

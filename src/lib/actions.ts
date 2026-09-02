@@ -18,6 +18,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { parsePaymentDateInput } from "./payment-date";
+import { rowFingerprint, type RowFingerprintInput } from "./rate-import";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
@@ -15208,8 +15209,20 @@ export async function previewGustoRateImport(csvText: string) {
         };
     }
 
-    const rows = diffRates(parsed.rows, users);
+    const rows = diffRates(parsed.rows, users, signRateRow);
     return { success: true as const, rows, errors: parsed.errors };
+}
+
+/**
+ * HMAC the row claim with NEXTAUTH_SECRET. The unsigned fingerprint is plain
+ * concatenation a client can reproduce, so on its own it proves nothing: a
+ * caller could fabricate an "approved" row it was never shown. Signing makes it
+ * evidence that THIS server built THIS preview.
+ */
+function signRateRow(input: RowFingerprintInput): string {
+    return createHmac("sha256", process.env.NEXTAUTH_SECRET ?? "")
+        .update(rowFingerprint(input), "utf8")
+        .digest("hex");
 }
 
 /** Everyone the import may write to, with rates as canonical decimal TEXT (never a float). */
@@ -15254,7 +15267,7 @@ export async function applyGustoRateImport(
     if (!Array.isArray(rows) || rows.length === 0) {
         return { success: false as const, error: "Nothing to save." };
     }
-    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue, rowFingerprint } = await import("./rate-import");
+    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } = await import("./rate-import");
     const { Prisma } = await import("@prisma/client");
 
     const seen = new Set<string>();
@@ -15292,16 +15305,22 @@ export async function applyGustoRateImport(
     const byId = new Map(known.map((u) => [u.id, u]));
     for (const row of clean) {
         const live = byId.get(row.userId)!;
-        const expected = rowFingerprint({
+        // Re-signed from the LIVE row. A mismatch means either the member's rate
+        // or pay type moved since the preview, or the token was forged.
+        // timingSafeEqual so the comparison cannot be probed byte by byte.
+        const expected = signRateRow({
             userId: row.userId,
             oldHourly: live.hourlyRate.toFixed(2),
+            oldPayType: live.payType ?? null,
             newHourly: row.newHourly,
             payType: row.payType,
         });
-        if (expected !== row.rowHash) {
+        const a = Buffer.from(expected, "utf8");
+        const b = Buffer.from(row.rowHash, "utf8");
+        if (a.length !== b.length || !timingSafeEqual(a, b)) {
             return {
                 success: false as const,
-                error: "One of those rates changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
+                error: "One of those team members changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
             };
         }
     }
@@ -15310,12 +15329,19 @@ export async function applyGustoRateImport(
     try {
         await prisma.$transaction(async (tx) => {
             for (const row of clean) {
-                const previousRate = byId.get(row.userId)!.hourlyRate;
-                // Compare-and-set on the rate we showed the human. A concurrent
-                // edit makes count 0, the throw rolls the whole batch back, and
-                // nobody ends up half-imported.
+                const live = byId.get(row.userId)!;
+                // Compare-and-set on BOTH values we showed the human. Rate
+                // alone was not enough: a concurrent null -> SALARY correction
+                // changes no rate, so a stale HOURLY preview would have
+                // overwritten it. A concurrent edit makes count 0, the throw
+                // rolls the whole batch back, and nobody ends up half-imported.
                 const result = await tx.user.updateMany({
-                    where: { id: row.userId, hourlyRate: previousRate, status: { not: "DISABLED" } },
+                    where: {
+                        id: row.userId,
+                        hourlyRate: live.hourlyRate,
+                        payType: live.payType,
+                        status: { not: "DISABLED" },
+                    },
                     data: {
                         hourlyRate: new Prisma.Decimal(row.newHourly),
                         lastRateSyncAt: syncedAt,
@@ -15324,7 +15350,7 @@ export async function applyGustoRateImport(
                 });
                 if (result.count !== 1) {
                     throw new Error(
-                        "Somebody changed one of these pay rates while this import was being saved. Nothing was saved — re-run the preview."
+                        "Somebody changed one of these team members while this import was being saved. Nothing was saved — re-run the preview."
                     );
                 }
             }
@@ -15447,8 +15473,29 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
                 // timeZone is persisted so enforcement can rebuild this
                 // period's workweek envelope exactly as it was, even if
                 // CompanySettings.timeZone changes later.
-                create: { periodStart, periodEnd, lockedAt, lockedById: user.id, exportHash: precheck.exportHash, timeZone },
-                update: { lockedAt, lockedById: user.id, exportHash: precheck.exportHash, timeZone },
+                // The CSVs are FROZEN here. A locked period is served from
+                // these verbatim afterwards: they are built from mutable inputs
+                // (name, email, payType, Gusto id mapping, a punch's project and
+                // cost code) and recomputing later would not reproduce the file
+                // that was actually sent to payroll.
+                create: {
+                    periodStart,
+                    periodEnd,
+                    lockedAt,
+                    lockedById: user.id,
+                    exportHash: precheck.exportHash,
+                    timeZone,
+                    summaryCsvSnapshot: precheck.summaryCsv,
+                    detailCsvSnapshot: precheck.detailCsv,
+                },
+                update: {
+                    lockedAt,
+                    lockedById: user.id,
+                    exportHash: precheck.exportHash,
+                    timeZone,
+                    summaryCsvSnapshot: precheck.summaryCsv,
+                    detailCsvSnapshot: precheck.detailCsv,
+                },
             });
 
             const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx });
@@ -15488,9 +15535,9 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
     const { startOfDateInTimeZone, dayKeyInTimeZone } = await import("./tz-date");
-    const { validatePayrollRange } = await import("./payroll-config");
+    const { validatePayrollRange, payrollLockEnvelope } = await import("./payroll-config");
     const { planDeferredSettlements } = await import("./gusto-export-core");
-    const { lockedPeriodFor, loadLockedPeriods } = await import("./payroll-period");
+    const { lockedPeriodFor, loadLockedPeriods, isPeriodLockedError } = await import("./payroll-period");
     const { settleDay } = await import("./wa-breaks-db");
 
     const range = validatePayrollRange(periodStartKey, periodEndKey);
@@ -15501,8 +15548,18 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
     const dayKey = (instant: Date) => dayKeyInTimeZone(instant, timeZone);
 
+    // The SAME window readiness and locking use. Readiness blocks on a deferred
+    // day anywhere in the workweek envelope, so settling only the literal pay
+    // period left a blocker just outside a midweek or Sunday-start period that
+    // the button could never clear.
+    const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
+
     const unsettled = await prisma.timeEntry.findMany({
-        where: { startTime: { gte: periodStart, lt: periodEnd }, mealOutcome: "DEFERRED", endTime: { not: null } },
+        where: {
+            startTime: { gte: envelope.start, lt: envelope.end },
+            mealOutcome: "DEFERRED",
+            endTime: { not: null },
+        },
         select: { userId: true, startTime: true },
     });
     if (unsettled.length === 0) return { success: true as const, settled: 0, skipped: 0 };
@@ -15523,8 +15580,14 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
 
     let settled = 0;
     for (const item of plan) {
-        const result = await settleDay(item.userId, item.dayKey, null);
-        if (result >= 0) settled += 1;
+        try {
+            const result = await settleDay(item.userId, item.dayKey, null);
+            if (result >= 0) settled += 1;
+        } catch (error) {
+            // A day that became locked mid-run is skipped, not fatal — the
+            // remaining days are still worth settling.
+            if (!isPeriodLockedError(error)) throw error;
+        }
     }
 
     const distinctDays = new Set(unsettled.map((row) => `${row.userId}|${dayKey(row.startTime)}`)).size;
@@ -15560,9 +15623,12 @@ export async function unlockPayrollPeriod(periodStartKey: string, periodEndKey: 
     const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
     const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
 
+    // Unlock deletes the snapshot: the period is editable again, so a frozen
+    // CSV would immediately stop describing it. The row and its exportHash stay
+    // as the record that this period WAS exported.
     await prisma.payrollPeriod.updateMany({
         where: { periodStart, periodEnd },
-        data: { lockedAt: null },
+        data: { lockedAt: null, summaryCsvSnapshot: null, detailCsvSnapshot: null },
     });
 
     revalidatePath("/manager/payroll-export");

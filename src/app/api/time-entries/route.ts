@@ -9,7 +9,7 @@ import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedW
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
-import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
 import {
     assertPeriodUnlocked,
     assertPeriodUnlockedInTx,
@@ -267,7 +267,7 @@ export async function POST(req: Request) {
     // transaction under the shared advisory lock (src/lib/payroll-period.ts).
     let timeEntry;
     try {
-        timeEntry = await withPayrollWriteTx([entryStartTime], (tx) =>
+        timeEntry = await withPayrollWriteTx({ instants: [entryStartTime] }, (tx) =>
             (tx as unknown as typeof prisma).timeEntry.create({
         data: {
             userId: user.id,
@@ -369,11 +369,14 @@ export interface ClockOutDependencies {
         userId: string,
         data: Record<string, unknown>,
         /**
-         * Instants the write must not touch a locked period at. Checked INSIDE
-         * the same transaction as the update, under the shared payroll advisory
-         * lock — the earlier stand-alone checks are fail-fast only.
+         * Everything the close transaction must do atomically:
+         *  - re-read + row-lock this entry and check its STORED startTime
+         *    against locked periods (the values read earlier are not trusted);
+         *  - claim and close the row;
+         *  - re-settle the worker's day IN THE SAME TRANSACTION, so a period
+         *    cannot be locked between the close and the settlement.
          */
-        lockGuardInstants: Date[]
+        guard: { entryId: string; settle: { dayKey: string; closing: { id: string; mealSkipped: unknown } } | null }
     ): Promise<
         { ok: true; entry: unknown } | { ok: false; current: unknown | null } | { ok: false; locked: LockedPeriodRow }
     >;
@@ -588,7 +591,15 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // the update, under the shared payroll advisory lock. The fail-fast
             // check at the top of this handler is an optimisation, not the
             // protection (see payroll-period.ts).
-            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData, [existing.startTime]);
+            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData, {
+                entryId: existing.id,
+                // Settlement rides along in the same transaction (deferMeal
+                // closes settle nothing — the day settles on the final punch).
+                settle:
+                    deferMeal !== true
+                        ? { dayKey: toCompanyDayKey(existing.startTime), closing: { id: existing.id, mealSkipped } }
+                        : null,
+            });
             if (!closeResult.ok && "locked" in closeResult) {
                 return periodLockedResponse(closeResult.locked);
             }
@@ -606,12 +617,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
-            // The day, not the row, is the unit the law cares about — re-plan it
-            // now that this close is committed (no-op on a single-entry day).
-            if (deferMeal !== true) {
-                const settled = await dependencies.settleDay(existing.userId, toCompanyDayKey(existing.startTime), { id: existing.id, mealSkipped });
-                if (settled < 0) await dependencies.flagSettlementFailed(existing.id);
-            }
+            // Settlement already ran INSIDE the close transaction above — the
+            // day, not the row, is the unit the law cares about, and doing it
+            // in a second transaction left a window in which the period could
+            // be locked in between.
 
             // Return what is STORED after settlement — the phone's "last entry"
             // card must never disagree with payroll about paid hours.
@@ -669,13 +678,21 @@ const clockOutHandler = createClockOutHandler({
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,
-    closeTimeEntry: async (id, userId, data, lockGuardInstants) => {
+    closeTimeEntry: async (id, userId, data, guard) => {
         return prisma.$transaction(async (t) => {
-            // Shared advisory lock + lock check, in the SAME transaction as the
-            // claim below. A lock being created concurrently either waits for
-            // this transaction or is seen by it.
+            // Shared advisory lock, then RE-READ the row under FOR UPDATE and
+            // check its STORED startTime — a concurrent writer may have moved
+            // it since this request read it, and a locker may have locked the
+            // period it moved into.
             try {
-                await assertPeriodUnlockedInTx(t as unknown as PayrollTxClient, lockGuardInstants);
+                const [row] = await t.$queryRawUnsafe<Array<{ startTime: Date }>>(
+                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1 FOR UPDATE`,
+                    guard.entryId
+                );
+                await assertPeriodUnlockedInTx(
+                    t as unknown as PayrollTxClient,
+                    row ? [row.startTime] : []
+                );
             } catch (error) {
                 if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
                 throw error;
@@ -691,6 +708,17 @@ const clockOutHandler = createClockOutHandler({
             if (claim.count === 0) {
                 const current = await t.timeEntry.findUnique({ where: { id } });
                 return { ok: false as const, current };
+            }
+            // Re-plan the day in THIS transaction, so the close and the
+            // settlement commit together under one payroll advisory lock.
+            if (guard.settle) {
+                try {
+                    const settled = await settleDayWithinTx(t, userId, guard.settle.dayKey, guard.settle.closing);
+                    if (settled < 0) await t.timeEntry.update({ where: { id }, data: { needsReview: true } });
+                } catch (error) {
+                    if (isPeriodLockedError(error)) return { ok: false as const, locked: error.period };
+                    throw error;
+                }
             }
             const entry = await t.timeEntry.findUniqueOrThrow({ where: { id } });
             return { ok: true as const, entry };

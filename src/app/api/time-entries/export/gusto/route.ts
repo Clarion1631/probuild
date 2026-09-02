@@ -68,6 +68,24 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
 
             const result = await dependencies.load(periodStart, periodEnd);
 
+            // A LOCKED period is served from its snapshot, verbatim. No
+            // readiness check and no recompute: this is the file that was sent
+            // to payroll, and re-deriving it from today's data could differ.
+            if (result.snapshot) {
+                const lastDay = addDaysToKey(range.endKey, -1);
+                return new NextResponse(
+                    format === "detail" ? result.snapshot.detailCsv : result.snapshot.summaryCsv,
+                    {
+                        headers: {
+                            "Content-Type": "text/csv; charset=utf-8",
+                            "Content-Disposition": `attachment; filename="gusto-${format}-${range.startKey}_to_${lastDay}.csv"`,
+                            "X-Export-Hash": result.snapshot.exportHash,
+                            "X-Export-Source": "snapshot",
+                        },
+                    }
+                );
+            }
+
             if (result.blocking.length > 0) {
                 return NextResponse.json(
                     {
@@ -95,6 +113,7 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                     // Covers BOTH csvs — lets the review page compare a fresh
                     // download against the hash stored when the period was locked.
                     "X-Export-Hash": result.exportHash,
+                    "X-Export-Source": "live",
                 },
             });
         },

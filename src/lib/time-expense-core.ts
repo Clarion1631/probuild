@@ -103,7 +103,7 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     // period, so gating HERE covers every caller instead of each server action
     // separately. Check + write in one transaction under the shared advisory
     // lock (src/lib/payroll-period.ts).
-    return withPayrollWriteTx([startTime], (tx) =>
+    return withPayrollWriteTx({ instants: [startTime] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.create({
             data: {
                 projectId,
@@ -111,8 +111,11 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
                 userId: data.userId,
                 costCodeId: data.costCodeId || null,
                 startTime,
-                // A manual entry is a COMPLETED shift, not an open punch.
-                endTime: new Date(startTime.getTime() + data.durationHours * 3_600_000),
+                // endTime stays NULL on a manual entry. durationHours IS the
+                // paid time a human entered; synthesising a span would make WA
+                // meal settlement read it as raw worked time, deduct a meal it
+                // never owed, and reprice it at the current rate. Readers treat
+                // "open" as endTime null AND durationHours null.
                 durationHours: data.durationHours,
                 laborCost: dollars(data.laborCost),
                 burdenCost: dollars(data.burdenCost ?? 0),

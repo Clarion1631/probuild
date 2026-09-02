@@ -41,8 +41,10 @@ export type RateImportParse = {
 
 export type RateDiffRow = {
     userId: string | null;
-    /** Per-ROW fingerprint (see rowFingerprint). Only set on a matched row. */
+    /** Per-ROW token: the fingerprint SIGNED by the server (see rowFingerprint). Only set on a matched row. */
     rowHash: string | null;
+    /** The member's pay type when the preview was built — part of what is being approved. */
+    oldPayType: string | null;
     name: string;
     email: string | null;
     /** Canonical decimal TEXT (2 places), or null when nothing matched. */
@@ -268,7 +270,12 @@ function normalizeName(value: string | null | undefined): string {
  * wrong person is worse than leaving a row unmatched for a human to sort out.
  * An ambiguous name (two members share it) is deliberately left unmatched.
  */
-export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): RateDiffRow[] {
+export function diffRates(
+    parsed: ParsedRateRow[],
+    users: ImportableUser[],
+    /** Signer for each matched row. Defaults to the unsigned fingerprint so pure tests stay pure. */
+    signRow: (input: RowFingerprintInput) => string = rowFingerprint
+): RateDiffRow[] {
     const byEmail = new Map<string, ImportableUser>();
     for (const user of users) byEmail.set(user.email.trim().toLowerCase(), user);
 
@@ -311,6 +318,7 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             return {
                 userId: null,
                 rowHash: null,
+                oldPayType: null,
                 name: user.name ?? row.name,
                 email: user.email,
                 oldHourly: null,
@@ -328,6 +336,7 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             return {
                 userId: null,
                 rowHash: null,
+                oldPayType: null,
                 name: row.name,
                 email: row.email,
                 oldHourly: null,
@@ -342,12 +351,15 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
         if (user) claimed.add(user.id);
 
         const oldHourly = user ? canonicalRateText(user.hourlyRate) : null;
+        const oldPayType = user ? user.payType ?? null : null;
         return {
             userId: user?.id ?? null,
+            oldPayType,
             rowHash: user
-                ? rowFingerprint({
+                ? signRow({
                       userId: user.id,
                       oldHourly,
+                      oldPayType,
                       newHourly: row.hourlyRate,
                       payType: row.payType,
                   })
@@ -404,13 +416,35 @@ export function previewFingerprint(rows: RateDiffRow[]): string {
  * rejected. Each submitted row now carries its own hash and is validated on its
  * own, and the DB write is additionally guarded on the previewed old rate.
  */
-export function rowFingerprint(input: {
+export type RowFingerprintInput = {
     userId: string;
+    /** The member's rate when the preview was built. */
     oldHourly: string | null;
+    /** The member's pay type when the preview was built. */
+    oldPayType: string | null;
     newHourly: string;
+    /** The pay type about to be written (null = leave it alone). */
     payType: string | null;
-}): string {
-    return [input.userId, input.oldHourly ?? "", input.newHourly, input.payType ?? ""].join(":");
+};
+
+/**
+ * The claim being made by one previewed row. BOTH old values are included: a
+ * concurrent null -> SALARY correction has to invalidate a preview that still
+ * thinks the member is HOURLY, or the stale preview silently reverts it.
+ *
+ * This is the payload only. It is not evidence on its own — `signRowToken`
+ * turns it into something the server can verify, because plain concatenation is
+ * trivially reproducible by any caller and would let a client fabricate an
+ * "approved" update it was never shown.
+ */
+export function rowFingerprint(input: RowFingerprintInput): string {
+    return [
+        input.userId,
+        input.oldHourly ?? "",
+        input.oldPayType ?? "",
+        input.newHourly,
+        input.payType ?? "",
+    ].join(":");
 }
 
 /**

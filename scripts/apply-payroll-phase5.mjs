@@ -51,6 +51,12 @@ const STATEMENTS = [
     `CREATE INDEX IF NOT EXISTS "PayrollPeriod_lockedAt_idx" ON "PayrollPeriod"("lockedAt")`,
     `CREATE INDEX IF NOT EXISTS "PayrollPeriod_lockedById_idx" ON "PayrollPeriod"("lockedById")`,
     `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "timeZone" TEXT`,
+    // The exported CSVs, frozen at lock time. A locked period is served from
+    // these verbatim rather than recomputed — the CSVs are built from mutable
+    // inputs (name, email, payType, Gusto id mapping, a punch's project and
+    // cost code after logistics recoding) and would not reproduce.
+    `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "summaryCsvSnapshot" TEXT`,
+    `ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "detailCsvSnapshot" TEXT`,
     // Every payroll read is a startTime RANGE scan; no FK index serves that.
     `CREATE INDEX IF NOT EXISTS "TimeEntry_startTime_idx" ON "TimeEntry"("startTime")`,
     // ADD CONSTRAINT has no IF NOT EXISTS — guard it so a replay is a no-op.
@@ -69,17 +75,10 @@ try {
         await prisma.$executeRawUnsafe(sql);
         console.log("ok:", sql.split("\n")[0].trim().slice(0, 90));
     }
-    // Backfill: manual time entries stored durationHours with endTime NULL, so
-    // every "is this punch still open?" reader saw a COMPLETED row as open —
-    // including the payroll export's readiness check. Give them the end time
-    // their own duration implies. Only touches rows still NULL, so a re-run is
-    // a no-op and a genuinely open punch (no duration) is left alone.
-    const closedManual = await prisma.$executeRawUnsafe(
-        `UPDATE "TimeEntry"
-         SET "endTime" = "startTime" + make_interval(secs => "durationHours" * 3600)
-         WHERE "endTime" IS NULL AND "durationHours" IS NOT NULL AND "durationHours" > 0`
-    );
-    console.log(`backfilled endTime on ${closedManual} completed manual time entr(ies)`);
+    // NO endTime backfill — see the note in the matching migration. Synthesising
+    // a span for a manual entry makes WA meal settlement treat PAID hours as a
+    // RAW span, deduct a meal it never owed, and reprice it at the member's
+    // current rate. The readers were fixed instead.
 
     // ONE-SHOT seed for User.payType from the env list, so the export is not
     // blocked on day one by a column nobody has filled in yet. Only touches

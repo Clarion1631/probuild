@@ -7,7 +7,7 @@ import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
-import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 import {
     assertPeriodUnlocked,
@@ -351,22 +351,35 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // payroll advisory lock. The check at the top of this handler is fail-fast
     // only — everything between it and here is awaited work (day load, meal
     // settlement, task re-binding) during which a period can be locked.
+    // The edit AND the day re-plan it triggers commit together. The entry's
+    // STORED startTime is re-read under FOR UPDATE inside the transaction (a
+    // concurrent writer may have moved the row since this request read it), and
+    // `newStart` is checked as the value about to be written.
     let updated;
     try {
-        updated = await withPayrollWriteTx([existing.startTime, newStart], (tx) =>
-            (tx as unknown as typeof prisma).timeEntry.update({ where: { id }, data })
-        );
+        updated = await withPayrollWriteTx({ entryIds: [id], instants: [newStart] }, async (tx) => {
+            const client = tx as unknown as typeof prisma;
+            const row = await client.timeEntry.update({ where: { id }, data });
+            // Re-plan every day this edit touched (the row may have moved days),
+            // in THIS transaction — settling afterwards left a window in which
+            // the period could be locked in between.
+            const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
+            for (const dayKey of days) {
+                const result = await settleDayWithinTx(
+                    tx as never,
+                    existing.userId,
+                    dayKey,
+                    newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null
+                );
+                if (result < 0) await client.timeEntry.update({ where: { id }, data: { needsReview: true } });
+            }
+            return row;
+        });
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
         throw error;
     }
 
-    // Re-plan every day this edit touched (the row may have moved days).
-    const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
-    for (const dayKey of days) {
-        const result = await settleDay(existing.userId, dayKey, newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null);
-        if (result < 0) await flagSettlementFailed(id);
-    }
     const settled = await prisma.timeEntry.findUnique({ where: { id } });
     return NextResponse.json(JSON.parse(JSON.stringify(settled ?? updated)));
 }

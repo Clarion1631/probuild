@@ -309,20 +309,30 @@ export default async function PayrollExportPage({ searchParams }: Props) {
             <div className="text-xs text-hui-textMuted space-y-1">
                 <p>
                     Export hash — sha256 over BOTH CSVs (summary and detail), so a change to any single
-                    entry shows up even when the rounded per-employee totals happen to match:{" "}
+                    entry shows up even when the rounded per-employee totals happen to match. Live now:{" "}
                     <code className="font-mono">{result.exportHash.slice(0, 16)}…</code>
-                    {result.period?.exportHash && (
+                    {result.snapshot && (
                         <>
-                            {" "}· stored at lock:{" "}
-                            <code className="font-mono">{result.period.exportHash.slice(0, 16)}…</code>
-                            {result.period.exportHash === result.exportHash ? (
-                                <span className="text-green-700"> · matches</span>
+                            {" "}· frozen at lock:{" "}
+                            <code className="font-mono">{result.snapshot.exportHash.slice(0, 16)}…</code>
+                            {result.snapshot.exportHash === result.exportHash ? (
+                                <span className="text-green-700"> · the live data still matches</span>
                             ) : (
-                                <span className="text-red-700"> · CHANGED since the lock</span>
+                                <span className="text-amber-800">
+                                    {" "}· the live data has moved since the lock. Downloads still serve the frozen
+                                    file that went to payroll.
+                                </span>
                             )}
                         </>
                     )}
                 </p>
+                {result.snapshot && (
+                    <p>
+                        This period is locked, so both downloads serve the CSVs exactly as they were when it was
+                        locked. They are not recomputed — a name, pay type, Gusto ID or cost-code change afterwards
+                        cannot rewrite the file that was already sent.
+                    </p>
+                )}
                 <p>
                     Locking freezes {dayKeyInTimeZone(result.envelopeStart, timeZone)} to{" "}
                     {addDaysToKey(dayKeyInTimeZone(result.envelopeEnd, timeZone), -1)} — the whole workweeks this period
