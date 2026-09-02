@@ -86,17 +86,19 @@ export function measureCoverage(rows) {
  * Decide every write WITHOUT touching the database, so the dry run can show the
  * exact same set the apply would perform. Pure and unit-tested.
  *
- * @param expenses rows with { id, projectId, estimate:{projectId}, costCodeId,
- *   costCodeSource, itemId, amount, vendor, description, date }
- * @param itemCostCodeById item id -> its cost code id (or null)
+ * @param expenses rows with { id, estimateId, projectId, estimate:{projectId},
+ *   costCodeId, costCodeSource, itemId, amount, vendor, description, date }
+ * @param items item id -> { estimateId, projectId, costCodeId } for every CODED
+ *   estimate item, so the link can be checked before it is trusted
  * @param costCodeIdByCode "03-PLUMB" -> cost code id
  * @param scopedProjectIds the In Progress, non-overhead jobs the suggester may touch
  */
-export function planBackfill({ expenses, itemCostCodeById, costCodeIdByCode, scopedProjectIds }) {
+export function planBackfill({ expenses, items, costCodeIdByCode, scopedProjectIds }) {
     const inScope = new Set(scopedProjectIds);
     const projectFills = [];
     const codeFills = [];
     const remainder = [];
+    const add = (expense, reason) => remainder.push({ ...expense, reason });
 
     for (const expense of expenses) {
         const resolvedProjectId = resolveExpenseProjectId(expense);
@@ -111,24 +113,52 @@ export function planBackfill({ expenses, itemCostCodeById, costCodeIdByCode, sco
         if (expense.costCodeId) continue;
         if (expense.costCodeSource === "capture" || expense.costCodeSource === "manual") continue;
 
-        // (b) item fallback, for ANY project — a coded line item is a fact
-        // about the money regardless of the job's status.
-        const fromItem = resolveExpenseCostCodeId(expense, itemCostCodeById);
-        if (fromItem) {
+        // (b) ITEM FALLBACK — and the link has to be checked before it is
+        // trusted (Codex round 1, blocker 3).
+        //
+        // `Expense.itemId` is `ON DELETE SET NULL` and has never been scoped to
+        // the expense's own estimate on any historical write path, so a stored
+        // itemId can point at a line item on somebody else's job. Copying its
+        // cost code would move a phase across jobs and call the result
+        // "backfill" — a wrong code is worse than an absent one, and this is
+        // exactly the kind of wrong that no one would notice.
+        //
+        // Accepted: the item belongs to the expense's OWN estimate, or to
+        // another estimate of the SAME project (which is how change-order and
+        // revised-estimate work reaches an item — CO line items live on the
+        // project's estimates, and `createExpenseCore` already requires a CO
+        // and its estimate to share the project). Anything else is skipped and
+        // listed for a human with reason "item-outside-estimate".
+        const item = expense.itemId ? items.get(expense.itemId) : undefined;
+        if (expense.itemId && !item) {
+            // A link to an item that is gone, or to an item with no cost code:
+            // no answer either way, so fall through to the rules below.
+        } else if (item && item.costCodeId) {
+            const sameEstimate = item.estimateId === expense.estimateId;
+            const sameProject =
+                item.projectId !== null && item.projectId === resolvedProjectId;
+            if (!sameEstimate && !sameProject) {
+                add(expense, "item-outside-estimate");
+                continue;
+            }
             codeFills.push({
                 id: expense.id,
-                costCodeId: fromItem,
+                costCodeId: item.costCodeId,
                 costCodeSource: "backfill",
                 costCodeConfidence: null,
-                why: "item cost code",
+                why: sameEstimate ? "item cost code (own estimate)" : "item cost code (same project)",
                 expense,
             });
             continue;
         }
 
         // (c) the rules, only on active customer jobs.
-        if (!resolvedProjectId || !inScope.has(resolvedProjectId)) {
-            remainder.push(expense);
+        if (!resolvedProjectId) {
+            add(expense, "no-project");
+            continue;
+        }
+        if (!inScope.has(resolvedProjectId)) {
+            add(expense, "out-of-scope");
             continue;
         }
         const suggestion = suggestCode(expense);
@@ -143,7 +173,7 @@ export function planBackfill({ expenses, itemCostCodeById, costCodeIdByCode, sco
                 expense,
             });
         } else {
-            remainder.push(expense);
+            add(expense, suggestion ? "unknown-code" : "no-rule-match");
         }
     }
 
@@ -164,7 +194,7 @@ function csvEscape(value) {
 }
 
 export function remainderCsv(remainder, projectNameById) {
-    const lines = [["expense_id", "project", "date", "vendor", "amount", "description"].join(",")];
+    const lines = [["expense_id", "project", "date", "vendor", "amount", "reason", "description"].join(",")];
     for (const expense of remainder) {
         lines.push([
             expense.id,
@@ -172,6 +202,10 @@ export function remainderCsv(remainder, projectNameById) {
             expense.date ? new Date(expense.date).toISOString().slice(0, 10) : "",
             csvEscape(expense.vendor),
             num(expense.amount).toFixed(2),
+            // WHY it is here. "item-outside-estimate" in particular is not
+            // "we could not guess" — it is "this row claims a line item on
+            // another job", which is a data problem a human should look at.
+            csvEscape(expense.reason),
             csvEscape(expense.description),
         ].join(","));
     }
@@ -208,19 +242,29 @@ export async function runBackfill({
 
     const expenses = await db.expense.findMany({
         select: {
-            id: true, projectId: true, costCodeId: true, costCodeSource: true,
+            id: true, estimateId: true, projectId: true, costCodeId: true, costCodeSource: true,
             itemId: true, amount: true, vendor: true, description: true, date: true,
             estimate: { select: { projectId: true } },
         },
     });
 
-    const items = await db.estimateItem.findMany({
+    // The item's OWN estimate and project come back with it: the fallback has
+    // to prove the link does not cross jobs before it copies a code.
+    const itemRows = await db.estimateItem.findMany({
         where: { costCodeId: { not: null } },
-        select: { id: true, costCodeId: true },
+        select: {
+            id: true, costCodeId: true, estimateId: true,
+            estimate: { select: { projectId: true } },
+        },
     });
-    const itemCostCodeById = new Map(items.map(i => [i.id, i.costCodeId]));
+    const items = new Map(itemRows.map(row => [row.id, {
+        costCodeId: row.costCodeId,
+        estimateId: row.estimateId,
+        projectId: row.estimate?.projectId ?? null,
+    }]));
+    const itemCostCodeById = new Map(itemRows.map(row => [row.id, row.costCodeId]));
 
-    const plan = planBackfill({ expenses, itemCostCodeById, costCodeIdByCode, scopedProjectIds });
+    const plan = planBackfill({ expenses, items, costCodeIdByCode, scopedProjectIds });
 
     // ── the table ───────────────────────────────────────────────────────────
     const scoped = new Set(scopedProjectIds);
@@ -279,6 +323,15 @@ export async function runBackfill({
         log(`  ${key.padEnd(40)} ${String(v.n).padStart(4)} rows  ${money(v.sum).padStart(13)}`);
     }
     log(`NEEDS HUMAN: ${plan.remainder.length} rows  ${money(plan.remainder.reduce((t, e) => t + Math.abs(num(e.amount)), 0))}`);
+    const byReason = new Map();
+    for (const expense of plan.remainder) {
+        byReason.set(expense.reason, (byReason.get(expense.reason) ?? 0) + 1);
+    }
+    for (const [reason, n] of [...byReason.entries()].sort((a, b) => b[1] - a[1])) {
+        // A non-zero "item-outside-estimate" is a DATA problem, not a coding
+        // gap: some expense points at a line item on another job.
+        log(`  ${String(reason).padEnd(24)} ${String(n).padStart(4)} rows`);
+    }
 
     if (csvPath) {
         writeFile(csvPath, remainderCsv(plan.remainder, projectNameById));
