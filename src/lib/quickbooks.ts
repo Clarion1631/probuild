@@ -202,7 +202,13 @@ export function isSharedQboFailureStatus(status: number): boolean {
  * 20s timeouts added up to the payments cron's entire 120s ceiling.
  */
 export function isQboConnectionFailure(error: unknown): boolean {
-    return isQBTimeoutError(error) || isRetryableQboError(error);
+    if (isQBTimeoutError(error) || isRetryableQboError(error)) return true;
+    // A 401/403 is the SAME credential failing, so every remaining record in a
+    // sweep will fail identically at full cost. Only the transient statuses
+    // were recognised here, so an expired token let a loop grind through
+    // hundreds of rows proving the same thing.
+    const status = qboHttpStatus(error);
+    return status === 401 || status === 403;
 }
 
 export function isQBTimeoutError(error: unknown): error is QBTimeoutError {

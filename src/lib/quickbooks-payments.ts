@@ -17,6 +17,7 @@ import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbo
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import { logAutomationEvent } from "./automation-events";
+import { createHash } from "node:crypto";
 import {
     type QBTokens,
     refreshQBToken,
@@ -197,6 +198,7 @@ export async function claimQBInvoiceUnlink(
             // "ambiguous retry" of a link that no longer exists, and Intuit
             // would hand back the invoice we just unlinked.
             qbIssuanceKey: null,
+            qbIssuancePayloadHash: null,
         },
     });
     return cleared.count === 1;
@@ -247,7 +249,27 @@ export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
  * that may follow. An unbudgeted push was the remaining way to run to the
  * platform's ceiling and be killed between the invoice create and the link.
  */
-export const MILESTONE_PUSH_BUDGET_MS = 55_000;
+export const MILESTONE_PUSH_BUDGET_MS = 45_000;
+/** Never spend the last slice of the route: leave the platform room to respond. */
+export const PLATFORM_RESERVE_MS = 2_000;
+
+/**
+ * How long compensation may take, measured when it BEGINS.
+ *
+ * Never additive: the old form added the cleanup window to whatever the route
+ * had left, which could push the total past the platform ceiling — the exact
+ * thing the budget exists to prevent. It is the SMALLER of the standard
+ * cleanup window and the route's real remaining headroom, minus a reserve so
+ * the function can still return a response.
+ */
+export function compensationWindowMs(routeRemainingMs: number): number {
+    if (!Number.isFinite(routeRemainingMs)) return MILESTONE_CLEANUP_BUDGET_MS;
+    const usable = Math.floor(routeRemainingMs) - PLATFORM_RESERVE_MS;
+    // Below the floor there is no useful window left; give the delete the
+    // minimum a call needs rather than a negative or absurd deadline.
+    if (usable <= 1_000) return 1_000;
+    return Math.min(MILESTONE_CLEANUP_BUDGET_MS, usable);
+}
 
 /**
  * The per-issuance idempotency seed, minted before the first QBO call.
@@ -261,21 +283,93 @@ export const MILESTONE_PUSH_BUDGET_MS = 55_000;
  * The CAS write is what makes it safe under concurrency: two pushes racing the
  * same milestone cannot mint two keys, so they cannot create two invoices.
  */
+/**
+ * Canonical hash of what we are asking QuickBooks to bill.
+ *
+ * Field equality on the RETURNED invoice catches drift QBO echoes back, but
+ * QBO does not echo everything: a line description edit, or a tax split that
+ * keeps the same grand total, come back looking identical. Hashing the payload
+ * we SENT closes that: same key + same hash is genuinely the same bill; same
+ * key + different hash means the milestone changed under an ambiguous retry.
+ *
+ * Ordering is fixed and nulls are explicit, so "no due date" hashes
+ * differently from "due date removed since" only when it actually differs.
+ */
+export function issuancePayloadHash(payload: {
+    customerId: string;
+    docNumber: string;
+    dueDate: string | null;
+    lineDescriptions: string[];
+    preTaxAmount: number;
+    taxAmount: number;
+    taxCode: string | null;
+    privateNote: string | null;
+}): string {
+    const canonical = JSON.stringify([
+        ["customerId", payload.customerId],
+        ["docNumber", payload.docNumber],
+        ["dueDate", payload.dueDate],
+        ["lineDescriptions", payload.lineDescriptions],
+        ["preTaxAmount", Number(payload.preTaxAmount).toFixed(2)],
+        ["taxAmount", Number(payload.taxAmount).toFixed(2)],
+        ["taxCode", payload.taxCode],
+        ["privateNote", payload.privateNote],
+    ]);
+    return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * True when a stored issuance can be reused for this payload. A stored hash
+ * that differs means the bill changed; a MISSING stored hash (a row minted
+ * before this column existed) is treated as reusable — refusing every legacy
+ * row would strand them.
+ */
+export function issuanceMatchesPayload(storedHash: string | null, currentHash: string): boolean {
+    if (!storedHash) return true;
+    return storedHash === currentHash;
+}
+
 export async function ensureIssuanceKey(
     model: { findUnique: Function; updateMany: Function },
     id: string,
     existing: string | null,
-): Promise<string> {
-    if (existing) return existing; // an ambiguous retry — reuse it
+    payloadHash: string,
+    storedHash: string | null = null,
+): Promise<{ key: string; reused: boolean }> {
+    if (existing) {
+        // An ambiguous retry. Reuse ONLY if it is still the same bill — a
+        // stored hash that differs means the milestone changed under us, and
+        // the invoice Intuit would hand back describes the old one.
+        if (!issuanceMatchesPayload(storedHash, payloadHash)) {
+            throw new IssuancePayloadChangedError(id);
+        }
+        return { key: existing, reused: true };
+    }
     const minted = qboRequestId(`${id}:${Date.now()}:${Math.random().toString(16).slice(2)}`);
     const claimed = await model.updateMany({
         where: { id, qbIssuanceKey: null },
-        data: { qbIssuanceKey: minted },
+        data: { qbIssuanceKey: minted, qbIssuancePayloadHash: payloadHash },
     });
-    if (claimed.count === 1) return minted;
-    // Someone else minted first; use theirs so both attempts share one key.
-    const row = await model.findUnique({ where: { id }, select: { qbIssuanceKey: true } });
-    return row?.qbIssuanceKey ?? minted;
+    if (claimed.count === 1) return { key: minted, reused: false };
+    // Someone else minted first; use theirs so both attempts share one key —
+    // but only if they were billing the same thing.
+    const row = await model.findUnique({
+        where: { id },
+        select: { qbIssuanceKey: true, qbIssuancePayloadHash: true },
+    });
+    if (!row?.qbIssuanceKey) return { key: minted, reused: false };
+    if (!issuanceMatchesPayload(row.qbIssuancePayloadHash ?? null, payloadHash)) {
+        throw new IssuancePayloadChangedError(id);
+    }
+    return { key: row.qbIssuanceKey, reused: true };
+}
+
+/** The stored issuance describes a different bill than the one being sent now. */
+export class IssuancePayloadChangedError extends Error {
+    name = "IssuancePayloadChangedError";
+    constructor(id: string) {
+        super(`The billing details changed since this QuickBooks invoice was first staged (${id}); re-issue instead of retrying.`);
+    }
 }
 
 /**
@@ -375,12 +469,6 @@ export async function pushMilestoneToQuickBooks(
         return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
     }
 
-    const issuanceKey = await ensureIssuanceKey(
-        prisma.paymentSchedule as never,
-        schedule.id,
-        schedule.qbIssuanceKey ?? null,
-    );
-
     const invoice = schedule.invoice;
     const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId, pushDeadline);
 
@@ -408,6 +496,28 @@ export async function pushMilestoneToQuickBooks(
         if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
+    const description = `${projectName} — ${schedule.name}`;
+    const privateNote = `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`;
+    // Hashed BEFORE the create, from what we are about to send — a retry that
+    // hashes differently is billing something else and must not reuse the key.
+    const payloadHash = issuancePayloadHash({
+        customerId,
+        docNumber,
+        dueDate: schedule.dueDate ? schedule.dueDate.toISOString().split("T")[0] : null,
+        lineDescriptions: [description],
+        preTaxAmount: tax ? tax.preTaxAmount : amount,
+        taxAmount: tax ? tax.taxAmount : 0,
+        taxCode: tax ? "TAX" : null,
+        privateNote,
+    });
+    const { key: issuanceKey } = await ensureIssuanceKey(
+        prisma.paymentSchedule as never,
+        schedule.id,
+        schedule.qbIssuanceKey ?? null,
+        payloadHash,
+        schedule.qbIssuancePayloadHash ?? null,
+    );
+
     const created = await createQBMilestoneInvoice(tokens, {
         docNumber,
         // Per-ISSUANCE, not per-row: an unlink clears it so the next send mints
@@ -415,12 +525,12 @@ export async function pushMilestoneToQuickBooks(
         idempotencyKey: issuanceKey,
         customerId,
         itemId,
-        description: `${projectName} — ${schedule.name}`,
+        description,
         amount,
         tax,
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
-        privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
+        privateNote,
     }, pushDeadline);
 
     const { qbId, total } = created;
@@ -502,16 +612,25 @@ export async function pushMilestoneToQuickBooks(
         });
     }));
     if (linked.count !== 1) {
+        // Losing the claim does not prove the milestone changed. The commonest
+        // cause is a CONCURRENT push that linked this very invoice first —
+        // both attempts share one issuance key, so Intuit returned the same
+        // invoice to both. Deleting it here would tear down the winner's work
+        // and leave the milestone pointing at a QBO invoice that no longer
+        // exists. Re-read before compensating.
+        const current = await prisma.paymentSchedule.findUnique({
+            where: { id: schedule.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        });
+        if (current?.qbInvoiceId === qbId) {
+            return { qbInvoiceId: qbId, payLink: current.qbInvoiceLink ?? payLink, qbTotal: total };
+        }
         // The compensation clock starts HERE, when compensation begins — not at
         // entry, where it would have been ticking down through every call that
         // preceded it and could already be spent by the time it is needed. It
         // is also capped by what the ROUTE has left, so cleanup cannot itself
         // overrun the platform ceiling: reserve whichever is smaller.
-        const routeHeadroom = remainingBudgetMs(pushDeadline);
-        const cleanupMs = Number.isFinite(routeHeadroom)
-            ? Math.max(1_000, Math.min(MILESTONE_CLEANUP_BUDGET_MS, Math.floor(routeHeadroom) + MILESTONE_CLEANUP_BUDGET_MS))
-            : MILESTONE_CLEANUP_BUDGET_MS;
-        const cleanupDeadline = createRouteDeadline(cleanupMs);
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
         const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
         if (!compensated) {
             // Even the reserved budget is gone (or the delete was refused).

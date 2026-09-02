@@ -703,6 +703,11 @@ model PaymentSchedule {
   /// and gets a genuinely new invoice. Keying on the row id could not tell
   /// those apart.
   qbIssuanceKey   String?
+  /// sha256 of the canonical billing payload this issuance was created from.
+  /// An ambiguous retry compares it: same key + same hash means "this is the
+  /// same bill, reuse the invoice"; same key + different hash means the
+  /// milestone changed under us and the returned invoice must not be linked.
+  qbIssuancePayloadHash String?
   qbInvoiceLink   String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId     String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt      DateTime?
@@ -805,6 +810,11 @@ model ProgressBilling {
   /// and gets a genuinely new invoice. Keying on the row id could not tell
   /// those apart.
   qbIssuanceKey   String?
+  /// sha256 of the canonical billing payload this issuance was created from.
+  /// An ambiguous retry compares it: same key + same hash means "this is the
+  /// same bill, reuse the invoice"; same key + different hash means the
+  /// milestone changed under us and the returned invoice must not be linked.
+  qbIssuancePayloadHash String?
   qbInvoiceLink   String?
   qbInvoiceSentAt DateTime?
   qbPaymentId     String?

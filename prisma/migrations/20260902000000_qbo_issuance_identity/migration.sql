@@ -10,3 +10,8 @@
 -- Additive and nullable: safe to apply while the old build is live.
 ALTER TABLE "PaymentSchedule" ADD COLUMN IF NOT EXISTS "qbIssuanceKey" TEXT;
 ALTER TABLE "ProgressBilling" ADD COLUMN IF NOT EXISTS "qbIssuanceKey" TEXT;
+
+-- The payload the issuance was created from, so an ambiguous retry can tell
+-- "same bill, reuse it" from "this changed, do not link it".
+ALTER TABLE "PaymentSchedule" ADD COLUMN IF NOT EXISTS "qbIssuancePayloadHash" TEXT;
+ALTER TABLE "ProgressBilling" ADD COLUMN IF NOT EXISTS "qbIssuancePayloadHash" TEXT;

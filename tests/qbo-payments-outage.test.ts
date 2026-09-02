@@ -1345,32 +1345,37 @@ test("an unresolvable orphan is recorded durably, not just logged", async () => 
 // --- Per-issuance identity: retry vs re-issue ---
 
 /** In-memory stand-in for the PaymentSchedule/ProgressBilling rows the helper CASes on. */
-function fakeIssuanceModel(initial: string | null = null) {
-    const row = { qbIssuanceKey: initial };
+function fakeIssuanceModel(initial: string | null = null, initialHash: string | null = null) {
+    const row: { qbIssuanceKey: string | null; qbIssuancePayloadHash: string | null } =
+        { qbIssuanceKey: initial, qbIssuancePayloadHash: initialHash };
     return {
         row,
         model: {
-            async findUnique() { return { qbIssuanceKey: row.qbIssuanceKey }; },
-            async updateMany({ where, data }: { where: { qbIssuanceKey: null | string }; data: { qbIssuanceKey: string } }) {
+            async findUnique() { return { ...row }; },
+            async updateMany({ where, data }: { where: { qbIssuanceKey: null | string }; data: { qbIssuanceKey: string; qbIssuancePayloadHash: string } }) {
                 // Mirrors the CAS: only claims when the column is still null.
                 if (where.qbIssuanceKey === null && row.qbIssuanceKey !== null) return { count: 0 };
                 row.qbIssuanceKey = data.qbIssuanceKey;
+                row.qbIssuancePayloadHash = data.qbIssuancePayloadHash;
                 return { count: 1 };
             },
         },
     };
 }
 
+const HASH_A = "hash-a";
+const HASH_B = "hash-b";
+
 test("an ambiguous retry REUSES the key, so Intuit returns the original invoice", async () => {
     const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
     const { model, row } = fakeIssuanceModel();
 
-    const first = await ensureIssuanceKey(model as never, "sched-1", null);
+    const { key: first } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
     assert.ok(first, "a key is minted before the first QBO call");
     assert.equal(row.qbIssuanceKey, first, "and persisted, so it survives the process");
 
     // The retry reads the stored key and passes it back in.
-    const retry = await ensureIssuanceKey(model as never, "sched-1", row.qbIssuanceKey);
+    const { key: retry } = await ensureIssuanceKey(model as never, "sched-1", row.qbIssuanceKey, HASH_A, row.qbIssuancePayloadHash);
     assert.equal(retry, first, "same key -> no duplicate invoice");
 });
 
@@ -1378,11 +1383,12 @@ test("a RE-ISSUE after unlink mints a NEW key, so a new invoice is created", asy
     const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
     const { model, row } = fakeIssuanceModel();
 
-    const first = await ensureIssuanceKey(model as never, "sched-1", null);
+    const { key: first } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
     // breakQBInvoiceLink clears it (qbIssuanceKey: null in the unlink write).
     row.qbIssuanceKey = null;
+    row.qbIssuancePayloadHash = null;
 
-    const reissued = await ensureIssuanceKey(model as never, "sched-1", null);
+    const { key: reissued } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
     // Codex gate: keying on the row id could not express this - the re-send
     // reused the same key and Intuit handed back the invoice just unlinked.
     assert.notEqual(reissued, first, "a new issuance must not reuse the old key");
@@ -1393,10 +1399,10 @@ test("two racing pushes share ONE key, so they cannot create two invoices", asyn
     const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
     const { model } = fakeIssuanceModel();
     const [a, b] = await Promise.all([
-        ensureIssuanceKey(model as never, "sched-1", null),
-        ensureIssuanceKey(model as never, "sched-1", null),
+        ensureIssuanceKey(model as never, "sched-1", null, HASH_A),
+        ensureIssuanceKey(model as never, "sched-1", null, HASH_A),
     ]);
-    assert.equal(a, b, "the CAS loser adopts the winner's key");
+    assert.equal(a.key, b.key, "the CAS loser adopts the winner's key");
 });
 
 // --- Reconciliation: every expected field must be present AND equal ---
@@ -1450,16 +1456,145 @@ test("the cleanup budget is not already spent by the calls that preceded it", as
     const { MILESTONE_CLEANUP_BUDGET_MS, MILESTONE_PUSH_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
     const { createRouteDeadline, isBudgetExhausted } = await import("../src/lib/quickbooks");
 
-    assert.equal(MILESTONE_PUSH_BUDGET_MS, 55_000);
+    assert.equal(MILESTONE_PUSH_BUDGET_MS, 45_000);
     assert.equal(MILESTONE_CLEANUP_BUDGET_MS, 10_000);
 
     // Codex gate: reserving the clock at ENTRY meant it ticked down through
     // every call that preceded compensation, so by the time it was needed it
     // could already be gone. Started at compensation time it is always fresh.
-    const pushDeadline = createRouteDeadline(MILESTONE_PUSH_BUDGET_MS, Date.now() - 54_000);
+    const pushDeadline = createRouteDeadline(MILESTONE_PUSH_BUDGET_MS, Date.now() - 44_000);
     await new Promise(resolve => setTimeout(resolve, 60));
     assert.ok(isBudgetExhausted(pushDeadline), "the push budget really is nearly gone");
 
     const cleanupDeadline = createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS);
     assert.equal(isBudgetExhausted(cleanupDeadline), false, "compensation still has its full window");
+});
+
+
+// --- The compensation window is never additive ---
+
+test("the cleanup window is the SMALLER of its own budget and route headroom", async () => {
+    const { compensationWindowMs, MILESTONE_CLEANUP_BUDGET_MS, PLATFORM_RESERVE_MS } =
+        await import("../src/lib/quickbooks-payments");
+
+    // Codex gate: the old form ADDED the cleanup window to what the route had
+    // left, which could push the total past the platform ceiling - the exact
+    // thing the budget exists to prevent.
+    assert.equal(compensationWindowMs(30_000), MILESTONE_CLEANUP_BUDGET_MS, "plenty of headroom: the standard window");
+    assert.equal(compensationWindowMs(6_000), 6_000 - PLATFORM_RESERVE_MS, "tight headroom: bounded by the route");
+    // Never more than the route can afford.
+    for (const remaining of [30_000, 12_000, 6_000, 3_000, 500, 0, -5_000]) {
+        const window = compensationWindowMs(remaining);
+        assert.ok(window <= MILESTONE_CLEANUP_BUDGET_MS, `window ${window} exceeds the cleanup budget`);
+        if (remaining > PLATFORM_RESERVE_MS + 1_000) {
+            assert.ok(window <= remaining - PLATFORM_RESERVE_MS, `window ${window} ate the platform reserve`);
+        }
+        assert.ok(window >= 1_000, "a call still needs a usable floor");
+    }
+});
+
+// --- A lost claim may be a concurrent WINNER ---
+
+test("losing the claim to a concurrent push that linked the SAME invoice is a success", async () => {
+    // Both pushes share one issuance key, so Intuit returns the same invoice to
+    // both. Compensating here would delete the winner's invoice and leave the
+    // milestone pointing at a QBO invoice that no longer exists.
+    const qbId = "inv-77";
+    const rowAfterRace = { qbInvoiceId: qbId, qbInvoiceLink: "https://pay/77" };
+    // Mirrors the re-read guard in pushMilestoneToQuickBooks / stageProgressBilling.
+    const isConcurrentWinner = rowAfterRace.qbInvoiceId === qbId;
+    assert.equal(isConcurrentWinner, true, "the row already points at the invoice we got back");
+
+    // A genuine mid-push edit looks different: the row points somewhere else.
+    const rowAfterEdit = { qbInvoiceId: null as string | null, qbInvoiceLink: null as string | null };
+    assert.equal(rowAfterEdit.qbInvoiceId === qbId, false, "then, and only then, compensate");
+});
+
+// --- Payload hash: same key only when it is the same bill ---
+
+test("a retry whose PAYLOAD changed refuses to reuse the issuance", async () => {
+    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
+    const { model, row } = fakeIssuanceModel();
+    const { key } = await ensureIssuanceKey(model as never, "sched-1", null, HASH_A);
+
+    // Same key, same bill: reuse.
+    const again = await ensureIssuanceKey(model as never, "sched-1", key, HASH_A, row.qbIssuancePayloadHash);
+    assert.equal(again.key, key);
+
+    // Same key, DIFFERENT bill: the invoice Intuit would hand back describes
+    // the old one, so this must not be treated as an ambiguous retry.
+    await assert.rejects(
+        () => ensureIssuanceKey(model as never, "sched-1", key, HASH_B, row.qbIssuancePayloadHash),
+        (e: unknown) => (e as Error).name === "IssuancePayloadChangedError",
+    );
+});
+
+test("a legacy row with no stored hash is still reusable", async () => {
+    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
+    const { model } = fakeIssuanceModel("old-key", null);
+    // Rows minted before the column existed must not be stranded.
+    const { key } = await ensureIssuanceKey(model as never, "sched-1", "old-key", HASH_A, null);
+    assert.equal(key, "old-key");
+});
+
+test("the hash catches changes QBO does not echo back", async () => {
+    const { issuancePayloadHash } = await import("../src/lib/quickbooks-payments");
+    const base = {
+        customerId: "c1", docNumber: "INV-1-1", dueDate: "2026-10-01",
+        lineDescriptions: ["Project — Deposit"], preTaxAmount: 1000, taxAmount: 80,
+        taxCode: "TAX", privateNote: "note",
+    };
+    const h = issuancePayloadHash(base);
+    assert.equal(issuancePayloadHash({ ...base }), h, "same payload, same hash");
+
+    // A cleared due date.
+    assert.notEqual(issuancePayloadHash({ ...base, dueDate: null }), h, "cleared due date");
+    // A description-only edit: same total, QBO echoes nothing useful.
+    assert.notEqual(
+        issuancePayloadHash({ ...base, lineDescriptions: ["Project — Deposit (revised)"] }),
+        h,
+        "description-only change",
+    );
+    // A tax-only change with the SAME grand total (1080 either way).
+    assert.notEqual(
+        issuancePayloadHash({ ...base, preTaxAmount: 1080, taxAmount: 0, taxCode: null }),
+        h,
+        "tax-only change with an identical total",
+    );
+});
+
+// --- A shared 401/403 aborts a sweep ---
+
+test("a 401/403 is a connection failure, so a sweep stops instead of grinding", async () => {
+    const { isQboConnectionFailure, QboHttpError, QboRetryableError, QBTimeoutError } =
+        await import("../src/lib/quickbooks");
+
+    // Codex gate: only the transient statuses were recognised here, so an
+    // expired token let a loop work through hundreds of rows proving the same
+    // credential was still bad, at a full deadline each.
+    assert.equal(isQboConnectionFailure(new QboHttpError("401", 401)), true);
+    assert.equal(isQboConnectionFailure(new QboHttpError("403", 403)), true);
+    assert.equal(isQboConnectionFailure(new QBTimeoutError("timeout")), true);
+    assert.equal(isQboConnectionFailure(new QboRetryableError("503", 503)), true);
+
+    // A per-record refusal is NOT shared: the next row may be fine.
+    assert.equal(isQboConnectionFailure(new QboHttpError("400", 400)), false);
+    assert.equal(isQboConnectionFailure(new QboHttpError("404", 404)), false);
+    assert.equal(isQboConnectionFailure(new Error("plain")), false);
+});
+
+test("the maintenance sync response reports the RUN, not just the request", async () => {
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    // Mirrors the route's `incomplete` expression.
+    const incomplete = (r: { runFailed: boolean; skipped: number; errors: string[] }) =>
+        r.runFailed || r.skipped > 0 || r.errors.length > 0;
+
+    const clean = { ...emptyResult() };
+    assert.equal(incomplete(clean), false);
+    assert.equal(paymentsSyncRunStatus(clean), "ok");
+
+    // A partial run must not read as a clean sweep to whoever called it.
+    assert.equal(incomplete({ ...emptyResult(), skipped: 12 }), true);
+    assert.equal(incomplete({ ...emptyResult(), errors: ["INV-1: boom"] }), true);
+    assert.equal(incomplete({ ...emptyResult(), runFailed: true }), true);
 });

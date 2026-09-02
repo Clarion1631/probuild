@@ -65,7 +65,19 @@ export async function POST(req: Request) {
         if (body.action === "sync-payments") {
             const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
             const result = await syncQuickBooksPayments(undefined, { source: "manual", deadline });
-            return NextResponse.json({ ok: true, ...result });
+            // `ok` reflects the RUN, not the fact that the handler returned. A
+            // run that failed outright, skipped rows, or hit row errors left
+            // work undone, and reporting ok:true taught every caller (and the
+            // operator reading it) that the sweep was clean. Status stays 200:
+            // the request itself succeeded and the body carries the detail.
+            const incomplete = result.runFailed || result.skipped > 0 || result.errors.length > 0;
+            return NextResponse.json({
+                ok: !incomplete,
+                ...(incomplete
+                    ? { reason: result.failureReason ?? "incomplete-run", retry: true }
+                    : {}),
+                ...result,
+            });
         }
         const qbTokens = tokens!;
         if (body.action === "test-settle") {

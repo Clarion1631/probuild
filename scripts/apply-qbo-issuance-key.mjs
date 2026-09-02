@@ -58,11 +58,13 @@ export function targetMatches(actual, expectDb, expectHost) {
 export const statements = [
     `ALTER TABLE "PaymentSchedule" ADD COLUMN IF NOT EXISTS "qbIssuanceKey" TEXT`,
     `ALTER TABLE "ProgressBilling" ADD COLUMN IF NOT EXISTS "qbIssuanceKey" TEXT`,
+    `ALTER TABLE "PaymentSchedule" ADD COLUMN IF NOT EXISTS "qbIssuancePayloadHash" TEXT`,
+    `ALTER TABLE "ProgressBilling" ADD COLUMN IF NOT EXISTS "qbIssuancePayloadHash" TEXT`,
 ];
 
 const expectedColumns = {
-    PaymentSchedule: ["qbIssuanceKey"],
-    ProgressBilling: ["qbIssuanceKey"],
+    PaymentSchedule: ["qbIssuanceKey", "qbIssuancePayloadHash"],
+    ProgressBilling: ["qbIssuanceKey", "qbIssuancePayloadHash"],
 };
 
 async function main() {
