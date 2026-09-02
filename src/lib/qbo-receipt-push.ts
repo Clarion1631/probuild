@@ -31,40 +31,16 @@ import {
     qbTimedFetch,
     parseJsonOrNull,
     isQBTimeoutError,
+    QboRetryableError,
+    isRetryableQboError,
+    isRetryableQboStatus,
     type QBTokens,
     type QBAttachable,
 } from "./quickbooks";
 
-/**
- * A QBO failure that WILL plausibly succeed on a later attempt: 429, 5xx, a
- * thrown network error, or a failed attachment lookup.
- *
- * These used to be flattened into `failed:<status>` next to `ok: true`, which
- * the Apps Script treats as FINAL — it stops resending, so a rate-limited or
- * briefly-5xx attachment upload left the Purchase permanently without its
- * receipt. Raising instead lets the route answer 503 retry:true, and the next
- * pass hits the idempotent existing-Purchase recovery. A 4xx other than 429 is
- * a real business rejection and stays terminal: retrying it forever is worse.
- */
-export class QboRetryableError extends Error {
-    name = "QboRetryableError";
-    constructor(message: string, readonly status?: number) {
-        super(message);
-    }
-}
-
-/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
-export function isRetryableQboError(error: unknown): boolean {
-    return (
-        error instanceof QboRetryableError ||
-        (error instanceof Error && error.name === "QboRetryableError")
-    );
-}
-
-/** A QBO HTTP status we should come back to rather than give up on. */
-export function isRetryableQboStatus(status: number): boolean {
-    return status === 429 || status >= 500;
-}
+// Retryable-failure vocabulary lives in quickbooks.ts (the payments rail needs
+// it too); re-exported here because this module's callers already import it.
+export { QboRetryableError, isRetryableQboError, isRetryableQboStatus };
 
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
 export class QboVendorDuplicateError extends Error {
@@ -340,7 +316,7 @@ export function attachmentFileName(rawFileName: string | undefined): string {
     return (rawFileName || "receipt").replace(/[\r\n"]/g, "") || "receipt";
 }
 
-async function defaultUploadAttachment(
+export async function defaultUploadAttachment(
     tokens: QBTokens,
     purchaseId: string,
     file: { base64: string; contentType: string; fileName: string },
@@ -391,6 +367,14 @@ async function defaultUploadAttachment(
     const fault = data?.AttachableResponse?.[0]?.Fault;
     // A Fault is a business rejection (bad ref, unsupported type) — terminal.
     if (fault) return "failed:fault";
+    // Intuit's schema says an AttachableResponse carries either an Attachable
+    // or a Fault — absence is NOT success. An empty, truncated, or HTML 200
+    // (proxy/CDN error pages are the usual source) used to fall through to
+    // "attached", banking a terminal success for a file that was never stored,
+    // so the bot never came back for it. Demand the created id.
+    if (!data?.AttachableResponse?.[0]?.Attachable?.Id) {
+        throw new QboRetryableError("QB attachment upload returned no Attachable id");
+    }
     return "attached";
 }
 

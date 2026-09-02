@@ -51,7 +51,7 @@ export async function POST(req: Request) {
         }
         if (body.action === "sync-payments") {
             const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
-            const result = await syncQuickBooksPayments();
+            const result = await syncQuickBooksPayments(undefined, { source: "manual" });
             return NextResponse.json({ ok: true, ...result });
         }
         if (body.action === "test-team-notify") {

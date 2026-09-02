@@ -322,3 +322,37 @@ test("the digest reports the payments rail alongside the receipt rail", () => {
     const { text } = formatPipelineDigest(sampleHealth());
     assert.match(text, /Last payments sync: /);
 });
+
+
+// --- The payments heartbeat must be able to go red ---
+
+test("a null payments heartbeat is NOT ok - the hourly cron has never reported", () => {
+    const v = evaluatePipelineHealth(snapshot({ lastPaymentsSync: { status: "ok", at: null } }));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("payments-sync-stale"));
+});
+
+test("a payments heartbeat older than 26h is stale", () => {
+    const fresh = evaluatePipelineHealth(snapshot({ lastPaymentsSync: { status: "ok", at: iso(25 * HOUR) } }));
+    assert.deepEqual(fresh, { ok: true, reasons: [] });
+
+    const stale = evaluatePipelineHealth(snapshot({ lastPaymentsSync: { status: "ok", at: iso(27 * HOUR) } }));
+    assert.equal(stale.ok, false);
+    assert.deepEqual(stale.reasons, ["payments-sync-stale"]);
+});
+
+test("a weeks-old payments heartbeat never decays back into ok", () => {
+    for (const days of [3, 30, 400]) {
+        const v = evaluatePipelineHealth(snapshot({ lastPaymentsSync: { status: "ok", at: iso(days * 24 * HOUR) } }));
+        assert.equal(v.ok, false, `${days}d`);
+        assert.ok(v.reasons.includes("payments-sync-stale"));
+    }
+});
+
+test("only a CRON-sourced run counts as the heartbeat", async () => {
+    const { PAYMENTS_SYNC_CRON_SOURCE, PAYMENTS_SYNC_STALE_HOURS } = await import("../src/lib/pipeline-health");
+    // On-view and manual refreshes write their own source precisely so they
+    // cannot stand in for an hourly job that has stopped running.
+    assert.equal(PAYMENTS_SYNC_CRON_SOURCE, "cron");
+    assert.equal(PAYMENTS_SYNC_STALE_HOURS, 26);
+});

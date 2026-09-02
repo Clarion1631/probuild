@@ -15,7 +15,7 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const result = await syncQuickBooksPayments();
+    const result = await syncQuickBooksPayments(undefined, { source: "cron" });
     if (result.settled > 0 || result.errors.length > 0) {
         console.log("[cron/quickbooks-payments]", JSON.stringify(result));
     }

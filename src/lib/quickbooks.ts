@@ -43,6 +43,44 @@ export class QBTimeoutError extends Error {
  * misclassification the whole deadline effort exists to prevent. The name is
  * set as a class field on every instance, so match on that too.
  */
+/**
+ * A QBO failure that WILL plausibly succeed on a later attempt: 429, 5xx, a
+ * thrown network error, or a dependent lookup that failed for those reasons.
+ *
+ * Distinct from a business rejection (a 4xx other than 429, or a QBO Fault),
+ * which is terminal and must NOT be retried forever.
+ */
+export class QboRetryableError extends Error {
+    name = "QboRetryableError";
+    constructor(message: string, readonly status?: number) {
+        super(message);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isRetryableQboError(error: unknown): boolean {
+    return (
+        error instanceof QboRetryableError ||
+        (error instanceof Error && error.name === "QboRetryableError")
+    );
+}
+
+/** A QBO HTTP status we should come back to rather than give up on. */
+export function isRetryableQboStatus(status: number): boolean {
+    return status === 429 || status >= 500;
+}
+
+/**
+ * Did QBO fail in a way that means the NEXT call will fail the same way?
+ *
+ * A caller looping over many records must stop on this: each further attempt
+ * burns its own full deadline against the same wall, which is how a handful of
+ * 20s timeouts added up to the payments cron's entire 120s ceiling.
+ */
+export function isQboConnectionFailure(error: unknown): boolean {
+    return isQBTimeoutError(error) || isRetryableQboError(error);
+}
+
 export function isQBTimeoutError(error: unknown): error is QBTimeoutError {
     return (
         error instanceof QBTimeoutError ||
@@ -719,9 +757,16 @@ export async function getQBPayment(
     paymentId: string
 ): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null> {
     const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const p = data.Payment;
+    if (!res.ok) {
+        // 429/5xx is QBO refusing to serve, not "this payment does not exist" —
+        // raise so a looping caller aborts instead of burning a deadline per row.
+        if (isRetryableQboStatus(res.status)) {
+            throw new QboRetryableError(`QB payment read failed with status ${res.status}`, res.status);
+        }
+        return null;
+    }
+    const data = await parseJsonOrNull(res);
+    const p = data?.Payment;
     if (!p) return null;
     return {
         txnDate: p.TxnDate || null,

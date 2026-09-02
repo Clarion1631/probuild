@@ -1063,3 +1063,71 @@ test("a purchase create that times out surfaces as 503 qbo-timeout at the route"
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-timeout" });
 });
+
+
+// --- Upload response validation ---
+
+/** Swap global fetch for one call; defaultUploadAttachment goes through it. */
+async function withFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<T> {
+    const original = globalThis.fetch;
+    globalThis.fetch = impl;
+    try {
+        return await run();
+    } finally {
+        globalThis.fetch = original;
+    }
+}
+
+const uploadFile = { base64: Buffer.from("bytes").toString("base64"), contentType: "image/jpeg", fileName: "receipt.jpg" };
+
+async function upload(response: Response) {
+    const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
+    return withFetch(async () => response, () => defaultUploadAttachment(TOKENS, "99", uploadFile));
+}
+
+const jsonResponse = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+test("an upload is only 'attached' when QBO returns a real Attachable id", async () => {
+    const result = await upload(jsonResponse(200, { AttachableResponse: [{ Attachable: { Id: "att-1" } }] }));
+    assert.equal(result, "attached");
+});
+
+test("a 200 with NO Attachable is retryable, never a terminal success", async () => {
+    // Codex gate: Intuit's schema says an AttachableResponse carries either an
+    // Attachable or a Fault - absence is not success. An empty/truncated/HTML
+    // 200 (proxy error pages are the usual source) used to report "attached"
+    // for a file that was never stored, so the bot never came back for it.
+    for (const body of [{}, { AttachableResponse: [] }, { AttachableResponse: [{}] }, { AttachableResponse: [{ Attachable: {} }] }]) {
+        await assert.rejects(
+            () => upload(jsonResponse(200, body)),
+            (error: unknown) => (error as Error)?.name === "QboRetryableError",
+            JSON.stringify(body),
+        );
+    }
+});
+
+test("a 200 whose body is not JSON at all is retryable", async () => {
+    await assert.rejects(
+        () => upload(new Response("<html>gateway error</html>", { status: 200, headers: { "content-type": "text/html" } })),
+        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+    );
+});
+
+test("a QBO Fault in a 200 stays terminal", async () => {
+    const result = await upload(jsonResponse(200, { AttachableResponse: [{ Fault: { Error: [{ code: "2010" }] } }] }));
+    assert.equal(result, "failed:fault");
+});
+
+test("429/5xx uploads are retryable; other 4xx stay terminal", async () => {
+    for (const status of [429, 500, 503]) {
+        await assert.rejects(
+            () => upload(jsonResponse(status, {})),
+            (error: unknown) => (error as Error)?.name === "QboRetryableError",
+            String(status),
+        );
+    }
+    for (const status of [400, 403, 404]) {
+        assert.equal(await upload(jsonResponse(status, {})), `failed:${status}`);
+    }
+});

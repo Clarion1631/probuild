@@ -81,67 +81,172 @@ test("a voided invoice is still authoritative, not a connection failure", async 
     assert.deepEqual(probe, { state: "voided" });
 });
 
-// ─── The loop rule the classification exists to drive ───────────────────────
+// --- The REAL loop, driven by a fake QuickBooks ---
 
-/**
- * Mirrors the guard in syncQuickBooksPayments: stop on the first
- * connection-level failure, count the rest as skipped. The real loops need a
- * database; this pins the DECISION they make, over many rows.
- */
-function runLoop(probes: QBInvoiceProbe[]): { checked: number; skipped: number; aborted: boolean } {
-    let checked = 0;
-    let skipped = 0;
-    let aborted = false;
-    for (const [index, probe] of probes.entries()) {
-        checked++;
-        if (probe.state === "error") {
-            if (probe.connectionFailed) {
-                aborted = true;
-                skipped += probes.length - index - 1;
-                break;
-            }
-            continue;
-        }
-    }
-    return { checked, skipped, aborted };
+import {
+    runQboRowLoop,
+    classifyPreflightFailure,
+    QBNotConnectedError,
+    type PaymentsSyncQboClient,
+    type QBPaymentSyncResult,
+} from "../src/lib/quickbooks-payments";
+import { QboRetryableError } from "../src/lib/quickbooks";
+
+function emptyResult(): QBPaymentSyncResult {
+    return {
+        checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0,
+        skipped: 0, abortedOnQboOutage: false, runFailed: false,
+    };
 }
 
-test("200 pending rows during an outage cost ONE probe, not 200", () => {
-    const outage: QBInvoiceProbe[] = Array.from({ length: 200 }, () => ({
-        state: "error" as const,
-        status: 0,
-        connectionFailed: true,
-        timedOut: true,
-    }));
-    const run = runLoop(outage);
-    // One 20s deadline, not six-plus — the whole point.
-    assert.equal(run.checked, 1);
-    assert.equal(run.skipped, 199);
-    assert.equal(run.aborted, true);
+/** A fake QuickBooks that records every call, so we can prove the run STOPPED. */
+function fakeQbo(script: {
+    probe?: (id: string) => QBInvoiceProbe;
+    payment?: (id: string) => { txnDate: string | null; amount: number; referenceNumber: string | null } | null;
+}) {
+    const calls = { probes: [] as string[], payments: [] as string[] };
+    const client: PaymentsSyncQboClient = {
+        async probeInvoice(id) {
+            calls.probes.push(id);
+            return script.probe ? script.probe(id) : { state: "ok", balance: 0, total: 10, paymentTxnIds: [] };
+        },
+        async getPayment(id) {
+            calls.payments.push(id);
+            return script.payment ? script.payment(id) : { txnDate: "2026-09-01", amount: 10, referenceNumber: null };
+        },
+    };
+    return { client, calls };
+}
+
+/** The same row body the real sync uses: probe, then read payment detail. */
+function rowHandler(qbo: PaymentsSyncQboClient, result: QBPaymentSyncResult) {
+    return async (row: { id: string; qbInvoiceId: string }) => {
+        result.checked++;
+        const probe = await qbo.probeInvoice(row.qbInvoiceId);
+        if (probe.state === "error") {
+            if (probe.connectionFailed) {
+                throw new QboRetryableError("probe failed", probe.status);
+            }
+            return;
+        }
+        if (probe.state !== "ok") return;
+        if (probe.total > 0 && probe.balance <= 0) {
+            const paymentId = probe.paymentTxnIds[0];
+            if (paymentId) await qbo.getPayment(paymentId);
+            result.settled++;
+        }
+    };
+}
+
+const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `s${i}`, qbInvoiceId: `${i + 1}` }));
+
+test("200 rows during an outage cost ONE probe, not 200", async () => {
+    const result = emptyResult();
+    const { client, calls } = fakeQbo({
+        probe: () => ({ state: "error", status: 0, connectionFailed: true, timedOut: true }),
+    });
+    await runQboRowLoop(rows(200), result, rowHandler(client, result), () => {}, "milestones");
+
+    // One 20s deadline instead of 200 - the whole point of the abort.
+    assert.equal(calls.probes.length, 1);
+    assert.equal(result.skipped, 199);
+    assert.equal(result.abortedOnQboOutage, true);
+    assert.equal(result.runFailed, true);
+    assert.equal(result.failureReason, "qbo-unavailable");
 });
 
-test("an ordinary per-invoice error does NOT stop the run", () => {
-    const probes: QBInvoiceProbe[] = [
-        { state: "error", status: 401 },
-        { state: "error", status: 401 },
-        { state: "ok", balance: 0, total: 10, paymentTxnIds: [] },
-    ];
-    const run = runLoop(probes);
-    assert.equal(run.checked, 3);
-    assert.equal(run.skipped, 0);
-    assert.equal(run.aborted, false);
+test("a PAYMENT-DETAIL timeout aborts the run too, not just the probe", async () => {
+    // Codex gate: getQBPayment failures were caught as ordinary row errors, so
+    // many settled invoices could each burn a full deadline after a good probe.
+    const result = emptyResult();
+    const { client, calls } = fakeQbo({
+        probe: () => ({ state: "ok", balance: 0, total: 100, paymentTxnIds: ["p1"] }),
+        payment: () => {
+            throw new QboRetryableError("QB payment read failed with status 503", 503);
+        },
+    });
+    await runQboRowLoop(rows(50), result, rowHandler(client, result), () => {}, "milestones");
+
+    assert.equal(calls.probes.length, 1, "must not probe row 2");
+    assert.equal(calls.payments.length, 1, "must not read a second payment");
+    assert.equal(result.skipped, 49);
+    assert.equal(result.abortedOnQboOutage, true);
 });
 
-test("an outage partway through skips only the remainder", () => {
-    const probes: QBInvoiceProbe[] = [
-        { state: "ok", balance: 0, total: 10, paymentTxnIds: [] },
-        { state: "ok", balance: 0, total: 10, paymentTxnIds: [] },
-        { state: "error", status: 0, connectionFailed: true, timedOut: true },
-        { state: "ok", balance: 0, total: 10, paymentTxnIds: [] },
-        { state: "ok", balance: 0, total: 10, paymentTxnIds: [] },
-    ];
-    const run = runLoop(probes);
-    assert.equal(run.checked, 3);
-    assert.equal(run.skipped, 2);
-    assert.equal(run.aborted, true);
+test("an ordinary per-row error does NOT stop the run", async () => {
+    const result = emptyResult();
+    const seen: string[] = [];
+    const { client, calls } = fakeQbo({
+        probe: (id) => (id === "2"
+            ? { state: "error", status: 401 }
+            : { state: "ok", balance: 0, total: 10, paymentTxnIds: [] }),
+    });
+    await runQboRowLoop(rows(4), result, rowHandler(client, result), (row) => seen.push(row.id), "milestones");
+
+    assert.equal(calls.probes.length, 4);
+    assert.equal(result.skipped, 0);
+    assert.equal(result.abortedOnQboOutage, false);
+    assert.equal(seen.length, 0, "a transient probe error is not a row error");
+});
+
+test("a settle failure is recorded per row and the run continues", async () => {
+    const result = emptyResult();
+    const errors: string[] = [];
+    const { client, calls } = fakeQbo({ probe: () => ({ state: "ok", balance: 0, total: 10, paymentTxnIds: [] }) });
+    const handler = async (row: { id: string; qbInvoiceId: string }) => {
+        result.checked++;
+        await client.probeInvoice(row.qbInvoiceId);
+        if (row.id === "s1") throw new Error("DB conflict");
+    };
+    await runQboRowLoop(rows(3), result, handler, (row) => errors.push(row.id), "milestones");
+
+    assert.equal(calls.probes.length, 3, "a row-level DB error must not abort the run");
+    assert.deepEqual(errors, ["s1"]);
+    assert.equal(result.abortedOnQboOutage, false);
+});
+
+test("an outage partway through skips only the remainder", async () => {
+    const result = emptyResult();
+    const { client } = fakeQbo({
+        probe: (id) => (Number(id) >= 3
+            ? { state: "error", status: 0, connectionFailed: true, timedOut: true }
+            : { state: "ok", balance: 5, total: 10, paymentTxnIds: [] }),
+    });
+    await runQboRowLoop(rows(5), result, rowHandler(client, result), () => {}, "milestones");
+
+    assert.equal(result.checked, 3);
+    assert.equal(result.skipped, 2);
+});
+
+test("a second pass is skipped wholesale once the first aborted", async () => {
+    const result = emptyResult();
+    result.abortedOnQboOutage = true;
+    const { client, calls } = fakeQbo({});
+    await runQboRowLoop(rows(7), result, rowHandler(client, result), () => {}, "progress billings");
+
+    assert.equal(calls.probes.length, 0, "the connection is shared - do not retry it");
+    assert.equal(result.skipped, 7);
+});
+
+// --- Preflight failures are failed runs ---
+
+test("EVERY preflight failure marks the run failed, not just timeouts", () => {
+    assert.deepEqual(
+        classifyPreflightFailure(new QBTimeoutError("refresh timed out")),
+        { reason: "qbo-unavailable", abortedOnQboOutage: true },
+    );
+    assert.deepEqual(
+        classifyPreflightFailure(new QboRetryableError("503", 503)),
+        { reason: "qbo-unavailable", abortedOnQboOutage: true },
+    );
+    // Codex gate: these two used to leave the run recorded as status "ok",
+    // which made the digest blind to a disconnected or broken money rail.
+    assert.deepEqual(
+        classifyPreflightFailure(new QBNotConnectedError()),
+        { reason: "quickbooks-not-connected", abortedOnQboOutage: false },
+    );
+    assert.deepEqual(
+        classifyPreflightFailure(new Error("settings store unreadable")),
+        { reason: "token-fetch-failed", abortedOnQboOutage: false },
+    );
 });

@@ -3756,7 +3756,7 @@ export async function createQBPaymentLink(paymentId: string) {
 export async function refreshQBPayments(invoiceId: string) {
     await assertInvoicePermission();
     const { syncQuickBooksPayments } = await import("./quickbooks-payments");
-    const result = await syncQuickBooksPayments({ invoiceId });
+    const result = await syncQuickBooksPayments({ invoiceId }, { source: "view" });
     if (result.settled > 0) {
         const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
         if (inv) {

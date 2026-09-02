@@ -63,7 +63,11 @@ export interface PipelineHealth {
         lastPurchaseSync: TimestampProbe;
         /** Newest receipt the bot actually CREATED (re-pushes don't count). */
         lastReceiptPush: TimestampProbe;
-        /** Newest SUCCESSFUL payments-sync run — the money rail's own pulse. */
+        /**
+         * Newest SUCCESSFUL payments-sync run triggered by the hourly CRON —
+         * the money rail's own pulse. On-view/manual runs are excluded on
+         * purpose: they must not be able to disguise a dead cron.
+         */
         lastPaymentsSync: TimestampProbe;
     };
     /** receipt-push events in the last 24h, by status ("created", "fallback", ...). */
@@ -118,6 +122,14 @@ export const BOOKED_PUSH_STATUSES = ["created"];
 
 /** The payments cron's per-run audit row (see quickbooks-payments.ts). */
 export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
+/**
+ * Only a run tagged "cron" counts as the heartbeat. On-view and manual
+ * refreshes write their own source precisely so they cannot stand in for an
+ * hourly job that has stopped running.
+ */
+export const PAYMENTS_SYNC_CRON_SOURCE = "cron";
+/** The cron runs hourly; 26h leaves room for a couple of missed runs and DST. */
+export const PAYMENTS_SYNC_STALE_HOURS = 26;
 
 /**
  * The verdict, split out from the database reads so the rules are testable
@@ -165,6 +177,15 @@ export function evaluatePipelineHealth(input: {
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
         reasons.push(`errors-24h:${input.stuck.count}`);
+    }
+
+    if (input.lastPaymentsSync.status === "ok") {
+        // The money rail's heartbeat. Null means the hourly cron has never
+        // completed a run we can see; stale means it stopped. Either way the
+        // digest must go red — a heartbeat nobody checks is not a heartbeat.
+        const at = input.lastPaymentsSync.at ? Date.parse(input.lastPaymentsSync.at) : null;
+        const stale = at === null || Number.isNaN(at) || input.now - at > PAYMENTS_SYNC_STALE_HOURS * HOUR_MS;
+        if (stale) reasons.push("payments-sync-stale");
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -259,7 +280,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             async () =>
                 (
                     await prisma.automationEvent.findFirst({
-                        where: { kind: PAYMENTS_SYNC_EVENT_KIND, status: "ok" },
+                        where: {
+                            kind: PAYMENTS_SYNC_EVENT_KIND,
+                            status: "ok",
+                            source: PAYMENTS_SYNC_CRON_SOURCE,
+                        },
                         orderBy: { createdAt: "desc" },
                         select: { createdAt: true },
                     })
