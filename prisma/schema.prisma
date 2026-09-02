@@ -16,6 +16,11 @@ model User {
   status                    String                   @default("PENDING") // PENDING, ACTIVATED, DISABLED
   hourlyRate                Decimal                  @default(0)
   burdenRate                Decimal                  @default(0)
+  /// Last time this member's pay rate was CONFIRMED — set by the Gusto rate
+  /// import and by a manual hourlyRate/burdenRate edit. Null means "never
+  /// confirmed since this column shipped", which the Payroll rates panel
+  /// shows in red. It is not a rate-change log; it is a staleness marker.
+  lastRateSyncAt            DateTime?
   mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
   showOnDispatch            Boolean                  @default(false) // Appears on the dispatch board bench/grid. Owner-controlled on Company → Team members.
   pinCode                   String? // Used for mobile app quick login
@@ -47,6 +52,34 @@ model User {
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
   percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
+  lockedPayrollPeriods      PayrollPeriod[]           @relation("PayrollPeriodLocker")
+}
+
+/// A pay period that has been reviewed and exported to Gusto.
+///
+/// The range is HALF-OPEN, [periodStart, periodEnd): an entry belongs to the
+/// period whose start is <= its startTime and whose end is > its startTime, so
+/// two adjacent periods can never both claim the same punch.
+///
+/// A row exists only once a human has looked at the period on
+/// /manager/payroll-export. `lockedAt` is what actually freezes the period —
+/// unlocking clears it but keeps the row and the hash, so the audit trail of
+/// "this is what we exported" survives an unlock. `exportHash` is the sha256
+/// of the SUMMARY csv as it stood at lock time; a later download that hashes
+/// differently means the underlying entries moved after the lock.
+model PayrollPeriod {
+  id          String    @id @default(cuid())
+  periodStart DateTime  @db.Timestamptz(6)
+  periodEnd   DateTime  @db.Timestamptz(6)
+  lockedAt    DateTime? @db.Timestamptz(6)
+  lockedById  String?
+  lockedBy    User?     @relation("PayrollPeriodLocker", fields: [lockedById], references: [id], onDelete: SetNull)
+  exportHash  String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([periodStart, periodEnd])
+  @@index([lockedAt])
+  @@index([lockedById])
 }
 
 model Client {
