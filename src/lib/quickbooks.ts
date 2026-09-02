@@ -934,6 +934,46 @@ export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: str
     return data.Invoice?.InvoiceLink || null;
 }
 
+/** One QuickBooks invoice as the ambiguous-create resolver needs to see it. */
+export interface QBInvoiceMatch {
+    id: string;
+    docNumber: string | null;
+    /** ProBuild writes its own marker here on create; this is what proves it is ours. */
+    privateNote: string | null;
+    total: number;
+    balance: number;
+}
+
+/**
+ * Every invoice QuickBooks holds under this DocNumber.
+ *
+ * Plural on purpose. DocNumber is not unique in QuickBooks (duplicate document
+ * numbers can be allowed, and ours is truncated to 21 characters), so the
+ * caller must decide what more than one means rather than being handed a
+ * confident single answer. A query failure THROWS — "I could not ask" must
+ * never read as "there is none".
+ */
+export async function findQBInvoicesByDocNumber(
+    tokens: QBTokens,
+    docNumber: string,
+    deadline?: RouteDeadline,
+): Promise<QBInvoiceMatch[]> {
+    const rows = await qbQuery<any>(
+        tokens,
+        `select * from Invoice where DocNumber = '${escapeQBString(docNumber)}' maxresults 20`,
+        deadline,
+    );
+    return rows
+        .filter((inv) => inv?.Id)
+        .map((inv) => ({
+            id: String(inv.Id),
+            docNumber: inv.DocNumber != null ? String(inv.DocNumber) : null,
+            privateNote: inv.PrivateNote != null ? String(inv.PrivateNote) : null,
+            total: Number(inv.TotalAmt ?? 0),
+            balance: Number(inv.Balance ?? 0),
+        }));
+}
+
 export interface QBInvoiceStatus {
     balance: number;
     total: number;

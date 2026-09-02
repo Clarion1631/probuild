@@ -9,6 +9,7 @@ import { authOptions, getSessionOrDev } from "@/lib/auth";
 export {
     ADMIN_ROLES,
     isAdminOrManager,
+    canResolveAmbiguousCreate,
     hasPermission,
     accessibleProjectIds,
     canAccessProject,

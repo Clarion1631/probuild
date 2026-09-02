@@ -14,6 +14,12 @@ function revalidatePath(path: string) {
 }
 import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import {
+    isBlockedByAmbiguousCreate,
+    isQboInvoiceLinkedOrPending,
+    PENDING_CREATE_MARKERS,
+    QBResolveRequiredError,
+} from "./qbo-create-markers";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
@@ -2337,6 +2343,14 @@ export async function updatePendingMilestoneAmountsCore(
             if (row.stripeSessionId || row.stripePaymentIntentId) {
                 throw new Error(`A payment is in progress on "${row.name}". Wait for it to finish or void it before rebalancing.`);
             }
+            // A parked row has no qbInvoiceId, so the QB preflight above never
+            // saw it — but an invoice for the OLD amount may be sitting in
+            // QuickBooks. Repricing it would leave the client paying one number
+            // while ProBuild settles another. Rebalances that leave this row's
+            // content alone are still fine.
+            if (isBlockedByAmbiguousCreate(row) && contentChanged(row, r)) {
+                throw new QBResolveRequiredError(row.name);
+            }
         }
 
         // Every currently-Pending row must be accounted for — a partial submission
@@ -2499,6 +2513,12 @@ export async function deleteInvoiceMilestoneCore(
         if (locked.qbInvoiceId) {
             throw new Error(`This milestone has a QuickBooks invoice staged — break the QuickBooks link first, then delete.`);
         }
+        // A parked milestone has NO qbInvoiceId and may still have a real,
+        // collectible invoice in QuickBooks. Deleting it here would abandon that
+        // invoice with nothing in ProBuild pointing at it.
+        if (isQboInvoiceLinkedOrPending(locked)) {
+            throw new QBResolveRequiredError(locked.name);
+        }
         if (locked.stripeSessionId || locked.stripePaymentIntentId) {
             throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
         }
@@ -2606,6 +2626,10 @@ export async function splitInvoiceMilestonesCore(
                     { stripeSessionId: { not: null } },
                     { stripePaymentIntentId: { not: null } },
                     { qbInvoiceId: { not: null } },
+                    // A create whose outcome is unknown counts as in flight: the
+                    // id is null but a collectible invoice may exist, and the
+                    // re-split below drops the row that would settle it.
+                    { qbSyncError: { in: [...PENDING_CREATE_MARKERS] } },
                 ],
             },
             select: { name: true },

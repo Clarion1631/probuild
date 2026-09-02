@@ -47,6 +47,12 @@ import {
     getQBPayment,
     deleteQBInvoice,
 } from "./quickbooks";
+import {
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    PAYLINK_PENDING_MARKER,
+    isBlockedByAmbiguousCreate,
+} from "./qbo-create-markers";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
 
@@ -240,59 +246,39 @@ export interface MilestonePushResult {
  * Create (or reuse) the QBO invoice for one milestone and return its pay link.
  * Idempotent: a milestone that already has a QBO invoice just refreshes the link.
  */
+// The marker vocabulary and the rules that read it live in a PURE module
+// (qbo-create-markers.ts) so money guards everywhere — and the invoice editor's
+// client bundle — share one definition instead of re-deriving it. Re-exported
+// here because this is where every existing caller imports them from.
+export {
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    CREATE_IN_FLIGHT_STALE_MS,
+    PAYLINK_PENDING_MARKER,
+    PENDING_CREATE_MARKERS,
+    isBlockedByAmbiguousCreate,
+    isStaleInFlight,
+    isQboInvoiceLinkedOrPending,
+    ambiguousCreateFingerprint,
+    QBResolveRequiredError,
+} from "./qbo-create-markers";
+
 /**
- * Parked on a milestone whose QuickBooks invoice create ended with an UNKNOWN
- * outcome — a timeout, or a transport failure after the request went out.
+ * The QuickBooks DocNumber for one milestone: INV-00012-2, the milestone's
+ * position within its invoice's schedule. Truncated to Intuit's 21 characters.
  *
- * The request may well have created a real, collectible invoice. Re-sending
- * blindly would bill the client twice, so the row is marked and the send path
- * refuses until a human has looked in QuickBooks. Clearing it is the existing
- * unlink flow, which already nulls qbSyncError.
+ * ONE definition, shared by the push that writes it and by the ambiguous-create
+ * resolver that has to look it up again. A second copy would drift and the
+ * resolver would quietly stop finding the invoices we create.
  */
-export const AMBIGUOUS_CREATE_MARKER = "ambiguous-create";
-
-/**
- * Set on the row BEFORE the create POST goes out, and replaced by the link
- * write on success.
- *
- * A process killed between the POST and the link write left no trace at all:
- * the next send saw a clean row and created a second invoice. The marker is
- * written first precisely so a crash is still visible afterwards.
- */
-export const CREATE_IN_FLIGHT_MARKER = "create-in-flight";
-
-/**
- * Left over from a send that never came back. Beyond this age we stop assuming
- * a peer is still working and treat it as an unknown outcome — the same
- * fail-closed handling as an observed timeout.
- */
-export const CREATE_IN_FLIGHT_STALE_MS = 5 * 60_000;
-
-/** Pay-link fetch failed AFTER the invoice was linked; the sweep retries it. */
-export const PAYLINK_PENDING_MARKER = "paylink-pending";
-
-/** Is this row blocked from sending because a previous attempt's outcome is unknown? */
-export function isBlockedByAmbiguousCreate(
-    row: { qbSyncError: string | null; updatedAt?: Date | null },
-    now: number = Date.now(),
-): boolean {
-    if (row.qbSyncError === AMBIGUOUS_CREATE_MARKER) return true;
-    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
-    // Both a fresh and a stale in-flight marker refuse the send: fresh means a
-    // peer is mid-flight, stale means nobody is coming back and the outcome is
-    // unknown. The age only decides what the operator is told.
-    void now;
-    return true;
+export function milestoneDocNumber(invoiceCode: string, position: number): string {
+    const suffix = `-${position}`;
+    return `${invoiceCode.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
 }
 
-/** A send that never came back — treated exactly like an observed timeout. */
-export function isStaleInFlight(
-    row: { qbSyncError: string | null; updatedAt?: Date | null },
-    now: number = Date.now(),
-): boolean {
-    if (row.qbSyncError !== CREATE_IN_FLIGHT_MARKER) return false;
-    const at = row.updatedAt ? row.updatedAt.getTime() : 0;
-    return now - at > CREATE_IN_FLIGHT_STALE_MS;
+/** The PrivateNote every milestone invoice carries — what proves it is ours. */
+export function milestonePrivateNote(invoiceCode: string, scheduleName: string, projectName: string): string {
+    return `ProBuild ${invoiceCode} · ${scheduleName} · ${projectName}`;
 }
 
 /** One row waiting for its pay link, from either rail. */
@@ -564,8 +550,7 @@ export async function pushMilestoneToQuickBooks(
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
-    const suffix = `-${position}`;
-    const docNumber = `${invoice.code.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
+    const docNumber = milestoneDocNumber(invoice.code, position);
 
     const projectName = invoice.project?.name || "Project";
     const amount = toNum(schedule.amount);
@@ -587,7 +572,7 @@ export async function pushMilestoneToQuickBooks(
     }
 
     const description = `${projectName} — ${schedule.name}`;
-    const privateNote = `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`;
+    const privateNote = milestonePrivateNote(invoice.code, schedule.name, projectName);
     // Claim the send BEFORE the request goes out. Losing this CAS means another
     // sender got there first — refuse rather than race them into two invoices.
     // A failure to WRITE the marker must abort: without it a crash mid-create

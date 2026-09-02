@@ -37,13 +37,18 @@ import { createRouteDeadline, remainingBudgetMs, type RouteDeadline, type QBToke
 import {
     compensationWindowMs,
     isAmbiguousCreateFailure,
-    isBlockedByAmbiguousCreate,
-    AMBIGUOUS_CREATE_MARKER,
-    CREATE_IN_FLIGHT_MARKER,
-    PAYLINK_PENDING_MARKER,
     QBAmbiguousCreateError,
     MILESTONE_PUSH_BUDGET_MS,
 } from "./quickbooks-payments";
+import {
+    isBlockedByAmbiguousCreate,
+    isQboInvoiceLinkedOrPending,
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    PAYLINK_PENDING_MARKER,
+    PENDING_CREATE_MARKERS,
+    QBResolveRequiredError,
+} from "./qbo-create-markers";
 import { logAutomationEvent } from "./automation-events";
 
 // Cent-round helper shared by every money computation below. EPSILON nudges
@@ -173,6 +178,13 @@ export async function createProgressBillingCore(
                 }
                 if (schedule.qbInvoiceId) {
                     throw new Error(`"${schedule.name}" already has a QuickBooks invoice staged — break the QuickBooks link first, then bill it here.`);
+                }
+                // A parked milestone has qbInvoiceId === null and may STILL have a
+                // real invoice in QuickBooks. Billing it into a progress invoice
+                // would leave the client holding two collectible invoices for the
+                // same money — the exact failure the marker exists to prevent.
+                if (isQboInvoiceLinkedOrPending(schedule)) {
+                    throw new QBResolveRequiredError(schedule.name);
                 }
                 if (schedule.stripeSessionId || schedule.stripePaymentIntentId) {
                     throw new Error(`A payment is in progress on "${schedule.name}" — wait for it to finish or void it before billing.`);
@@ -338,6 +350,12 @@ export async function createProgressBillingCore(
                     id: schedule.id,
                     status: "Pending",
                     qbInvoiceId: null,
+                    // The id being null is not enough: a create that started
+                    // between validation and here leaves the id null and the
+                    // marker set, and that row may already be billed in QBO.
+                    // Written as an explicit OR because SQL's NOT IN is false for
+                    // a NULL column, which would exclude every healthy row.
+                    OR: [{ qbSyncError: null }, { qbSyncError: { notIn: [...PENDING_CREATE_MARKERS] } }],
                     stripeSessionId: null,
                     stripePaymentIntentId: null,
                     amount: schedule.amount,
@@ -591,6 +609,12 @@ export async function deleteProgressBillingCore(
 
         const billing = await tx.progressBilling.findUnique({ where: { id: billingId } });
         if (!billing) throw new Error("Progress billing not found");
+        // A parked row LOOKS deletable — Draft, no qbInvoiceId — but a real,
+        // collectible QuickBooks invoice may exist for it. Deleting the draft
+        // would abandon that invoice with nothing in ProBuild pointing at it.
+        if (isBlockedByAmbiguousCreate(billing)) {
+            throw new QBResolveRequiredError(billing.code);
+        }
         if (billing.status !== "Draft" || billing.qbInvoiceId) {
             throw new Error(`This billing is "${billing.status}"${billing.qbInvoiceId ? " and has a QuickBooks invoice staged" : ""} — only Draft billings without a staged QuickBooks invoice can be deleted`);
         }

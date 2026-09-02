@@ -1,7 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe, updatePendingMilestoneAmounts, deleteInvoiceMilestone } from "@/lib/actions";
+import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvoiceMilestone, unrecordPayment, splitInvoiceMilestones, sendPaymentReceipt, createQBPaymentLink, refreshQBPayments, breakQBInvoiceLink, emailInvoiceCopyToMe, updatePendingMilestoneAmounts, deleteInvoiceMilestone, resolveAmbiguousInvoiceCreate } from "@/lib/actions";
+// Pure module (no Prisma) so the marker vocabulary is shared with the server
+// rather than restated here — a second copy of these strings is how a UI stops
+// recognising the state the money guards act on.
+import { ambiguousCreateFingerprint, isBlockedByAmbiguousCreate, PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -14,6 +18,19 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { formatMoneyDate } from "@/lib/payment-date";
 import type { CheckEvidence } from "@/lib/check-evidence";
+
+const PAYLINK_PENDING = PAYLINK_PENDING_MARKER;
+
+/** A send whose outcome is unknown: an invoice may exist in QuickBooks. */
+function isParkedOnQb(qbSyncError: string | null | undefined): boolean {
+    return isBlockedByAmbiguousCreate({ qbSyncError: qbSyncError ?? null });
+}
+
+function qbSyncErrorLabel(qbSyncError: string): string {
+    if (isParkedOnQb(qbSyncError)) return "unconfirmed";
+    if (qbSyncError === PAYLINK_PENDING) return "link pending";
+    return qbSyncError === "notFound" ? "missing" : "voided";
+}
 
 const METHOD_LABELS: Record<string, string> = {
     card: "Card",
@@ -105,6 +122,59 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                 toast.warning("QuickBooks invoice created, but no pay link — enable QuickBooks Payments in QBO to accept cards/ACH.");
                 router.refresh();
             }
+        } finally {
+            setQbBusy(null);
+        }
+    }
+
+    // A send whose outcome we never learned. QuickBooks may be holding a real,
+    // collectible invoice, so nothing here re-sends — it asks QuickBooks what
+    // happened and adopts the invoice only when the answer is unambiguous.
+    async function handleResolveAmbiguous(payment: { id: string; name: string; qbSyncError?: string | null; qbInvoiceId?: string | null }) {
+        const confirmed = window.confirm(
+            `Check QuickBooks for "${payment.name}"?\n\n` +
+            `A previous send ended without a confirmed result, so an invoice may already be there. ` +
+            `If exactly one is found it will be linked to this milestone. Nothing changes if the answer is unclear.`
+        );
+        if (!confirmed) return;
+        setQbBusy(payment.id);
+        try {
+            const res = await resolveAmbiguousInvoiceCreate({
+                kind: "milestone",
+                id: payment.id,
+                expectedState: ambiguousCreateFingerprint({
+                    qbSyncError: payment.qbSyncError ?? null,
+                    qbInvoiceId: payment.qbInvoiceId ?? null,
+                }),
+                decision: "link-existing",
+                reason: "Resolved from the invoice editor",
+            });
+            if (!res.ok) {
+                // The one case the operator can act on directly: QuickBooks has
+                // nothing, so releasing the row needs their explicit assertion.
+                if (res.refusal === "none-found" && window.confirm(`${res.message}\n\nConfirm that QuickBooks has no invoice for this milestone?`)) {
+                    const cleared = await resolveAmbiguousInvoiceCreate({
+                        kind: "milestone",
+                        id: payment.id,
+                        expectedState: ambiguousCreateFingerprint({
+                            qbSyncError: payment.qbSyncError ?? null,
+                            qbInvoiceId: payment.qbInvoiceId ?? null,
+                        }),
+                        decision: "confirmed-none",
+                        reason: "Operator confirmed no QuickBooks invoice exists",
+                    });
+                    if (!cleared.ok) toast.error(cleared.message);
+                    else {
+                        toast.success(cleared.message);
+                        router.refresh();
+                    }
+                    return;
+                }
+                toast.error(res.message);
+                return;
+            }
+            toast.success(res.message);
+            router.refresh();
         } finally {
             setQbBusy(null);
         }
@@ -887,9 +957,15 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                                                     {payment.status !== 'Paid' && payment.qbSyncError && (
                                                         <span
                                                             className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
-                                                            title="The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                            title={
+                                                                isParkedOnQb(payment.qbSyncError)
+                                                                    ? "A QuickBooks send ended without a confirmed result — an invoice may already exist there. Use Resolve in QuickBooks before sending again."
+                                                                    : payment.qbSyncError === PAYLINK_PENDING
+                                                                        ? "The QuickBooks invoice exists; only its pay link is still to be fetched. The maintenance sweep finishes this automatically."
+                                                                        : "The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
+                                                            }
                                                         >
-                                                            QB {payment.qbSyncError === 'notFound' ? 'missing' : 'voided'}
+                                                            QB {qbSyncErrorLabel(payment.qbSyncError)}
                                                         </span>
                                                     )}
                                                 </div>
@@ -959,7 +1035,17 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                                                                 {qbBusy === payment.id ? "Working…" : "Break QB Link"}
                                                             </button>
                                                         )}
-                                                        {payment.status === 'Pending' && !payment.sourceScheduleId && !payment.qbInvoiceId && (
+                                                        {!payment.qbInvoiceId && isParkedOnQb(payment.qbSyncError) && (
+                                                            <button
+                                                                onClick={() => handleResolveAmbiguous(payment)}
+                                                                disabled={qbBusy === payment.id}
+                                                                title="A previous QuickBooks send ended without a confirmed result. Ask QuickBooks whether the invoice exists."
+                                                                className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap disabled:opacity-50"
+                                                            >
+                                                                {qbBusy === payment.id ? "Checking…" : "Resolve in QuickBooks"}
+                                                            </button>
+                                                        )}
+                                                        {payment.status === 'Pending' && !payment.sourceScheduleId && !payment.qbInvoiceId && !isParkedOnQb(payment.qbSyncError) && (
                                                             <button
                                                                 onClick={() => setDeleteMilestoneTarget({ id: payment.id, name: payment.name })}
                                                                 title="Delete this milestone"

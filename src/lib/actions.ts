@@ -3785,12 +3785,12 @@ export async function breakQBInvoiceLink(
     paymentId: string,
     opts?: { deleteInQBO?: boolean },
 ): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
 
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentId },
         select: {
-            id: true, status: true, qbInvoiceId: true, qbPaymentId: true,
+            id: true, status: true, qbInvoiceId: true, qbPaymentId: true, qbSyncError: true,
             invoiceId: true, invoice: { select: { projectId: true } },
         },
     });
@@ -3802,6 +3802,27 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "A QuickBooks payment is recorded against this milestone. Refusing to unlink." };
     }
     if (!schedule.qbInvoiceId) {
+        // A milestone parked by an unknown-outcome create has NO qbInvoiceId, so
+        // this used to reject exactly the state the error message told the
+        // operator to clear here. Route it to the resolver instead: ask
+        // QuickBooks what really happened, and adopt the invoice if one is
+        // there. It writes nothing on any ambiguous answer.
+        const { isBlockedByAmbiguousCreate } = await import("./quickbooks-payments");
+        if (isBlockedByAmbiguousCreate(schedule)) {
+            const { resolveAmbiguousInvoiceCreateCore, ambiguousCreateFingerprint } = await import("./qbo-ambiguous-create");
+            const res = await resolveAmbiguousInvoiceCreateCore({
+                kind: "milestone",
+                id: schedule.id,
+                expectedState: ambiguousCreateFingerprint(schedule),
+                decision: "link-existing",
+                reason: "Break QB Link on a milestone whose create outcome was unknown",
+                actor: { id: user.id, email: user.email, role: user.role },
+            });
+            if (!res.ok) return { success: false, error: res.message };
+            revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
+            revalidatePath(`/invoices`);
+            return { success: true, warning: res.message };
+        }
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
@@ -3832,6 +3853,52 @@ export async function breakQBInvoiceLink(
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
     return { success: true, warning };
+}
+
+/**
+ * Resolve a milestone or progress billing parked by an unknown-outcome
+ * QuickBooks create: ask QuickBooks what actually happened and either adopt the
+ * invoice it already made, or (only on an explicit human confirmation that
+ * there is none) release the row so it can be sent again.
+ *
+ * The decision itself — including the ADMIN/FINANCE rule — lives in
+ * `qbo-ambiguous-create.ts` so it can be tested end to end against a fake
+ * QuickBooks. This wrapper is the session half: identify the actor, then
+ * revalidate what the outcome changed.
+ */
+export async function resolveAmbiguousInvoiceCreate(input: {
+    kind: "milestone" | "progressBilling";
+    id: string;
+    expectedState: string;
+    decision: "link-existing" | "confirmed-none";
+    reason: string;
+}) {
+    const user = await assertInvoicePermission();
+    const { resolveAmbiguousInvoiceCreateCore } = await import("./qbo-ambiguous-create");
+    const res = await resolveAmbiguousInvoiceCreateCore({
+        kind: input.kind,
+        id: input.id,
+        expectedState: input.expectedState,
+        decision: input.decision,
+        reason: input.reason,
+        actor: { id: user.id, email: user.email, role: user.role },
+    });
+
+    if (res.ok) {
+        const link = input.kind === "milestone"
+            ? await prisma.paymentSchedule.findUnique({
+                where: { id: input.id },
+                select: { invoiceId: true, invoice: { select: { projectId: true } } },
+            })
+            : await prisma.progressBilling.findUnique({
+                where: { id: input.id },
+                select: { invoiceId: true, invoice: { select: { projectId: true } } },
+            });
+        if (link) revalidatePath(`/projects/${link.invoice.projectId}/invoices/${link.invoiceId}`);
+        revalidatePath(`/invoices`);
+        revalidatePath(`/portal`);
+    }
+    return res;
 }
 
 export async function recordEstimatePayment(
