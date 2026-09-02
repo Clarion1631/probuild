@@ -27,7 +27,7 @@ const issue = (over: Partial<CardCandidateIssue> = {}): CardCandidateIssue => ({
     amountCents: -12_345,
     payee: "LOWES #02516",
     fingerprint: "pb-bl-1",
-    lastCardDate: null,
+    everCarded: false,
     ...over,
 });
 
@@ -69,12 +69,38 @@ test("requestId is deterministic per owner + Pacific date, and doubles as the th
     assert.equal(again[0].requestId, cards[0].requestId);
 });
 
-test("a card already posted today is not rebuilt — the run is a no-op", () => {
-    const today = pacificDate(NOW);
-    assert.deepEqual(buildOwnerCards([issue({ lastCardDate: today })], NOW), []);
-    // A NEW item that today's card never listed does get a card.
-    const cards = buildOwnerCards([issue({ lastCardDate: today }), issue({ id: "b", targetKey: "bl-b", lastCardDate: null })], NOW);
-    assert.equal(cards.length, 1);
+test("never-carded items outrank carded ones, however old the carded ones are", () => {
+    // Ordering by age alone froze the list: once the ten oldest were on a card,
+    // the same ten went out every morning and an eleventh newer charge was
+    // never asked about at all.
+    const cards = buildOwnerCards([
+        issue({ id: "old", targetKey: "bl-old", postedDate: "2026-08-01", everCarded: true }),
+        issue({ id: "new", targetKey: "bl-new", postedDate: "2026-08-18", everCarded: false }),
+    ], NOW);
+    assert.deepEqual(cards[0].items.map(i => i.targetKey), ["bl-new", "bl-old"]);
+});
+
+test("yesterday's overflow is today's first candidate", () => {
+    const many = Array.from({ length: 12 }, (_, i) => issue({
+        id: `ri-${i}`, targetKey: `bl-${i}`,
+        postedDate: `2026-08-${String(i + 1).padStart(2, "0")}`,
+        // The ten oldest were carded yesterday; two never were.
+        everCarded: i < 10,
+    }));
+    const [card] = buildOwnerCards(many, NOW);
+    assert.deepEqual(card.items.slice(0, 2).map(i => i.targetKey), ["bl-10", "bl-11"],
+        "the two that did not fit yesterday lead today's card");
+});
+
+test("selection is stable across runs — same inputs, same order", () => {
+    const input = [
+        issue({ id: "b", targetKey: "bl-b", postedDate: "2026-08-16" }),
+        issue({ id: "a", targetKey: "bl-a", postedDate: "2026-08-16" }),
+    ];
+    const first = buildOwnerCards(input, NOW)[0].items.map(i => i.targetKey);
+    const second = buildOwnerCards([...input].reverse(), NOW)[0].items.map(i => i.targetKey);
+    assert.deepEqual(first, second);
+    assert.deepEqual(first, ["bl-a", "bl-b"], "the lowest targetKey breaks a same-date tie");
 });
 
 test("a card lists at most 10 items and says how many it held back", () => {

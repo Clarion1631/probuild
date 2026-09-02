@@ -56,8 +56,8 @@ export interface CardCandidateIssue {
     amountCents: number;
     payee: string;
     fingerprint: string;
-    /** The Pacific date a card last listed this item, when one has. */
-    lastCardDate: string | null;
+    /** True once ANY card has listed this item (its cards[] history is non-empty). */
+    everCarded: boolean;
 }
 
 export interface CardItem {
@@ -82,7 +82,7 @@ export interface OwnerCard {
     /** Pacific date the card is for. */
     date: string;
     items: CardItem[];
-    /** Items beyond MAX_ITEMS_PER_CARD that this card does not list. */
+    /** Items not on this card. They are tomorrow's FIRST candidates. */
     overflow: number;
     text: string;
 }
@@ -106,7 +106,7 @@ export function requestIdFor(owner: string, date: string): string {
     return `receipt-req-${owner}-${date}`;
 }
 
-function cardText(owner: string, date: string, items: CardItem[], overflow: number): string {
+export function cardText(owner: string, date: string, items: readonly CardItem[], overflow: number): string {
     const lines = [
         `📸 *Receipts needed — ${owner}* (${items.length}${overflow > 0 ? ` of ${items.length + overflow}` : ""})`,
         "",
@@ -125,50 +125,69 @@ function cardText(owner: string, date: string, items: CardItem[], overflow: numb
     return lines.join("\n");
 }
 
+function toCardItem(issue: CardCandidateIssue, index: number): CardItem {
+    return {
+        n: index + 1,
+        fingerprint: issue.fingerprint,
+        date: issue.postedDate,
+        vendor: issue.payee,
+        cents: Math.abs(issue.amountCents),
+        amount: centsToAmount(issue.amountCents),
+        cardTail: issue.cardTail,
+        issueId: issue.id,
+        targetKey: issue.targetKey,
+    };
+}
+
 /**
- * PURE. Group the night's open issues into at most one card per asked owner.
+ * The selection order for ONE owner. PURE.
  *
- * Skipped: acknowledged issues (lifecycle step 4 semantics — someone already
- * said "I looked"), owners nobody asks, and any owner whose items were ALL
- * already listed by today's card. Oldest charge first, so the thing most at
- * risk of being forgotten is item 1.
+ * NEVER-CARDED ITEMS COME FIRST. Ordering by age alone meant that once the ten
+ * oldest charges were on a card, the same ten went out every morning and an
+ * eleventh, newer charge was never asked about at all — the queue looked busy
+ * and nothing new ever moved. So an item that has never appeared on a card
+ * outranks every item that has, and within each group the oldest charge wins
+ * (the lowest targetKey breaks a tie, so the order is stable across runs).
+ * Yesterday's overflow is by construction tomorrow's first candidate.
  */
-export function buildOwnerCards(issues: readonly CardCandidateIssue[], now: Date = new Date()): OwnerCard[] {
+export function selectOwnerItems(
+    candidates: readonly CardCandidateIssue[],
+    owner: string,
+): { items: CardItem[]; overflow: number } {
+    const mine = candidates
+        .filter(issue => issue.owner === owner && !issue.acknowledged)
+        .sort((a, b) => {
+            if (a.everCarded !== b.everCarded) return a.everCarded ? 1 : -1;
+            if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
+            return a.targetKey < b.targetKey ? -1 : a.targetKey > b.targetKey ? 1 : 0;
+        });
+    const listed = mine.slice(0, MAX_ITEMS_PER_CARD);
+    return { items: listed.map(toCardItem), overflow: mine.length - listed.length };
+}
+
+/** Rebuild a card's text and request id from an already-claimed selection. */
+export function buildCardFromItems(owner: string, date: string, items: CardItem[], overflow: number): OwnerCard {
+    return { owner, requestId: requestIdFor(owner, date), date, items, overflow, text: cardText(owner, date, items, overflow) };
+}
+
+/**
+ * PURE. One card per asked owner, from tonight's candidates.
+ *
+ * There is deliberately NO "already asked today" rule in here any more. That
+ * check used to live in this function, reading a stamp written AFTER the post —
+ * selection and the record of selection were two writes with a network call
+ * between them, so two concurrent runs could both select and both post. The
+ * claim is now a unique (owner, pacificDate) row created in the same
+ * transaction as selection; see the cron.
+ */
+export function buildOwnerCards(candidates: readonly CardCandidateIssue[], now: Date = new Date()): OwnerCard[] {
     const date = pacificDate(now);
     const cards: OwnerCard[] = [];
-
     for (const owner of CARD_OWNERS_ASKED) {
-        const mine = issues
-            .filter(issue => issue.owner === owner && !issue.acknowledged)
-            .sort((a, b) => (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1 : a.targetKey < b.targetKey ? -1 : 1));
-        if (mine.length === 0) continue;
-        // Already asked today. Re-posting the same list is how a useful card
-        // becomes noise, and a retried cron must be a no-op.
-        if (mine.every(issue => issue.lastCardDate === date)) continue;
-
-        const listed = mine.slice(0, MAX_ITEMS_PER_CARD);
-        const items: CardItem[] = listed.map((issue, index) => ({
-            n: index + 1,
-            fingerprint: issue.fingerprint,
-            date: issue.postedDate,
-            vendor: issue.payee,
-            cents: Math.abs(issue.amountCents),
-            amount: centsToAmount(issue.amountCents),
-            cardTail: issue.cardTail,
-            issueId: issue.id,
-            targetKey: issue.targetKey,
-        }));
-        const overflow = mine.length - listed.length;
-        cards.push({
-            owner,
-            requestId: requestIdFor(owner, date),
-            date,
-            items,
-            overflow,
-            text: cardText(owner, date, items, overflow),
-        });
+        const { items, overflow } = selectOwnerItems(candidates, owner);
+        if (items.length === 0) continue;
+        cards.push(buildCardFromItems(owner, date, items, overflow));
     }
-
     // Owners are two, so this can't bind today. Asserted anyway: a config
     // change that adds owners must not be able to turn one run into a flood.
     return cards.slice(0, CARD_RATE_CEILING);
