@@ -5,6 +5,8 @@ import { useState, useEffect } from "react";
 import { formatCurrency } from "@/lib/utils";
 import Link from "next/link";
 import { toast } from "sonner";
+import RatesImport from "./RatesImport";
+import { zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 type User = {
     id: string;
@@ -14,10 +16,24 @@ type User = {
     status: string;
     hourlyRate: number;
     burdenRate: number;
+    /** ISO string over the wire — last time this rate was confirmed (import or manual save). */
+    lastRateSyncAt: string | null;
     showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
 };
+
+/** A rate nobody has confirmed in three months is a rate nobody should trust. */
+const RATE_STALE_DAYS = 90;
+
+function rateSyncLabel(lastRateSyncAt: string | null): { text: string; stale: boolean } {
+    if (!lastRateSyncAt) return { text: "Never", stale: true };
+    const at = new Date(lastRateSyncAt);
+    if (Number.isNaN(at.getTime())) return { text: "Never", stale: true };
+    const days = Math.floor((Date.now() - at.getTime()) / 86_400_000);
+    const text = days <= 0 ? "Today" : days === 1 ? "Yesterday" : `${days} days ago`;
+    return { text, stale: days > RATE_STALE_DAYS };
+}
 
 export default function TeamPage() {
     const [users, setUsers] = useState<User[]>([]);
@@ -82,6 +98,11 @@ export default function TeamPage() {
         const matchesStatus = statusFilter === "All" || status === statusFilter;
         return matchesSearch && matchesStatus;
     });
+
+    // Payroll rates panel: ACTIVATED members only. A pending invite has no
+    // hours yet and a disabled account is off payroll — neither belongs in a
+    // list whose job is "what will Gusto pay".
+    const activeUsers = users.filter(user => getStatus(user) === "Activated");
 
     const getInitials = (name: string | null, email: string) => {
         if (name) {
@@ -226,6 +247,74 @@ export default function TeamPage() {
                         )}
                     </div>
                 )}
+
+                {/* Payroll rates (Phase 5 G1). Deliberately a separate panel from the
+                    roster table above: the roster is about access, this is about what
+                    payroll will pay. "Last synced" is the staleness marker — a rate
+                    nobody has confirmed is the one that quietly goes to Gusto wrong. */}
+                <div className="mt-8 hui-card overflow-hidden">
+                    <div className="px-6 py-4 border-b border-hui-border flex items-center justify-between">
+                        <div>
+                            <h2 className="font-semibold text-hui-textMain">Payroll rates</h2>
+                            <p className="text-xs text-hui-textMuted mt-0.5">
+                                Hourly rate drives labor cost and the Gusto hours export. Burden rate is ProBuild-only
+                                job costing and is edited on each member&apos;s page.
+                            </p>
+                        </div>
+                        <RatesImport onImported={fetchUsers} />
+                    </div>
+                    <table className="w-full text-left border-collapse text-sm">
+                        <thead>
+                            <tr className="bg-slate-50 border-b border-hui-border text-xs font-semibold text-hui-textMuted whitespace-nowrap">
+                                <th className="px-6 py-3 font-normal">Name</th>
+                                <th className="px-6 py-3 font-normal">Role</th>
+                                <th className="px-6 py-3 font-normal text-right">Hourly rate</th>
+                                <th className="px-6 py-3 font-normal text-right">Burden rate</th>
+                                <th className="px-6 py-3 font-normal">Last synced</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-hui-border">
+                            {activeUsers.map(user => {
+                                const sync = rateSyncLabel(user.lastRateSyncAt);
+                                const noRate = zeroRateBlocks({ role: user.role, hourlyRate: user.hourlyRate ?? 0 });
+                                return (
+                                    <tr key={user.id} className="hover:bg-slate-50 transition-colors">
+                                        <td className="px-6 py-3">
+                                            <Link href={`/company/team-members/${user.id}`} className="font-medium text-hui-textMain hover:text-blue-700">
+                                                {user.name || user.email}
+                                            </Link>
+                                            {noRate && (
+                                                <span
+                                                    className="ml-2 text-xs text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200"
+                                                    title="No hourly rate — this member cannot clock out until one is set"
+                                                >
+                                                    No pay rate
+                                                </span>
+                                            )}
+                                        </td>
+                                        <td className="px-6 py-3 text-hui-textMuted">
+                                            {(user.role === 'FIELD_CREW' || user.role === 'EMPLOYEE') ? 'Field Crew' :
+                                                user.role === 'MANAGER' ? 'Manager' :
+                                                    user.role === 'FINANCE' ? 'Finance' : 'Admin'}
+                                        </td>
+                                        <td className="px-6 py-3 text-right tabular-nums text-hui-textMain">
+                                            {formatCurrency(user.hourlyRate ?? 0)}/h
+                                        </td>
+                                        <td className="px-6 py-3 text-right tabular-nums text-hui-textMuted">
+                                            {formatCurrency(user.burdenRate ?? 0)}/h
+                                        </td>
+                                        <td className={`px-6 py-3 ${sync.stale ? "text-red-700" : "text-hui-textMuted"}`}>
+                                            {sync.text}
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                    {activeUsers.length === 0 && (
+                        <div className="p-6 text-center text-hui-textMuted">No activated team members yet.</div>
+                    )}
+                </div>
             </div>
 
             {/* Add User Modal */}

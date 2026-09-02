@@ -69,6 +69,13 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 if (userInfo.status !== undefined) data.status = userInfo.status;
                 if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
                 if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+                // lastRateSyncAt means "last time this rate was CONFIRMED", not
+                // "last time it changed" — saving the editor with the same
+                // number is a human confirming it, and that is exactly what the
+                // Payroll rates panel's staleness warning is asking about.
+                if (userInfo.hourlyRate !== undefined || userInfo.burdenRate !== undefined) {
+                    data.lastRateSyncAt = new Date();
+                }
                 // FINANCE accounts must never be offered as dispatch-board crew —
                 // guard server-side even though the Team page hides the toggle.
                 if (userInfo.showOnDispatch !== undefined) {

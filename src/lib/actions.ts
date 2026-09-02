@@ -15168,3 +15168,174 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
     revalidatePath("/manager/time-entries");
     return { success: true };
 }
+
+// ============ Payroll (Phase 5 — docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md) ============
+
+/**
+ * ADMIN, or the `financialReports` permission. Pay rates and payroll exports
+ * are money, not team administration — the same gate the export endpoint uses,
+ * so the panel and the download can never disagree about who may see rates.
+ */
+async function requirePayrollAccess() {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (user.role !== "ADMIN" && !hasPermission(user, "financialReports")) throw new Error("Forbidden");
+    return user;
+}
+
+/**
+ * Step 1 of the rate import: parse a pasted Gusto employee export and return
+ * the diff for a human to look at. WRITES NOTHING. The preview and the save
+ * both run the same pure code (src/lib/rate-import.ts), so what is approved is
+ * what is applied.
+ */
+export async function previewGustoRateImport(csvText: string) {
+    await requirePayrollAccess();
+    if (typeof csvText !== "string" || !csvText.trim()) {
+        return { success: false as const, error: "Paste the CSV first." };
+    }
+    const { parseGustoRateCsv, diffRates } = await import("./rate-import");
+    const parsed = parseGustoRateCsv(csvText);
+    const users = await prisma.user.findMany({
+        where: { status: { not: "DISABLED" } },
+        select: { id: true, name: true, email: true, hourlyRate: true },
+    });
+    const rows = diffRates(
+        parsed.rows,
+        users.map((u) => ({ id: u.id, name: u.name, email: u.email, hourlyRate: toNum(u.hourlyRate) }))
+    );
+    return { success: true as const, rows, errors: parsed.errors };
+}
+
+/**
+ * Step 2: apply the approved rows. hourlyRate ONLY (burden is not in the Gusto
+ * export — spec section 7 risk 4) plus lastRateSyncAt, in one transaction so a
+ * partial import cannot leave half the crew on old rates.
+ *
+ * The rows are re-validated here rather than trusted: this is a server action,
+ * so its argument is an HTTP request body, not the preview's return value.
+ */
+export async function applyGustoRateImport(rows: Array<{ userId: string; newHourly: number }>) {
+    await requirePayrollAccess();
+    if (!Array.isArray(rows) || rows.length === 0) {
+        return { success: false as const, error: "Nothing to save." };
+    }
+    const { MAX_IMPORTABLE_HOURLY_RATE } = await import("./rate-import");
+
+    const seen = new Set<string>();
+    const clean: Array<{ userId: string; newHourly: number }> = [];
+    for (const row of rows) {
+        if (!row || typeof row.userId !== "string" || !row.userId) continue;
+        if (seen.has(row.userId)) return { success: false as const, error: "The same team member appears twice." };
+        const rate = Number(row.newHourly);
+        if (!Number.isFinite(rate) || rate < 0 || rate > MAX_IMPORTABLE_HOURLY_RATE) {
+            return { success: false as const, error: `Rate out of range for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}).` };
+        }
+        seen.add(row.userId);
+        clean.push({ userId: row.userId, newHourly: rate });
+    }
+    if (clean.length === 0) return { success: false as const, error: "Nothing to save." };
+
+    const known = await prisma.user.findMany({
+        where: { id: { in: clean.map((r) => r.userId) } },
+        select: { id: true },
+    });
+    if (known.length !== clean.length) return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
+
+    const syncedAt = new Date();
+    await prisma.$transaction(
+        clean.map((row) =>
+            prisma.user.update({
+                where: { id: row.userId },
+                data: { hourlyRate: row.newHourly, lastRateSyncAt: syncedAt },
+            })
+        )
+    );
+
+    revalidatePath("/company/team-members");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const, updated: clean.length };
+}
+
+/**
+ * Freeze a pay period after its CSVs have been downloaded and checked.
+ *
+ * `periodEndKey` is EXCLUSIVE (the day after the last day), matching
+ * PayrollPeriod and the export endpoint. The summary CSV is recomputed here
+ * rather than taken from the caller: exportHash has to describe what the
+ * database actually held at lock time, not what a browser posted.
+ *
+ * Refuses while any in-range entry is still open or flagged — the same
+ * condition that makes the download 409, checked again at the moment of the
+ * write so a lock can never freeze a period that was not exportable.
+ */
+export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
+    const user = await requirePayrollAccess();
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { loadGustoExport } = await import("./gusto-export-db");
+
+    const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
+    if (!DAY_KEY.test(periodStartKey) || !DAY_KEY.test(periodEndKey) || periodEndKey <= periodStartKey) {
+        return { success: false as const, error: "Pick a valid period." };
+    }
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
+
+    const result = await loadGustoExport(periodStart, periodEnd);
+    if (result.blocking.length > 0) {
+        return {
+            success: false as const,
+            error: `${result.blocking.length} time ${result.blocking.length === 1 ? "entry is" : "entries are"} still open or flagged — clear them before locking.`,
+        };
+    }
+
+    const lockedAt = new Date();
+    await prisma.payrollPeriod.upsert({
+        where: { periodStart_periodEnd: { periodStart, periodEnd } },
+        create: {
+            periodStart,
+            periodEnd,
+            lockedAt,
+            lockedById: user.id,
+            exportHash: result.summaryHash,
+        },
+        update: { lockedAt, lockedById: user.id, exportHash: result.summaryHash },
+    });
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const, exportHash: result.summaryHash };
+}
+
+/**
+ * ADMIN only — unlocking re-opens paid hours for editing, which is exactly the
+ * situation the lock exists to prevent, so it is not a manager-level action.
+ * Clears lockedAt but keeps the row and its exportHash: "this is what we
+ * exported" has to survive the unlock.
+ */
+export async function unlockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Not authenticated");
+    if (user.role !== "ADMIN") throw new Error("Forbidden");
+
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
+    if (!DAY_KEY.test(periodStartKey) || !DAY_KEY.test(periodEndKey) || periodEndKey <= periodStartKey) {
+        return { success: false as const, error: "Pick a valid period." };
+    }
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
+
+    await prisma.payrollPeriod.updateMany({
+        where: { periodStart, periodEnd },
+        data: { lockedAt: null },
+    });
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return { success: true as const };
+}
