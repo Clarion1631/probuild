@@ -73,6 +73,21 @@ export interface CreateIdentity {
     docNumber: string;
     /** The exact PrivateNote the create wrote -- what proves an invoice is ours. */
     privateNote: string;
+    /**
+     * Fingerprint of the MONEY STATE the invoice was built from, from
+     * `qbo-issuance.ts`. Opaque here on purpose -- computing it needs
+     * node:crypto and this module is imported by a client component.
+     *
+     * docNumber + privateNote prove an invoice is OURS. They say nothing about
+     * whether it still DESCRIBES the row: neither carries the amount, the
+     * status, or the due date. A create that landed but lost its post-create
+     * CAS (the milestone was paid, canceled or repriced mid-flight) and whose
+     * compensating delete then failed leaves exactly that shape -- a real
+     * invoice in QuickBooks for money the row no longer owes. Without this the
+     * resolver would link it. `undefined` means the marker predates the field:
+     * the resolver treats that as unverifiable and refuses to link.
+     */
+    issuanceHash?: string;
 }
 
 /** Separates the marker kind from its identity payload. */
@@ -95,6 +110,15 @@ const MARKER_FIELD_SEP = "|";
  * to protect against.
  */
 const MARKER_TIME_PREFIX = "@";
+/**
+ * Prefixes the issuance hash, e.g.
+ * `ambiguous-create:#4f1c2ab90de7331a|INV-00171-2|ProBuild ...`.
+ *
+ * Sits after the optional `@time` field and before the docNumber. Both prefixes
+ * are safe to test for positionally because neither a DocNumber nor a
+ * PrivateNote can begin with them -- see the invariants in composeCreateMarker.
+ */
+const MARKER_HASH_PREFIX = "#";
 
 /**
  * `create-in-flight:@1730000000000|INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
@@ -115,8 +139,24 @@ export function composeCreateMarker(
     if (identity.docNumber.includes(MARKER_FIELD_SEP)) {
         throw new Error(`DocNumber must not contain "${MARKER_FIELD_SEP}": ${identity.docNumber}`);
     }
+    // The optional `@time` and `#hash` fields are recognised by their leading
+    // character, so a DocNumber starting with one would be swallowed as a
+    // malformed field and the marker would parse as corrupt (fail-closed, but
+    // silently unresolvable). Ours never do -- this is an invariant, not input
+    // validation, same as the separator check above.
+    if (identity.docNumber.startsWith(MARKER_TIME_PREFIX) || identity.docNumber.startsWith(MARKER_HASH_PREFIX)) {
+        throw new Error(
+            `DocNumber must not start with "${MARKER_TIME_PREFIX}" or "${MARKER_HASH_PREFIX}": ${identity.docNumber}`,
+        );
+    }
+    if (identity.issuanceHash != null && !/^[0-9a-f]+$/.test(identity.issuanceHash)) {
+        throw new Error(`Issuance hash must be lowercase hex: ${identity.issuanceHash}`);
+    }
     const timePart = kind === CREATE_IN_FLIGHT_MARKER ? `${MARKER_TIME_PREFIX}${at.getTime()}${MARKER_FIELD_SEP}` : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const hashPart = identity.issuanceHash
+        ? `${MARKER_HASH_PREFIX}${identity.issuanceHash}${MARKER_FIELD_SEP}`
+        : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -162,6 +202,17 @@ export function parseCreateMarker(
         // as corrupt, which is the same fail-closed handling as any other
         // corrupt marker.
     }
+    let issuanceHash: string | undefined;
+    if (payload.startsWith(MARKER_HASH_PREFIX)) {
+        const hashEnd = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = hashEnd > 0 ? payload.slice(MARKER_HASH_PREFIX.length, hashEnd) : "";
+        if (raw && /^[0-9a-f]+$/.test(raw)) {
+            issuanceHash = raw;
+            payload = payload.slice(hashEnd + MARKER_FIELD_SEP.length);
+        }
+        // A malformed `#...` field falls through unstripped for the same reason
+        // as a malformed `@...` one: it lands in docNumber and reads as corrupt.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
@@ -169,7 +220,14 @@ export function parseCreateMarker(
     const docNumber = payload.slice(0, sep);
     const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
     if (!docNumber || !privateNote) return { kind, identity: null, atMs };
-    return { kind, identity: { docNumber, privateNote }, atMs };
+    // The key is OMITTED, not set to undefined, when the marker carries no
+    // hash: a deep-equality check against a two-field identity has to keep
+    // reading as equal for a legacy marker.
+    return {
+        kind,
+        identity: issuanceHash ? { docNumber, privateNote, issuanceHash } : { docNumber, privateNote },
+        atMs,
+    };
 }
 
 /**

@@ -42,11 +42,15 @@ function isQboAuthFailure(error: unknown): boolean {
     // can't see its status — check it directly or a credential rejection here
     // reads as a business refusal (`qbo-fault`, terminal) instead of the
     // retryable-once-reconnected `qbo-auth` it actually is.
-    if (
-        error instanceof QboPurchaseFaultError &&
-        (error.status === 401 || error.status === 403)
-    ) {
-        return true;
+    // Name-based, for the same cross-module-identity reason as isQBNotConnectedError:
+    // a bare `instanceof` here can miss the SAME error class loaded from a
+    // second module instance and silently fall through to the terminal
+    // business-fault branch instead.
+    const isQboPurchaseFault =
+        error instanceof QboPurchaseFaultError || (error instanceof Error && error.name === "QboPurchaseFaultError");
+    if (isQboPurchaseFault) {
+        const status = (error as { status?: unknown }).status;
+        if (status === 401 || status === 403) return true;
     }
     // The attachment upload/lookup steps classify their own 401/403 the same
     // way (qbo-receipt-push.ts) — reconnecting fixes it, retrying the same

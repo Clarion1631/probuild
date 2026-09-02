@@ -6,8 +6,10 @@ import {
     isBudgetExhausted,
     isQBBudgetExhaustedError,
     isQboConnectionFailure,
+    isQboReconnectRequired,
     isQBTimeoutError,
 } from "@/lib/quickbooks";
+import { QBO_AUTH_EVENT_REASON } from "@/lib/pipeline-health";
 import {
     getQBInvoicePaymentOptions, setQBInvoicePaymentOptions,
     createQBPaymentForInvoice, deleteQBPayment, deleteQBInvoice,
@@ -192,7 +194,12 @@ export async function POST(req: Request) {
                     break pager;
                 }
                 if (isQboConnectionFailure(e)) {
-                    abortedReason = isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
+                    // 401/403 is the credential, not an outage — reported under
+                    // the reconnect reason the health digest counts, same rule
+                    // as the payments sweep and its preflight.
+                    abortedReason = isQboReconnectRequired(e)
+                        ? QBO_AUTH_EVENT_REASON
+                        : isQBTimeoutError(e) ? "qbo-timeout" : "qbo-unavailable";
                     break pager;
                 }
                 results.push({ qbInvoiceId: qbId, code: s.invoice.code, result: `error: ${e instanceof Error ? e.message.slice(0, 120) : "?"}` });

@@ -204,7 +204,11 @@ test("stopping early reports truncated + how many are left", async () => {
     assert.equal(body.ok, false);
     assert.equal(body.truncated, true);
     assert.equal(body.retry, true);
-    assert.equal(body.reason, "qbo-unavailable");
+    // Named as the CREDENTIAL failure it is, not as a generic outage. The
+    // health digest counts only the reconnect family toward its "reconnect
+    // QuickBooks" alert, so filing a 401 under "qbo-unavailable" made a broken
+    // connection read like ordinary Intuit flakiness and nobody was told.
+    assert.equal(body.reason, "qbo-auth");
     // Counted from the database after the last row it actually finished, so it
     // includes everything the cursor never reached.
     assert.equal(body.remaining, 37, `remaining was ${body.remaining}`);

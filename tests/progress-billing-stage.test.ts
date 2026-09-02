@@ -25,6 +25,7 @@ import {
     parseCreateMarker,
     AMBIGUOUS_CREATE_MARKER,
 } from "../src/lib/qbo-create-markers";
+import { progressBillingIssuanceHash } from "../src/lib/qbo-issuance";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 
@@ -253,9 +254,17 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
     assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER);
     // The marker carries what a recovery has to ask QuickBooks for, captured
     // before the POST — not recomputed later from a row that may have moved.
+    // ...along with a hash of the MONEY STATE it was staged against, so the
+    // resolver can tell "this invoice is ours" from "this invoice still
+    // describes this billing" — see qbo-issuance.ts.
     assert.deepEqual(parseCreateMarker(row.qbSyncError)?.identity, {
         docNumber: "INV-00171-P1",
         privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
+        issuanceHash: progressBillingIssuanceHash({
+            status: "Draft",
+            subtotal: 1000,
+            total: 1089,
+        }),
     });
     assert.equal(row.qbInvoiceId, null, "we never learned an id to record");
     assert.equal(events.at(-1)?.reason, "ambiguous-create");

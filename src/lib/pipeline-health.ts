@@ -150,6 +150,29 @@ export const PAYMENTS_SYNC_EVENT_KIND = "qbo-payments-sync";
  */
 export const QBO_AUTH_EVENT_REASON = "qbo-auth";
 /**
+ * EVERY reason string that means "a human has to reconnect QuickBooks".
+ *
+ * The probe used to count the exact string `qbo-auth` and nothing else, so the
+ * reconnect alert only fired for a failure the PREFLIGHT classified. Everything
+ * the token path reports (`classifyPreflightFailure` in quickbooks-payments.ts)
+ * — not connected at all, a refresh whose replacement token could not be
+ * stored, a rotation we cannot resolve, a settings read that failed — is
+ * equally un-self-healing and was silently filed as an ordinary error.
+ *
+ * `qbo-unavailable` is deliberately NOT in this list. It is a real outage
+ * (429/5xx/network) that clears itself, and folding it in would tell Justin to
+ * reconnect QuickBooks every time Intuit had a bad five minutes. The 401/403
+ * leak that used to hide in that bucket is fixed at the source instead — see
+ * `isQboReconnectRequired` in quickbooks.ts.
+ */
+export const QBO_RECONNECT_EVENT_REASONS: readonly string[] = [
+    QBO_AUTH_EVENT_REASON,
+    "quickbooks-not-connected",
+    "token-not-persisted",
+    "token-rotation-ambiguous",
+    "token-fetch-failed",
+];
+/**
  * Only a run tagged "cron" counts as the heartbeat. On-view and manual
  * refreshes write their own source precisely so they cannot stand in for an
  * hourly job that has stopped running.
@@ -427,7 +450,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         probe<number>(
             "qboAuth",
             () => prisma.automationEvent.count({
-                where: { createdAt: { gte: since24h }, reason: QBO_AUTH_EVENT_REASON },
+                where: { createdAt: { gte: since24h }, reason: { in: [...QBO_RECONNECT_EVENT_REASONS] } },
             }),
             0,
         ),
@@ -531,7 +554,7 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
     ];
     if (health.qboAuth && health.qboAuth.status === "ok" && health.qboAuth.count > 0) {
-        lines.push(`QuickBooks refused our credential ${health.qboAuth.count} time(s) in 24h — reconnect it in Settings → Integrations.`);
+        lines.push(`QuickBooks could not be used with the stored credential ${health.qboAuth.count} time(s) in 24h — reconnect it in Settings → Integrations.`);
     }
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);
 

@@ -172,11 +172,27 @@ export async function qboResponseError(res: Response, label: string): Promise<Er
     } catch (error) {
         if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
     }
-    const detail = `${label} failed (${res.status}): ${body}`.slice(0, 500);
-    if (isTransientQboStatus(res.status)) {
-        return new QboRetryableError(detail, res.status);
+    return qboErrorFromStatus(res.status, body, label);
+}
+
+/**
+ * The same classification as `qboResponseError`, for a caller that has ALREADY
+ * consumed the response body.
+ *
+ * A `Response` body can only be read once, so the create paths that sniff the
+ * text for a QBO Fault code (vendor duplicate 6240, purchase business rules)
+ * cannot hand the response back to `qboResponseError` afterwards. Without this
+ * they fell back to `new Error(...)`, which drops the status: a 401 on a vendor
+ * or purchase create then reached the receipt route as an unknown failure (a
+ * retried-forever 500) instead of the `qbo-auth` reconnect it is. Same rules,
+ * same two classes, one definition.
+ */
+export function qboErrorFromStatus(status: number, body: string, label: string): Error {
+    const detail = `${label} failed (${status}): ${body}`.slice(0, 500);
+    if (isTransientQboStatus(status)) {
+        return new QboRetryableError(detail, status);
     }
-    return new QboHttpError(detail, res.status, body);
+    return new QboHttpError(detail, status, body);
 }
 
 /**
@@ -200,6 +216,40 @@ export function isSharedQboFailureStatus(status: number): boolean {
  * burns its own full deadline against the same wall, which is how a handful of
  * 20s timeouts added up to the payments cron's entire 120s ceiling.
  */
+/**
+ * The HTTP status QuickBooks answered with, from EITHER typed error class.
+ *
+ * `qboHttpStatus` deliberately reads only `QboHttpError` — a retryable error is
+ * not a plain HTTP error, and callers branch on that distinction. But
+ * `QboRetryableError` DOES carry a status, and a caller that only wants to know
+ * "was this 401/403?" has to see it: a row loop wraps a failed invoice probe as
+ * `QboRetryableError(msg, 401)`, so classifying the abort off `qboHttpStatus`
+ * alone reported a broken credential as an ordinary outage and the digest's
+ * reconnect alert never fired.
+ */
+export function qboFailureStatus(error: unknown): number | null {
+    const plain = qboHttpStatus(error);
+    if (plain !== null) return plain;
+    if (isRetryableQboError(error)) {
+        const status = (error as { status?: unknown }).status;
+        return typeof status === "number" ? status : null;
+    }
+    return null;
+}
+
+/**
+ * Is this failure one that only a human RECONNECTING QuickBooks can fix?
+ *
+ * 401/403 is the credential, not an outage: every retry against the same token
+ * fails identically, and waiting does not help. It must be reported under its
+ * own reason so the digest can say "reconnect QuickBooks" instead of burying it
+ * in the generic transient bucket.
+ */
+export function isQboReconnectRequired(error: unknown): boolean {
+    const status = qboFailureStatus(error);
+    return status === 401 || status === 403;
+}
+
 export function isQboConnectionFailure(error: unknown): boolean {
     if (isQBTimeoutError(error) || isRetryableQboError(error)) return true;
     // A 401/403 is the SAME credential failing, so every remaining record in a
@@ -1635,10 +1685,10 @@ export async function syncEstimateToQB(
         qbDeadline: deadline,
     });
 
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB estimate sync failed: ${err}`);
-    }
+    // Every non-2xx goes through the shared classifier: a 429 or 5xx here is
+    // QuickBooks being unavailable, not a verdict on this estimate, and a bare
+    // Error made the two indistinguishable to every caller upstream.
+    if (!res.ok) throw await qboResponseError(res, "QB estimate sync");
 
     const data = await res.json();
     const qbId = data.Estimate?.Id;
@@ -1693,10 +1743,8 @@ export async function syncInvoiceToQB(
         qbDeadline: deadline,
     });
 
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`QB invoice sync failed: ${err}`);
-    }
+    // Same shared classification as the estimate push above.
+    if (!res.ok) throw await qboResponseError(res, "QB invoice sync");
 
     const data = await res.json();
     const qbId = data.Invoice?.Id;

@@ -41,6 +41,7 @@ import {
     parseCreateMarker,
     getFreshQBTokens,
 } from "./quickbooks-payments";
+import { milestoneIssuanceHash, progressBillingIssuanceHash } from "./qbo-issuance";
 
 /** Whole-operation budget: a token refresh plus one query, and room to answer. */
 export const RESOLVE_AMBIGUOUS_BUDGET_MS = 25_000;
@@ -69,7 +70,9 @@ export type AmbiguousCreateRefusal =
     | "changed"
     | "invalid"
     | "create-still-active"
-    | "result-set-truncated";
+    | "result-set-truncated"
+    | "issuance-changed"
+    | "issuance-unverifiable";
 
 export type ResolveAmbiguousCreateResult =
     | { ok: true; outcome: "linked"; qbInvoiceId: string; message: string }
@@ -133,7 +136,19 @@ interface ParkedRow {
      * nothing, and offer to release a row whose real invoice is collectible.
      * `null` means the marker predates the identity (or is corrupt): refuse.
      */
-    identity: { docNumber: string; privateNote: string } | null;
+    identity: { docNumber: string; privateNote: string; issuanceHash?: string } | null;
+    /**
+     * The issuance hash of the row AS IT STANDS NOW, recomputed from the same
+     * columns the create hashed. Compared against the marker's before linking.
+     */
+    currentIssuanceHash: string;
+    /**
+     * Those same columns as a Prisma `where` fragment, folded into the link
+     * CAS. The hash comparison is a read; this is what makes the decision
+     * atomic with the write, so a settle landing between the two cannot slip a
+     * stale invoice onto a row that just changed.
+     */
+    issuanceWhere: Record<string, unknown>;
     marker: string;
     /** Which pending-create kind the marker is, or `null` when not parked. */
     kind: string | null;
@@ -247,12 +262,45 @@ export async function resolveAmbiguousInvoiceCreateCore(
     const delegate = input.kind === "milestone" ? db.paymentSchedule : db.progressBilling;
 
     if (matches.length === 1) {
+        // An invoice exists — but "it is ours" and "it still describes this
+        // row" are different questions, and only the first one has been
+        // answered so far. DocNumber and PrivateNote carry no amount, no status
+        // and no due date, so a create that landed, lost its post-create CAS
+        // (paid/canceled/repriced/renamed mid-flight) and then failed to
+        // compensate leaves a real QuickBooks invoice for money this row no
+        // longer owes, wearing a perfectly matching identity. Linking it would
+        // point the row at a stale bill the client can still pay.
+        //
+        // The marker's issuance hash is the answer. Fail closed on both a
+        // mismatch and an absent hash: the operator can still resolve it by
+        // hand in QuickBooks, and a wrong link is a wrong bill.
+        if (!parked.identity.issuanceHash) {
+            return {
+                ok: false,
+                refusal: "issuance-unverifiable",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but ${parked.code} was parked without a record of the amount it was sent for, ` +
+                    `so ProBuild cannot confirm that invoice still matches this row. Check the amount in QuickBooks and resolve it there — nothing was changed here.`,
+            };
+        }
+        if (parked.identity.issuanceHash !== parked.currentIssuanceHash) {
+            return {
+                ok: false,
+                refusal: "issuance-changed",
+                message:
+                    `${parked.code} has changed since that QuickBooks invoice was created (its amount, status, name or due date is no longer what was sent), ` +
+                    `so linking it would attach a bill for the wrong money. Check invoice ${parked.identity.docNumber} in QuickBooks — if it is wrong, void or delete it there. Nothing was changed here.`,
+            };
+        }
         // QuickBooks is the truth: an invoice exists, whatever the operator
         // asserted. Adopt it. PAYLINK_PENDING_MARKER rather than null, because
         // we have the id but not the pay link — the maintenance sweep fetches it.
         const qbInvoiceId = matches[0].id;
         const linked = await delegate.updateMany({
-            where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker },
+            // The issuance columns are pinned here as well as hashed above: the
+            // hash check is a read taken before this write, so without them a
+            // settle or a reprice landing in between would still be linked.
+            where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker, ...parked.issuanceWhere },
             data: {
                 qbInvoiceId,
                 qbSyncedAt: new Date(),
@@ -313,11 +361,16 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
     // NOTE what is NOT selected: the sibling milestone order and the project
     // name. Neither is used any more — the identity comes off the marker, and
     // reading them here at all would invite recomputing it.
+    // What IS selected beyond that: the money columns the create hashed
+    // (status/amount/name/dueDate/qbPaymentId, or status/subtotal/total/
+    // description). Those are recomputed here, not read off the marker — the
+    // whole point is to compare the marker's snapshot against the row NOW.
     if (kind === "milestone") {
         const row = await db.paymentSchedule.findUnique({
             where: { id },
             select: {
                 id: true, name: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
+                status: true, amount: true, dueDate: true, qbPaymentId: true,
                 invoice: { select: { code: true, projectId: true } },
             },
         });
@@ -326,6 +379,18 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
             id: row.id,
             code: row.name || row.invoice?.code || row.id,
             ...parkedIdentity(row),
+            currentIssuanceHash: milestoneIssuanceHash({
+                status: row.status ?? null,
+                amount: row.amount,
+                dueDate: row.dueDate ?? null,
+                qbPaymentId: row.qbPaymentId ?? null,
+            }),
+            issuanceWhere: {
+                status: row.status,
+                amount: row.amount,
+                dueDate: row.dueDate,
+                qbPaymentId: row.qbPaymentId,
+            },
             fingerprint: ambiguousCreateFingerprint(row),
             projectId: row.invoice?.projectId ?? null,
             invoiceId: row.invoiceId ?? null,
@@ -335,6 +400,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         where: { id },
         select: {
             id: true, code: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
+            status: true, subtotal: true, total: true,
             invoice: { select: { code: true, projectId: true } },
         },
     });
@@ -343,6 +409,16 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         id: row.id,
         code: row.code,
         ...parkedIdentity(row),
+        currentIssuanceHash: progressBillingIssuanceHash({
+            status: row.status ?? null,
+            subtotal: row.subtotal,
+            total: row.total,
+        }),
+        issuanceWhere: {
+            status: row.status,
+            subtotal: row.subtotal,
+            total: row.total,
+        },
         fingerprint: ambiguousCreateFingerprint(row),
         projectId: row.invoice?.projectId ?? null,
         invoiceId: row.invoiceId ?? null,
@@ -357,7 +433,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
  */
 function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string | null }): {
     marker: string;
-    identity: { docNumber: string; privateNote: string } | null;
+    identity: { docNumber: string; privateNote: string; issuanceHash?: string } | null;
     kind: string | null;
     atMs: number | null;
 } {

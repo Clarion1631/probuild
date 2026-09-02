@@ -39,6 +39,7 @@ import {
     qboHttpStatus,
     isTransientQboStatus,
     qboResponseError,
+    qboErrorFromStatus,
     type RouteDeadline,
     QboRetryableError,
     isRetryableQboError,
@@ -163,7 +164,12 @@ export async function ensureQBVendor(
             const faultCode = err.match(/"code"\s*:\s*"(\d+)"/)?.[1];
             throw new QboPurchaseFaultError(res.status, `QB vendor create failed: ${err}`, faultCode);
         }
-        throw new Error(`QB vendor create failed: ${err}`);
+        // Everything else (401, 404, 409, ...) goes through the shared
+        // classifier rather than a bare Error, which dropped the status: a 401
+        // then reached the route as an unknown failure and got retried forever
+        // instead of being reported as the `qbo-auth` reconnect it is. The body
+        // is already consumed here, hence the from-status form.
+        throw qboErrorFromStatus(res.status, err, "QB vendor create");
     }
     const data = await parseJsonOrNull(res);
     if (!data?.Vendor?.Id) {
@@ -347,7 +353,10 @@ async function defaultQbCreatePurchase(
             const faultCode = text.match(/"code"\s*:\s*"(\d+)"/)?.[1];
             throw new QboPurchaseFaultError(res.status, `QB purchase create failed: ${text}`, faultCode);
         }
-        throw new Error(`QB purchase create failed: ${text}`);
+        // Same rule as the vendor create: a non-2xx that is neither transient
+        // nor a 400/403 business rule still carries its status through the
+        // shared classifier, so a 401 lands on the route's `qbo-auth` branch.
+        throw qboErrorFromStatus(res.status, text, "QB purchase create");
     }
     const data = await parseJsonOrNull(res);
     // Intuit documents that a 200 response can still carry a Fault body.

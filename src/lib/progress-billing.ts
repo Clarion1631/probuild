@@ -50,6 +50,7 @@ import {
     PAYLINK_PENDING_MARKER,
     QBResolveRequiredError,
 } from "./qbo-create-markers";
+import { progressBillingIssuanceHash } from "./qbo-issuance";
 import { logAutomationEvent } from "./automation-events";
 
 // Cent-round helper shared by every money computation below. EPSILON nudges
@@ -779,8 +780,25 @@ export async function stageProgressBillingToQuickBooksCore(
     // The marker CARRIES the recovery identity (docNumber + PrivateNote) in the
     // same CAS, so a recovery never has to recompute it from state that may
     // have moved since — see composeCreateMarker.
+    //
+    // The ISSUANCE HASH rides along for the same reason as on the milestone
+    // rail: the code and the note prove an invoice is ours, not that it still
+    // describes this billing. A create that lands, loses the link CAS below
+    // (the billing was edited or voided mid-stage) and then fails to compensate
+    // leaves a real invoice for the old total with a perfectly matching
+    // identity — the resolver must be able to see the row moved.
     const privateNote = progressBillingPrivateNote(invoice.code, billing.code);
-    const identity = { docNumber: billing.code, privateNote };
+    const identity = {
+        docNumber: billing.code,
+        privateNote,
+        // Pinned to the values the link CAS below requires, not to whatever was
+        // loaded — those are what this invoice is genuinely issued against.
+        issuanceHash: progressBillingIssuanceHash({
+            status: "Draft",
+            subtotal: billing.subtotal,
+            total: billing.total,
+        }),
+    };
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
     const claimedSend = await db.updateMany({
         where: { id: billing.id, status: "Draft", qbInvoiceId: null, qbSyncError: null },

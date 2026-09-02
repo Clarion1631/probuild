@@ -33,6 +33,7 @@ import {
     isRetryableQboError,
     isQboMalformedResponseError,
     qboHttpStatus,
+    isQboReconnectRequired,
     QBTokenStrandedError,
     isQBTokenStrandedError,
     QboRetryableError,
@@ -53,7 +54,12 @@ import {
     composeCreateMarker,
     isBlockedByAmbiguousCreate,
 } from "./qbo-create-markers";
+import { milestoneIssuanceHash } from "./qbo-issuance";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
+// One definition of the reconnect-QuickBooks reason string, shared with the
+// health probe that counts it. A second literal here is how the row loop and
+// the preflight drifted apart in the first place.
+import { QBO_AUTH_EVENT_REASON as QBO_AUTH_SYNC_REASON } from "./pipeline-health";
 import type { QBSyncIssue } from "./payment-notifications";
 
 /**
@@ -398,6 +404,26 @@ export interface PayLinkSweepResult {
 export const PAYLINK_SWEEP_LIMIT = 100;
 
 /**
+ * Where the last pay-link sweep stopped, per rail, so the next one CONTINUES.
+ *
+ * Both rail queries were an UNORDERED `take: 100`. A row whose pay-link read
+ * fails for a reason this sweep deliberately leaves alone (the invoice was
+ * deleted in QuickBooks, say — the invoice-probe sweep owns that, not this one)
+ * keeps its `paylink-pending` marker forever. Once 100 such rows existed, every
+ * run fetched the same stuck page and nothing behind it was ever looked at
+ * again. Ordering by id makes the page deterministic and the cursor makes the
+ * cap a rolling window over the whole set, wrapping to the top when it drains.
+ *
+ * Separate keys from PAYMENTS_CURSOR_KEYS on purpose: this sweep walks a
+ * different set (linked-but-linkless rows) than the payments sync does
+ * (unsettled rows), so sharing a cursor would make each skip the other's work.
+ */
+export const PAYLINK_CURSOR_KEYS = {
+    milestones: "qbo-paylink-sweep.cursor.milestones",
+    billings: "qbo-paylink-sweep.cursor.billings",
+} as const;
+
+/**
  * Finish the work a pay-link timeout left behind, on BOTH rails.
  *
  * `pushMilestoneToQuickBooks` and `stageProgressBillingToQuickBooksCore` link
@@ -415,25 +441,92 @@ export async function sweepPendingPayLinks(
     deps?: {
         db?: PayLinkSweepDb;
         readPayLink?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<string | null>;
+        /** Where the per-rail resume cursors live; defaults to AutomationSetting. */
+        cursorStore?: PaymentsSyncCursorStore;
     },
 ): Promise<PayLinkSweepResult> {
     const db: PayLinkSweepDb = deps?.db ?? prisma;
     const readPayLink = deps?.readPayLink ?? getQBInvoicePaymentLink;
+    const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
     const result: PayLinkSweepResult = { checked: 0, repaired: 0, noLink: 0, skipped: 0 };
 
     const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
-    const [milestones, billings] = await Promise.all([
-        db.paymentSchedule.findMany({
-            where,
-            select: { id: true, qbInvoiceId: true, invoice: { select: { code: true } } },
+
+    /**
+     * One rail's page, resumed from its cursor.
+     *
+     * A short page means we reached the end of the collection, so the cursor is
+     * dropped and the run continues from the top in the SAME pass — otherwise a
+     * cursor parked near the end would spend a whole run on a handful of rows
+     * while the head of the collection waited for the next one.
+     */
+    const fetchRail = async (
+        delegate: PayLinkSweepDelegate,
+        select: Record<string, unknown>,
+        key: string,
+    ): Promise<{ rows: any[]; startedFromCursor: boolean }> => {
+        const stored = await cursorStore.get(key);
+        const cursorId = stored && stored.length > 0 ? stored : null;
+        const page = async (after: string | null) => delegate.findMany({
+            where: after ? { ...where, id: { gt: after } } : where,
+            select,
+            // Stable key: without it Postgres may hand back the same first page
+            // every run and starve everything behind it.
+            orderBy: { id: "asc" },
             take: PAYLINK_SWEEP_LIMIT,
-        }),
-        db.progressBilling.findMany({
-            where,
-            select: { id: true, qbInvoiceId: true, code: true },
-            take: PAYLINK_SWEEP_LIMIT,
-        }),
+        });
+        const rows = await page(cursorId);
+        if (rows.length === 0 && cursorId) {
+            // Drained past the cursor: wrap now rather than burning the run.
+            await cursorStore.set(key, "");
+            return { rows: await page(null), startedFromCursor: false };
+        }
+        return { rows, startedFromCursor: cursorId !== null };
+    };
+
+    const [milestonePage, billingPage] = await Promise.all([
+        fetchRail(
+            db.paymentSchedule,
+            { id: true, qbInvoiceId: true, invoice: { select: { code: true } } },
+            PAYLINK_CURSOR_KEYS.milestones,
+        ),
+        fetchRail(
+            db.progressBilling,
+            { id: true, qbInvoiceId: true, code: true },
+            PAYLINK_CURSOR_KEYS.billings,
+        ),
     ]);
+    const milestones = milestonePage.rows;
+    const billings = billingPage.rows;
+
+    /**
+     * The furthest each rail's cursor may move: the last row this run actually
+     * REACHED A DECISION ON. Jumping to the end of the page after an outage cut
+     * it short would step straight over every row the outage skipped, and they
+     * would not be looked at again until the cursor wrapped all the way round.
+     * A row we deliberately left pending (per-invoice refusal, lost CAS) still
+     * counts as decided — leaving the cursor behind it is what starves the tail.
+     */
+    const lastDecided: Record<"milestone" | "progressBilling", string | null> = {
+        milestone: null,
+        progressBilling: null,
+    };
+    const saveCursors = async () => {
+        const rails = [
+            { kind: "milestone" as const, key: PAYLINK_CURSOR_KEYS.milestones, page: milestonePage },
+            { kind: "progressBilling" as const, key: PAYLINK_CURSOR_KEYS.billings, page: billingPage },
+        ];
+        for (const rail of rails) {
+            const last = lastDecided[rail.kind];
+            const drained = rail.page.rows.length < PAYLINK_SWEEP_LIMIT
+                && last !== null
+                && last === rail.page.rows[rail.page.rows.length - 1]?.id;
+            // A fully-worked short page IS the end of the collection: reset so
+            // the next run starts at the top instead of finding nothing.
+            if (drained) await cursorStore.set(rail.key, "");
+            else if (last !== null) await cursorStore.set(rail.key, last);
+        }
+    };
 
     const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] = [
         ...milestones.map((m: any) => ({
@@ -470,8 +563,14 @@ export async function sweepPendingPayLinks(
             }
             if (isQboConnectionFailure(error)) {
                 // Shared connection: the remaining rows would fail identically
-                // at a fresh 20s each. Stop and leave them pending.
-                result.reason = isQBTimeoutError(error) ? "qbo-timeout" : "qbo-unavailable";
+                // at a fresh 20s each. Stop and leave them pending. A 401/403
+                // is named as the credential failure it is — same family the
+                // digest's reconnect alert counts.
+                result.reason = isQboReconnectRequired(error)
+                    ? QBO_AUTH_SYNC_REASON
+                    : isQBTimeoutError(error)
+                        ? "qbo-timeout"
+                        : "qbo-unavailable";
                 result.skipped += rows.length - index;
                 result.checked--;
                 break;
@@ -479,6 +578,11 @@ export async function sweepPendingPayLinks(
             // A per-invoice refusal (it was deleted in QuickBooks, say). Leave the
             // marker: the row is still linked, and the invoice-probe sweep is what
             // resolves a gone invoice, not this one.
+            //
+            // The cursor still advances past it. This is THE starvation case:
+            // the row keeps its marker, so a fixed page would refetch it (and
+            // its 99 friends) forever and never reach anything behind them.
+            lastDecided[entry.kind] = entry.row.id;
             result.skipped++;
             continue;
         }
@@ -490,6 +594,9 @@ export async function sweepPendingPayLinks(
             where: { id: entry.row.id, qbInvoiceId: entry.row.qbInvoiceId, qbSyncError: PAYLINK_PENDING_MARKER },
             data: { qbSyncError: null, ...(payLink ? { qbInvoiceLink: payLink } : {}) },
         });
+        // Decided either way: a lost CAS means someone else moved this row on,
+        // so it is no longer this sweep's work.
+        lastDecided[entry.kind] = entry.row.id;
         if (cleared.count !== 1) {
             result.skipped++;
             continue;
@@ -498,6 +605,9 @@ export async function sweepPendingPayLinks(
         else result.noLink++;
     }
 
+    // Every exit above falls through to here, so the resume point is recorded
+    // whether the run finished its pages or stopped on an outage.
+    await saveCursors();
     return result;
 }
 
@@ -693,7 +803,26 @@ export async function pushMilestoneToQuickBooks(
     // after an earlier milestone was deleted or the project renamed would look
     // for a document we never created, find nothing, and offer to release a row
     // whose real invoice is sitting in QuickBooks collectible.
-    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, { docNumber, privateNote });
+    //
+    // It also carries an ISSUANCE HASH of the money state this invoice is being
+    // built from. DocNumber and PrivateNote prove an invoice is ours; they do
+    // not prove it still describes the row. If this create lands, the CAS below
+    // loses (paid/canceled/repriced mid-flight) and the compensating delete
+    // then fails, a real invoice for the OLD amount is left in QuickBooks with
+    // a matching identity — and the resolver would link it. The hash is what
+    // lets the resolver see the row moved and refuse.
+    const issuanceHash = milestoneIssuanceHash({
+        // Pinned literals, not the loaded row: these are the values the CAS
+        // below requires, so they are what the invoice is genuinely issued
+        // against. Reading them off `schedule` would let a row that was already
+        // Paid at load time hash as Paid and then match itself at resolve time.
+        status: "Pending",
+        qbPaymentId: null,
+        amount: schedule.amount,
+        dueDate: schedule.dueDate,
+    });
+    const identity = { docNumber, privateNote, issuanceHash };
+    const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
     const claimedSend = await prisma.paymentSchedule.updateMany({
         where: { id: schedule.id, qbInvoiceId: null, qbSyncError: null },
         data: { qbSyncError: inFlightMarker },
@@ -736,7 +865,7 @@ export async function pushMilestoneToQuickBooks(
             // by whatever marker replaced it.
             await prisma.paymentSchedule.updateMany({
                 where: { id: schedule.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
-                data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, { docNumber, privateNote }) },
+                data: { qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity) },
             });
             await logAutomationEvent({
                 kind: "qbo-payments-sync",
@@ -1336,7 +1465,15 @@ export async function runQboRowLoop<T extends { id: string }>(
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
                 result.runFailed = true;
-                result.failureReason = "qbo-unavailable";
+                // A 401/403 mid-loop is the CREDENTIAL, not an outage, and it
+                // arrives here wrapped as QboRetryableError(status) by the row
+                // handler — so a plain `qboHttpStatus` check could not see it
+                // and every such run was filed as "qbo-unavailable". The digest
+                // counts only the reconnect family toward its
+                // reconnect-QuickBooks alert, so a broken connection discovered
+                // mid-sweep (rather than in preflight) was invisible to it.
+                // Same verdict as classifyPreflightFailure, one definition.
+                result.failureReason = isQboReconnectRequired(error) ? QBO_AUTH_SYNC_REASON : "qbo-unavailable";
                 result.errors.push(
                     `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
                 );
@@ -1377,6 +1514,18 @@ export interface PaymentsSyncQboClient {
  * audit event and return a result instead of being killed mid-run.
  */
 export const PAYMENTS_SYNC_BUDGET_MS = 100_000;
+
+/**
+ * The budget for an ON-VIEW refresh (`refreshQBPayments`), which runs as a
+ * server ACTION under a 60s ceiling — not as the cron under 120s.
+ *
+ * Passing no deadline inherited PAYMENTS_SYNC_BUDGET_MS, so a slow QuickBooks
+ * could keep a page's refresh going for 100s inside a 60s ceiling: the action
+ * is killed with nothing returned and the user sees a hung page rather than
+ * "QuickBooks is slow, nothing changed". 30s leaves room for the revalidate
+ * work after the sync and still fits one probe plus a settle comfortably.
+ */
+export const ON_VIEW_PAYMENTS_SYNC_BUDGET_MS = 30_000;
 
 export interface SyncQuickBooksPaymentsOptions {
     /**
@@ -2006,9 +2155,8 @@ export function classifyPreflightFailure(error: unknown): { reason: string; abor
         // alerting (QBO_AUTH_EVENT_REASON), so folding it into the generic
         // "qbo-unavailable" bucket here made a broken connection invisible to
         // that alert and read like ordinary transient QBO flakiness instead.
-        const status = qboHttpStatus(error);
-        if (status === 401 || status === 403) {
-            return { reason: "qbo-auth", abortedOnQboOutage: true };
+        if (isQboReconnectRequired(error)) {
+            return { reason: QBO_AUTH_SYNC_REASON, abortedOnQboOutage: true };
         }
         return { reason: "qbo-unavailable", abortedOnQboOutage: true };
     }

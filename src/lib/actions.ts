@@ -3757,8 +3757,16 @@ export async function createQBPaymentLink(paymentId: string) {
 /** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
 export async function refreshQBPayments(invoiceId: string) {
     await assertInvoicePermission();
-    const { syncQuickBooksPayments } = await import("./quickbooks-payments");
-    const result = await syncQuickBooksPayments({ invoiceId });
+    const { syncQuickBooksPayments, ON_VIEW_PAYMENTS_SYNC_BUDGET_MS } = await import("./quickbooks-payments");
+    const { createRouteDeadline } = await import("./quickbooks");
+    // Its OWN sub-ceiling, not the cron's. Passing no deadline inherited the
+    // 100s cron budget inside a 60s server-action ceiling, so a slow QuickBooks
+    // got this killed mid-run instead of returning a partial result the page
+    // can render.
+    const result = await syncQuickBooksPayments(
+        { invoiceId },
+        { deadline: createRouteDeadline(ON_VIEW_PAYMENTS_SYNC_BUDGET_MS) },
+    );
     if (result.settled > 0) {
         const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
         if (inv) {

@@ -29,6 +29,7 @@ import {
     CREATE_IN_FLIGHT_MARKER,
     CREATE_IN_FLIGHT_STALE_MS,
 } from "../src/lib/qbo-create-markers";
+import { milestoneIssuanceHash, progressBillingIssuanceHash } from "../src/lib/qbo-issuance";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
@@ -37,12 +38,37 @@ const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
 const MILESTONE_DOC = milestoneDocNumber("INV-00171", 2);
 const MILESTONE_NOTE = milestonePrivateNote("INV-00171", "Rough-in", "Mesplay Kitchen");
 const BILLING_NOTE = progressBillingPrivateNote("INV-00171", "INV-00171-P1");
-const MILESTONE_IDENTITY = { docNumber: MILESTONE_DOC, privateNote: MILESTONE_NOTE };
+
+/**
+ * The MONEY STATE the QuickBooks invoice was issued from — what the marker's
+ * issuance hash pins. The resolver recomputes it off the row and refuses to
+ * link on any difference, so a fixture that changes one of these fields is
+ * deliberately no longer linkable.
+ */
+const MILESTONE_STATE = {
+    status: "Pending",
+    amount: 1089,
+    name: "Rough-in",
+    dueDate: new Date("2026-09-15T00:00:00.000Z"),
+    qbPaymentId: null as string | null,
+};
+const MILESTONE_IDENTITY = {
+    docNumber: MILESTONE_DOC,
+    privateNote: MILESTONE_NOTE,
+    issuanceHash: milestoneIssuanceHash(MILESTONE_STATE),
+};
+
+const BILLING_STATE = {
+    status: "Draft",
+    subtotal: 1000,
+    total: 1089,
+    description: "Rough-in complete",
+};
 
 function milestoneRow(overrides: Record<string, any> = {}): any {
     return {
         id: "ps-1",
-        name: "Rough-in",
+        ...MILESTONE_STATE,
         qbInvoiceId: null,
         // The marker as the create path writes it: kind + the identity it used.
         qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY),
@@ -61,10 +87,12 @@ function billingRow(overrides: Record<string, any> = {}): any {
     return {
         id: "pb-1",
         code: "INV-00171-P1",
+        ...BILLING_STATE,
         qbInvoiceId: null,
         qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, {
             docNumber: "INV-00171-P1",
             privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
+            issuanceHash: progressBillingIssuanceHash(BILLING_STATE),
         }),
         invoiceId: "inv-1",
         invoice: { code: "INV-00171", projectId: "proj-1" },

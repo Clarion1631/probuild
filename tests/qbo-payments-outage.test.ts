@@ -1816,7 +1816,14 @@ test("the milestone claim writes an identity-carrying marker, and compensation u
     // The claim CAS writes the composed marker, not the bare kind: recomputing
     // the docNumber later (it is a POSITION) or the note (it carries names)
     // would ask QuickBooks about a document we never created.
-    assert.match(push, /composeCreateMarker\(CREATE_IN_FLIGHT_MARKER, \{ docNumber, privateNote \}\)/);
+    assert.match(push, /const identity = \{ docNumber, privateNote, issuanceHash \}/);
+    assert.match(push, /composeCreateMarker\(CREATE_IN_FLIGHT_MARKER, identity\)/);
+    // The identity also carries a hash of the MONEY STATE the invoice is issued
+    // against, taken from the literals the post-create CAS pins rather than
+    // from the loaded row — otherwise a row that was already moved on at load
+    // time would hash as itself and match itself again at resolve time.
+    assert.match(push, /const issuanceHash = milestoneIssuanceHash\(\{/);
+    assert.match(push, /status: "Pending",\s*\n\s*qbPaymentId: null,/);
     assert.match(push, /data: \{ qbSyncError: inFlightMarker \}/);
     // Release and promote are pinned to OUR marker, not to any in-flight row.
     assert.match(push, /where: \{ id: schedule\.id, qbSyncError: inFlightMarker \}/);
