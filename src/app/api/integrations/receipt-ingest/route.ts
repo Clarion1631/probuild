@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
 
 export const dynamic = "force-dynamic";
@@ -91,7 +92,14 @@ export async function POST(req: Request) {
     const docRef = isCheck
         ? `Check #${body.checkNumber || "?"}${body.memo ? ` — "${body.memo}"` : ""}`
         : (body.invoice && body.invoice !== "NoInv" ? `Invoice ${body.invoice}` : "Receipt");
-    const date = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? new Date(`${body.date}T12:00:00`) : new Date();
+    // `T12:00:00` with no zone is the SERVER's noon, not the company's — on a
+    // UTC host that is 05:00 Pacific, still the right day, but it is the right
+    // answer by luck rather than by rule. The shared parser makes it a company
+    // calendar day like every other writer.
+    const companyTimeZone = await resolveCompanyTimeZone();
+    const date = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
+        ? dateOnlyInTimeZone(body.date, companyTimeZone)
+        : new Date();
 
     const warnings: string[] = [];
     let created = 0;

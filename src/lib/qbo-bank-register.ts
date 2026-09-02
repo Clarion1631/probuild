@@ -1,5 +1,6 @@
 import { qbFetch, type QBTokens } from "@/lib/quickbooks";
 import { prisma } from "@/lib/prisma";
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import { isPurchaseType, isMoneyInType } from "@/lib/register-types";
 
 /**
@@ -235,7 +236,11 @@ export async function attachVerdicts(rows: BankRegisterRow[]): Promise<BankRegis
                 qbPurchaseId: true,
                 amount: true,
                 receiptUrl: true,
-                estimate: { select: { project: { select: { id: true, name: true } } } },
+                // BOTH sides — the register labels a row by the job the money is
+            // actually on, not by the estimate it was booked against.
+            projectId: true,
+            project: { select: { id: true, name: true } },
+            estimate: { select: { project: { select: { id: true, name: true } } } },
             },
         })
         : [];
@@ -256,10 +261,13 @@ export async function attachVerdicts(rows: BankRegisterRow[]): Promise<BankRegis
             const expense = row.qbTxnId ? byPurchaseId.get(row.qbTxnId) : undefined;
             if (expense) {
                 const expenseAmountCents = Math.round(Number(expense.amount) * 100);
+                const label = resolveExpenseProjectLabel(expense);
                 verdict = {
                     kind: "linked",
-                    projectId: expense.estimate?.project?.id ?? null,
-                    projectName: expense.estimate?.project?.name ?? null,
+                    // Resolved, not read off the estimate — see
+                    // resolveExpenseProjectLabel.
+                    projectId: label.projectId,
+                    projectName: label.projectName,
                     amountMatches: expenseAmountCents === -row.amountCents,
                     expenseAmountCents,
                     receiptUrl: expense.receiptUrl ?? null,

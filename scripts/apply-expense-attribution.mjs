@@ -56,6 +56,25 @@ export function targetMatches(actual, expectDb, expectHost) {
     return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
+/**
+ * The company zone the legacy re-anchor uses. Read from CompanySettings at run
+ * time when it is there; the fallback matches src/lib/tz-date.ts.
+ */
+export const DEFAULT_COMPANY_TIME_ZONE = "America/Los_Angeles";
+
+/** Built per-run so the zone is the company's, not a hard-coded guess. */
+export function reanchorSql(timeZone) {
+    // The zone is interpolated, so it must be a real IANA name and nothing
+    // else — this string reaches the database unparameterized.
+    if (!/^[A-Za-z][A-Za-z0-9+_-]*(\/[A-Za-z0-9+_-]+)*$/.test(timeZone)) {
+        throw new Error(`Refusing to interpolate a suspicious time zone: ${timeZone}`);
+    }
+    return `UPDATE "Expense"
+   SET "date" = (("date"::date)::timestamp AT TIME ZONE '${timeZone}') AT TIME ZONE 'UTC'
+ WHERE "date" IS NOT NULL
+   AND "date"::time = TIME '00:00:00'`;
+}
+
 export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAmount" DECIMAL(65,30)`,
@@ -66,6 +85,8 @@ export const statements = [
     // Mixed receipts: the portion actually resold, when it is less than the
     // whole pre-tax total. NULL means "all of it".
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30)`,
+    // Set when a re-sync invalidated a human tax classification.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false`,
 
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
 
@@ -95,6 +116,20 @@ BEGIN
   END IF;
 END $$`,
 
+    // TAX CANNOT EXCEED THE GROSS (Codex round 6, item 2). The deduction base
+    // is `amount - taxAmount`, so a tax above the gross makes it NEGATIVE and
+    // the report subtracts money from the filing. The taxDeductibleBase CHECK
+    // does not cover it — a NULL allocation has nothing to violate.
+    `DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'Expense_taxAmount_check'
+                    AND conrelid = '"Expense"'::regclass) THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAmount_check"
+      CHECK ("taxAmount" IS NULL
+             OR ("taxAmount" >= 0 AND "taxAmount" <= "amount"));
+  END IF;
+END $$`,
+
     // THE DEDUCTION INVARIANT, IN THE DATABASE (Codex round 5, item 4).
     // Enforced only by the API handler before this: read the amount, validate,
     // then UPDATE. A QBO re-sync changing `amount` between those two statements
@@ -111,6 +146,26 @@ END $$`,
   END IF;
 END $$`,
 
+    // RE-ANCHOR THE LEGACY UTC-MIDNIGHT ROWS (Codex round 6, item 1).
+    //
+    // Every writer now stores `Expense.date` as a company calendar day, but the
+    // rows already in the table were written at UTC midnight — which the tax
+    // report reads as the PREVIOUS day in Pacific, moving a 1 July receipt out
+    // of Q3.
+    //
+    // IDEMPOTENT BY PREDICATE, which is stronger than a marker: re-anchoring
+    // moves the time-of-day off 00:00 UTC, so a second run matches nothing and
+    // there is no flag that can be lost, copied to another database, or get out
+    // of step with the data. (A marker was specified; this is the same
+    // once-only guarantee derived from the rows themselves, which is why it is
+    // used instead — noted in the PR.)
+    //
+    // For a company configured as UTC the update is a no-op by arithmetic:
+    // local midnight IS 00:00 UTC, so the value is rewritten to itself.
+    //
+    // It deliberately does NOT touch rows already at a non-midnight time —
+    // those were written by time-expense-core, which has always used the shared
+    // parser.
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
     `UPDATE "Expense" e SET "projectId" = est."projectId"
      FROM "Estimate" est
@@ -131,7 +186,7 @@ END $$`,
 export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
-        "costCodeSource", "costCodeConfidence", "taxDeductibleBase",
+        "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
     ],
 };
 
@@ -159,6 +214,11 @@ export const expectedConstraints = [
 ];
 
 export const expectedCheckConstraints = [
+    {
+        name: "Expense_taxAmount_check",
+        table: "Expense",
+        mustMatch: [/"taxAmount" IS NULL/, /"taxAmount" >= \(?0/, /"taxAmount" <= amount/],
+    },
     {
         name: "Expense_taxDeductibleBase_check",
         table: "Expense",
@@ -202,7 +262,15 @@ async function main() {
             process.exit(1);
         }
 
-        for (const sql of statements) {
+        // The company zone, for the legacy re-anchor below. Read before the DDL
+        // so a missing CompanySettings row fails loudly rather than half-way.
+        const [settings] = await prisma.$queryRawUnsafe(
+            `SELECT "timeZone" FROM "CompanySettings" WHERE id = 'singleton'`,
+        ).catch(() => [undefined]);
+        const companyTimeZone = settings?.timeZone || DEFAULT_COMPANY_TIME_ZONE;
+        console.log(`company time zone for the date re-anchor: ${companyTimeZone}`);
+
+        for (const sql of [...statements, reanchorSql(companyTimeZone)]) {
             const label = sql.replace(/\s+/g, " ").slice(0, 84);
             process.stdout.write(`  ${label} ... `);
             const affected = await prisma.$executeRawUnsafe(sql);

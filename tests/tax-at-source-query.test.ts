@@ -14,6 +14,8 @@ import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
 
+import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
+
 const PACIFIC = "America/Los_Angeles";
 
 const recorded: any[] = [];
@@ -144,4 +146,25 @@ test("a row is stamped with its COMPANY day and its RESOLVED job", async () => {
     assert.equal(row.taxCents, 1655);
     assert.equal(row.deductionBaseCents, 19119);
     assert.equal(row.reference, "82766");
+});
+
+test("the query excludes the Shop/overhead bucket, both ways round", async () => {
+    // The page has always PROMISED Shop purchases are excluded; nothing
+    // enforced it, so an overhead receipt mistakenly flagged
+    // installed-at-customer was claimed like any other.
+    const filters = parseTaxAtSourceFilters({ from: "2026-07-01", to: "2026-09-30" }, PACIFIC);
+    recorded.length = 0;
+    await queryTaxAtSourceRows(filters);
+
+    const branches = recorded[0].where.OR as Record<string, any>[];
+    assert.ok(Array.isArray(branches), "the exclusion must reach the query");
+    assert.equal(branches.length, 3, "direct, unattributed, and estimate-fallback");
+    // Direct attribution to the bucket is out...
+    assert.ok(JSON.stringify(branches[0]).includes(OVERHEAD_PROJECT_ID));
+    // ...and so is reaching it through the estimate.
+    assert.ok(JSON.stringify(branches[2]).includes(OVERHEAD_PROJECT_ID));
+    // ...while a row attributed to NOTHING still survives.
+    assert.deepEqual(branches[1], {
+        AND: [{ projectId: null }, { estimate: { projectId: null } }],
+    });
 });

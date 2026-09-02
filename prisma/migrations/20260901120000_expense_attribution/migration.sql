@@ -25,6 +25,8 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,3
 -- pre-tax total. NULL means "all of it", and is only reached on a row a human
 -- has explicitly flagged installed-at-customer.
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30);
+-- Set when a re-sync invalidated a human tax classification (see the sync).
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false;
 
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");
 
@@ -53,6 +55,23 @@ BEGIN
      OR existing_def NOT LIKE '%ON DELETE SET NULL%'
      OR existing_def NOT LIKE '%ON UPDATE CASCADE%' THEN
     RAISE EXCEPTION 'Expense_projectId_fkey already exists with an unexpected definition: %', existing_def;
+  END IF;
+END $$;
+
+-- TAX CANNOT EXCEED THE GROSS (Codex round 6, item 2).
+--
+-- The deduction base is `amount - taxAmount`, so a tax larger than the gross
+-- makes it NEGATIVE and the report subtracts money from the filing. The
+-- taxDeductibleBase CHECK below does not cover it: a row whose allocation is
+-- NULL has no allocation to violate, and the negative base is computed at read
+-- time. This closes that hole at the only place both values are always visible.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'Expense_taxAmount_check'
+                    AND conrelid = '"Expense"'::regclass) THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAmount_check"
+      CHECK ("taxAmount" IS NULL
+             OR ("taxAmount" >= 0 AND "taxAmount" <= "amount"));
   END IF;
 END $$;
 

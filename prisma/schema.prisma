@@ -657,6 +657,12 @@ model Expense {
   /// total", which is only reached once installedAtCustomer is an explicit
   /// true. Set by a bookkeeper on the expense edit route.
   taxDeductibleBase   Decimal?
+  /// A re-sync changed the gross out from under a tax classification a human
+  /// had made, so the tax fields were cleared and this row needs a person to
+  /// look at it again. Additive and default-false; the tax report ignores it
+  /// (a cleared row has no tax and drops out on its own), but the correction
+  /// UI surfaces it.
+  needsTaxReview      Boolean   @default(false)
   /// capture | ai | manual | backfill. Precedence: capture = manual >
   /// ai = backfill > null. Nothing but a human edit rewrites capture/manual.
   costCodeSource      String?

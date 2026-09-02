@@ -26,6 +26,7 @@ import {
     type TaxAtSourceRow,
 } from "../src/lib/tax-at-source-report";
 import { csvCell, csvNumber } from "../src/lib/csv-safe";
+import { expenseNotOnProjectWhere } from "../src/lib/expense-attribution";
 
 const PACIFIC = "America/Los_Angeles";
 
@@ -311,4 +312,29 @@ test("csvNumber accepts a Decimal-like or boxed value, and never emits exponent 
     assert.match(huge, /^\d+\.\d{2}$/);
     assert.equal(csvNumber(undefined), "");
     assert.equal(csvNumber("not a number"), "");
+});
+
+// ── the overhead bucket is excluded (Codex round 6, item 5) ────────────────
+
+test("the exclusion is written POSITIVELY so unattributed rows survive it", () => {
+    // `NOT (projectId = X OR (projectId IS NULL AND est = X))` is SQL-NULL for
+    // a row with neither set — which EXCLUDES it. That is exactly the
+    // "(unassigned)" receipt a bookkeeper most needs to see, so the exclusion
+    // is three positive branches instead.
+    const where = expenseNotOnProjectWhere("overhead-1");
+    const branches = where.OR as Record<string, unknown>[];
+    assert.equal(branches.length, 3);
+    assert.deepEqual(branches[0], {
+        AND: [{ projectId: { not: null } }, { NOT: { projectId: "overhead-1" } }],
+    });
+    assert.deepEqual(branches[1], {
+        AND: [{ projectId: null }, { estimate: { projectId: null } }],
+    });
+    assert.deepEqual(branches[2], {
+        AND: [
+            { projectId: null },
+            { estimate: { projectId: { not: null } } },
+            { NOT: { estimate: { projectId: "overhead-1" } } },
+        ],
+    });
 });

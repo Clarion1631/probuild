@@ -19,11 +19,15 @@ interface Props {
     };
     currentUser: { id: string; role: string; name: string };
     companyTimeZone: string;
+    /** This project's phases, for the Tax & phase panel. */
+    phases?: { id: string; code: string; name: string }[];
+    /** `financialReports` — gates that panel. */
+    canEditTax?: boolean;
 }
 
 type Tab = "time" | "expenses";
 
-export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone }: Props) {
+export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone, phases = [], canEditTax = false }: Props) {
     const [activeTab, setActiveTab] = useState<Tab>("time");
     const [showTimeModal, setShowTimeModal] = useState(false);
     const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -88,6 +92,8 @@ export default function TimeExpensesClient({ project, data, currentUser, company
                     onAddNew={() => setShowExpenseModal(true)}
                     currentUser={currentUser}
                     changeOrders={data.changeOrders}
+                    phases={phases}
+                    canEditTax={canEditTax}
                 />
             )}
 

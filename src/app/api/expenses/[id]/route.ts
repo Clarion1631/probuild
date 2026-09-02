@@ -12,6 +12,7 @@ import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -219,7 +220,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             data: {
                 amount: body.amount ? parseFloat(body.amount) : undefined,
                 vendor: has("vendor") ? (body.vendor || null) : undefined,
-                date: has("date") ? (body.date ? new Date(body.date) : null) : undefined,
+                // Same company-calendar-day rule as the POST — see there.
+                date: has("date") ? (body.date ? await expenseDate(body.date) : null) : undefined,
                 description: has("description") ? (body.description || null) : undefined,
                 itemId: has("itemId") ? (body.itemId || null) : undefined,
                 ...(editsCostCode
@@ -267,6 +269,17 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
  * a filing), but it is only half an answer unless a human can supply the real
  * figure afterwards. This is that path.
  */
+/**
+ * `Expense.date` is a COMPANY CALENDAR DAY. A bare YYYY-MM-DD goes through the
+ * shared parser so it lands at local noon; anything else is already an instant.
+ */
+async function expenseDate(value: unknown): Promise<Date> {
+    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return dateOnlyInTimeZone(value, await resolveCompanyTimeZone());
+    }
+    return new Date(value as string);
+}
+
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
         const user = await getCurrentUserWithPermissions();

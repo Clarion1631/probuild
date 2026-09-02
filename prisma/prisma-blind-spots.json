@@ -90,6 +90,11 @@
       "def": "CHECK (((((\"leadId\" IS NOT NULL))::integer + ((\"projectId\" IS NOT NULL))::integer) = 1))"
     },
     {
+      "name": "Expense_taxAmount_check",
+      "table": "\"Expense\"",
+      "def": "CHECK (((\"taxAmount\" IS NULL) OR ((\"taxAmount\" >= (0)::numeric) AND (\"taxAmount\" <= amount))))"
+    },
+    {
       "name": "Expense_taxDeductibleBase_check",
       "table": "\"Expense\"",
       "def": "CHECK (((\"taxDeductibleBase\" IS NULL) OR ((\"taxDeductibleBase\" >= (0)::numeric) AND (\"taxDeductibleBase\" <= (amount - COALESCE(\"taxAmount\", (0)::numeric))))))"

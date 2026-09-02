@@ -18,9 +18,11 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
+    expectedCheckConstraints,
     expectedColumns,
     expectedConstraints,
     expectedIndexes,
+    reanchorSql,
     statements,
     targetMatches,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -156,4 +158,43 @@ test("the target guard compares database AND host, both exactly", () => {
     assert.equal(targetMatches({ db: "postgres", host: "10.0.0.5" }, "postgres", "10"), false);
     assert.equal(targetMatches({ db: "other", host: "10.0.0.5" }, "postgres", "10.0.0.5"), false);
     assert.equal(targetMatches(null, "postgres", "10.0.0.5"), false);
+});
+
+// ── the legacy date re-anchor (Codex round 6, item 1) ──────────────────────
+
+test("the re-anchor only touches rows sitting at exactly 00:00 UTC", () => {
+    // Rows written by time-expense-core have always used the shared parser and
+    // sit at local noon; re-anchoring those would move them a second time.
+    const sql = reanchorSql("America/Los_Angeles");
+    assert.match(sql, /WHERE "date" IS NOT NULL/);
+    assert.match(sql, /"date"::time = TIME '00:00:00'/);
+    // ...and the predicate is what makes it once-only: after the update the
+    // time-of-day is no longer midnight UTC, so a second run matches nothing.
+    assert.match(sql, /AT TIME ZONE 'America\/Los_Angeles'/);
+    assert.match(sql, /AT TIME ZONE 'UTC'/);
+});
+
+test("the re-anchor refuses a time zone it cannot safely interpolate", () => {
+    // The zone reaches the database unparameterized, so it has to be an IANA
+    // name and nothing else.
+    for (const bad of ["x'; DROP TABLE \"Expense\"; --", "America/Los Angeles", "'", ""]) {
+        assert.throws(() => reanchorSql(bad), /suspicious time zone/, JSON.stringify(bad));
+    }
+    for (const good of ["UTC", "America/Los_Angeles", "Europe/Isle_of_Man", "Etc/GMT+7"]) {
+        assert.ok(reanchorSql(good).includes(`'${good}'`), good);
+    }
+});
+
+test("the tax-vs-gross CHECK is in both DDL paths and in the verifier", () => {
+    const guard = (statements as string[]).find(s => s.includes("Expense_taxAmount_check"));
+    assert.ok(guard, "the script must carry it");
+    assert.match(guard!, /"taxAmount" <= "amount"/);
+    assert.ok(
+        normalizedMigration.includes(normalize(guard!).replace(/;$/, "")),
+        "and the migration must carry the same statement",
+    );
+    const verified = (expectedCheckConstraints as { name: string }[]).some(
+        c => c.name === "Expense_taxAmount_check",
+    );
+    assert.ok(verified, "and the post-run verification must assert it");
 });

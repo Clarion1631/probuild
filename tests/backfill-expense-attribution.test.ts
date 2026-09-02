@@ -594,3 +594,23 @@ test("the CSV is written on a dry run — reviewing it is the point", async () =
     assert.match(files[0].body, /^expense_id,project,date,vendor,amount,reason,description/);
     assert.match(files[0].body, /e1/);
 });
+
+test("coverage counts an item-resolvable row as ALREADY attributed", () => {
+    // Codex round 6, item 7. Counting only `costCodeId` overstated the
+    // improvement twice: the row read as unattributed BEFORE, then copying the
+    // very same code from its item read as new coverage AFTER. The headline was
+    // measuring the backfill's activity, not the report's coverage.
+    const items = new Map<string, string | null>([["item-1", "cc-frame"]]);
+    const rows = [{ costCodeId: null, itemId: "item-1", amount: 400 }];
+
+    assert.equal(measureCoverage(rows, items).attributed, 400, "the item already resolves it");
+    assert.equal(measureCoverage(rows, items).unattributed, 0);
+    // ...and without the item universe it looks like a gap, which is the bug.
+    assert.equal(measureCoverage(rows).attributed, 0);
+});
+
+test("coverage still counts a genuinely uncoded row as a gap", () => {
+    const rows = [{ costCodeId: null, itemId: null, amount: 100 }];
+    assert.equal(measureCoverage(rows, new Map()).unattributed, 100);
+    assert.equal(measureCoverage(rows, new Map()).codedCount, 0);
+});

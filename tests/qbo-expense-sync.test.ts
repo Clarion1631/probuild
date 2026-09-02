@@ -791,6 +791,7 @@ function createSyncDependencies(
         upsertExpense: upsert,
         deactivateExpense: async () => "unchanged",
         upsertPurchaseClassification: async () => {},
+        companyTimeZone: async () => "America/Los_Angeles",
         now: () => new Date("2026-07-29T12:00:00.000Z"),
     };
 }
@@ -1547,4 +1548,37 @@ test("an ALREADY-attributed row keeps its estimate when QBO points at a newer on
     );
     assert.equal(fake.rows.get("purchase-1")?.estimateId, "estimate-1", "write-once, no exceptions");
     assert.equal(fake.rows.get("purchase-1")?.amount, 300);
+});
+
+test("a gross below the recorded tax CLEARS the classification and flags review", () => {
+    // Codex round 6, item 2. Keeping a tax larger than the gross makes
+    // `amount - taxAmount` negative and the report SUBTRACTS money from the
+    // filing; the DB CHECK would also refuse the write and abort the import.
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 30, taxDeductibleBase: 10 },
+        { ...WRITE, amount: 20 },
+    );
+    assert.equal(plan.data.taxAmount, null);
+    assert.equal(plan.data.taxAtSource, false);
+    assert.equal(plan.data.installedAtCustomer, null, "the human's answer was about another receipt");
+    assert.equal(plan.data.taxDeductibleBase, null);
+    assert.equal(plan.data.needsTaxReview, true, "silence must not read as 'no tax'");
+});
+
+test("a gross that still covers the tax leaves the classification alone", () => {
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 10, taxDeductibleBase: 50 },
+        { ...WRITE, amount: 100 },
+    );
+    assert.ok(!("taxAmount" in plan.data));
+    assert.ok(!("needsTaxReview" in plan.data));
+    assert.ok(!("installedAtCustomer" in plan.data));
+});
+
+test("clearing a tax classification is never reported as 'unchanged'", () => {
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 30, taxDeductibleBase: null },
+        { ...WRITE, amount: 20 },
+    );
+    assert.equal(plan.data.needsTaxReview, true);
 });

@@ -6,6 +6,7 @@ import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -98,13 +99,26 @@ export async function POST(req: NextRequest) {
             );
         }
 
+        // `Expense.date` is a COMPANY CALENDAR DAY. `new Date("2026-07-01")`
+        // parses as UTC midnight, which reads as 30 June in Pacific — the tax
+        // report would then file the receipt in the wrong month, and at a
+        // quarter edge in the wrong return. A bare YYYY-MM-DD goes through the
+        // shared parser; a full timestamp is kept as the instant it already is.
         let parsedDate: Date | null = null;
         if (date) {
-            const d = new Date(date);
-            if (Number.isNaN(d.getTime())) {
-                return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+            if (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+                try {
+                    parsedDate = dateOnlyInTimeZone(date, await resolveCompanyTimeZone());
+                } catch {
+                    return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+                }
+            } else {
+                const d = new Date(date);
+                if (Number.isNaN(d.getTime())) {
+                    return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+                }
+                parsedDate = d;
             }
-            parsedDate = d;
         }
 
         // BOTH checks, per the SCOPE note on resolveCostCode: "the cost code

@@ -67,13 +67,24 @@ const pct = (part, whole) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%
  * that was 0% attributed. Magnitude of money moved is the honest base, and it
  * is the same choice computeProjectVariance makes (job-variance.ts).
  */
-export function measureCoverage(rows) {
+export function measureCoverage(rows, itemCostCodeById = new Map()) {
     let attributed = 0;
     let unattributed = 0;
     let codedCount = 0;
     for (const row of rows) {
         const amount = Math.abs(num(row.amount));
-        if (row.costCodeId) {
+        // THE SAME RESOLVER AND THE SAME ITEM UNIVERSE the variance report uses.
+        //
+        // Counting only `costCodeId` overstated the improvement twice over: a
+        // row already resolvable through its `itemId` was counted as
+        // unattributed BEFORE, then copying that same code counted as new
+        // coverage AFTER. The headline was measuring the backfill's activity,
+        // not the report's coverage.
+        const resolved = resolveExpenseCostCodeId(
+            { costCodeId: row.costCodeId ?? null, itemId: row.itemId ?? null },
+            itemCostCodeById,
+        );
+        if (resolved) {
             attributed += amount;
             codedCount += 1;
         } else {
@@ -373,8 +384,8 @@ export async function runBackfill({
     // ── the table ───────────────────────────────────────────────────────────
     const scoped = new Set(scopedProjectIds);
     const inScopeExpenses = expenses.filter(e => scoped.has(resolveExpenseProjectId(e) ?? ""));
-    const before = measureCoverage(inScopeExpenses);
-    const after = measureCoverage(projectedRows(inScopeExpenses, plan.codeFills));
+    const before = measureCoverage(inScopeExpenses, itemCostCodeById);
+    const after = measureCoverage(projectedRows(inScopeExpenses, plan.codeFills), itemCostCodeById);
 
     log(`scope: ${scopedProjectIds.length} In Progress customer job(s); overhead project ${overheadProjectId} excluded`);
     log("");
@@ -383,8 +394,8 @@ export async function runBackfill({
     for (const projectId of scopedProjectIds) {
         const rows = inScopeExpenses.filter(e => resolveExpenseProjectId(e) === projectId);
         if (rows.length === 0) continue;
-        const b = measureCoverage(rows);
-        const a = measureCoverage(projectedRows(rows, plan.codeFills));
+        const b = measureCoverage(rows, itemCostCodeById);
+        const a = measureCoverage(projectedRows(rows, plan.codeFills), itemCostCodeById);
         log(
             `  ${(projectNameById.get(projectId) ?? projectId).slice(0, 34).padEnd(34)} ` +
             `${`${a.codedCount}/${a.count}`.padStart(11)} ${money(a.total).padStart(13)}  ` +

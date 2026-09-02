@@ -43,7 +43,8 @@ import {
     startOfDateInTimeZone,
     validTimeZone,
 } from "./tz-date";
-import { resolveExpenseProjectId } from "./expense-attribution";
+import { expenseNotOnProjectWhere, resolveExpenseProjectId } from "./expense-attribution";
+import { OVERHEAD_PROJECT_ID } from "./overhead-project";
 import { csvCell, csvDocument, csvNumber } from "./csv-safe";
 
 export interface TaxAtSourceFilters {
@@ -360,6 +361,12 @@ export async function queryTaxAtSourceRows(filters: TaxAtSourceFilters): Promise
             installedAtCustomer: true,
             taxAmount: { gt: 0 },
             date: { gte: filters.from, lt: filters.to },
+            // The page promises Shop purchases are excluded; until now nothing
+            // enforced it. An overhead receipt mistakenly flagged
+            // installed-at-customer was claimed like any other. Resolver-aware,
+            // so a row that reaches the bucket through its ESTIMATE is caught
+            // too — and written positively so fully-unattributed rows survive.
+            ...expenseNotOnProjectWhere(OVERHEAD_PROJECT_ID),
         },
         select: {
             id: true,

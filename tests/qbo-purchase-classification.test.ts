@@ -59,6 +59,7 @@ function fakeDependencies(
         upsertExpense: async () => "imported",
         deactivateExpense: async () => "removed",
         upsertPurchaseClassification: async write => { classifications.push(write); },
+        companyTimeZone: async () => "America/Los_Angeles",
         now: () => new Date("2026-07-29T12:00:00.000Z"),
         ...overrides,
     };

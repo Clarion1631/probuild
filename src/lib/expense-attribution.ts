@@ -119,6 +119,35 @@ export function expenseForProjectsWhere(projectIds: string[]): Prisma.ExpenseWhe
     };
 }
 
+/**
+ * "This row does NOT resolve to `projectId`", written as three POSITIVE
+ * branches rather than as `NOT expenseForProjectWhere(...)`.
+ *
+ * The negation looks equivalent and is not: SQL's `NOT (a = x OR (a IS NULL AND
+ * b = x))` evaluates to NULL — and therefore excludes the row — when both
+ * columns are NULL. That is exactly the fully-unattributed expense the tax
+ * report shows as "(unassigned)", so the tidy form would silently drop the rows
+ * a bookkeeper most needs to see.
+ */
+export function expenseNotOnProjectWhere(projectId: string): Prisma.ExpenseWhereInput {
+    return {
+        OR: [
+            // Attributed directly, to some other job.
+            { AND: [{ projectId: { not: null } }, { NOT: { projectId } }] },
+            // Not attributed directly, and the estimate names no job either.
+            { AND: [{ projectId: null }, { estimate: { projectId: null } }] },
+            // Not attributed directly; the estimate names some other job.
+            {
+                AND: [
+                    { projectId: null },
+                    { estimate: { projectId: { not: null } } },
+                    { NOT: { estimate: { projectId } } },
+                ],
+            },
+        ],
+    };
+}
+
 /** "This row is attributable to SOME project", either way round. */
 export function expenseHasAnyProjectWhere(): Prisma.ExpenseWhereInput {
     return {
@@ -173,4 +202,43 @@ export function notHumanCodedExpenseWhere(): Prisma.ExpenseWhereInput {
  */
 export function resolveInstalledAtCustomer(declared: boolean | null): boolean | null {
     return declared;
+}
+
+/** The project facts a DISPLAY row needs: an id and a name, either way round. */
+export interface ExpenseProjectLabel {
+    projectId?: string | null;
+    project?: { id?: string | null; name: string | null } | null;
+    estimate?: { projectId?: string | null; project?: { id: string; name: string } | null } | null;
+}
+
+/**
+ * The job to SHOW for an expense, resolved the same way the money is.
+ *
+ * Aggregation queries were converted first; these display paths were not, so a
+ * re-attributed expense was still listed — and, in the review-alert case,
+ * ROUTED — under the job it used to be on. A label that disagrees with the
+ * ledger is worse than no label: it is a wrong answer that looks authoritative.
+ *
+ * Falls back to the estimate's project for the id AND the name together, so the
+ * two can never come from different rows.
+ */
+export function resolveExpenseProjectLabel(
+    expense: ExpenseProjectLabel,
+): { projectId: string | null; projectName: string | null } {
+    if (expense.projectId) {
+        return {
+            projectId: expense.projectId,
+            // The direct relation when it was selected; otherwise the estimate's
+            // name is only usable when the estimate agrees on the id.
+            projectName:
+                expense.project?.name ??
+                (expense.estimate?.project?.id === expense.projectId
+                    ? expense.estimate.project.name
+                    : null),
+        };
+    }
+    return {
+        projectId: expense.estimate?.project?.id ?? expense.estimate?.projectId ?? null,
+        projectName: expense.estimate?.project?.name ?? null,
+    };
 }

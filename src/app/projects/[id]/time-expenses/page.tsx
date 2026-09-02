@@ -4,6 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { getTimeExpenseData } from "@/lib/time-expense-actions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
+import { resolveProjectPhaseCodes } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import TimeExpensesClient from "./TimeExpensesClient";
 
 export default async function TimeExpensesPage({
@@ -38,7 +41,17 @@ export default async function TimeExpensesPage({
 
     if (!project) redirect("/projects");
 
-    const [data, companyTimeZone] = await Promise.all([getTimeExpenseData(projectId), resolveCompanyTimeZone()]);
+    // The Tax & phase panel edits numbers that land on a state excise return,
+    // so it is gated on `financialReports` — not on the `timeClock` permission
+    // that merely gets you onto this page — and it may only offer THIS
+    // project's phases.
+    const [data, companyTimeZone, permissionedUser, phases] = await Promise.all([
+        getTimeExpenseData(projectId),
+        resolveCompanyTimeZone(),
+        getCurrentUserWithPermissions(),
+        resolveProjectPhaseCodes(prismaPhaseDataSource, projectId),
+    ]);
+    const canEditTax = !!permissionedUser && hasPermission(permissionedUser, "financialReports");
 
     return (
         <div className="flex h-full bg-hui-background">
@@ -49,6 +62,8 @@ export default async function TimeExpensesPage({
                         data={JSON.parse(JSON.stringify(data))}
                         currentUser={{ id: user.id, role: user.role, name: user.name || user.email }}
                         companyTimeZone={companyTimeZone}
+                        phases={phases.map(p => ({ id: p.id, code: p.code, name: p.name }))}
+                        canEditTax={canEditTax}
                     />
                 </div>
             </div>

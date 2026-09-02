@@ -68,6 +68,11 @@ async function fetchExpensesByPurchaseIds(purchaseIds: string[]): Promise<Regist
             qbPurchaseId: true,
             amount: true,
             receiptUrl: true,
+            // BOTH sides: a review alert is ROUTED by this project, so reading
+            // it off the estimate sends a re-attributed expense's alert to the
+            // job it used to be on.
+            projectId: true,
+            project: { select: { id: true, name: true } },
             estimate: { select: { project: { select: { id: true, name: true } } } },
         },
     });

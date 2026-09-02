@@ -11,6 +11,8 @@ import {
     resolveExpenseProjectId,
 } from "./expense-attribution";
 import { isOverheadProject } from "./overhead-project";
+import { dateOnlyInTimeZone } from "./tz-date";
+import { resolveCompanyTimeZone } from "./company-timezone";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { prismaPhaseDataSource } from "./project-phases-db";
 // Shared with the register merge layer (register-merge.ts, Unified Money
@@ -580,7 +582,13 @@ type ExistingQboExpense =
  * non-QBO field it can carry, and only to clear an allocation the new amount
  * would make impossible — see planQboExpenseUpdate.
  */
-export type QboExpenseUpdateData = Partial<QboExpenseWrite> & { taxDeductibleBase?: null };
+export type QboExpenseUpdateData = Partial<QboExpenseWrite> & {
+    taxDeductibleBase?: null;
+    taxAmount?: null;
+    taxAtSource?: false;
+    installedAtCustomer?: null;
+    needsTaxReview?: true;
+};
 
 export interface QboExpenseUpdatePlan {
     /**
@@ -645,13 +653,36 @@ export function planQboExpenseUpdate(
     // NULL ("the whole pre-tax total"), and because the report counts only rows
     // a human flagged `installedAtCustomer`, the correction is visible rather
     // than silently generous.
+    const existingTax =
+        existing.taxAmount === null || existing.taxAmount === undefined
+            ? null
+            : Number(existing.taxAmount);
     const existingBase =
         existing.taxDeductibleBase === null || existing.taxDeductibleBase === undefined
             ? null
             : Number(existing.taxDeductibleBase);
-    if (existingBase !== null) {
-        const ceiling =
-            Math.round((write.amount - Number(existing.taxAmount ?? 0)) * 100) / 100;
+
+    // A LOWERED GROSS INVALIDATES THE WHOLE TAX CLASSIFICATION.
+    //
+    // If QuickBooks now says the purchase was smaller than the tax a human
+    // recorded, that tax is about a receipt this row no longer describes.
+    // Keeping it makes `amount - taxAmount` NEGATIVE, and the report subtracts
+    // money from the filing; the database CHECK would also refuse the write and
+    // take the entire QBO import down with it.
+    //
+    // So the classification is CLEARED, not clamped — a guessed-down tax is
+    // still a guess on a tax return — and `needsTaxReview` marks the row so a
+    // person is asked rather than the silence being mistaken for "no tax".
+    // `costCodeSource` is deliberately untouched: which PHASE the money is on
+    // is a separate question the gross does not bear on.
+    if (existingTax !== null && existingTax > write.amount) {
+        data.taxAmount = null;
+        data.taxAtSource = false;
+        data.installedAtCustomer = null;
+        data.taxDeductibleBase = null;
+        data.needsTaxReview = true;
+    } else if (existingBase !== null) {
+        const ceiling = Math.round((write.amount - (existingTax ?? 0)) * 100) / 100;
         if (!Number.isFinite(ceiling) || existingBase > ceiling) {
             data.taxDeductibleBase = null;
         }
@@ -683,6 +714,7 @@ function planIsNoop(existing: ExistingQboExpense, plan: QboExpenseUpdatePlan): b
     const data = plan.data;
     // Clearing a stranded allocation is a real change, even when nothing else moved.
     if (data.taxDeductibleBase === null && existing.taxDeductibleBase != null) return false;
+    if (data.needsTaxReview === true) return false;
     if (data.qbSyncToken !== undefined && existing.qbSyncToken !== data.qbSyncToken) return false;
     if (data.amount !== undefined && Number(existing.amount) !== data.amount) return false;
     if (data.vendor !== undefined && existing.vendor !== data.vendor) return false;
@@ -1053,6 +1085,8 @@ export interface QboExpenseSyncDependencies {
      * and so existing tests that build dependencies by hand keep compiling.
      */
     suggestCostCode?(input: QboCostCodeSuggestionInput): Promise<void>;
+    /** The company's configured zone — `Expense.date` is a day in it, not an instant. */
+    companyTimeZone(): Promise<string>;
     now(): Date;
 }
 
@@ -1162,6 +1196,7 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
                     isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
             );
         },
+        companyTimeZone: resolveCompanyTimeZone,
         now: () => new Date(),
     };
 }
@@ -1201,10 +1236,25 @@ function qboExpenseDescription(
     return `${body.slice(0, 4000 - marker.length - 1)} ${marker}`;
 }
 
-function qboTransactionDate(txnDate: string | null): Date | null {
-    if (!txnDate) return null;
-    const parsed = new Date(`${txnDate}T00:00:00.000Z`);
-    return Number.isFinite(parsed.getTime()) ? parsed : null;
+/**
+ * A QBO `TxnDate` is a CALENDAR DAY ("2026-07-01"), not an instant. Storing it
+ * at UTC midnight put every Pacific expense on the previous day for anything
+ * that reads `Expense.date` in the company's zone — the tax report filters on
+ * company-midnight bounds and buckets with `dayKeyInTimeZone`, so a 1 July
+ * purchase fell into June and out of Q3 entirely.
+ *
+ * `dateOnlyInTimeZone` is the shared parser every other writer now uses. It
+ * anchors the day at local NOON, which is what makes it DST-proof: midnight can
+ * fall in a spring-forward gap, noon never does, and both land in the same
+ * company calendar day for bucketing.
+ */
+function qboTransactionDate(txnDate: string | null, timeZone: string): Date | null {
+    if (!txnDate || !/^\d{4}-\d{2}-\d{2}$/.test(txnDate)) return null;
+    try {
+        return dateOnlyInTimeZone(txnDate, timeZone);
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -1237,6 +1287,9 @@ export async function syncQboExpenses(
 
     const tokens = runtime.tokens ?? await dependencies.getTokens();
     const mode = options.mode ?? "backfill";
+    // One read per sync. `Expense.date` is a company CALENDAR DAY, and every
+    // writer has to agree on that or the tax report reads them in two zones.
+    const companyTimeZone = await dependencies.companyTimeZone();
     const [purchaseRead, projects] = await Promise.all([
         dependencies.readPurchases(tokens, options.since, mode, options.until),
         dependencies.listProjects(),
@@ -1358,7 +1411,7 @@ export async function syncQboExpenses(
                     projectId: overheadProject?.id ?? null,
                     amount: purchase.total,
                     vendor: purchase.vendor,
-                    date: qboTransactionDate(purchase.txnDate),
+                    date: qboTransactionDate(purchase.txnDate, companyTimeZone),
                     description: qboExpenseDescription(purchase, "[Overhead]"),
                     status: "Reviewed",
                 });
@@ -1411,7 +1464,7 @@ export async function syncQboExpenses(
             projectId: match.projectId,
             amount: purchase.total,
             vendor: purchase.vendor,
-            date: qboTransactionDate(purchase.txnDate),
+            date: qboTransactionDate(purchase.txnDate, companyTimeZone),
             description,
             status: "Reviewed",
         });
