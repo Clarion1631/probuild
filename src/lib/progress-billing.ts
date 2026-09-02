@@ -36,6 +36,7 @@ import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "./quickbooks";
 import {
     ensureIssuanceKey,
+    clearIssuanceIfUnlinked,
     issuancePayloadHash,
     reconcileIssuedInvoice,
     compensationWindowMs,
@@ -738,6 +739,12 @@ export async function stageProgressBillingToQuickBooksCore(
         // when compensation begins, capped by the route's real headroom.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(stageDeadline)));
         const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
+        if (compensated) {
+            // Provably gone: release the identity so the next stage mints a
+            // fresh key instead of asking Intuit for a deleted invoice.
+            // CAS-guarded so a concurrent stage keeps its own key.
+            await clearIssuanceIfUnlinked(prisma.progressBilling as never, billing.id, issuanceKey);
+        }
         if (!compensated) {
             throw new Error(
                 `Staging this billing's QuickBooks invoice failed (${err instanceof Error ? err.message : String(err)}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`

@@ -54,7 +54,6 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
     // Break QB Link confirm dialog (replaces window.confirm so the "also delete
     // in QuickBooks" checkbox has somewhere to live).
     const [breakQBTarget, setBreakQBTarget] = useState<{ id: string; name: string } | null>(null);
-    const [breakQBDeleteInQBO, setBreakQBDeleteInQBO] = useState(false);
 
     // Edit amounts (rebalance Pending milestones without changing the invoice total)
     type EditRow = { name: string; amount: string; dueDate: string };
@@ -112,10 +111,9 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
 
     // Recover a milestone whose QuickBooks invoice was voided/deleted: clear the
     // stale link so it can be re-created fresh. Money state is untouched. Opens
-    // the confirm dialog below (with the optional "also delete in QuickBooks"
-    // checkbox) instead of firing immediately.
+    // the confirm dialog below instead of firing immediately — the server
+    // deletes any live QuickBooks invoice before clearing the link.
     function handleBreakQBLink(payment: { id: string; name: string }) {
-        setBreakQBDeleteInQBO(false);
         setBreakQBTarget(payment);
     }
 
@@ -124,7 +122,7 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
         const target = breakQBTarget;
         setQbBusy(target.id);
         try {
-            const res = await breakQBInvoiceLink(target.id, { deleteInQBO: breakQBDeleteInQBO });
+            const res = await breakQBInvoiceLink(target.id);
             if (!res.success) {
                 toast.error(res.error);
                 return;
@@ -1023,20 +1021,12 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                                 on &quot;Pending&quot;. It clears the QuickBooks link in ProBuild so you can re-create it fresh
                                 with &quot;QuickBooks Link&quot;. It does NOT change the paid/unpaid status.
                             </p>
-                            <label className="flex items-start gap-2 text-sm text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    checked={breakQBDeleteInQBO}
-                                    onChange={(e) => setBreakQBDeleteInQBO(e.target.checked)}
-                                    className="mt-0.5 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
-                                />
-                                <span>
-                                    Also delete the staged invoice in QuickBooks.
-                                    {breakQBDeleteInQBO
-                                        ? " This WILL delete it in QuickBooks (if it has no linked payment)."
-                                        : " Leave unchecked to keep the QuickBooks invoice as-is (e.g. a voided invoice kept for audit)."}
-                                </span>
-                            </label>
+                            <p className="text-sm text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5">
+                                ProBuild checks QuickBooks first. A live invoice is deleted there before the link is
+                                cleared here — leaving it behind would let the client pay an invoice ProBuild no longer
+                                tracks. An already-voided or already-deleted invoice is left alone. If QuickBooks
+                                can&apos;t be reached, nothing changes.
+                            </p>
                         </div>
                         <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-end gap-2 bg-slate-50/50 rounded-b-xl">
                             <button type="button" onClick={() => setBreakQBTarget(null)} disabled={qbBusy === breakQBTarget.id} className="hui-btn hui-btn-secondary">

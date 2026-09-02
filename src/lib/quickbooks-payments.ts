@@ -29,6 +29,7 @@ import {
     isBudgetExhausted,
     type RouteDeadline,
     qbQuery,
+    escapeQBString,
     isQboConnectionFailure,
     isQboMalformedResponseError,
     qboHttpStatus,
@@ -364,6 +365,72 @@ export async function ensureIssuanceKey(
     return { key: row.qbIssuanceKey, reused: true };
 }
 
+/** QuickBooks could not be reached, so remote state is unknown and nothing was changed. */
+export class QBRemoteStateUnknownError extends Error {
+    name = "QBRemoteStateUnknownError";
+    constructor(detail: string) {
+        super(`QuickBooks could not be reached to confirm the invoice state (${detail}); nothing was changed. Try again once QuickBooks responds.`);
+    }
+}
+
+/**
+ * Clear the issuance identity, but only if the row is still the one we staged.
+ *
+ * Called after a CONFIRMED delete/void. The CAS matters: without it, a
+ * concurrent push that had already minted a fresh key and created a new
+ * invoice would have its identity wiped by this cleanup, and the next retry
+ * would create a THIRD invoice.
+ */
+export async function clearIssuanceIfUnlinked(
+    model: { updateMany: Function },
+    id: string,
+    expectedKey: string | null,
+): Promise<boolean> {
+    if (!expectedKey) return false;
+    const cleared = await model.updateMany({
+        where: { id, qbInvoiceId: null, qbIssuanceKey: expectedKey },
+        data: { qbIssuanceKey: null, qbIssuancePayloadHash: null },
+    });
+    return cleared.count === 1;
+}
+
+/**
+ * An issuance whose payload changed while its invoice state is unknown.
+ *
+ * The dangerous shape: an ambiguous create (request landed, response lost)
+ * followed by an edit. The stored key says "an invoice may exist"; the changed
+ * hash says "but not for this bill". Minting blindly could double-bill;
+ * reusing blindly could link an invoice describing the old amount. So ASK
+ * QuickBooks whether the invoice exists.
+ *
+ *  - found     -> link it and let the normal drift check park it for a human
+ *  - not found -> the issuance is proven unsent; clear it and mint fresh
+ *  - unknown   -> refuse, change nothing
+ */
+export async function reconcileStrandedIssuance(
+    tokens: QBTokens,
+    args: { docNumber: string; marker: string },
+    deadline?: RouteDeadline,
+): Promise<{ state: "found"; qbInvoiceId: string } | { state: "not-found" }> {
+    let rows: Array<{ Id?: string; PrivateNote?: string }>;
+    try {
+        rows = await qbQuery<{ Id?: string; PrivateNote?: string }>(
+            tokens,
+            `SELECT Id, PrivateNote FROM Invoice WHERE DocNumber = '${escapeQBString(args.docNumber)}'`,
+            deadline,
+        );
+    } catch (error) {
+        // Unknown is NOT "not found". Guessing either way risks a duplicate
+        // bill or a stranded invoice, so change nothing and say so.
+        throw new QBRemoteStateUnknownError(error instanceof Error ? error.name : "query failed");
+    }
+    // DocNumber alone can collide across re-issues; the private-note marker is
+    // what proves this invoice is the one this issuance created.
+    const mine = rows.find(row => (row.PrivateNote ?? "").includes(args.marker)) ?? rows[0];
+    if (mine?.Id) return { state: "found", qbInvoiceId: String(mine.Id) };
+    return { state: "not-found" };
+}
+
 /** The stored issuance describes a different bill than the one being sent now. */
 export class IssuancePayloadChangedError extends Error {
     name = "IssuancePayloadChangedError";
@@ -510,13 +577,61 @@ export async function pushMilestoneToQuickBooks(
         taxCode: tax ? "TAX" : null,
         privateNote,
     });
-    const { key: issuanceKey } = await ensureIssuanceKey(
-        prisma.paymentSchedule as never,
-        schedule.id,
-        schedule.qbIssuanceKey ?? null,
-        payloadHash,
-        schedule.qbIssuancePayloadHash ?? null,
-    );
+    const privateNoteMarker = `ProBuild ${invoice.code} · ${schedule.name}`;
+    let issuanceKey: string;
+    try {
+        ({ key: issuanceKey } = await ensureIssuanceKey(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            schedule.qbIssuanceKey ?? null,
+            payloadHash,
+            schedule.qbIssuancePayloadHash ?? null,
+        ));
+    } catch (error) {
+        if (!(error instanceof IssuancePayloadChangedError)) throw error;
+        // An ambiguous create followed by an edit: the stored key says an
+        // invoice MAY exist, the changed hash says it is not for this bill.
+        // Minting blindly could double-bill; reusing blindly could link an
+        // invoice describing the old amount. Ask QuickBooks which it is.
+        const remote = await reconcileStrandedIssuance(
+            tokens,
+            { docNumber, marker: privateNoteMarker },
+            pushDeadline,
+        );
+        if (remote.state === "found") {
+            // It exists. Link it so it is never orphaned, then let the normal
+            // drift check park it for a human — it bills the OLD amount.
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: null },
+                data: { qbInvoiceId: remote.qbInvoiceId, qbSyncError: "invoice-drift" },
+            });
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "error",
+                reason: "invoice-drift",
+                source: "milestone-push",
+                docNumber,
+                detail: { paymentScheduleId: schedule.id, qbInvoiceId: remote.qbInvoiceId, cause: "stranded-issuance" },
+            });
+            throw new Error(
+                `QuickBooks already holds invoice ${docNumber} (id ${remote.qbInvoiceId}) from an earlier attempt, and this milestone has changed since. ` +
+                `Review it in QuickBooks before re-sending.`,
+            );
+        }
+        // Proven unsent: clear the stale identity and mint fresh.
+        await clearIssuanceIfUnlinked(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            schedule.qbIssuanceKey ?? null,
+        );
+        ({ key: issuanceKey } = await ensureIssuanceKey(
+            prisma.paymentSchedule as never,
+            schedule.id,
+            null,
+            payloadHash,
+            null,
+        ));
+    }
 
     const created = await createQBMilestoneInvoice(tokens, {
         docNumber,
@@ -632,6 +747,13 @@ export async function pushMilestoneToQuickBooks(
         // overrun the platform ceiling: reserve whichever is smaller.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
         const compensated = await deleteQBInvoice(tokens, qbId, cleanupDeadline).catch(() => false);
+        if (compensated) {
+            // The invoice is provably gone, so the identity that produced it
+            // must be released or the next send would reuse the key and ask
+            // Intuit for an invoice that no longer exists. CAS-guarded: a
+            // concurrent push that already minted a fresh key keeps it.
+            await clearIssuanceIfUnlinked(prisma.paymentSchedule as never, schedule.id, issuanceKey);
+        }
         if (!compensated) {
             // Even the reserved budget is gone (or the delete was refused).
             // Record the orphan durably so the maintenance sweep can resolve

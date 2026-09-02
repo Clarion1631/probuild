@@ -1316,8 +1316,10 @@ export async function appendQBInvoiceCustomerMemo(
     tokens: QBTokens,
     qbInvoiceId: string,
     line: string,
+    deadline?: RouteDeadline,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    // Two serial calls (read then sparse update) under one budget.
+    const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!read.ok) return { ok: false, error: `Could not read QuickBooks invoice (${read.status})` };
     const invoice = (await parseJsonOrNull(read))?.Invoice;
     if (!invoice?.SyncToken) return { ok: false, error: "QuickBooks invoice response was incomplete" };
@@ -1325,6 +1327,7 @@ export async function appendQBInvoiceCustomerMemo(
     const current = String(invoice.CustomerMemo?.value ?? "").trim();
     if (current.includes(line)) return { ok: true };
     const update = await qbFetch("/invoice", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Id: qbInvoiceId,
@@ -1625,11 +1628,12 @@ export async function syncInvoiceToQB(
 }
 
 /** Send a QBO invoice email to a client. */
-export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendTo?: string | null) {
+export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendTo?: string | null, deadline?: RouteDeadline) {
     const qs = new URLSearchParams({ minorversion: "73" });
     if (sendTo) qs.set("sendTo", sendTo);
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}/send?${qs}`;
     const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
         method: "POST",
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,

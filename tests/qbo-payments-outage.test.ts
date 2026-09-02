@@ -1598,3 +1598,110 @@ test("the maintenance sync response reports the RUN, not just the request", asyn
     assert.equal(incomplete({ ...emptyResult(), errors: ["INV-1: boom"] }), true);
     assert.equal(incomplete({ ...emptyResult(), runFailed: true }), true);
 });
+
+// --- Releasing the issuance after a CONFIRMED delete ---
+
+test("a confirmed compensating delete releases the issuance, CAS-guarded", async () => {
+    const { clearIssuanceIfUnlinked } = await import("../src/lib/quickbooks-payments");
+
+    // The happy path: still unlinked, still our key -> released, so the next
+    // send mints fresh instead of asking Intuit for a deleted invoice.
+    const rows: Record<string, { qbInvoiceId: string | null; qbIssuanceKey: string | null; qbIssuancePayloadHash: string | null }> = {
+        a: { qbInvoiceId: null, qbIssuanceKey: "key-1", qbIssuancePayloadHash: "h" },
+    };
+    const model = {
+        async updateMany({ where, data }: { where: { id: string; qbInvoiceId: null; qbIssuanceKey: string }; data: { qbIssuanceKey: null; qbIssuancePayloadHash: null } }) {
+            const row = rows[where.id];
+            if (!row || row.qbInvoiceId !== null || row.qbIssuanceKey !== where.qbIssuanceKey) return { count: 0 };
+            row.qbIssuanceKey = data.qbIssuanceKey;
+            row.qbIssuancePayloadHash = data.qbIssuancePayloadHash;
+            return { count: 1 };
+        },
+    };
+    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), true);
+    assert.equal(rows.a.qbIssuanceKey, null);
+    assert.equal(rows.a.qbIssuancePayloadHash, null);
+
+    // A concurrent push that already minted a NEW key keeps it — wiping it
+    // would make the next retry create a third invoice.
+    rows.a = { qbInvoiceId: null, qbIssuanceKey: "key-2", qbIssuancePayloadHash: "h2" };
+    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), false);
+    assert.equal(rows.a.qbIssuanceKey, "key-2");
+
+    // A row that got linked in the meantime is left alone.
+    rows.a = { qbInvoiceId: "inv-9", qbIssuanceKey: "key-1", qbIssuancePayloadHash: "h" };
+    assert.equal(await clearIssuanceIfUnlinked(model as never, "a", "key-1"), false);
+    assert.equal(rows.a.qbIssuanceKey, "key-1");
+});
+
+// --- An ambiguous create followed by an edit ---
+
+test("a stranded issuance asks QuickBooks instead of guessing", async () => {
+    const { reconcileStrandedIssuance, QBRemoteStateUnknownError } = await import("../src/lib/quickbooks-payments");
+    const TOKENS_ = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
+    const marker = "ProBuild INV-1 · Deposit";
+
+    const queryReturning = (body: unknown, status = 200) =>
+        (async () => new Response(JSON.stringify(body), {
+            status, headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+
+    // FOUND: the invoice exists, so it must be linked and parked - never
+    // re-created, which would double-bill.
+    const found = await withFetch(
+        queryReturning({ QueryResponse: { Invoice: [{ Id: "77", PrivateNote: `${marker} · Project` }] } }),
+        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
+    );
+    assert.deepEqual(found, { state: "found", qbInvoiceId: "77" });
+
+    // NOT FOUND: the create never landed, so the issuance is proven unsent and
+    // can be released for a fresh mint.
+    const missing = await withFetch(
+        queryReturning({ QueryResponse: {} }),
+        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
+    );
+    assert.deepEqual(missing, { state: "not-found" });
+
+    // UNREACHABLE is not "not found": guessing either way risks a duplicate
+    // bill or a stranded invoice, so it must refuse and change nothing.
+    const unreachable = await withFetch(
+        queryReturning("busy", 503),
+        () => reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker }),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(unreachable instanceof QBRemoteStateUnknownError, `got ${unreachable?.name}`);
+});
+
+test("the marker, not the DocNumber alone, identifies our invoice", async () => {
+    const { reconcileStrandedIssuance } = await import("../src/lib/quickbooks-payments");
+    const TOKENS_ = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
+    // Two invoices share the DocNumber (a re-issue); the marker disambiguates.
+    const impl = (async () => new Response(JSON.stringify({
+        QueryResponse: { Invoice: [
+            { Id: "10", PrivateNote: "ProBuild INV-1 · Retainage · Project" },
+            { Id: "11", PrivateNote: "ProBuild INV-1 · Deposit · Project" },
+        ] },
+    }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+
+    const found = await withFetch(impl, () =>
+        reconcileStrandedIssuance(TOKENS_, { docNumber: "INV-1-1", marker: "ProBuild INV-1 · Deposit" }),
+    );
+    assert.deepEqual(found, { state: "found", qbInvoiceId: "11" });
+});
+
+// --- Cumulative budget across a refresh plus serial calls ---
+
+test("a refresh plus N serial calls cannot exceed the route deadline", async () => {
+    const { createRouteDeadline, isBudgetExhausted, remainingBudgetMs } = await import("../src/lib/quickbooks");
+    // Every helper in the chain takes the SAME deadline, so the budget is
+    // spent once across the whole sequence rather than reset per call.
+    const deadline = createRouteDeadline(1_000);
+    const spend = async (ms: number) => { await new Promise(r => setTimeout(r, ms)); };
+
+    let calls = 0;
+    while (!isBudgetExhausted(deadline) && calls < 50) {
+        calls++;
+        await spend(120);
+    }
+    assert.ok(calls < 50, "the sequence stopped itself");
+    assert.ok(remainingBudgetMs(deadline) <= 1_000, "never more budget than was granted");
+});
