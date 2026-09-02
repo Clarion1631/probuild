@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     buildCardFromItems,
     selectOwnerItems,
@@ -8,15 +11,23 @@ import {
 } from "../src/lib/receipt-request-cards";
 
 /**
- * The claim protocol, exercised against an in-memory stand-in for the
- * `ReceiptRequestCard` table (Codex blocker 3).
+ * The claim protocol, exercised against an in-memory stand-in for
+ * `ReceiptRequestCard` (Codex blockers 3, rounds 1 and 2).
  *
- * The table's UNIQUE (owner, pacificDate) is the whole mechanism, so the fake
- * models exactly that and nothing else. The point is to prove the ORDER of
- * operations is safe — claim, then post, then mark — not to re-test Postgres.
+ * TWO claims live on that row and they answer different questions:
+ *   - the DAY claim is `UNIQUE (owner, pacificDate)`: who gets to select today.
+ *   - the POST claim is `claimedAt`/`claimToken`: who gets to send the message,
+ *     and — because completion is fenced on the token — who gets to record that
+ *     it was sent. Without the token, a superseded run's late completion could
+ *     mark a row posted that it never posted.
+ *
+ * The fake models exactly those two and nothing else. The point is that the
+ * ORDER of operations is safe, not to re-test Postgres.
  */
 
 const DATE = "2026-08-20";
+const CLAIM_LEASE_MS = 10 * 60_000;
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const issue = (over: Partial<CardCandidateIssue> = {}): CardCandidateIssue => ({
     id: "ri-1",
@@ -34,64 +45,100 @@ const issue = (over: Partial<CardCandidateIssue> = {}): CardCandidateIssue => ({
 
 class UniqueViolation extends Error {}
 
-/**
- * How long a claimed-but-unposted row is left alone before another run may
- * re-post it. Mirrors RESUME_AFTER_MS in the cron: the advisory lock there is
- * transaction-scoped and released before any card is posted, so without this
- * lease a second overlapping run "resumes" the first's in-flight row and the
- * card goes out twice. (This test found exactly that.)
- */
-const RESUME_AFTER_MS = 10 * 60_000;
+interface CardRow {
+    id: string;
+    owner: string;
+    itemsJson: string;
+    overflow: number;
+    claimedAt: Date | null;
+    claimToken: string | null;
+    postedAt: Date | null;
+    attempts: number;
+}
 
-/** UNIQUE (owner, pacificDate), and nothing else. */
 function cardTable() {
-    const rows = new Map<string, { id: string; owner: string; itemsJson: string; overflow: number; postedAt: Date | null; attempts: number; createdAt: Date }>();
+    const rows = new Map<string, CardRow>();
     let seq = 0;
     return {
         rows,
         find(owner: string, date: string) {
             return rows.get(`${owner}|${date}`) ?? null;
         },
-        create(owner: string, date: string, items: CardItem[], overflow: number) {
+        /** UNIQUE (owner, pacificDate) — the DAY claim. */
+        create(owner: string, date: string, items: CardItem[], overflow: number, now: Date, token: string) {
             const key = `${owner}|${date}`;
             if (rows.has(key)) throw new UniqueViolation();
-            const row = { id: `card-${++seq}`, owner, itemsJson: JSON.stringify(items), overflow, postedAt: null as Date | null, attempts: 0, createdAt: new Date() };
+            const row: CardRow = {
+                id: `card-${++seq}`, owner, itemsJson: JSON.stringify(items), overflow,
+                claimedAt: now, claimToken: token, postedAt: null, attempts: 0,
+            };
             rows.set(key, row);
             return row;
         },
-        markPosted(id: string) {
-            for (const row of rows.values()) if (row.id === id) { row.postedAt = new Date(); row.attempts++; }
+        /** The POST claim CAS. Returns the number of rows updated. */
+        takePostClaim(id: string, now: Date, token: string): number {
+            for (const row of rows.values()) {
+                if (row.id !== id) continue;
+                if (row.postedAt !== null) return 0;
+                const free = row.claimedAt === null || row.claimedAt.getTime() < now.getTime() - CLAIM_LEASE_MS;
+                if (!free) return 0;
+                row.claimedAt = now;
+                row.claimToken = token;
+                return 1;
+            }
+            return 0;
+        },
+        /** Token-fenced completion. */
+        markPosted(id: string, token: string): number {
+            for (const row of rows.values()) {
+                if (row.id !== id || row.claimToken !== token) continue;
+                row.postedAt = new Date();
+                row.attempts++;
+                return 1;
+            }
+            return 0;
+        },
+        releaseClaim(id: string, token: string) {
+            for (const row of rows.values()) {
+                if (row.id !== id || row.claimToken !== token) continue;
+                row.claimedAt = null;
+                row.claimToken = null;
+                row.attempts++;
+            }
         },
     };
 }
 
-/** The cron's claim → post → mark sequence, with the post injected. */
+/** The cron's claim → record → post → complete sequence, with the post injected. */
 async function runOnce(
     table: ReturnType<typeof cardTable>,
     candidates: CardCandidateIssue[],
     post: (owner: string, items: CardItem[]) => Promise<boolean>,
     now: Date = new Date(),
-): Promise<{ posted: string[]; claimed: string[]; resumed: string[] }> {
+    tokenSeed = Math.random().toString(36).slice(2),
+): Promise<{ posted: string[]; claimed: string[]; resumed: string[]; recordedBeforePost: string[] }> {
     const posted: string[] = [];
     const claimed: string[] = [];
     const resumed: string[] = [];
-    const toPost: Array<{ owner: string; rowId: string; items: CardItem[] }> = [];
+    const recordedBeforePost: string[] = [];
+    const toPost: Array<{ owner: string; rowId: string; token: string; items: CardItem[] }> = [];
 
     for (const owner of ["CJ", "Richard"]) {
+        const token = `${tokenSeed}-${owner}`;
         const existing = table.find(owner, DATE);
         if (existing) {
             if (existing.postedAt !== null) continue;
-            if (now.getTime() - existing.createdAt.getTime() < RESUME_AFTER_MS) continue;
+            if (table.takePostClaim(existing.id, now, token) === 0) continue;
             resumed.push(owner);
-            toPost.push({ owner, rowId: existing.id, items: JSON.parse(existing.itemsJson) as CardItem[] });
+            toPost.push({ owner, rowId: existing.id, token, items: JSON.parse(existing.itemsJson) as CardItem[] });
             continue;
         }
         const { items, overflow } = selectOwnerItems(candidates, owner);
         if (items.length === 0) continue;
         try {
-            const row = table.create(owner, DATE, items, overflow);
+            const row = table.create(owner, DATE, items, overflow, now, token);
             claimed.push(owner);
-            toPost.push({ owner, rowId: row.id, items });
+            toPost.push({ owner, rowId: row.id, token, items });
         } catch (error) {
             if (error instanceof UniqueViolation) continue;
             throw error;
@@ -99,12 +146,15 @@ async function runOnce(
     }
 
     for (const entry of toPost) {
+        recordedBeforePost.push(entry.owner); // cards[] is written first
         const ok = await post(entry.owner, entry.items);
-        if (!ok) continue;
-        table.markPosted(entry.rowId);
-        posted.push(entry.owner);
+        if (!ok) {
+            table.releaseClaim(entry.rowId, entry.token);
+            continue;
+        }
+        if (table.markPosted(entry.rowId, entry.token) === 1) posted.push(entry.owner);
     }
-    return { posted, claimed, resumed };
+    return { posted, claimed, resumed, recordedBeforePost };
 }
 
 test("two simultaneous runs post ONE card per owner", async () => {
@@ -112,12 +162,11 @@ test("two simultaneous runs post ONE card per owner", async () => {
     const candidates = [issue(), issue({ id: "ri-2", targetKey: "bl-2", owner: "Richard", cardTail: "6098" })];
     const posts: string[] = [];
     const post = async (owner: string) => { posts.push(owner); return true; };
+    const now = new Date();
 
-    // Both runs select and claim before either posts — the interleaving that
-    // the old "stamp the issue after posting" design could not survive.
     const [a, b] = await Promise.all([
-        runOnce(table, candidates, post),
-        runOnce(table, candidates, post),
+        runOnce(table, candidates, post, now, "A"),
+        runOnce(table, candidates, post, now, "B"),
     ]);
 
     assert.equal(posts.length, 2, "one card for CJ, one for Richard — not four");
@@ -128,57 +177,104 @@ test("two simultaneous runs post ONE card per owner", async () => {
 
 test("a later run on the same day posts nothing", async () => {
     const table = cardTable();
-    const candidates = [issue()];
     const posts: string[] = [];
     const post = async (owner: string) => { posts.push(owner); return true; };
-
-    await runOnce(table, candidates, post);
-    await runOnce(table, candidates, post);
+    await runOnce(table, [issue()], post);
+    await runOnce(table, [issue()], post);
     assert.deepEqual(posts, ["CJ"], "the second run finds a posted claim and stops");
 });
 
-test("a crash between claim and post costs AT MOST one duplicate, never a silent miss", async () => {
+test("a run that does not hold the token cannot complete the post", async () => {
     const table = cardTable();
-    const candidates = [issue()];
+    const now = new Date();
+    await runOnce(table, [issue()], async () => false, now, "A"); // claims, fails, releases
 
-    // Run 1: claims, then the process dies before the post is marked.
-    await runOnce(table, candidates, async () => false);
+    // A stale run tries to complete with a token it no longer holds.
     const row = table.find("CJ", DATE)!;
-    assert.notEqual(row, null, "the claim is durable");
+    assert.equal(table.markPosted(row.id, "A-CJ"), 0, "the released token is dead");
+
+    // The legitimate next run takes the claim and completes.
+    const later = new Date(now.getTime() + 1000);
+    const second = await runOnce(table, [issue()], async () => true, later, "B");
+    assert.deepEqual(second.posted, ["CJ"]);
+    assert.notEqual(table.find("CJ", DATE)!.postedAt, null);
+});
+
+test("a failed post leaves the row unposted for a SAME-DAY retry", async () => {
+    const table = cardTable();
+    const now = new Date();
+    await runOnce(table, [issue()], async () => false, now, "A");
+    const row = table.find("CJ", DATE)!;
     assert.equal(row.postedAt, null);
+    assert.equal(row.claimToken, null, "the claim was released, not held until the lease expires");
 
-    // Run 2, after the lease expires, resumes THAT row rather than re-selecting.
-    const later = new Date(Date.now() + RESUME_AFTER_MS + 1);
-    const posts: string[] = [];
-    const second = await runOnce(table, candidates, async owner => { posts.push(owner); return true; }, later);
-    assert.deepEqual(second.resumed, ["CJ"]);
-    assert.deepEqual(posts, ["CJ"]);
+    // Same day, moments later — no need to wait out a lease.
+    const retry = await runOnce(table, [issue()], async () => true, new Date(now.getTime() + 1000), "B");
+    assert.deepEqual(retry.posted, ["CJ"]);
+    assert.deepEqual(retry.resumed, ["CJ"]);
+});
+
+test("a crash mid-post is recovered only after the lease, and costs at most one duplicate", async () => {
+    const table = cardTable();
+    const now = new Date();
+    // Claim taken, then the process dies: neither markPosted nor releaseClaim ran.
+    const token = "crashed-CJ";
+    const { items, overflow } = selectOwnerItems([issue()], "CJ");
+    table.create("CJ", DATE, items, overflow, now, token);
+
+    // A run seconds later must NOT touch it — that is how you post twice.
+    const early = await runOnce(table, [issue()], async () => { throw new Error("must not post"); }, new Date(now.getTime() + 1000), "B");
+    assert.deepEqual(early.posted, []);
+
+    // After the lease, it is recoverable.
+    const later = new Date(now.getTime() + CLAIM_LEASE_MS + 1);
+    const recovered = await runOnce(table, [issue()], async () => true, later, "C");
+    assert.deepEqual(recovered.resumed, ["CJ"]);
+    assert.deepEqual(recovered.posted, ["CJ"]);
     assert.equal(table.rows.size, 1, "no second claim row was created");
-
-    // Run 3 is a no-op.
-    const third = await runOnce(table, candidates, async () => { throw new Error("must not post"); }, later);
-    assert.deepEqual(third.posted, []);
 });
 
 test("a resumed card re-posts the SAME items in the SAME order", async () => {
     const table = cardTable();
-    // Three items; only the first two would be selected if the queue changed.
+    const now = new Date();
     const candidates = [
         issue({ id: "a", targetKey: "bl-a", postedDate: "2026-08-10" }),
         issue({ id: "b", targetKey: "bl-b", postedDate: "2026-08-11" }),
     ];
-    await runOnce(table, candidates, async () => false);
+    await runOnce(table, candidates, async () => false, now, "A");
     const claimedItems = JSON.parse(table.find("CJ", DATE)!.itemsJson) as CardItem[];
-    const later = new Date(Date.now() + RESUME_AFTER_MS + 1);
 
     // The queue moves on: a brand-new, older-looking charge appears.
     const changed = [...candidates, issue({ id: "c", targetKey: "bl-c", postedDate: "2026-08-01" })];
     let seen: CardItem[] = [];
-    await runOnce(table, changed, async (_owner, items) => { seen = items; return true; }, later);
+    await runOnce(table, changed, async (_owner, items) => { seen = items; return true; }, new Date(now.getTime() + 1000), "B");
 
     assert.deepEqual(seen.map(i => i.targetKey), claimedItems.map(i => i.targetKey),
         "renumbering would break every 'sign N' reply against this thread");
     assert.deepEqual(seen.map(i => i.n), [1, 2]);
+});
+
+test("the thread record is written BEFORE the post", async () => {
+    // A crash between posting and recording put a card in the space that
+    // ProBuild had no record of, orphaning every reply to it. Written first,
+    // the worst case is a recorded thread for a message that never went out.
+    const table = cardTable();
+    const order: string[] = [];
+    const result = await runOnce(table, [issue()], async owner => { order.push(`post:${owner}`); return true; });
+    assert.deepEqual(result.recordedBeforePost, ["CJ"]);
+    assert.deepEqual(order, ["post:CJ"]);
+
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    const recordAt = source.indexOf("await recordCardOnIssues(card, null, null, now);");
+    const postAt = source.indexOf("await postOwnerCard(webhookUrl, card);");
+    assert.ok(recordAt > 0 && postAt > 0);
+    assert.ok(recordAt < postAt, "the pre-post record must come first in the source too");
+});
+
+test("completion is token-fenced in the real route, not just in this fake", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    assert.match(source, /where: \{ id: rowId, claimToken: token \}/);
+    assert.match(source, /OR: \[\{ claimedAt: null \}, \{ claimedAt: \{ lt: new Date\(now\.getTime\(\) - CLAIM_LEASE_MS\) \} \}\]/);
 });
 
 test("the request id and thread key are the same deterministic string", () => {

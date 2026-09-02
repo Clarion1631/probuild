@@ -6,6 +6,7 @@ import { CARD_HISTORY_DAYS, RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-re
 import {
     parseOwnerChatUsers,
     serializeThreads,
+    type CardItem,
     type PostedCardRecord,
     type ThreadRecordItem,
 } from "@/lib/receipt-request-cards";
@@ -22,6 +23,15 @@ export const dynamic = "force-dynamic";
  * endpoint and MERGES the result into the file by thread key, never clobbering
  * Beverly's own entries.
  *
+ * THE OUTBOX IS THE SOURCE OF TRUTH. Earlier this reconstructed threads by
+ * scanning every open issue's `displayDetails.cards[]` and grouping by thread
+ * name, which made the export a derived guess: an issue whose details write
+ * failed vanished from its own thread, and the ITEM NUMBERING — the thing a
+ * "sign 2" reply resolves against — was re-derived rather than read from the
+ * message that was actually sent. `ReceiptRequestCard.itemsJson` is the
+ * immutable snapshot that WAS posted, so it is what gets exported; the issues
+ * are joined in only for the display fields (payee, amount, date).
+ *
  * The response shape is EXACTLY sweepChatReceipts.js:108-110. It is not ours to
  * improve: the sweep indexes by `thread.name` and reads those five keys.
  *
@@ -33,9 +43,17 @@ export const dynamic = "force-dynamic";
  * here at all.
  */
 
-/** Cards posted in the last two weeks. Older threads are closed business, and
- * this matches CARD_HISTORY_DAYS, the retention the issue's own cards[] keeps. */
+/** Cards posted in the last two weeks; matches the issues' own cards[] retention. */
 const WINDOW_DAYS = CARD_HISTORY_DAYS;
+
+function parseItems(itemsJson: string): CardItem[] {
+    try {
+        const parsed: unknown = JSON.parse(itemsJson);
+        return Array.isArray(parsed) ? (parsed as CardItem[]) : [];
+    } catch {
+        return [];
+    }
+}
 
 export async function GET(request: Request) {
     const provided = request.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
@@ -44,67 +62,61 @@ export async function GET(request: Request) {
     }
 
     const cutoff = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
-    const issues = await prisma.reviewIssue.findMany({
-        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
-        orderBy: { firstObservedAt: "desc" },
-        take: 500,
-        select: { targetKey: true, reasonCodes: true, displayDetails: true },
+
+    // POSTED cards only. A claimed-but-unposted row describes a message that
+    // never reached Chat, and exporting its thread would invite the sweep to
+    // look for replies in a thread that does not exist.
+    const cards = await prisma.receiptRequestCard.findMany({
+        where: { pacificDate: { gte: cutoff }, postedAt: { not: null }, threadName: { not: null } },
+        orderBy: { pacificDate: "desc" },
+        take: 200,
+        select: { owner: true, itemsJson: true, threadName: true, messageName: true },
     });
-
-    // One record per thread, items in their card order. An issue carries a
-    // 14-day `cards[]` HISTORY, not just today's card: an item asked about on
-    // Monday and again on Wednesday lives in two threads, and a reply in
-    // Monday's thread must still resolve. Exporting only the latest silently
-    // stranded those replies.
-    const byThread = new Map<string, PostedCardRecord & { seen: Map<number, ThreadRecordItem> }>();
-    for (const issue of issues) {
-        if (decodeReasonCodes(issue.reasonCodes).length === 0) continue;
-        const details = parseMissingReceiptDetails(issue.displayDetails);
-        const history = Array.isArray(details.cards)
-            ? (details.cards as unknown[])
-            : details.card && typeof details.card === "object"
-                // Rows written before cards[] existed still carry the single slot.
-                ? [details.card]
-                : [];
-
-        for (const entry of history) {
-            if (!entry || typeof entry !== "object") continue;
-            const card = entry as Record<string, unknown>;
-            const threadName = typeof card.threadName === "string" ? card.threadName : "";
-            const cardDate = typeof card.date === "string" ? card.date : "";
-            if (!threadName || cardDate < cutoff) continue;
-
-            const record = byThread.get(threadName) ?? {
-                threadName,
-                messageName: typeof card.messageName === "string" ? card.messageName : "",
-                owner: typeof details.owner === "string" ? details.owner : "unassigned",
-                items: [],
-                seen: new Map<number, ThreadRecordItem>(),
-            };
-            const n = typeof card.n === "number" ? card.n : record.seen.size + 1;
-            // Numbering is what a "sign 2" reply resolves against, so a duplicate
-            // n would make that reply ambiguous. First writer wins, deterministically.
-            if (!record.seen.has(n)) {
-                const amountCents = typeof details.amountCents === "number" ? details.amountCents : 0;
-                record.seen.set(n, {
-                    n,
-                    fingerprint: typeof details.fingerprint === "string" ? details.fingerprint : `pb-${issue.targetKey}`,
-                    date: typeof details.postedDate === "string" ? details.postedDate : "",
-                    vendor: typeof details.payee === "string" ? details.payee : "",
-                    cents: Math.abs(amountCents),
-                    amount: (Math.abs(amountCents) / 100).toFixed(2),
-                });
-            }
-            byThread.set(threadName, record);
-        }
+    if (cards.length === 0) {
+        return NextResponse.json(serializeThreads([], parseOwnerChatUsers(process.env.RECEIPT_OWNER_CHAT_USERS)));
     }
 
-    const posted: PostedCardRecord[] = [...byThread.values()].map(record => ({
-        threadName: record.threadName,
-        messageName: record.messageName,
-        owner: record.owner,
-        items: [...record.seen.values()].sort((a, b) => a.n - b.n),
-    }));
+    // Join the issues in for display fields only. A CLEARED issue is dropped:
+    // it has been answered, and the sweep must never chase it again — but the
+    // thread itself stays, carrying whatever items are still open.
+    const issueIds = [...new Set(cards.flatMap(card => parseItems(card.itemsJson).map(item => item.issueId)))];
+    const issues = await prisma.reviewIssue.findMany({
+        where: { id: { in: issueIds }, targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null },
+        select: { id: true, targetKey: true, reasonCodes: true, displayDetails: true },
+    });
+    const detailsById = new Map(
+        issues
+            .filter(issue => decodeReasonCodes(issue.reasonCodes).length > 0)
+            .map(issue => [issue.id, { targetKey: issue.targetKey, details: parseMissingReceiptDetails(issue.displayDetails) }]),
+    );
+
+    const posted: PostedCardRecord[] = [];
+    for (const card of cards) {
+        const items: ThreadRecordItem[] = [];
+        for (const item of parseItems(card.itemsJson)) {
+            const joined = detailsById.get(item.issueId);
+            if (!joined) continue; // answered since, or never ours
+            const details = joined.details;
+            const amountCents = typeof details.amountCents === "number" ? details.amountCents : item.cents;
+            items.push({
+                // `n` comes from the SNAPSHOT, never recomputed: it is what the
+                // message said, and what "sign 2" means.
+                n: item.n,
+                fingerprint: typeof details.fingerprint === "string" ? details.fingerprint : item.fingerprint,
+                date: typeof details.postedDate === "string" ? details.postedDate : item.date,
+                vendor: typeof details.payee === "string" ? details.payee : item.vendor,
+                cents: Math.abs(amountCents),
+                amount: (Math.abs(amountCents) / 100).toFixed(2),
+            });
+        }
+        if (items.length === 0) continue; // every item answered — nothing left to chase
+        posted.push({
+            threadName: card.threadName as string,
+            messageName: card.messageName ?? "",
+            owner: card.owner,
+            items: items.sort((a, b) => a.n - b.n),
+        });
+    }
 
     return NextResponse.json(serializeThreads(posted, parseOwnerChatUsers(process.env.RECEIPT_OWNER_CHAT_USERS)));
 }

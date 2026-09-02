@@ -415,7 +415,15 @@ export function appendCardRecord(
     now: Date,
 ): Record<string, unknown> {
     const merged: Record<string, unknown> = { ...(details ?? {}) };
-    const priorRaw = Array.isArray(merged.cards) ? (merged.cards as unknown[]) : [];
+    // SEED FROM THE LEGACY SLOT. Rows written before `cards[]` existed carry a
+    // single `card`. Starting from an empty array on their first write silently
+    // discarded the thread they were last asked in, which is exactly the reply
+    // the sweep would then have had nothing to resolve against.
+    const priorRaw = Array.isArray(merged.cards)
+        ? (merged.cards as unknown[])
+        : merged.card && typeof merged.card === "object"
+            ? [merged.card]
+            : [];
     const cutoffDay = (dayNumber(toYmd(now)) ?? 0) - CARD_HISTORY_DAYS;
     const kept = priorRaw.filter((entry): entry is CardRecord => {
         if (!entry || typeof entry !== "object") return false;

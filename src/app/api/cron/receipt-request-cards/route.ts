@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
@@ -8,6 +9,7 @@ import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord } from "@/lib/receipt-req
 import {
     CARD_OWNERS_ASKED,
     CARD_RATE_CEILING,
+    MAX_ITEMS_PER_CARD,
     buildCardFromItems,
     isPacificWeekday,
     pacificDate,
@@ -55,21 +57,23 @@ const CLAIM_LOCK_KEY = "receipt-request-cards";
 
 /** Page size for the candidate scan. See scanCandidates for why it pages. */
 const SCAN_PAGE_SIZE = 500;
-/** Hard stop, so a pathological backlog cannot run the request out of time. */
-const SCAN_MAX_PAGES = 20;
+/**
+ * Absolute stop, so a pathological backlog cannot run the request out of time.
+ * It is a SAFETY VALVE, not the scan's exit condition — see scanCandidates.
+ */
+const SCAN_MAX_PAGES = 200;
 
 /**
- * How long a claimed-but-unposted row is left alone before another run will
- * re-post it.
+ * How long a POST-CLAIM is honoured before another run may take it.
  *
- * The advisory lock above is transaction-scoped and is released the moment the
- * CLAIM transaction commits — which is before any card is posted (the same
- * caveat the intake worker documents). So two overlapping invocations can both
- * get past it, and without this lease the second one would find the first's
- * still-in-flight row, "resume" it, and post the card twice. A row younger than
- * the lease is assumed to belong to a run that is still going.
+ * The advisory lock is transaction-scoped and released the moment the claim
+ * transaction commits — before any card is posted (the same caveat the intake
+ * worker documents) — so two overlapping invocations can both get past it. The
+ * `claimedAt`/`claimToken` CAS is what actually decides who posts: one run wins
+ * it, and only that run may mark the row posted. A claim older than this lease
+ * belongs to a run that died, and is up for grabs again.
  */
-const RESUME_AFTER_MS = 10 * 60_000;
+const CLAIM_LEASE_MS = 10 * 60_000;
 
 async function claim(): Promise<boolean> {
     return prisma.$transaction(async tx => {
@@ -127,6 +131,7 @@ function toCandidate(issue: {
 async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pages: number; exhausted: boolean }> {
     const candidates: CardCandidateIssue[] = [];
     const perOwner = new Map<string, number>(CARD_OWNERS_ASKED.map(owner => [owner, 0]));
+    const neverCardedPerOwner = new Map<string, number>(CARD_OWNERS_ASKED.map(owner => [owner, 0]));
     let cursor: string | undefined;
     let pages = 0;
     let exhausted = false;
@@ -154,13 +159,22 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
             if (candidate.acknowledged) continue;
             candidates.push(candidate);
             perOwner.set(candidate.owner, (perOwner.get(candidate.owner) ?? 0) + 1);
+            if (!candidate.everCarded) {
+                neverCardedPerOwner.set(candidate.owner, (neverCardedPerOwner.get(candidate.owner) ?? 0) + 1);
+            }
         }
         if (page.length < SCAN_PAGE_SIZE) { exhausted = true; break; }
-        // Enough for a full card each, INCLUDING the never-carded ordering
-        // headroom (twice the ceiling), so the priority rule still has a real
-        // choice to make rather than being decided by where the scan stopped.
-        const enough = CARD_OWNERS_ASKED.every(owner => (perOwner.get(owner) ?? 0) >= CARD_RATE_CEILING * 2);
-        if (enough) break;
+        // STOP CONDITION: every asked owner either has a NEVER-CARDED item in
+        // hand, or has nothing left to find. A fixed page budget was the wrong
+        // shape — with a long backlog of already-carded rows the scan could
+        // stop before reaching the one new charge that should lead the card,
+        // and the same frozen list would go out again. Selection prefers
+        // never-carded items, so the scan has to keep going until it has found
+        // one (or run out) for each owner.
+        const satisfied = CARD_OWNERS_ASKED.every(owner =>
+            (neverCardedPerOwner.get(owner) ?? 0) > 0
+            && (perOwner.get(owner) ?? 0) >= MAX_ITEMS_PER_CARD);
+        if (satisfied) break;
     }
 
     return { candidates, pages, exhausted };
@@ -183,6 +197,9 @@ function parseItems(itemsJson: string): CardItem[] {
  * hash, so writing it opens no new generation and sends no second alert.
  */
 async function recordCardOnIssues(card: OwnerCard, threadName: string | null, messageName: string | null, now: Date) {
+    // Called TWICE per card: once before the post (thread unknown) and once
+    // after (thread filled in). appendCardRecord replaces the same-day entry
+    // rather than stacking, so the second call updates the first's record.
     for (const item of card.items) {
         const issue = await prisma.reviewIssue.findUnique({
             where: { id: item.issueId },
@@ -229,57 +246,98 @@ export async function GET(request: Request) {
     }
 
     const date = pacificDate(now);
+    const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
     const scan = await scanCandidates();
-    const toPost: Array<{ card: OwnerCard; rowId: string; resumed: boolean }> = [];
+    const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
 
     for (const owner of CARD_OWNERS_ASKED) {
-        // RESUME FIRST. A claimed row with no postedAt is last run's crash
-        // between commit and post; re-post it verbatim from its immutable
-        // snapshot rather than re-selecting (which would renumber the items a
-        // "sign 2" reply resolves against).
-        const claimed = await prisma.receiptRequestCard.findUnique({
+        const existing = await prisma.receiptRequestCard.findUnique({
             where: { owner_pacificDate: { owner, pacificDate: date } },
-            select: { id: true, itemsJson: true, overflow: true, postedAt: true, createdAt: true },
+            select: { id: true, itemsJson: true, overflow: true, postedAt: true },
         });
-        if (claimed) {
-            if (claimed.postedAt !== null) continue; // already asked today
-            // Younger than the lease: another invocation is mid-flight. Leave
-            // it be — resuming here is how you post the same card twice.
-            if (now.getTime() - claimed.createdAt.getTime() < RESUME_AFTER_MS) continue;
-            const items = parseItems(claimed.itemsJson);
+
+        if (existing) {
+            // Already asked today — nothing to do, whoever posted it.
+            if (existing.postedAt !== null) continue;
+
+            // A claimed-but-unposted row: last run crashed, or its post failed.
+            // TAKE THE POST-CLAIM BY TOKEN. `claimedAt` older than the lease (or
+            // never set) is up for grabs; the CAS means exactly one concurrent
+            // run wins it, and only the winner may later mark it posted. A
+            // count of 0 means another run holds it right now — leave it be.
+            const token = randomUUID();
+            const taken = await prisma.receiptRequestCard.updateMany({
+                where: {
+                    id: existing.id,
+                    postedAt: null,
+                    OR: [{ claimedAt: null }, { claimedAt: { lt: new Date(now.getTime() - CLAIM_LEASE_MS) } }],
+                },
+                data: { claimedAt: now, claimToken: token },
+            });
+            if (taken.count === 0) continue;
+
+            const items = parseItems(existing.itemsJson);
             if (items.length === 0) continue;
-            toPost.push({ card: buildCardFromItems(owner, date, items, claimed.overflow), rowId: claimed.id, resumed: true });
+            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow), rowId: existing.id, token, resumed: true });
             continue;
         }
 
+        // Yesterday's unposted card is not lost work: its items are still open
+        // (a cleared issue would have dropped out of the scan), so they are
+        // simply re-planned into today's selection — which is what
+        // never-carded-first ordering already does. Nothing to carry over
+        // explicitly; the stale row is left as the record that the day failed.
+        void yesterday;
+
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
+        const token = randomUUID();
         try {
-            // THE CLAIM: selection and the record of it are one write. A
-            // concurrent run loses the unique index and posts nothing.
+            // THE DAY-CLAIM and the POST-CLAIM in one insert: selection, its
+            // immutable record, and this run's ownership of the post.
             const row = await prisma.receiptRequestCard.create({
-                data: { owner, pacificDate: date, itemsJson: JSON.stringify(items), overflow },
+                data: {
+                    owner,
+                    pacificDate: date,
+                    itemsJson: JSON.stringify(items),
+                    overflow,
+                    claimedAt: now,
+                    claimToken: token,
+                },
                 select: { id: true },
             });
-            toPost.push({ card: buildCardFromItems(owner, date, items, overflow), rowId: row.id, resumed: false });
+            toPost.push({ card: buildCardFromItems(owner, date, items, overflow), rowId: row.id, token, resumed: false });
         } catch (error) {
-            if (isUniqueConstraintError(error)) continue; // the other run won
+            if (isUniqueConstraintError(error)) continue; // the other run won the day
             throw error;
         }
     }
 
     const posted: Array<{ owner: string; items: number; threadName: string | null; resumed: boolean }> = [];
-    for (const { card, rowId, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+    for (const { card, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+        // cards[] IS WRITTEN BEFORE THE POST, not after. The threads endpoint
+        // and the sweep need the thread record to exist for any message that
+        // reaches Chat; writing it afterwards meant a crash in between produced
+        // a card in the space that ProBuild had no record of, so every reply to
+        // it was orphaned. Written first, the worst case is a recorded thread
+        // for a message that never went out — visible, and harmless.
+        await recordCardOnIssues(card, null, null, now);
+
         const result = await postOwnerCard(webhookUrl, card);
         if (!result) {
-            await prisma.receiptRequestCard.update({
-                where: { id: rowId },
-                data: { attempts: { increment: 1 }, lastError: "post-failed" },
+            // Left UNPOSTED on purpose: a same-day retry can take the claim
+            // again once the lease expires.
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token },
+                data: { attempts: { increment: 1 }, lastError: "post-failed", claimedAt: null, claimToken: null },
             });
             continue;
         }
-        await prisma.receiptRequestCard.update({
-            where: { id: rowId },
+        // COMPLETION IS TOKEN-FENCED: only the run that holds the claim may
+        // record the post, so a late completion from a superseded run cannot
+        // mark a row posted that it did not post.
+        await prisma.receiptRequestCard.updateMany({
+            where: { id: rowId, claimToken: token },
             data: {
                 postedAt: new Date(),
                 threadName: result.threadName,

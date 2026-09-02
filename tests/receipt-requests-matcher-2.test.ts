@@ -177,3 +177,26 @@ test("a corrupt cards entry is dropped, never thrown on", () => {
     );
     assert.equal((details.cards as unknown[]).length, 2);
 });
+
+test("appendCardRecord seeds cards[] from the legacy single slot", () => {
+    // Rows written before cards[] existed carry a single `card`. Starting from
+    // an empty array on their first write silently discarded the thread they
+    // were last asked in — and every reply still sitting in it.
+    const legacy = { card: { threadName: "t/old", messageName: "m/old", n: 1, date: "2026-08-19", requestId: "r" } };
+    const details = appendCardRecord(legacy, rec("2026-08-20", 2), NOW);
+    const cards = details.cards as Array<{ threadName: string }>;
+    assert.equal(cards.length, 2);
+    assert.deepEqual(cards.map(c => c.threadName), ["t/old", "t/2026-08-20"]);
+});
+
+test("a legacy slot older than the window is still dropped on seeding", () => {
+    const legacy = { card: { threadName: "t/ancient", messageName: "m", n: 1, date: "2026-07-01", requestId: "r" } };
+    const details = appendCardRecord(legacy, rec("2026-08-20"), NOW);
+    assert.equal((details.cards as unknown[]).length, 1);
+});
+
+test("seeding does not double-count when cards[] already exists", () => {
+    const both = { cards: [rec("2026-08-19")], card: rec("2026-08-19") };
+    const details = appendCardRecord(both, rec("2026-08-20", 2), NOW);
+    assert.equal((details.cards as unknown[]).length, 2);
+});
