@@ -69,16 +69,20 @@ try {
         await prisma.$executeRawUnsafe(sql);
         console.log("ok:", sql.split("\n")[0].trim());
     }
+    // Read the whole prefix and compare in JS rather than passing an array
+    // parameter — one less raw-query serialization detail to get wrong in a
+    // script whose failure mode is "the deploy 500s on P2022".
     const cols = await prisma.$queryRawUnsafe(
         `SELECT column_name FROM information_schema.columns
-         WHERE table_name = 'Project' AND column_name = ANY($1::text[])`,
-        EXPECTED_COLUMNS
+         WHERE table_name = 'Project' AND column_name LIKE 'percentComplete%'`
     );
+    const present = new Set(cols.map((c) => c.column_name));
+    const missing = EXPECTED_COLUMNS.filter((name) => !present.has(name));
     console.log(
-        `verified ${cols.length}/${EXPECTED_COLUMNS.length} columns present:`,
-        cols.map((c) => `Project.${c.column_name}`).join(", ")
+        `verified ${EXPECTED_COLUMNS.length - missing.length}/${EXPECTED_COLUMNS.length} columns present`,
+        missing.length ? `— MISSING: ${missing.join(", ")}` : ""
     );
-    if (cols.length !== EXPECTED_COLUMNS.length) process.exit(1);
+    if (missing.length) process.exit(1);
 
     const fk = await prisma.$queryRawUnsafe(
         `SELECT conname FROM pg_constraint WHERE conname = 'Project_percentCompleteUpdatedById_fkey'`
