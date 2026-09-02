@@ -207,10 +207,29 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // names. A PUT that merely LOWERS the amount can strand an existing
         // base above the new pre-tax total — the same impossible state reached
         // through the other door.
-        const resultingAmount =
-            body.amount !== undefined && body.amount !== null
-                ? Number(body.amount)
-                : Number(expense.amount);
+        // ONE PARSE, one value, used by BOTH the check below and the write.
+        //
+        // This used to validate `Number(body.amount)` and then persist
+        // `parseFloat(body.amount)`, which are different functions: "10junk"
+        // validates as NaN (silently passing every check that is not a
+        // comparison) and PERSISTS as 10. And `body.amount ? ...` dropped a
+        // legitimate 0 on the floor, so a receipt could never be zeroed.
+        const hasAmount = Object.prototype.hasOwnProperty.call(body, "amount");
+        let nextAmount: number | undefined;
+        if (hasAmount && body.amount !== null && body.amount !== undefined && body.amount !== "") {
+            const raw =
+                typeof body.amount === "number"
+                    ? body.amount
+                    : Number(String(body.amount).trim());
+            if (!Number.isFinite(raw) || raw < 0) {
+                return NextResponse.json(
+                    { error: "Amount must be a number of dollars, zero or more.", field: "amount" },
+                    { status: 400 },
+                );
+            }
+            nextAmount = raw;
+        }
+        const resultingAmount = nextAmount ?? Number(expense.amount);
         const existingBase =
             expense.taxDeductibleBase === null ? null : Number(expense.taxDeductibleBase);
         if (existingBase !== null) {
@@ -236,7 +255,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const updatedExpense = await prisma.expense.update({
             where: { id },
             data: {
-                amount: body.amount ? parseFloat(body.amount) : undefined,
+                amount: nextAmount,
                 vendor: has("vendor") ? (body.vendor || null) : undefined,
                 // Same company-calendar-day rule as the POST — see there.
                 date: has("date") ? (body.date ? await expenseDate(body.date) : null) : undefined,

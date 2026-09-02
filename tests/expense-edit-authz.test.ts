@@ -527,3 +527,47 @@ test("the tax PATCH writes under the shared per-expense lock", async () => {
         fakePrisma.$queryRawUnsafe = originalLock;
     }
 });
+
+// ── PUT amount: one parse, one value (Codex round 13, item 8) ──────────────
+
+test("a junk amount is REFUSED, not silently truncated", async () => {
+    // "10junk" used to validate as NaN (passing every check that is not a
+    // comparison) and then persist as 10 via parseFloat — a $207.74 receipt
+    // quietly becoming a $10 one.
+    const res = await call({ amount: "10junk" });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).field, "amount");
+    assert.equal(updateArgs, null, "nothing is written");
+});
+
+test("a negative amount is refused", async () => {
+    const res = await call({ amount: -5 });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
+});
+
+test("ZERO is a real amount, not an omission", async () => {
+    // `body.amount ? ...` dropped it, so a receipt could never be zeroed.
+    const res = await call({ amount: 0 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, 0);
+});
+
+test("the value validated is the value persisted", async () => {
+    storedExpense = { ...(storedExpense as object), taxDeductibleBase: 100 } as Record<string, unknown>;
+    // 100 of base + 16.55 of tax needs at least 116.55 of gross. 116.55 passes...
+    const ok = await call({ amount: "116.55" });
+    assert.equal(ok.status, 200);
+    assert.equal(updateArgs?.data.amount, 116.55, "the parsed number, not a re-parse");
+    // ...and a cent less is refused by the same number that would be written.
+    updateArgs = null;
+    const denied = await call({ amount: "116.54" });
+    assert.equal(denied.status, 400);
+    assert.equal(updateArgs, null);
+});
+
+test("an omitted amount leaves the stored one alone", async () => {
+    const res = await call({ vendor: "Lowe's" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, undefined);
+});
