@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { evaluateReviewIssue, type ReviewIssueLifecycleClient, type ReviewIssueRow } from "../src/lib/review-alert-lifecycle";
 import { decodeReasonCodes } from "../src/lib/review-alert-reasons";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     RECEIPT_REQUEST_TARGET_TYPE,
+    hasResolution,
+    mergeReceiptRequestDetails,
     planReceiptRequests,
     type ReceiptEvidenceExpense,
     type ReceiptRequestBankLine,
@@ -98,6 +103,7 @@ function inMemoryLifecycle() {
 }
 
 const NOW = new Date("2026-08-20T09:00:00Z");
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const LINES: ReceiptRequestBankLine[] = [
     { id: "bl-lowes", postedDate: "2026-08-16", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null },
@@ -209,4 +215,53 @@ test("one failing target never abandons the rest of the sweep", async () => {
     // caller's input order (that is what makes evidence assignment stable).
     assert.deepEqual(seen, ["bl-depot", "bl-lowes"]);
     assert.deepEqual(summary, { opened: 1, closed: 0, touched: 0, skipped: 1 });
+});
+
+test("a memo signed DURING the sweep is not un-answered by it", async () => {
+    // The sweep loads everything up front and then works through it. The
+    // answers endpoint can write a resolution and clear an issue in that
+    // window; a merge from the run-start snapshot would write the stale
+    // details back over it and reopen something a human just answered.
+    const store = inMemoryLifecycle();
+    await run(store, []);
+    const key = `${RECEIPT_REQUEST_TARGET_TYPE}::bl-lowes`;
+
+    // Mid-run: the memo is signed. Resolution recorded, issue cleared.
+    const signed = store.issues.get(key)!;
+    signed.displayDetails = JSON.stringify({
+        ...JSON.parse(signed.displayDetails!),
+        resolution: "memo-signed",
+        pdfUrl: "https://drive.example/memo.pdf",
+    });
+    signed.clearedAt = NOW;
+
+    // The sweep's snapshot still says "open and unresolved", so it plans a
+    // reopen. The per-issue FRESH READ is what must stop it.
+    const plan = planReceiptRequests({ bankLines: LINES, expenses: [], intakes: [], openIssueKeys: [], resolvedIssueKeys: [], now: NOW });
+    const summary = await applyReceiptRequestPlan(plan, async (targetKey, codes, displayDetails) => {
+        const fresh = store.issues.get(`${RECEIPT_REQUEST_TARGET_TYPE}::${targetKey}`);
+        const freshDetails = fresh?.displayDetails ? JSON.parse(fresh.displayDetails) : {};
+        if (codes.length > 0 && hasResolution(freshDetails)) {
+            return { decision: { step: 1, action: "noop", canonicalCodes: [], reasonHash: "" }, applied: false };
+        }
+        return evaluateReviewIssue(RECEIPT_REQUEST_TARGET_TYPE, targetKey, codes,
+            displayDetails ? mergeReceiptRequestDetails(freshDetails, displayDetails) : null,
+            { episodeStatus: "SUPPRESSED", client: store.client, now: () => NOW });
+    });
+
+    assert.equal(summary.skipped, 1, "the resolved issue is skipped, not reopened");
+    const after = store.issues.get(key)!;
+    assert.notEqual(after.clearedAt, null, "it stays cleared");
+    const details = JSON.parse(after.displayDetails!);
+    assert.equal(details.resolution, "memo-signed", "and the answer survives");
+    assert.equal(details.pdfUrl, "https://drive.example/memo.pdf");
+});
+
+test("the sweep's real apply path reads fresh, not from the run-start snapshot", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    const applyAt = source.indexOf("applyReceiptRequestPlan(plan,");
+    const freshReadAt = source.indexOf("const fresh = await prisma.reviewIssue.findUnique(");
+    assert.ok(applyAt > 0 && freshReadAt > applyAt, "the read must be INSIDE the per-issue callback");
+    assert.match(source, /if \(codes\.length > 0 && hasResolution\(freshDetails\)\)/);
+    assert.match(source, /mergeReceiptRequestDetails\(freshDetails, displayDetails\)/);
 });

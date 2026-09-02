@@ -190,6 +190,20 @@ export function ReceiptsTab({
                                     {(row.stateReason || row.lastError) && (
                                         <p className="text-xs text-amber-700 mt-1">{row.stateReason ?? row.lastError}</p>
                                     )}
+                                    {row.postVoidQbPurchaseId && (
+                                        <p className="text-xs font-medium text-red-700 mt-1">
+                                            QuickBooks created a purchase for this AFTER it was voided. Nothing here can
+                                            remove it — open it and void it in QuickBooks by hand.{" "}
+                                            <a
+                                                href={`https://qbo.intuit.com/app/expense?txnId=${encodeURIComponent(row.postVoidQbPurchaseId)}`}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="font-medium text-hui-primary hover:underline"
+                                            >
+                                                Open in QuickBooks ↗
+                                            </a>
+                                        </p>
+                                    )}
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} />

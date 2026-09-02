@@ -110,7 +110,11 @@ interface Recorder {
     events: any[];
 }
 
-function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
+function recorder(
+    overrides: Partial<BookDependencies> = {},
+    opts: { estimates?: { id: string }[]; intakeStillBooking?: boolean } = {},
+): Recorder {
+    const intakeStillBooking = opts.intakeStillBooking !== false;
     const purchaseCalls: any[] = [];
     const sendMarks: string[] = [];
     const expenses: any[] = [];
@@ -837,6 +841,34 @@ test("a real create DOES mark it, before the call", async () => {
     await bookReceipt(row(), r.deps);
     assert.deepEqual(order, ["mark", "create"], "marked FIRST, so a mid-create death still records it");
     assert.deepEqual(r.sendMarks, ["intake-1"]);
+test("a void that lands AFTER the send parks the orphaned Purchase for a human", async () => {
+    // The pre-send re-read narrows this window but cannot close it: QuickBooks
+    // takes real time to answer, and the money exists the moment it does. QBO
+    // is read-only from this pipeline, so nothing here can take it back.
+    const { deps, purchaseCalls, intakeUpdates, events } = recorder({}, { intakeStillBooking: false });
+    const result = await bookReceipt(row(), deps);
+
+    assert.equal(result.outcome, "booked-after-void");
+    assert.equal((result as { qbPurchaseId: string }).qbPurchaseId, "QB-1");
+    assert.equal(purchaseCalls.length, 1, "the send did happen — that is the whole problem");
+
+    const parked = intakeUpdates.find(u => u.stateReason === "booked-after-void");
+    assert.ok(parked, "the row must record what happened");
+    assert.equal(parked.postVoidQbPurchaseId, "QB-1");
+    // NOT qbPurchaseId: that column means "this row is booked", and it is not.
+    assert.equal(parked.qbPurchaseId, undefined);
+    assert.equal(parked.state, undefined, "the human's state is never overwritten");
+    assert.equal(parked.bookedAt, undefined);
+
+    assert.ok(events.some(e => e.status === "booked-after-void"), "and it must be auditable");
+});
+
+test("the fence does not fire on the normal path", async () => {
+    const { deps, intakeUpdates } = recorder();
+    const result = await bookReceipt(row(), deps);
+    assert.equal(result.outcome, "booked");
+    assert.ok(intakeUpdates.some(u => u.state === "BOOKED"));
+    assert.ok(!intakeUpdates.some(u => u.stateReason === "booked-after-void"));
 });
 
 // ── An attachment QBO REFUSED is terminal (round-9 item 5) ─────────────────

@@ -136,6 +136,11 @@ export type BookResult =
      * send. Nothing was sent and nothing is written back — the row is already
      * whatever they made it. */
     | { outcome: "aborted"; reason: string }
+    /** The send WENT OUT and QuickBooks created a Purchase, but the row was
+     * voided before the booked write landed. The money exists in QBO and only a
+     * human can remove it; the id is parked on the row as
+     * `postVoidQbPurchaseId` with stateReason "booked-after-void". */
+    | { outcome: "booked-after-void"; qbPurchaseId: string }
     /**
      * Terminal: a human must look at it. No further automatic attempt.
      *
@@ -697,6 +702,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             if (claimed.count === 0) throw new StaleClaimError();
             return expense.id;
         });
+
+        if (expenseId === null) {
+            await deps.logEvent({
+                kind: "receipt-push",
+                status: "booked-after-void",
+                source: "intake-worker",
+                vendor: row.vendor ?? undefined,
+                projectName: project.name,
+                docNumber: result.docNumber,
+                fileName: row.fileName ?? undefined,
+                amountCents,
+                taxCents: taxApplied,
+                detail: { fileId, qbPurchaseId: result.qbPurchaseId, intakeId: row.id, sourceRef: row.sourceRef },
+            }).catch(() => { /* audit only */ });
+            return { outcome: "booked-after-void", qbPurchaseId: result.qbPurchaseId };
+        }
 
         // Audit row so the /automation register keeps seeing v2 bookings
         // alongside the bot's. Fire-and-forget by contract — never fails a

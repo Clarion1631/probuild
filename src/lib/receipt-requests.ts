@@ -57,6 +57,10 @@ export interface ReceiptEvidenceExpense {
     /** Stable row id. Evidence is assigned to at most ONE bank line, and the
      * tie-break has to be deterministic across runs — see assignEvidence. */
     id: string;
+    /** The QuickBooks Purchase this expense came from, when it has one. Used to
+     * fold it together with the ReceiptIntake that created it — see
+     * evidenceUnitKey. */
+    qbPurchaseId?: string | null;
     /** POSITIVE cents (an Expense's amount is a magnitude, not a signed posting). */
     amountCents: number;
     /** YYYY-MM-DD, or null when the expense has no date. */
@@ -66,6 +70,10 @@ export interface ReceiptEvidenceExpense {
 
 export interface ReceiptEvidenceIntake {
     id: string;
+    /** Set once the intake booked. Folds this row together with the Expense it
+     * produced — see evidenceUnitKey. */
+    expenseId?: string | null;
+    qbPurchaseId?: string | null;
     totalCents: number | null;
     /** YYYY-MM-DD, or null. */
     txnDate: string | null;
@@ -204,9 +212,43 @@ export function payeeMatches(a: string, b: string | null | undefined): boolean {
 
 interface EvidenceRow {
     id: string;
+    /** Rows sharing a unit key are ONE receipt and count once. */
+    unit: string;
     amountCents: number;
     date: string | null;
     vendor: string | null;
+}
+
+/**
+ * The identity two rows share when they are the same physical receipt. An
+ * Expense links back to its intake by `expenseId`, and both carry the QBO
+ * Purchase id once booked; either is enough to fold them.
+ */
+export function evidenceUnitKey(row: { expenseId?: string | null; qbPurchaseId?: string | null }): string | null {
+    // qbPurchaseId FIRST, and the order matters. Both rows carry it once the
+    // receipt has booked, so it is the identity they reliably agree on. Keying
+    // the Expense by its own id and the intake by `expenseId` only agrees when
+    // the intake happens to carry the link — the email-fallback path books an
+    // Expense with no intake link at all, and the two would not fold.
+    if (row.qbPurchaseId) return `purchase:${row.qbPurchaseId}`;
+    if (row.expenseId) return `expense:${row.expenseId}`;
+    return null;
+}
+
+/**
+ * Collapse rows that are the same receipt, keeping the FIRST (expenses are
+ * listed first, and the Expense is the booked, authoritative form). Preserves
+ * order, so the caller's determinism is unaffected.
+ */
+function dedupeEvidenceUnits(rows: EvidenceRow[]): EvidenceRow[] {
+    const seen = new Set<string>();
+    const out: EvidenceRow[] = [];
+    for (const row of rows) {
+        if (seen.has(row.unit)) continue;
+        seen.add(row.unit);
+        out.push(row);
+    }
+    return out;
 }
 
 function satisfies(line: ReceiptRequestBankLine, payee: string, evidence: EvidenceRow): boolean {
@@ -259,12 +301,30 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
     const resolvedKeys = new Set(input.resolvedIssueKeys ?? []);
     const todayDay = dayNumber(toYmd(input.now));
 
-    const evidence: EvidenceRow[] = [
-        ...input.expenses.map(e => ({ id: `expense:${e.id}`, amountCents: e.amountCents, date: e.date, vendor: e.vendor })),
+    // ONE EVIDENCE UNIT per real receipt. A booked ReceiptIntake and the
+    // Expense it created are the SAME piece of paper; counting them separately
+    // meant one receipt could satisfy two different charges, which is exactly
+    // the one-to-one rule this was supposed to enforce. They are folded by
+    // whichever identity they share (expenseId, then qbPurchaseId).
+    const evidence: EvidenceRow[] = dedupeEvidenceUnits([
+        ...input.expenses.map(e => ({
+            id: `expense:${e.id}`,
+            // An Expense's own id IS the expense link the intake points at.
+            unit: evidenceUnitKey({ expenseId: e.id, qbPurchaseId: e.qbPurchaseId }) ?? `expense:${e.id}`,
+            amountCents: e.amountCents,
+            date: e.date,
+            vendor: e.vendor,
+        })),
         ...input.intakes
             .filter(intake => !DEAD_INTAKE_STATES.has(intake.state) && intake.totalCents !== null)
-            .map(intake => ({ id: `intake:${intake.id}`, amountCents: intake.totalCents as number, date: intake.txnDate, vendor: intake.vendor })),
-    ];
+            .map(intake => ({
+                id: `intake:${intake.id}`,
+                unit: evidenceUnitKey(intake) ?? `intake:${intake.id}`,
+                amountCents: intake.totalCents as number,
+                date: intake.txnDate,
+                vendor: intake.vendor,
+            })),
+    ]);
     const consumed = new Set<string>();
 
     // Oldest charge first, id breaking the tie: the assignment below depends on
@@ -307,7 +367,7 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         const payee = normalizePayee(line.rawDescriptor);
         const match = assignEvidence(line, payee, evidence, consumed);
         if (match) {
-            consumed.add(match.id);
+            consumed.add(match.unit);
             closeIfOpen();
             continue;
         }
@@ -346,7 +406,7 @@ function assignEvidence(
     let best: EvidenceRow | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const row of evidence) {
-        if (consumed.has(row.id)) continue;
+        if (consumed.has(row.unit)) continue;
         if (!satisfies(line, payee, row)) continue;
         const distance = Math.abs((dayNumber(row.date as string) as number) - lineDay);
         if (distance < bestDistance || (distance === bestDistance && best !== null && row.id < best.id)) {

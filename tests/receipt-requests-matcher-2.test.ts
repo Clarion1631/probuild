@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     appendCardRecord,
+    evidenceUnitKey,
     hasResolution,
     mergeReceiptRequestDetails,
     payeeMatches,
@@ -199,4 +200,67 @@ test("seeding does not double-count when cards[] already exists", () => {
     const both = { cards: [rec("2026-08-19")], card: rec("2026-08-19") };
     const details = appendCardRecord(both, rec("2026-08-20", 2), NOW);
     assert.equal((details.cards as unknown[]).length, 2);
+});
+
+// ── One evidence UNIT per receipt (Codex round-2 item 7) ────────────────────
+
+test("a booked intake and its Expense are ONE receipt, not two", () => {
+    // Counting them separately let one piece of paper satisfy two charges —
+    // the exact failure the one-to-one rule exists to prevent.
+    const result = planReceiptRequests({
+        bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
+        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        intakes: [{ id: "int-1", expenseId: "exp-1", qbPurchaseId: "QB-1", totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
+        openIssueKeys: [],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.equal(result.open.length, 1, "one receipt answers exactly one charge");
+});
+
+test("they fold on qbPurchaseId alone when the expense link is absent", () => {
+    const result = planReceiptRequests({
+        bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
+        expenses: [{ id: "exp-1", qbPurchaseId: "QB-1", amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        intakes: [{ id: "int-1", expenseId: null, qbPurchaseId: "QB-1", totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
+        openIssueKeys: [],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.equal(result.open.length, 1);
+});
+
+test("an UNBOOKED intake and an unrelated expense stay two units", () => {
+    // No shared identity — they really are two separate pieces of evidence.
+    const result = planReceiptRequests({
+        bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
+        expenses: [{ id: "exp-1", qbPurchaseId: null, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        intakes: [{ id: "int-1", expenseId: null, qbPurchaseId: null, totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "READ" }],
+        openIssueKeys: [],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.deepEqual(result.open, [], "two receipts, two charges");
+});
+
+test("evidenceUnitKey prefers the purchase id, then the expense link", () => {
+    // Purchase id first because BOTH rows carry it once the receipt has booked,
+    // so it is the identity they reliably agree on. The expense link only
+    // exists when the intake happens to carry it — the email-fallback path
+    // books an Expense with no intake at all.
+    assert.equal(evidenceUnitKey({ expenseId: "e1", qbPurchaseId: "QB-1" }), "purchase:QB-1");
+    assert.equal(evidenceUnitKey({ expenseId: "e1", qbPurchaseId: null }), "expense:e1");
+    assert.equal(evidenceUnitKey({}), null, "unlinked rows are their own units");
+});
+
+test("they fold on the expense link when neither has a purchase id", () => {
+    const result = planReceiptRequests({
+        bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
+        expenses: [{ id: "exp-1", qbPurchaseId: null, amountCents: 12_345, date: "2026-08-16", vendor: "Lowe's Home Improvement" }],
+        intakes: [{ id: "int-1", expenseId: "exp-1", qbPurchaseId: null, totalCents: 12_345, txnDate: "2026-08-16", vendor: "Lowes", state: "BOOKED" }],
+        openIssueKeys: [],
+        resolvedIssueKeys: [],
+        now: NOW,
+    });
+    assert.equal(result.open.length, 1);
 });

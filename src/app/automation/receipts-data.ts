@@ -34,6 +34,9 @@ export type IntakeRow = {
     storagePath: string;
     duplicateOfId: string | null;
     qbPurchaseId: string | null;
+    /** A real QuickBooks Purchase for a row that was voided mid-send. Needs a
+     * human to void it in QBO — nothing here can. */
+    postVoidQbPurchaseId: string | null;
     attempts: number;
     lastError: string | null;
     nextRetryAt: string | null;
@@ -115,6 +118,7 @@ function toIntakeRow(row: RawIntake): IntakeRow {
         storagePath: row.storagePath,
         duplicateOfId: row.duplicateOfId,
         qbPurchaseId: row.qbPurchaseId,
+        postVoidQbPurchaseId: row.postVoidQbPurchaseId,
         attempts: row.attempts,
         lastError: row.lastError,
         nextRetryAt: row.nextRetryAt ? row.nextRetryAt.toISOString() : null,
