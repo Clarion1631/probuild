@@ -95,6 +95,7 @@ function createStub(
         }
         if ("projectId" in where && (row.projectId ?? null) !== where.projectId) return false;
         if ("costCodeId" in where && (row.costCodeId ?? null) !== where.costCodeId) return false;
+        if ("estimateId" in where && row.estimateId !== where.estimateId) return false;
         // The row-version CAS. Dates compare by value, not identity.
         if ("updatedAt" in where) {
             const want = where.updatedAt as Date | null;
@@ -140,12 +141,16 @@ function createStub(
                 async findMany() { return []; },
             },
             expense: {
-                async findMany() { return rows; },
+                // A SNAPSHOT, like a real read. Handing back the live objects
+                // meant a test could not model "the row changed after the
+                // planner saw it" — the planner would see the change too.
+                async findMany() { return rows.map(row => ({ ...row })); },
                 // The cost-code pass re-reads each row UNDER THE LOCK before
                 // deciding, so the stub has to serve the CURRENT row rather
                 // than the snapshot the planner saw.
                 async findUnique(args: { where: { id: string } }) {
-                    return rows.find(row => row.id === args.where.id) ?? null;
+                    const row = rows.find(candidate => candidate.id === args.where.id);
+                    return row ? { ...row } : null;
                 },
                 async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
                     writes.push(args);
@@ -175,7 +180,11 @@ test("plans a projectId fill only for rows whose column is still NULL", () => {
         costCodeIdByCode: COST_CODE_IDS,
         scopedProjectIds: ["job-1"],
     });
-    assert.deepEqual(plan.projectFills, [{ id: "needs-fill", projectId: "job-1" }]);
+    // The estimate the project was DERIVED from rides along, so the write can
+    // require the derivation is still valid.
+    assert.deepEqual(plan.projectFills, [
+        { id: "needs-fill", projectId: "job-1", expectedEstimateId: "est-job-1" },
+    ]);
 });
 
 test("the item fallback wins over the rules, and is sourced 'backfill'", () => {
@@ -445,7 +454,12 @@ test("apply writes both passes, each behind its own predicate", async () => {
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
 
     const projectWrite = stub.writes.find(w => "projectId" in w.data)!;
-    assert.deepEqual(projectWrite.where, { id: { in: ["e1"] }, projectId: null });
+    assert.deepEqual(projectWrite.where, {
+        id: { in: ["e1"] },
+        projectId: null,
+        // Both halves of the derivation.
+        estimateId: "est-job-1",
+    });
 
     const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
     assert.equal(codeWrite.where.id, "e1");
@@ -826,4 +840,81 @@ test("a row re-attributed after the plan is skipped on the re-read", async () =>
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     assert.equal(result.written.costCodes, 0, "the phase was chosen for a job it is no longer on");
     assert.equal(stub.rows[0].costCodeId, null);
+});
+
+// ── mutations BEFORE the re-read (round 12, item 3) ────────────────────────
+
+test("an expense re-pointed at another estimate is not stamped with the old job", async () => {
+    // `projectId IS NULL` alone does not say the derivation is still valid.
+    const stub = createStub([
+        expense({ id: "e1", projectId: null, estimateId: "est-job-1", estimate: { projectId: "job-1" } }),
+    ]);
+    // The move happens AFTER the planner has read the row — the snapshot it
+    // planned from still says est-job-1.
+    const realFindMany = stub.db.expense.findMany;
+    let planned = false;
+    (stub.db.expense as any).findMany = async () => {
+        const snapshot = await realFindMany();
+        if (!planned) {
+            planned = true;
+            stub.rows[0].estimateId = "est-job-2";
+        }
+        return snapshot;
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.projectIds, 0, "the plan's derivation no longer holds");
+    assert.equal(stub.rows[0].projectId, null);
+});
+
+test("a vendor edited before the re-read changes the answer, so nothing is written", async () => {
+    // Eligibility was not the only thing the plan depended on: the vendor feeds
+    // the rule. Re-checking eligibility alone would have written a phase chosen
+    // from text that is no longer on the row.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => {
+        // The edit lands while the row is being locked, i.e. BEFORE the re-read.
+        stub.rows[0].vendor = "General Hardware";
+        stub.rows[0].description = "misc supplies";
+        return [{}];
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0, "the planned code answered a question nobody is asking now");
+    assert.equal(stub.rows[0].costCodeId, null);
+});
+
+test("a vendor edit that points at a DIFFERENT phase is refused, not applied", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => {
+        // Now the rules would say FRAMING, not plumbing.
+        stub.rows[0].vendor = "Parr Lumber";
+        return [{}];
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0, "the plan and the re-plan disagree, so neither is applied");
+    assert.equal(stub.rows[0].costCodeId, null, "a re-run will plan it properly");
+});
+
+test("an untouched row still codes normally through the re-plan", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => [{}];
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 1);
+    assert.equal(stub.rows[0].costCodeId, "cc-plumb");
+    assert.equal(stub.rows[0].costCodeSource, "ai");
 });

@@ -44,13 +44,22 @@
  * so there is one answer rather than a version-dependent one.
  *
  * USAGE
- *   node --import=tsx scripts/suggest-expense-cost-codes.ts              # dry run + report
- *   node --import=tsx scripts/suggest-expense-cost-codes.ts --apply      # write matches
+ *   node --import=tsx scripts/suggest-expense-cost-codes.ts               # report
  *   node --import=tsx scripts/suggest-expense-cost-codes.ts --csv out.csv
+ *
+ * READ-ONLY. There is no --apply and there must not be one: writing cost codes
+ * belongs to scripts/backfill-expense-attribution.ts, which is the only path
+ * with the per-expense lock, the compare-and-set on the row version, the
+ * re-plan under that lock, and the project-scoped phase check. This script
+ * kept a second, weaker writer alive for the same columns — two ways to code an
+ * expense, one of them unaware of every guarantee the other was given.
  */
 import { PrismaClient } from "@prisma/client";
 import { suggestCode } from "../src/lib/expense-cost-suggest";
-import { notHumanCodedExpenseWhere } from "../src/lib/expense-attribution";
+import { expenseNotOnProjectWhere, resolveExpenseProjectId } from "../src/lib/expense-attribution";
+import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
+import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
+import { csvCell, csvNumber } from "../src/lib/csv-safe";
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -62,21 +71,25 @@ config({ path: join(__dirname, "..", ".env") });
 
 const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
 
-const APPLY = process.argv.includes("--apply");
 const csvIdx = process.argv.indexOf("--csv");
 const CSV = csvIdx > -1 ? process.argv[csvIdx + 1] : null;
 
-/** Company overhead bucket — never gets a job phase. */
-const OVERHEAD_PROJECTS = ["Shop"];
+// The overhead bucket is excluded BY ID via the canonical constant. Matching
+// on the name "Shop" stopped being true the day the project could be renamed,
+// and this report is read as evidence.
 
 const num = (v) => (v == null ? 0 : Number(v));
 const money = (v) => `$${num(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-const HELP = `Suggest cost codes for uncoded expenses (rule-based, not a model).
+const HELP = `Report cost-code suggestions for uncoded expenses (rule-based, not a model).
 
-  node --import=tsx scripts/suggest-expense-cost-codes.ts              # dry run + report
-  node --import=tsx scripts/suggest-expense-cost-codes.ts --apply      # write matches
+  node --import=tsx scripts/suggest-expense-cost-codes.ts               # report
   node --import=tsx scripts/suggest-expense-cost-codes.ts --csv out.csv
+
+READ-ONLY: this script never writes. Use
+scripts/backfill-expense-attribution.ts --apply to actually code expenses — it
+is the only writer with the per-expense lock, the row-version CAS and the
+project-scoped phase check.
 
 The --import=tsx loader is required: this script imports TypeScript from src/.`;
 
@@ -91,28 +104,63 @@ async function main() {
     const codes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
     const codeId = new Map(codes.map((c) => [c.code, c.id]));
 
+    // Attribution resolved the ONE way, and the overhead bucket excluded by id.
+    // A row re-attributed to a live job used to be invisible here (its estimate
+    // still named the old one), so the report understated the work to be done.
     const rows = await prisma.expense.findMany({
         where: {
             costCodeId: null,
-            estimate: { project: { status: "In Progress", name: { notIn: OVERHEAD_PROJECTS } } },
+            ...expenseNotOnProjectWhere(OVERHEAD_PROJECT_ID),
         },
         select: {
-            id: true, amount: true, vendor: true, description: true,
-            estimate: { select: { project: { select: { name: true } } } },
+            id: true, amount: true, vendor: true, description: true, projectId: true,
+            project: { select: { id: true, name: true, status: true } },
+            estimate: { select: { projectId: true, project: { select: { id: true, name: true, status: true } } } },
         },
         orderBy: { amount: "desc" },
     });
 
+    // The PROJECT'S OWN PHASES, same rule the writer applies. A suggestion the
+    // job could never accept is not a suggestion, and listing it as one sends a
+    // bookkeeper to check something that was never on the table.
+    const phaseRows = await prisma.estimateItem.findMany({
+        where: {
+            costCodeId: { not: null },
+            costCode: { isActive: true },
+            estimate: { ...PHASE_ELIGIBLE_ESTIMATE_WHERE },
+        },
+        select: { costCodeId: true, estimate: { select: { projectId: true } } },
+    });
+    const allowedCodesByProject = new Map();
+    for (const row of phaseRows) {
+        const projectId = row.estimate?.projectId ?? null;
+        if (!projectId || !row.costCodeId) continue;
+        if (!allowedCodesByProject.has(projectId)) allowedCodesByProject.set(projectId, new Set());
+        allowedCodesByProject.get(projectId).add(row.costCodeId);
+    }
+
+    const inProgress = (row) =>
+        (row.projectId ? row.project?.status : row.estimate?.project?.status) === "In Progress";
+
     const matched = [];
     const unmatched = [];
     for (const r of rows) {
+        if (!inProgress(r)) continue;
+        const projectId = resolveExpenseProjectId(r);
         const s = suggestCode(r);
-        if (s && codeId.has(s.code)) matched.push({ ...r, ...s });
+        const suggestedId = s ? codeId.get(s.code) : undefined;
+        const allowed = projectId ? allowedCodesByProject.get(projectId) : undefined;
+        // Reported as a match only if the WRITER would accept it.
+        if (s && suggestedId && allowed && allowed.has(suggestedId)) matched.push({ ...r, ...s });
         else unmatched.push(r);
     }
 
+    const projectName = (row) =>
+        (row.projectId ? row.project?.name : row.estimate?.project?.name) ?? "";
+
     const sum = (a) => a.reduce((t, r) => t + num(r.amount), 0);
-    console.log(`scope: active customer jobs (overhead bucket "${OVERHEAD_PROJECTS.join(", ")}" excluded)`);
+    console.log(`scope: In Progress customer jobs (overhead project ${OVERHEAD_PROJECT_ID} excluded)`);
+    console.log("READ-ONLY report. Use backfill-expense-attribution.ts --apply to write.");
     console.log(`uncoded rows: ${rows.length}  ${money(sum(rows))}`);
     console.log(`  confident match: ${matched.length}  ${money(sum(matched))}`);
     console.log(`  NEEDS HUMAN:     ${unmatched.length}  ${money(sum(unmatched))}\n`);
@@ -129,35 +177,23 @@ async function main() {
     }
 
     if (CSV) {
-        const esc = (s) => `"${String(s ?? "").replace(/"/g, '""').replace(/\s+/g, " ").slice(0, 160)}"`;
+        // csv-safe: vendor and description are OCR output, so a leading `=`
+        // reaches the reader's spreadsheet as a formula.
+        const cell = (v) => csvCell(String(v ?? "").replace(/\s+/g, " ").slice(0, 160));
         const out = [["expense_id", "project", "amount", "vendor", "suggested_code", "why", "description"].join(",")];
         for (const m of matched) {
-            out.push([m.id, esc(m.estimate?.project?.name), num(m.amount), esc(m.vendor), m.code, esc(m.why), esc(m.description)].join(","));
+            out.push([cell(m.id), cell(projectName(m)), csvNumber(num(m.amount)), cell(m.vendor), cell(m.code), cell(m.why), cell(m.description)].join(","));
         }
         for (const u of unmatched) {
-            out.push([u.id, esc(u.estimate?.project?.name), num(u.amount), esc(u.vendor), "", "NEEDS_HUMAN", esc(u.description)].join(","));
+            out.push([cell(u.id), cell(projectName(u)), csvNumber(num(u.amount)), cell(u.vendor), cell(""), cell("NEEDS_HUMAN"), cell(u.description)].join(","));
         }
         writeFileSync(CSV, out.join("\n"));
         console.log(`\nwrote ${CSV} (${out.length - 1} rows)`);
     }
 
-    if (!APPLY) {
-        console.log("\nDRY RUN — nothing written. Re-run with --apply to save the confident matches.");
-        return;
-    }
-
-    let n = 0;
-    for (const m of matched) {
-        // Phase 3: stamp provenance alongside the code. A row with a code and
-        // no source would be indistinguishable from a human's choice, and the
-        // capture/manual guard everywhere else keys on exactly that.
-        const written = await prisma.expense.updateMany({
-            where: { id: m.id, costCodeId: null, ...notHumanCodedExpenseWhere() },
-            data: { costCodeId: codeId.get(m.code), costCodeSource: "ai", costCodeConfidence: m.confidence },
-        });
-        n += written.count;
-    }
-    console.log(`\napplied ${n} cost code(s). ${unmatched.length} rows left NULL for human review.`);
+    console.log("\nREPORT ONLY — nothing was written. To apply:");
+    console.log("  node --import=tsx scripts/backfill-expense-attribution.ts          # dry run");
+    console.log("  node --import=tsx scripts/backfill-expense-attribution.ts --apply  # write");
 }
 
 main()

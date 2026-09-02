@@ -364,6 +364,21 @@ loading as `suggest-expense-cost-codes.mjs`. Steps:
     Marge.
 Re-run after `--apply` must report 0 changes (backfill-estimate-item-cost-codes proof rule).
 
+**AS BUILT — there is exactly ONE writer of `costCodeId` among the scripts.**
+`scripts/suggest-expense-cost-codes.ts` (the older rule-suggester) had its own
+`--apply`, which made it a second writer of the same column — one with no
+per-expense lock, no row-version compare-and-set, no re-plan under that lock and
+no project-scoped phase check. Its `--apply` is REMOVED (Codex round 12): it is
+report-only now, reads attribution through `resolveExpenseProjectId`, excludes
+the overhead bucket by `OVERHEAD_PROJECT_ID` rather than by the name "Shop",
+reports a match only when the writer would accept it, and emits its CSV through
+`csv-safe`. `tests/scripts-runtime-smoke.test.ts` fails if a write or an
+`--apply` flag ever comes back.
+
+Both scripts are `.ts` and run under `node --import=tsx` — they import
+TypeScript from `src/`, and tsx hands a `.ts` module to an `.mjs` file as CJS,
+so named imports fail outright from a `.mjs` wrapper.
+
 ## 7. Tax paid at source report — `/reports/tax-paid-at-source`
 
 - `src/app/reports/tax-paid-at-source/page.tsx` (server component, List layout per

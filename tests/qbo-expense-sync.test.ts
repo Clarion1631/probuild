@@ -1233,12 +1233,25 @@ type StoredForSuggestion = {
     projectId: string | null;
     costCodeId: string | null;
     costCodeSource: string | null;
+    // The suggestion reads the PERSISTED text, so the stub has to carry it.
+    vendor: string | null;
+    description: string | null;
+    qbSyncToken: string | null;
+    updatedAt?: Date;
     estimate?: { projectId: string | null } | null;
 } | null;
 
-function fakeSuggestionClient(
-    stored: StoredForSuggestion = { projectId: "project-1", costCodeId: null, costCodeSource: null },
-) {
+const STORED_DEFAULT: StoredForSuggestion = {
+    projectId: "project-1",
+    costCodeId: null,
+    costCodeSource: null,
+    vendor: "Summit Plumbing",
+    description: "[QuickBooks import] rough-in",
+    qbSyncToken: "3",
+    updatedAt: new Date("2026-09-01T00:00:00.000Z"),
+};
+
+function fakeSuggestionClient(stored: StoredForSuggestion = { ...STORED_DEFAULT! }) {
     const calls: { where: Record<string, unknown>; data: Record<string, unknown> }[] = [];
     let count = 1;
     return {
@@ -1263,11 +1276,7 @@ test("a NULL cost code is filled with source ai and the rule's tier confidence",
     const fake = fakeSuggestionClient();
     const result = await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        {
-            qbPurchaseId: "purchase-1",
-            vendor: "Summit Plumbing",
-            description: "[QuickBooks import] rough-in",
-        },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
     );
     assert.equal(result, "written");
@@ -1286,7 +1295,7 @@ test("the write is guarded on uncoded AND not-human-coded, with a NULL branch", 
     const fake = fakeSuggestionClient();
     await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
     );
     const where = fake.calls[0].where;
@@ -1308,6 +1317,7 @@ test("the write requires the SAME attribution the suggestion was scoped to", asy
     // decision was made in, and it is just as much a precondition as a
     // populated id.
     const fake = fakeSuggestionClient({
+        ...STORED_DEFAULT,
         projectId: null,
         costCodeId: null,
         costCodeSource: null,
@@ -1315,7 +1325,7 @@ test("the write requires the SAME attribution the suggestion was scoped to", asy
     });
     await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
     );
     assert.equal(fake.calls[0].where.projectId, null);
@@ -1323,10 +1333,10 @@ test("the write requires the SAME attribution the suggestion was scoped to", asy
 
 test("a row a human already coded is refused on the STORED source, before any write", async () => {
     for (const costCodeSource of ["capture", "manual"]) {
-        const fake = fakeSuggestionClient({ projectId: "project-1", costCodeId: null, costCodeSource });
+        const fake = fakeSuggestionClient({ ...STORED_DEFAULT, costCodeSource });
         const result = await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+            { qbPurchaseId: "purchase-1" },
             COST_CODE_IDS,
         );
         assert.equal(result, "not-written", costCodeSource);
@@ -1335,11 +1345,11 @@ test("a row a human already coded is refused on the STORED source, before any wr
 });
 
 test("a row that is already coded is left alone", async () => {
-    const fake = fakeSuggestionClient({ projectId: "project-1", costCodeId: "cc-existing", costCodeSource: null });
+    const fake = fakeSuggestionClient({ ...STORED_DEFAULT, costCodeId: "cc-existing" });
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "purchase-1", vendor: "Ferguson", description: "x" },
+            { qbPurchaseId: "purchase-1" },
             COST_CODE_IDS,
         ),
         "not-written",
@@ -1352,13 +1362,14 @@ test("scope comes from the STORED project, not the incoming QBO match", async ()
     // ref still says "Mueller Bathroom", so a suggester scoped to the match
     // would hand an overhead purchase a job phase.
     const fake = fakeSuggestionClient({
+        ...STORED_DEFAULT,
         projectId: OVERHEAD_PROJECT_ID,
         costCodeId: null,
         costCodeSource: null,
     });
     const result = await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
     );
     assert.equal(result, "skipped-overhead");
@@ -1367,6 +1378,7 @@ test("scope comes from the STORED project, not the incoming QBO match", async ()
 
 test("the stored project is resolved through the estimate when the column is NULL", async () => {
     const fake = fakeSuggestionClient({
+        ...STORED_DEFAULT,
         projectId: null,
         costCodeId: null,
         costCodeSource: null,
@@ -1375,7 +1387,7 @@ test("the stored project is resolved through the estimate when the column is NUL
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+            { qbPurchaseId: "purchase-1" },
             COST_CODE_IDS,
         ),
         "skipped-overhead",
@@ -1383,11 +1395,11 @@ test("the stored project is resolved through the estimate when the column is NUL
 });
 
 test("a row with no job at all gets no job phase", async () => {
-    const fake = fakeSuggestionClient({ projectId: null, costCodeId: null, costCodeSource: null, estimate: null });
+    const fake = fakeSuggestionClient({ ...STORED_DEFAULT!, projectId: null, estimate: null });
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+            { qbPurchaseId: "purchase-1" },
             COST_CODE_IDS,
         ),
         "skipped-no-project",
@@ -1400,7 +1412,7 @@ test("a vanished row is reported, not treated as a silent success", async () => 
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(
             fake.client,
-            { qbPurchaseId: "gone", vendor: "Summit Plumbing", description: "x" },
+            { qbPurchaseId: "gone" },
             COST_CODE_IDS,
         ),
         "missing-row",
@@ -1414,7 +1426,7 @@ test("a phase the JOB does not have is refused, however confident the rule was",
     const fake = fakeSuggestionClient();
     const result = await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
         async () => false,
     );
@@ -1427,7 +1439,7 @@ test("the scope check is asked about the row's OWN job and the resolved code", a
     const asked: { projectId: string; costCodeId: string }[] = [];
     await applyQboExpenseCostCodeSuggestion(
         fake.client,
-        { qbPurchaseId: "purchase-1", vendor: "Summit Plumbing", description: "x" },
+        { qbPurchaseId: "purchase-1" },
         COST_CODE_IDS,
         async (projectId, costCodeId) => { asked.push({ projectId, costCodeId }); return true; },
     );
@@ -1436,24 +1448,25 @@ test("the scope check is asked about the row's OWN job and the resolved code", a
 });
 
 test("no rule match and an unknown code both write nothing", async () => {
-    const fake = fakeSuggestionClient();
+    // The text comes from the STORED row now, so a no-match case has to be a
+    // stored row the rules do not recognise.
+    const bland = fakeSuggestionClient({
+        ...STORED_DEFAULT!,
+        vendor: "General Hardware",
+        description: "misc supplies",
+    });
     assert.equal(
-        await applyQboExpenseCostCodeSuggestion(
-            fake.client,
-            { qbPurchaseId: "p", vendor: "General Hardware", description: "misc" },
-            COST_CODE_IDS,
-        ),
+        await applyQboExpenseCostCodeSuggestion(bland.client, { qbPurchaseId: "p" }, COST_CODE_IDS),
         "no-match",
     );
+    assert.equal(bland.calls.length, 0);
+
+    const known = fakeSuggestionClient();
     assert.equal(
-        await applyQboExpenseCostCodeSuggestion(
-            fake.client,
-            { qbPurchaseId: "p", vendor: "Summit Plumbing", description: "x" },
-            new Map(),
-        ),
+        await applyQboExpenseCostCodeSuggestion(known.client, { qbPurchaseId: "p" }, new Map()),
         "unknown-code",
     );
-    assert.equal(fake.calls.length, 0);
+    assert.equal(known.calls.length, 0);
 });
 
 test("a failing suggester never fails the import it rides alongside", async () => {
@@ -1787,4 +1800,58 @@ test("a permanently contended row is LEFT ALONE, never unconditionally written",
     assert.equal(result, "unchanged");
     assert.equal(updateCalls, 0, "no unconditional write anywhere on this path");
     assert.deepEqual(fake.rows.get("purchase-1"), before);
+});
+
+// ── a REJECTED payload must never feed a suggestion (round 12, item 1) ─────
+
+test("an out-of-order QBO payload cannot code the row from text that was refused", async () => {
+    // The webhook arrives late and carries an OLDER SyncToken, so the upsert
+    // correctly refuses it. Previously the sync then handed THAT payload's
+    // vendor to the suggester, and the row was coded from a version of the
+    // purchase the database had just thrown away.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            qbSyncToken: "5", vendor: "General Hardware",
+            description: "[QuickBooks import] misc supplies",
+        } as any,
+    ]);
+
+    const stale = await upsertQboExpense(fake.client, {
+        ...WRITE, qbSyncToken: "2", vendor: "Summit Plumbing",
+        description: "[QuickBooks import] rough-in",
+    });
+    assert.equal(stale, "unchanged", "the older token is refused");
+    assert.equal(fake.rows.get("purchase-1")?.vendor, "General Hardware", "and its text never lands");
+
+    // The suggester reads what is STORED, so the refused "Summit Plumbing"
+    // cannot reach it.
+    const suggestion = fakeSuggestionClient({
+        ...STORED_DEFAULT!,
+        vendor: "General Hardware",
+        description: "[QuickBooks import] misc supplies",
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(suggestion.client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "no-match",
+        "the stored text matches nothing, so nothing is coded",
+    );
+});
+
+test("the suggestion write is fenced on the row version AND the sync token", async () => {
+    const fake = fakeSuggestionClient();
+    await applyQboExpenseCostCodeSuggestion(fake.client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS);
+    const where = fake.calls[0].where;
+    assert.equal(where.qbSyncToken, "3", "a newer sync committing in the gap must lose");
+    assert.deepEqual(where.updatedAt, new Date("2026-09-01T00:00:00.000Z"));
+    assert.equal(where.costCodeId, null);
+});
+
+test("a newer sync landing between the read and the write wins", async () => {
+    const fake = fakeSuggestionClient();
+    fake.setCount(0); // the CAS matches nothing — the token moved
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(fake.client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "not-written",
+    );
 });

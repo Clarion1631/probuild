@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.join(__dirname, "..");
@@ -50,3 +51,36 @@ for (const script of SCRIPTS) {
         );
     });
 }
+
+// ── the report script must stay READ-ONLY (round 12, item 4) ───────────────
+
+test("suggest-expense-cost-codes issues no writes and offers no --apply", () => {
+    // It used to have its own `--apply`, which made it a SECOND writer of
+    // `costCodeId` — one that knew nothing about the per-expense lock, the
+    // row-version CAS, the re-plan under that lock, or the project-scoped phase
+    // check the real backfill applies. Two ways to code an expense, one of them
+    // unaware of every guarantee the other was given.
+    const source = readFileSync(path.join(ROOT, "scripts/suggest-expense-cost-codes.ts"), "utf8");
+    const code = source
+        .split("\n")
+        .filter(line => !/^\s*(\/\/|\*|\/\*)/.test(line))
+        .join("\n");
+
+    for (const write of [".update(", ".updateMany(", ".create(", ".delete(", ".deleteMany("]) {
+        assert.ok(!code.includes(`prisma.expense${write}`), `write survived: ${write}`);
+    }
+    assert.ok(
+        !/process\.argv\.includes\("--apply"\)/.test(code),
+        "the --apply flag must be gone, not merely undocumented",
+    );
+});
+
+test("the report scopes by the canonical overhead id, not the name \"Shop\"", () => {
+    const source = readFileSync(path.join(ROOT, "scripts/suggest-expense-cost-codes.ts"), "utf8");
+    assert.ok(source.includes("OVERHEAD_PROJECT_ID"), "excluded by id");
+    assert.ok(!/notIn: OVERHEAD_PROJECTS/.test(source), "the name-based scope is gone");
+    // ...and it reads attribution the one way, so a re-attributed expense is
+    // not invisible to the report that is supposed to find it.
+    assert.ok(source.includes("resolveExpenseProjectId"));
+    assert.ok(source.includes("csvCell"), "OCR'd vendor text is formula-neutralized");
+});

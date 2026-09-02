@@ -174,7 +174,16 @@ export function planBackfill({
     for (const expense of expenses) {
         const resolvedProjectId = resolveExpenseProjectId(expense);
         if (expense.projectId === null && resolvedProjectId) {
-            projectFills.push({ id: expense.id, projectId: resolvedProjectId });
+            projectFills.push({
+                id: expense.id,
+                projectId: resolvedProjectId,
+                // The estimate this project was DERIVED from. `projectId IS
+                // NULL` alone does not say the derivation is still valid: an
+                // expense re-pointed at a different estimate has a different
+                // project, and filling it from the old one would attribute the
+                // money to a job it was moved off.
+                expectedEstimateId: expense.estimateId,
+            });
         }
 
         // NEVER re-code a row that already has a code, and never touch a
@@ -555,21 +564,28 @@ export async function runBackfill({
 
     // ── the writes ──────────────────────────────────────────────────────────
     let projectIdsWritten = 0;
+    // Grouped by (project, estimate) rather than by project alone: the estimate
+    // is half the predicate now, so rows derived from different estimates
+    // cannot share one statement.
     const byProject = new Map();
     for (const fill of plan.projectFills) {
-        if (!byProject.has(fill.projectId)) byProject.set(fill.projectId, []);
-        byProject.get(fill.projectId).push(fill.id);
+        const key = `${fill.projectId}\u0000${fill.expectedEstimateId}`;
+        if (!byProject.has(key)) {
+            byProject.set(key, { projectId: fill.projectId, estimateId: fill.expectedEstimateId, ids: [] });
+        }
+        byProject.get(key).ids.push(fill.id);
     }
-    for (const [projectId, ids] of byProject) {
-        // `projectId: null` in the predicate, not just in the plan: between the
-        // read above and this write, a re-sync or a bookkeeper may have set it.
+    for (const { projectId, estimateId, ids } of byProject.values()) {
+        // BOTH halves of the derivation, re-asserted at write time.
         //
-        // No CAS on `updatedAt` here on purpose. This pass only ever fills a
-        // NULL, so "the row changed" and "the column is still NULL" are the
-        // same question, and the id-set write is one statement per project
-        // rather than one per row.
+        // `projectId: null` says nobody has attributed the row yet;
+        // `estimateId` says it is still hanging off the estimate this project
+        // was READ from. Without the second one, an expense re-pointed at a
+        // different estimate between the plan and the write would be stamped
+        // with the old estimate's project — a silent cross-job attribution
+        // performed by the very pass that exists to get attribution right.
         const result = await db.expense.updateMany({
-            where: { id: { in: ids }, projectId: null },
+            where: { id: { in: ids }, projectId: null, estimateId },
             data: { projectId },
         });
         projectIdsWritten += result.count;
@@ -610,21 +626,35 @@ export async function runBackfill({
             const current = await tx.expense.findUnique({
                 where: { id: fill.id },
                 select: {
-                    id: true, projectId: true, costCodeId: true, costCodeSource: true,
-                    itemId: true, updatedAt: true, estimate: { select: { projectId: true } },
+                    id: true, estimateId: true, projectId: true, costCodeId: true,
+                    costCodeSource: true, itemId: true, vendor: true, description: true,
+                    updatedAt: true, estimate: { select: { projectId: true } },
                 },
             });
             if (!current) return { count: 0 };
 
-            // The plan was made about a row that no longer looks like this.
-            // Re-deciding here would be a second planner with its own copy of
-            // the rules; skipping is honest and a re-run will plan it properly.
-            const stillEligible =
-                current.costCodeId === null &&
-                current.costCodeSource !== "capture" &&
-                current.costCodeSource !== "manual" &&
-                resolveExpenseProjectId(current) === fill.expectedProjectId;
-            if (!stillEligible) return { count: 0 };
+            // RE-PLAN, don't re-use.
+            //
+            // The plan was computed minutes ago from a snapshot. Checking that
+            // the row is still ELIGIBLE is not the same as checking that the
+            // same answer still follows from it: the vendor, the description
+            // and the item link all feed the decision, and an edit to any of
+            // them makes the planned code an answer to a question nobody asked
+            // any more.
+            //
+            // `planBackfill` is the single copy of the rules, so it is run
+            // again over this one row rather than re-implemented here.
+            const replanned = planBackfill({
+                expenses: [current],
+                items,
+                costCodeIdByCode,
+                scopedProjectIds,
+                allowedCodesByProject,
+            });
+            const fresh = replanned.codeFills[0];
+            // No longer codeable at all, or codeable as something else — either
+            // way the planned write is void. A re-run will plan it properly.
+            if (!fresh || fresh.costCodeId !== fill.costCodeId) return { count: 0 };
 
             return tx.expense.updateMany({
             where: {
@@ -648,9 +678,11 @@ export async function runBackfill({
                 ...notHumanCodedExpenseWhere(),
             },
             data: {
-                costCodeId: fill.costCodeId,
-                costCodeSource: fill.costCodeSource,
-                costCodeConfidence: fill.costCodeConfidence,
+                // From the RE-PLAN, so the provenance and confidence describe
+                // the decision that was actually just made.
+                costCodeId: fresh.costCodeId,
+                costCodeSource: fresh.costCodeSource,
+                costCodeConfidence: fresh.costCodeConfidence,
             },
             });
         });

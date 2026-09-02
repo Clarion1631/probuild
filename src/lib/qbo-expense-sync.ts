@@ -998,10 +998,12 @@ export async function deactivateQboExpense(
 // It also never runs on the deactivate path: a Purchase deleted in QBO is not
 // an occasion to guess its phase.
 
+/**
+ * Only the identity. The vendor and description the suggestion reads come from
+ * the PERSISTED row, never from the caller — see below.
+ */
 export interface QboCostCodeSuggestionInput {
     qbPurchaseId: string;
-    vendor: string | null;
-    description: string;
 }
 
 export interface QboCostCodeSuggestionClient {
@@ -1013,6 +1015,10 @@ export interface QboCostCodeSuggestionClient {
             projectId: string | null;
             costCodeId: string | null;
             costCodeSource: string | null;
+            vendor: string | null;
+            description: string | null;
+            qbSyncToken: string | null;
+            updatedAt?: Date;
             estimate?: { projectId: string | null } | null;
         } | null>;
         updateMany(args: {
@@ -1058,12 +1064,28 @@ export async function applyQboExpenseCostCodeSuggestion(
      */
     isAllowedForProject?: (projectId: string, costCodeId: string) => Promise<boolean>,
 ): Promise<QboCostCodeSuggestionResult> {
+    // THE PERSISTED ROW IS THE ONLY INPUT.
+    //
+    // The sync used to hand this function the vendor and description off the
+    // purchase it had just processed. That is wrong whenever the upsert did not
+    // actually accept them: an out-of-order QBO webhook carries an OLDER
+    // SyncToken, `isIncomingQboSyncTokenCurrent` correctly refuses it and
+    // returns "unchanged" — and the suggestion then ran on the rejected
+    // payload's text and coded the row from a version of the purchase the
+    // database deliberately threw away.
+    //
+    // Reading the row back means the suggestion can only ever describe what is
+    // actually stored.
     const stored = await client.expense.findUnique({
         where: { qbPurchaseId: input.qbPurchaseId },
         select: {
             projectId: true,
             costCodeId: true,
             costCodeSource: true,
+            vendor: true,
+            description: true,
+            qbSyncToken: true,
+            updatedAt: true,
             estimate: { select: { projectId: true } },
         },
     });
@@ -1085,7 +1107,7 @@ export async function applyQboExpenseCostCodeSuggestion(
     // and a row that has since been attributed must be re-scoped, not written.
     const expectedProjectId = stored.projectId ?? null;
 
-    const suggestion = suggestCode({ vendor: input.vendor, description: input.description });
+    const suggestion = suggestCode({ vendor: stored.vendor, description: stored.description });
     if (!suggestion) return "no-match";
 
     const costCodeId = costCodeIdByCode.get(suggestion.code);
@@ -1107,6 +1129,13 @@ export async function applyQboExpenseCostCodeSuggestion(
             // skipped rather than written on stale reasoning.
             projectId: expectedProjectId,
             costCodeId: null,
+            // The exact row version the suggestion was computed from. Without
+            // `qbSyncToken` a NEWER sync could commit between the read and this
+            // write, and the row would be coded from the text of a purchase it
+            // no longer holds — the same staleness the read above fixed, just
+            // one statement later.
+            ...(stored.updatedAt ? { updatedAt: stored.updatedAt } : {}),
+            qbSyncToken: stored.qbSyncToken,
             ...notHumanCodedExpenseWhere(),
         },
         data: {
@@ -1615,11 +1644,10 @@ export async function syncQboExpenses(
         // Same resilience posture as persistClassification/attachReceipt.
         if (dependencies.suggestCostCode) {
             try {
-                await dependencies.suggestCostCode({
-                    qbPurchaseId: purchase.qbPurchaseId,
-                    vendor: purchase.vendor,
-                    description,
-                });
+                // Identity only. Whether this purchase's payload was ACCEPTED
+                // is the upsert's business, and the suggestion reads whatever
+                // the upsert left behind rather than what it was offered.
+                await dependencies.suggestCostCode({ qbPurchaseId: purchase.qbPurchaseId });
             } catch (error) {
                 console.error(
                     "QBO cost-code suggestion failed",
