@@ -20,15 +20,45 @@ import { isSalariedOwner } from "@/lib/pay-rate-guard";
  * hourlyRate/burdenRate are exact decimal TEXT — money never goes through a JS
  * float on the way to the screen and back into an import.
  */
-export async function GET() {
+export async function GET(_req: Request) {
     const viewer = await getCurrentUserWithPermissions();
     if (!viewer) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     if (viewer.role !== "ADMIN" && !hasPermission(viewer, "financialReports")) {
         return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
+    // `?historicalFrom=YYYY-MM-DD&historicalTo=YYYY-MM-DD` additionally returns
+    // DISABLED members with entries in that window. They are off the roster but
+    // still owed a pay type: an unanswered former employee with hours in an
+    // unclosed period blocks the export, and re-activating them to fix it would
+    // put them back on the dispatch board.
+    const url = new URL(_req.url);
+    const from = url.searchParams.get("historicalFrom");
+    const to = url.searchParams.get("historicalTo");
+    const DAY = /^\d{4}-\d{2}-\d{2}$/;
+    let historicalIds: string[] = [];
+    if (from && to && DAY.test(from) && DAY.test(to)) {
+        const { resolveCompanyTimeZone } = await import("@/lib/company-timezone");
+        const { startOfDateInTimeZone } = await import("@/lib/tz-date");
+        const timeZone = await resolveCompanyTimeZone();
+        const rows = await prisma.timeEntry.findMany({
+            where: {
+                startTime: {
+                    gte: startOfDateInTimeZone(from, timeZone),
+                    lt: startOfDateInTimeZone(to, timeZone),
+                },
+                user: { status: "DISABLED" },
+            },
+            select: { userId: true },
+            distinct: ["userId"],
+        });
+        historicalIds = rows.map((row) => row.userId);
+    }
+
     const users = await prisma.user.findMany({
-        where: { status: "ACTIVATED" },
+        where: historicalIds.length > 0
+            ? { OR: [{ status: "ACTIVATED" }, { id: { in: historicalIds } }] }
+            : { status: "ACTIVATED" },
         select: {
             id: true,
             name: true,
@@ -38,6 +68,7 @@ export async function GET() {
             hourlyRate: true,
             burdenRate: true,
             lastRateSyncAt: true,
+            status: true,
         },
         orderBy: [{ name: "asc" }, { email: "asc" }],
     });
@@ -52,6 +83,9 @@ export async function GET() {
             hourlyRate: user.hourlyRate.toFixed(2),
             burdenRate: user.burdenRate.toFixed(2),
             lastRateSyncAt: user.lastRateSyncAt ? user.lastRateSyncAt.toISOString() : null,
+            // The panel splits on this: a former employee gets the historical
+            // section, where their pay type can be set without reactivating them.
+            historical: user.status === "DISABLED",
             salaried: isSalariedOwner({ role: user.role, email: user.email, payType: user.payType }),
         }))
     );

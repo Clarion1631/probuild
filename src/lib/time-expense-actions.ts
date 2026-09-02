@@ -16,6 +16,8 @@ import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
+import { toNum } from "@/lib/prisma-helpers";
+import { appendZeroRateReview, zeroRateBlocks, zeroRateManagerMessage } from "@/lib/pay-rate-guard";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -23,6 +25,54 @@ async function assertTimeExpenseProjectAccess(projectId: string) {
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+}
+
+/**
+ * Price an entry from the member's STORED rates, applying the same $0-rate
+ * policy as every other write path.
+ *
+ * Read inside the caller's transaction and row-locked: a rate import committing
+ * between a pre-read and this write would otherwise price the shift from a
+ * value that is no longer true.
+ *
+ * This is always an office action, so it follows the MANAGER branch — refused
+ * by default, allowed only on an explicit acknowledgement, and then flagged so
+ * the payroll export refuses to run past it.
+ */
+async function priceEntryFromStoredRates(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string,
+    durationHours: number,
+    acknowledgeZeroRate: boolean
+): Promise<{ laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string }> {
+    const [member] = (await tx.$queryRawUnsafe(
+        `SELECT "name", "email", "role", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR UPDATE`,
+        userId
+    )) as Array<{
+        name: string | null;
+        email: string;
+        role: string;
+        payType: string | null;
+        hourlyRate: unknown;
+        burdenRate: unknown;
+    }>;
+    if (!member) throw new Error("Crew member not found");
+
+    const hourlyRate = toNum(member.hourlyRate as never);
+    const burdenRate = toNum(member.burdenRate as never);
+    const zeroRate = zeroRateBlocks({
+        role: member.role,
+        email: member.email,
+        payType: member.payType,
+        hourlyRate,
+    });
+    if (zeroRate && !acknowledgeZeroRate) throw new Error(zeroRateManagerMessage(member.name));
+
+    return {
+        laborCost: durationHours * hourlyRate,
+        burdenCost: durationHours * burdenRate,
+        ...(zeroRate ? appendZeroRateReview(null) : {}),
+    };
 }
 
 // ─── Time Entry Actions ────────────────────────────────────────
@@ -55,14 +105,14 @@ export async function updateTimeEntry(
         costCodeId: string | null;
         date: string;
         durationHours: number;
-        laborCost: number;
+        /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+        acknowledgeZeroRate?: boolean;
     }
 ) {
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Unauthorized");
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
-    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
     // Date-only input goes through the company-timezone helper, not new Date():
     // new Date("2026-07-27") is UTC midnight, which is the 26th in company time,
     // so a plain parse silently moves the entry back a day. createTimeEntryCore
@@ -90,7 +140,7 @@ export async function updateTimeEntry(
     // period that was already exported. The row's STORED startTime is re-read
     // and row-locked inside the transaction — the value captured above is not
     // trusted, because another writer may have moved the row since.
-    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, (tx) =>
+    const updated = await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) =>
         (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id, invoiceId: null, invoicedAt: null },
             data: {
@@ -99,7 +149,18 @@ export async function updateTimeEntry(
                 startTime,
                 scheduleTaskId,
                 durationHours: data.durationHours,
-                laborCost: data.laborCost,
+                // Cost and burden are DERIVED, inside this transaction, from the
+                // member's stored rates. They used to be parameters: a server
+                // action's arguments are an HTTP body, so a caller could post
+                // any cost against any worker, straight into payroll and job
+                // costing. Recomputed here (not before the transaction) so a
+                // concurrent rate change cannot land in between.
+                ...(await priceEntryFromStoredRates(
+                    tx as never,
+                    data.userId,
+                    data.durationHours,
+                    data.acknowledgeZeroRate === true
+                )),
             },
         })
     );

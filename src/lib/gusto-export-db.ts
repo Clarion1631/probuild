@@ -156,14 +156,23 @@ export async function findPayrollPeriod(startKey: string, endKey: string, client
  * about what has to hold still. Two different questions, two different ranges.
  */
 export async function findOverlappingLockedPeriods(
-    start: Date,
-    end: Date,
+    startKey: string,
+    endKey: string,
     client: ExportDbClient = prisma
 ): Promise<PayrollPeriodRow[]> {
+    // Compared on the STABLE day keys, not the timestamps. The timestamps are
+    // derived from company-local days, so they shift when the company time zone
+    // changes — and an overlap test on shifted values reports a different answer
+    // for the same two periods than it did yesterday. Keys are YYYY-MM-DD text,
+    // so the half-open comparison is a plain lexicographic one and cannot move.
     return client.payrollPeriod.findMany({
-        where: { lockedAt: { not: null }, periodStart: { lt: end }, periodEnd: { gt: start } },
+        where: {
+            lockedAt: { not: null },
+            periodStartKey: { lt: endKey },
+            periodEndKey: { gt: startKey },
+        },
         select: PAYROLL_PERIOD_SELECT,
-        orderBy: { periodStart: "asc" },
+        orderBy: { periodStartKey: "asc" },
     });
 }
 
@@ -193,8 +202,8 @@ export async function loadGustoExport(
 
     const [period, overlappingLocks] = await Promise.all([
         findPayrollPeriod(startKey, endKey, client),
-        // Ownership: the pay-period range, not the envelope (see above).
-        findOverlappingLockedPeriods(periodStart, periodEnd, client),
+        // Ownership: the pay-period range, on its stable day keys (see above).
+        findOverlappingLockedPeriods(startKey, endKey, client),
     ]);
 
     // The query spans the FULL Mon-Sun workweeks overlapping the period, so a

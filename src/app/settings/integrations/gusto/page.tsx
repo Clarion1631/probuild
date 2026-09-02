@@ -1,5 +1,6 @@
 import { getGustoSettings } from "@/lib/integration-store";
 import { prisma } from "@/lib/prisma";
+import { canAccessGusto } from "@/lib/gusto-access";
 import GustoClient from "./GustoClient";
 
 export const dynamic = "force-dynamic";
@@ -9,6 +10,13 @@ export default async function GustoSettingsPage({
 }: {
     searchParams: Promise<{ success?: string; error?: string }>;
 }) {
+    // The page renders the employee map and the connection state, and it is the
+    // only surface that drives the (previously ungated) mapping write. Same gate
+    // as the routes and the payroll export.
+    if (!(await canAccessGusto())) {
+        return <div className="p-8 text-red-500">Access Denied. Payroll access required.</div>;
+    }
+
     const params = await searchParams;
     const [gustoSettings, users] = await Promise.all([
         getGustoSettings(),

@@ -15438,13 +15438,26 @@ export async function applyGustoRateImport(
  * payroll export refuses to run while somebody with hours has no answer, so
  * this is the screen that unblocks it.
  */
-export async function setUserPayType(userId: string, payType: string) {
+export async function setUserPayType(
+    userId: string,
+    payType: string,
+    /**
+     * Answering for somebody who has already LEFT.
+     *
+     * A disabled account with hours in an unclosed period blocks the export
+     * forever otherwise: the pay type can only be set on an active user, and
+     * re-activating a former employee to unblock payroll is a worse cure than
+     * the disease (they reappear on the dispatch board, in pickers, in
+     * auto-assignment). This writes the pay type WITHOUT touching status.
+     */
+    options: { historical?: boolean } = {}
+) {
     await requirePayrollAccess();
     if (payType !== "HOURLY" && payType !== "SALARY") {
         return { success: false as const, error: "Pay type must be hourly or salary." };
     }
     const updated = await prisma.user.updateMany({
-        where: { id: userId, status: { not: "DISABLED" } },
+        where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
         data: { payType },
     });
     if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
@@ -15574,22 +15587,24 @@ export async function lockPayrollPeriod(
             // FOR UPDATE cannot lock a row nobody has inserted yet.
             await acquirePayrollLockCreationLock(tx as never);
 
-            const overlapping = await tx.$queryRaw<Array<{ id: string; periodStart: Date; periodEnd: Date }>>`
-                SELECT "id", "periodStart", "periodEnd"
+            const overlapping = await tx.$queryRaw<Array<{ id: string; periodStartKey: string | null; periodEndKey: string | null }>>`
+                SELECT "id", "periodStartKey", "periodEndKey"
                 FROM "PayrollPeriod"
-                WHERE "periodStart" < ${periodEnd} AND "periodEnd" > ${periodStart}
+                WHERE "periodStartKey" < ${range.endKey} AND "periodEndKey" > ${range.startKey}
                 FOR UPDATE
             `;
             // Envelope overlap, re-checked INSIDE the transaction now that the
             // exclusive advisory lock is held. The pre-check outside is
             // advisory: two locks racing each other both passed it, and only
             // this one is serialised.
+            // Keyed on the STABLE day keys, exactly like findOverlappingLockedPeriods.
+            // Timestamps move with the company time zone; these do not.
             const rangeConflicts = (await tx.$queryRaw<Array<{ periodStartKey: string | null; periodEndKey: string | null }>>`
                 SELECT "periodStartKey", "periodEndKey"
                 FROM "PayrollPeriod"
                 WHERE "lockedAt" IS NOT NULL
-                  AND "periodStart" < ${periodEnd}
-                  AND "periodEnd" > ${periodStart}
+                  AND "periodStartKey" < ${range.endKey}
+                  AND "periodEndKey" > ${range.startKey}
                   AND NOT ("periodStartKey" = ${range.startKey} AND "periodEndKey" = ${range.endKey})
                 FOR UPDATE
             `);
@@ -15601,13 +15616,11 @@ export async function lockPayrollPeriod(
             }
 
             const conflicting = overlapping.filter(
-                (row) =>
-                    row.periodStart.getTime() !== periodStart.getTime() ||
-                    row.periodEnd.getTime() !== periodEnd.getTime()
+                (row) => row.periodStartKey !== range.startKey || row.periodEndKey !== range.endKey
             );
             if (conflicting.length > 0) {
                 const listed = conflicting
-                    .map((row) => `${row.periodStart.toISOString().slice(0, 10)} to ${row.periodEnd.toISOString().slice(0, 10)}`)
+                    .map((row) => `${row.periodStartKey} to ${row.periodEndKey}`)
                     .join(", ");
                 throw new Error(
                     `This range overlaps an existing pay period (${listed}). Pay periods cannot overlap - pick the exact period, or unlock the other one first.`
@@ -15744,10 +15757,16 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     if (unsettled.length === 0) return { success: true as const, settled: 0, skipped: 0 };
 
     const affectedUserIds = [...new Set(unsettled.map((row) => row.userId))];
-    const openRows = await prisma.timeEntry.findMany({
+    // The SAME "still on the clock" test the export uses (isOpenEntry). A bare
+    // `endTime: null` counted every completed manual entry as an open punch, so
+    // this button skipped days the export was blocking on — a period that could
+    // never be cleared from either end.
+    const { isOpenEntry } = await import("./gusto-export-core");
+    const openCandidates = await prisma.timeEntry.findMany({
         where: { endTime: null, userId: { in: affectedUserIds } },
-        select: { userId: true, startTime: true },
+        select: { userId: true, startTime: true, endTime: true, durationHours: true },
     });
+    const openRows = openCandidates.filter((row) => isOpenEntry(row));
     const lockedPeriods = await loadLockedPeriods();
 
     const plan = planDeferredSettlements({

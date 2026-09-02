@@ -87,7 +87,13 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const exactLock = result.period?.lockedAt ? result.period : null;
     // Either reason disables the downloads; they are different problems.
     const overlapsLock = result.overlapsLockWithoutBeingIt;
-    const blocked = result.blocking.length > 0 || overlapsLock;
+    // A LOCKED period serves its snapshot, so live blockers are irrelevant to
+    // the download: the file was frozen when it was locked and no longer
+    // depends on what the entries look like now. Leaving it disabled meant a
+    // locked period whose entries were later reopened could not be re-downloaded
+    // at all — the one case where the snapshot exists precisely so it can be.
+    const servesSnapshot = !!result.snapshot;
+    const blocked = !servesSnapshot && (result.blocking.length > 0 || overlapsLock);
     const deferredCount = result.blocking.filter((row) => row.reason === "deferred").length;
     const unknownPayTypeCount = result.blocking.filter((row) => row.reason === "unknownPayType").length;
 

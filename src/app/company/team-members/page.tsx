@@ -24,6 +24,8 @@ type PayrollRosterRow = {
     burdenRate: string;
     lastRateSyncAt: string | null;
     salaried: boolean;
+    /** A DISABLED former employee, returned only for the historical window. */
+    historical?: boolean;
 };
 
 type User = {
@@ -67,7 +69,15 @@ export default function TeamPage() {
     // Payroll data comes from the payroll-scoped endpoint. A viewer without
     // payroll access simply gets no panel rather than a broken one.
     async function fetchRoster() {
-        const res = await fetch('/api/payroll/roster');
+        // The historical window asks for former employees with hours in it. It
+        // defaults to the last 90 days: wide enough to cover any period still
+        // open, narrow enough not to resurrect the whole payroll history.
+        const to = new Date();
+        const from = new Date(to.getTime() - 90 * 86_400_000);
+        const day = (d: Date) => d.toISOString().slice(0, 10);
+        const res = await fetch(
+            `/api/payroll/roster?historicalFrom=${day(from)}&historicalTo=${day(to)}`
+        );
         if (res.ok) setRoster(await res.json());
     }
 
@@ -302,7 +312,7 @@ export default function TeamPage() {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-hui-border">
-                            {roster.map(user => {
+                            {roster.filter(row => !row.historical).map(user => {
                                 const sync = rateSyncLabel(user.lastRateSyncAt);
                                 // Mirrors zeroRateBlocks on the server: `salaried` already folds in
                                 // payType, role and the env fallback.
@@ -366,12 +376,76 @@ export default function TeamPage() {
                             })}
                         </tbody>
                     </table>
-                    {roster.length === 0 && (
+                    {roster.filter(row => !row.historical).length === 0 && (
                         <div className="p-6 text-center text-hui-textMuted">
                             No payroll rates to show. (This panel needs payroll access.)
                         </div>
                     )}
                 </div>
+
+                {/* Historical payroll.
+                    A former employee with hours in a period that is still open
+                    blocks the payroll export until somebody says how they were
+                    paid — and the only way to answer used to be re-activating
+                    them, which puts them back on the dispatch board and in every
+                    picker. This answers it without touching their status. */}
+                {roster.some(row => row.historical) && (
+                    <div className="mt-8 hui-card overflow-hidden">
+                        <div className="px-6 py-4 border-b border-hui-border">
+                            <h2 className="font-semibold text-hui-textMain">Historical payroll</h2>
+                            <p className="text-xs text-hui-textMuted mt-0.5">
+                                Former team members with hours in the last 90 days. Setting a pay type here does
+                                not re-activate the account — it only answers how those hours should be paid, so
+                                the payroll export can run.
+                            </p>
+                        </div>
+                        <table className="w-full text-left border-collapse text-sm">
+                            <thead>
+                                <tr className="bg-slate-50 border-b border-hui-border text-xs font-semibold text-hui-textMuted whitespace-nowrap">
+                                    <th className="px-6 py-3 font-normal">Name</th>
+                                    <th className="px-6 py-3 font-normal">Pay type</th>
+                                    <th className="px-6 py-3 font-normal text-right">Hourly rate</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-hui-border">
+                                {roster.filter(row => row.historical).map(user => (
+                                    <tr key={user.id} className="hover:bg-slate-50 transition-colors">
+                                        <td className="px-6 py-3">
+                                            <span className="font-medium text-hui-textMain">{user.name || user.email}</span>
+                                            <span className="ml-2 text-xs text-hui-textMuted bg-slate-100 px-2 py-0.5 rounded border border-hui-border">
+                                                no longer active
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-3">
+                                            <select
+                                                value={user.payType ?? ""}
+                                                onChange={async (e) => {
+                                                    const value = e.target.value;
+                                                    if (value !== "HOURLY" && value !== "SALARY") return;
+                                                    const result = await setUserPayType(user.id, value, { historical: true });
+                                                    if (result.success) {
+                                                        toast.success("Pay type saved for their historical hours.");
+                                                        fetchRoster();
+                                                    } else {
+                                                        toast.error(result.error);
+                                                    }
+                                                }}
+                                                className={`hui-input text-xs py-1 ${user.payType ? "" : "border-red-300 text-red-700"}`}
+                                            >
+                                                <option value="">Not set</option>
+                                                <option value="HOURLY">Hourly</option>
+                                                <option value="SALARY">Salary</option>
+                                            </select>
+                                        </td>
+                                        <td className="px-6 py-3 text-right tabular-nums text-hui-textMuted">
+                                            ${user.hourlyRate}/h
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
             </div>
 
             {/* Add User Modal */}

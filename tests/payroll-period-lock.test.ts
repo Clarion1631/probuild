@@ -539,14 +539,15 @@ test("OWNERSHIP overlap is judged on the pay-period range, not the OT envelope",
     // it made the SECOND of two consecutive periods look like it overlapped the
     // first, so it could neither be exported nor locked.
     const db = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
-    assert.match(db, /findOverlappingLockedPeriods\(periodStart, periodEnd, client\)/);
+    assert.match(db, /findOverlappingLockedPeriods\(startKey, endKey, client\)/);
     assert.doesNotMatch(db, /findOverlappingLockedPeriods\(envelope\.start, envelope\.end/);
 
     const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
     const lock = actions.slice(actions.indexOf("export async function lockPayrollPeriod"));
     const body = lock.slice(0, lock.indexOf(LF + "export "));
     assert.match(body, /rangeConflicts/);
-    assert.match(body, /"periodStart" < \$\{periodEnd\}[\s\S]{0,80}"periodEnd" > \$\{periodStart\}/);
+    // Compared on the stable day keys — see the dedicated test below.
+    assert.match(body, /"periodStartKey" < \$\{range\.endKey\}/);
     // Freezing still uses the envelope — the two questions stay separate.
     assert.match(body, /envelope\.end\.getTime\(\) > Date\.now\(\)/);
 });
@@ -720,4 +721,69 @@ test("PATCH applies the zero-rate guard to ANY cost recomputation, not just a cl
     // a rate import could zero it between the pre-read and the write.
     assert.match(source, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
     assert.match(source, /ZeroRateAtWriteError/);
+});
+
+test("period ownership is compared on STABLE day keys, never timestamps", () => {
+    // Timestamps are derived from company-local days, so they shift when the
+    // company time zone changes — and an overlap test on shifted values gives a
+    // different answer for the same two periods than it did yesterday.
+    const db = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    const fn = db.slice(db.indexOf("export async function findOverlappingLockedPeriods"));
+    const body = fn.slice(0, fn.indexOf(LF + "}"));
+    assert.match(body, /periodStartKey: \{ lt: endKey \}/);
+    assert.match(body, /periodEndKey: \{ gt: startKey \}/);
+    assert.doesNotMatch(body, /periodStart: \{ lt:/, "must not compare timestamps");
+
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const lock = actions.slice(actions.indexOf("export async function lockPayrollPeriod"));
+    const lockBody = lock.slice(0, lock.indexOf(LF + "export "));
+    // BOTH transactional checks, not just one of them.
+    assert.match(lockBody, /"periodStartKey" < \$\{range\.endKey\}[\s\S]{0,120}"periodEndKey" > \$\{range\.startKey\}/);
+    assert.doesNotMatch(lockBody, /"periodStart" < \$\{periodEnd\}/, "no timestamp comparison survives");
+});
+
+test("a locked period's downloads stay enabled regardless of live blockers", () => {
+    // The snapshot exists precisely so a locked period can still be downloaded
+    // after its entries move; disabling on live blockers made that impossible.
+    const page = readFileSync(
+        path.join(__dirname, "..", "src", "app", "manager", "payroll-export", "page.tsx"),
+        "utf8"
+    );
+    assert.match(page, /const servesSnapshot = !!result\.snapshot;/);
+    assert.match(page, /const blocked = !servesSnapshot && \(result\.blocking\.length > 0 \|\| overlapsLock\);/);
+});
+
+test("a former employee's pay type can be answered without reactivating them", () => {
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function setUserPayType"));
+    const body = fn.slice(0, fn.indexOf(LF + "}"));
+    // Re-activating a leaver to unblock payroll puts them back on the dispatch
+    // board and in every picker — a worse cure than the disease.
+    assert.match(body, /options: \{ historical\?: boolean \} = \{\}/);
+    assert.match(body, /options\.historical \? \{ id: userId \} : \{ id: userId, status: \{ not: "DISABLED" \} \}/);
+    // And status is never in the update.
+    assert.doesNotMatch(body, /data: \{ payType, status/);
+
+    const panel = readFileSync(
+        path.join(__dirname, "..", "src", "app", "company", "team-members", "page.tsx"),
+        "utf8"
+    );
+    assert.match(panel, /Historical payroll/);
+    assert.match(panel, /setUserPayType\(user\.id, value, \{ historical: true \}\)/);
+    assert.match(panel, /historicalFrom=/);
+});
+
+test("updateTimeEntry derives cost from stored rates inside the transaction", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "time-expense-actions.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function updateTimeEntry"));
+    const body = fn.slice(0, fn.indexOf(LF + "export "));
+    // A server action's arguments are an HTTP body: laborCost as a parameter
+    // let a caller post any cost against any worker.
+    assert.doesNotMatch(body, /laborCost: number;/);
+    assert.doesNotMatch(body, /laborCost: data\.laborCost/);
+    assert.match(body, /priceEntryFromStoredRates\(/);
+    // Read FOR UPDATE inside the write transaction, so a concurrent rate change
+    // cannot land between the read and the write.
+    assert.match(source, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
+    assert.match(source, /zeroRateBlocks\(/);
 });

@@ -130,6 +130,22 @@ export type GustoExport = {
     blocking: BlockingEntry[];
 };
 
+/**
+ * "Still on the clock" — the ONE definition.
+ *
+ * endTime IS NULL alone is not it: a manual entry records paid hours directly
+ * and leaves endTime null forever, so that test called every completed manual
+ * entry an open punch. Open means nobody has said how long the shift was:
+ * no end time AND no duration.
+ *
+ * Exported because the settlement planner has to agree with the export about
+ * this. When they disagreed, the export blocked on a day the settle button
+ * considered finished, and the period could never be cleared.
+ */
+export function isOpenEntry(entry: { endTime: Date | null; durationHours: number | null }): boolean {
+    return entry.endTime == null && !(Number.isFinite(entry.durationHours) && (entry.durationHours ?? 0) > 0);
+}
+
 function round2(value: number): number {
     return Math.round(value * 100) / 100;
 }
@@ -188,12 +204,8 @@ export function blockingEntries(
         // export settles what it can first; anything still DEFERRED afterwards
         // (the worker is mid-shift, or settlement failed) would export at FULL
         // pay with no meal deduction. Refuse rather than overpay.
-        // OPEN means "nobody has said how long this shift was": endTime null AND
-        // no duration. A manual entry carries durationHours with (historically)
-        // no endTime — a COMPLETED shift — and calling that "still clocked in"
-        // blocked every export that contained one.
         const reason: BlockingReason | null =
-            entry.endTime == null && !(Number.isFinite(entry.durationHours) && entry.durationHours > 0)
+            isOpenEntry(entry)
                 ? "open"
                 : entry.needsReview
                   ? "needsReview"

@@ -578,3 +578,23 @@ test("a disabled former employee with only a CONTEXT punch is not on the roster"
     assert.deepEqual(result.blocking, [], "nobody on the roster, so nothing to answer for");
     assert.deepEqual(result.employees, []);
 });
+
+test("ONE definition of an open punch, shared by the export and the settle button", async () => {
+    const { isOpenEntry } = await import("../src/lib/gusto-export-core");
+    // Nobody has said how long it was: no end time AND no duration.
+    assert.equal(isOpenEntry({ endTime: null, durationHours: null }), true);
+    assert.equal(isOpenEntry({ endTime: null, durationHours: 0 }), true);
+    // A manual entry records paid hours and leaves endTime null forever — a
+    // COMPLETED shift. Calling it open blocked every export containing one.
+    assert.equal(isOpenEntry({ endTime: null, durationHours: 8 }), false);
+    assert.equal(isOpenEntry({ endTime: new Date(), durationHours: 8 }), false);
+
+    // The settle action uses the SAME predicate. When the two disagreed, the
+    // export blocked on a day the button considered finished, and the period
+    // could never be cleared from either end.
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function settleDeferredDaysForPeriod"));
+    const body = fn.slice(0, fn.indexOf(String.fromCharCode(10) + "export "));
+    assert.match(body, /isOpenEntry/);
+    assert.match(body, /openCandidates\.filter\(\(row\) => isOpenEntry\(row\)\)/);
+});
