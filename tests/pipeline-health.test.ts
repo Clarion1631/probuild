@@ -21,6 +21,7 @@ import {
     BOOKED_PUSH_STATUSES,
     type PipelineHealth,
     INTAKE_STUCK_HOURS,
+    CHASER_STALE_HOURS,
     INTAKE_STAGING_STUCK_MINUTES,
 } from "../src/lib/pipeline-health";
 
@@ -46,6 +47,8 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         uncertainCards: { status: "ok" as const, count: 0 },
         // A connected Drive is the normal state; the memo path needs it.
         driveCredentials: { status: "ok" as const, configured: true, source: "company-settings" },
+        // A chase that finished an hour ago is the normal state.
+        chaser: { status: "ok" as const, phase: "done", completedAt: iso(1 * HOUR) },
         // The nightly QBO pull is OFF by default, so it contributes no reason.
         bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null },
         now: NOW,
@@ -860,4 +863,52 @@ test("the Drive credential is probed, and the stored one counts", () => {
     );
     assert.match(spec, /Connect Google Drive, or the signed-memo path is dead on arrival/);
     assert.match(spec, /CompanySettings\.googleDriveRefreshToken/);
+});
+
+test("a stalled chaser is visible BEFORE the next day's cards are due", () => {
+    // Everything on the Receipts tab is downstream of this sweep, and the cards
+    // cron refuses to select until it has finished today — answering 200 with
+    // `skipped:"chaser-incomplete"`, which nobody sees unless they read cron
+    // logs. So the staleness is reported here, in hours, before the cards.
+    assert.equal(CHASER_STALE_HOURS, 26, "one missed night plus a slow morning");
+
+    const fresh = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "done", completedAt: iso(2 * HOUR) },
+    }));
+    assert.deepEqual(fresh.reasons, []);
+
+    // Mid-cycle is fine on its own — a resume pass is normal. What matters is
+    // how long since one COMPLETED.
+    const running = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "lines", completedAt: iso(3 * HOUR) },
+    }));
+    assert.deepEqual(running.reasons, []);
+
+    const stale = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "lines", completedAt: iso(30 * HOUR) },
+    }));
+    assert.equal(stale.ok, false);
+    assert.ok(stale.reasons.includes("chaser-stale:30h"), stale.reasons.join(","));
+
+    // NEVER completed is the loudest case, not the quietest.
+    const never = evaluatePipelineHealth(snapshot({
+        chaser: { status: "ok", phase: "open-issues", completedAt: null },
+    }));
+    assert.ok(never.reasons.includes("chaser-stale:never"), never.reasons.join(","));
+
+    // A failed probe is probe-failed, and must not also invent a staleness.
+    const broken = evaluatePipelineHealth(snapshot({
+        chaser: { status: "error", reason: "timeout", phase: "unknown", completedAt: null },
+    }));
+    assert.ok(broken.reasons.includes("probe-failed:chaser"));
+    assert.ok(!broken.reasons.some(r => r.startsWith("chaser-stale")));
+});
+
+test("the chaser probe reads the sweep's own marker row", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
+        "utf8",
+    );
+    assert.match(source, /"chaser",\s*\n\s*async \(\) => \{[\s\S]{0,400}parseSweepMarker\(row\?\.value\)/);
+    assert.match(source, /\{ phase: "unknown", completedAt: null \}/, "an unreadable marker is not 'done'");
 });

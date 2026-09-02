@@ -1115,18 +1115,27 @@ export interface ComponentVersion {
     lines: number;
     lineHash: string;
     /**
-     * The receipt-bearing expenses in the window: a count, and a hash of
-     * (id, hasReceipt).
+     * The expenses in the window: a count, and a hash of EVERY FIELD THE
+     * PLANNER READS — id, receipt presence, amount, date and vendor.
      *
      * `Expense` HAS NO `updatedAt` COLUMN — only `createdAt` and `qbSyncedAt` —
-     * so a timestamp cannot see the race that matters here: a bookkeeper
-     * attaching a receipt to an EXISTING expense flips `hasReceipt` false→true
-     * and changes the answer for every line in the component, while every
-     * timestamp on the row stays exactly where it was. Hashing the flag itself
-     * is the only fingerprint that catches it.
+     * so a timestamp cannot see the races that matter here: a bookkeeper
+     * attaching a receipt to an EXISTING expense flips `hasReceipt` false→true,
+     * and a corrected amount, date or vendor changes which line it can answer.
+     * Every one of those changes the verdict for the whole component while
+     * leaving every timestamp on the row exactly where it was, so the fields
+     * themselves are the only usable fingerprint. Hashing identity alone was
+     * the same mistake one level down.
      */
     expenses: number;
     expenseHash: string;
+    /**
+     * The intakes in the window, hashed the same way and for the same reason:
+     * `updatedAt` moves for edits we care about, but a hash of the fields the
+     * matcher actually reads (state, reason, total, date, vendor) is what
+     * proves the evidence set is unchanged rather than merely unbumped.
+     */
+    intakeHash: string;
 }
 
 /** A short, order-independent digest. Not cryptographic — a change detector. */
@@ -1157,9 +1166,23 @@ function fingerprint(parts: readonly string[]): string {
 export function componentVersionOf(input: {
     /** `targetKey` is carried so a caller can filter to one component. */
     issues: ReadonlyArray<{ targetKey?: string; updatedAt: Date | string | null }>;
-    intakes: ReadonlyArray<{ updatedAt: Date | string | null }>;
+    intakes: ReadonlyArray<{
+        id?: string;
+        updatedAt: Date | string | null;
+        state?: string | null;
+        stateReason?: string | null;
+        totalCents?: number | null;
+        txnDate?: Date | string | null;
+        vendor?: string | null;
+    }>;
     lines?: ReadonlyArray<{ id: string; updatedAt?: Date | string | null; rawDescriptor?: string | null }>;
-    expenses?: ReadonlyArray<{ id: string; hasReceipt: boolean }>;
+    expenses?: ReadonlyArray<{
+        id: string;
+        hasReceipt: boolean;
+        amountCents?: number | null;
+        date?: Date | string | null;
+        vendor?: string | null;
+    }>;
 }): ComponentVersion {
     const iso = (value: Date | string | null | undefined): string =>
         value instanceof Date ? value.toISOString() : (value ?? "");
@@ -1179,7 +1202,23 @@ export function componentVersionOf(input: {
         // changes the payee, which changes what matches.
         lineHash: fingerprint(lines.map(line => `${line.id}:${line.rawDescriptor ?? ""}`)),
         expenses: expenses.length,
-        expenseHash: fingerprint(expenses.map(expense => `${expense.id}:${expense.hasReceipt ? 1 : 0}`)),
+        // AMOUNT, DATE AND VENDOR too — they decide which line an expense can
+        // answer, so a correction to any of them changes the verdict.
+        expenseHash: fingerprint(expenses.map(expense => [
+            expense.id,
+            expense.hasReceipt ? 1 : 0,
+            expense.amountCents ?? "",
+            iso(expense.date),
+            expense.vendor ?? "",
+        ].join(":"))),
+        intakeHash: fingerprint(input.intakes.map(intake => [
+            intake.id ?? "",
+            intake.state ?? "",
+            intake.stateReason ?? "",
+            intake.totalCents ?? "",
+            iso(intake.txnDate),
+            intake.vendor ?? "",
+        ].join(":"))),
     };
 }
 
@@ -1190,5 +1229,6 @@ export function componentVersionsMatch(a: ComponentVersion, b: ComponentVersion)
         && a.lines === b.lines
         && a.lineHash === b.lineHash
         && a.expenses === b.expenses
-        && a.expenseHash === b.expenseHash;
+        && a.expenseHash === b.expenseHash
+        && a.intakeHash === b.intakeHash;
 }

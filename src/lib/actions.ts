@@ -15910,10 +15910,20 @@ export async function resolveUncertainCard(
  * `displayDetails.ownerOverride` — a key the nightly matcher PRESERVES, so the
  * next recompute cannot undo it — and the morning card picks the item up.
  */
-export async function setMissingReceiptOwner(issueId: string, owner: string) {
+export async function setMissingReceiptOwner(issueId: string, owner: string, expectedVersion: number) {
     await assertReceiptQueueAccess();
     if (typeof issueId !== "string" || !issueId) throw new Error("issueId is required");
     if (!RECEIPT_OWNER_CHOICES.includes(owner)) throw new Error("That isn't an owner we recognise");
+    // THE VERSION THE PAGE RENDERED, not the one this click happens to find.
+    //
+    // Reading the current version here and then guarding on it guards against
+    // nothing an operator cares about: the row can be cleared, reopened and
+    // rewritten between the render and the click, and the read would simply
+    // pick up whatever it had become — so an assignment aimed at the charge
+    // somebody was LOOKING at lands on a different question with the same id.
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
 
     const issue = await prisma.reviewIssue.findUnique({
         where: { id: issueId },
@@ -15921,6 +15931,9 @@ export async function setMissingReceiptOwner(issueId: string, owner: string) {
     });
     if (!issue || issue.targetType !== RECEIPT_REQUEST_TARGET_TYPE) throw new Error("Not a missing-receipt item");
     if (issue.clearedAt !== null) throw new Error("That item is already answered — refresh.");
+    if (issue.version !== expectedVersion) {
+        throw new Error("That item changed underneath you — refresh and try again.");
+    }
 
     let details: Record<string, unknown> = {};
     try {
@@ -15932,7 +15945,9 @@ export async function setMissingReceiptOwner(issueId: string, owner: string) {
     // Version-guarded: the nightly sweep writes this same column, and losing
     // that race silently would drop the assignment on the floor.
     const result = await prisma.reviewIssue.updateMany({
-        where: { id: issue.id, version: issue.version, clearedAt: null },
+        // The RENDERED version, so the write is refused atomically even if the
+        // row moved between the read above and this statement.
+        where: { id: issue.id, version: expectedVersion, clearedAt: null },
         data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
     });
     if (result.count === 0) throw new Error("That item changed underneath you — refresh and try again.");

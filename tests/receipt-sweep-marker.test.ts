@@ -67,7 +67,10 @@ test("the sweep stamps only a clean cycle, and the cards cron refuses without on
     assert.match(sweep, /chaserCompletedAt: completedAt \?\? previous\.chaserCompletedAt,/);
 
     const cards = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    assert.match(cards, /if \(!chaserCompletedFor\(marker, date\)\) \{/);
+    // The gate is now a named verdict, because the RETRY pass consults it too:
+    // it may select when the chase finished after the morning run bailed.
+    assert.match(cards, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
+    assert.match(cards, /if \(!selectionAllowed\) \{/);
     assert.match(cards, /skipped: "chaser-incomplete"/);
     // ok:false so it is visible, 200 because retrying THIS invocation would not
     // help — and nothing is claimed, so the slot is still free later.
@@ -77,7 +80,9 @@ test("the sweep stamps only a clean cycle, and the cards cron refuses without on
     const selectAt = cards.indexOf("const { items, overflow } = selectOwnerItems(");
     assert.ok(gateAt > 0 && selectAt > gateAt, "the gate comes BEFORE selection");
     // The retry pass is exempt: it never selects.
-    assert.match(cards, /if \(!retryOnly\) \{[\s\S]{0,1400}chaser-incomplete/);
+    assert.match(cards, /if \(!retryOnly\) \{[\s\S]{0,400}chaser-incomplete/);
+    // ...and a retry pass that MAY select does so rather than losing the day.
+    assert.match(cards, /if \(!selectionAllowed\) continue;/);
     assert.equal(SWEEP_MARKER_KEY, "receiptRequestsPhase", "one row, not a new table");
 });
 

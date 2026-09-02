@@ -182,7 +182,16 @@ export function ResolveOrphanButton({ intakeId, qbPurchaseId, expectedUpdatedAt 
     );
 }
 
-export function AssignOwnerControl({ issueId, currentOwner }: { issueId: string; currentOwner: string }) {
+export function AssignOwnerControl({
+    issueId,
+    currentOwner,
+    expectedVersion,
+}: {
+    issueId: string;
+    currentOwner: string;
+    /** The row version this page rendered — the server CASes on it. */
+    expectedVersion: number;
+}) {
     const [owner, setOwner] = useState("");
     const { pending, run } = useAction("Owner set — the card goes out tomorrow morning");
     return (
@@ -204,7 +213,7 @@ export function AssignOwnerControl({ issueId, currentOwner }: { issueId: string;
                 type="button"
                 className={BTN}
                 disabled={pending || !owner || owner === currentOwner}
-                onClick={() => run(() => setMissingReceiptOwner(issueId, owner))}
+                onClick={() => run(() => setMissingReceiptOwner(issueId, owner, expectedVersion))}
             >
                 Assign
             </button>

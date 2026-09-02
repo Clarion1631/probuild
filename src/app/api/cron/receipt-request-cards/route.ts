@@ -268,11 +268,17 @@ export async function GET(request: Request) {
      * The retry pass is exempt: it never selects, it only re-posts a snapshot
      * an earlier run already claimed while the chase WAS complete.
      */
+    const marker = parseSweepMarker(
+        (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,
+    );
+    /**
+     * SELECTION needs tonight's chase to have finished. POSTING an
+     * already-claimed card does not — that snapshot was chosen when the chase
+     * WAS complete, and re-posting it is the retry pass's whole job.
+     */
+    const selectionAllowed = chaserCompletedFor(marker, date);
     if (!retryOnly) {
-        const marker = parseSweepMarker(
-            (await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } }))?.value,
-        );
-        if (!chaserCompletedFor(marker, date)) {
+        if (!selectionAllowed) {
             const summary = {
                 ok: false,
                 skipped: "chaser-incomplete",
@@ -287,10 +293,15 @@ export async function GET(request: Request) {
         }
     }
     const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
-    // The retry pass posts from the claimed snapshot, so it needs no scan.
-    const scan = retryOnly
-        ? { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true }
-        : await scanCandidates();
+    // SCANNED WHENEVER SELECTION IS ALLOWED, in either mode. A retry pass that
+    // may now select (the chase finished after the morning run bailed) needs
+    // candidates to select FROM — without this it would take the new branch
+    // below and find an empty list, which is the same lost day wearing a
+    // different hat. A retry that may not select still needs no scan: it only
+    // re-posts what an earlier run claimed.
+    const scan = selectionAllowed
+        ? await scanCandidates()
+        : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true };
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Sent, but we never confirmed it. Reported, never reposted.
     const uncertain: string[] = [];
@@ -370,7 +381,16 @@ export async function GET(request: Request) {
         // explicitly; the stale row is left as the record that the day failed.
         void yesterday;
 
-        if (retryOnly) continue; // nothing claimed today; the retry pass does not select
+        /**
+         * THE RETRY PASS SELECTS TOO, when nothing was claimed for this owner.
+         *
+         * It used to skip, which lost a whole day on the most ordinary
+         * sequence there is: the 14:30 run finds the chase unfinished and
+         * claims nothing, the chase completes at 15:00, and the 16:30 retry
+         * pass — the only run left today — refused to select because there was
+         * no row to re-post. Nobody got a card, and nothing said so.
+         */
+        if (!selectionAllowed) continue;
         const { items, overflow } = selectOwnerItems(scan.candidates, owner);
         if (items.length === 0) continue;
         const token = randomUUID();

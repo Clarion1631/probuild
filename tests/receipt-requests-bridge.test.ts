@@ -290,12 +290,17 @@ test("a configured webhook that fails to deliver FAILS the run", () => {
     assert.match(source, /status: "PENDING",[\s\S]{0,200}lastError: `rejected:\$\{result\.reason\}`/);
 });
 
-test("the retry pass re-posts unposted rows and never selects new work", () => {
+test("the retry pass re-posts unposted rows, and selects only when it may", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     assert.match(source, /const retryOnly = new URL\(request\.url\)\.searchParams\.get\("retry"\) === "1";/);
-    assert.match(source, /if \(retryOnly\) continue; \/\/ nothing claimed today/);
-    // It needs no scan at all — it posts from the claimed snapshot.
-    assert.match(source, /retryOnly\s*\n\s*\? \{ candidates: \[\] as CardCandidateIssue\[\]/);
+    // It re-posts what an earlier run claimed, and — since round 20 — MAY also
+    // select when the chase finished after the morning run bailed, which is
+    // the only way that day gets a card at all.
+    assert.match(source, /if \(!selectionAllowed\) continue;/);
+    assert.match(source, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
+    // The scan follows the same verdict: needed when it may select, skipped
+    // when it may not (then it posts purely from the claimed snapshot).
+    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
 });
 
 test("the retry pass is scheduled two hours after the morning card", () => {
@@ -316,11 +321,10 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
     // Checkpoint after every page, so a killed run loses one page, not all.
     assert.match(source, /await writeCursor\(cursor\);/);
-    // The cursor must NOT advance past a target whose write threw.
-    assert.match(source, /if \(outcome\.summary\.errors > 0\) break;/);
-    // lastIndexOf: both strings appear in the open-issue pass too, and it is
-    // the LINE pass's ordering this is about.
-    const breakAt = source.lastIndexOf("if (outcome.summary.errors > 0) break;");
+    // The cursor must NOT advance past a target whose write threw — from
+    // either half of the page (round-20 finding 3).
+    assert.match(source, /if \(pageErrors > 0\) break;/);
+    const breakAt = source.lastIndexOf("if (pageErrors > 0) break;");
     const advanceAt = source.lastIndexOf("cursor = page[page.length - 1].key;");
     assert.ok(breakAt > 0 && advanceAt > breakAt, "the break must come BEFORE the cursor advances");
     // And errors make the run a 500.
@@ -521,7 +525,7 @@ test("open issues are paged with their OWN cursor and budget", () => {
     );
     // Same wall clock as the line pass, and it never checkpoints past a failure.
     assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)[\s\S]{0,400}reviewIssue\.findMany/);
-    assert.match(source, /if \(outcome\.summary\.errors > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
+    assert.match(source, /if \(pageErrors > 0\) break;[\s\S]{0,200}openCursor = page\[page\.length - 1\]\.id;/);
 });
 
 test("an issue whose BankLine is gone is CLOSED as target-missing", () => {

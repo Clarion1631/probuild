@@ -15,12 +15,18 @@
 -- true statement about them, not a convenient guess.
 ALTER TABLE "BankLine" ADD COLUMN IF NOT EXISTS "sourceOfRecord" TEXT NOT NULL DEFAULT 'STATEMENT';
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'BankLine_sourceOfRecord_check'
-                    AND conrelid = '"BankLine"'::regclass) THEN
-    ALTER TABLE "BankLine" ADD CONSTRAINT "BankLine_sourceOfRecord_check"
-      CHECK ("sourceOfRecord" IN ('STATEMENT', 'QBO'));
+DO $$
+DECLARE current_def text;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO current_def
+    FROM pg_constraint
+   WHERE conname = 'BankLine_sourceOfRecord_check'
+     AND conrelid = '"BankLine"'::regclass;
+  IF current_def IS NULL THEN
+    ALTER TABLE "BankLine" ADD CONSTRAINT "BankLine_sourceOfRecord_check" CHECK ("sourceOfRecord" IN ('STATEMENT', 'QBO'));
+  ELSIF current_def <> 'CHECK ((' || 'sourceOfRecord = ANY (ARRAY[''STATEMENT''::text, ''QBO''::text])' || '))' THEN
+    ALTER TABLE "BankLine" DROP CONSTRAINT "BankLine_sourceOfRecord_check";
+    ALTER TABLE "BankLine" ADD CONSTRAINT "BankLine_sourceOfRecord_check" CHECK ("sourceOfRecord" IN ('STATEMENT', 'QBO'));
   END IF;
 END $$;
 
@@ -92,11 +98,17 @@ ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "overflowExact" BOOLEA
 -- found in POSTING is UNCERTAIN, not retryable.
 ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT 'PENDING';
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                  WHERE conname = 'ReceiptRequestCard_status_check'
-                    AND conrelid = '"ReceiptRequestCard"'::regclass) THEN
-    ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check"
-      CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
+DO $$
+DECLARE current_def text;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO current_def
+    FROM pg_constraint
+   WHERE conname = 'ReceiptRequestCard_status_check'
+     AND conrelid = '"ReceiptRequestCard"'::regclass;
+  IF current_def IS NULL THEN
+    ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check" CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
+  ELSIF current_def <> 'CHECK ((' || 'status = ANY (ARRAY[''PENDING''::text, ''POSTING''::text, ''POSTED''::text, ''UNCERTAIN''::text])' || '))' THEN
+    ALTER TABLE "ReceiptRequestCard" DROP CONSTRAINT "ReceiptRequestCard_status_check";
+    ALTER TABLE "ReceiptRequestCard" ADD CONSTRAINT "ReceiptRequestCard_status_check" CHECK ("status" IN ('PENDING', 'POSTING', 'POSTED', 'UNCERTAIN'));
   END IF;
 END $$;

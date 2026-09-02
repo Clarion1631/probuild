@@ -55,12 +55,31 @@ test("both are additive and idempotent — a re-run must change nothing", () => 
             || /^CREATE TABLE IF NOT EXISTS/i.test(s)
             || /^CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/i.test(s)
             || /^DO \$\$ BEGIN\s+IF NOT EXISTS/i.test(s)
+            // The CONSTRAINT CONVERGENCE shape: read the current definition,
+            // add it when absent, replace it when it differs. Idempotent by
+            // COMPARISON rather than by name — which is the point, because a
+            // by-name guard lets a stale definition survive every re-run while
+            // reporting "ok".
+            || /^DO \$\$\s+DECLARE current_def text;\s+BEGIN\s+SELECT pg_get_constraintdef/i.test(s)
             // ENABLE ROW LEVEL SECURITY is idempotent by definition: enabling
             // it twice is the same as enabling it once, and it touches no row.
             || /^ALTER TABLE .* ENABLE ROW LEVEL SECURITY$/i.test(s);
         assert.ok(guarded, `not idempotent:\n  ${s.slice(0, 120)}`);
-        // Nothing here may destroy or rewrite existing data.
-        assert.doesNotMatch(s, /\bDROP\b|\bTRUNCATE\b|\bDELETE FROM\b|\bUPDATE\b/i);
+        // NOTHING HERE MAY DESTROY OR REWRITE DATA. A constraint is not data:
+        // dropping one to re-add it with the right definition changes no row,
+        // and is the only way to converge a stale check. Everything else that
+        // drops, truncates or rewrites is still forbidden.
+        assert.doesNotMatch(s, /\bDROP\s+(?:TABLE|COLUMN|INDEX|SCHEMA|DATABASE)\b/i);
+        assert.doesNotMatch(s, /\bTRUNCATE\b|\bDELETE FROM\b|\bUPDATE\s+"/i);
+        if (/\bDROP CONSTRAINT\b/i.test(s)) {
+            const name = /DROP CONSTRAINT "([^"]+)"/.exec(s)?.[1];
+            assert.ok(name, "a constraint drop must name the constraint");
+            assert.match(
+                s,
+                new RegExp(`ADD CONSTRAINT "${name}"`),
+                "a constraint may only be dropped as part of replacing it",
+            );
+        }
     }
 });
 

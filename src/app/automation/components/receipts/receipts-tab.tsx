@@ -448,7 +448,7 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                 )}
             </div>
             <div className="flex items-center gap-3 flex-wrap">
-                {row.owner === "unattributed" && <AssignOwnerControl issueId={row.id} currentOwner={row.owner} />}
+                {row.owner === "unattributed" && <AssignOwnerControl issueId={row.id} currentOwner={row.owner} expectedVersion={row.version} />}
                 {row.ownerAssigned && <span className="text-xs text-hui-textMuted">owner set by hand</span>}
                 {row.threadName && <span className="text-xs text-hui-textMuted">asked in Chat</span>}
                 {/* Reuses the register's mark-reviewed contract verbatim

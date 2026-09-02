@@ -932,8 +932,10 @@ test("book.ts and the chaser share ONE list of no-evidence reasons", () => {
     // BOTH evidence loads select it — the recompute pass and the batch pass.
     // (The batch pass's select is wrapped across lines; match the pair, not the
     // formatting.)
+    // Three now: the recompute pass, the batch pass, and the in-transaction
+    // re-read that the component fence fingerprints.
     const selects = cron.match(/state: true,\s+stateReason: true/g) ?? [];
-    assert.equal(selects.length, 2, "the batch pass and the recompute pass");
+    assert.equal(selects.length, 3, "recompute, batch, and the locked re-read");
 });
 
 
@@ -1005,7 +1007,10 @@ test("the whole component aborts together — never half its verdicts", () => {
     // underneath it.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // One transaction per component, holding its verdicts.
-    assert.match(source, /await prisma\.\$transaction\(async tx => \{[\s\S]{0,600}FOR UPDATE/);
+    assert.match(source, /await prisma\.\$transaction\(async tx => \{[\s\S]{0,1400}FOR UPDATE/);
+    // And it opens with the component's advisory lock, so two sweeps working
+    // the same set serialize instead of both passing their checks.
+    assert.match(source, /pg_advisory_xact_lock\(hashtext\(\$\{`\$\{COMPONENT_LOCK_PREFIX\}/);
     assert.match(source, /\{ open: componentOpen, close: componentClose, undecided: \[\] \}/);
     // The abort is a throw, so the transaction rolls back rather than the loop
     // continuing with some writes already committed.

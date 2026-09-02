@@ -208,6 +208,13 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
  *    chaser reads BankLine, so a dead pull silently starves it: every check
  *    stays green while the queue quietly stops finding anything. Only reported
  *    when the feature is actually on — an unset flag is not a failure.
+ *  - `chaser-stale:<hours>h` — the missing-receipt sweep has not COMPLETED a
+ *    cycle in over a day (or has never completed one). Everything downstream
+ *    reads its output: the Receipts tab's missing-receipt list is whatever it
+ *    last left behind, and the morning cards cron refuses to select at all
+ *    until it has finished today — answering `{skipped:"chaser-incomplete"}`
+ *    with HTTP 200, which is invisible unless somebody reads cron logs. This is
+ *    the check that makes a stalled chaser visible BEFORE the cards are due.
  *  - `drive-not-configured` — no Google Drive credential is loadable, so the
  *    signed-memo path cannot verify a single artifact. Every `signed:true` the
  *    bridge sends is refused with a 503 while this holds, which is correct
@@ -252,6 +259,11 @@ export function evaluatePipelineHealth(input: {
     uncertainCards: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
     driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
+    /**
+     * The missing-receipt sweep's own marker: which half it is in, and when it
+     * last finished a clean cycle.
+     */
+    chaser: { status: ProbeStatus; reason?: string; phase: string; completedAt: string | null };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -269,6 +281,7 @@ export function evaluatePipelineHealth(input: {
         ["uncertainCards", input.uncertainCards],
         ["bankPull", input.bankPull],
         ["driveCredentials", input.driveCredentials],
+        ["chaser", input.chaser],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -348,6 +361,20 @@ export function evaluatePipelineHealth(input: {
         if (stale) reasons.push("bank-pull-stale");
     }
 
+    // A CHASER THAT HAS NOT FINISHED is the input every other receipt surface
+    // depends on. Reported in HOURS so the digest says how long, rather than
+    // just that something is wrong.
+    if (input.chaser.status === "ok") {
+        const at = input.chaser.completedAt ? Date.parse(input.chaser.completedAt) : null;
+        const stale = at === null || Number.isNaN(at) || input.now - at > CHASER_STALE_HOURS * HOUR_MS;
+        if (stale) {
+            const hours = at === null || Number.isNaN(at)
+                ? "never"
+                : `${Math.floor((input.now - at) / HOUR_MS)}h`;
+            reasons.push(`chaser-stale:${hours}`);
+        }
+    }
+
     // NO DRIVE CREDENTIAL = the signed-memo path is dead, silently. Only
     // reported when the probe actually ANSWERED: a failed probe is already
     // `probe-failed:driveCredentials`.
@@ -371,6 +398,14 @@ export function evaluatePipelineHealth(input: {
  * that a dead pull is caught before the chaser has drifted a whole week.
  */
 export const BANK_PULL_STALE_HOURS = 36;
+
+/**
+ * The chaser runs a full sweep daily (plus 15-minute resume passes), so 26h is
+ * one missed night with room for a slow morning — short enough that the alarm
+ * lands BEFORE the next day's cards are due, which is the whole point of
+ * watching it.
+ */
+export const CHASER_STALE_HOURS = 26;
 
 /** Where the pull records its last SUCCESS (AutomationSetting is a KV table). */
 export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
@@ -456,7 +491,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull, driveCredentials,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull, chaser, driveCredentials,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -620,6 +655,19 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // memo arrives, because the answer "no" produces no symptom anywhere
         // else: memos are signed, the bridge is refused, and the queue simply
         // never empties.
+        // The chaser's own marker. Everything on the Receipts tab and every
+        // morning card is downstream of it, and a stalled one is otherwise
+        // silent: the cards cron answers 200 with `skipped:"chaser-incomplete"`.
+        probe<{ phase: string; completedAt: string | null }>(
+            "chaser",
+            async () => {
+                const { SWEEP_MARKER_KEY, parseSweepMarker } = await import("./receipt-sweep-marker");
+                const row = await prisma.automationSetting.findUnique({ where: { key: SWEEP_MARKER_KEY } });
+                const marker = parseSweepMarker(row?.value);
+                return { phase: marker.phase, completedAt: marker.chaserCompletedAt };
+            },
+            { phase: "unknown", completedAt: null },
+        ),
         probe<{ ok: boolean; source: string }>(
             "driveCredentials",
             async () => {
@@ -674,6 +722,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: uncertainCards.status,
             reason: uncertainCards.reason,
             count: uncertainCards.value,
+        },
+        chaser: {
+            status: chaser.status,
+            reason: chaser.reason,
+            phase: chaser.value.phase,
+            completedAt: chaser.value.completedAt,
         },
         driveCredentials: {
             status: driveCredentials.status,

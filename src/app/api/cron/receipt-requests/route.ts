@@ -499,6 +499,35 @@ async function componentIssueRows(lineIds: string[]): Promise<Array<{ targetKey:
     });
 }
 
+/**
+ * Every bank-line issue, reduced to the three things a plan reads: which are
+ * OPEN, which carry a RESOLUTION, and each one's details.
+ *
+ * One query, one shape, two callers — the run's opening snapshot and every
+ * replan. Two loaders would drift, and the drift would be invisible: a replan
+ * reading a subtly different set is exactly the bug the replan exists to fix.
+ */
+async function loadIssueSnapshot(): Promise<{
+    openIssues: Array<{ targetKey: string }>;
+    resolvedIssueKeys: string[];
+    detailsByKey: Map<string, Record<string, unknown>>;
+}> {
+    const allIssues = await prisma.reviewIssue.findMany({
+        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
+        select: { targetKey: true, clearedAt: true, displayDetails: true },
+    });
+    const detailsByKey = new Map(
+        allIssues.map(issue => [issue.targetKey, parseMissingReceiptDetails(issue.displayDetails)]),
+    );
+    return {
+        openIssues: allIssues.filter(issue => issue.clearedAt === null).map(issue => ({ targetKey: issue.targetKey })),
+        resolvedIssueKeys: allIssues
+            .filter(issue => hasResolution(detailsByKey.get(issue.targetKey)))
+            .map(issue => issue.targetKey),
+        detailsByKey,
+    };
+}
+
 /** Raised inside a component transaction when its inputs moved. Aborts it. */
 class ComponentMovedError extends Error {
     constructor() {
@@ -513,6 +542,13 @@ class ComponentMovedError extends Error {
  * re-read is four queries and the writes are one per verdict.
  */
 const COMPONENT_TX_TIMEOUT_MS = 15_000;
+
+/**
+ * Namespace for the per-component advisory lock. Every writer of a component
+ * takes `hashtext(prefix + componentKey)`, so two sweeps working the same set
+ * serialize rather than both passing their fingerprint checks and both writing.
+ */
+const COMPONENT_LOCK_PREFIX = "receipt-component:";
 
 function emptySummary(): ReceiptRequestApplySummary {
     return { opened: 0, closed: 0, touched: 0, skipped: 0, errors: 0, failedTargets: [] };
@@ -535,11 +571,29 @@ async function processBatchWithReplan(
     cohortMode: "window" | "closure" = "window",
 ): Promise<{ summary: ReceiptRequestApplySummary; undecided: number; replans: number }> {
     let replans = 0;
+    let issues = openIssues;
+    let resolved = resolvedIssueKeys;
+    let details = detailsByKey;
     for (let attempt = 1; attempt <= MAX_COMPONENT_REPLANS; attempt++) {
-        const outcome = await processBatch(batch, openIssues, resolvedIssueKeys, detailsByKey, now, cohortMode);
+        const outcome = await processBatch(batch, issues, resolved, details, now, cohortMode);
         if (!outcome.replan) return { ...outcome, replans };
         replans++;
         console.log("[cron/receipt-requests] component changed mid-plan; replanning", batch.length, "line(s)", attempt);
+
+        /**
+         * RELOAD THE ISSUE STATE BEFORE REPLANNING.
+         *
+         * A replan happens precisely BECAUSE something moved, and the most
+         * common something is a memo signed on a sibling — which lands in these
+         * three inputs and nowhere else. Retrying with the run-start snapshot
+         * replans against the very state that was already stale, so the second
+         * attempt reaches the same wrong verdict as the first and opens a chase
+         * for a charge somebody just answered.
+         */
+        const reloaded = await loadIssueSnapshot();
+        issues = reloaded.openIssues;
+        resolved = reloaded.resolvedIssueKeys;
+        details = reloaded.detailsByKey;
     }
     // Deliberately no verdict, and it is REPORTED as undecided rather than
     // hidden: a chase left open is a question a human can answer; a chase
@@ -770,13 +824,37 @@ async function processBatch(
             issues: planIssueRows.filter(issue => ids.has(issue.targetKey)),
             intakes: intakeRows.filter(row => intakeInWindow(row.txnDate)),
             lines: componentLines.map(row => ({ id: row.id, rawDescriptor: row.rawDescriptor })),
+            // EVERY FIELD THE PLANNER READS, not just identity: an amount, date
+            // or vendor correction changes which line an expense can answer.
             expenses: expenseRows
                 .filter(row => expenseInWindow(row.date))
-                .map(row => ({ id: row.id, hasReceipt: !!row.receiptUrl || row.receiptIntake !== null })),
+                .map(row => ({
+                    id: row.id,
+                    hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+                    amountCents: decimalStringToCents(row.amount.toString()),
+                    date: row.date,
+                    vendor: row.vendor,
+                })),
         });
 
         try {
             await prisma.$transaction(async tx => {
+                /**
+                 * 0. THE COMPONENT LOCK.
+                 *
+                 * Row locks cover the rows that EXIST; they cannot exclude a
+                 * concurrent sweep that is about to read the same Expense and
+                 * BankLine rows (ordinary reads take no lock) or insert a new
+                 * competitor into the same window. One advisory lock per
+                 * component, taken by every writer of that component, is what
+                 * makes the fingerprint check meaningful rather than advisory:
+                 * two sweeps serialize instead of both passing their checks and
+                 * both writing.
+                 *
+                 * $executeRaw, not $queryRaw: pg_advisory_xact_lock returns void.
+                 */
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${COMPONENT_LOCK_PREFIX}${component.key}`}))`;
+
                 // 1. LOCKS, in id order, one statement each.
                 const issueKeys = [...component.lineIds].sort();
                 await tx.$queryRaw`
@@ -805,7 +883,10 @@ async function processBatch(
                     }),
                     intakes: await tx.receiptIntake.findMany({
                         where: { txnDate: componentRange.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
-                        select: { updatedAt: true },
+                        select: {
+                            id: true, updatedAt: true, state: true, stateReason: true,
+                            totalCents: true, txnDate: true, vendor: true,
+                        },
                     }),
                     lines: await tx.bankLine.findMany({
                         where: { amountCents: { in: amounts }, postedDate: componentRange.calendar },
@@ -813,8 +894,17 @@ async function processBatch(
                     }),
                     expenses: (await tx.expense.findMany({
                         where: { date: componentRange.timestamp },
-                        select: { id: true, receiptUrl: true, receiptIntake: { select: { id: true } } },
-                    })).map(row => ({ id: row.id, hasReceipt: !!row.receiptUrl || row.receiptIntake !== null })),
+                        select: {
+                            id: true, amount: true, date: true, vendor: true,
+                            receiptUrl: true, receiptIntake: { select: { id: true } },
+                        },
+                    })).map(row => ({
+                        id: row.id,
+                        hasReceipt: !!row.receiptUrl || row.receiptIntake !== null,
+                        amountCents: decimalStringToCents(row.amount.toString()),
+                        date: row.date,
+                        vendor: row.vendor,
+                    })),
                 });
                 if (!componentVersionsMatch(planned, current)) throw new ComponentMovedError();
 
@@ -1013,21 +1103,13 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
 
     // Every bank-line issue, open OR cleared. The open ones say what may need
     // closing; the cleared ones carry resolutions that must not be re-asked.
-    const allIssues = await prisma.reviewIssue.findMany({
-        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
-        select: { targetKey: true, clearedAt: true, displayDetails: true },
-    });
-    const openIssues = allIssues.filter(issue => issue.clearedAt === null);
+    //
     // ONE query for every issue in the sweep, parsed once and reused by every
     // batch — the bulk half of the lifecycle work. The per-issue FRESH read
-    // before each write stays: it is what stops a memo signed mid-run from
-    // being un-answered, and no amount of bulking is worth losing that.
-    const detailsByKey = new Map(
-        allIssues.map(issue => [issue.targetKey, parseMissingReceiptDetails(issue.displayDetails)]),
-    );
-    const resolvedIssueKeys = allIssues
-        .filter(issue => hasResolution(parseMissingReceiptDetails(issue.displayDetails)))
-        .map(issue => issue.targetKey);
+    // before each write stays, and so does the RELOAD on every replan: it is
+    // what stops a memo signed mid-run from being un-answered, and no amount of
+    // bulking is worth losing that.
+    const { openIssues, resolvedIssueKeys, detailsByKey } = await loadIssueSnapshot();
 
     // OLDEST-FIRST, FROM A DURABLE CURSOR, IN TIME-BUDGETED BATCHES.
     //
@@ -1089,6 +1171,11 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // pointing at nothing.
         const present = new Set(lines.map(line => line.id));
         const orphaned = page.filter(issue => !present.has(issue.targetKey));
+        // ANY failure on THIS page stops the checkpoint. An orphan close that
+        // threw used to be counted and then stepped over, and a later
+        // `?continue=1` could finish the pass and clear the cursor — stranding
+        // that issue permanently, nagging with a target nothing can answer.
+        let pageErrors = 0;
         for (const issue of orphaned) {
             try {
                 const details = detailsByKey.get(issue.targetKey) ?? {};
@@ -1103,6 +1190,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
                 targetMissing++;
             } catch (error) {
                 openPass.errors++;
+                pageErrors++;
                 openPass.failedTargets.push(issue.targetKey);
                 console.error("[cron/receipt-requests] target-missing close failed", issue.targetKey,
                     error instanceof Error ? error.message : "UnknownError");
@@ -1128,9 +1216,12 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             openPass.errors += outcome.summary.errors;
             openPass.failedTargets.push(...outcome.summary.failedTargets);
             openUndecided += outcome.undecided;
-            // Same rule as the line pass: never checkpoint past a failure.
-            if (outcome.summary.errors > 0) break;
+            pageErrors += outcome.summary.errors;
         }
+
+        // Same rule as the line pass: never checkpoint past a failure — from
+        // EITHER half of this page.
+        if (pageErrors > 0) break;
 
         openCursor = page[page.length - 1].id;
         await writeOpenCursor(openCursor);
