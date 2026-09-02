@@ -442,12 +442,30 @@ export async function runBackfill({
     // because clock-in already requires a phase.
     const timeEntries = await db.timeEntry.findMany({
         where: { projectId: { in: scopedProjectIds } },
-        select: { costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true },
+        select: {
+            costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true,
+            // Needed to scope the item fallback to the entry's OWN job.
+            projectId: true,
+        },
     });
+    // PROJECT-SCOPED, exactly like the expense side. A time entry pointing at
+    // another job's estimate item is unattributed on the variance page, so
+    // resolving it through a global id->code map counted labor dollars as
+    // covered that the report itself does not — the same flattering error the
+    // expense metric had.
+    const laborItems = scopedItemCostCodes(
+        timeEntries.map(t => ({
+            projectId: t.projectId,
+            estimate: null,
+            itemId: t.estimateItemId,
+        })),
+        items,
+        allowedCodesByProject,
+    );
     const laborRows = timeEntries.map(t => ({
         costCodeId: resolveExpenseCostCodeId(
             { costCodeId: t.costCodeId, itemId: t.estimateItemId },
-            itemCostCodeById,
+            laborItems,
         ),
         amount: num(t.laborCost) + num(t.burdenCost),
     }));

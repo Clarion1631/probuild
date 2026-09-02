@@ -14,6 +14,7 @@ import { isOverheadProject } from "./overhead-project";
 import { dateOnlyInTimeZone } from "./tz-date";
 import { resolveCompanyTimeZone } from "./company-timezone";
 import { isCostCodeAllowedForProject } from "./project-phases";
+import { lockExpense } from "./expense-lock";
 import { prismaPhaseDataSource } from "./project-phases-db";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
@@ -531,6 +532,7 @@ type ExpenseTransaction = {
             qbSyncToken: string | null;
             estimateId: string;
             projectId?: string | null;
+            updatedAt?: Date;
             taxAmount?: unknown;
             taxAtSource?: boolean;
             installedAtCustomer?: boolean | null;
@@ -763,6 +765,26 @@ function planIsNoop(existing: ExistingQboExpense, plan: QboExpenseUpdatePlan): b
     return true;
 }
 
+/**
+ * The values a plan was computed from. `updatedAt` covers everything else on
+ * the row — including the attribution the authorization rested on — so a
+ * re-attribution landing in the gap fails the CAS rather than being written
+ * over by a plan that never saw it.
+ */
+function casWhere(existing: {
+    id: string;
+    updatedAt?: Date;
+    taxAmount?: unknown;
+    taxDeductibleBase?: unknown;
+}): Record<string, unknown> {
+    return {
+        id: existing.id,
+        ...(existing.updatedAt ? { updatedAt: existing.updatedAt } : {}),
+        taxAmount: existing.taxAmount ?? null,
+        taxDeductibleBase: existing.taxDeductibleBase ?? null,
+    };
+}
+
 async function lockQboExpense(
     transaction: ExpenseTransaction,
     qbPurchaseId: string,
@@ -793,6 +815,7 @@ export async function upsertQboExpense(
                 qbSyncToken: true,
                 estimateId: true,
                 projectId: true,
+                updatedAt: true,
                 taxAmount: true,
                 taxDeductibleBase: true,
                 amount: true,
@@ -813,6 +836,12 @@ export async function upsertQboExpense(
             return "imported";
         }
 
+        // The per-EXPENSE lock, on top of the per-purchase one already held.
+        // They are different scopes: the purchase lock orders two syncs of the
+        // same Purchase, this one orders the sync against the tax PATCH and the
+        // booking fill, which know nothing about QBO purchase ids.
+        await lockExpense(transaction, existing.id);
+
         const plan = planQboExpenseUpdate(existing, write);
         if (planIsNoop(existing, plan)) return "unchanged";
 
@@ -832,33 +861,34 @@ export async function upsertQboExpense(
         // re-plan once, which is enough because the second read is inside the
         // advisory lock this transaction already holds.
         const cas = await transaction.expense.updateMany({
-            where: {
-                id: existing.id,
-                taxAmount: existing.taxAmount ?? null,
-                taxDeductibleBase: existing.taxDeductibleBase ?? null,
-            },
+            where: casWhere(existing),
             data: plan.data,
         });
         if (cas.count > 0) return "updated";
 
-        // The tax values moved between the read and the write — a bookkeeper's
-        // PATCH landed. Re-read and RE-PLAN once against what is actually
-        // there. Once is enough: this transaction holds the per-purchase
-        // advisory lock, so the only writer that can beat it is that PATCH, and
-        // it has now committed.
+        // The row moved between the read and the write despite the lock — i.e.
+        // a writer that does NOT take it (a script, a migration, a path nobody
+        // wired). Re-read, RE-PLAN, and re-CAS: never an unconditional write,
+        // because the same thing can happen again and "give up and clobber" is
+        // not a resolution when the loser is a human's tax answer.
         const fresh = await transaction.expense.findUnique({
             where: { qbPurchaseId: write.qbPurchaseId },
             select: {
                 id: true, qbSyncToken: true, estimateId: true, projectId: true,
-                taxAmount: true, taxDeductibleBase: true, amount: true,
+                updatedAt: true, taxAmount: true, taxDeductibleBase: true, amount: true,
                 vendor: true, date: true, description: true, status: true,
             },
         });
         if (!fresh) return "unchanged";
         const replanned = planQboExpenseUpdate(fresh, write);
         if (planIsNoop(fresh, replanned)) return "unchanged";
-        await transaction.expense.update({ where: { id: fresh.id }, data: replanned.data });
-        return "updated";
+        const retry = await transaction.expense.updateMany({
+            where: casWhere(fresh),
+            data: replanned.data,
+        });
+        // Still contended. Leaving it is correct: the sync's facts are
+        // recoverable on the next run, a discarded tax correction is not.
+        return retry.count > 0 ? "updated" : "unchanged";
     });
 }
 

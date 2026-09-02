@@ -26,7 +26,11 @@ let storedExpense: Record<string, unknown> | null;
 let updateArgs: { where: unknown; data: Record<string, unknown> } | null;
 let estimateItems: { id: string; estimateId: string; projectId: string | null }[];
 
-const fakePrisma = {
+const fakePrisma: any = {
+    // The tax PATCH writes inside a transaction that first takes the shared
+    // per-expense advisory lock.
+    $transaction: async (fn: any) => fn(fakePrisma),
+    $queryRawUnsafe: async () => [{ lock_result: null }],
     expense: {
         findUnique: async () => storedExpense,
         update: async (args: { where: unknown; data: Record<string, unknown> }) => {
@@ -39,7 +43,12 @@ const fakePrisma = {
             const row = storedExpense as Record<string, any> | null;
             if (!row) return { count: 0 };
             const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
-            for (const key of ["amount", "taxAmount", "taxDeductibleBase"]) {
+            for (const key of [
+                "amount", "taxAmount", "taxDeductibleBase",
+                // The attribution the authorization rested on, plus the row
+                // version that covers everything else.
+                "projectId", "estimateId", "updatedAt",
+            ]) {
                 if (key in args.where && !eq(row[key], args.where[key])) return { count: 0 };
             }
             updateArgs = args;
@@ -115,6 +124,7 @@ beforeEach(() => {
         taxAtSource: true,
         taxDeductibleBase: null,
         needsTaxReview: false,
+        updatedAt: new Date("2026-09-01T00:00:00.000Z"),
         estimateId: "est-job-1",
         projectId: "job-1",
         estimate: { projectId: "job-1" },
@@ -448,4 +458,72 @@ test("the CAS names the values the decision rested on", async () => {
     assert.equal(where.amount, 207.74);
     assert.equal(where.taxAmount, 16.55);
     assert.equal(where.taxDeductibleBase, null);
+});
+
+// ── #1 deletion is authorized on the RESOLVED job ──────────────────────────
+
+test("DELETE authorizes on the job the expense is actually on, not its estimate's", async () => {
+    // A re-attributed expense: projectId says job-1, the estimate still says
+    // job-2. Someone with access only to the OLD job must not be able to
+    // destroy it, and someone with access to the new one must be able to.
+    storedExpense = {
+        ...storedExpense,
+        projectId: "job-1",
+        estimateId: "est-job-2",
+        estimate: { projectId: "job-2" },
+    };
+
+    currentUser = { id: "u-old", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-2"] };
+    assert.equal((await del()).status, 403, "the job it LEFT confers nothing");
+    assert.equal(deleteArgs, null);
+
+    currentUser = { id: "u-new", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    assert.equal((await del()).status, 200, "the job it is ON does");
+});
+
+// ── #2 the CAS covers the attribution the authorization rested on ──────────
+
+test("a PATCH is refused when the row was RE-ATTRIBUTED under it", async () => {
+    // Access was granted because of the project this row was on. If it moved,
+    // the permission check that let the request through was answered about a
+    // different job — so the write must not land, even though every money
+    // value it validated is untouched.
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200, "control");
+
+    const original = fakePrisma.expense.updateMany;
+    fakePrisma.expense.updateMany = async (args: any) => {
+        // Model the re-attribution: the row's projectId no longer matches.
+        if (args.where.projectId === "job-1") return { count: 0 };
+        return original(args);
+    };
+    try {
+        const stale = await patch({ installedAtCustomer: true });
+        assert.equal(stale.status, 409);
+        assert.equal((await stale.json()).code, "STALE_EXPENSE");
+    } finally {
+        fakePrisma.expense.updateMany = original;
+    }
+});
+
+test("the CAS names projectId, estimateId and updatedAt", async () => {
+    await patch({ installedAtCustomer: true });
+    const where = updateArgs?.where as Record<string, unknown>;
+    assert.equal(where.projectId, "job-1");
+    assert.equal(where.estimateId, "est-job-1");
+    assert.ok(where.updatedAt instanceof Date, "the row version pins everything else");
+});
+
+test("the tax PATCH writes under the shared per-expense lock", async () => {
+    const locks: unknown[][] = [];
+    const originalLock = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (...args: unknown[]) => { locks.push(args); return [{}]; };
+    try {
+        await patch({ installedAtCustomer: true });
+        assert.equal(locks.length, 1, "exactly one lock, taken before the write");
+        assert.match(String(locks[0][0]), /pg_advisory_xact_lock/);
+        assert.equal(locks[0][1], "expense:e1", "namespaced per expense");
+    } finally {
+        fakePrisma.$queryRawUnsafe = originalLock;
+    }
 });

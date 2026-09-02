@@ -142,8 +142,18 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
                 expenseUpdates.push(args);
                 const cur = state.existingExpense ?? {};
                 const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
-                for (const key of ["projectId", "costCodeId", "taxAmount", "installedAtCustomer"]) {
+                for (const key of ["costCodeId", "taxAmount", "installedAtCustomer"]) {
                     if (key in args.where && !eq(cur[key], args.where[key])) return { count: 0 };
+                }
+                // `projectId` is pinned in every fill predicate to the
+                // attribution the decision was made under; the project fill
+                // itself pins NULL.
+                if ("projectId" in args.where) {
+                    const want = args.where.projectId;
+                    const have = cur.projectId ?? null;
+                    if (want === null ? have !== null : !(have === null || have === want)) {
+                        return { count: 0 };
+                    }
                 }
                 if (Array.isArray(args.where.OR)) {
                     const src = cur.costCodeSource ?? null;
@@ -157,6 +167,8 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
                 return { count: 1 };
             },
         },
+        // The fill takes the shared per-expense advisory lock first.
+        $queryRawUnsafe: async () => [{ lock_result: null }],
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
             updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },

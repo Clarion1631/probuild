@@ -8,6 +8,7 @@ import {
     assertExpenseMutableOutsideQbo,
 } from "@/lib/qbo-expense-guard";
 import { resolveExpenseProjectId } from "@/lib/expense-attribution";
+import { lockExpense } from "@/lib/expense-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -314,6 +315,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 taxDeductibleBase: true,
                 estimateId: true,
                 projectId: true,
+                updatedAt: true,
                 estimate: { select: { projectId: true } },
             },
         });
@@ -507,6 +509,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             amount: expense.amount,
             taxAmount: expense.taxAmount,
             taxDeductibleBase: expense.taxDeductibleBase,
+            // THE ATTRIBUTION THE AUTHORIZATION RESTED ON. Access to this row
+            // was granted because of the project it was on; if it has since
+            // been re-attributed, the permission check that let this request
+            // through was answered about a different job. `updatedAt` catches
+            // everything else that moved.
+            projectId: expense.projectId,
+            estimateId: expense.estimateId,
+            updatedAt: expense.updatedAt,
         };
         const data = {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
@@ -528,7 +538,15 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                     }
                     : {}),
         };
-        const written = await prisma.expense.updateMany({ where: casWhere, data });
+        // The write runs under the shared per-expense lock, so this request is
+        // ordered against the QBO sync and the booking fill rather than merely
+        // racing them. The CAS stays inside it: the lock orders the writers
+        // that TAKE it, the predicate is what still protects against one that
+        // does not.
+        const written = await prisma.$transaction(async tx => {
+            await lockExpense(tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> }, id);
+            return tx.expense.updateMany({ where: casWhere, data });
+        });
         if (written.count === 0) {
             return NextResponse.json(
                 {

@@ -672,6 +672,12 @@ model Expense {
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
   createdAt DateTime @default(now())
+  /// Row version. Exists so the tax PATCH can COMPARE-AND-SET against the exact
+  /// row it authorized and validated against — attribution included. Without
+  /// it the CAS could only name the money columns, and a re-attribution
+  /// landing in the gap would slip past a check that had already decided who
+  /// was allowed to make it.
+  updatedAt DateTime @updatedAt
 
   /// Back-relation for ReceiptIntake.expenseId. Declared here rather than left
   /// SQL-only because `prisma migrate diff` WOULD see a foreign key that

@@ -628,8 +628,18 @@ function createFakePrisma(initial: StoredExpense[] = []) {
                 $queryRawUnsafe: (query: string, qbPurchaseId: string) => Promise<unknown>;
             }) => Promise<T>) {
                 let releaseLock: (() => void) | undefined;
+                // RE-ENTRANT, like the real thing. `pg_advisory_xact_lock` is
+                // held for the whole transaction and taking it again inside the
+                // same one returns immediately — the sync now takes two (per
+                // purchase, then per expense). A fake that serialised every
+                // call made the second wait on a lock the same transaction
+                // already held, which is a deadlock the database would never
+                // have.
+                let heldByThisTransaction = false;
                 const transactionLock = {
                     async $queryRawUnsafe() {
+                        if (heldByThisTransaction) return [{ pg_advisory_xact_lock: null }];
+                        heldByThisTransaction = true;
                         const previous = lockTail;
                         lockTail = new Promise<void>(resolve => {
                             releaseLock = resolve;
@@ -1704,4 +1714,77 @@ test("invalidating an ALLOCATION also flags the row — never a silent null", as
     assert.equal(plan.data.needsTaxReview, true, "and the report must skip it until re-checked");
     // The tax itself is still valid against the new gross, so it stays.
     assert.ok(!("taxAmount" in plan.data));
+});
+
+// ── #3 interleaving: the sync never clobbers, and never gives up and writes ─
+
+test("the sync takes the per-EXPENSE lock as well as the per-purchase one", async () => {
+    const fake = createFakePrisma([
+        { ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null } as any,
+    ]);
+    const keys: unknown[] = [];
+    const wrapped = {
+        ...fake.client,
+        async $transaction(cb: any) {
+            return fake.client.$transaction(async (tx: any) => {
+                const inner = tx.$queryRawUnsafe;
+                tx.$queryRawUnsafe = async (...args: unknown[]) => { keys.push(args[1]); return inner(...args); };
+                return cb(tx);
+            });
+        },
+    };
+    await upsertQboExpense(wrapped as any, { ...WRITE, qbSyncToken: "1", amount: 400 });
+    assert.ok(keys.includes("expense:expense-1"), `expense lock missing: ${JSON.stringify(keys)}`);
+});
+
+test("a RE-ATTRIBUTION mid-sync fails the CAS and is re-planned, not overwritten", async () => {
+    // The attribution moved under the sync. `updatedAt` is in the predicate, so
+    // the first write matches nothing; the re-plan reads the row as it now is.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            taxAmount: 500, taxDeductibleBase: null, installedAtCustomer: true,
+            updatedAt: new Date("2026-09-01T00:00:00.000Z"),
+        } as any,
+    ]);
+    const stored = fake.rows.get("purchase-1") as any;
+    const prePatch = { ...stored };
+    fake.rows.set("purchase-1", {
+        ...stored, projectId: "moved-by-hand", taxAmount: 16.55,
+        updatedAt: new Date("2026-09-02T00:00:00.000Z"),
+    });
+
+    let firstRead = true;
+    const realFindUnique = fake.expense.findUnique;
+    fake.expense.findUnique = async (args: any) => {
+        if (firstRead) { firstRead = false; return prePatch; }
+        return realFindUnique(args);
+    };
+
+    await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 300 });
+    const after = fake.rows.get("purchase-1") as any;
+    assert.equal(after.projectId, "moved-by-hand", "the re-attribution stands");
+    assert.equal(after.taxAmount, 16.55, "and the tax answer with it");
+});
+
+test("a permanently contended row is LEFT ALONE, never unconditionally written", async () => {
+    // Both the CAS and its retry miss. The sync's own facts are recoverable on
+    // the next run; a discarded human answer is not, so the correct move is to
+    // do nothing rather than to clobber.
+    const fake = createFakePrisma([
+        {
+            ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+            taxAmount: 500, taxDeductibleBase: null,
+            updatedAt: new Date("2026-09-01T00:00:00.000Z"),
+        } as any,
+    ]);
+    const before = { ...(fake.rows.get("purchase-1") as any) };
+    fake.expense.updateMany = async () => ({ count: 0 });
+    let updateCalls = 0;
+    fake.expense.update = (async () => { updateCalls += 1; return {} as never; }) as typeof fake.expense.update;
+
+    const result = await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 300 });
+    assert.equal(result, "unchanged");
+    assert.equal(updateCalls, 0, "no unconditional write anywhere on this path");
+    assert.deepEqual(fake.rows.get("purchase-1"), before);
 });

@@ -87,7 +87,12 @@ test("the ReceiptIntake columns are behind a to_regclass guard in both files", (
 test("the backfill UPDATE only ever touches rows whose projectId is still NULL", () => {
     // This is the whole of its idempotency. A re-run must report 0 rows, and a
     // manual re-attribution must survive it.
-    const update = (statements as string[]).find(s => s.trimStart().startsWith("UPDATE"));
+    // Selected by what it WRITES, not by "the first UPDATE" — the script now
+    // carries a second one (the updatedAt backfill), and a positional match
+    // would have silently started asserting about the wrong statement.
+    const update = (statements as string[]).find(
+        s => s.trimStart().startsWith("UPDATE") && s.includes('SET "projectId"'),
+    );
     assert.ok(update, "the script must carry the backfill UPDATE");
     assert.match(update!, /e\."projectId" IS NULL/);
     assert.match(update!, /est\."projectId" IS NOT NULL/);

@@ -651,3 +651,31 @@ test("coverage ignores an item whose code is not a live phase of the job", () =>
     assert.equal(scoped.size, 0);
     assert.equal(measureCoverage(rows, scoped).unattributed, 100);
 });
+
+test("LABOR item dollars from another job stay unattributed too", () => {
+    // The expense side was scoped in round 7; the labor side still resolved
+    // through a global id->code map, so a time entry pointing at another job's
+    // estimate item counted as covered when the variance page says it is not.
+    const entries = [
+        { projectId: "job-1", estimate: null, itemId: "item-elsewhere" },
+        { projectId: "job-1", estimate: null, itemId: "item-own" },
+    ];
+    const items = new Map([
+        ["item-elsewhere", { costCodeId: "cc-frame", estimateId: "est-2", projectId: "job-2" }],
+        ["item-own", { costCodeId: "cc-plumb", estimateId: "est-1", projectId: "job-1" }],
+    ]);
+    const scoped = scopedItemCostCodes(entries, items, ALL_PHASES);
+
+    assert.equal(scoped.has("item-own"), true);
+    assert.equal(scoped.has("item-elsewhere"), false, "another job's item is not this job's coverage");
+
+    const labor = measureCoverage(
+        [
+            { costCodeId: null, itemId: "item-elsewhere", amount: 900 },
+            { costCodeId: null, itemId: "item-own", amount: 100 },
+        ],
+        scoped,
+    );
+    assert.equal(labor.attributed, 100);
+    assert.equal(labor.unattributed, 900);
+});

@@ -28,6 +28,19 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30
 -- Set when a re-sync invalidated a human tax classification (see the sync).
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false;
 
+-- A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
+--
+-- Added in three steps on purpose: nullable, backfilled, then NOT NULL. A
+-- single `ADD COLUMN ... NOT NULL DEFAULT now()` would leave a DB-level default
+-- that `updatedAt DateTime @updatedAt` does not declare, and CI's
+-- "migrations reproduce production" check compares the two.
+--
+-- Each statement is independently re-runnable: IF NOT EXISTS, a predicate-bound
+-- UPDATE, and a SET NOT NULL that is a no-op once applied.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3);
+UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL;
+ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");
 
 -- SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A

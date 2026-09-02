@@ -88,6 +88,14 @@ export const statements = [
     // Set when a re-sync invalidated a human tax classification.
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL DEFAULT false`,
 
+    // A ROW VERSION FOR THE TAX CORRECTION PATH (Codex round 9, item 2).
+    // Three steps on purpose — nullable, backfill, NOT NULL — because a single
+    // NOT NULL DEFAULT now() would leave a DB default that `@updatedAt` does
+    // not declare, and CI compares the two. Each step is re-runnable.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3)`,
+    `UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", CURRENT_TIMESTAMP) WHERE "updatedAt" IS NULL`,
+    `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
+
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
 
     // SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
@@ -187,6 +195,7 @@ export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
         "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
+        "updatedAt",
     ],
 };
 

@@ -20,6 +20,7 @@
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
+import { lockExpense } from "@/lib/expense-lock";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -682,6 +683,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // already answered (true OR false) is a tax answer nobody but a
             // bookkeeper may change.
             if (existing) {
+                // The shared per-expense lock, so this fill is ORDERED against
+                // the tax PATCH and the QBO sync instead of racing them. The
+                // guarded predicates below stay: the lock orders the writers
+                // that take it, the predicate protects against one that does not.
+                await lockExpense(tx as any, existing.id);
+
                 const existingProjectId = existing.projectId ?? existing.estimate?.projectId ?? null;
                 // ATTRIBUTION CONFLICT. The Purchase is already on a different
                 // job than this intake row claims. Filling fields would be
@@ -707,6 +714,14 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // Split per field because the conditions differ and a single
                 // predicate would make one field's contention veto another's
                 // legitimate fill.
+                // `expectedProjectId` is the attribution EVERY decision below
+                // was made under — the conflict check above passed against it.
+                // Pinning it in each predicate means a re-attribution landing
+                // in the gap makes the fill match zero rows rather than
+                // writing a phase and a tax answer onto a job they were never
+                // about.
+                const expectedProjectId = existing.projectId ?? null;
+
                 if (!existing.projectId && row.projectId) {
                     await tx.expense.updateMany({
                         where: { id: existing.id, projectId: null },
@@ -717,6 +732,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     await tx.expense.updateMany({
                         where: {
                             id: existing.id,
+                            projectId: expectedProjectId ?? row.projectId,
                             costCodeId: null,
                             // A human's phase outranks anything booking knows.
                             // The explicit NULL branch matters: SQL `NOT IN`
@@ -736,13 +752,21 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 // re-read.
                 if (taxApplied > 0) {
                     await tx.expense.updateMany({
-                        where: { id: existing.id, taxAmount: null },
+                        where: {
+                            id: existing.id,
+                            projectId: expectedProjectId ?? row.projectId,
+                            taxAmount: null,
+                        },
                         data: { taxAmount: taxApplied / 100, taxAtSource: true },
                     });
                 }
                 if (row.installedAtCustomer !== null) {
                     await tx.expense.updateMany({
-                        where: { id: existing.id, installedAtCustomer: null },
+                        where: {
+                            id: existing.id,
+                            projectId: expectedProjectId ?? row.projectId,
+                            installedAtCustomer: null,
+                        },
                         data: { installedAtCustomer: row.installedAtCustomer },
                     });
                 }
