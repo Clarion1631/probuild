@@ -346,13 +346,18 @@ export function blockingEntries(
 
 /**
  * One blocker per worker who has hours IN THE PERIOD but no answer to "how does
- * Gusto pay this person".
+ * Gusto pay this person" — the STORED payType first, then the
+ * PAYROLL_SALARIED_EMAILS override (`isSalariedOverride`), the same order
+ * isSalariedOwner uses elsewhere (pay-rate-guard.ts). Skipping the override
+ * here used to leave it able to classify a null-payType user as salaried
+ * everywhere else in this export (buildGustoExport's own `isSalaried`, the
+ * roster UI, the zero-rate guard) while this blocker kept refusing to run for
+ * exactly that person — the override could never actually unblock an export.
  *
- * Guessing is a wrong paycheque either way: treat a salaried person as hourly
- * and Gusto pays them twice; treat an hourly person as salaried and they are
- * not paid at all. The env list (PAYROLL_SALARIED_EMAILS) cannot close this gap
- * because an absent email is indistinguishable from "hourly" — it fails open by
- * construction. So the export refuses until User.payType says.
+ * Guessing beyond both of those is still a wrong paycheque either way: treat a
+ * salaried person as hourly and Gusto pays them twice; treat an hourly person
+ * as salaried and they are not paid at all. So the export refuses until
+ * User.payType or the named override says.
  *
  * Scoped to the PERIOD, not the envelope: only people actually being paid for
  * this period need an answer.
@@ -361,7 +366,9 @@ export function unknownPayTypeBlockers(
     entries: Array<Pick<ExportEntry, "id" | "userId" | "startTime">>,
     users: ExportUser[],
     periodStart: Date,
-    periodEnd: Date
+    periodEnd: Date,
+    /** Same predicate buildGustoExport passes as `isSalaried` — keeps both paths reading one verdict. */
+    isSalariedOverride?: (user: ExportUser) => boolean
 ): BlockingEntry[] {
     const byId = new Map(users.map((user) => [user.id, user]));
 
@@ -392,6 +399,10 @@ export function unknownPayTypeBlockers(
         // An UNRECOGNISED value counts as unknown, exactly like null — never as
         // a default.
         if (isKnownPayType(user.payType)) continue;
+        // The override answers the same question the stored column would. A
+        // null payType here is not automatically "unknown" — it is only
+        // unknown if PAYROLL_SALARIED_EMAILS has not named this person either.
+        if (isSalariedOverride?.(user)) continue;
         const entry = firstEntryFor.get(user.id);
         if (!entry) continue;
         blockers.push({
@@ -527,7 +538,11 @@ export function buildGustoExport(input: {
         detail,
         blocking: [
             ...blockingEntries(entries, users, envelopeStart, envelopeEnd, periodStart, periodEnd),
-            ...unknownPayTypeBlockers(entries, users, periodStart, periodEnd),
+            // Same `isSalaried` predicate the summary CSV uses above, so a
+            // PAYROLL_SALARIED_EMAILS hit reads as salaried in BOTH places —
+            // otherwise the override can classify someone but never actually
+            // unblock their export.
+            ...unknownPayTypeBlockers(entries, users, periodStart, periodEnd, isSalaried),
         ],
     };
 }

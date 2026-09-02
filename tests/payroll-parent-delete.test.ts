@@ -1,15 +1,16 @@
 /**
- * Deleting a parent that owns time entries (review rounds 16-17).
+ * Deleting a parent that owns time entries (review rounds 16-18).
  *
  * TimeEntry CASCADEd from both User and Project, so deleting a former employee
  * or an old job silently destroyed their payroll history — including hours
  * inside a LOCKED period that had already been exported and paid. Both foreign
  * keys are RESTRICT now, and this module is the only sanctioned way past them.
  *
- * Round 17 moved DISCOVERY inside the transaction. Reading first and locking
- * second left two holes: a parent with no entries took no payroll lock at all
- * (the lock target was empty, so the guard returned early), and a row created
- * between the read and the write was deleted without ever being checked.
+ * Round 17 moved DISCOVERY inside the transaction. Round 18 removed the
+ * "delete the unlocked entries" branch entirely: production's paid history
+ * predates PayrollPeriod, so it has no lock to trip, and a lock-only check
+ * read every one of those rows as safe to destroy. The rule now is simply
+ * ZERO time entries or the delete is refused — locked or not.
  */
 
 import { test } from "node:test";
@@ -19,196 +20,122 @@ import path from "node:path";
 import {
     deleteParentWithTimeEntries,
     deleteParentsWithTimeEntries,
-    isConcurrentTimeEntryError,
+    isTimeEntriesExistError,
 } from "../src/lib/payroll-parent-delete";
-import { PeriodLockedError } from "../src/lib/payroll-period";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-parent-delete";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 
 const read = (file: string) => readFileSync(path.join(process.cwd(), file), "utf8");
 
-const ENTRIES = [
-    { id: "e1", userId: "u1", startTime: new Date("2026-08-24T15:00:00Z") },
-    { id: "e2", userId: "u1", startTime: new Date("2026-08-25T15:00:00Z") },
-];
-
-const LOCKED_PERIOD = {
-    id: "p1",
-    periodStart: new Date("2026-08-24T07:00:00Z"),
-    periodEnd: new Date("2026-09-07T07:00:00Z"),
-    lockedAt: new Date("2026-09-08T00:00:00Z"),
-    timeZone: "America/Los_Angeles",
-};
-
 /**
- * A fake transaction. `rows` is the table; `onFind` can mutate it to simulate a
- * writer landing at a specific point.
+ * A fake transaction. `count` is how many time entries the fake claims to
+ * find for whatever scope it is asked about — real behaviour never needs to
+ * distinguish per-parent here, since one `count()` covers the whole OR'd set.
  */
-function fakeTx(options: {
-    rows?: typeof ENTRIES;
-    leftover?: number;
-    onGuard?: () => void;
-    trace?: string[];
-}) {
+function fakeTx(options: { count?: number; trace?: string[] }) {
     const trace = options.trace ?? [];
-    let guardTarget: { entryIds: string[]; dayKeys: string[] } | null = null;
     const tx = {
         $executeRawUnsafe: async (sql: string) => {
             if (sql.includes("pg_advisory_xact_lock_shared")) trace.push("payroll-lock");
-            else if (sql.includes("pg_advisory_xact_lock")) trace.push("day-lock");
             return 1;
         },
-        $queryRawUnsafe: async (sql: string, ids: string[]) => {
-            if (sql.includes("FOR UPDATE")) {
-                trace.push("row-lock");
-                guardTarget = { entryIds: ids, dayKeys: [] };
-                return (options.rows ?? ENTRIES).filter((r) => ids.includes(r.id)).map((r) => ({ startTime: r.startTime }));
-            }
-            return [];
-        },
+        $queryRawUnsafe: async () => [],
         payrollPeriod: { findMany: async () => [] },
         timeEntry: {
-            findMany: async () => {
-                trace.push("discover");
-                options.onGuard?.();
-                return options.rows ?? ENTRIES;
+            count: async () => {
+                trace.push("count");
+                return options.count ?? 0;
             },
-            deleteMany: async () => {
-                trace.push("delete-entries");
-                return { count: (options.rows ?? ENTRIES).length };
-            },
-            count: async () => options.leftover ?? 0,
         },
     };
-    return { tx, trace, guard: () => guardTarget };
+    return { tx, trace };
 }
 
-test("the payroll lock is taken FIRST, and BEFORE anything is discovered", async () => {
-    const { tx, trace } = fakeTx({});
+test("the payroll lock is taken FIRST, before the count, before the parent is touched", async () => {
+    const { tx, trace } = fakeTx({ count: 0 });
     await deleteParentWithTimeEntries({ projectId: "proj-1" }, async () => { trace.push("parent"); }, {
         runTransaction: (fn) => fn(tx as never),
     });
-    assert.equal(trace[0], "payroll-lock", "deferring the lock to the guard left a window before discovery");
-    assert.ok(trace.indexOf("payroll-lock") < trace.indexOf("discover"));
-    // The guard re-takes the payroll lock when it runs; pg_advisory_xact_lock is
-    // re-entrant within a transaction, so that is a no-op rather than a second
-    // acquisition. What matters is the ORDER, and that the first one precedes
-    // discovery.
-    assert.deepEqual(trace.filter((s) => s !== "day-lock" && s !== "payroll-lock"), [
-        "discover",
-        "row-lock",
-        "delete-entries",
-        "parent",
-    ]);
+    assert.deepEqual(trace, ["payroll-lock", "count", "parent"]);
 });
 
-test("a parent with NO entries still takes the payroll lock", async () => {
-    // This is the hole: an empty lock target made the guard return early, so
-    // nothing serialized this delete against a clock-in landing mid-flight.
-    const { tx, trace } = fakeTx({ rows: [] });
-    await deleteParentWithTimeEntries({ userId: "u-nobody" }, async () => { trace.push("parent"); }, {
+test("a parent with ZERO time entries can be deleted", async () => {
+    const { tx, trace } = fakeTx({ count: 0 });
+    let parentDeleted = false;
+    const result = await deleteParentWithTimeEntries({ userId: "u-nobody" }, async () => { parentDeleted = true; }, {
         runTransaction: (fn) => fn(tx as never),
     });
-    assert.ok(trace.includes("payroll-lock"), "the lock is unconditional");
-    assert.equal(trace[0], "payroll-lock");
+    assert.equal(parentDeleted, true);
+    assert.deepEqual(result, { deletedEntries: 0 });
+    assert.ok(trace.includes("payroll-lock"), "the lock is unconditional, even for a parent nobody has ever punched under");
 });
 
-test("an entry created AFTER discovery aborts the whole delete", async () => {
-    // The new row has never been checked against a locked period, so deleting it
-    // anyway is exactly the silent destruction this module exists to prevent.
-    const { tx, trace } = fakeTx({ leftover: 1 });
+test("ANY existing time entries refuse the delete — locked status is never consulted", async () => {
+    // This is the regression the round-18 review caught: historical paid
+    // entries predate PayrollPeriod entirely, so they are "unlocked" forever.
+    // A version of this module that deleted unlocked entries and refused only
+    // locked ones would delete these silently. The fake here never even
+    // exposes a lock/period concept any more — the count alone must refuse.
+    const { tx } = fakeTx({ count: 2 });
     let parentDeleted = false;
-
-    await assert.rejects(
-        () =>
-            deleteParentWithTimeEntries({ projectId: "proj-1" }, async () => { parentDeleted = true; }, {
-                runTransaction: (fn) => fn(tx as never),
-            }),
-        (error: Error) => isConcurrentTimeEntryError(error) && /try again/.test(error.message)
-    );
-    assert.equal(parentDeleted, false, "the parent must survive an aborted delete");
-    assert.ok(trace.includes("delete-entries"), "the abort happens after the checked set is removed, and rolls it back");
-});
-
-test("only the CHECKED id set is deleted, never everything under the parent", () => {
-    const source = read("src/lib/payroll-parent-delete.ts");
-    // Scoping the delete by the parent would sweep up any row that appeared
-    // since discovery — a row no locked-period check has ever seen.
-    assert.match(source, /deleteMany\(\{ where: \{ id: \{ in: entryIds \} \} \}\)/);
-    assert.doesNotMatch(source, /deleteMany\(\{ where \}\)/);
-    // And the leftover count is what turns that narrower delete into a refusal
-    // rather than a silent orphan.
-    assert.match(source, /count\(\{ where: \{ OR: scopes as never \} \}\)/);
-    assert.match(source, /leftover > 0\) throw new ConcurrentTimeEntryError/);
-});
-
-test("the LOCKED branch: nothing is deleted and the parent survives", async () => {
-    let parentDeleted = false;
-    const { tx } = fakeTx({});
-
     await assert.rejects(
         () =>
             deleteParentWithTimeEntries({ userId: "u1" }, async () => { parentDeleted = true; }, {
-                runTransaction: async (fn) => {
-                    // What assertEntriesUnlockedInTx really does when a row is
-                    // frozen: it throws before the delete can run.
-                    (tx as any).$queryRawUnsafe = async (sql: string) => {
-                        if (sql.includes("FOR UPDATE")) throw new PeriodLockedError(LOCKED_PERIOD);
-                        return [];
-                    };
-                    return fn(tx as never);
-                },
+                runTransaction: (fn) => fn(tx as never),
             }),
-        (error: Error) => error.name === "PeriodLockedError"
+        (error: Error) => isTimeEntriesExistError(error) && /2 time entries/.test(error.message)
     );
-    assert.equal(parentDeleted, false, "a locked period must leave the parent standing");
+    assert.equal(parentDeleted, false, "a parent with any history must survive the delete");
 });
 
-test("the day locks are the qualified wa-breaks key, sorted", () => {
+test("a SINGLE remaining entry still refuses, and the message says 'entry' not 'entries'", async () => {
+    const { tx } = fakeTx({ count: 1 });
+    await assert.rejects(
+        () => deleteParentWithTimeEntries({ projectId: "proj-1" }, async () => {}, { runTransaction: (fn) => fn(tx as never) }),
+        (error: Error) => isTimeEntriesExistError(error) && /1 time entry\b/.test(error.message)
+    );
+});
+
+test("the module never writes to TimeEntry at all — count and refuse, nothing more", () => {
     const source = read("src/lib/payroll-parent-delete.ts");
-    assert.match(source, /dayLockKey\(entry\.userId, toCompanyDayKey\(entry\.startTime\)\)/);
-    assert.match(source, /\]\.sort\(\)/);
+    // No delete, update, or any other TimeEntry mutation lives here any more —
+    // the only sanctioned outcome for a parent with history is refusal.
+    assert.doesNotMatch(source, /\.timeEntry\.(create|createMany|update|updateMany|delete|deleteMany|upsert)\(/);
+    assert.match(source, /client\.timeEntry\.count\(\{ where: \{ OR: scopes as never \} \}\)/);
+    assert.match(source, /existing > 0\) throw new TimeEntriesExistError\(existing\)/);
 });
 
-// ── Item 4: the whole selection, or none of it ──────────────────────────────
-
-test("MANY parents are checked before ANY parent is deleted", async () => {
-    const { tx, trace } = fakeTx({});
+test("MANY parents are checked before ANY parent is deleted, in ONE transaction", async () => {
+    const { tx, trace } = fakeTx({ count: 0 });
     let deletedParents = 0;
     await deleteParentsWithTimeEntries(
-        [{ projectId: "p-unlocked" }, { projectId: "p-other" }],
+        [{ projectId: "p-a" }, { projectId: "p-b" }],
         async () => { deletedParents += 1; trace.push("parents"); },
         { runTransaction: (fn) => fn(tx as never) }
     );
     // ONE callback for the whole set, inside ONE transaction — not a loop of
     // independent deletes.
     assert.equal(deletedParents, 1);
-    assert.ok(trace.indexOf("delete-entries") < trace.indexOf("parents"));
+    assert.deepEqual(trace, ["payroll-lock", "count", "parents"]);
 });
 
-test("one unlocked + one LOCKED project: nothing is deleted at all", async () => {
-    // The loop-per-project version left the caller half-deleted when the second
-    // job turned out to be locked, with nothing to undo the first.
+test("one parent WITH time entries refuses the whole batch, not just that parent", async () => {
+    // The loop-per-project version left the caller half-deleted when the
+    // second job turned out to have history, with nothing to undo the first.
+    const { tx } = fakeTx({ count: 3 });
     let parentsDeleted = false;
-    const { tx } = fakeTx({});
-    (tx as any).$queryRawUnsafe = async (sql: string) => {
-        // The guard sees BOTH projects' rows at once, so the locked one aborts
-        // the batch before any project row is touched.
-        if (sql.includes("FOR UPDATE")) throw new PeriodLockedError(LOCKED_PERIOD);
-        return [];
-    };
 
     await assert.rejects(
         () =>
             deleteParentsWithTimeEntries(
-                [{ projectId: "p-unlocked" }, { projectId: "p-locked" }],
+                [{ projectId: "p-clean" }, { projectId: "p-has-history" }],
                 async () => { parentsDeleted = true; },
                 { runTransaction: (fn) => fn(tx as never) }
             ),
-        (error: Error) => error.name === "PeriodLockedError"
+        (error: Error) => isTimeEntriesExistError(error)
     );
-    assert.equal(parentsDeleted, false, "the unlocked project must survive too — it is one transaction");
+    assert.equal(parentsDeleted, false, "the clean project must survive too — it is one transaction");
 });
 
 test("deleteProjects deletes the whole set in ONE call, not a loop", () => {
@@ -267,10 +194,14 @@ test("the migration converts the FKs and is replay-safe on confdeltype", () => {
     assert.match(script, /still cascading/);
 });
 
-test("the users route answers 423 for a locked period", () => {
+test("the users route answers 423 for a locked period and 409 for existing time entries", () => {
     const users = read("src/app/api/users/[id]/route.ts");
     assert.match(users, /deleteParentWithTimeEntries\(\{ userId: id \}/);
     assert.match(users, /isPeriodLockedError\(error\)\) return periodLockedResponse\(error\.period\)/);
-    // Ordered before the generic 500 handler, or a locked period reads as a crash.
+    assert.match(users, /isTimeEntriesExistError\(error\)\)/);
+    assert.match(users, /status: 409/);
+    // Both refusals must be ordered before the generic 500 handler, or they
+    // read as a crash instead of a well-formed, allowed-but-refused request.
     assert.ok(users.indexOf("isPeriodLockedError") < users.indexOf("Internal server error"));
+    assert.ok(users.indexOf("isTimeEntriesExistError") < users.indexOf("Internal server error"));
 });

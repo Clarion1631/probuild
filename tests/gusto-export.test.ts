@@ -272,6 +272,27 @@ test("but the SAME worker blocks the moment they have in-period hours", () => {
     assert.equal(result.blocking[0].startTime.getTime(), new Date(at8am("2026-08-18")).getTime());
 });
 
+test("PAYROLL_SALARIED_EMAILS unblocks the SAME worker it classifies as salaried", () => {
+    // Round-review finding: the classifier (isSalaried, used for the SUMMARY
+    // csv) and this blocker used to read the env override differently — the
+    // classifier consulted it, the blocker did not. A null-payType user named
+    // in PAYROLL_SALARIED_EMAILS read as salaried everywhere else (the roster
+    // UI, the zero-rate guard) while the export itself kept 409ing for them
+    // forever, because nothing had ever answered payType. Passing the SAME
+    // isSalaried predicate to both closes that gap.
+    const named: ExportUser = { id: "u-named", name: "Named Salaried", email: "named@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: named.id, startTime: at8am("2026-08-18"), durationHours: 8, mealOutcome: "AUTO_DEDUCTED" })],
+        users: [named],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.email === named.email,
+    });
+    assert.deepEqual(result.blocking, []);
+    assert.equal(result.employees[0].salaried, true);
+});
+
 test("the zero-hour roster is driven by payType HOURLY, not by role", () => {
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
     // An hourly ADMIN or FINANCE user is a real arrangement; keying the roster

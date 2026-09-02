@@ -8650,16 +8650,18 @@ export async function deleteProjects(projectIds: string[]) {
     const { deleteParentsWithTimeEntries } = await import("./payroll-parent-delete");
     // ONE transaction for the whole selection: every project is checked before
     // any project is deleted. Looping per project left the caller half-deleted
-    // when the third job in the list turned out to be locked — the first two
-    // were already gone and there was nothing to undo them with.
+    // when the third job in the list turned out to have time entries — the
+    // first two were already gone and there was nothing to undo them with.
     //
     // A single deleteMany, which is what this used to be, was worse still: it
     // CASCADEd every punch on every job in the list into nothing — locked,
     // exported, paid hours included — and reported success.
     //
-    // A locked period throws PeriodLockedError out of here and rolls the batch
-    // back. Server actions have no status code, so the caller sees its message;
-    // the API surface that CAN answer 423 is DELETE /api/users/[id].
+    // A project with ANY time entries — locked or not — throws
+    // TimeEntriesExistError out of here and rolls the batch back. Historical
+    // paid hours predate PayrollPeriod and have no lock to trip, so "unlocked"
+    // is never read as "safe to delete". Server actions have no status code,
+    // so the caller sees the error's message.
     await deleteParentsWithTimeEntries(
         projectIds.map((projectId) => ({ projectId })),
         async (tx) => {
@@ -15554,7 +15556,12 @@ export async function setUserPayType(
     }
     const updated = await prisma.user.updateMany({
         where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
-        data: { payType },
+        // lastRateSyncAt moves too, not just payType. The rate-import token is
+        // signed over BOTH — that is the whole point of the stamp (see the
+        // comment on oldLastRateSyncAt in applyGustoRateImport) — so leaving it
+        // untouched here let a HOURLY -> SALARY -> HOURLY cycle restore the
+        // exact signed state and replay an old, already-shown approval.
+        data: { payType, lastRateSyncAt: new Date() },
     });
     if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
 

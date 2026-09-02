@@ -133,10 +133,11 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "project manual delete, wrapped in withPayrollWriteTx; deleteMany so invoiceId/invoicedAt are in the WHERE and a row billed mid-delete is detected",
     },
-    "lib/payroll-parent-delete.ts::deleteMany": {
-        kind: "guarded",
-        why: "deleting a User's or Project's hours before the parent row, wrapped in withPayrollWriteTx over every affected entry id and qualified day key — the FK used to CASCADE and destroy locked payroll history silently",
-    },
+    // lib/payroll-parent-delete.ts is deliberately absent here: it no longer
+    // performs a .timeEntry write at all. It counts entries for a parent and
+    // REFUSES the delete if the count is nonzero (locked or not) — see that
+    // file's header. A stale entry here would be a claim about code that no
+    // longer runs.
 
     // ---- the settlement protocol -------------------------------------------
     "lib/wa-breaks-db.ts::update": {
