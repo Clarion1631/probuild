@@ -655,8 +655,6 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         data: {
                             state: "NEEDS_REVIEW",
                             stateReason: `weak-dup:${conflict.id}`,
-                            claimToken: null,
-                            claimedAt: null,
                             // Parked without ever reaching QuickBooks, so the
                             // strong key goes back (same rule as book.ts).
                             dedupStrongKey: null,
@@ -723,6 +721,20 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // A superseded worker writes NOTHING: the row belongs to whoever
             // holds the current token, and its state is theirs to set.
             if (result.outcome === "stale") return;
+            if (result.outcome === "booked-after-void") {
+                // book.ts wrote postVoidQbPurchaseId + stateReason inside its
+                // own transaction. Anything written here would move a state the
+                // human just set.
+                console.error("[cron/receipt-intake-worker] BOOKED AFTER VOID — void this Purchase in QuickBooks by hand",
+                    rowId, result.qbPurchaseId);
+                return;
+            }
+            if (result.outcome === "aborted") {
+                // A human changed the row between the claim and the send. Their
+                // decision stands; writing anything here would undo it.
+                console.log("[cron/receipt-intake-worker] send aborted", rowId, result.reason);
+                return;
+            }
             // Every write below is a CAS on the claim AND on the state.
             //
             // The token alone is not enough here: bookReceipt own commit may

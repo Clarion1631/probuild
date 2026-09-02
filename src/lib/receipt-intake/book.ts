@@ -719,22 +719,22 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 },
                 select: { id: true },
             });
-            // CAS again inside the commit. If the row was re-claimed between
-            // the create and here, this transaction rolls back — including the
-            // Expense — and the successor retries: QBO's DocNumber idempotency
-            // returns the SAME Purchase, so it books once, under one owner.
-            // Completing a BOOKED write from a stale worker would leave two
-            // owners disagreeing about the row.
-            const claimed = await tx.receiptIntake.updateMany({
-                where: { id: row.id, state: "BOOKING", claimToken: row.claimToken },
+            // CLAIM CAS, inside the same commit, now that the Expense exists.
+            //
+            // The fence above proved the row was still BOOKING (a void loses
+            // there, and is parked as booked-after-void); this proves WE still
+            // own it. If the row was re-claimed the whole transaction rolls
+            // back — the BOOKED write above and the Expense with it — and the
+            // successor retries: QBO's DocNumber idempotency returns the SAME
+            // Purchase, so it books once, under one owner.
+            //
+            // It does NOT re-assert `state: "BOOKING"`: the fence above already
+            // moved this row to BOOKED inside this transaction, so requiring
+            // BOOKING here would fail on our own uncommitted write, every time.
+            const confirmed = await tx.receiptIntake.updateMany({
+                where: { id: row.id, claimToken: row.claimToken },
                 data: {
-                    state: "BOOKED",
-                    stateReason: null,
-                    qbPurchaseId: result.qbPurchaseId,
                     expenseId: expense.id,
-                    bookedAt: now,
-                    lastError: null,
-                    nextRetryAt: null,
                     // Ownership is released by the write that completes the
                     // transition — a booked row is nobody's to hold.
                     claimToken: null,

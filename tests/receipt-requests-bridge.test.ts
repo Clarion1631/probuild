@@ -326,7 +326,11 @@ test("worker ownership is a claim TOKEN, and the queue fences on it", () => {
 
 test("finished worker transitions hand ownership back", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
-    const releases = source.match(/claimToken: null/g) ?? [];
+    // Phase 1 named the pair; the invariant is unchanged — every finished or
+    // deferred transition hands the row back, or a crashed claim blocks a human
+    // for the whole lease.
+    assert.match(source, /const RELEASE_CLAIM = \{ claimToken: null, claimedAt: null \} as const;/);
+    const releases = source.match(/\.\.\.RELEASE_CLAIM/g) ?? [];
     assert.ok(releases.length >= 4, `expected terminal/deferred branches to release, saw ${releases.length}`);
 });
 

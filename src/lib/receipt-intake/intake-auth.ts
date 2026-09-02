@@ -34,7 +34,7 @@ import type { User } from "@prisma/client";
 export const RECEIPT_INTAKE_SECRET_HEADER = "x-receipt-intake-secret";
 
 /** What a caller is asking to do. Checked against the secret it presented. */
-export type IntakeCapability = "ingest" | "archive";
+export type IntakeCapability = "ingest" | "archive" | "bridge";
 
 export type IntakeAuth =
     | {
