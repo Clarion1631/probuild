@@ -2752,6 +2752,11 @@ model ReceiptRequestCard {
   itemsJson   String
   /// Items that did not fit on this card; they are tomorrow's first candidates.
   overflow    Int       @default(0)
+  /// Is `overflow` a TOTAL, or a floor? The selection scan can stop early, and
+  /// a retry pass does not scan at all — so this travels with the row rather
+  /// than being re-derived at post time, where a resumed card would otherwise
+  /// print "and 4 more" as though a scan that never ran had counted them.
+  overflowExact Boolean @default(true)
   /// When a run took the post-claim, and the token identifying THAT run. Only
   /// the holder may mark the row posted, so an overlapping run can never
   /// complete a post it did not make. A claim older than the lease is up for

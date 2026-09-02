@@ -10,21 +10,37 @@
  *   - a bogus/expired session cookie -> authenticateMobileOrSession returns
  *     ok:false, and this returns 401 JSON, never a redirect.
  *
- * TWO SECRETS, NOT ONE. They belong to different programs with different
- * blast radii:
+ * THREE SECRETS, NOT ONE. They belong to three different programs with three
+ * different blast radii. Each line below is the COMPLETE capability list for
+ * that key — if a route needs something not on its key's list, it needs a
+ * different key, not a wider one.
  *
- *   RECEIPT_INTAKE_SECRET  — the forwarders. May only INGEST, and only under
- *     the sources they actually own (drive/email/chat). Cannot read the queue,
- *     cannot see another job's receipts, cannot archive anything.
- *   RECEIPT_ARCHIVE_SECRET — the nightly Drive mirror. May only READ
- *     BOOKED/ARCHIVED rows and report back what it archived. Cannot create a
- *     row, cannot publish one, cannot touch a document's contents.
+ *   RECEIPT_INTAKE_SECRET  — the Apps Script forwarders.
+ *     MAY: POST /api/receipts/intake, /intake/start, /intake/{id}/finalize,
+ *          and only under source drive | email | chat.
+ *     MAY NOT: read the queue, see another job's receipts, archive anything,
+ *          resolve a missing-receipt chase.
+ *   RECEIPT_ARCHIVE_SECRET — the nightly Drive archive mirror.
+ *     MAY: GET /api/receipts/intake?state=BOOKED (BOOKED/ARCHIVED rows only),
+ *          POST /api/receipts/intake/{id}/archived.
+ *     MAY NOT: create a row, publish one, change a document's contents,
+ *          resolve a missing-receipt chase.
+ *   RECEIPT_BRIDGE_SECRET  — Beverly's Chat bridge (Phase 2 §4).
+ *     MAY: GET /api/automation/receipt-requests/threads (export live threads),
+ *          POST /api/automation/receipt-requests/answers (record a SIGNED memo
+ *          against one of our own fingerprints).
+ *     MAY NOT: touch a ReceiptIntake row at all — not create one, not read
+ *          one, not archive one.
  *
  * One shared secret gave a script that only copies files to Drive the power to
  * inject Purchases into the books, and gave the ingest forwarders the power to
- * enumerate every receipt in the system. Splitting them means a leak of either
- * one is bounded by what that program actually does. They rotate independently
- * for the same reason.
+ * enumerate every receipt in the system. The bridge is the same argument a
+ * third time: it runs in Beverly's Apps Script project, not ours, and its key
+ * must not be able to book anything. A leak of any one of the three is bounded
+ * by what that program actually does, and they rotate independently.
+ *
+ * Presenting the WRONG one of the three is a 403, not a 401 — see
+ * wrongCapability.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
@@ -76,6 +92,56 @@ function wrongCapability(have: IntakeCapability, need: IntakeCapability): NextRe
 }
 
 /**
+ * Which of the three programs presented this secret, or null for none.
+ *
+ * ALL THREE COMPARES ALWAYS RUN. Short-circuiting on the first match would make
+ * the response time depend on WHICH key was presented, which is a free hint to
+ * anyone probing.
+ *
+ * A value configured for more than one of the variables silently re-merges
+ * capabilities that exist to be separate, so it is refused outright rather than
+ * resolved in some order.
+ */
+function classifySecret(provided: string): IntakeCapability | null {
+    const matched: IntakeCapability[] = [];
+    for (const [capability, expected] of [
+        ["ingest", process.env.RECEIPT_INTAKE_SECRET],
+        ["archive", process.env.RECEIPT_ARCHIVE_SECRET],
+        ["bridge", process.env.RECEIPT_BRIDGE_SECRET],
+    ] as const) {
+        // Unset means that capability is refused outright — never "allow
+        // because unset" (secretMatches returns false for an absent expected).
+        if (secretMatches(provided, expected)) matched.push(capability);
+    }
+    if (matched.length === 0) return null;
+    if (matched.length > 1) {
+        console.error("[receipts/intake] receipt secrets are not distinct:", matched.join(" == "));
+        return null;
+    }
+    return matched[0];
+}
+
+/**
+ * Secret-only auth for the machine bridge endpoints (Phase 2 §4).
+ *
+ * NO SESSION BRANCH, deliberately: these are Apps Script endpoints on the
+ * proxy's exact-match bypass, and a browser has no business posting a signed
+ * memo. Cross-use is a 403 with both capabilities named, so a mis-wired script
+ * is obvious instead of looking like a rotation problem.
+ */
+export function authenticateBridge(
+    req: Request,
+    need: IntakeCapability = "bridge",
+): { ok: true; capability: IntakeCapability } | { ok: false; response: NextResponse } {
+    const provided = req.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
+    if (provided === null) return { ok: false, response: unauthorized() };
+    const verdict = classifySecret(provided);
+    if (verdict === null) return { ok: false, response: unauthorized() };
+    if (verdict !== need) return { ok: false, response: wrongCapability(verdict, need) };
+    return { ok: true, capability: verdict };
+}
+
+/**
  * Secret first, then a session/mobile-Bearer user.
  *
  * `need` is what the ROUTE requires. A caller presenting a valid secret for the
@@ -89,33 +155,17 @@ export async function authenticateIntake(
 ): Promise<IntakeAuth> {
     const provided = req.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
     if (provided !== null) {
-        const ingest = process.env.RECEIPT_INTAKE_SECRET;
-        const archive = process.env.RECEIPT_ARCHIVE_SECRET;
-
-        // Both compares always run: short-circuiting on the first match would
-        // make the response time depend on WHICH key was presented.
-        const isIngest = secretMatches(provided, ingest);
-        const isArchive = secretMatches(provided, archive);
-
-        if (!isIngest && !isArchive) return { ok: false, response: unauthorized() };
-
-        // A single value configured for both variables is a misconfiguration
-        // that would silently re-merge the two capabilities. Refuse it.
-        if (isIngest && isArchive) {
-            console.error("[receipts/intake] RECEIPT_INTAKE_SECRET and RECEIPT_ARCHIVE_SECRET are identical");
-            return { ok: false, response: unauthorized() };
-        }
-
-        const capability: IntakeCapability = isIngest ? "ingest" : "archive";
-        if (capability !== need) return { ok: false, response: wrongCapability(capability, need) };
+        const verdict = classifySecret(provided);
+        if (verdict === null) return { ok: false, response: unauthorized() };
+        if (verdict !== need) return { ok: false, response: wrongCapability(verdict, need) };
 
         return {
             ok: true,
             via: "secret",
             user: null,
             userVia: null,
-            capability,
-            allowedSources: capability === "ingest" ? INGEST_ALLOWED_SOURCES : new Set(),
+            capability: verdict,
+            allowedSources: verdict === "ingest" ? INGEST_ALLOWED_SOURCES : new Set(),
         };
     }
 

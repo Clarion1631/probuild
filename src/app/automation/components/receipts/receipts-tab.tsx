@@ -21,6 +21,7 @@ import {
     ResolveOrphanButton,
     RetryButton,
     SetJobControl,
+    UncertainCardControls,
     VoidButton,
 } from "./receipt-row-actions";
 
@@ -123,6 +124,7 @@ export function ReceiptsTab({
         "missing-receipts": queue.counts.missingReceipts,
         duplicates: queue.counts.duplicates,
         exceptions: queue.counts.exceptions,
+        "uncertain-cards": queue.counts.uncertainCards,
     };
 
     const missingByOwner = OWNER_ORDER
@@ -163,6 +165,31 @@ export function ReceiptsTab({
                 ))}
             </div>
 
+            {groupIsVisible("uncertain-cards", filters) && queue.counts.uncertainCards > 0 && (
+                <GroupCard title={RECEIPT_GROUP_LABELS["uncertain-cards"]} count={counts["uncertain-cards"]}>
+                    <p className="px-4 py-2 text-xs text-amber-800 bg-amber-50 border-b border-amber-100">
+                        We asked Google Chat to post these cards and never got a confirmed answer. They are not resent
+                        automatically — a duplicate chase card is worse than a late one. Open the Receipts Need Review
+                        space, look for the card, and say which way it went.
+                    </p>
+                    {queue.uncertainCards.map(card => (
+                        <RowShell key={card.id}>
+                            <div className="min-w-[16rem]">
+                                <p className="text-sm font-medium text-hui-text">
+                                    {card.owner} · {card.pacificDate}
+                                </p>
+                                <p className="text-xs text-hui-textMuted mt-1">
+                                    {card.items} item{card.items === 1 ? "" : "s"} · {card.attempts} attempt
+                                    {card.attempts === 1 ? "" : "s"}
+                                    {card.lastError ? ` · ${card.lastError}` : ""}
+                                </p>
+                            </div>
+                            <UncertainCardControls cardId={card.id} expectedUpdatedAt={card.updatedAt} />
+                        </RowShell>
+                    ))}
+                </GroupCard>
+            )}
+
             {groupIsVisible("exceptions", filters) && queue.counts.exceptions > 0 && (
                 <GroupCard title={RECEIPT_GROUP_LABELS.exceptions} count={counts.exceptions}>
                     <p className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">
@@ -190,7 +217,7 @@ export function ReceiptsTab({
                                 {row.postVoidQbPurchaseId && (
                                     <>
                                         <QuickBooksLink qbPurchaseId={row.postVoidQbPurchaseId} />
-                                        <ResolveOrphanButton intakeId={row.id} qbPurchaseId={row.postVoidQbPurchaseId} />
+                                        <ResolveOrphanButton intakeId={row.id} qbPurchaseId={row.postVoidQbPurchaseId} expectedUpdatedAt={row.updatedAt} />
                                     </>
                                 )}
                             </div>
@@ -208,9 +235,9 @@ export function ReceiptsTab({
                             <RowShell key={row.id}>
                                 <RowFacts row={row} />
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} />
+                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <VoidButton intakeId={row.id} expectedState={row.state} />
+                                    <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>
                         ))
@@ -246,16 +273,16 @@ export function ReceiptsTab({
                                     )}
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
-                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} />
+                                    <SetJobControl intakeId={row.id} jobs={jobs} currentProjectId={row.projectId} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <MarkDuplicateControl intakeId={row.id} expectedState={row.state} />
+                                    <MarkDuplicateControl intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                     {/* Only offered when a retry can actually
                                         do something. A document VERDICT
                                         (multi-doc, a duplicate, no estimate)
                                         needs a decision, not another attempt —
                                         the button would just park it again. */}
-                                    {retryTargetFor(row.state, row.stateReason) && <RetryButton intakeId={row.id} />}
-                                    <VoidButton intakeId={row.id} expectedState={row.state} />
+                                    {retryTargetFor(row.state, row.stateReason) && <RetryButton intakeId={row.id} expectedUpdatedAt={row.updatedAt} />}
+                                    <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>
                         ))
@@ -280,8 +307,8 @@ export function ReceiptsTab({
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <RetryButton intakeId={row.id} />
-                                    <VoidButton intakeId={row.id} expectedState={row.state} />
+                                    <RetryButton intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
+                                    <VoidButton intakeId={row.id} expectedState={row.state} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>
                         ))
@@ -372,7 +399,7 @@ export function ReceiptsTab({
                                 </div>
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <ReceiptLink storagePath={row.storagePath} />
-                                    <NotADuplicateButton intakeId={row.id} />
+                                    <NotADuplicateButton intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
                                 </div>
                             </RowShell>
                         ))

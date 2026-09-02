@@ -287,13 +287,18 @@ export async function GET(request: Request) {
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Sent, but we never confirmed it. Reported, never reposted.
     const uncertain: string[] = [];
+    // The subset THIS RUN moved into UNCERTAIN. Distinct from `uncertain`,
+    // which also lists rows an earlier run left that way: re-reporting an old
+    // one must not make every subsequent run look partial, and a NEW one must
+    // not be lost in the noise of the old ones.
+    const uncertainTransitions: string[] = [];
     // A healthy run is mid-send on this owner's card. Left strictly alone.
     const inFlight: string[] = [];
 
     for (const owner of CARD_OWNERS_ASKED) {
         const existing = await prisma.receiptRequestCard.findUnique({
             where: { owner_pacificDate: { owner, pacificDate: date } },
-            select: { id: true, itemsJson: true, overflow: true, postedAt: true, status: true, claimedAt: true },
+            select: { id: true, itemsJson: true, overflow: true, overflowExact: true, postedAt: true, status: true, claimedAt: true },
         });
 
         if (existing) {
@@ -315,10 +320,11 @@ export async function GET(request: Request) {
                 // The lease expired: that run died mid-send and nobody will
                 // ever tell us whether Chat took the message. Uncertain, and
                 // never resent.
-                await prisma.receiptRequestCard.updateMany({
+                const converted = await prisma.receiptRequestCard.updateMany({
                     where: { id: existing.id, status: "POSTING" },
                     data: { status: "UNCERTAIN", lastError: "uncertain-delivery", claimedAt: null, claimToken: null },
                 });
+                if (converted.count > 0) uncertainTransitions.push(owner);
                 uncertain.push(owner);
                 continue;
             }
@@ -342,7 +348,11 @@ export async function GET(request: Request) {
 
             const items = parseItems(existing.itemsJson);
             if (items.length === 0) continue;
-            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, scan.exhausted), rowId: existing.id, token, resumed: true });
+            // THE ROW'S OWN overflowExact, not this run's scan flag. A retry
+            // pass does not scan at all, so `scan.exhausted` is trivially true
+            // there — and a card claimed by a run whose scan stopped early
+            // would come back claiming its "and N more" was a total.
+            toPost.push({ card: buildCardFromItems(owner, date, items, existing.overflow, existing.overflowExact), rowId: existing.id, token, resumed: true });
             continue;
         }
 
@@ -366,6 +376,9 @@ export async function GET(request: Request) {
                     pacificDate: date,
                     itemsJson: JSON.stringify(items),
                     overflow,
+                    // Persisted WITH the selection, because only this run knows
+                    // whether its scan finished.
+                    overflowExact: scan.exhausted,
                     claimedAt: now,
                     claimToken: token,
                 },
@@ -476,6 +489,7 @@ export async function GET(request: Request) {
                 },
             });
             uncertain.push(card.owner);
+            uncertainTransitions.push(card.owner);
             continue;
         }
 
@@ -500,6 +514,7 @@ export async function GET(request: Request) {
                 data: { status: "UNCERTAIN", lastError: "uncertain-delivery" },
             }).catch(() => { /* the row is already beyond us */ });
             uncertain.push(card.owner);
+            uncertainTransitions.push(card.owner);
             continue;
         }
         await recordCardOnIssues(card, result.threadName, result.messageName, now);
@@ -507,9 +522,18 @@ export async function GET(request: Request) {
     }
 
     const summary = {
-        ok: failures.length === 0,
+        // A card whose delivery we could not confirm is NOT a success. It is
+        // also not a failure we can retry — resending risks a duplicate chase
+        // card, which teaches people the list is noise. So the run is PARTIAL:
+        // ok:false so it is visible, HTTP 200 so the platform does not treat it
+        // as a crashed invocation and re-run it.
+        ok: failures.length === 0 && uncertainTransitions.length === 0,
+        partial: failures.length === 0 && uncertainTransitions.length > 0,
         failedOwners: failures,
         uncertainOwners: uncertain,
+        // Only what THIS run moved. An old uncertain row is somebody's to
+        // resolve on the Receipts tab, not a reason to fail every later run.
+        uncertainTransitions,
         inFlightOwners: inFlight,
         date,
         retryOnly,
@@ -525,8 +549,12 @@ export async function GET(request: Request) {
     };
     if (failures.length > 0) {
         console.error("[cron/receipt-request-cards] delivery failed", JSON.stringify(summary));
+    } else if (uncertainTransitions.length > 0) {
+        console.error("[cron/receipt-request-cards] delivery unconfirmed", JSON.stringify(summary));
     } else if (toPost.length > 0) {
         console.log("[cron/receipt-request-cards]", JSON.stringify(summary));
     }
-    return NextResponse.json(summary, { status: summary.ok ? 200 : 500 });
+    // 500 ONLY for a refused delivery, which is worth retrying. An unconfirmed
+    // one is 200: it needs a human, not another attempt.
+    return NextResponse.json(summary, { status: failures.length > 0 ? 500 : 200 });
 }

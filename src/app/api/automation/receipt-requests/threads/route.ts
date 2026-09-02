@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { RECEIPT_INTAKE_SECRET_HEADER, secretMatches } from "@/lib/receipt-intake/intake-auth";
+import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { CARD_HISTORY_DAYS, RECEIPT_REQUEST_TARGET_TYPE } from "@/lib/receipt-requests";
 import {
@@ -56,10 +56,11 @@ function parseItems(itemsJson: string): CardItem[] {
 }
 
 export async function GET(request: Request) {
-    const provided = request.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
-    if (!secretMatches(provided, process.env.RECEIPT_INTAKE_SECRET)) {
-        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
-    }
+    // RECEIPT_BRIDGE_SECRET, not the intake key: this endpoint belongs to
+    // Beverly's Apps Script project, and that project must not be able to book
+    // anything. Presenting the intake or archive key here is a 403.
+    const auth = authenticateBridge(request);
+    if (!auth.ok) return auth.response;
 
     const cutoff = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
 

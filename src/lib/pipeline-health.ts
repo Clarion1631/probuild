@@ -208,6 +208,13 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
  *    chaser reads BankLine, so a dead pull silently starves it: every check
  *    stays green while the queue quietly stops finding anything. Only reported
  *    when the feature is actually on — an unset flag is not a failure.
+ *  - `cards-uncertain:<n>` — the morning Chat digest asked Google Chat to post
+ *    a card and never got a confirmed answer. Those rows are deliberately NEVER
+ *    auto-retried (a duplicate chase card teaches people the list is noise), so
+ *    nothing clears them but a human: the Receipts tab shows each one with
+ *    "mark delivered" and "resend". Left alone they are silent — the crew
+ *    simply never got asked, which is the failure mode this whole feature
+ *    exists to prevent.
  *  - `no-receipts-72h` — nothing has been booked in 72h. This used to
  *    auto-green as "a quiet week is quiet", which meant a permanently dead
  *    pipeline reported OK forever. It doesn't any more: the digest prints how
@@ -230,6 +237,8 @@ export function evaluatePipelineHealth(input: {
      * it last SUCCEEDED (not merely ran).
      */
     bankPull: { enabled: boolean; lastSuccessAt: string | null };
+    /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
+    uncertainCards: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -244,6 +253,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeStuck", input.intakeStuck],
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
+        ["uncertainCards", input.uncertainCards],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -318,6 +328,13 @@ export function evaluatePipelineHealth(input: {
         // elsewhere.
         const stale = at === null || Number.isNaN(at) || input.now - at > BANK_PULL_STALE_HOURS * HOUR_MS;
         if (stale) reasons.push("bank-pull-stale");
+    }
+
+    // An uncertain card is an ASK THAT MAY NEVER HAVE HAPPENED. It cannot be
+    // auto-retried without risking a duplicate, so it needs a human, and until
+    // one looks the crew has silently not been asked for those receipts.
+    if (input.uncertainCards.status === "ok" && input.uncertainCards.count > 0) {
+        reasons.push(`cards-uncertain:${input.uncertainCards.count}`);
     }
 
     return { ok: reasons.length === 0, reasons };
@@ -415,7 +432,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -560,6 +577,13 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 }),
             0,
         ),
+        // Chat cards we asked for and never got a confirmed answer about. They
+        // are never auto-retried, so this count only falls when a human acts.
+        probe<number>(
+            "uncertainCards",
+            () => prisma.receiptRequestCard.count({ where: { status: "UNCERTAIN" } }),
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -600,6 +624,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: intakeUnassigned.status,
             reason: intakeUnassigned.reason,
             count: intakeUnassigned.value,
+        },
+        uncertainCards: {
+            status: uncertainCards.status,
+            reason: uncertainCards.reason,
+            count: uncertainCards.value,
         },
         bankPull: await readBankPullState(),
     };

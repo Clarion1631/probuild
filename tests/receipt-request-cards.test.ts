@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { effectiveOwner } from "../src/lib/receipt-requests";
 import {
     CARD_RATE_CEILING,
@@ -369,4 +372,44 @@ test("an untouched snapshot rebuilds to itself, byte for byte", () => {
     const rebuilt = rebuildCardItems(items, truth, "CJ");
     assert.deepEqual(rebuilt.items, items);
     assert.deepEqual(rebuilt.dropped, []);
+});
+
+// ── An unconfirmed delivery is PARTIAL, and needs a human (round-13 item 6) ─
+
+test("the cards cron reports partial — ok:false, HTTP 200 — for an uncertain send", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
+        "utf8",
+    );
+    // ok:false so it is visible; 200 so the platform does not treat it as a
+    // crashed invocation and re-run it (which would risk the duplicate card).
+    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0,/);
+    assert.match(source, /partial: failures\.length === 0 && uncertainTransitions\.length > 0,/);
+    assert.match(source, /status: failures\.length > 0 \? 500 : 200/);
+    // TRANSITIONS, not the reported list: an old uncertain row must not make
+    // every later run look partial.
+    assert.match(source, /const uncertainTransitions: string\[\] = \[\];/);
+    const pushes = source.match(/uncertainTransitions\.push\(/g) ?? [];
+    assert.equal(pushes.length, 3, "the expired-POSTING conversion, an unknown post, and a lost completion");
+    // The expired-POSTING conversion only counts when it actually wrote.
+    assert.match(source, /if \(converted\.count > 0\) uncertainTransitions\.push\(owner\);/);
+});
+
+test("an uncertain card is surfaced, and resolving it is a CAS", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const actions = readFileSync(join(root, "src/lib/actions.ts"), "utf8");
+    assert.match(actions, /export async function resolveUncertainCard\(\s*\n\s*cardId: string,\s*\n\s*decision: "delivered" \| "resend",\s*\n\s*expectedUpdatedAt: string,/);
+    assert.match(actions, /where: \{ id: cardId, status: "UNCERTAIN", updatedAt: seenAt \}/);
+    // "delivered" closes the day; "resend" hands it back to the retry pass.
+    assert.match(actions, /status: "POSTED",[\s\S]{0,200}postedAt: new Date\(\)/);
+    assert.match(actions, /status: "PENDING",\s*\n\s*lastError: "resend-requested"/);
+
+    // The queue loads them and the tab renders a group with both actions.
+    const data = readFileSync(join(root, "src/app/automation/receipts-data.ts"), "utf8");
+    assert.match(data, /prisma\.receiptRequestCard\.count\(\{ where: \{ status: "UNCERTAIN" \} \}\)/);
+    const tab = readFileSync(join(root, "src/app/automation/components/receipts/receipts-tab.tsx"), "utf8");
+    assert.match(tab, /RECEIPT_GROUP_LABELS\["uncertain-cards"\]/);
+    assert.match(tab, /<UncertainCardControls cardId=\{card\.id\} expectedUpdatedAt=\{card\.updatedAt\} \/>/);
+    const filters = readFileSync(join(root, "src/app/automation/receipts-filters.ts"), "utf8");
+    assert.match(filters, /"uncertain-cards": "Uncertain deliveries"/);
 });

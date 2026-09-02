@@ -340,14 +340,26 @@ Planner output for the executor: build exactly this; do not guess.
     decision 3). Off ships as an ABSENT dependency in the pull, not a disabled
     branch. Turn it on only AFTER `scripts/apply-phase2-receipt-queue.mjs` has
     run — the mint writes `sourceOfRecord`.
-  - `RECEIPT_INTAKE_SECRET` (Phase 1's, reused) gates both bridge endpoints.
+  - `RECEIPT_BRIDGE_SECRET` — gates BOTH bridge endpoints
+    (`GET /api/automation/receipt-requests/threads`, `POST .../answers`). A
+    THIRD secret, not Phase 1's intake key: the bridge runs inside Beverly's
+    Apps Script project, and that project must not be able to book a Purchase.
+    The complete capability list for each of the three keys lives in
+    `src/lib/receipt-intake/intake-auth.ts` and `.env.example`; the rule is that
+    a route needing something off its key's list needs a DIFFERENT key, never a
+    wider one. Presenting the intake or archive key to a bridge endpoint (or the
+    bridge key to an intake endpoint) is a **403** naming both capabilities, so
+    a mis-wired script reads as a mis-wiring rather than a rotation problem.
+    Setting any two of the three to the same value is refused at runtime.
 
 - **Schema (this DID change, contrary to the original §6).** Two additive
   objects, in `scripts/apply-phase2-receipt-queue.mjs` +
   `prisma/migrations/20260901120000_phase2_receipt_queue`:
   `BankLine.sourceOfRecord` (default `'STATEMENT'`, CHECK in
   `('STATEMENT','QBO')`) and `ReceiptRequestCard` (UNIQUE `(owner, pacificDate)`
-  — the durable per-day claim for the Chat digest). Run the script against prod
+  — the durable per-day claim for the Chat digest; it also carries
+  `status`, the post-claim (`claimedAt`/`claimToken`) and `overflowExact`,
+  which says whether that card's "and N more" was a total or a floor). Run the script against prod
   BEFORE the deploy that selects them, per CLAUDE.md pre-deploy rule #2.
 
 ## 7. Tests (node:test, `test/receipt-requests/*.test.mjs`; no `mock.module` — CI is Node 20)

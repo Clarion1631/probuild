@@ -43,6 +43,13 @@ export type IntakeRow = {
     nextRetryAt: string | null;
     bookedAt: string | null;
     createdAt: string;
+    /**
+     * The row version the human is looking at, ISO. Every queue action CASes on
+     * it: the state alone cannot tell NEEDS_REVIEW from a later, different
+     * NEEDS_REVIEW (the ABA problem), and a decision made about the first must
+     * not silently apply to the second.
+     */
+    updatedAt: string;
 };
 
 export interface MissingReceiptRow {
@@ -69,6 +76,19 @@ export interface MissingReceiptRow {
     pdfUrl: string | null;
 }
 
+export type UncertainCardRow = {
+    id: string;
+    owner: string;
+    /** YYYY-MM-DD Pacific — the day the card was for. */
+    pacificDate: string;
+    /** How many items the card listed. */
+    items: number;
+    attempts: number;
+    lastError: string | null;
+    /** The row version the human is looking at; the action CASes on it. */
+    updatedAt: string;
+};
+
 export interface ReceiptQueue {
     needsJob: IntakeRow[];
     needsReview: IntakeRow[];
@@ -83,6 +103,13 @@ export interface ReceiptQueue {
      * Purchase sat in QuickBooks forever.
      */
     exceptions: IntakeRow[];
+    /**
+     * Morning Chat cards we asked Google Chat to post and never got a confirmed
+     * answer about. They are NEVER auto-retried — a duplicate chase card
+     * teaches people the list is noise — so nothing clears them but a human
+     * saying which way it went.
+     */
+    uncertainCards: UncertainCardRow[];
     missingReceipts: MissingReceiptRow[];
     counts: {
         needsJob: number;
@@ -91,10 +118,36 @@ export interface ReceiptQueue {
         bookedToday: number;
         duplicates: number;
         exceptions: number;
+        uncertainCards: number;
         /** The whole open missing-receipt queue, from a count query. */
         missingReceipts: number;
         /** How many of those this render is actually showing (owner filter + display cap). */
         missingReceiptsShown: number;
+    };
+}
+
+/** A card row → the shape the tab renders. `itemsJson` is never sent to the browser. */
+function toUncertainCardRow(row: {
+    id: string; owner: string; pacificDate: string; itemsJson: string;
+    attempts: number; lastError: string | null; updatedAt: Date;
+}): UncertainCardRow {
+    let items = 0;
+    try {
+        const parsed: unknown = JSON.parse(row.itemsJson);
+        items = Array.isArray(parsed) ? parsed.length : 0;
+    } catch {
+        // A card whose snapshot will not parse still has to be resolvable — the
+        // count is cosmetic, the row is not.
+        items = 0;
+    }
+    return {
+        id: row.id,
+        owner: row.owner,
+        pacificDate: row.pacificDate,
+        items,
+        attempts: row.attempts,
+        lastError: row.lastError,
+        updatedAt: row.updatedAt.toISOString(),
     };
 }
 
@@ -136,6 +189,7 @@ function toIntakeRow(row: RawIntake): IntakeRow {
         nextRetryAt: row.nextRetryAt ? row.nextRetryAt.toISOString() : null,
         bookedAt: row.bookedAt ? row.bookedAt.toISOString() : null,
         createdAt: row.createdAt.toISOString(),
+        updatedAt: row.updatedAt.toISOString(),
     };
 }
 
@@ -297,6 +351,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
     const [
         needsJob, needsReview, booking, bookedToday, duplicates, exceptions, issues,
         needsJobCount, needsReviewCount, bookingCount, bookedTodayCount, duplicatesCount, exceptionsCount, missingReceiptsCount,
+        uncertainCardRows, uncertainCardCount,
     ] = await Promise.all([
         loadIntakes(needsJobWhere),
         loadIntakes(needsReviewWhere),
@@ -312,6 +367,18 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
         prisma.receiptIntake.count({ where: duplicatesWhere }),
         prisma.receiptIntake.count({ where: exceptionsWhere }),
         prisma.reviewIssue.count({ where: issueWhere }),
+        // NOT project-scoped: a card is per OWNER, not per job, so a project
+        // filter cannot narrow it without hiding it entirely.
+        prisma.receiptRequestCard.findMany({
+            where: { status: "UNCERTAIN" },
+            orderBy: [{ pacificDate: "desc" }, { owner: "asc" }],
+            take: RECEIPT_GROUP_TAKE,
+            select: {
+                id: true, owner: true, pacificDate: true, itemsJson: true,
+                attempts: true, lastError: true, updatedAt: true,
+            },
+        }),
+        prisma.receiptRequestCard.count({ where: { status: "UNCERTAIN" } }),
     ]);
 
     const missingReceipts = issues
@@ -330,6 +397,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
         bookedToday: bookedToday.map(toIntakeRow),
         duplicates: duplicates.map(toIntakeRow),
         exceptions: exceptions.map(toIntakeRow),
+        uncertainCards: uncertainCardRows.map(toUncertainCardRow),
         missingReceipts,
         counts: {
             needsJob: needsJobCount,
@@ -338,6 +406,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
             bookedToday: bookedTodayCount,
             duplicates: duplicatesCount,
             exceptions: exceptionsCount,
+            uncertainCards: uncertainCardCount,
             // A real count query, like the other five. Deriving this from the
             // capped list understated the queue the moment it exceeded
             // RECEIPT_GROUP_TAKE — a 300-item backlog would have read as "100",

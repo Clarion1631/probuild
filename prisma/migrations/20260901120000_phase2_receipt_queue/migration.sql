@@ -78,6 +78,14 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT
 ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY;
 
 
+-- `overflow` is a COUNT; this says whether that count is exact. The selection
+-- scan can stop early (SCAN_MAX_PAGES) and a retry pass does not scan at all,
+-- so without persisting this a resumed card printed "and 4 more" as though it
+-- were authoritative when the number came from a scan that never ran. Defaults
+-- true: every card written before this column existed came from a full scan.
+ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "overflowExact" BOOLEAN NOT NULL DEFAULT true;
+
+
 -- The card delivery state machine. POSTING is written BEFORE the webhook call,
 -- so a crash mid-send is distinguishable from a crash before it — otherwise the
 -- next run has to either double-post or silently drop the day's card. A row

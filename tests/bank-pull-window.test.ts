@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     PULL_FULL_SWEEP_DAYS,
     PULL_MAX_WINDOW_DAYS,
     PULL_OVERLAP_DAYS,
+    REGISTER_WINDOW_DAYS,
+    registerWindowStart,
+    registerWindowStartYmd,
     CHECKPOINT_RESERVE_MS,
     advanceScanBoundary,
     highWaterOf,
@@ -443,4 +449,49 @@ test("exhaustion at the LAST ingest batch checkpoints the batch before it", asyn
     );
     assert.equal(summary.continueAfter?.qbTxnId, ordered[999].qbTxnId);
     assert.deepEqual(saved[0].continueAfter, summary.continueAfter);
+});
+
+// ── ONE 60-calendar-day boundary (round-13 item 4) ─────────────────────────
+
+test("the oldest supported day is IN the window; the day before it is not", () => {
+    // Day-based, not instant-based. `Date.now() - 60 * 86_400_000` is a time of
+    // day, and postedDate is a `@db.Date` at UTC midnight — so an instant
+    // boundary silently dropped the whole of its own oldest day, and moved
+    // every time the cron fired.
+    assert.equal(REGISTER_WINDOW_DAYS, 60);
+    const now = new Date("2026-09-02T18:45:00Z");
+    const oldest = registerWindowStartYmd(now);
+    assert.equal(oldest, "2026-07-05", "60 calendar days, inclusive of both ends");
+
+    // Inclusive of both ends: exactly 60 days are covered.
+    const span = (Date.parse("2026-09-02T00:00:00Z") - Date.parse(`${oldest}T00:00:00Z`)) / 86_400_000 + 1;
+    assert.equal(span, 60);
+
+    // A DATE column value on the oldest day is at UTC midnight, and a `gte` on
+    // the boundary must include it — that is the case an instant boundary lost.
+    const boundary = registerWindowStart(now);
+    assert.equal(boundary.toISOString(), "2026-07-05T00:00:00.000Z");
+    assert.ok(new Date("2026-07-05T00:00:00Z") >= boundary, "the oldest supported day is IN");
+    assert.ok(new Date("2026-07-04T00:00:00Z") < boundary, "the day before it is OUT");
+    // And it does not drift with the time of day the cron happens to run.
+    assert.equal(registerWindowStartYmd(new Date("2026-09-02T00:00:01Z")), oldest);
+    assert.equal(registerWindowStartYmd(new Date("2026-09-02T23:59:59Z")), oldest);
+});
+
+test("the deep sweep, the chaser and minting all use that ONE boundary", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    // The sweep plans exactly the shared window.
+    const sweep = planPullWindow({ highWater: "2026-09-01", lastFullSweep: null }, NOW);
+    assert.equal(sweep.fullSweep, true);
+    assert.equal(sweep.startDate, registerWindowStartYmd(NOW));
+
+    // The chaser and the mint pass read the same constant rather than their own.
+    const chaser = readFileSync(join(root, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(chaser, /export const LOOKBACK_DAYS = REGISTER_WINDOW_DAYS;/);
+    assert.match(chaser, /registerWindowStartYmd\(now, LOOKBACK_DAYS\)/);
+    const mint = readFileSync(join(root, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(mint, /const MINT_LOOKBACK_DAYS = REGISTER_WINDOW_DAYS;/);
+    assert.match(mint, /registerWindowStart\(new Date\(\), MINT_LOOKBACK_DAYS\)/);
+    // 45 was the old, SHORTER mint window — the dangerous direction.
+    assert.doesNotMatch(mint, /MINT_LOOKBACK_DAYS = 45/);
 });

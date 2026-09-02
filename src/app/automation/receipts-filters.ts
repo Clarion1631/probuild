@@ -13,6 +13,7 @@ export const RECEIPT_GROUPS = [
     "missing-receipts",
     "duplicates",
     "exceptions",
+    "uncertain-cards",
 ] as const;
 
 export type ReceiptGroup = (typeof RECEIPT_GROUPS)[number];
@@ -25,6 +26,7 @@ export const RECEIPT_GROUP_LABELS: Record<ReceiptGroup, string> = {
     "missing-receipts": "Missing receipts",
     duplicates: "Duplicates",
     exceptions: "Exceptions",
+    "uncertain-cards": "Uncertain deliveries",
 };
 
 /**

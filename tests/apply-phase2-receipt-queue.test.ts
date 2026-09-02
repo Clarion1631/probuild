@@ -137,3 +137,15 @@ test("the three-column BankLine index exists in all three places", () => {
     assert.ok(normalizedMigration.includes("bankline_account_posteddate_amountcents_idx"));
     assert.match(schemaPrisma, /@@index\(\[account, postedDate, amountCents\]\)/);
 });
+
+test("overflowExact ships with a TRUE default, so old cards keep their meaning", () => {
+    // Every card written before the column existed came from a completed scan,
+    // so `true` is the truthful backfill — and a DEFAULT means no UPDATE pass.
+    const wanted = normalize(
+        `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "overflowExact" BOOLEAN NOT NULL DEFAULT true`,
+    );
+    assert.ok(statements.some(s => normalize(s) === wanted), "the apply script adds it");
+    assert.ok(normalizedMigration.includes(wanted), "and so does the committed migration");
+    // Prisma has to agree, or the client selects a column the DB may not have.
+    assert.match(schemaPrisma, /overflowExact Boolean @default\(true\)/);
+});

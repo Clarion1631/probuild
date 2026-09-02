@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { RECEIPT_INTAKE_SECRET_HEADER, secretMatches } from "@/lib/receipt-intake/intake-auth";
+import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
 import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, isDurableArtifactUrl } from "@/lib/receipt-requests";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
@@ -48,10 +48,9 @@ interface AnswerBody {
 const MAX_SIGNATURE_ID_LEN = 128;
 
 export async function POST(request: Request) {
-    const provided = request.headers.get(RECEIPT_INTAKE_SECRET_HEADER);
-    if (!secretMatches(provided, process.env.RECEIPT_INTAKE_SECRET)) {
-        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
-    }
+    // RECEIPT_BRIDGE_SECRET, not the intake key — see the threads route.
+    const auth = authenticateBridge(request);
+    if (!auth.ok) return auth.response;
 
     let bodyUnknown: unknown;
     try {

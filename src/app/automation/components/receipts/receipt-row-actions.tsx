@@ -6,6 +6,7 @@ import { RECEIPT_OWNER_CHOICES } from "@/lib/receipt-requests";
 import {
     markReceiptIntakeDuplicate,
     resolveOrphanedQbPurchase,
+    resolveUncertainCard,
     setMissingReceiptOwner,
     retryReceiptIntake,
     setReceiptIntakeJob,
@@ -44,12 +45,19 @@ export function SetJobControl({
     jobs,
     currentProjectId,
     expectedState,
+    expectedUpdatedAt,
 }: {
     intakeId: string;
     jobs: Array<{ id: string; name: string }>;
     currentProjectId: string | null;
     /** The state this row was RENDERED with — the server CASes on it. */
     expectedState: string;
+    /**
+     * And the row VERSION it was rendered with. The state alone cannot tell one
+     * NEEDS_REVIEW from a later, different NEEDS_REVIEW, so a decision made
+     * about the first would otherwise land on the second.
+     */
+    expectedUpdatedAt: string;
 }) {
     const [projectId, setProjectId] = useState(currentProjectId ?? "");
     const { pending, run } = useAction("Job set — the pipeline will pick it up");
@@ -73,7 +81,7 @@ export function SetJobControl({
                 type="button"
                 className={BTN}
                 disabled={pending || !projectId}
-                onClick={() => run(() => setReceiptIntakeJob(intakeId, projectId, expectedState))}
+                onClick={() => run(() => setReceiptIntakeJob(intakeId, projectId, expectedState, expectedUpdatedAt))}
             >
                 Set job
             </button>
@@ -81,16 +89,16 @@ export function SetJobControl({
     );
 }
 
-export function RetryButton({ intakeId }: { intakeId: string }) {
+export function RetryButton({ intakeId, expectedUpdatedAt }: { intakeId: string; expectedUpdatedAt: string }) {
     const { pending, run } = useAction("Queued — the worker retries within 5 minutes");
     return (
-        <button type="button" className={BTN} disabled={pending} onClick={() => run(() => retryReceiptIntake(intakeId))}>
+        <button type="button" className={BTN} disabled={pending} onClick={() => run(() => retryReceiptIntake(intakeId, expectedUpdatedAt))}>
             Retry now
         </button>
     );
 }
 
-export function VoidButton({ intakeId, expectedState }: { intakeId: string; expectedState: string }) {
+export function VoidButton({ intakeId, expectedState, expectedUpdatedAt }: { intakeId: string; expectedState: string; expectedUpdatedAt: string }) {
     const { pending, run } = useAction("Voided");
     return (
         <button
@@ -99,7 +107,7 @@ export function VoidButton({ intakeId, expectedState }: { intakeId: string; expe
             disabled={pending}
             onClick={() => {
                 if (!window.confirm("Void this receipt? It stops being processed. A booked receipt can't be voided.")) return;
-                run(() => voidReceiptIntake(intakeId, expectedState));
+                run(() => voidReceiptIntake(intakeId, expectedState, expectedUpdatedAt));
             }}
         >
             Void
@@ -107,16 +115,16 @@ export function VoidButton({ intakeId, expectedState }: { intakeId: string; expe
     );
 }
 
-export function NotADuplicateButton({ intakeId }: { intakeId: string }) {
+export function NotADuplicateButton({ intakeId, expectedUpdatedAt }: { intakeId: string; expectedUpdatedAt: string }) {
     const { pending, run } = useAction("Sent back through routing");
     return (
-        <button type="button" className={BTN} disabled={pending} onClick={() => run(() => unmarkReceiptIntakeDuplicate(intakeId))}>
+        <button type="button" className={BTN} disabled={pending} onClick={() => run(() => unmarkReceiptIntakeDuplicate(intakeId, expectedUpdatedAt))}>
             Not a duplicate
         </button>
     );
 }
 
-export function MarkDuplicateControl({ intakeId, expectedState }: { intakeId: string; expectedState: string }) {
+export function MarkDuplicateControl({ intakeId, expectedState, expectedUpdatedAt }: { intakeId: string; expectedState: string; expectedUpdatedAt: string }) {
     const [duplicateOfId, setDuplicateOfId] = useState("");
     const { pending, run } = useAction("Marked as a duplicate");
     return (
@@ -134,7 +142,7 @@ export function MarkDuplicateControl({ intakeId, expectedState }: { intakeId: st
                 type="button"
                 className={BTN}
                 disabled={pending || !duplicateOfId}
-                onClick={() => run(() => markReceiptIntakeDuplicate(intakeId, duplicateOfId, expectedState))}
+                onClick={() => run(() => markReceiptIntakeDuplicate(intakeId, duplicateOfId, expectedState, expectedUpdatedAt))}
             >
                 Mark duplicate
             </button>
@@ -142,14 +150,14 @@ export function MarkDuplicateControl({ intakeId, expectedState }: { intakeId: st
     );
 }
 
-export function ResolveOrphanButton({ intakeId, qbPurchaseId }: { intakeId: string; qbPurchaseId: string }) {
+export function ResolveOrphanButton({ intakeId, qbPurchaseId, expectedUpdatedAt }: { intakeId: string; qbPurchaseId: string; expectedUpdatedAt: string }) {
     const [pending, startTransition] = useTransition();
     // This action RETURNS a stale verdict rather than throwing one, so a lost
     // race reads as "refresh", not "that didn't work — try again". Retrying a
     // stale click just loses the same race.
     const run = () => startTransition(async () => {
         try {
-            const result = await resolveOrphanedQbPurchase(intakeId);
+            const result = await resolveOrphanedQbPurchase(intakeId, expectedUpdatedAt);
             if (result.success) toast.success("Marked resolved");
             else toast.error(result.reason ?? "This receipt changed underneath you — refresh.");
         } catch (error) {
@@ -198,6 +206,43 @@ export function AssignOwnerControl({ issueId, currentOwner }: { issueId: string;
                 onClick={() => run(() => setMissingReceiptOwner(issueId, owner))}
             >
                 Assign
+            </button>
+        </div>
+    );
+}
+
+export function UncertainCardControls({ cardId, expectedUpdatedAt }: { cardId: string; expectedUpdatedAt: string }) {
+    const [pending, startTransition] = useTransition();
+    // Like ResolveOrphanButton, this action RETURNS a stale verdict instead of
+    // throwing one: a lost race means "somebody already decided", which reads
+    // as refresh, not as retry.
+    const run = (decision: "delivered" | "resend") => startTransition(async () => {
+        try {
+            const result = await resolveUncertainCard(cardId, decision, expectedUpdatedAt);
+            if (result.success) {
+                toast.success(decision === "delivered" ? "Marked delivered" : "Queued for resend");
+            } else {
+                toast.error(result.reason ?? "That card changed underneath you — refresh.");
+            }
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "That didn't work — try again");
+        }
+    });
+    return (
+        <div className="flex items-center gap-2 flex-wrap">
+            <button type="button" className={BTN} disabled={pending} onClick={() => run("delivered")}>
+                It&apos;s there — mark delivered
+            </button>
+            <button
+                type="button"
+                className={BTN}
+                disabled={pending}
+                onClick={() => {
+                    if (!window.confirm("Resend this card? Only do this if it is NOT in the space — a duplicate is worse than a late one.")) return;
+                    run("resend");
+                }}
+            >
+                Not there — resend
             </button>
         </div>
     );

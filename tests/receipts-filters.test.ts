@@ -31,10 +31,19 @@ test("parseReceiptFilters never trusts the query string", async t => {
     });
 });
 
-test("every group has a label, and the six are the spec's six", () => {
-    assert.deepEqual([...RECEIPT_GROUPS], ["needs-job", "needs-review", "booking", "booked-today", "missing-receipts", "duplicates", "exceptions"]);
-    assert.deepEqual(RECEIPT_GROUPS.map(g => RECEIPT_GROUP_LABELS[g]),
-        ["Needs job", "Needs review", "Booking", "Booked today", "Missing receipts", "Duplicates", "Exceptions"]);
+test("every group has a label, and they are the spec's groups plus the two operational ones", () => {
+    // The spec's six, then `exceptions` (an orphaned QuickBooks Purchase) and
+    // `uncertain-cards` (a Chat card whose delivery was never confirmed). Both
+    // exist because the work they describe is otherwise INVISIBLE: neither has
+    // a state any other group shows.
+    assert.deepEqual([...RECEIPT_GROUPS], [
+        "needs-job", "needs-review", "booking", "booked-today", "missing-receipts",
+        "duplicates", "exceptions", "uncertain-cards",
+    ]);
+    assert.deepEqual(RECEIPT_GROUPS.map(g => RECEIPT_GROUP_LABELS[g]), [
+        "Needs job", "Needs review", "Booking", "Booked today", "Missing receipts",
+        "Duplicates", "Exceptions", "Uncertain deliveries",
+    ]);
 });
 
 test("groupIsVisible: no filter shows all, a filter shows exactly one", () => {

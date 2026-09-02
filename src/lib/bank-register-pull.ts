@@ -178,12 +178,44 @@ export function isYmd(value: unknown): value is string {
 }
 
 
+/**
+ * THE register window: 60 calendar days, inclusive of today and of the oldest
+ * day. ONE definition, used by the deep sweep, the missing-receipt chaser and
+ * QBO minting.
+ *
+ * They used to carry three numbers (60 / 60 / 45) and two different notions of
+ * "60 days ago". Minting reaching back less far than the chaser is the one that
+ * bites: the chaser opens a chase for a 50-day-old charge, the mint pass cannot
+ * see the observation that would have given it a canonical line, and the chase
+ * can never close by itself. A boundary that three subsystems have to agree on
+ * belongs in one place.
+ */
+export const REGISTER_WINDOW_DAYS = 60;
+
+/**
+ * The OLDEST calendar day inside the window, YYYY-MM-DD (UTC).
+ *
+ * Day-based, not instant-based. `Date.now() - 60 * 86_400_000` is a time of
+ * day, and `postedDate` is a `@db.Date` stored at UTC midnight — so a
+ * mid-morning run silently excluded the whole of its own oldest day, and the
+ * boundary moved every time the cron fired.
+ */
+export function registerWindowStartYmd(now: Date, days: number = REGISTER_WINDOW_DAYS): string {
+    const today = Date.parse(`${now.toISOString().slice(0, 10)}T00:00:00Z`);
+    return new Date(today - (days - 1) * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** The same boundary as a Date at UTC midnight — what a `gte` on a DATE column wants. */
+export function registerWindowStart(now: Date, days: number = REGISTER_WINDOW_DAYS): Date {
+    return new Date(`${registerWindowStartYmd(now, days)}T00:00:00Z`);
+}
+
 /** Overlap re-pulled on every run, so an edit near the boundary is not missed. */
 export const PULL_OVERLAP_DAYS = 3;
 /** The most one run will ask QBO for. Bigger windows time out; this one continues. */
 export const PULL_MAX_WINDOW_DAYS = 60;
 /** The periodic deep sweep, to catch entries BACKDATED behind the high-water mark. */
-export const PULL_FULL_SWEEP_DAYS = 60;
+export const PULL_FULL_SWEEP_DAYS = REGISTER_WINDOW_DAYS;
 
 export interface PullWindowState {
     /** Latest TxnDate we have successfully pulled, YYYY-MM-DD, or null. */

@@ -33,6 +33,7 @@ interface Row {
     dedupStrongKey: string | null;
     stateReason: string | null;
     claimedAt: Date | null;
+    updatedAt: Date;
     duplicateOfId?: string | null;
 }
 
@@ -44,6 +45,7 @@ function row(over: Partial<Row> = {}): Row {
         dedupStrongKey: "strong:lowes:4600:2026-08-30",
         stateReason: null,
         claimedAt: null,
+        updatedAt: new Date("2026-09-02T17:00:00Z"),
         ...over,
     };
 }
@@ -62,6 +64,12 @@ function matches(where: Record<string, unknown>, target: Row): boolean {
             continue;
         }
         const value = (target as unknown as Record<string, unknown>)[field];
+        // Dates compare by VALUE — a Date is also an object, so this has to come
+        // before the operator branch below.
+        if (condition instanceof Date) {
+            if (!(value instanceof Date) || value.getTime() !== condition.getTime()) return false;
+            continue;
+        }
         if (condition !== null && typeof condition === "object") {
             const lt = (condition as { lt?: Date }).lt;
             if (lt !== undefined) {
@@ -197,4 +205,60 @@ test("the queue actions go through the plan, and the tab surfaces the result", (
     // And a kept key is visible: the Exceptions group is where a human finds it.
     const data = readFileSync(join(repoRoot, "src/app/automation/receipts-data.ts"), "utf8");
     assert.match(data, /stateReason: \{ endsWith: `:\$\{POSSIBLE_ORPHAN_REASON\}` \}/);
+});
+
+// ── Every queue action pins the row VERSION it saw (round-13 item 3) ────────
+
+test("ABA: the same state twice over is NOT the same row", () => {
+    // The failure this prevents, concretely. Marge opens the queue with a
+    // receipt in NEEDS_REVIEW. The worker retries it, books it, QBO faults, and
+    // it lands back in NEEDS_REVIEW — same state, same id, different row. Her
+    // "void" click was a decision about the FIRST one.
+    const seen = new Date("2026-09-02T17:00:00Z");
+    const afterTheRoundTrip = new Date("2026-09-02T17:04:00Z");
+    const plan = planParkWrites({
+        id: "intake-1",
+        expectedState: "NEEDS_REVIEW",
+        targetState: "VOID",
+        stateReason: "voided-by-user",
+        claimFence: { updatedAt: seen, ...claimFence(NOW) },
+    });
+
+    const rowAsRendered = row({ state: "NEEDS_REVIEW", updatedAt: seen });
+    const rowAfterABA = row({ state: "NEEDS_REVIEW", updatedAt: afterTheRoundTrip });
+
+    assert.equal(applyPlan(plan, rowAsRendered).applied, "release", "the row she looked at");
+    assert.equal(applyPlan(plan, rowAfterABA).applied, null, "a state-only CAS would have voided this one");
+
+    // Both branches carry it — the keep branch is not a way around the check.
+    assert.deepEqual(plan.release.where.updatedAt, seen);
+    assert.deepEqual(plan.keep.where.updatedAt, seen);
+});
+
+test("every queue action CASes on updatedAt, and the page hands it over", () => {
+    const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
+    assert.match(actions, /function assertExpectedUpdatedAt\(value: unknown\): Date/);
+    // Signatures: nothing may be called without the version the view saw.
+    for (const signature of [
+        /setReceiptIntakeJob\(id: string, projectId: string, expectedState: string, expectedUpdatedAt: string/,
+        /markReceiptIntakeDuplicate\(id: string, duplicateOfId: string, expectedState: string, expectedUpdatedAt: string\)/,
+        /unmarkReceiptIntakeDuplicate\(id: string, expectedUpdatedAt: string\)/,
+        /voidReceiptIntake\(id: string, expectedState: string, expectedUpdatedAt: string\)/,
+        /retryReceiptIntake\(id: string, expectedUpdatedAt: string\)/,
+        /resolveOrphanedQbPurchase\(id: string, expectedUpdatedAt: string\)/,
+    ]) {
+        assert.match(actions, signature);
+    }
+    // And each one reaches the WHERE clause, not just the signature.
+    const wheres = actions.match(/where: \{ id[^}]*updatedAt: seenAt/g) ?? [];
+    assert.ok(wheres.length >= 4, `expected the direct updateMany paths to pin it, saw ${wheres.length}`);
+    const parked = actions.match(/claimFence: \{ updatedAt: assertExpectedUpdatedAt\(expectedUpdatedAt\)/g) ?? [];
+    assert.equal(parked.length, 2, "void and mark-duplicate go through the park plan");
+
+    // The rendered row carries it, and every control is handed it.
+    const data = readFileSync(join(repoRoot, "src/app/automation/receipts-data.ts"), "utf8");
+    assert.match(data, /updatedAt: row\.updatedAt\.toISOString\(\),/);
+    const tab = readFileSync(join(repoRoot, "src/app/automation/components/receipts/receipts-tab.tsx"), "utf8");
+    const handed = tab.match(/expectedUpdatedAt=\{row\.updatedAt\}/g) ?? [];
+    assert.ok(handed.length >= 8, `every action control needs it, saw ${handed.length}`);
 });

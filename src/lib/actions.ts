@@ -15267,6 +15267,24 @@ async function runParkWrites(plan: ParkPlan, id: string, expected: string, now: 
     await receiptIntakeWriteFailure(id, [expected], now);
 }
 
+/**
+ * The row version the submitted view was rendering, as a Date.
+ *
+ * WHY THE STATE IS NOT ENOUGH (the ABA problem). A row can be NEEDS_REVIEW when
+ * the page renders, get routed, booked, and parked in NEEDS_REVIEW again a
+ * minute later — same state, different row. A state-only CAS happily applies a
+ * decision somebody made about the FIRST one to the second. `updatedAt` moves
+ * on every write, so pinning it means "the row I was looking at", not "a row
+ * that looks like the one I was looking at".
+ */
+function assertExpectedUpdatedAt(value: unknown): Date {
+    const at = typeof value === "string" || value instanceof Date ? new Date(value) : new Date(NaN);
+    if (Number.isNaN(at.getTime())) {
+        throw new Error("Refresh the page and try again — that view is out of date.");
+    }
+    return at;
+}
+
 /** Every state a manual write may legally act on (never BOOKED/ARCHIVED). */
 const HUMAN_WRITABLE_STATES = ["STAGING", "RECEIVED", "READ", "NEEDS_JOB", "NEEDS_REVIEW", "BOOKING", "DUPLICATE", "VOID", "NON_RECEIPT"];
 
@@ -15297,7 +15315,7 @@ function revalidateReceiptQueue() {
  * jumping the row straight to booking would skip the weak/strong duplicate
  * checks that stand between a re-uploaded receipt and a double purchase.
  */
-export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, costCodeId?: string | null) {
+export async function setReceiptIntakeJob(id: string, projectId: string, expectedState: string, expectedUpdatedAt: string, costCodeId?: string | null) {
     const user = await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
     if (typeof projectId !== "string" || !projectId) throw new Error("projectId is required");
@@ -15326,11 +15344,12 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
 
     const now = new Date();
     const expected = assertExpectedState(expectedState);
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
     if (!["NEEDS_JOB", "NEEDS_REVIEW"].includes(expected)) {
         throw new Error("A job can only be set on a receipt waiting for one");
     }
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: expected, ...notClaimedByWorker(now) },
+        where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
         data: {
             projectId,
             // Explicit code wins; otherwise keep one still valid here, else null.
@@ -15350,7 +15369,7 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
 }
 
 /** Park a row as a duplicate of another. `duplicateOfId` must be a real, different row. */
-export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string, expectedState: string) {
+export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: string, expectedState: string, expectedUpdatedAt: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
     if (typeof duplicateOfId !== "string" || !duplicateOfId) throw new Error("duplicateOfId is required");
@@ -15388,20 +15407,23 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
         targetState: "DUPLICATE",
         stateReason: `manual-dup:${duplicateOfId}`,
         extraData: { duplicateOfId },
-        claimFence: notClaimedByWorker(now),
+        claimFence: { updatedAt: assertExpectedUpdatedAt(expectedUpdatedAt), ...notClaimedByWorker(now) },
     }), id, expected, now);
     revalidateReceiptQueue();
     return { success: true };
 }
 
 /** "Not a duplicate" — back to READ so routing and dedup run again from scratch. */
-export async function unmarkReceiptIntakeDuplicate(id: string) {
+export async function unmarkReceiptIntakeDuplicate(id: string, expectedUpdatedAt: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
     const now = new Date();
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: "DUPLICATE", ...notClaimedByWorker(now) },
+        // DUPLICATE twice over is the ABA case exactly: unmarked, re-marked
+        // against a different original, and this click would undo the new one.
+        where: { id, state: "DUPLICATE", updatedAt: seenAt, ...notClaimedByWorker(now) },
         data: { state: "READ", duplicateOfId: null, stateReason: null, lastError: null, nextRetryAt: null },
     });
     if (result.count === 0) await receiptIntakeWriteFailure(id, ["DUPLICATE"], now);
@@ -15410,7 +15432,7 @@ export async function unmarkReceiptIntakeDuplicate(id: string) {
 }
 
 /** Void anything that hasn't booked. A BOOKED/ARCHIVED row is refused outright. */
-export async function voidReceiptIntake(id: string, expectedState: string) {
+export async function voidReceiptIntake(id: string, expectedState: string, expectedUpdatedAt: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
@@ -15422,7 +15444,7 @@ export async function voidReceiptIntake(id: string, expectedState: string) {
         expectedState: expected,
         targetState: "VOID",
         stateReason: "voided-by-user",
-        claimFence: notClaimedByWorker(now),
+        claimFence: { updatedAt: assertExpectedUpdatedAt(expectedUpdatedAt), ...notClaimedByWorker(now) },
     }), id, expected, now);
     revalidateReceiptQueue();
     return { success: true };
@@ -15437,11 +15459,12 @@ export async function voidReceiptIntake(id: string, expectedState: string) {
  * permanently-broken document stops hammering QBO, and a human clicking retry
  * shouldn't silently remove that ceiling.
  */
-export async function retryReceiptIntake(id: string) {
+export async function retryReceiptIntake(id: string, expectedUpdatedAt: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
 
     const now = new Date();
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
     const current = await prisma.receiptIntake.findUnique({
         where: { id },
         select: { state: true, stateReason: true, nextRetryAt: true },
@@ -15459,7 +15482,10 @@ export async function retryReceiptIntake(id: string) {
     }
 
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: current.state, stateReason: current.stateReason, ...notClaimedByWorker(now) },
+        // The row version the human SAW, not merely the state and reason the
+        // re-read found: those two can be identical across a whole failed
+        // attempt in between.
+        where: { id, state: current.state, stateReason: current.stateReason, updatedAt: seenAt, ...notClaimedByWorker(now) },
         data: {
             // RECEIVED re-reads the document; BOOKING resumes at the send.
             state: target,
@@ -15487,9 +15513,10 @@ export async function retryReceiptIntake(id: string) {
  * Exceptions queue empties as the work is actually done rather than by anyone
  * clicking it away. The id is kept in `stateReason` so the audit trail survives.
  */
-export async function resolveOrphanedQbPurchase(id: string) {
+export async function resolveOrphanedQbPurchase(id: string, expectedUpdatedAt: string) {
     await assertReceiptQueueAccess();
     if (typeof id !== "string" || !id) throw new Error("id is required");
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
 
     const row = await prisma.receiptIntake.findUnique({
         where: { id },
@@ -15512,11 +15539,67 @@ export async function resolveOrphanedQbPurchase(id: string) {
     // and a second tab can resolve the same row, and either means the view this
     // click came from is stale.
     const result = await prisma.receiptIntake.updateMany({
-        where: { id, state: row.state, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
+        where: { id, state: row.state, updatedAt: seenAt, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
         data: { postVoidQbPurchaseId: null, stateReason },
     });
     if (result.count === 0) {
         return { success: false, stale: true as const, reason: "This receipt changed underneath you — refresh and try again." };
+    }
+    revalidateReceiptQueue();
+    return { success: true, stale: false as const };
+}
+
+/**
+ * Resolve a Chat card whose delivery was never confirmed (round-13 item 6).
+ *
+ * An UNCERTAIN row means we called the webhook and did not get an answer we
+ * could believe: the card may be sitting in the crew's space right now, or it
+ * may never have arrived. The cron will NEVER decide that for itself — an
+ * automatic resend risks a duplicate chase card, and a duplicate teaches people
+ * the list is noise. So a human looks in the space and says which it was:
+ *
+ *   "delivered" — it is there. The row is POSTED and the day is closed. The
+ *     items are not re-asked, and tomorrow's card moves on.
+ *   "resend"    — it is not there. The row goes back to PENDING with its claim
+ *     released, so the retry pass sends it — and that pass re-verifies the
+ *     snapshot first, so anything answered in the meantime is dropped.
+ *
+ * CASed on `updatedAt` as well as `status`: two people looking at the same
+ * queue must not both decide, and the cron may have moved the row since the
+ * page rendered.
+ */
+export async function resolveUncertainCard(
+    cardId: string,
+    decision: "delivered" | "resend",
+    expectedUpdatedAt: string,
+) {
+    await assertReceiptQueueAccess();
+    if (typeof cardId !== "string" || !cardId) throw new Error("cardId is required");
+    if (decision !== "delivered" && decision !== "resend") throw new Error("decision must be delivered or resend");
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+
+    const result = await prisma.receiptRequestCard.updateMany({
+        where: { id: cardId, status: "UNCERTAIN", updatedAt: seenAt },
+        data: decision === "delivered"
+            ? {
+                status: "POSTED",
+                // The card IS out; `postedAt` is what stops any later run
+                // re-posting the day.
+                postedAt: new Date(),
+                lastError: null,
+                claimedAt: null,
+                claimToken: null,
+            }
+            : {
+                status: "PENDING",
+                lastError: "resend-requested",
+                // Ownership released, so the retry pass can claim it.
+                claimedAt: null,
+                claimToken: null,
+            },
+    });
+    if (result.count === 0) {
+        return { success: false, stale: true as const, reason: "That card changed underneath you — refresh." };
     }
     revalidateReceiptQueue();
     return { success: true, stale: false as const };

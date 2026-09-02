@@ -20,6 +20,7 @@ import {
     planReceiptRequests,
     type ReceiptRequestPlan,
 } from "@/lib/receipt-requests";
+import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
 export const dynamic = "force-dynamic";
@@ -52,8 +53,13 @@ export const maxDuration = 60;
 
 
 
-/** How far back the sweep looks for chaseable debits. */
-export const LOOKBACK_DAYS = 60;
+/**
+ * How far back the sweep looks for chaseable debits — THE SAME 60-calendar-day
+ * boundary the QBO pull's deep sweep and minting use (`REGISTER_WINDOW_DAYS`).
+ * Three subsystems have to agree on this or a chase can outlive the evidence
+ * that would close it.
+ */
+export const LOOKBACK_DAYS = REGISTER_WINDOW_DAYS;
 
 /**
  * Lines per BATCH. Small on purpose: the cursor is checkpointed after each one,
@@ -608,11 +614,6 @@ async function evidenceRange(fromYmd: string, toYmd: string): Promise<EvidenceBo
     return evidenceBoundsFor(fromYmd, toYmd, await resolveCompanyTimeZone());
 }
 
-/** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
-function ymdDaysBefore(now: Date, days: number): string {
-    return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
-}
-
 export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -666,7 +667,7 @@ export async function GET(request: Request) {
 }
 
 async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
-    const windowStart = ymdDaysBefore(now, LOOKBACK_DAYS);
+    const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
     // The cycle is unfinished from here until the line pass exhausts.
     if (startPhase !== "lines") await writePhase("open-issues");

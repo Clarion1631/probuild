@@ -40,6 +40,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intakeStuck: { status: "ok" as const, count: 0 },
         intakeNeedsReview: { status: "ok" as const, count: 0 },
         intakeUnassigned: { status: "ok" as const, count: 0 },
+        uncertainCards: { status: "ok" as const, count: 0 },
         // The nightly QBO pull is OFF by default, so it contributes no reason.
         bankPull: { enabled: false, lastSuccessAt: null },
         now: NOW,
@@ -752,4 +753,20 @@ test("the stale reason rides alongside the others, it does not replace them", ()
     }));
     assert.equal(result.ok, false);
     assert.deepEqual([...result.reasons].sort(), ["bank-pull-stale", "errors-24h:3"]);
+});
+
+test("an uncertain Chat card is a real, actionable failure", () => {
+    // Those rows are deliberately never auto-retried, so nothing but a human
+    // clears them. Until one looks, the crew simply never got asked — which is
+    // the exact failure the digest exists to prevent, reported as healthy.
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({ uncertainCards: { status: "ok", count: 2 } })),
+        { ok: false, reasons: ["cards-uncertain:2"] },
+    );
+    // Zero is silent, and a FAILED probe is already reported as probe-failed —
+    // it must not also invent a count.
+    assert.deepEqual(evaluatePipelineHealth(snapshot({ uncertainCards: { status: "ok", count: 0 } })).reasons, []);
+    const broken = evaluatePipelineHealth(snapshot({ uncertainCards: { status: "error", reason: "error", count: 0 } }));
+    assert.ok(broken.reasons.includes("probe-failed:uncertainCards"));
+    assert.ok(!broken.reasons.some(r => r.startsWith("cards-uncertain")));
 });

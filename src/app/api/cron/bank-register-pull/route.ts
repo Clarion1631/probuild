@@ -11,6 +11,8 @@ import {
     BANK_REGISTER_ACCOUNT,
     type PullWindowState,
     BANK_REGISTER_PULL_DAYS,
+    REGISTER_WINDOW_DAYS,
+    registerWindowStart,
     runBankRegisterPull,
     type BankRegisterIngestLine,
     type BankRegisterIngestResult,
@@ -114,8 +116,15 @@ export async function GET(request: Request) {
     }
 }
 
-/** How far back a mint pass looks for still-unlinked QBO observations. */
-const MINT_LOOKBACK_DAYS = 45;
+/**
+ * How far back a mint pass looks for still-unlinked QBO observations: THE SAME
+ * 60-calendar-day boundary as the deep sweep and the missing-receipt chaser.
+ *
+ * It was 45, and shorter is the dangerous direction: the chaser opens a chase
+ * for a 50-day-old charge, minting cannot see the observation that would give
+ * it a canonical line, and that chase can never close by itself.
+ */
+const MINT_LOOKBACK_DAYS = REGISTER_WINDOW_DAYS;
 
 /** Rows per mint transaction. Small enough to commit well inside the timeout. */
 const MINT_BATCH_SIZE = 200;
@@ -136,7 +145,10 @@ const MINT_MAX_BATCHES = 10;
  * observation wins and this mint rolls back rather than forking the identity.
  */
 async function mintFromQbo(account: string, deadlineAt?: number): Promise<{ minted: number; skipped: Record<string, number> }> {
-    const since = new Date(Date.now() - MINT_LOOKBACK_DAYS * 86_400_000);
+    // The START of the oldest allowed day, not an instant 60 days ago:
+    // `postedDate` is a `@db.Date` at UTC midnight, so an instant boundary
+    // silently drops the whole of its own oldest day and moves every run.
+    const since = registerWindowStart(new Date(), MINT_LOOKBACK_DAYS);
     let minted = 0;
     const skipped: Record<string, number> = {};
 

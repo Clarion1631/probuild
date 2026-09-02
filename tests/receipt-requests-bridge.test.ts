@@ -263,8 +263,11 @@ test("a configured webhook that fails to deliver FAILS the run", () => {
     // A 200 here meant nobody was ever told the crew's card did not go out.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     assert.match(source, /failures\.push\(card\.owner\);/);
-    assert.match(source, /ok: failures\.length === 0/);
-    assert.match(source, /status: summary\.ok \? 200 : 500/);
+    assert.match(source, /ok: failures\.length === 0 && uncertainTransitions\.length === 0,/);
+    // A REFUSED delivery is a 500 — it is worth retrying. An UNCONFIRMED one is
+    // partial: ok:false, HTTP 200, because it needs a human and not another
+    // attempt (see tests/receipt-request-cards.test.ts).
+    assert.match(source, /status: failures\.length > 0 \? 500 : 200/);
     // The row is left UNPOSTED with its claim released, so the retry pass can
     // take it straight away rather than waiting out a lease.
     assert.match(source, /status: "PENDING",[\s\S]{0,200}lastError: `rejected:\$\{result\.reason\}`/);
@@ -336,7 +339,7 @@ test("finished worker transitions hand ownership back", () => {
 
 test("resolveOrphanedQbPurchase CASes and APPENDS rather than overwriting", () => {
     const source = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
-    assert.match(source, /where: \{ id, state: row\.state, postVoidQbPurchaseId: row\.postVoidQbPurchaseId \}/);
+    assert.match(source, /where: \{ id, state: row\.state, updatedAt: seenAt, postVoidQbPurchaseId: row\.postVoidQbPurchaseId \}/);
     assert.match(source, /`\$\{row\.stateReason\}; \$\{note\}`/, "the existing reason must survive");
     assert.match(source, /stale: true as const/, "a lost race is a stale verdict, not a retryable error");
 });
@@ -591,12 +594,14 @@ test("queue actions CAS on the state the submitted view saw", () => {
     // with a whole booking attempt in between.
     for (const call of [
         /setReceiptIntakeJob\(id: string, projectId: string, expectedState: string/,
-        /markReceiptIntakeDuplicate\(id: string, duplicateOfId: string, expectedState: string\)/,
-        /voidReceiptIntake\(id: string, expectedState: string\)/,
+        /markReceiptIntakeDuplicate\(id: string, duplicateOfId: string, expectedState: string, expectedUpdatedAt: string\)/,
+        /voidReceiptIntake\(id: string, expectedState: string, expectedUpdatedAt: string\)/,
     ]) {
         assert.match(source, call);
     }
-    assert.match(source, /where: \{ id, state: expected, \.\.\.notClaimedByWorker\(now\) \}/);
+    // ...and on the row VERSION too, because the same state twice over is not
+    // the same row (see tests/receipt-intake-park.test.ts for the ABA case).
+    assert.match(source, /where: \{ id, state: expected, updatedAt: seenAt, \.\.\.notClaimedByWorker\(now\) \}/);
     assert.doesNotMatch(source, /where: \{ id, state: \{ in: allowed \}/, "the allowed-set CAS is gone");
 });
 
@@ -614,7 +619,10 @@ test("signed:true with no durable artifact is a 400 that writes nothing", async 
     // malformed forwarder row silenced a genuinely missing receipt and left
     // nothing behind a human could open. These requests are refused BEFORE any
     // read or write — the route never reaches Prisma on this path.
+    // The BRIDGE key now, not the intake one — see receipt-bridge-secret.test.ts.
     process.env.RECEIPT_INTAKE_SECRET = "test-intake-secret";
+    process.env.RECEIPT_ARCHIVE_SECRET = "test-archive-secret";
+    process.env.RECEIPT_BRIDGE_SECRET = "test-bridge-secret";
     const { POST } = await import("../src/app/api/automation/receipt-requests/answers/route");
 
     const post = (body: Record<string, unknown>) => POST(new Request(
@@ -623,7 +631,7 @@ test("signed:true with no durable artifact is a 400 that writes nothing", async 
             method: "POST",
             headers: {
                 "content-type": "application/json",
-                "x-receipt-intake-secret": "test-intake-secret",
+                "x-receipt-intake-secret": "test-bridge-secret",
             },
             body: JSON.stringify(body),
         },
