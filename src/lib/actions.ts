@@ -15845,7 +15845,8 @@ export async function lockPayrollPeriod(
 export async function settleDeferredDaysForPeriod(periodStartKey: string, periodEndKey: string) {
     await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
-    const { startOfDateInTimeZone, dayKeyInTimeZone } = await import("./tz-date");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { COMPANY_TIME_ZONE, toCompanyDayKey } = await import("./company-day");
     const { validatePayrollRange, payrollLockEnvelope } = await import("./payroll-config");
     const { planDeferredSettlements } = await import("./gusto-export-core");
     const { lockedPeriodFor, loadLockedPeriods, isPeriodLockedError } = await import("./payroll-period");
@@ -15854,10 +15855,21 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
     const range = validatePayrollRange(periodStartKey, periodEndKey);
     if (!range.ok) return { success: false as const, error: range.error };
 
+    // The query WINDOW (periodStart/periodEnd/envelope) is legitimately in the
+    // configured company zone — it is just a superset filter for which rows to
+    // look at. But the per-row `dayKey` below feeds straight into settleDay(),
+    // and settleDay selects/rewrites rows with toCompanyDayKey, which is
+    // hardcoded to COMPANY_TIME_ZONE (see the comment on assertSettlementDayUnlocked
+    // in wa-breaks-db.ts — every OTHER settleDay caller derives its dayKey the
+    // same way). Labeling rows here with the configured zone instead made this
+    // the one caller that could hand settleDay a key for the wrong calendar
+    // day whenever CompanySettings.timeZone was non-Pacific: a midnight-
+    // boundary entry would be grouped under one date here and then matched
+    // against a different date's rows inside settleDay.
     const timeZone = await resolveCompanyTimeZone();
     const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
     const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
-    const dayKey = (instant: Date) => dayKeyInTimeZone(instant, timeZone);
+    const dayKey = (instant: Date) => toCompanyDayKey(instant);
 
     // The SAME window readiness and locking use. Readiness blocks on a deferred
     // day anywhere in the workweek envelope, so settling only the literal pay
@@ -15892,7 +15904,12 @@ export async function settleDeferredDaysForPeriod(periodStartKey: string, period
         unsettled: unsettled.map((row) => ({ userId: row.userId, dayKey: dayKey(row.startTime) })),
         openPunchDayKeys: openRows.map((row) => `${row.userId}|${dayKey(row.startTime)}`),
         todayKey: dayKey(new Date()),
-        isDayLocked: (key) => !!lockedPeriodFor(lockedPeriods, startOfDateInTimeZone(key, timeZone), { timeZone }),
+        // Same reasoning as dayKey above: `key` is a COMPANY_TIME_ZONE day, so
+        // reading it back into an instant must use that same zone, not the
+        // configured one — otherwise this pre-check disagrees with the zone
+        // settleDay's own guard (assertSettlementDayUnlocked) enforces.
+        isDayLocked: (key) =>
+            !!lockedPeriodFor(lockedPeriods, startOfDateInTimeZone(key, COMPANY_TIME_ZONE), { timeZone: COMPANY_TIME_ZONE }),
     });
 
     let settled = 0;

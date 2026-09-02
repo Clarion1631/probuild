@@ -166,6 +166,26 @@ async function settleDayInTx(
                 await assertSettlementDayUnlocked(tx, userId, dayKey);
             }
 
+            // TimeEntry BEFORE User, in sorted id order — the same order every
+            // other payroll writer takes (THE GLOBAL LOCK ORDER in
+            // payroll-period.ts; closeTimeEntry locks its row FOR UPDATE, then
+            // reads the owner FOR UPDATE afterwards). Settlement used to read
+            // the owner FOR SHARE first and only lock TimeEntry rows later, one
+            // at a time, inside the update loop below — the exact opposite
+            // order. A settlement and a concurrent clock-out/edit on an
+            // overlapping window could then each hold what the other needs
+            // next: the close holding its TimeEntry row and waiting on the
+            // owner, this settlement holding the owner (shared) and waiting on
+            // a TimeEntry row. Locking the day's candidate rows here, before
+            // the owner read, removes that cycle.
+            const window = dayWindow(dayKey);
+            await tx.$queryRawUnsafe(
+                `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3 ORDER BY "id" FOR UPDATE`,
+                userId,
+                window.gte,
+                window.lt
+            );
+
             // The whole owner, not just the numbers: settlement REPRICES every
             // row it touches, so it is a first-pass pricing decision in its own
             // right and answers to the same $0-rate policy. Writing
@@ -191,7 +211,7 @@ async function settleDayInTx(
             });
 
             const rows = await tx.timeEntry.findMany({
-                where: { userId, endTime: { not: null }, startTime: dayWindow(dayKey) },
+                where: { userId, endTime: { not: null }, startTime: window },
                 select: {
                     id: true, startTime: true, endTime: true, mealOutcome: true, mealSkipStatus: true, reviewReason: true,
                     shiftHours: true, mealDeductionHours: true, durationHours: true, needsReview: true,
