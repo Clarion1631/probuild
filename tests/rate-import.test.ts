@@ -9,6 +9,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     diffRates,
     parseCsvGrid,
@@ -409,4 +411,34 @@ test("the envelope is Mon-Sun OT weeks ONLY — PAYROLL_WEEK_START never widens 
         if (previous === undefined) delete process.env.PAYROLL_WEEK_START;
         else process.env.PAYROLL_WEEK_START = previous;
     }
+});
+
+test("a file with SOME unreadable rows blocks the whole import", () => {
+    // The good rows parse and the bad ones are reported, so the preview looks
+    // usable. Importing just the good half leaves a half-applied pay change
+    // nobody reviewed — and the errors were on the screen Save was clicked from.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            "Tim Brennan,tim@example.com,31.00",
+            "Garrett Lane,garrett@example.com,28.005",
+            "Pat One,pat1@example.com,29.00",
+        ].join(String.fromCharCode(10))
+    );
+    assert.equal(parsed.rows.length, 2, "the readable rows still parse");
+    assert.equal(parsed.errors.length, 1, "and the unreadable one is reported");
+
+    // The server re-parses rather than trusting the browser's "no errors".
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function applyGustoRateImport"));
+    const body = fn.slice(0, fn.indexOf(String.fromCharCode(10) + "/**"));
+    assert.match(body, /parseGustoRateCsv\(csvText\)/);
+    assert.match(body, /reparsed\.errors\.length > 0/);
+
+    // And the button is disabled, so it is refused before it is attempted.
+    const ui = readFileSync(
+        path.join(__dirname, "..", "src", "app", "company", "team-members", "RatesImport.tsx"),
+        "utf8"
+    );
+    assert.match(ui, /disabled=\{busy \|\| errors\.length > 0\}/);
 });

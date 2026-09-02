@@ -73,9 +73,11 @@ export async function POST(req: NextRequest) {
     if (!reserved.ok) {
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
-    if (reserved.existing) {
-      // A retry carrying the same submissionId. Return what already exists
-      // rather than opening a second issue for one report.
+    // A retry carrying the same submissionId. If the previous attempt died
+    // before it could create the issue, RESUME it rather than returning early —
+    // otherwise that report is stranded in `submitting` forever. Otherwise
+    // return what exists, so a double-tap never files twice.
+    if (reserved.existing && !reserved.resume) {
       const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
       return NextResponse.json({ request: prior, githubIssue: null, duplicate: true });
     }

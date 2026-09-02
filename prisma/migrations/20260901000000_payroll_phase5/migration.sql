@@ -138,6 +138,14 @@ DO $$ BEGIN
    END IF;
  END $$;
 
+-- The backfill above filled every legacy row, so the constraint can now be
+-- VALIDATED. Leaving it NOT VALID meant the constraint existed but had never
+-- checked anything, which is both weaker than it looks and a real difference
+-- from production that the migrations job correctly refused to ignore.
+-- VALIDATE takes only a SHARE UPDATE EXCLUSIVE lock, so it does not block reads
+-- or writes.
+ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_keys_present";
+
 ALTER TABLE "PayrollPeriod" ENABLE ROW LEVEL SECURITY;
 
 -- User carries hourlyRate / burdenRate / payType, so it needs the same

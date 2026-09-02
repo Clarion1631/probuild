@@ -13,6 +13,7 @@ import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } fr
 import {
     assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
+    withPayrollWrite,
     dayLockKey,
     isPeriodLockedError,
     periodLockedResponse,
@@ -103,7 +104,14 @@ export async function POST(req: Request) {
         });
         if (stale && latest) {
             // Optimistic: only if nobody composed a reason onto the row meanwhile.
-            await prisma.timeEntry.updateMany({ where: { id: latest.id, reviewReason: latest.reviewReason }, data: stale });
+            // Payroll write (it sets needsReview, which gates the export), so it
+            // takes the advisory-lock protocol like every other one.
+            await withPayrollWrite({ entryIds: [latest.id] }, async (tx) =>
+                (tx as unknown as typeof prisma).timeEntry.updateMany({
+                    where: { id: latest.id, reviewReason: latest.reviewReason },
+                    data: stale,
+                })
+            );
             // And settle that day for real — the deferred close WAS the day's end.
             // Day keyed by START time, like every other reader of a row's day.
             await settleDay(user.id, toCompanyDayKey(latest.startTime), null);

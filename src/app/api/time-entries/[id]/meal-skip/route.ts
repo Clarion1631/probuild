@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withPayrollWrite } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canApproveMealSkip, checkMealSkipDecision } from "@/lib/wa-breaks";
 import { isValidChatWebhookUrl } from "@/lib/chat-webhook";
@@ -74,10 +75,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return NextResponse.json({ id: entry.id, mealSkipStatus: entry.mealSkipStatus, alreadyRequested: true });
     }
 
-    const updated = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const updated = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         where: { id, userId: user.id, endTime: null, mealSkipStatus: null },
         data: { mealSkipStatus: "PENDING", mealSkipRequestedAt: new Date() },
-    });
+        })
+    );
     if (updated.count === 0) {
         const current = await prisma.timeEntry.findUnique({ where: { id }, select: { mealSkipStatus: true, endTime: true } });
         if (current?.mealSkipStatus) {
@@ -136,7 +141,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 
     // Guarded update: only a still-PENDING row flips, so two approvers
     // deciding at once cannot overwrite each other.
-    const flipped = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const flipped = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         // APPROVED additionally requires the shift to STILL be open at write time —
         // a clock-out racing this decision must not leave "approved" on a row
         // whose pay was already settled by the attestation path.
@@ -153,7 +161,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             mealSkipDecidedAt: new Date(),
             ...(reason !== undefined ? { mealSkipReason: reason } : {}),
         },
-    });
+        })
+    );
     if (flipped.count === 0) {
         return NextResponse.json({ error: "Request was already decided", code: "NOT_PENDING" }, { status: 409 });
     }

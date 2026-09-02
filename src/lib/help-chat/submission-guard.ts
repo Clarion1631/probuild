@@ -152,21 +152,29 @@ export function hourBucket(now: Date = new Date()): Date {
 }
 
 export type ReserveResult =
-    | { ok: true; id: string; existing: boolean }
+    | { ok: true; id: string; existing: boolean; resume: boolean }
     | { ok: false; reason: "throttled" };
 
+/** A `submitting` row older than this was abandoned mid-flight; a retry resumes it. */
+export const HELP_SUBMITTING_STALE_MS = 2 * 60 * 1000;
+
 /**
- * Claim a submission slot and create the row.
+ * Claim a submission slot and create the row, in ONE transaction.
  *
- * The limit is enforced by a CONDITIONAL UPDATE on a per-user, per-hour counter
- * row (`SET count = count + 1 WHERE count < limit RETURNING`). Counting rows in
- * HelpRequest was a read-then-write that concurrent requests all passed; here
- * the database decides, once, and the losing request gets no row back.
+ * Both halves commit together or neither does. They used to be separate
+ * statements: a failure between them either consumed a slot with no row to show
+ * for it, or created a row the counter never saw.
  *
- * `submissionId` makes a retry idempotent: the same key returns the row that
- * already exists, without consuming another slot or filing a second issue. The
- * lookup happens BEFORE the counter is touched, so a client retrying a request
- * that actually succeeded is never throttled for it.
+ * Retry semantics, for the same `submissionId`:
+ *  - a row that reached a terminal status is returned as-is (`existing`), so a
+ *    retry never opens a second GitHub issue;
+ *  - a row still `submitting` and OLDER than HELP_SUBMITTING_STALE_MS is
+ *    RESUMED (`resume`): the previous attempt died before it could create the
+ *    issue, and returning early would strand the report forever;
+ *  - a row still `submitting` and recent is treated as in-flight and returned,
+ *    because a double-tap should not file twice.
+ *
+ * A resume consumes no additional quota — the slot was already paid for.
  */
 export async function reserveHelpRequest(input: {
     userId: string;
@@ -183,36 +191,57 @@ export async function reserveHelpRequest(input: {
         // clients pick these, so collisions are a matter of time.
         const existing = await prisma.helpRequest.findUnique({
             where: { userId_submissionId: { userId: input.userId, submissionId: input.submissionId } },
-            select: { id: true },
+            select: { id: true, status: true, createdAt: true },
         });
-        if (existing) return { ok: true, id: existing.id, existing: true };
+        if (existing) {
+            const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
+            const stale = existing.status === "submitting" && age > HELP_SUBMITTING_STALE_MS;
+            return { ok: true, id: existing.id, existing: true, resume: stale };
+        }
     }
 
     const bucket = hourBucket();
-    // Insert-on-missing, then the conditional increment. Two statements, but the
-    // decision is entirely in the second one.
-    await prisma.$executeRaw`
-        INSERT INTO "HelpSubmissionQuota" ("id", "userId", "hourBucket", "count")
-        VALUES (gen_random_uuid()::text, ${input.userId}, ${bucket}, 0)
-        ON CONFLICT ("userId", "hourBucket") DO NOTHING
-    `;
-    const claimed = await prisma.$queryRaw<Array<{ count: number }>>`
-        UPDATE "HelpSubmissionQuota"
-        SET "count" = "count" + 1
-        WHERE "userId" = ${input.userId}
-          AND "hourBucket" = ${bucket}
-          AND "count" < ${HELP_SUBMISSIONS_PER_HOUR}
-        RETURNING "count"
-    `;
-    if (claimed.length === 0) return { ok: false, reason: "throttled" };
+    try {
+        const id = await prisma.$transaction(async (tx) => {
+            // Insert-on-missing, then the conditional increment. The decision is
+            // entirely in the UPDATE: five concurrent callers all read the same
+            // count under the old count-then-insert and all passed.
+            await tx.$executeRaw`
+                INSERT INTO "HelpSubmissionQuota" ("id", "userId", "hourBucket", "count")
+                VALUES (gen_random_uuid()::text, ${input.userId}, ${bucket}, 0)
+                ON CONFLICT ("userId", "hourBucket") DO NOTHING
+            `;
+            const claimed = await tx.$queryRaw<Array<{ count: number }>>`
+                UPDATE "HelpSubmissionQuota"
+                SET "count" = "count" + 1
+                WHERE "userId" = ${input.userId}
+                  AND "hourBucket" = ${bucket}
+                  AND "count" < ${HELP_SUBMISSIONS_PER_HOUR}
+                RETURNING "count"
+            `;
+            if (claimed.length === 0) throw new HelpThrottledError();
 
-    const rows = await prisma.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO "HelpRequest" ("userId", "type", "question", "response", "currentPage", "status", "conversationId", "submissionId")
-        VALUES (${input.userId}, ${input.type}, ${input.question}, ${input.response},
-                ${input.currentPage}, 'submitting', ${input.conversationId}, ${input.submissionId})
-        RETURNING "id"
-    `;
-    return { ok: true, id: rows[0].id, existing: false };
+            const rows = await tx.$queryRaw<Array<{ id: string }>>`
+                INSERT INTO "HelpRequest" ("userId", "type", "question", "response", "currentPage", "status", "conversationId", "submissionId")
+                VALUES (${input.userId}, ${input.type}, ${input.question}, ${input.response},
+                        ${input.currentPage}, 'submitting', ${input.conversationId}, ${input.submissionId})
+                RETURNING "id"
+            `;
+            return rows[0].id;
+        });
+        return { ok: true, id, existing: false, resume: false };
+    } catch (error) {
+        if (error instanceof HelpThrottledError) return { ok: false, reason: "throttled" };
+        throw error;
+    }
+}
+
+/** Internal: rolls the reservation transaction back when the hourly slot is gone. */
+class HelpThrottledError extends Error {
+    constructor() {
+        super("throttled");
+        this.name = "HelpThrottledError";
+    }
 }
 
 

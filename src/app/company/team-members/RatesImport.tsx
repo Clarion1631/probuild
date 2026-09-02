@@ -85,7 +85,9 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
         }
         setBusy(true);
         try {
-            const result = await applyGustoRateImport(payload);
+            // The raw file goes with it so the server can re-parse and refuse:
+            // the browser's "no errors" is not evidence.
+            const result = await applyGustoRateImport(payload, csvText);
             if (!result.success) {
                 toast.error(result.error);
                 return;
@@ -220,7 +222,17 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                         <div className="px-6 py-4 flex justify-end gap-3 border-t border-hui-border">
                             <button type="button" onClick={close} className="hui-btn hui-btn-secondary">Cancel</button>
                             {rows ? (
-                                <button type="button" onClick={handleSave} disabled={busy} className="hui-btn hui-btn-primary disabled:opacity-50">
+                                <button
+                                    type="button"
+                                    onClick={handleSave}
+                                    disabled={busy || errors.length > 0}
+                                    title={
+                                        errors.length > 0
+                                            ? "Fix the unreadable rows first — a half-imported file is worse than none"
+                                            : undefined
+                                    }
+                                    className="hui-btn hui-btn-primary disabled:opacity-50"
+                                >
                                     {busy ? "Saving..." : "Save rates"}
                                 </button>
                             ) : (

@@ -97,6 +97,11 @@ const STATEMENTS = [
             ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_keys_present" CHECK ("periodStartKey" IS NOT NULL AND "periodEndKey" IS NOT NULL) NOT VALID;
         END IF;
      END $$`,
+    // The key backfill above filled every legacy row, so validate it: a
+    // permanently NOT VALID constraint has never checked anything, and it is a
+    // real difference from production. VALIDATE takes only SHARE UPDATE
+    // EXCLUSIVE, so it blocks neither reads nor writes.
+    `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_keys_present"`,
     // A leaked anon/authenticated Supabase key must not read payroll periods,
     // their frozen CSVs, or the pay columns on User. Prisma connects as the
     // table OWNER and owners bypass RLS, so the app is unaffected; the Supabase

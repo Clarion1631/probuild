@@ -185,65 +185,13 @@ test("PUT clock-out succeeds once the period is unlocked", async () => {
 
 // ── Wiring tripwire for the two handlers that are not DI-factored ──────────
 
-/**
- * The canonical list of writers that can change how many payroll hours a period
- * holds. Every one of them must call a lock assertion. This is a TRIPWIRE, not
- * a behavioural proof — it catches "somebody added a writer and forgot", which
- * is the failure mode that actually happened (the first cut of this feature
- * gated the three API routes and left four server actions wide open).
- *
- * If you add a TimeEntry writer that touches startTime, durationHours, or
- * existence, add it here and gate it. If it only touches flags, notes, cost
- * coding, change-order tags or billing stamps, it belongs in the exclusion
- * comment in src/lib/payroll-period.ts instead.
- */
-const GATED_WRITERS: Array<{ file: string; mustMatch: RegExp[] }> = [
-    {
-        file: "src/lib/time-expense-core.ts",
-        // createTimeEntryCore — the canonical manual create, and the reason
-        // gating it here covers createTimeEntry in time-expense-actions too.
-        mustMatch: [/withPayrollWriteTx\(\{ instants: \[startTime\] \}/],
-    },
-    {
-        file: "src/lib/time-expense-actions.ts",
-        mustMatch: [
-            /withPayrollWriteTx\(\{ entryIds: \[id\], instants: \[startTime\] \}/, // updateTimeEntry
-            /withPayrollWriteTx\(\{ entryIds: \[id\] \}/, // deleteTimeEntry
-            /withPayrollWriteTx\(\{ entryIds: allowedIds \}/, // deleteTimeEntries
-        ],
-    },
-    {
-        file: "src/app/projects/[id]/timeclock/actions.ts",
-        mustMatch: [
-            /withPayrollWriteTx\(\{ instants: \[startTime\] \}/, // createTimeEntry
-            /withPayrollWriteTx\(\{ entryIds: \[id\], instants: \[startTime\] \}/, // updateTimeEntry
-            /withPayrollWriteTx\(\{ entryIds: \[id\] \}/, // deleteTimeEntry
-        ],
-    },
-    {
-        file: "src/app/api/time-entries/route.ts",
-        mustMatch: [
-            /withPayrollWriteTx\(\{ instants: \[entryStartTime\] \}/, // POST clock-in (client-supplied startTime)
-            /assertEntriesUnlockedInTx\(client, \[guard\.entryId\]/, // PUT clock-out, inside the close transaction
-        ],
-    },
-    {
-        file: "src/app/api/time-entries/[id]/route.ts",
-        mustMatch: [
-            /entryIds: \[id\],[\s\S]{0,400}dayKeys: \[/, // PATCH declares its rows AND its days up front
-            /assertEntriesUnlockedInTx\(tx, \[id\], \{ dayKeys \}\)/, // DELETE
-        ],
-    },
-];
+// The per-writer allowlist that used to live here is gone. It only ever listed
+// the writers somebody had remembered to add, so the four it did not know about
+// (the logistics re-code, the review reprice, the change-order retag, the
+// stale-DEFERRED flag) stayed unguarded while this file reported green.
+// tests/payroll-writer-manifest.test.ts inverts it: it enumerates the writers
+// that EXIST and fails when the set changes.
 
-test("every payroll-hours writer calls a lock assertion", () => {
-    for (const writer of GATED_WRITERS) {
-        const source = readFileSync(path.join(__dirname, "..", ...writer.file.split("/")), "utf8");
-        for (const pattern of writer.mustMatch) {
-            assert.match(source, pattern, `${writer.file} is missing ${pattern}`);
-        }
-    }
-});
 
 test("a lock taken AFTER the fail-fast check still stops the write (in-transaction guard)", async () => {
     // The injected-sequence pattern: the stand-alone loader says "unlocked"
@@ -730,4 +678,46 @@ test("the project timeclock action never accepts a caller-supplied cost", () => 
         "utf8"
     );
     assert.doesNotMatch(client, /laborCost: cost/);
+});
+
+test("the guarded writers really are wrapped, not merely listed", () => {
+    // Complements the manifest: that test proves nobody added a writer without
+    // classifying it; this one proves the classification is not a fiction.
+    const cases: Array<[string, RegExp]> = [
+        ["lib/actions.ts", /withPayrollWrite\({ entryIds: \[entryId\] }/],
+        ["lib/time-expense-core.ts", /withPayrollWrite\({ entryIds: input\.ids }/],
+        ["app/api/time-entries/[id]/logistics/route.ts", /withPayrollWrite\({ entryIds: \[id\] }/],
+        ["app/api/time-entries/[id]/meal-skip/route.ts", /withPayrollWrite\({ entryIds: \[id\] }/],
+        ["app/api/time-entries/route.ts", /withPayrollWrite\({ entryIds: \[latest\.id\] }/],
+    ];
+    for (const [file, pattern] of cases) {
+        const source = readFileSync(path.join(__dirname, "..", "src", ...file.split("/")), "utf8");
+        assert.match(source, pattern, `${file} claims to be guarded`);
+    }
+});
+
+test("markTimeEntryReviewed cannot clear a zero-rate flag without repricing", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function markTimeEntryReviewed"));
+    const body = fn.slice(0, fn.indexOf(LF + "export "));
+    // It is the one write that can turn a flagged $0 shift into an exportable
+    // one, so it re-checks the rate, reprices, AND takes the payroll lock.
+    assert.match(body, /ZERO_RATE_REVIEW_NOTE/);
+    assert.match(body, /zeroRateBlocks\(/);
+    assert.match(body, /withPayrollWrite\(/);
+});
+
+test("PATCH applies the zero-rate guard to ANY cost recomputation, not just a close", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    // Shrinking an 8h entry to 4h at a $0 rate rewrites the cost just as
+    // silently as closing one does; `closingOpenEntry &&` let that through.
+    assert.match(source, /const recomputesCost = newEnd != null;/);
+    assert.match(source, /recomputesCost &&\s*\n\s*zeroRateBlocks\(/);
+    // And the owner's rate is re-read, row-locked, INSIDE the write transaction:
+    // a rate import could zero it between the pre-read and the write.
+    assert.match(source, /FROM "User" WHERE "id" = \$1 FOR UPDATE/);
+    assert.match(source, /ZeroRateAtWriteError/);
 });

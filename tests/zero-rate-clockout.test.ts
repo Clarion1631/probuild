@@ -224,12 +224,15 @@ test("a worker WITH a rate is unaffected", async () => {
     assert.equal(updateCalls.length, 1);
 });
 
-test("the PATCH edit path still mirrors the block, and only on an OPEN -> CLOSED transition", () => {
+test("the PATCH edit path mirrors the block on ANY cost recomputation", () => {
     const source = readFileSync(
         path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
         "utf8"
     );
-    assert.match(source, /closingOpenEntry &&[\s\S]{0,20}zeroRateBlocks\(/);
+    // Widened from the OPEN -> CLOSED transition: shrinking a closed 8h entry to
+    // 4h at a $0 rate rewrites the cost just as silently.
+    assert.match(source, /const recomputesCost = newEnd != null;/);
+    assert.match(source, /recomputesCost &&[\s\S]{0,20}zeroRateBlocks\(/);
     assert.match(source, /email: owner\.email/, "the manager mirror must pass the email, or a salaried manager is blocked");
     assert.match(source, /payType: owner\.payType/, "and the stored payType, which beats both");
     // Owner-only refusal, and a flag on the manager path — the same shape the

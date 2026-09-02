@@ -4,7 +4,7 @@ import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
 import { appendZeroRateReview, zeroRateBlocks } from "./pay-rate-guard";
-import { withPayrollWriteTx } from "./payroll-period";
+import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -243,10 +243,14 @@ export async function tagTimeEntriesToChangeOrderCore(
     if (rows.length !== new Set(input.ids).size) throw new Error("One or more time entries were not found");
     if (rows.some((row) => row.projectId !== changeOrder.projectId)) throw new Error("All time entries must belong to the change order project");
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed time entries cannot be retagged");
-    const result = await prisma.timeEntry.updateMany({
-        where: { id: { in: input.ids }, invoiceId: null, invoicedAt: null },
-        data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
-    });
+    // Re-tagging changes which change order the hours are billed against, and
+    // runs against rows a locked period may own — advisory-lock protocol.
+    const result = await withPayrollWrite({ entryIds: input.ids }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
+            where: { id: { in: input.ids }, invoiceId: null, invoicedAt: null },
+            data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
+        })
+    );
     return { updated: result.count };
 }
 

@@ -79,7 +79,8 @@ export async function POST(req: NextRequest) {
     if (!reserved.ok) {
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
-    if (reserved.existing) {
+    // See the request route: a stale `submitting` row is resumed, not returned.
+    if (reserved.existing && !reserved.resume) {
       const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
       return NextResponse.json({ request: prior, duplicate: true });
     }

@@ -14926,7 +14926,11 @@ export async function markTimeEntryReviewed(entryId: string) {
     }
 
     const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
-    await prisma.timeEntry.update({
+    // Clearing the flag can REPRICE the entry, so it is a payroll write like any
+    // other and goes through the advisory-lock protocol.
+    const { withPayrollWrite } = await import("./payroll-period");
+    await withPayrollWrite({ entryIds: [entryId] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.update({
         where: { id: entryId },
         data: {
             ...(reprice ?? {}),
@@ -14937,7 +14941,8 @@ export async function markTimeEntryReviewed(entryId: string) {
             reviewReason: stripSettlementNotes(entry.reviewReason),
             notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
         },
-    });
+        })
+    );
 
     revalidatePath("/manager/time-entries");
     return { success: true };
@@ -15114,7 +15119,11 @@ export async function decideMealSkip(entryId: string, decision: "APPROVED" | "DE
         } as const;
         throw new Error(messages[check.code]);
     }
-    const flipped = await prisma.timeEntry.updateMany({
+    // A skip decision changes what the day's settlement owes, so it is a
+    // payroll write and takes the advisory-lock protocol.
+    const { withPayrollWrite: withPayrollWriteForSkip } = await import("./payroll-period");
+    const flipped = await withPayrollWriteForSkip({ entryIds: [entryId] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         // APPROVED additionally requires the shift to STILL be open at write time
         // (a clock-out racing this decision already settled pay via attestation).
         where: {
@@ -15123,7 +15132,8 @@ export async function decideMealSkip(entryId: string, decision: "APPROVED" | "DE
             ...(decision === "APPROVED" ? { endTime: null, user: { mealWaiverSignedAt: { not: null } } } : {}),
         },
         data: { mealSkipStatus: decision, mealSkipDecidedById: user.id, mealSkipDecidedAt: new Date() },
-    });
+        })
+    );
     if (flipped.count === 0) throw new Error("Request was already decided or the shift closed");
     revalidatePath("/manager/time-entries");
     return { success: true };
@@ -15170,12 +15180,20 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
 
     // Guarded at write time (Codex): an invoice landing between our read and
     // the write must win — count 0 means "changed underneath you".
+    // Re-coding rewrites the project and cost code that the DETAIL csv reports,
+    // so a locked period must refuse it like any other payroll write.
+    const { withPayrollWrite: withPayrollWriteForRoute } = await import("./payroll-period");
     if (routeToProjectId === null) {
         if (entry.routedFromProjectId) {
-            const r = await prisma.timeEntry.updateMany({
+            // Captured before the callback: the narrowing above does not survive
+            // the async boundary, and this is the project the entry goes back to.
+            const restoreProjectId = entry.routedFromProjectId;
+            const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
+                (tx as unknown as typeof prisma).timeEntry.updateMany({
                 where: { id: entryId, invoiceId: null, invoicedAt: null },
-                data: { projectId: entry.routedFromProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
-            });
+                data: { projectId: restoreProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
+                })
+            );
             if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
         }
     } else {
@@ -15183,7 +15201,8 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
         if (!job || job.isLogistics || job.status !== PROJECT_STATUS_IN_PROGRESS) throw new Error("That job is not available for routing");
         const costCode = await prisma.costCode.findUnique({ where: { code: LOGISTICS_COST_CODE }, select: { id: true } });
         if (!costCode) throw new Error(`${LOGISTICS_COST_CODE} cost code is missing`);
-        const r = await prisma.timeEntry.updateMany({
+        const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
+            (tx as unknown as typeof prisma).timeEntry.updateMany({
             where: { id: entryId, invoiceId: null, invoicedAt: null },
             data: {
                 projectId: job.id,
@@ -15193,7 +15212,8 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
                 routedAt: new Date(),
                 routedById: user.id,
             },
-        });
+            })
+        );
         if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
     }
     revalidatePath("/manager/logistics");
@@ -15292,9 +15312,26 @@ async function importableUsers() {
  * the value never passes through a JS float.
  */
 export async function applyGustoRateImport(
-    rows: Array<{ userId: string; newHourly: string; payType?: string | null; rowHash: string }>
+    rows: Array<{ userId: string; newHourly: string; payType?: string | null; rowHash: string }>,
+    /**
+     * Re-parsed here, not trusted from the browser: a file with unreadable rows
+     * is a file somebody has to look at again. Importing the rows that happened
+     * to parse leaves a half-applied pay change nobody reviewed, and the errors
+     * were on the screen they clicked Save from.
+     */
+    csvText?: string
 ) {
     await requirePayrollAccess();
+    if (typeof csvText === "string" && csvText.trim()) {
+        const { parseGustoRateCsv } = await import("./rate-import");
+        const reparsed = parseGustoRateCsv(csvText);
+        if (reparsed.errors.length > 0) {
+            return {
+                success: false as const,
+                error: `That file still has ${reparsed.errors.length} row${reparsed.errors.length === 1 ? "" : "s"} that could not be read. Fix the file and preview it again — nothing was saved.`,
+            };
+        }
+    }
     if (!Array.isArray(rows) || rows.length === 0) {
         return { success: false as const, error: "Nothing to save." };
     }

@@ -403,6 +403,24 @@ export async function loadLockedPeriods(): Promise<LockedPeriodRow[]> {
  * Throws PeriodLockedError, which routes map to 423 and server actions surface
  * as their usual thrown error.
  */
+/**
+ * THE entry point for any write that touches a TimeEntry.
+ *
+ * Named so there is one thing to grep for and one thing to teach: every
+ * TimeEntry update, delete or create call site in src/ is either inside one of
+ * these, inside the settlement protocol (which takes the same locks), or on the
+ * explicit exemption list in tests/payroll-writer-manifest.test.ts. There is no
+ * regex allowlist of "approved routes" any more — a new writer is caught by the
+ * manifest, not by whether somebody remembered to update a pattern.
+ */
+export async function withPayrollWrite<T>(
+    target: PayrollWriteTarget,
+    write: (tx: PayrollTxClient) => Promise<T>,
+    options: { timeZone?: string; weekStart?: PayrollWeekStart } = {}
+): Promise<T> {
+    return withPayrollWriteTx(target, write, options);
+}
+
 export async function withPayrollWriteTx<T>(
     target: PayrollWriteTarget,
     write: (tx: PayrollTxClient) => Promise<T>,

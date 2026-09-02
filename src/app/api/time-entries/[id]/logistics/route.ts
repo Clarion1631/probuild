@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withPayrollWrite } from "@/lib/payroll-period";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
 import { z } from "zod";
@@ -133,14 +134,18 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // cannot both win. A lost-response retry that finds its own routing already
     // applied gets a 200, not a false failure.
     const routing = body.routeToProjectId !== undefined;
-    const claim = await prisma.timeEntry.updateMany({
+    // Payroll write: goes through the advisory-lock protocol so a locked
+    // period refuses it (src/lib/payroll-period.ts).
+    const claim = await withPayrollWrite({ entryIds: [id] }, async (tx) =>
+        (tx as unknown as typeof prisma).timeEntry.updateMany({
         where: {
             id,
             ...(routing ? { invoiceId: null, invoicedAt: null } : {}),
             ...(routing && !isPrivileged ? { OR: [{ routedById: null }, { routedById: user.id }] } : {}),
         },
         data,
-    });
+        })
+    );
     const current = await prisma.timeEntry.findUnique({ where: { id }, select: resultSelect });
     if (!current) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
     if (claim.count === 0) {

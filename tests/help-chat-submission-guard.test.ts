@@ -225,3 +225,37 @@ test("the hour bucket is the truncated hour", () => {
     assert.equal(hourBucket(new Date("2026-09-02T14:37:12.500Z")).toISOString(), "2026-09-02T14:00:00.000Z");
     assert.equal(hourBucket(new Date("2026-09-02T15:00:00.000Z")).toISOString(), "2026-09-02T15:00:00.000Z");
 });
+
+test("the slot and the row commit together, or neither does", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
+    // They were two separate statements: a failure in between either burned a
+    // slot with no row to show for it, or created a row the counter never saw.
+    assert.match(fn, /prisma\.\$transaction\(async \(tx\) => \{/);
+    const tx = fn.slice(fn.indexOf("$transaction"));
+    assert.ok(tx.indexOf('UPDATE "HelpSubmissionQuota"') < tx.indexOf('INSERT INTO "HelpRequest"'));
+    // Throwing is what rolls the slot back when the limit is gone.
+    assert.match(fn, /throw new HelpThrottledError\(\)/);
+});
+
+test("a retry resumes a submission stranded mid-flight instead of returning early", () => {
+    // If the previous attempt died before it could open the issue, returning
+    // the `submitting` row would strand that report forever.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.match(source, /HELP_SUBMITTING_STALE_MS/);
+    assert.match(source, /existing\.status === "submitting" && age > HELP_SUBMITTING_STALE_MS/);
+    // A resume must not consume a second slot — it was already paid for.
+    const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
+    assert.ok(
+        fn.indexOf("resume: stale") < fn.indexOf("HelpSubmissionQuota"),
+        "the resume path returns before the counter is touched"
+    );
+
+    for (const route of ["request", "bug-fix"]) {
+        const routeSource = readFileSync(
+            path.join(__dirname, "..", "src", "app", "api", "help-chat", route, "route.ts"),
+            "utf8"
+        );
+        assert.match(routeSource, /reserved\.existing && !reserved\.resume/, route);
+    }
+});

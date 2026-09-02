@@ -253,7 +253,19 @@ export async function loadGustoExport(
     // role alone dropped them from the file entirely. The role list stays as a
     // fallback for accounts whose payType nobody has set yet — they are blocked
     // by unknownPayTypeBlockers anyway, and appearing is how they get noticed.
-    const punchedUserIds = [...new Set(entries.map((entry) => entry.userId))];
+    // ONLY people with hours INSIDE the period. The wider query exists solely to
+    // get the 40-hour threshold right; a punch in the surrounding context week
+    // is not a reason to put somebody on this period's roster. A disabled former
+    // employee whose last shift landed in the context week was being added to
+    // the file — and then blocking it, because nobody had set a pay type on an
+    // account that is gone.
+    const punchedUserIds = [
+        ...new Set(
+            entries
+                .filter((entry) => entry.startTime >= periodStart && entry.startTime < periodEnd)
+                .map((entry) => entry.userId)
+        ),
+    ];
     const userRows = await client.user.findMany({
         where: {
             OR: [

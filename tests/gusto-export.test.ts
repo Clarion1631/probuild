@@ -557,3 +557,24 @@ test("a ZERO-HOUR roster member with no payType blocks the export too", () => {
     // The blocker still carries a sensible instant even with no entry to hang it on.
     assert.equal(result.blocking[0].startTime.getTime(), PERIOD_START.getTime());
 });
+
+test("a disabled former employee with only a CONTEXT punch is not on the roster", () => {
+    // The wider query exists to get the 40h threshold right. A punch in the
+    // surrounding context week is not a reason to put somebody on this period's
+    // roster — and doing so BLOCKED the export, because nobody had set a pay
+    // type on an account that is gone.
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    assert.match(source, /entry\.startTime >= periodStart && entry\.startTime < periodEnd/);
+
+    // And the pure half agrees: a context-only punch contributes no blocker.
+    const former: ExportUser = { id: "u-gone", name: "Former Hire", email: "gone@example.com", payType: null };
+    const result = buildGustoExport({
+        entries: [entry({ userId: former.id, startTime: at8am("2026-08-14"), durationHours: 8 })],
+        users: [],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    assert.deepEqual(result.blocking, [], "nobody on the roster, so nothing to answer for");
+    assert.deepEqual(result.employees, []);
+});

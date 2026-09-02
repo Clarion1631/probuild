@@ -32,6 +32,14 @@ import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@
 //                          Mobile geofence watcher hits this every minute or on
 //                          a state change; we accept the absolute offsite_ms the
 //                          mobile reports so retries don't double-count.
+/** The owner's rate became unusable between the pre-read and the write. */
+class ZeroRateAtWriteError extends Error {
+    constructor() {
+        super("Zero rate at write time");
+        this.name = "ZeroRateAtWriteError";
+    }
+}
+
 /** The targeted row moved (or vanished) between the pre-read and the write. */
 class EntryMovedError extends Error {
     constructor() {
@@ -204,8 +212,13 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // a forgotten punch, and closing it at a $0 rate books a free shift. Only a
     // genuine OPEN -> CLOSED transition is gated; re-editing an already-closed
     // entry is left alone so an old punch never becomes uneditable.
+    // Any edit that leaves the entry CLOSED recomputes laborCost/burdenCost from
+    // the owner's rate — not just the OPEN -> CLOSED transition. Shrinking an 8h
+    // entry to 4h at a $0 rate rewrites the cost just as silently as closing one
+    // does, and the earlier `closingOpenEntry &&` let every such edit through.
+    const recomputesCost = newEnd != null;
     const zeroRate =
-        closingOpenEntry &&
+        recomputesCost &&
         zeroRateBlocks({
             role: owner.role,
             email: owner.email,
@@ -392,6 +405,28 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     `SELECT "startTime", "updatedAt" FROM "TimeEntry" WHERE "id" = $1`,
                     id
                 )) as Array<{ startTime: Date; updatedAt: Date }>;
+
+                // The OWNER's rate and pay type, re-read and row-locked inside
+                // this transaction. The copy above was read before it, so a
+                // concurrent rate import could set a rate to $0 in between and
+                // this edit would price the shift from the stale value.
+                const [liveOwner] = (await client.$queryRawUnsafe(
+                    `SELECT "role", "email", "payType", "hourlyRate", "burdenRate" FROM "User" WHERE "id" = $1 FOR UPDATE`,
+                    existing.userId
+                )) as Array<{ role: string; email: string; payType: string | null; hourlyRate: unknown; burdenRate: unknown }>;
+                if (
+                    liveOwner &&
+                    newEnd != null &&
+                    zeroRateBlocks({
+                        role: liveOwner.role,
+                        email: liveOwner.email,
+                        payType: liveOwner.payType,
+                        hourlyRate: toNum(liveOwner.hourlyRate as never),
+                    }) &&
+                    !acknowledgedZeroRate
+                ) {
+                    throw new ZeroRateAtWriteError();
+                }
                 if (!stored) throw new EntryMovedError();
                 if (stored.startTime.getTime() !== existing.startTime.getTime()) {
                     // It moved days. The day locks we hold are for the old day,
@@ -438,6 +473,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 },
                 { status: 409 }
             );
+        }
+        if (error instanceof ZeroRateAtWriteError) {
+            return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
         }
         throw error;
     }
