@@ -7,7 +7,7 @@ import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
-import { EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
+import { ACCEPTED_MIME_TYPES, EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
 import {
     MAX_INLINE_JSON_BYTES,
     MAX_INLINE_UPLOAD_BYTES,
@@ -98,7 +98,7 @@ function unsupportedType(declared: string) {
             reason: essence === "text/plain"
                 ? "text receipts are not accepted: QuickBooks cannot attach a .txt, so it would be read and then stranded unbookable. Print or export it to PDF first."
                 : "the stored bytes are not a format QuickBooks can attach",
-            accepted: ["application/pdf", "image/jpeg", "image/png", "image/heic", "image/webp", "image/gif"],
+            accepted: ACCEPTED_MIME_TYPES,
         },
         { status: 415 },
     );
@@ -342,8 +342,33 @@ export async function POST(req: Request) {
         //
         // A no-op cleanup for an upload that genuinely never landed is free;
         // the sweeper's delete simply finds nothing.
-        await recordPendingCleanup(storagePath, `upload-ambiguous:${uploadFailed}`.slice(0, 200));
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        try {
+            await recordPendingCleanup(storagePath, `upload-ambiguous:${uploadFailed}`.slice(0, 200));
+        } catch {
+            // The record is the only thing that would remember this object. If
+            // it cannot be written, KEEP THE ROW: a STAGING row pointing at the
+            // path is the remaining way to find the bytes, and the sweeper will
+            // resolve it. Deleting now would orphan them with nothing left
+            // referencing them anywhere.
+            console.error("[receipts/intake] cleanup unrecordable; keeping the row as the pointer", storagePath);
+            return NextResponse.json(
+                { ok: false, reason: "storage-failed", id, retained: true },
+                { status: 503 },
+            );
+        }
+
+        // Row deletion failure is SURFACED, not swallowed: the caller's retry
+        // would otherwise hit a sourceRef conflict against a row it was told
+        // did not exist.
+        try {
+            await prisma.receiptIntake.delete({ where: { id } });
+        } catch (deleteError) {
+            console.error("[receipts/intake] row delete failed after an ambiguous upload", id, deleteError);
+            return NextResponse.json(
+                { ok: false, reason: "storage-failed", id, retained: true },
+                { status: 503 },
+            );
+        }
         console.error("[receipts/intake] upload failed", uploadFailed);
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
     }

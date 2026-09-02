@@ -124,9 +124,9 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
         downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
-        applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
+        applyRead: async (_id, patch) => { h.applied.push(patch); return { owned: true, strongOwner: null }; },
         findWeakHit: async () => null,
-        applyState: async (id, state, reason, patch) => { h.states.push({ id, state, reason, patch }); },
+        applyState: async (id, state, reason, patch) => { h.states.push({ id, state, reason, patch }); return true; },
         finishRouting: async (id, claimToken, stateReason) => {
             h.finished.push({ id, claimToken, stateReason });
         },
@@ -137,8 +137,8 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
             return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult;
         },
         applyBookResult: async () => {},
-        deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); },
-        retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); },
+        deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); return true; },
+        retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); return true; },
         now: () => NOW,
         monotonicMs: () => h.clock,
         ...overrides,
@@ -191,7 +191,7 @@ test("LIVE: a READ row with dryRun=false is promoted and booked", async () => {
 test("a strong-key claim that loses re-routes against the owner and keeps no key", async () => {
     // Same total AND same canonical vendor: a confirmed duplicate.
     const h = harness([workerRow()], {
-        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { DUPLICATE: 1 });
@@ -201,7 +201,7 @@ test("a strong-key claim that loses re-routes against the owner and keeps no key
 
 test("a strong-key loss at a DIFFERENT total goes to a human, not to DUPLICATE", async () => {
     const h = harness([workerRow()], {
-        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 999, canonicalVendor: "lowes" } }),
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 999, canonicalVendor: "lowes" } }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
@@ -296,7 +296,7 @@ test("one blowing-up row does not stall the batch", async () => {
 
 test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", async () => {
     const h = harness([workerRow()], {
-        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "homedepot" } }),
+        applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "homedepot" } }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
@@ -567,7 +567,7 @@ test("an EXACT duplicate becomes DUPLICATE, not NEEDS_REVIEW", async () => {
         applyRead: async (_id, patch) => {
             order.push("strong-claim");
             h.applied.push(patch);
-            return { strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
+            return { owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
         },
         findWeakHit: async () => { order.push("weak-lookup"); return { id: "row-owner" }; },
     });
@@ -581,7 +581,7 @@ test("an EXACT duplicate becomes DUPLICATE, not NEEDS_REVIEW", async () => {
 test("the strong claim is attempted with the key, before any weak lookup", async () => {
     const order: string[] = [];
     const h = harness([workerRow()], {
-        applyRead: async (_id, patch) => { order.push("strong-claim"); h.applied.push(patch); return { strongOwner: null }; },
+        applyRead: async (_id, patch) => { order.push("strong-claim"); h.applied.push(patch); return { owned: true, strongOwner: null }; },
         findWeakHit: async () => { order.push("weak-lookup"); return null; },
     });
     await runIntakeWorker(h.deps);
@@ -911,7 +911,9 @@ test("a row that DID send keeps its key at the retry limit", async () => {
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "max-retries");
-    assert.equal(h.states[0].patch, undefined, "no patch, so the key is untouched");
+    // parkTerminal always sends a patch; what matters is that it does NOT carry
+    // a key release for a row that reached QuickBooks.
+    assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), "the key is untouched");
 });
 
 // ── Content changed under us (round-8 item 2) ──────────────────────────────
@@ -1009,4 +1011,97 @@ test("every book result carries the row's claim token to the writer", async () =
     });
     await runIntakeWorker(h.deps);
     assert.deepEqual(tokens, ["tok-9"]);
+});
+
+// ── Ownership is CAS'd on EVERY mutation (round-10 item 3) ─────────────────
+
+test("losing the row aborts each mutation path instead of clobbering a successor", async () => {
+    // A zombie worker holds a view its successor has already moved past. Every
+    // write it attempts must affect zero rows and stop the pass for that row —
+    // a time-based lease cannot express this, because both hold the same id.
+    const lost = { owned: false as const };
+
+    // applyRead at the document-level gate.
+    const gate = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, docType: "multi" } }) as ReadOutcome,
+        applyRead: async () => ({ ...lost, strongOwner: null }),
+    });
+    assert.deepEqual((await runIntakeWorker(gate.deps)).byState, { STALE: 1 });
+
+    // applyRead at the strong claim.
+    const claim = harness([workerRow()], { applyRead: async () => ({ ...lost, strongOwner: null }) });
+    assert.deepEqual((await runIntakeWorker(claim.deps)).byState, { STALE: 1 });
+    assert.deepEqual(claim.finished, [], "never published");
+
+    // applyState, via a terminal park.
+    const park = harness([workerRow()], {
+        downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }),
+        applyState: async () => false,
+    });
+    assert.deepEqual((await runIntakeWorker(park.deps)).byState, { STALE: 1 });
+
+    // deferRead, via an AI outage.
+    const defer = harness([workerRow()], {
+        read: async () => ({ ok: false, decisive: false }),
+        deferRead: async () => false,
+    });
+    assert.deepEqual((await runIntakeWorker(defer.deps)).byState, { STALE: 1 });
+
+    // retryRow, via a transient storage fault.
+    const retry = harness([workerRow()], {
+        downloadBytes: async () => ({ ok: false as const, kind: "transient" as const, message: "x" }),
+        retryRow: async () => false,
+    });
+    assert.deepEqual((await runIntakeWorker(retry.deps)).byState, { STALE: 1 });
+});
+
+test("every mutation is offered the row's OWN state and token", async () => {
+    const seen: unknown[] = [];
+    const h = harness([workerRow({ claimToken: "tok-7" })], {
+        applyRead: async (_id, patch, ownership) => {
+            seen.push(ownership);
+            h.applied.push(patch);
+            return { owned: true, strongOwner: null };
+        },
+    });
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(seen, [{ state: "RECEIVED", claimToken: "tok-7" }]);
+});
+
+// ── One parkTerminal decides the key release (round-10 item 4) ─────────────
+
+test("EVERY pre-send terminal park releases the strong key", async () => {
+    // Each of these used to decide independently, and the ones that forgot held
+    // a dedup key against a Purchase that never existed — so the corrected
+    // resubmission collided with nothing.
+    const cases: Array<[string, Partial<WorkerDependencies>]> = [
+        ["file-missing", { downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }) }],
+        ["content-changed", { downloadBytes: async () => ({ ok: false as const, kind: "sha-mismatch" as const, message: "x" }) }],
+        ["unreadable", { read: async () => ({ ok: false, decisive: true }) }],
+    ];
+    for (const [reason, over] of cases) {
+        const h = harness([workerRow({ sendAttempted: false })], over);
+        await runIntakeWorker(h.deps);
+        assert.equal(h.states[0].reason, reason);
+        assert.equal(h.states[0].patch?.dedupStrongKey, null, `${reason} must release the key`);
+    }
+
+    // ...and the AI-unavailable ceiling, which is a different code path again.
+    const busy = harness([workerRow({ sendAttempted: false, busyPasses: MAX_BUSY_PASSES - 1 })], {
+        read: async () => ({ ok: false, decisive: false }),
+    });
+    await runIntakeWorker(busy.deps);
+    assert.equal(busy.states[0].reason, "ai-unavailable");
+    assert.equal(busy.states[0].patch?.dedupStrongKey, null);
+});
+
+test("a park AFTER a send keeps the key, on every one of those paths", async () => {
+    for (const over of [
+        { downloadBytes: async () => ({ ok: false as const, kind: "missing" as const }) },
+        { read: async () => ({ ok: false as const, decisive: true }) },
+    ]) {
+        const h = harness([workerRow({ sendAttempted: true })], over);
+        await runIntakeWorker(h.deps);
+        assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})), "the Purchase may exist");
+    }
 });

@@ -191,3 +191,31 @@ test("text/plain is no longer accepted at all", async () => {
     assert.equal(check.ok, false);
     assert.equal((check as { reason: string }).reason, "unsupported-file-type");
 });
+
+// ── A sha-mismatch is recoverable while the URL can still land (item 5) ────
+
+test("the sweeper's two parks are the ones /finalize recovers from", () => {
+    // A partial upload sitting at the path while the signed URL is still valid
+    // is a retry in progress, not an error state. Parking it would turn the
+    // client's own next request into a review item — and the correct bytes
+    // arriving a minute later would find the row already out of STAGING.
+    const { readFileSync } = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const root = path.resolve(__dirname, "..");
+
+    const sweeper = readFileSync(
+        path.join(root, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8",
+    );
+    // Both the missing-object and the sha-mismatch branches wait for expiry.
+    const shaBranch = sweeper.slice(sweeper.indexOf('row.expectedSha256 !== check.fileSha256'));
+    assert.match(
+        shaBranch.slice(0, shaBranch.indexOf("parked++")),
+        /SIGNED_UPLOAD_TTL_MS/,
+        "a sha mismatch waits for the upload URL to expire",
+    );
+
+    const finalize = readFileSync(
+        path.join(root, "src/app/api/receipts/intake/[id]/finalize/route.ts"), "utf8",
+    );
+    assert.match(finalize, /stateReason === "file-missing" \|\| row\.stateReason === "sha-mismatch"/);
+});

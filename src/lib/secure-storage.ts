@@ -367,6 +367,27 @@ export async function uploadSecureDoc(
 }
 
 /** Best-effort removal of a secure object, for compensating a failed DB write. */
+/**
+ * Delete, and REFUSE to report success on anything less than a confirmed one.
+ *
+ * `removeSecureDoc` returns quietly when the ref is unusable or no storage
+ * client is configured, which is right for its best-effort callers (a leftover
+ * signature is not worth failing a contract over) but wrong for the receipt
+ * cleanup queue: "no client" there would mark an orphan resolved on a
+ * misconfigured deployment and lose it permanently. Same delete, honest result.
+ *
+ * Deliberately a separate export rather than a behaviour change to
+ * removeSecureDoc: several callers outside this feature do not guard it.
+ */
+export async function removeSecureDocStrict(ref: string): Promise<void> {
+    const path = secureRefPath(ref);
+    if (!path) throw new Error(`not a secure ref: ${String(ref).slice(0, 80)}`);
+    const supabase = getSupabase();
+    if (!supabase) throw new Error("secure storage is not configured");
+    const { error } = await supabase.storage.from(SECURE_BUCKET).remove([path]);
+    if (error) throw error;
+}
+
 export async function removeSecureDoc(ref: string): Promise<void> {
     const path = secureRefPath(ref);
     if (!path) return;

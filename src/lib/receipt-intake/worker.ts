@@ -138,10 +138,25 @@ export interface WorkerDependencies {
      * Persist the read + routing. Returns the strong-key owner when the partial
      * unique index rejected our claim — that rejection IS the dedup hit.
      */
-    applyRead: (rowId: string, patch: ReadPatch) => Promise<{ strongOwner: StrongOwner | null }>;
+    /**
+     * CAS'd on {id, state, claimToken} like every other mutation. `owned:false`
+     * means this worker lost the row mid-pass and must abort — writing on would
+     * clobber whatever its successor has since decided.
+     */
+    applyRead: (
+        rowId: string,
+        patch: ReadPatch,
+        ownership: Ownership,
+    ) => Promise<{ strongOwner: StrongOwner | null; owned: boolean }>;
     findWeakHit: (rowId: string, weakKey: string) => Promise<{ id: string } | null>;
     /** Marks a row NEEDS_REVIEW / NON_RECEIPT / whatever routing decided, with no keys claimed. */
-    applyState: (rowId: string, state: ReceiptIntakeState, stateReason: string | null, patch?: Partial<ReadPatch>) => Promise<void>;
+    applyState: (
+        rowId: string,
+        state: ReceiptIntakeState,
+        stateReason: string | null,
+        patch?: Partial<ReadPatch>,
+        ownership?: Ownership,
+    ) => Promise<boolean>;
     /**
      * READ + dryRun=false -> BOOKING, and the LAST weak-dedup check, taken
      * inside the same transaction as the transition. Returns the conflicting
@@ -157,9 +172,15 @@ export interface WorkerDependencies {
     /** CAS'd on the claim: a superseded worker's result must write nothing. */
     applyBookResult: (rowId: string, result: BookResult, claimToken: string | null) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
-    deferRead: (rowId: string, busyPasses: number, reason: string) => Promise<void>;
+    deferRead: (rowId: string, busyPasses: number, reason: string, ownership: Ownership) => Promise<boolean>;
     /** A transient fault anywhere else: spend an attempt and back off. */
-    retryRow: (rowId: string, attempts: number, nextRetryAt: Date, reason: string) => Promise<void>;
+    retryRow: (
+        rowId: string,
+        attempts: number,
+        nextRetryAt: Date,
+        reason: string,
+        ownership: Ownership,
+    ) => Promise<boolean>;
     /**
      * RECEIVED -> READ, the release of the claim lease, AND the release of the
      * claim token. Called ONCE, after every dedup net has answered — never
@@ -177,6 +198,20 @@ export interface WorkerDependencies {
     monotonicMs: () => number;
     /** The company's configured time zone — business dates are anchored to it, never UTC. */
     companyTimeZone: () => Promise<string>;
+}
+
+/**
+ * What a write must still be true of to be allowed.
+ *
+ * Every worker mutation is a CAS on this. `nextRetryAt` alone is a time-based
+ * lease and cannot distinguish a live worker from a zombie whose invocation was
+ * killed and whose row has since been re-claimed — both hold the same row id
+ * and both believe they own it. Zero rows affected means ownership was lost;
+ * the caller aborts rather than overwriting the successor's decisions.
+ */
+export interface Ownership {
+    state: string;
+    claimToken: string | null;
 }
 
 export interface StrongOwner {
@@ -460,33 +495,24 @@ export async function handleRowError(
     const message = error instanceof Error ? `${error.name}: ${error.message}` : "UnknownError";
 
     if (isTerminalQboFault(error)) {
-        await deps.applyState(row.id, "NEEDS_REVIEW", `qbo-fault:${message}`.slice(0, 400)).catch(() => {});
-        return "NEEDS_REVIEW";
+        // A CLASSIFIED QBO fault means the send happened, so parkTerminal will
+        // (correctly) keep the key — the decision is still made in one place.
+        return parkTerminal(row, deps, `qbo-fault:${message}`.slice(0, 400));
     }
 
     const attempts = row.attempts + 1;
     if (attempts >= MAX_BOOK_ATTEMPTS) {
-        // Same rule as booking's own ceiling: a row that exhausted its attempts
-        // without ever reaching QuickBooks (a weak-lookup fault, a
-        // finishRouting fault, a storage outage) created no Purchase, so its
-        // strong key must go back or a corrected resend collides with it.
-        await deps
-            .applyState(
-                row.id,
-                "NEEDS_REVIEW",
-                "max-retries",
-                row.sendAttempted ? undefined : { dedupStrongKey: null },
-            )
-            .catch(() => {});
-        return "NEEDS_REVIEW";
+        // Same rule as every other terminal park, applied in the same place.
+        return parkTerminal(row, deps, "max-retries");
     }
-    await deps.retryRow(
+    const ownedRetry = await deps.retryRow(
         row.id,
         attempts,
         new Date(deps.now().getTime() + backoffMs(attempts)),
         `worker-error:${message}`.slice(0, 400),
-    ).catch(() => {});
-    return "RETRY";
+        ownershipOf(row),
+    ).catch(() => false);
+    return ownedRetry ? "RETRY" : "STALE";
 }
 
 /** QBTimeoutError is deliberately NOT here — a timeout is transport, not a verdict. */
@@ -517,15 +543,13 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // parked good receipts as file-missing, permanently, for a human to
         // untangle. Only an AFFIRMATIVE not-found is terminal.
         if (download.kind === "missing") {
-            await deps.applyState(row.id, "NEEDS_REVIEW", "file-missing");
-            return "NEEDS_REVIEW";
+            return parkTerminal(row, deps, "file-missing");
         }
         // The stored bytes are not the ones this row was published with.
         // Terminal, and loud: it means the object was replaced after
         // verification, which is the exact thing sealing exists to prevent.
         if (download.kind === "sha-mismatch") {
-            await deps.applyState(row.id, "NEEDS_REVIEW", "content-changed");
-            return "NEEDS_REVIEW";
+            return parkTerminal(row, deps, "content-changed");
         }
         return retryTransient(row, deps, `storage:${download.message}`);
     }
@@ -538,8 +562,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     if (!outcome.ok) {
         // decisive: the model answered and still could not read it -> a human.
         if (outcome.decisive) {
-            await deps.applyState(row.id, "NEEDS_REVIEW", "unreadable");
-            return "NEEDS_REVIEW";
+            return parkTerminal(row, deps, "unreadable");
         }
         // The SERVICE was unavailable. That is never the document's fault, so
         // it costs no `attempts` — but it cannot be free forever either, or an
@@ -547,11 +570,10 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // counts the busy passes separately and gives up after 20.
         const busyPasses = row.busyPasses + 1;
         if (busyPasses >= MAX_BUSY_PASSES) {
-            await deps.applyState(row.id, "NEEDS_REVIEW", "ai-unavailable");
-            return "NEEDS_REVIEW";
+            return parkTerminal(row, deps, "ai-unavailable");
         }
-        await deps.deferRead(row.id, busyPasses, "ai-unavailable");
-        return "RECEIVED";
+        const owned = await deps.deferRead(row.id, busyPasses, "ai-unavailable", ownershipOf(row));
+        return owned ? "RECEIVED" : "STALE";
     }
 
     const read = outcome.read;
@@ -647,14 +669,14 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // A multi-doc, a non-receipt, or a $0/negative misread must never hold
         // a dedup key — it would quarantine the real receipt that arrives next
         // (:531 and the v3.6 rationale).
-        await deps.applyRead(row.id, {
+        const gated = await deps.applyRead(row.id, {
             ...base,
             state: gate.state,
             stateReason: note(gate.stateReason),
             dedupStrongKey: null,
             duplicateOfId: gate.duplicateOfId,
-        });
-        return gate.state;
+        }, ownershipOf(row));
+        return gated.owned ? gate.state : "STALE";
     }
 
     // The strong claim IS the partial unique index: a rejection is the hit.
@@ -676,7 +698,10 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         stateReason: note(null),
         dedupStrongKey: keys.strong,
         duplicateOfId: null,
-    });
+    }, ownershipOf(row));
+    // Lost the row mid-read. Everything after this — the strong claim, the weak
+    // net, the publish — would be decided on a view the successor has moved past.
+    if (!applied.owned) return "STALE";
 
     if (applied.strongOwner) {
         const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, !!row.projectId);
@@ -720,6 +745,39 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     return "READ";
 }
 
+/**
+ * THE one place a row is parked terminally, and the one place the strong-key
+ * release is decided.
+ *
+ * The rule is a property of the ROW, not of the reason string: if no QBO send
+ * was ever attempted, no Purchase can exist, so the dedup key must go back or a
+ * corrected resubmission collides with a row that never became a purchase. That
+ * was previously re-derived at each call site, and the branches that forgot it
+ * (file-missing, unreadable, ai-unavailable, worker-error) each held a key
+ * against nothing.
+ *
+ * `sendAttempted` is the PERSISTED flag — markSendAttempted writes it before
+ * the create precisely so this decision survives a process that died mid-send.
+ */
+async function parkTerminal(
+    row: WorkerRow,
+    deps: WorkerDependencies,
+    reason: string,
+    patch?: Partial<ReadPatch>,
+): Promise<string> {
+    const release = row.sendAttempted ? {} : { dedupStrongKey: null };
+    const owned = await deps
+        .applyState(row.id, "NEEDS_REVIEW", reason, { ...(patch ?? {}), ...release }, ownershipOf(row))
+        .catch(() => false);
+    // Zero rows means a successor owns this row now; its state is theirs to set.
+    return owned ? "NEEDS_REVIEW" : "STALE";
+}
+
+/** The row as this pass claimed it — what every CAS matches on. */
+export function ownershipOf(row: WorkerRow): Ownership {
+    return { state: row.state, claimToken: row.claimToken };
+}
+
 /** A transport-class fault during a row's processing: spend an attempt, back off. */
 async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: string): Promise<string> {
     const attempts = row.attempts + 1;
@@ -727,8 +785,14 @@ async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: 
         await deps.applyState(row.id, "NEEDS_REVIEW", "max-retries");
         return "NEEDS_REVIEW";
     }
-    await deps.retryRow(row.id, attempts, new Date(deps.now().getTime() + backoffMs(attempts)), reason);
-    return "RETRY";
+    const owned = await deps.retryRow(
+        row.id,
+        attempts,
+        new Date(deps.now().getTime() + backoffMs(attempts)),
+        reason,
+        ownershipOf(row),
+    );
+    return owned ? "RETRY" : "STALE";
 }
 
 /**

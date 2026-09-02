@@ -18,8 +18,13 @@ export const EXT_BY_MIME: Record<string, string> = {
     "image/heif": "heic",
     "image/webp": "webp",
     "image/gif": "gif",
-    "text/plain": "txt",
+    // text/plain is deliberately absent: QuickBooks cannot attach a .txt, so a
+    // row created for one would read fine and then strand unbookable. Both
+    // intake paths refuse it — see the 415 in the route and /start.
 };
+
+/** The formats a caller may be told to send. Single source for the 415 body. */
+export const ACCEPTED_MIME_TYPES = Object.keys(EXT_BY_MIME);
 
 export const MAX_INTAKE_BYTES = 15 * 1024 * 1024;
 

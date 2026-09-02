@@ -14,7 +14,7 @@
  */
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
-import { SECURE_BUCKET, removeSecureDoc, toSecureRef } from "@/lib/secure-storage";
+import { SECURE_BUCKET, removeSecureDocStrict, toSecureRef } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
@@ -71,13 +71,24 @@ export async function sealObject(
  * before that happens is the only way the orphan stays findable.
  */
 export async function recordPendingCleanup(storagePath: string, reason: string): Promise<void> {
+    // THROWS on failure, unlike an audit write. This record is not an audit
+    // trail — it is the ONLY thing that will remember the object once the row
+    // pointing at it is gone. Swallowing the failure loses the orphan silently
+    // and forever, so the caller must know and keep the row instead.
     await logAutomationEvent({
         kind: STORAGE_CLEANUP_KIND,
         status: "pending",
         reason,
         source: "receipt-intake",
         detail: { storagePath },
-    }).catch(() => { /* audit only — the orphan is the lesser problem */ });
+    });
+    const recorded = await prisma.automationEvent.findFirst({
+        where: { kind: STORAGE_CLEANUP_KIND, status: "pending", detail: { contains: storagePath } },
+        select: { id: true },
+    });
+    // logAutomationEvent is fire-and-forget by contract, so "it did not throw"
+    // is not proof it wrote. Read it back.
+    if (!recorded) throw new Error(`could not record a cleanup for ${storagePath}`);
 }
 
 /**
@@ -87,17 +98,15 @@ export async function recordPendingCleanup(storagePath: string, reason: string):
  */
 export async function deleteObjectOrRecord(storagePath: string, reason: string): Promise<boolean> {
     try {
-        await removeSecureDoc(toSecureRef(storagePath));
+        await removeSecureDocStrict(toSecureRef(storagePath));
         return true;
     } catch (error) {
         console.error("[receipts/intake] object delete failed", storagePath, error instanceof Error ? error.name : "error");
-        await logAutomationEvent({
-            kind: STORAGE_CLEANUP_KIND,
-            status: "pending",
-            reason,
-            source: "receipt-intake",
-            detail: { storagePath },
-        }).catch(() => { /* audit only — the orphan is the lesser problem */ });
+        await recordPendingCleanup(storagePath, reason).catch(recordError => {
+            // Both the delete AND the record failed. Say so loudly: this is the
+            // one combination that loses an object with nothing left to find it.
+            console.error("[receipts/intake] ORPHANED OBJECT, no cleanup recorded", storagePath, recordError);
+        });
         return false;
     }
 }
@@ -130,13 +139,39 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
             await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "abandoned" } });
             continue;
         }
+
+        // NEVER delete a path a LIVE row still points at.
+        //
+        // The recovery sequence makes this reachable: an ambiguous upload
+        // records a cleanup, the row is deleted, the caller retries, and the
+        // retry's row can end up pointing at the same path — or a seal can
+        // publish a canonical path that an older pending event names. Deleting
+        // then destroys a receipt that is in active use. The event is resolved
+        // rather than retried forever: the object is accounted for, just not by
+        // us.
+        const referenced = await prisma.receiptIntake.findFirst({
+            where: { storagePath },
+            select: { id: true },
+        });
+        if (referenced) {
+            await prisma.automationEvent.update({
+                where: { id: event.id },
+                data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
+            });
+            continue;
+        }
+
         try {
-            await removeSecureDoc(toSecureRef(storagePath));
-            await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });
-            cleared++;
+            await removeSecureDocStrict(toSecureRef(storagePath));
         } catch {
             // Still failing. Leave it pending for the next pass.
+            continue;
         }
+        // Resolved ONLY after a delete that did not throw — removeSecureDoc
+        // surfaces a missing storage client as an error rather than a success,
+        // so a misconfigured deployment cannot quietly mark the queue clean.
+        await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });
+        cleared++;
     }
     return cleared;
 }

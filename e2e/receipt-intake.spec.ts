@@ -1023,3 +1023,95 @@ test.describe("round-9 intake contracts", () => {
         expect(row?.fileSha256).toHaveLength(64);
     });
 });
+
+test.describe("round-10 finalize authorization and recovery", () => {
+    const startPath = `${INTAKE_PATH}/start`;
+    const finalize = (request: APIRequestContext, id: string, body: Record<string, unknown>) =>
+        request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify(body),
+            maxRedirects: 0,
+        });
+
+    test("a session caller cannot attach a project it may not reach", async ({ playwright, request }) => {
+        // Without this any authenticated user could file a receipt against any
+        // project by id.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}authz` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const employee = await playwright.request.newContext({
+            baseURL: "http://localhost:3000",
+            storageState: "e2e/.auth/contract-user.json",
+        });
+        const res = await employee.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json" },
+            data: JSON.stringify({ projectId: "e2e-scope-oos-project" }),
+            maxRedirects: 0,
+        });
+        // Either refused outright (403) or invisible to this caller (404) — what
+        // must NOT happen is the project landing on the row.
+        expect([403, 404]).toContain(res.status());
+        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.projectId)
+            .not.toBe("e2e-scope-oos-project");
+        await employee.dispose();
+    });
+
+    test("a cost code that is not a phase of the job is refused", async ({ request }) => {
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}phasecheck` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const res = await finalize(request, created.body.id, { costCodeId: "e2e-mob-cc-demo" });
+        // No project on the row and none supplied, so a phase is meaningless.
+        expect(res.status()).toBe(400);
+        expect((await res.json()).error).toBe("cost-code-without-project");
+    });
+
+    test("late fields are refused once the row has been routed", async ({ request }) => {
+        // Past RECEIVED the dedup keys, the phase suggestion and possibly a
+        // booking were all derived from the project the row had at the time.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}toolate` }));
+        expect(created.res.status()).toBe(200);
+        const id = created.body.id;
+        minted.push(id);
+
+        await prisma.receiptIntake.update({ where: { id }, data: { state: "BOOKED" } });
+        const res = await finalize(request, id, { projectId: "e2e-scope-oos-project" });
+        expect(res.status()).toBe(409);
+        expect((await res.json()).error).toBe("late-fields-too-late");
+        expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.projectId).toBeNull();
+    });
+
+    test("finalize returns the PERSISTED values, not what the caller asked for", async ({ request }) => {
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}persisted` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const res = await finalize(request, created.body.id, {});
+        expect(res.status()).toBe(200);
+        const body = await res.json();
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(body.state).toBe(row?.state);
+        expect(body.fileSha256).toBe(row?.fileSha256);
+        expect(body.costCodeId).toBe(row?.costCodeId ?? null);
+    });
+
+    test("/start refuses an unsupported type with 415 and creates NO row", async ({ request }) => {
+        const ref = `${REF_PREFIX}start-415`;
+        const res = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({
+                source: "drive", sourceRef: ref, mimeType: "text/plain", sha256: "a".repeat(64),
+            }),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(415);
+        const body = await res.json();
+        expect(body.error).toBe("unsupported-file-type");
+        expect(body.accepted).not.toContain("text/plain");
+        // The row must not exist — a STAGING row for a document we will never
+        // accept is something the sweeper then has to reason about.
+        expect(await prisma.receiptIntake.findUnique({ where: { sourceRef: ref } })).toBeNull();
+    });
+});

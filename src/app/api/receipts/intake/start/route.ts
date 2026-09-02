@@ -6,7 +6,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { SECURE_BUCKET } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
-import { EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
+import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 
 export const dynamic = "force-dynamic";
@@ -41,11 +41,28 @@ export async function POST(req: Request) {
     }
     const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
+    // REFUSED BEFORE A ROW EXISTS. A 400 after creating the row left a STAGING
+    // row for a document we will never accept, which the sweeper then has to
+    // reason about. 415, not 400: the request is well-formed, the format is
+    // simply one QuickBooks cannot attach.
+    //
+    // The declared mime only picks the extension; /finalize re-derives the real
+    // type from the STORED BYTES, so a lie costs the caller its upload.
     const mimeType = String(body.mimeType ?? "").split(";")[0].trim().toLowerCase();
     const ext = EXT_BY_MIME[mimeType];
-    // The declared mime only picks the extension here; /finalize re-derives the
-    // real type from the STORED BYTES, so a lie costs the caller its upload.
-    if (!ext) return NextResponse.json({ ok: false, reason: "unsupported-file-type" }, { status: 400 });
+    if (!ext) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "unsupported-file-type",
+                reason: mimeType === "text/plain"
+                    ? "text receipts are not accepted: QuickBooks cannot attach a .txt. Print or export it to PDF first."
+                    : "that format is not one QuickBooks can attach",
+                accepted: ACCEPTED_MIME_TYPES,
+            },
+            { status: 415 },
+        );
+    }
 
     // The client's own hash of what it is ABOUT to upload. Persisted, because
     // the two-step flow hands the bytes straight to storage: without it a

@@ -321,6 +321,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // to be at that path — which is the same overwrite the seal
                     // exists to close, arriving by a different door.
                     if (row.expectedSha256 && row.expectedSha256 !== check.fileSha256) {
+                        // RECOVERABLE, not a park. A partial or superseded
+                        // upload sitting at the path while the signed URL is
+                        // still valid is exactly the state a client is about to
+                        // fix by finishing its upload. Parking it here would
+                        // turn a retry-in-progress into a review item, and the
+                        // correct bytes arriving a minute later would find the
+                        // row already gone from STAGING.
+                        if (row.createdAt.getTime() > Date.now() - SIGNED_UPLOAD_TTL_MS) continue;
                         await prisma.receiptIntake.updateMany({
                             where: { id: row.id, state: "STAGING" },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
@@ -405,18 +413,19 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         read: (bytes, mime, phases) => readReceipt(bytes, mime, phases),
 
-        applyRead: async (rowId, patch: ReadPatch) => {
+        applyRead: async (rowId, patch: ReadPatch, ownership) => {
             try {
-                // nextRetryAt is deliberately UNTOUCHED: the claim lease must
-                // survive until routing finishes. Clearing it here let an
-                // overlapping invocation reclaim a half-routed row and book it
-                // while this one was still deciding — and then this one would
-                // regress it. finishRouting()/applyState() release the lease.
-                await prisma.receiptIntake.update({
-                    where: { id: rowId },
+                // CAS on {id, state, claimToken}. nextRetryAt is deliberately
+                // UNTOUCHED: the claim lease must survive until routing
+                // finishes. Clearing it here let an overlapping invocation
+                // reclaim a half-routed row and book it while this one was
+                // still deciding — and then this one would regress it.
+                // finishRouting()/applyState() release the lease.
+                const { count } = await prisma.receiptIntake.updateMany({
+                    where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                     data: { ...patch, lastError: null },
                 });
-                return { strongOwner: null };
+                return { strongOwner: null, owned: count > 0 };
             } catch (error) {
                 // The partial unique index refused the claim — the DATABASE is
                 // the lock the Apps Script did with Script Properties. Load the
@@ -439,6 +448,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // write; re-throw rather than reporting a dedup hit that isn't.
                 if (!owner) throw error;
                 return {
+                    owned: true,
                     strongOwner: {
                         id: owner.id,
                         totalCents: owner.totalCents,
@@ -458,11 +468,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             orderBy: { createdAt: "asc" },
         }),
 
-        applyState: async (rowId, state, stateReason, patch) => {
-            await prisma.receiptIntake.update({
-                where: { id: rowId },
+        applyState: async (rowId, state, stateReason, patch, ownership) => {
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: {
+                    id: rowId,
+                    ...(ownership ? { state: ownership.state, claimToken: ownership.claimToken } : {}),
+                },
                 data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null },
             });
+            return count > 0;
         },
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
@@ -647,26 +661,28 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             });
         },
 
-        deferRead: async (rowId, busyPasses, reason) => {
+        deferRead: async (rowId, busyPasses, reason, ownership) => {
             // The service was unavailable; the document was never read, so this
             // costs no `attempts` — only a delay and one busy pass. Reuses the
             // booking backoff table so one outage does not hammer Gemini from
             // every row at once.
-            await prisma.receiptIntake.update({
-                where: { id: rowId },
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: {
                     busyPasses,
                     lastError: reason,
                     nextRetryAt: new Date(Date.now() + backoffMs(1)),
                 },
             });
+            return count > 0;
         },
 
-        retryRow: async (rowId, attempts, nextRetryAt, reason) => {
-            await prisma.receiptIntake.update({
-                where: { id: rowId },
+        retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { attempts, lastError: reason, nextRetryAt },
             });
+            return count > 0;
         },
 
         now: () => new Date(),
