@@ -1341,3 +1341,125 @@ test("an unresolvable orphan is recorded durably, not just logged", async () => 
     // instead of a console line nobody greps.
     assert.equal(PAYMENTS_SYNC_EVENT_KIND, "qbo-payments-sync");
 });
+
+// --- Per-issuance identity: retry vs re-issue ---
+
+/** In-memory stand-in for the PaymentSchedule/ProgressBilling rows the helper CASes on. */
+function fakeIssuanceModel(initial: string | null = null) {
+    const row = { qbIssuanceKey: initial };
+    return {
+        row,
+        model: {
+            async findUnique() { return { qbIssuanceKey: row.qbIssuanceKey }; },
+            async updateMany({ where, data }: { where: { qbIssuanceKey: null | string }; data: { qbIssuanceKey: string } }) {
+                // Mirrors the CAS: only claims when the column is still null.
+                if (where.qbIssuanceKey === null && row.qbIssuanceKey !== null) return { count: 0 };
+                row.qbIssuanceKey = data.qbIssuanceKey;
+                return { count: 1 };
+            },
+        },
+    };
+}
+
+test("an ambiguous retry REUSES the key, so Intuit returns the original invoice", async () => {
+    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
+    const { model, row } = fakeIssuanceModel();
+
+    const first = await ensureIssuanceKey(model as never, "sched-1", null);
+    assert.ok(first, "a key is minted before the first QBO call");
+    assert.equal(row.qbIssuanceKey, first, "and persisted, so it survives the process");
+
+    // The retry reads the stored key and passes it back in.
+    const retry = await ensureIssuanceKey(model as never, "sched-1", row.qbIssuanceKey);
+    assert.equal(retry, first, "same key -> no duplicate invoice");
+});
+
+test("a RE-ISSUE after unlink mints a NEW key, so a new invoice is created", async () => {
+    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
+    const { model, row } = fakeIssuanceModel();
+
+    const first = await ensureIssuanceKey(model as never, "sched-1", null);
+    // breakQBInvoiceLink clears it (qbIssuanceKey: null in the unlink write).
+    row.qbIssuanceKey = null;
+
+    const reissued = await ensureIssuanceKey(model as never, "sched-1", null);
+    // Codex gate: keying on the row id could not express this - the re-send
+    // reused the same key and Intuit handed back the invoice just unlinked.
+    assert.notEqual(reissued, first, "a new issuance must not reuse the old key");
+    assert.equal(row.qbIssuanceKey, reissued);
+});
+
+test("two racing pushes share ONE key, so they cannot create two invoices", async () => {
+    const { ensureIssuanceKey } = await import("../src/lib/quickbooks-payments");
+    const { model } = fakeIssuanceModel();
+    const [a, b] = await Promise.all([
+        ensureIssuanceKey(model as never, "sched-1", null),
+        ensureIssuanceKey(model as never, "sched-1", null),
+    ]);
+    assert.equal(a, b, "the CAS loser adopts the winner's key");
+});
+
+// --- Reconciliation: every expected field must be present AND equal ---
+
+test("a reordered retry (same content) reconciles clean", async () => {
+    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
+    const drift = reconcileIssuedInvoice(
+        { total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
+        { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
+    );
+    assert.deepEqual(drift, [], "reordering does not change what is billed");
+});
+
+test("an EDITED retry parks as invoice-drift on any changed field", async () => {
+    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
+    const expected = { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" };
+
+    assert.ok(reconcileIssuedInvoice({ total: 1600, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" }, expected).length > 0, "amount");
+    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c2", dueDate: "2026-10-01", docNumber: "INV-1-DEP" }, expected).length > 0, "customer");
+    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c1", dueDate: "2026-11-01", docNumber: "INV-1-DEP" }, expected).length > 0, "due date");
+    assert.ok(reconcileIssuedInvoice({ total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-2-DEP" }, expected).length > 0, "docNumber");
+});
+
+test("a MISSING expected field is a mismatch, not a pass", async () => {
+    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
+    const expected = { amount: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" };
+    // "We could not check" is not "it matches" — QBO omitting the field must
+    // never be read as agreement.
+    for (const returned of [
+        { total: 1500, customerId: null, dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
+        { total: 1500, customerId: "c1", dueDate: null, docNumber: "INV-1-DEP" },
+        { total: 1500, customerId: "c1", dueDate: "2026-10-01", docNumber: null },
+        { total: Number.NaN, customerId: "c1", dueDate: "2026-10-01", docNumber: "INV-1-DEP" },
+    ]) {
+        assert.ok(reconcileIssuedInvoice(returned, expected).length > 0, JSON.stringify(returned));
+    }
+});
+
+test("no expected due date means QBO's due date is not checked", async () => {
+    const { reconcileIssuedInvoice } = await import("../src/lib/quickbooks-payments");
+    const drift = reconcileIssuedInvoice(
+        { total: 100, customerId: "c1", dueDate: null, docNumber: "PB-1" },
+        { amount: 100, customerId: "c1", dueDate: null, docNumber: "PB-1" },
+    );
+    assert.deepEqual(drift, [], "progress billings carry no due date");
+});
+
+// --- The compensation clock starts when compensation begins ---
+
+test("the cleanup budget is not already spent by the calls that preceded it", async () => {
+    const { MILESTONE_CLEANUP_BUDGET_MS, MILESTONE_PUSH_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline, isBudgetExhausted } = await import("../src/lib/quickbooks");
+
+    assert.equal(MILESTONE_PUSH_BUDGET_MS, 55_000);
+    assert.equal(MILESTONE_CLEANUP_BUDGET_MS, 10_000);
+
+    // Codex gate: reserving the clock at ENTRY meant it ticked down through
+    // every call that preceded compensation, so by the time it was needed it
+    // could already be gone. Started at compensation time it is always fresh.
+    const pushDeadline = createRouteDeadline(MILESTONE_PUSH_BUDGET_MS, Date.now() - 54_000);
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.ok(isBudgetExhausted(pushDeadline), "the push budget really is nearly gone");
+
+    const cleanupDeadline = createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS);
+    assert.equal(isBudgetExhausted(cleanupDeadline), false, "compensation still has its full window");
+});

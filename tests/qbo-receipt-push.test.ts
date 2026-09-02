@@ -1919,3 +1919,35 @@ test("an ordinary refresh failure still degrades to the plain 401 outcome", asyn
     // Still retryable (the 401 survived), but not masquerading as a token error.
     assert.equal(thrown?.name, "QboRetryableError");
 });
+
+// --- The recovery lookup's 401 retry matches the upload branch exactly ---
+
+test("typed refresh failures propagate from the attachment LOOKUP 401 retry too", async () => {
+    const { QboHttpError, QBTimeoutError, QboRetryableError, QBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const { QBTokenPersistenceError } = await import("../src/lib/quickbooks-payments");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // Codex gate: the upload branch preserved these; the existing-purchase
+    // recovery branch still swallowed them, so the same outage read as an
+    // ordinary 401 depending on which call happened to hit it first.
+    for (const error of [
+        new QBTimeoutError("refresh timed out"),
+        new QboRetryableError("503 from Intuit", 503),
+        new QBTokenStrandedError("ECONNRESET"),
+        new QBTokenPersistenceError(),
+    ]) {
+        const { deps } = createDeps({
+            existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+            attachableQueryImpl: async () => {
+                throw new QboHttpError("QB query failed (401)", 401);
+            },
+        });
+        deps.refreshTokensFn = async () => { throw error; };
+        const thrown = await createQBReceiptPurchase(TOKENS, input, deps).then(
+            () => null,
+            (e: unknown) => e as Error,
+        );
+        assert.equal(thrown?.name, error.name, `${error.name} was swallowed by the lookup branch`);
+    }
+});

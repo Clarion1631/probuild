@@ -2414,8 +2414,9 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     const deposit = pendingMilestones[0] || null;
     if (deposit) {
         try {
-            const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            const { pushMilestoneToQuickBooks, MILESTONE_PUSH_BUDGET_MS } = await import("./quickbooks-payments");
+            const { createRouteDeadline } = await import("./quickbooks");
+            const pushed = await pushMilestoneToQuickBooks(deposit.id, undefined, createRouteDeadline(MILESTONE_PUSH_BUDGET_MS));
             payLink = pushed.payLink;
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
@@ -3737,8 +3738,9 @@ export async function updateMonthlyOverhead(amount: number) {
 export async function createQBPaymentLink(paymentId: string) {
     await assertInvoicePermission();
     try {
-        const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-        const res = await pushMilestoneToQuickBooks(paymentId);
+        const { pushMilestoneToQuickBooks, MILESTONE_PUSH_BUDGET_MS } = await import("./quickbooks-payments");
+        const { createRouteDeadline } = await import("./quickbooks");
+        const res = await pushMilestoneToQuickBooks(paymentId, undefined, createRouteDeadline(MILESTONE_PUSH_BUDGET_MS));
         const schedule = await prisma.paymentSchedule.findUnique({
             where: { id: paymentId },
             select: { invoiceId: true, invoice: { select: { projectId: true } } },

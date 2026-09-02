@@ -520,7 +520,21 @@ async function ensureAttachmentOnExistingPurchase(
             rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
         } catch (error) {
             if (qboHttpStatus(error) !== 401) throw error;
-            const refreshed = await refresh().catch(() => null);
+            // Identical handling to the upload branch above: a typed refresh
+            // failure is the thing a human needs to act on, and swallowing it
+            // made a QBO outage, a stranded token and a persistence failure all
+            // look like an ordinary 401 on the lookup.
+            const refreshed = await refresh().catch((refreshError: unknown) => {
+                if (
+                    isQBTimeoutError(refreshError) ||
+                    isRetryableQboError(refreshError) ||
+                    isQBTokenStrandedError(refreshError) ||
+                    (refreshError instanceof Error && refreshError.name === "QBTokenPersistenceError")
+                ) {
+                    throw refreshError;
+                }
+                return null;
+            });
             if (!refreshed) throw error;
             activeTokens = refreshed;
             rows = await qbQueryFn<QBAttachable>(activeTokens, lookupSql);
@@ -542,7 +556,19 @@ async function ensureAttachmentOnExistingPurchase(
         // nothing about the file, so they must NOT become a terminal `failed:`
         // on an ok:true response — that is what made the Apps Script stop
         // resending and leave the Purchase unattached.
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+        //
+        // Token failures pass through UNCHANGED rather than being re-wrapped:
+        // a stranded or unpersisted token is a connection that needs human
+        // attention, and flattening it into a generic retryable error loses
+        // exactly the detail that says so.
+        if (
+            isQBTimeoutError(error) ||
+            isRetryableQboError(error) ||
+            isQBTokenStrandedError(error) ||
+            (error instanceof Error && error.name === "QBTokenPersistenceError")
+        ) {
+            throw error;
+        }
 
         // Same transient set as the upload path, which this must match: 401
         // (survived a forced refresh) and 408 join 429/5xx as retryable.

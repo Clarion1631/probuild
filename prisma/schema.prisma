@@ -696,7 +696,13 @@ model PaymentSchedule {
   createdAt             DateTime  @default(now())
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
-  qbInvoiceId     String?
+  qbInvoiceId     String?
+  /// Per-issuance idempotency seed for the QuickBooks invoice send. Minted
+  /// before the first QBO call and cleared on unlink, so a RETRY reuses it
+  /// (Intuit returns the original invoice) while a RE-ISSUE mints a new one
+  /// and gets a genuinely new invoice. Keying on the row id could not tell
+  /// those apart.
+  qbIssuanceKey   String?
   qbInvoiceLink   String? // Intuit-hosted "Review & Pay" page (card/ACH)
   qbPaymentId     String? // QBO Payment txn that settled this milestone (set by the sync poller)
   qbSyncedAt      DateTime?
@@ -792,7 +798,13 @@ model ProgressBilling {
   taxRate         Decimal               @default(0) // percent snapshot at build time
   taxAmount       Decimal               @default(0)
   total           Decimal               @default(0) // subtotal + taxAmount
-  qbInvoiceId     String?
+  qbInvoiceId     String?
+  /// Per-issuance idempotency seed for the QuickBooks invoice send. Minted
+  /// before the first QBO call and cleared on unlink, so a RETRY reuses it
+  /// (Intuit returns the original invoice) while a RE-ISSUE mints a new one
+  /// and gets a genuinely new invoice. Keying on the row id could not tell
+  /// those apart.
+  qbIssuanceKey   String?
   qbInvoiceLink   String?
   qbInvoiceSentAt DateTime?
   qbPaymentId     String?
