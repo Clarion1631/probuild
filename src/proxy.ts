@@ -53,10 +53,19 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // with financialReports). Without this bypass NextAuth intercepts it first and
 // a headless Bearer check gets redirected to /login instead of its JSON.
 // Exact-match only — nothing else under /api/health/ inherits it.
+// api/receipts/intake and api/receipts/intake/<id>/archived are the same shape
+// (Receipt Pipeline v2, docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §3): the Apps
+// Script forwarders and the nightly archive mirror self-authenticate with
+// x-receipt-intake-secret and need a clean 401 rather than a /login redirect,
+// and the mobile app reaches the same POST with a Bearer token. Both are listed
+// EXACTLY — the [id]/archived form is spelled out rather than made a descendant
+// wildcard, so a future /api/receipts/intake/<id>/anything route does not
+// inherit the bypass before anyone has reviewed its gates. Everything else
+// under /api/receipts (notably /api/receipts/parse) keeps the proxy boundary.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/[^/]+\/archived\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 // The legal pages are static server components that define no Server Actions.
 // Next's action IDs are global, so a bypassed path is a place an anonymous caller
