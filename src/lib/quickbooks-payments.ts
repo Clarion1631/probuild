@@ -28,6 +28,7 @@ import {
     qbQuery,
     isQboConnectionFailure,
     isQboMalformedResponseError,
+    qboHttpStatus,
     QBTokenStrandedError,
     isQBTokenStrandedError,
     QboRetryableError,
@@ -107,17 +108,25 @@ export async function refreshTokensOrFallBack(
         fresh = await refresh(qb.refreshToken);
     } catch (error) {
         if (isQBTimeoutError(error)) throw error;
-        // AMBIGUOUS failures never fall back. A reset socket, a TLS failure, a
-        // truncated or malformed body — in all of these the request may well
-        // have reached Intuit and rotated the token, so the stored pair we
-        // would return could already be spent. Reporting a healthy connection
-        // on top of a spent token is how an integration goes quietly dead.
-        if (isQboConnectionFailure(error) || isQboMalformedResponseError(error)) {
-            throw new QBTokenStrandedError(error instanceof Error ? error.name : "transport failure");
+
+        // Falling back is only safe when Intuit EXPLICITLY rejected the
+        // exchange — a 400/401 (invalid_grant and friends) means it processed
+        // the request and refused, so nothing rotated and the stored access
+        // token may still be good.
+        //
+        // Everything else is ambiguous and must strand: a 5xx says Intuit
+        // broke somewhere in its own pipeline and may well have rotated before
+        // failing, and a reset socket, TLS failure, truncated or malformed body
+        // says we never learned the outcome at all. Treating those as "refused"
+        // hands back a pair that could already be spent, reporting a healthy
+        // connection sitting on a dead token.
+        const status = qboHttpStatus(error);
+        const explicitlyRejected = status === 400 || status === 401;
+        if (!explicitlyRejected) {
+            throw new QBTokenStrandedError(
+                status !== null ? `HTTP ${status}` : error instanceof Error ? error.name : "transport failure",
+            );
         }
-        // What is left is an UNAMBIGUOUS refusal: Intuit answered with a
-        // non-2xx and rotated nothing, so the old access token may still be
-        // valid. This is the ONLY branch that may fall back.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
 
@@ -928,7 +937,12 @@ const PAYMENTS_SYNC_MAX_ROWS = 500;
 export async function forEachPendingPage<T extends { id: string }>(
     result: QBPaymentSyncResult,
     deadline: RouteDeadline,
-    fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
+    /**
+     * `stopAfterId` bounds the WRAPPED pass: rows with an id greater than it
+     * were already visited earlier in this same run, so re-fetching them would
+     * process them twice (and could loop). Null means "no upper bound".
+     */
+    fetchPage: (cursorId: string | null, take: number, stopAfterId: string | null) => Promise<T[]>,
     countRemaining: (cursorId: string | null) => Promise<number>,
     /** Returns the last row it actually completed — the furthest the cursor may move. */
     handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
@@ -960,7 +974,10 @@ export async function forEachPendingPage<T extends { id: string }>(
         if (isBudgetExhausted(deadline)) break;
 
         const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, maxRows - processed);
-        const page = await fetchPage(cursorId, take);
+        // After wrapping, the run is walking the rows BEFORE where it started;
+        // it must stop at that point or it would revisit the ones it has
+        // already done this run.
+        const page = await fetchPage(cursorId, take, wrapped ? storedCursor : null);
 
         if (page.length === 0) {
             // End of the collection. If we started mid-way, wrap once and keep
@@ -1171,14 +1188,23 @@ async function runPaymentsSync(
     const runMilestonePass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.paymentSchedule.findMany({
-            where: pendingWhere,
+        (cursorId, take, stopAfterId) => prisma.paymentSchedule.findMany({
+            where: {
+                ...pendingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: milestoneSelect,
             // Stable key: without it Postgres may return the same first page
             // every run and starve everything behind it.
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
         (cursorId) => prisma.paymentSchedule.count({
             where: cursorId ? { ...pendingWhere, id: { gt: cursorId } } : pendingWhere,
@@ -1285,12 +1311,21 @@ async function runPaymentsSync(
     const runBillingPass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.progressBilling.findMany({
-            where: billingWhere,
+        (cursorId, take, stopAfterId) => prisma.progressBilling.findMany({
+            where: {
+                ...billingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: billingSelect,
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
         (cursorId) => prisma.progressBilling.count({
             where: cursorId ? { ...billingWhere, id: { gt: cursorId } } : billingWhere,

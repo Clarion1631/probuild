@@ -161,7 +161,17 @@ export function isTransientQboStatus(status: number): boolean {
  * else, so downstream classification is identical wherever it happens.
  */
 export async function qboResponseError(res: Response, label: string): Promise<Error> {
-    const body = await res.text().catch(() => "");
+    // Reading the ERROR body is itself a body read, and it can time out or die
+    // on a reset socket. `.catch(() => "")` swallowed exactly that, turning an
+    // outage into a tidy "failed (400): " — the status was preserved but the
+    // real failure was not. Let those out; only a genuine parse/decode problem
+    // degrades to an empty body.
+    let body = "";
+    try {
+        body = await res.text();
+    } catch (error) {
+        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+    }
     const detail = `${label} failed (${res.status}): ${body}`.slice(0, 500);
     if (isTransientQboStatus(res.status)) {
         return new QboRetryableError(detail, res.status);
@@ -603,7 +613,11 @@ export async function refreshQBToken(
             refreshTimeoutMs(),
         );
 
-        if (!res.ok) throw new Error("QB token refresh failed");
+        // The status decides whether falling back to the stored pair is safe,
+        // so it must survive: a bare Error made a 500 (Intuit may well have
+        // rotated) indistinguishable from a 400 invalid_grant (it definitely
+        // did not).
+        if (!res.ok) throw await qboResponseError(res, "QB token refresh");
         const data = await res.json();
         return { accessToken: data.access_token, refreshToken: data.refresh_token };
     } catch (error) {
@@ -704,12 +718,14 @@ export interface QBAttachable {
 export async function getQBPurchaseAttachables(
     tokens: QBTokens,
     purchaseId: string,
+    deadline?: RouteDeadline,
 ): Promise<QBAttachable[]> {
     // QBO transaction ids are numeric; refuse anything else rather than escape it.
     if (!/^\d+$/.test(purchaseId)) return [];
     const rows = await qbQuery<QBAttachable>(
         tokens,
         `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+        deadline,
     );
     // Entity ids are only unique per entity type, so the value-only query can
     // surface attachments from other transaction types — keep Purchase links.

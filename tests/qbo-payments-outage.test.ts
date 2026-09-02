@@ -375,20 +375,45 @@ test("a transient save blip is retried once and then succeeds", async () => {
     assert.equal(saves, 2);
 });
 
-test("a REFRESH failure still falls back to the old access token (unchanged)", async () => {
+test("an EXPLICIT 400/401 rejection falls back to the old access token", async () => {
     const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
-    let saves = 0;
-    const tokens = await refreshTokensOrFallBack(
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    // Intuit processed the exchange and refused it (invalid_grant and
+    // friends), so nothing rotated and the stored access token may still work.
+    for (const status of [400, 401]) {
+        let saves = 0;
+        const tokens = await refreshTokensOrFallBack(
+            STALE_QB,
+            async () => { throw new QboHttpError(`QB token refresh failed (${status})`, status); },
+            async () => { saves++; },
+        );
+        assert.deepEqual(tokens, STALE_QB, `status ${status}`);
+        assert.equal(saves, 0, "nothing was rotated, so nothing is saved");
+    }
+});
+
+test("a 5xx refresh strands instead of falling back", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { QboRetryableError, isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+    // Codex gate: Intuit broke somewhere in its own pipeline and may well have
+    // rotated before failing, so the stored pair could already be spent.
+    const error = await refreshTokensOrFallBack(
         STALE_QB,
-        async () => {
-            throw new Error("500 from Intuit");
-        },
-        async () => {
-            saves++;
-        },
-    );
-    assert.deepEqual(tokens, STALE_QB);
-    assert.equal(saves, 0, "nothing was rotated, so nothing is saved");
+        async () => { throw new QboRetryableError("QB token refresh failed (503)", 503); },
+        async () => {},
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isQBTokenStrandedError(error), true, `got ${error?.name}`);
+});
+
+test("an untyped refresh failure strands - no status is no evidence", async () => {
+    const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+    const error = await refreshTokensOrFallBack(
+        STALE_QB,
+        async () => { throw new Error("something went wrong"); },
+        async () => {},
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isQBTokenStrandedError(error), true, `got ${error?.name}`);
 });
 
 test("a token-persistence failure marks the run failed with its own reason", async () => {
@@ -699,16 +724,25 @@ test("a 200 MISSING either token is stranded, and nothing is persisted", async (
     }
 });
 
-test("an UNAMBIGUOUS refusal still falls back to the stored pair", async () => {
+test("only an explicit client rejection falls back to the stored pair", async () => {
     const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
-    // Intuit answered with a non-2xx and rotated nothing, so the old access
-    // token may still be valid. This is the one branch that may fall back.
+    const { QboHttpError, isQBTokenStrandedError } = await import("../src/lib/quickbooks");
+
+    // 400 invalid_grant: Intuit answered and refused, rotating nothing.
     const tokens = await refreshTokensOrFallBack(
         STORED_QB,
-        async () => { throw new Error("QB token refresh failed"); },
+        async () => { throw new QboHttpError("QB token refresh failed (400): invalid_grant", 400); },
         async () => {},
     );
     assert.deepEqual(tokens, STORED_QB);
+
+    // A 500 is not a refusal - it is an unknown outcome.
+    const stranded = await refreshTokensOrFallBack(
+        STORED_QB,
+        async () => { throw new QboHttpError("QB token refresh failed (500)", 500); },
+        async () => {},
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isQBTokenStrandedError(stranded), true, `got ${stranded?.name}`);
 });
 
 test("a stranded refresh is classified as its own failed-run reason", async () => {
@@ -1112,4 +1146,77 @@ test("a standalone row loop still keeps its own tally", async () => {
     const { skippedInPage } = await runQboRowLoop(rows(30), result, rowHandler(client, result), () => {}, "milestones");
     assert.equal(result.skipped, 29);
     assert.equal(skippedInPage, 29, "and reports it, so a paginator can opt out");
+});
+
+
+// --- A wrapped run visits every row exactly once ---
+
+/**
+ * Drives the REAL paging helper over an in-memory collection, honouring the
+ * stopAfterId bound the wrapped pass relies on. Records visits as a LIST, so a
+ * row processed twice is visible rather than collapsed by a Set.
+ */
+async function walkWithBound(
+    all: { id: string }[],
+    store: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<void> },
+    key: string,
+    maxRows: number,
+    visits: string[],
+) {
+    const { forEachPendingPage } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const sorted = [...all].sort((a, b) => a.id.localeCompare(b.id));
+
+    await forEachPendingPage(
+        emptyResult(),
+        createRouteDeadline(30_000),
+        async (cursorId, take, stopAfterId) => sorted
+            .filter(r => (cursorId === null || r.id > cursorId) && (stopAfterId === null || r.id <= stopAfterId))
+            .slice(0, take),
+        async (cursorId) => sorted.filter(r => cursorId === null || r.id > cursorId).length,
+        async (page) => {
+            for (const row of page) visits.push(row.id);
+            return { lastCompletedId: page[page.length - 1]?.id ?? null };
+        },
+        { store, key },
+        maxRows,
+    );
+}
+
+test("a wrapped run visits every row EXACTLY once, never twice", async () => {
+    // Codex gate: after wrapping, the traversal restarted at the top with no
+    // upper bound, so it walked back over the rows it had just finished in
+    // this same run. A Set would hide that; a list does not.
+    const all = Array.from({ length: 10 }, (_, i) => ({ id: `row-${String(i).padStart(2, "0")}` }));
+    const { store } = memoryCursorStore();
+    // Resume from the middle so the run genuinely wraps.
+    await store.set("k", "row-06");
+
+    const visits: string[] = [];
+    await walkWithBound(all, store, "k", 100, visits);
+
+    const duplicates = visits.filter((id, i) => visits.indexOf(id) !== i);
+    assert.deepEqual(duplicates, [], `visited twice: ${duplicates.join(", ")}`);
+    assert.equal(visits.length, 10, `expected 10 visits, saw ${visits.length}`);
+    assert.deepEqual([...visits].sort(), all.map(r => r.id), "and every row was reached");
+});
+
+test("the wrapped pass stops at the original cursor, not the end", async () => {
+    const all = Array.from({ length: 8 }, (_, i) => ({ id: `row-0${i}` }));
+    const { store } = memoryCursorStore();
+    await store.set("k", "row-05");
+
+    const visits: string[] = [];
+    await walkWithBound(all, store, "k", 100, visits);
+
+    // Tail first (06, 07), then the wrapped head (00..05) — each once.
+    assert.deepEqual(visits, ["row-06", "row-07", "row-00", "row-01", "row-02", "row-03", "row-04", "row-05"]);
+});
+
+test("a run that starts at the top still visits each row once", async () => {
+    const all = Array.from({ length: 6 }, (_, i) => ({ id: `row-0${i}` }));
+    const { store } = memoryCursorStore();
+    const visits: string[] = [];
+    await walkWithBound(all, store, "k", 100, visits);
+    assert.deepEqual(visits, all.map(r => r.id));
 });

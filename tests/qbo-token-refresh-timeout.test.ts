@@ -38,17 +38,18 @@ test("a refresh TIMEOUT propagates instead of handing back stale tokens", async 
     assert.equal(saved, false, "a timed-out refresh must never persist anything");
 });
 
-test("an ORDINARY refresh failure still falls back to the old access token", async () => {
+test("an explicit 400 rejection still falls back to the old access token", async () => {
     const { refreshTokensOrFallBack } = await import("../src/lib/quickbooks-payments");
+    const { QboHttpError } = await import("../src/lib/quickbooks");
     const tokens = await refreshTokensOrFallBack(
         STALE,
         async () => {
-            throw new Error("500 from Intuit");
+            throw new QboHttpError("QB token refresh failed (400): invalid_grant", 400);
         },
         async () => {},
     );
-    // Deliberate: the old access token may still be valid, and this is the
-    // long-standing behaviour for non-timeout failures.
+    // Deliberate: Intuit refused the exchange outright, so nothing rotated and
+    // the old access token may still be valid.
     assert.deepEqual(tokens, STALE);
 });
 

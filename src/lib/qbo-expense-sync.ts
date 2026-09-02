@@ -1,5 +1,13 @@
 import type { QBTokens } from "./quickbooks";
-import { getQBPurchaseChangesSince, getQBPurchasesSince } from "./quickbooks";
+import {
+    getQBPurchaseChangesSince,
+    getQBPurchasesSince,
+    createRouteDeadline,
+    isBudgetExhausted,
+    isQboConnectionFailure,
+    isQBBudgetExhaustedError,
+    type RouteDeadline,
+} from "./quickbooks";
 import { findBestProjectNameMatches } from "./project-match";
 import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
@@ -760,7 +768,7 @@ export interface QboExpenseSyncDependencies {
     upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
     deactivateExpense(write: QboExpenseRemovalWrite): Promise<QboExpenseRemovalResult>;
     /** Optional: copy the QBO receipt attachment into ProBuild storage for this purchase. */
-    attachReceipt?(tokens: QBTokens, qbPurchaseId: string): Promise<void>;
+    attachReceipt?(tokens: QBTokens, qbPurchaseId: string, deadline?: RouteDeadline): Promise<void>;
     upsertPurchaseClassification(write: QboPurchaseClassificationWrite): Promise<void>;
     now(): Date;
 }
@@ -770,6 +778,14 @@ export interface QboExpenseSyncResult {
     updated: number;
     removed: number;
     skipped: Array<{ qbPurchaseId: string; reason: string }>;
+    /**
+     * Set when receipt-attachment work stopped early on a connection-level QBO
+     * failure. The expense rows themselves are still correct — attachments are
+     * a best-effort follow-on — but the run did NOT finish, so it must not be
+     * reported as a clean pass.
+     */
+    attachmentsIncomplete?: boolean;
+    attachmentsSkipped?: number;
 }
 
 /**
@@ -836,9 +852,9 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
                 prisma as unknown as QboExpensePersistenceClient,
                 write,
             ),
-        attachReceipt: async (tokens, qbPurchaseId) => {
+        attachReceipt: async (tokens, qbPurchaseId, deadline) => {
             const { attachQboReceipt } = await import("./qbo-receipt-attachments");
-            await attachQboReceipt(tokens, qbPurchaseId);
+            await attachQboReceipt(tokens, qbPurchaseId, deadline);
         },
         upsertPurchaseClassification: write =>
             upsertQboPurchaseClassification(
@@ -895,6 +911,9 @@ function qboTransactionDate(txnDate: string | null): Date | null {
  * External QBO reads and project loading happen before the short per-row
  * database transaction used by the upsert.
  */
+/** Under the sync route's 300s maxDuration. */
+export const QBO_EXPENSE_SYNC_BUDGET_MS = 280_000;
+
 export async function syncQboExpenses(
     options: {
         since: Date;
@@ -904,7 +923,7 @@ export async function syncQboExpenses(
         overheadProjectId?: string;
     },
     dependencies: QboExpenseSyncDependencies = createDefaultSyncDependencies(),
-    runtime: { tokens?: QBTokens } = {},
+    runtime: { tokens?: QBTokens; deadline?: RouteDeadline } = {},
 ): Promise<QboExpenseSyncResult> {
     if (!Number.isFinite(options.since.getTime())) {
         throw new Error("QBO expense sync requires a valid since date");
@@ -919,6 +938,9 @@ export async function syncQboExpenses(
     }
 
     const tokens = runtime.tokens ?? await dependencies.getTokens();
+    // 280s under the route's 300s ceiling, leaving room to persist what was
+    // imported and report the outcome instead of being killed mid-sync.
+    const deadline = runtime.deadline ?? createRouteDeadline(QBO_EXPENSE_SYNC_BUDGET_MS);
     const mode = options.mode ?? "backfill";
     const [purchaseRead, projects] = await Promise.all([
         dependencies.readPurchases(tokens, options.since, mode, options.until),
@@ -999,9 +1021,29 @@ export async function syncQboExpenses(
         // indexed read when a receipt is already linked, and retrying here is
         // what recovers from a transient failure on an earlier run.
         if (!dependencies.attachReceipt) return;
+        // Once QBO has stopped answering, every further attachment costs a full
+        // deadline to learn the same thing. Stop, and count what we gave up on.
+        if (result.attachmentsIncomplete) {
+            result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
+            return;
+        }
+        if (isBudgetExhausted(deadline)) {
+            result.attachmentsIncomplete = true;
+            result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
+            return;
+        }
         try {
-            await dependencies.attachReceipt(tokens, qbPurchaseId);
+            await dependencies.attachReceipt(tokens, qbPurchaseId, deadline);
         } catch (error) {
+            if (isQboConnectionFailure(error) || isQBBudgetExhaustedError(error)) {
+                result.attachmentsIncomplete = true;
+                result.attachmentsSkipped = (result.attachmentsSkipped ?? 0) + 1;
+                console.error(
+                    "QBO receipt attach stopped: QuickBooks is unavailable",
+                    error instanceof Error ? error.name : "UnknownError",
+                );
+                return;
+            }
             console.error(
                 "QBO receipt attach failed",
                 qbPurchaseId,

@@ -1073,3 +1073,50 @@ test("backfill fixture imports only the active unambiguous job and stays idempot
     });
     assert.equal(fake.rows.size, 1);
 });
+
+
+// --- Attachment work stops on a shared QBO failure ---
+
+test("a connection-level attach failure stops the rest and marks the run incomplete", async () => {
+    const { QboRetryableError } = await import("../src/lib/quickbooks");
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }, { ...PURCHASE, Id: "1003", DocNumber: "DOC-1003" }];
+    const attempted: string[] = [];
+
+    const dependencies = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async (_tokens: unknown, qbPurchaseId: string) => {
+            attempted.push(qbPurchaseId);
+            throw new QboRetryableError("QBO went away", 503);
+        },
+    };
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies as never);
+
+    // Codex gate: every further attachment would spend a full deadline
+    // learning the same thing, and a run that gave up on them is not clean.
+    assert.equal(attempted.length, 1, `kept attaching after an outage: ${attempted.length} attempts`);
+    assert.equal(result.attachmentsIncomplete, true);
+    assert.ok((result.attachmentsSkipped ?? 0) >= 1, "what was given up on must be counted");
+    // The expense rows themselves still imported — attachments are a follow-on.
+    assert.ok(result.imported >= 1, "the import itself is unaffected");
+});
+
+test("an ordinary attach failure does NOT stop the rest", async () => {
+    const fake = createFakePrisma();
+    const purchases = [PURCHASE, { ...PURCHASE, Id: "1002", DocNumber: "DOC-1002" }];
+    const attempted: string[] = [];
+
+    const dependencies = {
+        ...createSyncDependencies(purchases, ACTIVE_PROJECTS, (write) => upsertQboExpense(fake.client, write)),
+        attachReceipt: async (_tokens: unknown, qbPurchaseId: string) => {
+            attempted.push(qbPurchaseId);
+            throw new Error("no attachment on this one");
+        },
+    };
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies as never);
+
+    assert.equal(attempted.length, purchases.length, "a per-purchase problem is not an outage");
+    assert.equal(result.attachmentsIncomplete, undefined);
+});
