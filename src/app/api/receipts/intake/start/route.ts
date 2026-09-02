@@ -207,11 +207,30 @@ export async function POST(req: Request) {
             // published once, then physically lost, be "recovered" with an
             // entirely unrelated document. Only a row with NO recorded hash at
             // all (nothing to protect) may rearm without proving identity.
+            //
+            // "RECORDED" MEANS `fileSha256`, AND ONLY `fileSha256`.
+            //
+            // That column is written by the seal, from the bytes actually in
+            // the bucket — it is the one hash this system has ever verified,
+            // and the only one that can describe a document a human or
+            // QuickBooks has seen. `expectedSha256` is the opposite: a promise
+            // a client made about bytes it was ABOUT to upload, and on a
+            // recoverable park that promise is precisely what was never kept.
+            //
+            // OR-ing the two in bricked the recovery it was guarding. Both
+            // recoverable parks are reachable from STAGING, where `fileSha256`
+            // is "" — so the announced-but-unuploaded hash became the identity
+            // to protect, and a forwarder coming back with a corrected hash
+            // (a re-scanned Drive file, a recomputed digest) got 409 forever on
+            // a sourceRef that had never held a document at all. Nothing can
+            // be overwritten by narrowing it: a rearm writes to a NEW lease
+            // path, clears `fileSha256`, and leaves the row parked until
+            // /finalize verifies the bytes that actually land.
             const recoverable = existing.state !== "STAGING"
                 && finalizeDisposition(existing) === "publish";
             if (recoverable) {
-                const knownForRecovery = (existing.fileSha256 || existing.expectedSha256 || "").toLowerCase();
-                if (knownForRecovery && knownForRecovery !== expectedSha256) {
+                const verifiedSha = (existing.fileSha256 || "").toLowerCase();
+                if (verifiedSha && verifiedSha !== expectedSha256) {
                     return NextResponse.json(
                         {
                             ok: false,

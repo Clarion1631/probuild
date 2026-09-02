@@ -983,11 +983,29 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
             maxRedirects: 0,
         });
         expect(first.status()).toBe(200);
-        const { id, storagePath } = await first.json();
+        const { id } = await first.json();
         minted.push(id);
+
+        // The row must actually HOLD its document, because `alreadyReceived` is
+        // now answered from the bucket and not from the row alone — the
+        // forwarder deletes its only copy on that answer, so /start confirms
+        // the object is really there first. /start never carries bytes and this
+        // spec cannot PUT to a signed URL, so the object is seeded the same way
+        // the two cases above do it: real bytes stored by the single-shot
+        // route, and the row pointed at them.
+        const seeded = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}swept-notrecoverable-src` }),
+            maxRedirects: 0,
+        });
+        expect(seeded.status()).toBe(200);
+        const seededRow = await prisma.receiptIntake.findUnique({ where: { id: (await seeded.json()).id } });
+        minted.push(seededRow!.id);
+        const storagePath = seededRow!.storagePath;
+
         await prisma.receiptIntake.update({
             where: { id },
-            data: { state: "NEEDS_REVIEW", stateReason: "vendor-mismatch" },
+            data: { state: "NEEDS_REVIEW", stateReason: "vendor-mismatch", storagePath },
         });
 
         const again = await request.post(startPath, {
@@ -1109,6 +1127,61 @@ test.describe("round-9 intake contracts", () => {
         }
         // And nothing was created for any of them.
         const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: { startsWith: "drive:a" } } });
+        expect(rows).toHaveLength(0);
+    });
+
+    test("every sourceRef rule /start enforces, the inline endpoint enforces IDENTICALLY", async ({ request }) => {
+        // The inline endpoint used to check only the NAMESPACE PREFIX while
+        // /start ran decideSource(), so a secret caller could push a shape
+        // /start refuses through the other door: junk QuickBooks identities
+        // (a `drive` row books under its tail) and oversized values headed for
+        // a UNIQUE index.
+        //
+        // Prefix-only validation accepts every row below, which is why "both
+        // return 400" is not the assertion. The doors must agree on the REASON
+        // too — a forwarder that can tell them apart will learn to prefer the
+        // lenient one, and that is how the two implementations drifted in the
+        // first place.
+        const refused: Array<[string, string, string]> = [
+            // Right namespace, wrong SHAPE — precisely what a prefix check misses.
+            // One email message can carry several receipts, so the message id
+            // alone is not an identity.
+            ["email", "email:1993f0a3c9c4d0d2", "invalid-sourceRef"],
+            ["email", "email:1993f0a3c9c4d0d2:NOTHEX0123456789", "invalid-sourceRef"],
+            // A Chat ref without its attachment index, and one whose resource
+            // name is not a resource name.
+            ["chat", "chat:spaces/AAQANF47osY/messages/abc.def", "invalid-sourceRef"],
+            ["chat", "chat:not-a-resource-name:0", "invalid-sourceRef"],
+            // Control characters and whitespace: this value is echoed into logs
+            // and compared for equality. A LEADING one is deliberately not a
+            // case here — both doors trim before validating, and that agreement
+            // is itself part of the parity.
+            ["drive", "drive:1AbCdEfGh IjKlMnOp", "invalid-sourceRef"],
+            ["drive", "drive:1AbCdEfGh\u0001IjKlMnOp", "invalid-sourceRef"],
+            // Oversized, in a namespace the drive-only case above does not reach.
+            ["email", `email:${"a".repeat(600)}:0f1e2d3c4b5a6978`, "sourceRef-too-long"],
+            // A well-formed ref, in a namespace the caller did not declare.
+            ["drive", "email:1993f0a3c9c4d0d2:0f1e2d3c4b5a6978", "sourceRef-namespace-mismatch"],
+        ];
+
+        for (const [source, sourceRef, reason] of refused) {
+            const label = `${source} / ${JSON.stringify(sourceRef).slice(0, 64)}`;
+            const inline = await postIntake(request, intakeBody({ source, sourceRef }));
+            const started = await start(request, {
+                source, sourceRef, mimeType: "image/png", sha256: sha(PNG_BASE64),
+            });
+            expect(inline.res.status(), `inline ${label}`).toBe(400);
+            expect(started.status(), `start ${label}`).toBe(400);
+            expect(inline.body.reason, `inline ${label}`).toBe(reason);
+            expect((await started.json()).reason, `start ${label}`).toBe(reason);
+        }
+
+        // Neither door created a row for any of them. A 400 that still inserts
+        // is the oversized-unique-index half of the finding.
+        const rows = await prisma.receiptIntake.findMany({
+            where: { sourceRef: { in: refused.map(([, sourceRef]) => sourceRef) } },
+            select: { sourceRef: true },
+        });
         expect(rows).toHaveLength(0);
     });
 
