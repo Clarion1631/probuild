@@ -80,7 +80,10 @@ async function applyLateFields(
  * Without the second, a cost code from another job rides into the Expense and
  * every variance report reads it as overspend on a line nobody budgeted.
  */
-async function authorizeFinalization(
+/** Exported for tests/finalize-late-field-authz.test.ts — the project-access
+ *  half of this is the only thing standing between a late `projectId` and a
+ *  job the caller cannot see. */
+export async function authorizeFinalization(
     auth: Extract<IntakeAuth, { ok: true }>,
     rowProjectId: string | null,
     lateFields: LateFields,

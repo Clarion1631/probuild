@@ -1,3 +1,14 @@
+// @ts-nocheck
+//
+// These one-shot operational scripts were `.mjs` until the rename that made
+// `node --import=tsx` able to resolve their named imports from src/. They have
+// never been typechecked, and this marker keeps that true rather than quietly
+// changing what CI enforces in the same commit that changed the file
+// extension. `tsconfig.json` excludes `scripts/`; the only reason tsc sees this
+// file at all is that a test imports it.
+//
+// Worth typing properly — but as its own change, where a type error is a
+// finding rather than rebase noise.
 /**
  * Suggest ProBuild cost codes (phases) for expenses that have none.
  *
@@ -22,17 +33,24 @@
  *   lumber, drywall, paint and toilets alike.
  *
  * The rules themselves moved to src/lib/expense-cost-suggest.ts (Phase 3) so
- * the QBO sync and scripts/backfill-expense-attribution.mjs run the SAME ones.
+ * the QBO sync and scripts/backfill-expense-attribution.ts run the SAME ones.
  * This script keeps its own scope and reporting; it no longer owns the regexes.
  *
+ * RUNTIME: this file imports TypeScript from src/, so it needs a TS loader.
+ *   node --import=tsx scripts/...
+ * Plain `node` works on this machine (Node 24 strips types) and FAILS on CI's
+ * Node 20 and on anything older — which is exactly where a one-shot data script
+ * gets run in a hurry. `--import=tsx` is the same loader the test suite uses,
+ * so there is one answer rather than a version-dependent one.
+ *
  * USAGE
- *   node scripts/suggest-expense-cost-codes.mjs              # dry run + report
- *   node scripts/suggest-expense-cost-codes.mjs --apply      # write matches
- *   node scripts/suggest-expense-cost-codes.mjs --csv out.csv
+ *   node --import=tsx scripts/suggest-expense-cost-codes.ts              # dry run + report
+ *   node --import=tsx scripts/suggest-expense-cost-codes.ts --apply      # write matches
+ *   node --import=tsx scripts/suggest-expense-cost-codes.ts --csv out.csv
  */
 import { PrismaClient } from "@prisma/client";
-import { suggestCode } from "../src/lib/expense-cost-suggest.ts";
-import { notHumanCodedExpenseWhere } from "../src/lib/expense-attribution.ts";
+import { suggestCode } from "../src/lib/expense-cost-suggest";
+import { notHumanCodedExpenseWhere } from "../src/lib/expense-attribution";
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -54,7 +72,22 @@ const OVERHEAD_PROJECTS = ["Shop"];
 const num = (v) => (v == null ? 0 : Number(v));
 const money = (v) => `$${num(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
+const HELP = `Suggest cost codes for uncoded expenses (rule-based, not a model).
+
+  node --import=tsx scripts/suggest-expense-cost-codes.ts              # dry run + report
+  node --import=tsx scripts/suggest-expense-cost-codes.ts --apply      # write matches
+  node --import=tsx scripts/suggest-expense-cost-codes.ts --csv out.csv
+
+The --import=tsx loader is required: this script imports TypeScript from src/.`;
+
 async function main() {
+    // Works with no database and no env — and doubles as the CI check that this
+    // file still LOADS under the documented runtime.
+    if (process.argv.includes("--help") || process.argv.includes("-h")) {
+        console.log(HELP);
+        return;
+    }
+
     const codes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
     const codeId = new Map(codes.map((c) => [c.code, c.id]));
 

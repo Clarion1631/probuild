@@ -1,3 +1,14 @@
+// @ts-nocheck
+//
+// These one-shot operational scripts were `.mjs` until the rename that made
+// `node --import=tsx` able to resolve their named imports from src/. They have
+// never been typechecked, and this marker keeps that true rather than quietly
+// changing what CI enforces in the same commit that changed the file
+// extension. `tsconfig.json` excludes `scripts/`; the only reason tsc sees this
+// file at all is that a test imports it.
+//
+// Worth typing properly — but as its own change, where a type error is a
+// finding rather than rebase noise.
 /**
  * Backfill Expense attribution (Receipt Pipeline v2, Phase 3 —
  * docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §6).
@@ -24,10 +35,17 @@
  * loop's discipline: overwrite an existing cost code, and overwrite a HUMAN's
  * (costCodeSource "capture" or "manual").
  *
+ * RUNTIME: this file imports TypeScript from src/, so it needs a TS loader.
+ *   node --import=tsx scripts/...
+ * Plain `node` works on this machine (Node 24 strips types) and FAILS on CI's
+ * Node 20 and on anything older — which is exactly where a one-shot data script
+ * gets run in a hurry. `--import=tsx` is the same loader the test suite uses,
+ * so there is one answer rather than a version-dependent one.
+ *
  * USAGE
- *   node scripts/backfill-expense-attribution.mjs                    # dry run
- *   node scripts/backfill-expense-attribution.mjs --csv out.csv      # + remainder CSV
- *   node scripts/backfill-expense-attribution.mjs --apply            # write
+ *   node --import=tsx scripts/backfill-expense-attribution.ts                # dry run
+ *   node --import=tsx scripts/backfill-expense-attribution.ts --csv out.csv  # + remainder CSV
+ *   node --import=tsx scripts/backfill-expense-attribution.ts --apply        # write
  *
  * A re-run after --apply must report 0 planned changes. That is the proof, and
  * it is the same rule scripts/backfill-estimate-item-cost-codes.mjs follows.
@@ -37,16 +55,16 @@ import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFileSync } from "node:fs";
-import { suggestCode } from "../src/lib/expense-cost-suggest.ts";
+import { suggestCode } from "../src/lib/expense-cost-suggest";
 import {
     notHumanCodedExpenseWhere,
     resolveExpenseCostCodeId,
     resolveExpenseProjectId,
-} from "../src/lib/expense-attribution.ts";
-import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project.ts";
-import { lockExpense } from "../src/lib/expense-lock.ts";
-import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases.ts";
-import { csvCell, csvNumber } from "../src/lib/csv-safe.ts";
+} from "../src/lib/expense-attribution";
+import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
+import { lockExpense } from "../src/lib/expense-lock";
+import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
+import { csvCell, csvNumber } from "../src/lib/csv-safe";
 
 /**
  * Both current tiers clear this (0.9 vendor, 0.75 line), so it changes nothing
@@ -350,9 +368,13 @@ export async function runBackfill({
     // Annotated rather than left to inference: a bare `null` default infers the
     // parameter as `null`, and every caller that passes a real path (including
     // the test) then fails to typecheck.
-    csvPath = /** @type {string | null} */ (null),
-    writeFile = /** @type {(path: string, body: string) => void} */ (writeFileSync),
-    log = /** @type {(message: string) => void} */ (console.log),
+    // Real annotations now the file is TypeScript. They are not error-checked
+    // (see @ts-nocheck at the top) but they still type the EXPORT, which is
+    // what callers and tests see — a bare `= null` default would infer the
+    // parameter as `null` and reject every real path.
+    csvPath = null as string | null,
+    writeFile = writeFileSync as (path: string, body: string) => void,
+    log = console.log as (message: string) => void,
     overheadProjectId = OVERHEAD_PROJECT_ID,
 }) {
     const [projects, costCodes] = await Promise.all([
@@ -538,15 +560,6 @@ export async function runBackfill({
         if (!byProject.has(fill.projectId)) byProject.set(fill.projectId, []);
         byProject.get(fill.projectId).push(fill.id);
     }
-    // Pass (a) bumps `updatedAt` on the rows it fills, so their planned
-    // cost-code CAS would miss on a version the backfill itself changed. Those
-    // rows are exempted from the version check — the attribution and
-    // uncoded predicates still guard them.
-    const filledByProjectPass = new Set(plan.projectFills.map(fill => fill.id));
-    for (const fill of plan.codeFills) {
-        fill.projectWasFilled = filledByProjectPass.has(fill.id);
-    }
-
     for (const [projectId, ids] of byProject) {
         // `projectId: null` in the predicate, not just in the plan: between the
         // read above and this write, a re-sync or a bookkeeper may have set it.
@@ -579,16 +592,46 @@ export async function runBackfill({
     let costCodesWritten = 0;
     let costCodesSkipped = 0;
     for (const fill of plan.codeFills) {
-        const result = await writeUnderExpenseLock(db, fill.id, tx => tx.expense.updateMany({
+        const result = await writeUnderExpenseLock(db, fill.id, async tx => {
+            // RE-READ UNDER THE LOCK, then re-plan against what is really
+            // there.
+            //
+            // The previous version exempted rows that pass (a) had just filled
+            // from the version check, because the backfill bumps `updatedAt`
+            // itself. That traded one hazard for another: an exempted row had
+            // NO version guard at all, so anything a concurrent writer did to
+            // it between the plan and the write was invisible. And a row the
+            // project pass did NOT touch could still have moved.
+            //
+            // Reading inside the lock removes the guesswork. The version that
+            // goes into the CAS is the CURRENT one, so it names the state this
+            // decision is actually being made against — including the
+            // `projectId` pass (a) may have just written.
+            const current = await tx.expense.findUnique({
+                where: { id: fill.id },
+                select: {
+                    id: true, projectId: true, costCodeId: true, costCodeSource: true,
+                    itemId: true, updatedAt: true, estimate: { select: { projectId: true } },
+                },
+            });
+            if (!current) return { count: 0 };
+
+            // The plan was made about a row that no longer looks like this.
+            // Re-deciding here would be a second planner with its own copy of
+            // the rules; skipping is honest and a re-run will plan it properly.
+            const stillEligible =
+                current.costCodeId === null &&
+                current.costCodeSource !== "capture" &&
+                current.costCodeSource !== "manual" &&
+                resolveExpenseProjectId(current) === fill.expectedProjectId;
+            if (!stillEligible) return { count: 0 };
+
+            return tx.expense.updateMany({
             where: {
                 id: fill.id,
-                // The row version the plan was computed from. Pass (a) above
-                // may legitimately have bumped it, so a fill whose project was
-                // just written is re-read rather than assumed — see the
-                // `expectedUpdatedAt === null` branch in the helper.
-                ...(fill.expectedUpdatedAt && !fill.projectWasFilled
-                    ? { updatedAt: fill.expectedUpdatedAt }
-                    : {}),
+                // The version as READ UNDER THIS LOCK — not the one the plan
+                // was built from minutes ago.
+                ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}),
                 // Everything the plan depended on, re-asserted at write time.
                 // The plan is a snapshot taken before pass (a) ran and before
                 // any concurrent sync or bookkeeper edit; the predicate is what
@@ -609,7 +652,8 @@ export async function runBackfill({
                 costCodeSource: fill.costCodeSource,
                 costCodeConfidence: fill.costCodeConfidence,
             },
-        }));
+            });
+        });
         costCodesWritten += result.count;
         if (result.count === 0) costCodesSkipped += 1;
     }
@@ -631,7 +675,28 @@ export async function runBackfill({
     };
 }
 
+const HELP = `Backfill Expense attribution (Receipt Pipeline v2, Phase 3).
+
+  node --import=tsx scripts/backfill-expense-attribution.ts                # dry run
+  node --import=tsx scripts/backfill-expense-attribution.ts --csv out.csv  # + remainder CSV
+  node --import=tsx scripts/backfill-expense-attribution.ts --apply        # write
+
+Dry run is the DEFAULT. --apply writes; re-run dry afterwards and it must
+report zero planned changes.
+
+The --import=tsx loader is required: this script imports TypeScript from src/,
+and plain node only strips types on Node 22.6+.`;
+
 async function main() {
+    // --help must work with NO database and NO env. It is also the CI smoke
+    // test that this file can be LOADED under the documented runtime — an
+    // import error surfaces here rather than the first time someone runs the
+    // real thing against production.
+    if (process.argv.includes("--help") || process.argv.includes("-h")) {
+        console.log(HELP);
+        return;
+    }
+
     const __dirname = dirname(fileURLToPath(import.meta.url));
     config({ path: join(__dirname, "..", ".env.local") });
     config({ path: join(__dirname, "..", ".env") });

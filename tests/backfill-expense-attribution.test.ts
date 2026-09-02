@@ -15,7 +15,7 @@ import {
     remainderCsv,
     runBackfill,
     scopedItemCostCodes,
-} from "../scripts/backfill-expense-attribution.mjs";
+} from "../scripts/backfill-expense-attribution";
 
 const OVERHEAD_ID = "overhead-project";
 
@@ -141,6 +141,12 @@ function createStub(
             },
             expense: {
                 async findMany() { return rows; },
+                // The cost-code pass re-reads each row UNDER THE LOCK before
+                // deciding, so the stub has to serve the CURRENT row rather
+                // than the snapshot the planner saw.
+                async findUnique(args: { where: { id: string } }) {
+                    return rows.find(row => row.id === args.where.id) ?? null;
+                },
                 async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
                     writes.push(args);
                     let count = 0;
@@ -744,20 +750,80 @@ test("the CAS names the row version the plan was computed from", async () => {
     assert.deepEqual(codeWrite.where.updatedAt, new Date("2026-09-01"));
 });
 
-test("a row the PROJECT pass just filled is exempt from the version check", async () => {
-    // Pass (a) bumps updatedAt itself, so a naive CAS would miss on a version
-    // the backfill changed a moment earlier — and code nothing, which is
-    // exactly the ordering bug from round 6 wearing a different hat.
+test("a row the PROJECT pass just filled is re-read, not exempted", async () => {
+    // Pass (a) bumps `updatedAt` itself, so the plan's version is stale for
+    // exactly the rows this run just touched. The earlier fix EXEMPTED those
+    // from the version check, which traded one hazard for another: an exempted
+    // row had no version guard at all, so a concurrent writer was invisible to
+    // it. Re-reading under the lock removes the guess — the CAS names the
+    // version as it is NOW, including the projectId pass (a) wrote.
     const stub = createStub(
-        [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" }, vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [expense({
+            id: "e1", projectId: null, estimate: { projectId: "job-1" },
+            vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01"),
+        })],
         [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
     );
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
     (stub.db as any).$queryRawUnsafe = async () => [{}];
+    // Model the real column: pass (a)'s write bumps the version.
+    const realUpdateMany = stub.db.expense.updateMany;
+    (stub.db.expense as any).updateMany = async (args: any) => {
+        const result = await realUpdateMany(args);
+        if (result.count > 0 && "projectId" in args.data) {
+            stub.rows[0].updatedAt = new Date("2026-09-02");
+        }
+        return result;
+    };
 
     const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
     assert.equal(result.written.projectIds, 1);
     assert.equal(result.written.costCodes, 1, "the code still lands");
+
     const codeWrite = stub.writes.find(w => "costCodeId" in w.data)!;
-    assert.ok(!("updatedAt" in codeWrite.where), "no version check on a row this run just touched");
+    assert.deepEqual(
+        codeWrite.where.updatedAt,
+        new Date("2026-09-02"),
+        "the CAS names the POST-fill version, not the planner's snapshot",
+    );
+});
+
+test("a row that became human-coded after the plan is skipped on the re-read", async () => {
+    // The re-read is not just a version fetch — it re-checks eligibility, so a
+    // bookkeeper who coded the row mid-run keeps their answer.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => {
+        // The PATCH lands while this row is being locked.
+        stub.rows[0].costCodeId = "cc-human";
+        stub.rows[0].costCodeSource = "manual";
+        return [{}];
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0);
+    assert.equal(stub.rows[0].costCodeId, "cc-human", "the human's phase stands");
+    assert.ok(
+        !stub.writes.some(w => "costCodeId" in w.data),
+        "and no write is even attempted once the re-read says ineligible",
+    );
+});
+
+test("a row re-attributed after the plan is skipped on the re-read", async () => {
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", vendor: "Summit Plumbing", updatedAt: new Date("2026-09-01") })],
+        [{ id: "i1", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
+    (stub.db as any).$queryRawUnsafe = async () => {
+        stub.rows[0].projectId = "job-elsewhere";
+        return [{}];
+    };
+
+    const result = await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.equal(result.written.costCodes, 0, "the phase was chosen for a job it is no longer on");
+    assert.equal(stub.rows[0].costCodeId, null);
 });
