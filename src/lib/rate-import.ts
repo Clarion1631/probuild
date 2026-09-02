@@ -22,7 +22,15 @@ export type ParsedRateRow = {
     lineNumber: number;
     name: string;
     email: string | null;
-    hourlyRate: number;
+    /**
+     * CANONICAL DECIMAL TEXT, never a JS number. A pay rate is money: 28.005
+     * has no exact binary float, and Number("1e2") silently becomes 100. The
+     * text is carried all the way to `new Prisma.Decimal(text)` at write time so
+     * nothing is ever rounded on the way through.
+     */
+    hourlyRate: string;
+    /** "HOURLY" | "SALARY" when the file said so, else null. */
+    payType: string | null;
 };
 
 export type RateImportParse = {
@@ -35,8 +43,12 @@ export type RateDiffRow = {
     userId: string | null;
     name: string;
     email: string | null;
-    oldHourly: number | null;
-    newHourly: number;
+    /** Canonical decimal TEXT (2 places), or null when nothing matched. */
+    oldHourly: string | null;
+    /** Canonical decimal TEXT (2 places) — the value that will be written verbatim. */
+    newHourly: string;
+    /** Pay type the file supplied for this row, if any. */
+    payType: string | null;
     matched: boolean;
     matchedBy: "email" | "name" | null;
     changed: boolean;
@@ -48,7 +60,10 @@ export type ImportableUser = {
     id: string;
     name: string | null;
     email: string;
-    hourlyRate: number;
+    /** Canonical decimal text of the CURRENT stored rate. */
+    hourlyRate: string;
+    status?: string | null;
+    payType?: string | null;
 };
 
 /** Highest rate the import will accept without a human overriding it by hand — a typo like "5500" instead of "55.00" must not reach payroll. */
@@ -60,7 +75,17 @@ const HEADER_HINTS = {
     firstName: ["first name", "first"],
     lastName: ["last name", "last"],
     rate: ["compensation rate", "hourly rate", "pay rate", "rate", "wage"],
+    payType: ["compensation type", "pay type", "employee type", "pay basis"],
 };
+
+/** Gusto spells the compensation type a few ways; anything else is left as "not stated". */
+export function normalizePayType(raw: string): string | null {
+    const value = raw.trim().toLowerCase();
+    if (!value) return null;
+    if (value.includes("salar")) return "SALARY";
+    if (value.includes("hour")) return "HOURLY";
+    return null;
+}
 
 /** RFC4180-ish reader: quoted fields, doubled quotes inside them, CR/LF or LF line endings. */
 export function parseCsvGrid(text: string): string[][] {
@@ -130,19 +155,37 @@ function findColumn(headers: string[], hints: string[]): number {
 }
 
 /**
- * "$28.50" -> 28.5. Currency symbols and whitespace are stripped; a COMMA is
- * REFUSED, not stripped. Stripping it silently turns the European "28,50" into
- * 2850 — a 100x pay rate — and a thousands-separated "1,200" is not a plausible
- * hourly rate anyway. An unreadable value becomes a visible error the human
- * fixes in the file, which is the only safe answer here.
+ * Money text in, CANONICAL DECIMAL TEXT out ("28.5" -> "28.50"), or null.
+ *
+ * Deliberately strict, because every loose reading of this field is a wrong
+ * paycheque:
+ *  - a COMMA is refused, not stripped: stripping turns the European "28,50"
+ *    into 2850, a 100x rate, and "1,200" is not a plausible hourly rate anyway;
+ *  - EXPONENT notation is refused: Number("1e2") is 100, which is not what
+ *    anybody typed into a payroll system;
+ *  - more than 2 fractional digits is refused rather than rounded. 28.005 is
+ *    not a rate somebody meant, and silently making it 28.01 (or 28.00) is the
+ *    kind of half-cent decision a human should make, not an importer.
+ *
+ * The result is text, never a float — the caller hands it to Prisma.Decimal.
  */
-export function parseRateValue(raw: string): number | null {
+export function parseRateValue(raw: string): string | null {
     if (raw.includes(",")) return null;
     const cleaned = raw.replace(/[$\s]/g, "");
     if (!cleaned) return null;
-    const value = Number(cleaned);
-    if (!Number.isFinite(value)) return null;
-    return value;
+    // Optional sign, digits, optional . and up to 2 digits. No exponent, no hex,
+    // no "Infinity" — all of which Number() would happily accept.
+    const match = /^([+-]?)(\d+)(?:\.(\d{1,2}))?$/.exec(cleaned);
+    if (!match) return null;
+    const [, sign, whole, fraction = ""] = match;
+    if (sign === "-") return "-" + whole + "." + fraction.padEnd(2, "0");
+    return whole + "." + fraction.padEnd(2, "0");
+}
+
+/** Canonical 2-place text for a value that is already known to be a valid number-ish string. */
+export function canonicalRateText(value: string | number): string {
+    const parsed = parseRateValue(String(value));
+    return parsed ?? "0.00";
 }
 
 export function parseGustoRateCsv(text: string): RateImportParse {
@@ -155,6 +198,7 @@ export function parseGustoRateCsv(text: string): RateImportParse {
     const firstAt = findColumn(headers, HEADER_HINTS.firstName);
     const lastAt = findColumn(headers, HEADER_HINTS.lastName);
     const rateAt = findColumn(headers, HEADER_HINTS.rate);
+    const payTypeAt = findColumn(headers, HEADER_HINTS.payType);
 
     const errors: string[] = [];
     if (rateAt < 0) {
@@ -188,21 +232,25 @@ export function parseGustoRateCsv(text: string): RateImportParse {
 
         const hourlyRate = parseRateValue(rateText);
         if (hourlyRate == null) {
-            errors.push(`Row ${lineNumber} (${name || email}): could not read the rate "${rateText}".`);
+            errors.push(
+                `Row ${lineNumber} (${name || email}): could not read the rate "${rateText}". Use plain digits with at most two decimal places, e.g. 28.50.`
+            );
             continue;
         }
-        if (hourlyRate < 0) {
+        if (hourlyRate.startsWith("-")) {
             errors.push(`Row ${lineNumber} (${name || email}): a negative rate is not a rate.`);
             continue;
         }
-        if (hourlyRate > MAX_IMPORTABLE_HOURLY_RATE) {
+        // Compared as a NUMBER only for the sanity ceiling; the value that gets
+        // written is always the text.
+        if (Number(hourlyRate) > MAX_IMPORTABLE_HOURLY_RATE) {
             errors.push(
                 `Row ${lineNumber} (${name || email}): ${hourlyRate} is over the $${MAX_IMPORTABLE_HOURLY_RATE}/h import limit — enter it by hand if it is real.`
             );
             continue;
         }
 
-        rows.push({ lineNumber, name, email, hourlyRate });
+        rows.push({ lineNumber, name, email, hourlyRate, payType: normalizePayType(at(payTypeAt)) });
     }
 
     return { rows, errors };
@@ -254,6 +302,24 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             }
         }
 
+        if (user && user.status === "DISABLED") {
+            // A disabled account is off payroll. Writing a rate to it is
+            // pointless at best and, if it is ever re-enabled, a stale rate
+            // nobody reviewed.
+            return {
+                userId: null,
+                name: user.name ?? row.name,
+                email: user.email,
+                oldHourly: null,
+                newHourly: row.hourlyRate,
+                payType: row.payType,
+                matched: false,
+                matchedBy: null,
+                changed: false,
+                note: "That account is disabled — re-activate it first if this rate should apply.",
+            };
+        }
+
         if (user && claimed.has(user.id)) {
             // The same person twice in one file: take neither silently.
             return {
@@ -262,6 +328,7 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
                 email: row.email,
                 oldHourly: null,
                 newHourly: row.hourlyRate,
+                payType: row.payType,
                 matched: false,
                 matchedBy: null,
                 changed: false,
@@ -278,12 +345,38 @@ export function diffRates(parsed: ParsedRateRow[], users: ImportableUser[]): Rat
             // the row would display an email that belongs to nobody in
             // ProBuild while the rate lands on whoever shares the name.
             email: user ? user.email : row.email,
-            oldHourly: user ? user.hourlyRate : null,
+            oldHourly: user ? canonicalRateText(user.hourlyRate) : null,
             newHourly: row.hourlyRate,
+            payType: row.payType,
             matched: !!user,
             matchedBy,
-            changed: !!user && Math.abs(user.hourlyRate - row.hourlyRate) > 1e-9,
+            // Canonical TEXT comparison — exact, and free of the float epsilon
+            // fudge the numeric version needed.
+            changed:
+                !!user &&
+                (canonicalRateText(user.hourlyRate) !== row.hourlyRate ||
+                    (!!row.payType && row.payType !== (user.payType ?? null))),
             note,
         };
     });
+}
+
+/**
+ * Fingerprint of exactly what a human approved: each row's target user, the
+ * rate and pay type to be written, AND the user's rate/pay type AT PREVIEW
+ * TIME.
+ *
+ * Apply re-computes this from the live database and refuses if it differs. That
+ * is what makes the two-step import honest: without it, `apply` is just an
+ * arbitrary "set these people's pay rates" endpoint that trusts a body the
+ * browser could replay minutes later, against rates somebody else has since
+ * changed. Including the OLD values is the point — a stale approval is a
+ * different decision from the one that was shown.
+ */
+export function previewFingerprint(rows: RateDiffRow[]): string {
+    return rows
+        .filter((row) => row.userId)
+        .map((row) => [row.userId, row.oldHourly ?? "", row.newHourly, row.payType ?? ""].join(":"))
+        .sort()
+        .join("|");
 }

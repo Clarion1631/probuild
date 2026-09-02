@@ -12,12 +12,13 @@ import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { applyGustoRateImport, previewGustoRateImport } from "@/lib/actions";
 import type { RateDiffRow } from "@/lib/rate-import";
-import { formatCurrency } from "@/lib/utils";
 
 export default function RatesImport({ onImported }: { onImported: () => void }) {
     const [open, setOpen] = useState(false);
     const [csvText, setCsvText] = useState("");
     const [rows, setRows] = useState<RateDiffRow[] | null>(null);
+    // Ties the save to the exact preview that was shown (see previewFingerprint).
+    const [previewHash, setPreviewHash] = useState("");
     const [errors, setErrors] = useState<string[]>([]);
     const [selected, setSelected] = useState<Record<string, boolean>>({});
     const [busy, setBusy] = useState(false);
@@ -28,6 +29,7 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
         setRows(null);
         setErrors([]);
         setSelected({});
+        setPreviewHash("");
     };
 
     const close = () => {
@@ -52,6 +54,7 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
             }
             setRows(result.rows);
             setErrors(result.errors);
+            setPreviewHash(result.previewHash);
             // Pre-tick exactly the rows that would actually change something.
             // Pre-tick only EMAIL-matched changes. A name-only match is exactly
             // the row a human should have to look at before it writes a pay
@@ -72,14 +75,14 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
     async function handleSave() {
         const payload = (rows ?? [])
             .filter((row) => row.userId && selected[row.userId])
-            .map((row) => ({ userId: row.userId as string, newHourly: row.newHourly }));
+            .map((row) => ({ userId: row.userId as string, newHourly: row.newHourly, payType: row.payType }));
         if (payload.length === 0) {
             toast.error("Tick at least one rate to save.");
             return;
         }
         setBusy(true);
         try {
-            const result = await applyGustoRateImport(payload);
+            const result = await applyGustoRateImport(payload, previewHash);
             if (!result.success) {
                 toast.error(result.error);
                 return;
@@ -188,10 +191,17 @@ export default function RatesImport({ onImported }: { onImported: () => void }) 
                                                         <div className="text-hui-textMuted">{row.email || ""}</div>
                                                     </td>
                                                     <td className="px-3 py-2 text-right tabular-nums text-hui-textMuted">
-                                                        {row.oldHourly == null ? "—" : `${formatCurrency(row.oldHourly)}/h`}
+                                                        {row.oldHourly == null ? "—" : `$${row.oldHourly}/h`}
                                                     </td>
                                                     <td className={`px-3 py-2 text-right tabular-nums font-medium ${row.changed ? "text-hui-textMain" : "text-hui-textMuted"}`}>
-                                                        {formatCurrency(row.newHourly)}/h
+                                                        {/* Rendered from the exact decimal TEXT that will be written —
+                                                            not re-parsed through a float on the way to the screen. */}
+                                                        ${row.newHourly}/h
+                                                        {row.payType && (
+                                                            <div className="text-[10px] font-normal text-hui-textMuted uppercase tracking-wide">
+                                                                {row.payType === "SALARY" ? "salary" : "hourly"}
+                                                            </div>
+                                                        )}
                                                     </td>
                                                     <td className="px-3 py-2 text-hui-textMuted">
                                                         {row.note ?? (row.changed ? "" : "No change")}
