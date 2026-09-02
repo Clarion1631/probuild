@@ -24,6 +24,7 @@ import {
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
 import type { ProjectPhase, ReadOutcome } from "./read";
+import type { DocBytesResult } from "@/lib/secure-storage";
 
 /**
  * ONE global constant, deliberately not derived from anything per-row or
@@ -95,7 +96,8 @@ export interface WorkerDependencies {
      */
     sweepStaleStaging: () => Promise<number>;
     loadPhases: (projectId: string | null) => Promise<{ id: string; code: string; name: string }[]>;
-    downloadBytes: (secureRef: string) => Promise<Buffer | null>;
+    /** Tagged: a confirmed 404 and a transient storage fault are NOT the same answer. */
+    downloadBytes: (storagePath: string) => Promise<DocBytesResult>;
     read: (bytes: Buffer, mime: string, phases: ProjectPhase[]) => Promise<ReadOutcome>;
     /**
      * Persist the read + routing. Returns the strong-key owner when the partial
@@ -307,12 +309,19 @@ function stateForBookResult(result: BookResult): string {
 }
 
 async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promise<string> {
-    const bytes = await deps.downloadBytes(row.storagePath);
-    if (!bytes) {
-        // The object is gone from the bucket — nothing to read, ever.
-        await deps.applyState(row.id, "NEEDS_REVIEW", "file-missing");
-        return "NEEDS_REVIEW";
+    const download = await deps.downloadBytes(row.storagePath);
+    if (!download.ok) {
+        // "The object is gone" and "storage was briefly unreachable" demand
+        // opposite answers, and collapsing them to null meant a Supabase blip
+        // parked good receipts as file-missing, permanently, for a human to
+        // untangle. Only an AFFIRMATIVE not-found is terminal.
+        if (download.kind === "not-found") {
+            await deps.applyState(row.id, "NEEDS_REVIEW", "file-missing");
+            return "NEEDS_REVIEW";
+        }
+        return retryTransient(row, deps, `storage:${download.message}`);
     }
+    const bytes = download.bytes;
 
     const costCodes = await deps.loadPhases(row.projectId);
     const phases: ProjectPhase[] = costCodes.map(c => ({ code: c.code, name: c.name }));
@@ -352,11 +361,6 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const taxCentsRaw = centsOf(read.taxAmount || "0.00");
     const taxCents = taxCentsRaw && taxCentsRaw > 0 ? taxCentsRaw : null;
 
-    // Weak hits are a plain query and never a claim (:1591-1596). Strong hits
-    // come from the partial unique index rejecting the write below.
-    const weak = await deps.findWeakHit(row.id, keys.weak);
-    const hits: DedupHits = { strong: null, weak };
-
     const base = {
         vendor: read.vendor || null,
         txnDate: dateOnly(keys.dateStr),
@@ -377,25 +381,47 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         totalCents,
         canonicalVendor: canonicalVendor(read.vendor),
     };
-    const decision = routeState(routeInput, hits, !!row.projectId);
 
-    // A document that never reaches READ must not hold the strong key: a
-    // multi-doc, a non-receipt, or a $0 misread would otherwise quarantine the
-    // real receipt that arrives next (:531 and the v3.6 rationale).
-    const claimsStrongKey = decision.state === "READ" && keys.strong !== null;
+    // ORDER MATTERS, and it used to be wrong.
+    //
+    // The weak lookup ran FIRST, so an exact duplicate — same date, same ref,
+    // same vendor, same amount, which therefore matches BOTH nets — routed on
+    // the weak hit to NEEDS_REVIEW and never attempted the strong claim at all.
+    // The one case the strong key exists to resolve automatically was the one
+    // case it never got to see, and every re-sent receipt landed in a human's
+    // queue.
+    //
+    // So: the document-level gates first (multi, non-receipt, refund/zero, no
+    // job) because those outrank dedup entirely; then the STRONG claim, which
+    // is the only net that can answer DUPLICATE on its own; and only if the
+    // strong net is silent do we fall back to the weak one, which by design
+    // never decides anything itself.
+    const gate = routeState(routeInput, { strong: null, weak: null }, !!row.projectId);
+    if (gate.state !== "READ") {
+        // A multi-doc, a non-receipt, or a $0/negative misread must never hold
+        // a dedup key — it would quarantine the real receipt that arrives next
+        // (:531 and the v3.6 rationale).
+        await deps.applyRead(row.id, {
+            ...base,
+            state: gate.state,
+            stateReason: gate.stateReason,
+            dedupStrongKey: null,
+            duplicateOfId: gate.duplicateOfId,
+        });
+        return gate.state;
+    }
 
+    // The strong claim IS the partial unique index: a rejection is the hit.
     const applied = await deps.applyRead(row.id, {
         ...base,
-        state: decision.state,
-        stateReason: decision.stateReason,
-        dedupStrongKey: claimsStrongKey ? keys.strong : null,
-        duplicateOfId: decision.duplicateOfId,
+        state: "READ",
+        stateReason: null,
+        dedupStrongKey: keys.strong,
+        duplicateOfId: null,
     });
 
     if (applied.strongOwner) {
-        // The claim lost: another live row already owns this date|ref. Re-route
-        // with the owner in hand and write the losing outcome (no key).
-        const second = routeState(routeInput, { strong: applied.strongOwner, weak }, !!row.projectId);
+        const second = routeState(routeInput, { strong: applied.strongOwner, weak: null }, !!row.projectId);
         await deps.applyState(row.id, second.state, second.stateReason, {
             ...base,
             dedupStrongKey: null,
@@ -404,7 +430,31 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         return second.state;
     }
 
-    return decision.state;
+    // No strong hit (or no strong key at all — a placeholder ref). The weak net
+    // is a plain query and never a claim (:1591-1596); a hit only ever asks a
+    // human, because two genuine same-day purchases from one vendor for the
+    // same amount do happen.
+    const weak = await deps.findWeakHit(row.id, keys.weak);
+    if (weak) {
+        const third = routeState(routeInput, { strong: null, weak }, !!row.projectId);
+        // The strong key stays claimed: this row is still the live owner of
+        // that date|ref, and releasing it would let a third copy book.
+        await deps.applyState(row.id, third.state, third.stateReason);
+        return third.state;
+    }
+
+    return "READ";
+}
+
+/** A transport-class fault during a row's processing: spend an attempt, back off. */
+async function retryTransient(row: WorkerRow, deps: WorkerDependencies, reason: string): Promise<string> {
+    const attempts = row.attempts + 1;
+    if (attempts >= MAX_BOOK_ATTEMPTS) {
+        await deps.applyState(row.id, "NEEDS_REVIEW", "max-retries");
+        return "NEEDS_REVIEW";
+    }
+    await deps.retryRow(row.id, attempts, new Date(deps.now().getTime() + backoffMs(attempts)), reason);
+    return "RETRY";
 }
 
 /**

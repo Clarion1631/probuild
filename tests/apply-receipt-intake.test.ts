@@ -93,6 +93,8 @@ test("every statement is idempotent — the script is safe to re-run", () => {
             /CREATE TABLE IF NOT EXISTS/.test(sql) ||
             /CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/.test(sql) ||
             /ALTER TABLE .* ADD COLUMN IF NOT EXISTS/.test(sql) ||
+            // Re-enabling RLS on a table that already has it is a no-op.
+            /ENABLE ROW LEVEL SECURITY/.test(sql) ||
             /IF NOT EXISTS \(SELECT 1 FROM pg_constraint/.test(sql);
         assert.ok(guarded, `not idempotent: ${sql.slice(0, 80)}`);
     }
@@ -153,4 +155,28 @@ test("STAGING is in the state set, and is the column DEFAULT", () => {
     const create = statements.find((s: string) => s.includes('CREATE TABLE IF NOT EXISTS "ReceiptIntake"'));
     assert.match(create!, /"state"\s+TEXT NOT NULL DEFAULT 'STAGING'/);
     assert.match(migrationSql, /"state" TEXT NOT NULL DEFAULT 'STAGING'/);
+});
+
+test("RLS is enabled on ReceiptIntake, in both files, and WITHOUT force", () => {
+    // Same shape as every other sensitive table here (apply-bank-ledger,
+    // apply-automation-events, apply-deposit-ingest-schema): ENABLE with no
+    // policies. The app connects as the owner/service role, which BYPASSES RLS,
+    // so reads and writes are unaffected — while anon and authenticated roles
+    // (a leaked anon key, a Supabase client someone wires up later) get nothing.
+    //
+    // FORCE is the trap: it applies RLS to the owner too, and with zero policies
+    // that denies everything. It would take the pipeline down silently, as
+    // empty result sets rather than errors.
+    assert.ok(statements.some((s: string) => /ALTER TABLE "ReceiptIntake" ENABLE ROW LEVEL SECURITY/.test(s)));
+    assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ENABLE ROW LEVEL SECURITY;/);
+    assert.ok(!statements.some((s: string) => /FORCE ROW LEVEL SECURITY/.test(s)), "never FORCE");
+    assert.ok(!/FORCE ROW LEVEL SECURITY/.test(migrationSql), "never FORCE");
+
+    // And it must be recorded in the snapshot CI compares against production.
+    const snapshot = JSON.parse(
+        readFileSync(path.join(__dirname, "..", "prisma", "prisma-blind-spots.json"), "utf8"),
+    );
+    const entry = snapshot.rlsTables.find((r: { name: string }) => r.name === "ReceiptIntake");
+    assert.ok(entry, "ReceiptIntake missing from prisma-blind-spots.json rlsTables");
+    assert.equal(entry.forced, false);
 });

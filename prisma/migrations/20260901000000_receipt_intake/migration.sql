@@ -82,6 +82,12 @@ BEGIN
     END IF;
 END $$;
 
+-- RLS, matching every other sensitive table in this schema. ENABLE with no
+-- policies and WITHOUT FORCE: the app connects as the owner/service role, which
+-- bypasses RLS, so reads and writes are unaffected — while anon and
+-- authenticated roles get nothing. FORCE would deny the owner too.
+ALTER TABLE "ReceiptIntake" ENABLE ROW LEVEL SECURITY;
+
 DO $$
 BEGIN
     IF NOT EXISTS (

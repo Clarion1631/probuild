@@ -3,11 +3,16 @@ import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { userCanAccessProject } from "@/lib/mobile-auth";
-import { SECURE_BUCKET } from "@/lib/secure-storage";
+import { SECURE_BUCKET, secureObjectExists } from "@/lib/secure-storage";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { EXT_BY_MIME, MAX_INTAKE_BYTES, sniffMime } from "@/lib/receipt-intake/file-type";
-import { ARCHIVE_READABLE_STATES, listReceiptIntakes, serializeReceiptIntake } from "@/lib/receipt-intake/queries";
+import {
+    ARCHIVE_READABLE_STATES,
+    listReceiptIntakes,
+    serializeReceiptIntake,
+    withArchiveDownloadUrls,
+} from "@/lib/receipt-intake/queries";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -46,12 +51,16 @@ const MACHINE_SOURCES = new Set(["drive", "email", "chat"]);
 /** Minted server-side from the authenticated caller, never read off the body. */
 const USER_SOURCES = new Set(["mobile", "web"]);
 
+/** Client-supplied idempotency tokens must be real UUIDs — never a free-text key. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 interface ParsedBody {
     bytes: Buffer;
     declaredMime: string;
     fileName: string | null;
     source: string;
     sourceRef: string | null;
+    uploadId: string | null;
     projectId: string | null;
     costCodeId: string | null;
     threadName: string | null;
@@ -83,6 +92,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
             fileName: str(file.name),
             source: String(form.get("source") ?? ""),
             sourceRef: str(form.get("sourceRef")),
+            uploadId: str(form.get("uploadId")),
             projectId: str(form.get("projectId")),
             costCodeId: str(form.get("costCodeId")),
             threadName: str(form.get("threadName")),
@@ -109,6 +119,7 @@ async function parseBody(req: Request): Promise<ParsedBody | NextResponse> {
         fileName: str(json.fileName),
         source: String(json.source ?? ""),
         sourceRef: str(json.sourceRef),
+        uploadId: str(json.uploadId),
         projectId: str(json.projectId),
         costCodeId: str(json.costCodeId),
         threadName: str(json.threadName),
@@ -138,16 +149,32 @@ export async function POST(req: Request) {
     if (auth.via === "secret") {
         if (!MACHINE_SOURCES.has(parsed.source)) return bad("invalid-source");
         if (!parsed.sourceRef) return bad("missing-sourceRef");
+        // The ref must live in the namespace the caller declared. Without this
+        // a chat forwarder could write `drive:<fileId>` and collide with — or
+        // pre-empt — the Drive pipeline's key for a file it does not own, and
+        // `drive` rows are the ones that book under the Drive fileId, i.e. the
+        // QBO DocNumber.
+        if (!parsed.sourceRef.startsWith(`${parsed.source}:`)) return bad("sourceRef-namespace-mismatch");
         source = parsed.source;
         sourceRef = parsed.sourceRef;
     } else {
         source = auth.userVia === "mobile-jwt" ? "mobile" : "web";
-        // Reject rather than silently ignore: a client that thinks it set the
-        // key would otherwise believe its retries were idempotent when every
-        // one of them creates a new document.
-        if (parsed.sourceRef) return bad("sourceRef-not-allowed");
         if (parsed.source && parsed.source !== source) return bad("invalid-source");
-        sourceRef = `${source}:${randomUUID()}`;
+        // A RAW sourceRef stays forbidden — provenance is not caller input.
+        if (parsed.sourceRef) return bad("sourceRef-not-allowed");
+
+        // But a phone on a bad connection needs SOME way to retry safely: a
+        // minted uuid makes every retry a new document, so a crew member who
+        // taps Send twice on a spinner books the same receipt twice. `uploadId`
+        // is the client's own idempotency token, and it is SCOPED TO THE USER
+        // server-side — two people cannot collide on the same uuid, and one
+        // user cannot reach another's row by guessing one.
+        if (parsed.uploadId) {
+            if (!UUID_PATTERN.test(parsed.uploadId)) return bad("invalid-uploadId");
+            sourceRef = `${source}:${auth.user.id}:${parsed.uploadId.toLowerCase()}`;
+        } else {
+            sourceRef = `${source}:${randomUUID()}`;
+        }
     }
     if (!USER_SOURCES.has(source) && !MACHINE_SOURCES.has(source)) return bad("invalid-source");
 
@@ -227,27 +254,53 @@ export async function POST(req: Request) {
         await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
-    const upload = await supabase.storage
-        .from(SECURE_BUCKET)
-        .upload(storagePath, parsed.bytes, { contentType: mimeType, upsert: false });
-    if (upload.error) {
-        // Delete the row so the caller's retry is a clean insert rather than a
-        // sourceRef conflict against a row pointing at an object that is not
-        // there. The worker would otherwise park it "file-missing".
+    // A THROW here is not the same as an error result — the SDK can reject
+    // before it ever reaches storage — but both leave a STAGING row pointing at
+    // an object that may not exist, so both clean it up. The caller's retry is
+    // then a clean insert rather than a conflict against a half-written row.
+    let uploadFailed: string | null = null;
+    try {
+        const upload = await supabase.storage
+            .from(SECURE_BUCKET)
+            .upload(storagePath, parsed.bytes, { contentType: mimeType, upsert: false });
+        if (upload.error) uploadFailed = upload.error.message;
+    } catch (error) {
+        uploadFailed = error instanceof Error ? `${error.name}: ${error.message}` : "upload-threw";
+    }
+    if (uploadFailed) {
         await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
-        console.error("[receipts/intake] upload failed", upload.error.message);
+        console.error("[receipts/intake] upload failed", uploadFailed);
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
     }
 
-    // The object exists now, so the row becomes claimable. One UPDATE, and it
-    // is the ONLY thing that publishes a row to the worker.
-    const published = await prisma.receiptIntake.update({
-        where: { id },
-        data: { state: "RECEIVED" },
-        select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
-    });
+    return publishStagedRow(id);
+}
 
-    return NextResponse.json({ ok: true, ...published });
+/**
+ * STAGING -> RECEIVED. The one write that makes a row claimable.
+ *
+ * Split out because it must be RESUMABLE: if the upload lands and this UPDATE
+ * then fails (a connection reset between two round trips is not rare), the
+ * object exists and the row does not point at it, and nothing would ever fix
+ * that — the row is invisible to the worker's claim by design, so it would sit
+ * until the 15-minute sweeper wrongly declared its file missing. An identical
+ * retry finds the STAGING row, confirms the object really is there, and
+ * finishes the job.
+ */
+async function publishStagedRow(id: string): Promise<NextResponse> {
+    try {
+        const published = await prisma.receiptIntake.update({
+            where: { id },
+            data: { state: "RECEIVED" },
+            select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
+        });
+        return NextResponse.json({ ok: true, ...published });
+    } catch (error) {
+        // The bytes ARE stored; only the publish failed. Leave the row in
+        // STAGING — 503 tells the caller to retry, and the retry resumes.
+        console.error("[receipts/intake] publish failed", error instanceof Error ? error.name : "error");
+        return NextResponse.json({ ok: false, reason: "publish-failed", id, status: "staging" }, { status: 503 });
+    }
 }
 
 /**
@@ -274,7 +327,7 @@ async function respondToSourceRefConflict(
         where: { sourceRef },
         select: {
             id: true, state: true, source: true, sourceRef: true, projectId: true,
-            dryRun: true, fileSha256: true, createdById: true,
+            dryRun: true, fileSha256: true, createdById: true, storagePath: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
@@ -309,11 +362,20 @@ async function respondToSourceRefConflict(
         );
     }
 
-    // Same bytes, but the FIRST request has not finished uploading yet. 200
-    // would tell the caller its document is queued when the object may still
-    // fail to land; 202 says "accepted, not yet published" so a forwarder can
-    // re-poll instead of moving the file out from under a half-written row.
+    // Same bytes, and the first attempt is still STAGING. Two very different
+    // reasons for that, and only storage can tell them apart:
+    //
+    //  - the object IS there, so the previous request uploaded successfully and
+    //    only its publish UPDATE failed. Finish it. This is what makes the
+    //    publish resumable rather than a permanent half-state.
+    //  - the object is NOT there yet — a concurrent request is mid-upload, or
+    //    the last one died before storing anything. 202 "accepted, not yet
+    //    published" tells the caller to re-poll rather than assume a queued
+    //    document; the 15-minute sweeper handles the case where it never lands.
     if (existing.state === "STAGING") {
+        if (await secureObjectExists(existing.storagePath)) {
+            return publishStagedRow(existing.id);
+        }
         return NextResponse.json(
             { ok: true, status: "staging", alreadyReceived: true, id: existing.id, sourceRef: existing.sourceRef },
             { status: 202 },
@@ -364,5 +426,17 @@ export async function GET(req: Request) {
         take: url.searchParams.get("take") ? Number(url.searchParams.get("take")) : null,
         archiveOnly,
     });
+
+    if (archiveOnly) {
+        // The mirror needs to FETCH each file and NAME it. It holds no service
+        // key and cannot read the private bucket, so every row carries a
+        // short-lived signed URL plus the project name the filename is built
+        // from.
+        const withUrls = await withArchiveDownloadUrls(
+            rows as Array<{ storagePath: string; project?: { name: string } | null }>,
+        );
+        return NextResponse.json({ ok: true, rows: withUrls.map(serializeReceiptIntake) });
+    }
+
     return NextResponse.json({ ok: true, rows: rows.map(serializeReceiptIntake) });
 }

@@ -103,7 +103,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         isDryRunEnabled: () => true,
         sweepStaleStaging: async () => { h.sweepCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
-        downloadBytes: async () => Buffer.from("bytes"),
+        downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
         findWeakHit: async () => null,
@@ -219,10 +219,25 @@ test("a document the model answered on but could not read goes to a human", asyn
 });
 
 test("a missing storage object is terminal, not an infinite read loop", async () => {
-    const h = harness([workerRow()], { downloadBytes: async () => null });
+    const h = harness([workerRow()], {
+        downloadBytes: async () => ({ ok: false as const, kind: "not-found" as const }),
+    });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "file-missing");
     assert.equal(h.reads, 0);
+});
+
+test("a TRANSIENT storage fault retries — it is not evidence the file is gone", async () => {
+    // Collapsing both to null meant a Supabase blip parked good receipts as
+    // file-missing, permanently, for a human to untangle.
+    const h = harness([workerRow({ attempts: 1 })], {
+        downloadBytes: async () => ({ ok: false as const, kind: "transient" as const, message: "ECONNRESET" }),
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { RETRY: 1 });
+    assert.deepEqual(h.states, [], "not parked");
+    assert.equal(h.retried[0].attempts, 2);
+    assert.match(h.retried[0].reason, /^storage:/);
 });
 
 test("another run holding the lock yields skipped, not an empty pass", async () => {
@@ -446,4 +461,70 @@ test("dateOnly keeps a calendar day at UTC midnight, the way @db.Date round-trip
     assert.equal(dateOnly("2026-13-03"), null);
     assert.equal(dateOnly("nope"), null);
     assert.equal(toDateStr(new Date("2026-08-03T23:59:00.000Z")), "2026-08-03");
+});
+
+// ── Dedup ORDER: strong before weak (Codex round 3, item 1) ─────────────────
+
+test("an EXACT duplicate becomes DUPLICATE, not NEEDS_REVIEW", async () => {
+    // The regression this pins: an exact re-send matches BOTH nets. The weak
+    // lookup used to run first, so it routed on the weak hit and the strong
+    // claim — the only net that can answer DUPLICATE on its own — was never
+    // attempted. The one case the strong key exists to resolve automatically
+    // was the one case it never saw, and every re-sent receipt hit a human.
+    const order: string[] = [];
+    const h = harness([workerRow()], {
+        applyRead: async (_id, patch) => {
+            order.push("strong-claim");
+            h.applied.push(patch);
+            return { strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } };
+        },
+        findWeakHit: async () => { order.push("weak-lookup"); return { id: "row-owner" }; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { DUPLICATE: 1 });
+    assert.equal(h.states[0].state, "DUPLICATE");
+    assert.deepEqual(order, ["strong-claim"], "the weak net is never consulted once the strong one answers");
+});
+
+test("the strong claim is attempted with the key, before any weak lookup", async () => {
+    const order: string[] = [];
+    const h = harness([workerRow()], {
+        applyRead: async (_id, patch) => { order.push("strong-claim"); h.applied.push(patch); return { strongOwner: null }; },
+        findWeakHit: async () => { order.push("weak-lookup"); return null; },
+    });
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(order, ["strong-claim", "weak-lookup"]);
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766", "the claim carries the key");
+    assert.equal(h.applied[0].state, "READ");
+});
+
+test("a weak-only hit still asks a human, and KEEPS the strong key", async () => {
+    // This row is the live owner of that date|ref. Releasing the key would let
+    // a third copy claim it and book while the pair is still unresolved.
+    const h = harness([workerRow()], { findWeakHit: async () => ({ id: "row-twin" }) });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "weak-dup:row-twin");
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    // applyState was called WITHOUT a patch clearing dedupStrongKey.
+    assert.equal(h.applied[0].dedupStrongKey, "2026-08-03|82766");
+});
+
+test("a document-level gate short-circuits BOTH nets and claims no key", async () => {
+    for (const [read, reason] of [
+        [{ ...goodRead.read, docType: "multi" }, "multi-doc"],
+        [{ ...goodRead.read, totalAmount: "0.00" }, "refund-or-zero"],
+        [{ ...goodRead.read, totalAmount: "-22.57" }, "refund-or-zero"],
+    ] as const) {
+        let weakCalls = 0;
+        const h = harness([workerRow()], {
+            read: async () => ({ ok: true, read } as ReadOutcome),
+            findWeakHit: async () => { weakCalls++; return { id: "row-twin" }; },
+        });
+        await runIntakeWorker(h.deps);
+        assert.equal(h.applied[0].stateReason, reason);
+        assert.equal(h.applied[0].dedupStrongKey, null, reason);
+        assert.equal(weakCalls, 0, `${reason}: dedup is not consulted at all`);
+    }
 });

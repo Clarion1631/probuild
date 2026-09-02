@@ -240,6 +240,10 @@
       "forced": false
     },
     {
+      "name": "ReceiptIntake",
+      "forced": false
+    },
+    {
       "name": "RefundEvent",
       "forced": false
     },

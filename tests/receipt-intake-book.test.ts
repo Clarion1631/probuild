@@ -93,7 +93,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
             purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: input.fileId.slice(0, 21), alreadyExists: false, attachment: "attached" };
         },
-        downloadBytes: async () => Buffer.from("bytes"),
+        downloadBytes: async () => ({ ok: true as const, bytes: Buffer.from("bytes") }),
         logEvent: async (event) => { events.push(event); },
         now: () => NOW,
         ...overrides,
@@ -331,4 +331,41 @@ test("a DB failure AFTER the Purchase exists retries — the create is idempoten
     (r.deps.db as any).$transaction = async () => { throw new Error("connection reset"); };
     const result = await bookReceipt(row(), r.deps);
     assert.equal(result.outcome, "retry");
+});
+
+// ── Never a Purchase without its receipt (Codex round 3, item 3) ────────────
+
+test("a MISSING receipt file refuses the booking outright", async () => {
+    // Booking with `fileBase64: undefined` produced a QBO Purchase with no
+    // attachment — the one failure the bookkeeper cannot fix later, because the
+    // Purchase looks complete and nothing flags it. The receipt IS the evidence
+    // for the expense.
+    const r = recorder({ downloadBytes: async () => ({ ok: false, kind: "not-found" }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.deepEqual(result, {
+        outcome: "needs-review",
+        reason: "receipt-bytes-missing",
+        // Pre-send: nothing reached QuickBooks, so the key goes back for a
+        // corrected re-upload.
+        releaseStrongKey: true,
+    });
+    assert.equal(r.purchaseCalls.length, 0, "QuickBooks is never touched");
+    assert.equal(r.expenses.length, 0);
+});
+
+test("a TRANSIENT storage fault retries instead of parking a good receipt", async () => {
+    const r = recorder({
+        downloadBytes: async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
+    });
+    const result = await bookReceipt(row({ attempts: 1 }), r.deps);
+    assert.equal(result.outcome, "retry");
+    assert.match((result as any).reason, /^storage:/);
+    assert.equal(r.purchaseCalls.length, 0);
+});
+
+test("the receipt bytes always ride along with the Purchase", async () => {
+    const r = recorder();
+    await bookReceipt(row(), r.deps);
+    assert.equal(r.purchaseCalls[0].fileBase64, Buffer.from("bytes").toString("base64"));
+    assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
 });

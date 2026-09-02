@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { logAutomationEvent } from "@/lib/automation-events";
-import { downloadDocBytes, toSecureRef } from "@/lib/secure-storage";
+import { downloadDocBytesResult, toSecureRef } from "@/lib/secure-storage";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { readReceipt } from "@/lib/receipt-intake/read";
@@ -142,7 +142,7 @@ function buildDeps(): WorkerDependencies {
             orderBy: { code: "asc" },
         }),
 
-        downloadBytes: (storagePath: string) => downloadDocBytes(toSecureRef(storagePath)),
+        downloadBytes: (storagePath: string) => downloadDocBytesResult(toSecureRef(storagePath)),
 
         read: (bytes, mime, phases) => readReceipt(bytes, mime, phases),
 
@@ -224,11 +224,23 @@ function buildDeps(): WorkerDependencies {
             // block each other.
             if (weakKey) {
                 await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${weakKey}, 0))`;
+                // EVERY LIVE STATE, not just the post-booking ones.
+                //
+                // Limiting this to BOOKING/BOOKED/ARCHIVED meant a twin sitting
+                // in NEEDS_REVIEW — which is exactly where the weak net puts
+                // the FIRST of a suspected pair — was invisible here, so the
+                // second copy sailed past the human decision that was still
+                // pending on the first and booked itself. A twin awaiting
+                // review is the strongest possible signal to stop, not the
+                // weakest.
+                //
+                // DUPLICATE / VOID / NON_RECEIPT are excluded because those are
+                // settled: somebody already decided they are not a purchase.
                 const conflict = await tx.receiptIntake.findFirst({
                     where: {
                         dedupWeakKey: weakKey,
                         id: { not: rowId },
-                        state: { in: ["BOOKING", "BOOKED", "ARCHIVED"] },
+                        state: { notIn: ["DUPLICATE", "VOID", "NON_RECEIPT"] },
                     },
                     select: { id: true },
                     orderBy: { createdAt: "asc" },
@@ -261,7 +273,7 @@ function buildDeps(): WorkerDependencies {
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             getTokens: getFreshQBTokens,
             createPurchase: (tokens, input) => createQBReceiptPurchase(tokens, input),
-            downloadBytes: downloadDocBytes,
+            downloadBytes: downloadDocBytesResult,
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),

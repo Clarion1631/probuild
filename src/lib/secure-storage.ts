@@ -174,6 +174,98 @@ export async function resolveDocUrls<K extends string>(
 }
 
 /**
+ * Why a download did not produce bytes.
+ *
+ * `downloadDocBytes` collapses every failure to `null`, which is fine for a PDF
+ * that renders without a signature but NOT for a money path: "the object is
+ * gone" and "Supabase was briefly unreachable" demand opposite responses. The
+ * first is terminal (a human must re-upload); the second must be retried, and
+ * treating it as terminal would park good receipts during a storage blip.
+ *
+ * `not-found` is only ever returned when storage AFFIRMATIVELY said the object
+ * is missing. Anything ambiguous — a network error, a 5xx, no configured
+ * client — is `transient`, because guessing "gone" on incomplete evidence is
+ * the failure mode that loses documents.
+ */
+export type DocBytesResult =
+    | { ok: true; bytes: Buffer }
+    | { ok: false; kind: "not-found" }
+    | { ok: false; kind: "transient"; message: string };
+
+/** Supabase storage's shapes for "this key does not exist". */
+function isNotFoundError(error: { message?: string; status?: number; statusCode?: string | number } | null): boolean {
+    if (!error) return false;
+    const status = Number(error.status ?? error.statusCode);
+    if (status === 404 || status === 400) return true;
+    const message = String(error.message ?? "").toLowerCase();
+    return message.includes("not found") || message.includes("object not found");
+}
+
+/**
+ * Tagged download. Same resolution rules as downloadDocBytes (secure ref, data
+ * URL, our own storage URL, legacy bare path) but the caller is told WHY it
+ * failed. Use this on any path where a missing file changes what happens to
+ * real money.
+ */
+export async function downloadDocBytesResult(
+    stored: string | null | undefined,
+): Promise<DocBytesResult> {
+    if (!stored) return { ok: false, kind: "not-found" };
+
+    if (isDataUrl(stored)) {
+        const bytes = await downloadDocBytes(stored);
+        return bytes ? { ok: true, bytes } : { ok: false, kind: "not-found" };
+    }
+
+    let bucket: string;
+    let path: string;
+
+    const securePath = secureRefPath(stored);
+    if (securePath) {
+        bucket = SECURE_BUCKET;
+        path = securePath;
+    } else if (/^https?:\/\//i.test(stored)) {
+        const parsed = parseOwnStorageUrl(stored);
+        // Not ours, or naming a bucket we never write absolute URLs for. That is
+        // a REFUSAL, not a transient failure — retrying cannot make it ours.
+        if (!parsed || parsed.bucket !== STORAGE_BUCKET) return { ok: false, kind: "not-found" };
+        bucket = parsed.bucket;
+        path = parsed.path;
+    } else {
+        if (stored.startsWith("/") || stored.includes("..")) return { ok: false, kind: "not-found" };
+        bucket = STORAGE_BUCKET;
+        path = stored;
+    }
+
+    const supabase = getSupabase();
+    // No client is a CONFIGURATION fault, not a missing object. Retry it.
+    if (!supabase) return { ok: false, kind: "transient", message: "storage-not-configured" };
+    try {
+        const { data, error } = await supabase.storage.from(bucket).download(path);
+        if (error) {
+            return isNotFoundError(error as { message?: string; status?: number })
+                ? { ok: false, kind: "not-found" }
+                : { ok: false, kind: "transient", message: String(error.message ?? "download-failed").slice(0, 200) };
+        }
+        if (!data) return { ok: false, kind: "not-found" };
+        return { ok: true, bytes: Buffer.from(await data.arrayBuffer()) };
+    } catch (error) {
+        // A throw is a transport fault every time — never evidence of absence.
+        return {
+            ok: false,
+            kind: "transient",
+            message: error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 200) : "download-threw",
+        };
+    }
+}
+
+/** True only when storage affirmatively confirms the object is there. */
+export async function secureObjectExists(storagePath: string): Promise<boolean> {
+    const result = await downloadDocBytesResult(toSecureRef(storagePath));
+    return result.ok;
+}
+
+/**
  * Read a stored document's bytes server-side using the service key.
  *
  * Server-side consumers (PDF generation, Drive mirroring) must use this rather than

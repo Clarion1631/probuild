@@ -177,6 +177,53 @@ test.describe("intake POST", () => {
         expect(rows[0].storagePath).toBe(`receipts/intake/${first.body.id}.png`);
     });
 
+    test("a publish that failed after a successful upload RESUMES on the next retry", async ({ request }) => {
+        // The gap this closes: upload lands, the STAGING -> RECEIVED update then
+        // fails (a connection reset between two round trips is not rare). The
+        // object exists, the row does not point at it, and nothing would ever
+        // fix that — STAGING is invisible to the worker's claim by design, so
+        // the row would sit until the 15-minute sweeper wrongly declared its
+        // file missing.
+        const ref = `${REF_PREFIX}resume`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+
+        // Rewind to exactly the half-state a failed publish leaves behind: the
+        // object is in the bucket, the row is still STAGING.
+        await prisma.receiptIntake.update({ where: { id: created.body.id }, data: { state: "STAGING" } });
+
+        const retry = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(retry.res.status()).toBe(200);
+        expect(retry.body.state).toBe("RECEIVED");
+        expect(retry.body.id).toBe(created.body.id);
+
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: ref } });
+        expect(rows).toHaveLength(1);
+        expect(rows[0].state).toBe("RECEIVED");
+    });
+
+    test("a STAGING row whose object is NOT there yet answers 202, not 200", async ({ request }) => {
+        // A concurrent request is mid-upload, or the last one died before
+        // storing anything. 200 would promise a queued document that does not
+        // exist; 202 tells the caller to re-poll. The 15-minute sweeper handles
+        // the case where it never lands.
+        const ref = `${REF_PREFIX}staging-nofile`;
+        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(created.res.status()).toBe(200);
+
+        // A STAGING row pointing at a path nothing was ever written to.
+        await prisma.receiptIntake.update({
+            where: { id: created.body.id },
+            data: { state: "STAGING", storagePath: `receipts/intake/${created.body.id}-never-uploaded.png` },
+        });
+
+        const retry = await postIntake(request, intakeBody({ sourceRef: ref }));
+        expect(retry.res.status()).toBe(202);
+        expect(retry.body.status).toBe("staging");
+        expect(retry.body.id).toBe(created.body.id);
+        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.state).toBe("STAGING");
+    });
+
     test("a machine caller MUST supply its own sourceRef", async ({ request }) => {
         const { res, body } = await postIntake(request, JSON.stringify({
             source: "drive", fileBase64: PNG_BASE64, mimeType: "image/png",
@@ -245,6 +292,60 @@ test.describe("intake POST", () => {
         }));
         expect(sameNamespace.res.status()).toBe(409);
         expect(sameNamespace.body.existingId).toBe(seeded.body.id);
+    });
+
+    test("the same uploadId from one user is ONE row; a raw sourceRef is still refused", async ({ request }) => {
+        // A phone on a bad connection needs a safe retry. A minted uuid makes
+        // every retry a NEW document, so a crew member tapping Send twice on a
+        // spinner books the same receipt twice. `uploadId` is the client's own
+        // idempotency token — and it is scoped to the authenticated user
+        // server-side, so two people cannot collide on one uuid and nobody can
+        // reach another user's row by guessing one.
+        const uploadId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+        const body = JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", uploadId });
+        const post = () => request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json" },
+            data: body,
+            maxRedirects: 0,
+        });
+
+        const first = await post();
+        expect(first.status()).toBe(200);
+        const firstBody = await first.json();
+        minted.push(firstBody.id);
+        // Scoped to the user, so the uuid alone is not the key.
+        expect(firstBody.sourceRef).toMatch(/^web:[^:]+:3f2504e0-4f89-41d3-9a0c-0305e82c3301$/);
+        expect(firstBody.sourceRef).not.toBe(`web:${uploadId}`);
+
+        const second = await post();
+        expect(second.status()).toBe(200);
+        const secondBody = await second.json();
+        expect(secondBody.id).toBe(firstBody.id);
+        expect(secondBody.alreadyReceived).toBe(true);
+
+        const rows = await prisma.receiptIntake.findMany({ where: { sourceRef: firstBody.sourceRef } });
+        expect(rows).toHaveLength(1);
+
+        // A non-UUID token is refused rather than used as a free-text key.
+        const junk = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json" },
+            data: JSON.stringify({ fileBase64: PNG_BASE64, mimeType: "image/png", uploadId: "not-a-uuid" }),
+            maxRedirects: 0,
+        });
+        expect(junk.status()).toBe(400);
+        expect((await junk.json()).reason).toBe("invalid-uploadId");
+    });
+
+    test("a secret caller's sourceRef must live in the namespace it declared", async ({ request }) => {
+        // Without this a chat forwarder could write `drive:<fileId>` and collide
+        // with — or pre-empt — the Drive pipeline's key for a file it does not
+        // own, and `drive` rows are the ones that book under the Drive fileId,
+        // i.e. the QBO DocNumber.
+        const { res, body } = await postIntake(request, intakeBody({
+            source: "chat", sourceRef: `${REF_PREFIX}wrongns`,
+        }));
+        expect(res.status()).toBe(400);
+        expect(body.reason).toBe("sourceRef-namespace-mismatch");
     });
 
     test("a session caller may not choose its own source or sourceRef", async ({ request }) => {

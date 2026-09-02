@@ -197,6 +197,17 @@ export const statements = [
        END IF;
      END $$`,
 
+    // RLS, matching every other sensitive table in this schema
+    // (apply-bank-ledger.mjs, apply-automation-events.mjs,
+    // apply-deposit-ingest-schema.mjs). ENABLE with no policies and WITHOUT
+    // FORCE: the app connects as the owner/service role, which bypasses RLS, so
+    // reads and writes are unaffected — while anon and authenticated roles
+    // (a leaked anon key, a Supabase client someone wires up later) get nothing.
+    // FORCE would deny the owner too and take the pipeline down.
+    // ReceiptIntake holds vendor names, amounts and storage paths for real
+    // purchases, so it belongs in the same class as BankLine.
+    `ALTER TABLE "ReceiptIntake" ENABLE ROW LEVEL SECURITY`,
+
     `DO $$ BEGIN
        IF NOT EXISTS (SELECT 1 FROM pg_constraint
                        WHERE conname = 'ReceiptIntake_expenseId_fkey'

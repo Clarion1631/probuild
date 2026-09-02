@@ -7,6 +7,7 @@
  * outside the worker should read from it.
  */
 import { prisma } from "@/lib/prisma";
+import { resolveDocUrl, toSecureRef } from "@/lib/secure-storage";
 
 export const RECEIPT_INTAKE_LIST_SELECT = {
     id: true,
@@ -40,6 +41,10 @@ export const RECEIPT_INTAKE_LIST_SELECT = {
     expenseId: true,
     archiveDriveFileId: true,
     attempts: true,
+    // The AI-unavailable counter. Without it the Phase 2 queue page cannot tell
+    // "this document defeated the model" from "Gemini was down all afternoon",
+    // which is the first question anyone asks during an outage.
+    busyPasses: true,
     lastError: true,
     nextRetryAt: true,
     bookedAt: true,
@@ -71,7 +76,19 @@ export const RECEIPT_INTAKE_ARCHIVE_SELECT = {
     state: true,
     archiveDriveFileId: true,
     bookedAt: true,
+    // The mirror names the Drive file `<Project>_<date>_<vendor>_<ref>_$<total>`,
+    // so it needs the project NAME, not an id it cannot resolve.
+    project: { select: { name: true } },
 } as const;
+
+/**
+ * Signed-URL lifetime for the archive mirror. Long enough for a nightly Apps
+ * Script pass to fetch every BOOKED receipt, short enough that a URL captured
+ * from a log is useless by morning. The bucket is private; this is the ONLY way
+ * the script can read the bytes, and it is deliberately a per-request grant
+ * rather than anything the script can store.
+ */
+export const ARCHIVE_SIGNED_URL_TTL_SECONDS = 600;
 
 /**
  * States the secret caller may query. The mirror archives what is BOOKED and
@@ -108,6 +125,31 @@ export async function listReceiptIntakes(args: ListReceiptIntakesArgs) {
         take,
         select: args.archiveOnly ? RECEIPT_INTAKE_ARCHIVE_SELECT : RECEIPT_INTAKE_LIST_SELECT,
     });
+}
+
+/**
+ * Attach a short-lived download URL and flatten the project name.
+ *
+ * The mirror cannot read the private bucket and must not be handed a service
+ * key, so each row carries its own signed URL. A row whose URL cannot be signed
+ * is returned with `downloadUrl: null` rather than dropped — the script logs it
+ * and moves on, which is strictly better than a silently short archive.
+ */
+export async function withArchiveDownloadUrls<T extends { storagePath: string; project?: { name: string } | null }>(
+    rows: T[],
+    /** Injectable so the contract is testable without Supabase. */
+    sign: (ref: string, ttlSeconds: number) => Promise<string | null> = resolveDocUrl,
+): Promise<Array<Omit<T, "project"> & { projectName: string | null; downloadUrl: string | null }>> {
+    return Promise.all(
+        rows.map(async row => {
+            const { project, ...rest } = row;
+            return {
+                ...(rest as Omit<T, "project">),
+                projectName: project?.name ?? null,
+                downloadUrl: await sign(toSecureRef(row.storagePath), ARCHIVE_SIGNED_URL_TTL_SECONDS),
+            };
+        }),
+    );
 }
 
 /** Dates out as ISO strings; there are no Decimals on this model, cents are Ints. */

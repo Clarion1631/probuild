@@ -29,6 +29,7 @@ const HEALTH: PipelineHealth = {
     receipts24h: { status: "ok", counts: { created: 2 } },
     bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
     stuck: { status: "ok", count: 0 },
+    intake: { stuck: { status: "ok", count: 0 }, needsReview: { status: "ok", count: 0 } },
 };
 
 function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {

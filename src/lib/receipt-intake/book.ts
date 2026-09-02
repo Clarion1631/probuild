@@ -29,6 +29,7 @@ import {
     type QboReceiptGroup,
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
+import type { DocBytesResult } from "@/lib/secure-storage";
 import { backoffMs, MAX_BOOK_ATTEMPTS } from "./route-state";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
@@ -101,8 +102,11 @@ export interface BookDependencies {
     isPushPaused: () => Promise<boolean>;
     getTokens: () => Promise<QBTokens>;
     createPurchase: (tokens: QBTokens, input: CreateQBReceiptPurchaseInput) => Promise<CreateQBReceiptPurchaseResult>;
-    /** Reads the stored file back out of the private bucket for the QBO attachment. */
-    downloadBytes: (secureRef: string) => Promise<Buffer | null>;
+    /**
+     * Reads the stored file back out of the private bucket. TAGGED, because a
+     * confirmed 404 and a transient storage fault must not book the same way.
+     */
+    downloadBytes: (secureRef: string) => Promise<DocBytesResult>;
     logEvent: (event: AutomationEventInput) => Promise<void>;
     now: () => Date;
 }
@@ -249,7 +253,24 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    no-op rather than a second Purchase.
     const fileId = driveFileIdOf(row) ?? row.id;
     const isCheck = String(row.docType || "receipt").toLowerCase() === "check";
-    const bytes = await deps.downloadBytes(toSecureRef(row.storagePath));
+
+    // NEVER a Purchase without its receipt.
+    //
+    // This used to pass `fileBase64: undefined` when the bytes could not be
+    // loaded and book anyway, which produces a QBO Purchase with no attachment
+    // — the one thing the bookkeeper cannot fix later, because by then the
+    // Purchase looks complete and nothing flags it. The receipt IS the evidence
+    // for the expense; a booking without it is worse than no booking.
+    //
+    // A transient storage fault retries (the document is fine, Supabase was
+    // not); an affirmative 404 is terminal and pre-send, so the strong key goes
+    // back for a corrected re-upload.
+    const download = await deps.downloadBytes(toSecureRef(row.storagePath));
+    if (!download.ok) {
+        if (download.kind === "not-found") return parkedBeforeSend("receipt-bytes-missing");
+        return retry(row, deps, now, `storage:${download.message}`);
+    }
+    const bytes = download.bytes;
 
     const input: CreateQBReceiptPurchaseInput = {
         projectName: project.name,
@@ -263,8 +284,8 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         fileId,
         fileName: row.fileName ?? undefined,
         groups,
-        fileBase64: bytes ? bytes.toString("base64") : undefined,
-        fileContentType: bytes ? row.mimeType : undefined,
+        fileBase64: bytes.toString("base64"),
+        fileContentType: row.mimeType,
     };
 
     let result: CreateQBReceiptPurchaseResult;

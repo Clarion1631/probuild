@@ -232,3 +232,45 @@ test("a missing API key is a SERVICE fact, never charged to the document", async
     assert.deepEqual(outcome, { ok: false, decisive: false });
     assert.equal(calls, 0);
 });
+
+test("EVERY 5xx is the service failing, never the document (busy pass, not a strike)", async () => {
+    // 500/502/504 used to fall into the "decisive" branch and charge the row a
+    // strike for a Google-side fault it had nothing to do with — exactly what
+    // the outage rationale exists to prevent. A gateway error says nothing
+    // about whether the receipt is readable.
+    for (const status of [500, 502, 503, 504, 529]) {
+        const outcome = await readReceipt(BYTES, "image/jpeg", [], {
+            apiKey: () => "test-key",
+            sleep: noSleep,
+            fetchFn: (async () => new Response("server fault", { status })) as unknown as typeof fetch,
+        });
+        assert.deepEqual(outcome, { ok: false, decisive: false }, `HTTP ${status}`);
+    }
+});
+
+test("a 5xx on the first model still falls through to the second", async () => {
+    const calls: string[] = [];
+    const outcome = await readReceipt(BYTES, "image/jpeg", [], {
+        apiKey: () => "test-key",
+        sleep: noSleep,
+        fetchFn: (async (url: string) => {
+            calls.push(url);
+            if (calls.length <= 3) return new Response("bad gateway", { status: 502 });
+            return geminiJson({ doc_type: "receipt", total_amount: "1.00" });
+        }) as unknown as typeof fetch,
+    });
+    assert.ok(outcome.ok, "the second model answered");
+    assert.ok(calls[3].includes("gemini-flash-latest"));
+});
+
+test("a 4xx that is not 401/403/404/429 is still DECISIVE", async () => {
+    // A rejected payload is about this document, and retrying cannot help.
+    for (const status of [400, 413, 422]) {
+        const outcome = await readReceipt(BYTES, "image/jpeg", [], {
+            apiKey: () => "test-key",
+            sleep: noSleep,
+            fetchFn: (async () => new Response("rejected", { status })) as unknown as typeof fetch,
+        });
+        assert.deepEqual(outcome, { ok: false, decisive: true }, `HTTP ${status}`);
+    }
+});

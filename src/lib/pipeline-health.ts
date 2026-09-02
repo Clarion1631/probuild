@@ -83,7 +83,23 @@ export interface PipelineHealth {
     bank: TimestampProbe;
     /** Automation events (ANY kind) that errored in the last 24h. */
     stuck: CountProbe;
+    /**
+     * Receipt Pipeline v2 (ReceiptIntake). The v1 probes above all read
+     * AutomationEvent, which only ever records a BOOKING — so a v2 row that
+     * never reaches QuickBooks is invisible to every check in this file. A
+     * jammed intake queue would report a perfectly healthy pipeline right up
+     * until somebody noticed the expenses were missing.
+     */
+    intake: {
+        /** RECEIVED or BOOKING and older than 6h — the queue is not draining. */
+        stuck: CountProbe;
+        /** NEEDS_REVIEW backlog. Reported always; a reason only when rows are STUCK. */
+        needsReview: CountProbe;
+    };
 }
+
+/** A row this old in a working state has not been picked up, it has jammed. */
+export const INTAKE_STUCK_HOURS = 6;
 
 /**
  * Intuit's own status page.
@@ -181,6 +197,8 @@ export function evaluatePipelineHealth(input: {
     receipts24h: CountsProbe;
     bank: TimestampProbe;
     stuck: CountProbe;
+    intakeStuck: CountProbe;
+    intakeNeedsReview: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -192,6 +210,8 @@ export function evaluatePipelineHealth(input: {
         ["receipts24h", input.receipts24h],
         ["bank", input.bank],
         ["stuck", input.stuck],
+        ["intakeStuck", input.intakeStuck],
+        ["intakeNeedsReview", input.intakeNeedsReview],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -230,6 +250,16 @@ export function evaluatePipelineHealth(input: {
         // It proves the cron is alive, so it counts for freshness — but it must
         // be reported the same day, not hidden inside the 26h staleness window.
         else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
+    // A row sitting in RECEIVED or BOOKING for six hours means the worker is
+    // not draining the queue — a wedged cron, an exhausted retry budget, a
+    // storage outage. The backlog number rides along so the digest can say how
+    // big the hole is, but only the STUCK count is a failure: NEEDS_REVIEW rows
+    // are working as designed (a human was asked a question) and would
+    // otherwise hold the pipeline red until somebody cleared the queue.
+    if (input.intakeStuck.status === "ok" && input.intakeStuck.count > 0) {
+        const backlog =
+            input.intakeNeedsReview.status === "ok" ? `,needs-review:${input.intakeNeedsReview.count}` : "";
+        reasons.push(`intake-stuck:${input.intakeStuck.count}${backlog}`);
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -297,6 +327,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     const probe = runProbe;
 
     const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck] = await Promise.all([
+    const [intuit, lastPurchase, lastPush, receiptRows, lastBankLine, stuck, intakeStuck, intakeNeedsReview] =
+        await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -389,6 +421,25 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             }),
             0,
         ),
+        // ReceiptIntake: the v2 queue. STAGING is excluded on purpose — those
+        // rows are mid-upload and the intake route's own 15-minute sweeper owns
+        // them; counting them here would flag every in-flight request.
+        probe<number>(
+            "intakeStuck",
+            () =>
+                prisma.receiptIntake.count({
+                    where: {
+                        state: { in: ["RECEIVED", "BOOKING"] },
+                        createdAt: { lt: new Date(now - INTAKE_STUCK_HOURS * HOUR_MS) },
+                    },
+                }),
+            0,
+        ),
+        probe<number>(
+            "intakeNeedsReview",
+            () => prisma.receiptIntake.count({ where: { state: "NEEDS_REVIEW" } }),
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -419,6 +470,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             at: lastBankLine.value?.toISOString() ?? null,
         },
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
+        intakeStuck: { status: intakeStuck.status, reason: intakeStuck.reason, count: intakeStuck.value },
+        intakeNeedsReview: {
+            status: intakeNeedsReview.status,
+            reason: intakeNeedsReview.reason,
+            count: intakeNeedsReview.value,
+        },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -435,6 +492,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         receipts24h: snapshot.receipts24h,
         bank: snapshot.bank,
         stuck: snapshot.stuck,
+        intake: { stuck: snapshot.intakeStuck, needsReview: snapshot.intakeNeedsReview },
     };
 }
 
@@ -485,6 +543,15 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
                     : "no lines"
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
+        // Optional-chained on purpose: a digest that THROWS means no morning
+        // email at all, which is strictly worse than a digest missing a line.
+        // Same rule as "no probe may throw" above.
+        `Receipt intake stuck >${INTAKE_STUCK_HOURS}h: ${
+            health.intake?.stuck?.status === "error" ? "unavailable (probe failed)" : health.intake?.stuck?.count ?? "unavailable"
+        }`,
+        `Receipt intake awaiting review: ${
+            health.intake?.needsReview?.status === "error" ? "unavailable (probe failed)" : health.intake?.needsReview?.count ?? "unavailable"
+        }`,
     ];
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);
 

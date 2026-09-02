@@ -71,7 +71,8 @@ export type ReadOutcome =
      * usable data (or rejected the payload). Retrying will not change that —
      * the caller must spend an attempt and route the row to a human.
      *
-     * decisive false: every model was unavailable (429/503/404/401/403/network).
+     * decisive false: every model was unavailable (429, ANY 5xx, 404, 401,
+     * 403, or a network error).
      * The document was never read, so the caller must NOT spend an attempt.
      */
     | { ok: false; decisive: boolean };
@@ -269,7 +270,13 @@ export async function readReceipt(
                 break;
             }
 
-            if (code === 429 || code === 503) { // overloaded / rate-limited
+            // EVERY 5xx is the SERVICE failing, not the document. 503 and 429
+            // were already treated that way, but 500/502/504 fell through to
+            // the "decisive" branch below and charged the row a strike for a
+            // Google-side fault it had nothing to do with — precisely the
+            // mistake the outage rationale at :1143-1184 exists to prevent. A
+            // gateway error says nothing about whether the receipt is readable.
+            if (code === 429 || code >= 500) { // overloaded / rate-limited / server fault
                 if (attempts >= MAX_RETRIES) break; // fall through to the next model
                 const wait = RETRY_BACKOFF_MS[attempts];
                 attempts++;
@@ -284,7 +291,9 @@ export async function readReceipt(
             // model while another works is exactly what the chain is for.
             if (code === 404 || code === 401 || code === 403) break;
 
-            // 400 = oversized/undecodable payload. THAT is about this document.
+            // What is left is a 4xx that is not 401/403/404/429: a rejected
+            // payload (400 = oversized or undecodable). THAT is about this
+            // document, and no amount of retrying changes it.
             sawDecisiveFailure = true;
             return { ok: false, decisive: true };
         }

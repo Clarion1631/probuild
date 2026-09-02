@@ -35,6 +35,8 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
         bank: { status: "ok" as const, at: iso(48 * HOUR) },
         stuck: { status: "ok" as const, count: 0 },
+        intakeStuck: { status: "ok" as const, count: 0 },
+        intakeNeedsReview: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
     };
@@ -179,6 +181,10 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         receipts24h: { status: "ok", counts: { created: 4, fallback: 1 } },
         bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
         stuck: { status: "ok", count: 0 },
+        intake: {
+            stuck: { status: "ok", count: 0 },
+            needsReview: { status: "ok", count: 0 },
+        },
         ...overrides,
     };
 }
@@ -546,4 +552,60 @@ test("the journey mapper renders attachment-failed as failed, not in-flight", as
     // arriving - the bot has already stopped.
     assert.equal(journey.finalState, "error");
     assert.equal(journey.finalReason, "failed:fault");
+// ── Receipt Pipeline v2 intake queue (Codex round 3, item 7) ────────────────
+// Every other probe in this file reads AutomationEvent, which only records a
+// BOOKING — so a v2 row that never reaches QuickBooks is invisible to all of
+// them. A jammed intake queue reported a perfectly healthy pipeline.
+
+test("rows stuck in the intake queue fail the check and name the backlog", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 4 },
+        intakeNeedsReview: { status: "ok", count: 11 },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intake-stuck:4,needs-review:11"]);
+});
+
+test("a NEEDS_REVIEW backlog alone is NOT a failure", () => {
+    // Those rows are working as designed — a human was asked a question.
+    // Failing on them would hold the pipeline red until somebody cleared the
+    // queue, which trains everyone to ignore the signal.
+    const v = evaluatePipelineHealth(snapshot({ intakeNeedsReview: { status: "ok", count: 40 } }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("an intake probe that FAILED is not an intake probe that found nothing", () => {
+    for (const name of ["intakeStuck", "intakeNeedsReview"] as const) {
+        const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
+        assert.equal(v.ok, false, name);
+        assert.ok(v.reasons.includes(`probe-failed:${name}`), name);
+    }
+});
+
+test("the stuck reason survives a failed backlog probe rather than lying about it", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        intakeStuck: { status: "ok", count: 2 },
+        intakeNeedsReview: { status: "error", reason: "error", count: 0 },
+    }));
+    assert.ok(v.reasons.includes("intake-stuck:2"), "no invented needs-review count");
+    assert.ok(v.reasons.includes("probe-failed:intakeNeedsReview"));
+});
+
+test("the digest prints both intake numbers", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        intake: { stuck: { status: "ok", count: 3 }, needsReview: { status: "ok", count: 7 } },
+    }));
+    assert.match(text, /Receipt intake stuck >6h: 3/);
+    assert.match(text, /Receipt intake awaiting review: 7/);
+});
+
+test("the digest says a failed intake probe is unavailable, never zero", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        intake: {
+            stuck: { status: "error", reason: "timeout", count: 0 },
+            needsReview: { status: "error", reason: "timeout", count: 0 },
+        },
+    }));
+    assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
+    assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
 });
