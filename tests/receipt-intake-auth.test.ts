@@ -357,3 +357,113 @@ test("a secret may only declare the sources ITS key owns", async () => {
     assert.deepEqual(decideSource(archive, { source: "drive", sourceRef: "drive:F1" }),
         { ok: false, reason: "invalid-source" });
 });
+
+// ── The worker cron gate (Phase 2 gate, a) ─────────────────────────────────
+
+test("the intake worker cron route uses the shared fail-closed gate", async () => {
+    // Source assertion, because the hole was a BRANCH rather than a wrong
+    // comparison: `!VERCEL && NODE_ENV !== "production" && !CRON_SECRET` is
+    // satisfied by an UNSET environment, so any container or drifted preview
+    // served this route — which books real money into QuickBooks — to anyone.
+    const { readFileSync } = await import("node:fs");
+    const raw = readFileSync(
+        new URL("../src/app/api/cron/receipt-intake-worker/route.ts", import.meta.url),
+        "utf8",
+    );
+    // Comments stripped: the route DESCRIBES the hole it closed, and a naive
+    // scan reads that description as the hole itself.
+    const route = raw
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .split("\n")
+        .map(line => line.replace(/\/\/.*/, ""))
+        .join("\n");
+
+    assert.match(route, /isCronAuthorized\(request\)/, "uses the shared gate");
+    assert.ok(!/isLocalDev/.test(route), "the fail-open branch is gone");
+    assert.ok(!/authHeader === `Bearer/.test(route), "no plain string compare on a secret");
+    assert.ok(!/process\.env\.VERCEL\b/.test(route), "no environment escape hatch");
+    assert.ok(!/process\.env\.CRON_SECRET/.test(route), "the secret is read only by the shared helper");
+});
+
+test("isCronAuthorized fails closed on an unset secret and is constant-time", async () => {
+    const { isCronAuthorized, bearerMatches } = await import("../src/lib/cron-auth");
+    const env = process.env as Record<string, string | undefined>;
+    const before = { s: env.CRON_SECRET, n: env.NODE_ENV };
+    const req = (auth?: string) =>
+        new Request("https://probuild.test/api/cron/receipt-intake-worker", {
+            headers: auth ? { authorization: auth } : {},
+        });
+    try {
+        env.NODE_ENV = "production";
+
+        // No secret configured: refuse, rather than treat "unconfigured" as open.
+        delete env.CRON_SECRET;
+        assert.equal(isCronAuthorized(req("Bearer anything")), false);
+        assert.equal(isCronAuthorized(req()), false);
+
+        env.CRON_SECRET = "s3cret";
+        assert.equal(isCronAuthorized(req("Bearer s3cret")), true);
+        assert.equal(isCronAuthorized(req("Bearer wrong")), false);
+        assert.equal(isCronAuthorized(req("s3cret")), false, "the scheme is part of the match");
+        assert.equal(isCronAuthorized(req()), false);
+
+        // Length is compared before the bytes, so a wrong-length header cannot
+        // throw out of timingSafeEqual.
+        assert.equal(bearerMatches("Bearer s3cre", "s3cret"), false);
+        assert.equal(bearerMatches("Bearer s3cretttt", "s3cret"), false);
+        assert.equal(bearerMatches(null, "s3cret"), false);
+        assert.equal(bearerMatches("Bearer s3cret", undefined), false);
+    } finally {
+        env.CRON_SECRET = before.s;
+        env.NODE_ENV = before.n;
+    }
+});
+
+test("machine endpoints refuse a Server Action dispatch; portal actions still work", async () => {
+    // The matcher's FIRST entry already routes every next-action request here
+    // regardless of path, so these were reaching the proxy — the bypass was
+    // waving them through before any action check ran.
+    const { default: proxy } = await loadProxy();
+    const { NextRequest } = await import("next/server");
+    const event = { waitUntil() {} } as any;
+    const env = process.env as Record<string, string | undefined>;
+    const prod = env.NODE_ENV;
+    env.NODE_ENV = "production";
+
+    const dispatch = (p: string) =>
+        proxy(new NextRequest(`https://probuild.test${p}`, {
+            method: "POST",
+            headers: { "next-action": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+        }), event);
+
+    try {
+        for (const path of [
+            "/api/cron/receipt-intake-worker",
+            "/api/health/pipeline",
+            "/api/integrations/qbo-receipts/create",
+            "/api/webhook/stripe",
+            "/api/twilio/sms",
+        ]) {
+            const res = await dispatch(path);
+            assert.ok(res, path);
+            assert.equal(res.status, 403, `${path} must refuse an action dispatch`);
+            assert.equal(res.headers.get("x-middleware-next"), null, path);
+        }
+
+        // Routes that GENUINELY serve anonymous Server Actions are untouched —
+        // 403ing them would break the client portal.
+        for (const path of ["/api/portal/verify", "/api/payments/deposit-ingest", "/api/selections/item-comments"]) {
+            const res = await dispatch(path);
+            assert.equal(res!.headers.get("x-middleware-next"), "1", `${path} must still pass`);
+        }
+
+        // And an ordinary cron call is unaffected.
+        const normal = await proxy(
+            new NextRequest("https://probuild.test/api/cron/receipt-intake-worker", { method: "GET" }),
+            event,
+        );
+        assert.equal(normal!.headers.get("x-middleware-next"), "1");
+    } finally {
+        env.NODE_ENV = prod;
+    }
+});

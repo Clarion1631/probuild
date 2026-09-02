@@ -88,8 +88,37 @@ const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$
 //
 // Exact match, mirroring the bypass entries themselves — a descendant that is
 // NOT bypassed still hits withAuth and needs no special case here.
-const MACHINE_ENDPOINT_PATTERN =
-    /^\/api\/receipts\/intake(?:\/start|\/[^/]+\/(?:archived|finalize))?\/?$/;
+// NOTE on the matcher (bottom of this file): its FIRST entry is
+// `{ source: "/:path*", has: [{ type: "header", key: "next-action" }] }`, which
+// routes EVERY next-action request through this proxy regardless of path — the
+// exclusion list in the second entry does not apply to them. So these paths were
+// already reaching the code below; what waved them through was
+// PUBLIC_PROXY_BYPASS_PATTERN returning next() before any action check ran.
+// Widening this pattern is therefore the whole fix, and the matcher is left
+// alone: adding /api/cron, /api/webhook and friends to it would put middleware
+// (including a DB-touching staff lookup) in front of every ordinary webhook and
+// cron request, which is real latency and a new failure point on a hot path,
+// for no additional protection.
+//
+// Deliberately NOT here: api/portal, api/payments, api/sub-portal and
+// api/selections/*. Those genuinely serve anonymous Server Actions — that is the
+// tradeoff their bypass exists for, and 403ing them would break the client
+// portal.
+const MACHINE_ENDPOINT_PATTERN = new RegExp(
+    "^\/api\/(?:" + [
+        // Receipt Pipeline v2 — secret/Bearer in the handler, exact paths.
+        "receipts\/intake(?:\/start|\/[^/]+\/(?:archived|finalize))?",
+        // Cron: Bearer CRON_SECRET, checked in each route.
+        "cron\/[^?]*",
+        // Machine-to-machine ingest: each carries its own shared secret.
+        "integrations\/[^?]*",
+        // Stripe / Twilio: signature-verified, never session-authenticated.
+        "webhook(?:s)?\/[^?]*",
+        "twilio\/[^?]*",
+        // Ops probe: Bearer CRON_SECRET or a staff session, checked in-route.
+        "health\/pipeline",
+    ].join("|") + ")\/?$",
+);
 
 // Test-only action dispatchers that get the proxy bypass below. Explicit, not a
 // prefix match: the proxy checks only the environment gates, never the route's

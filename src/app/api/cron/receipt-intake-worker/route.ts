@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
+import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
@@ -53,9 +54,9 @@ export const maxDuration = 60;
  *   - QBO's DocNumber/requestid idempotency means a double booking creates one
  *     Purchase, not two.
  *
- * Auth is the fail-closed drain-notifications pattern: whenever CRON_SECRET is
- * configured it is ALWAYS required; the only unauthenticated path is a genuinely
- * local dev run (not on Vercel, not production, and no secret set).
+ * Auth is isCronAuthorized() from lib/cron-auth: constant-time Bearer compare,
+ * required EVERYWHERE except an explicit NODE_ENV === "development", and a
+ * missing CRON_SECRET rejects rather than waving traffic through.
  */
 
 const LEASE_MS = CLAIM_LEASE_MINUTES * 60_000;
@@ -644,11 +645,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 }
 
 export async function GET(request: Request) {
-    const secret = process.env.CRON_SECRET;
-    const authHeader = request.headers.get("authorization");
-    const authed = !!secret && authHeader === `Bearer ${secret}`;
-    const isLocalDev = !process.env.VERCEL && process.env.NODE_ENV !== "production" && !secret;
-    if (!authed && !isLocalDev) {
+    // isCronAuthorized: constant-time compare, and it fails CLOSED.
+    //
+    // The hand-rolled version this replaces had both problems the shared helper
+    // exists to fix. `authHeader === \`Bearer ${secret}\`` is a byte-at-a-time
+    // string compare that leaks the secret to anyone who can time the response.
+    // Worse, the `isLocalDev` escape hatch — no VERCEL, NODE_ENV not
+    // "production", and no CRON_SECRET — is satisfied by an unset environment,
+    // so any container, self-hosted build, or preview whose env drifted served
+    // this endpoint to anyone who asked. On a route that books real money into
+    // QuickBooks.
+    if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
