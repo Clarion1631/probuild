@@ -319,7 +319,20 @@ Planner output for the executor: build exactly this; do not guess.
     (chatAffidavitApp.js:211 gates on it). Malformed ⇒ empty map, and `owner_user`
     serializes as `""` rather than breaking the bridge JSON.
   - `RECEIPT_REQUEST_CARDS_ENABLED` — unset initially; must be exactly `"true"` to arm.
+  - `BANK_LINE_MINT_FROM_QBO` — unset initially; `"true"` lets the nightly pull
+    mint canonical `BankLine` rows from QBO register observations (Justin,
+    decision 3). Off ships as an ABSENT dependency in the pull, not a disabled
+    branch. Turn it on only AFTER `scripts/apply-phase2-receipt-queue.mjs` has
+    run — the mint writes `sourceOfRecord`.
   - `RECEIPT_INTAKE_SECRET` (Phase 1's, reused) gates both bridge endpoints.
+
+- **Schema (this DID change, contrary to the original §6).** Two additive
+  objects, in `scripts/apply-phase2-receipt-queue.mjs` +
+  `prisma/migrations/20260901120000_phase2_receipt_queue`:
+  `BankLine.sourceOfRecord` (default `'STATEMENT'`, CHECK in
+  `('STATEMENT','QBO')`) and `ReceiptRequestCard` (UNIQUE `(owner, pacificDate)`
+  — the durable per-day claim for the Chat digest). Run the script against prod
+  BEFORE the deploy that selects them, per CLAUDE.md pre-deploy rule #2.
 
 ## 7. Tests (node:test, `test/receipt-requests/*.test.mjs`; no `mock.module` — CI is Node 20)
 
