@@ -165,7 +165,9 @@ export const expectedCheckConstraints = [
         mustMatch: [
             /"taxDeductibleBase" IS NULL/,
             /"taxDeductibleBase" >= \(?0/,
-            /"amount" - COALESCE\("taxAmount"/,
+            // pg_get_constraintdef renders `amount` UNQUOTED (all-lowercase,
+            // not a keyword) while the mixed-case columns keep their quotes.
+            /amount - COALESCE\("taxAmount"/,
         ],
     },
 ];
