@@ -444,7 +444,13 @@ export function buildGustoExport(input: {
                     costCodeLabel: item.costCodeLabel ?? "",
                     shiftHours: item.shiftHours,
                     mealDeductionHours: item.mealDeductionHours,
-                    paidHours: item.durationHours,
+                    // Paid hours are the ALLOCATED hundredths, not the raw
+                    // duration: a detail row that says 8.02 paid against 8.01
+                    // regular + 0.00 overtime is a row that does not add up, and
+                    // it is the row a bookkeeper reconciles by hand.
+                    paidHours: fromHundredths(
+                        allocation.regularHundredths + allocation.overtimeHundredths
+                    ),
                     regularHours: fromHundredths(allocation.regularHundredths),
                     overtimeHours: fromHundredths(allocation.overtimeHundredths),
                     isEdited: item.isEdited,

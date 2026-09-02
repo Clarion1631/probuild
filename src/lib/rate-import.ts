@@ -100,13 +100,43 @@ export function normalizePayType(raw: string): string | null {
     return null;
 }
 
-/** RFC4180-ish reader: quoted fields, doubled quotes inside them, CR/LF or LF line endings. */
+export class CsvParseError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "CsvParseError";
+    }
+}
+
+/**
+ * RFC4180 reader: quoted fields, doubled quotes inside them, CR/LF or LF.
+ *
+ * Strict on purpose. The lenient version silently produced a grid that LOOKED
+ * fine from a file that was not:
+ *
+ *  - an unterminated quote swallowed the rest of the file into one field, so a
+ *    hundred-row import became one row and the other ninety-nine vanished with
+ *    no error at all;
+ *  - a stray quote mid-field, and a ragged row with the wrong number of
+ *    columns, both shifted every later value one column left — which for this
+ *    file means somebody's NAME lands in the rate column, or one person's rate
+ *    lands on another person's row.
+ *
+ * A pay-rate file that cannot be read exactly is not a file to guess at.
+ */
 export function parseCsvGrid(text: string): string[][] {
     const rows: string[][] = [];
     let row: string[] = [];
     let field = "";
     let inQuotes = false;
+    let fieldWasQuoted = false;
     let sawAnyChar = false;
+    let line = 1;
+
+    const pushField = () => {
+        row.push(field);
+        field = "";
+        fieldWasQuoted = false;
+    };
 
     for (let i = 0; i < text.length; i += 1) {
         const char = text[i];
@@ -119,39 +149,64 @@ export function parseCsvGrid(text: string): string[][] {
                     inQuotes = false;
                 }
             } else {
+                if (char === "\n") line += 1;
                 field += char;
             }
             continue;
         }
         if (char === '"') {
+            // A quote may only OPEN a field. Mid-field it is a malformed row,
+            // and guessing at what was meant is how a rate lands on the wrong
+            // person.
+            if (field.length > 0 || fieldWasQuoted) {
+                throw new CsvParseError(`Line ${line}: unexpected quote in the middle of a field.`);
+            }
             inQuotes = true;
+            fieldWasQuoted = true;
             sawAnyChar = true;
             continue;
         }
         if (char === ",") {
-            row.push(field);
-            field = "";
+            pushField();
             sawAnyChar = true;
             continue;
         }
         if (char === "\r") continue;
         if (char === "\n") {
-            row.push(field);
+            pushField();
             rows.push(row);
             row = [];
-            field = "";
             sawAnyChar = false;
+            line += 1;
             continue;
         }
         field += char;
         sawAnyChar = true;
     }
+
+    if (inQuotes) {
+        throw new CsvParseError("The file ends inside a quoted value — a quote is unclosed.");
+    }
     if (field.length > 0 || sawAnyChar || row.length > 0) {
-        row.push(field);
+        pushField();
         rows.push(row);
     }
-    return rows.filter((cells) => cells.some((cell) => cell.trim() !== ""));
+
+    const populated = rows.filter((cells) => cells.some((cell) => cell.trim() !== ""));
+    if (populated.length > 1) {
+        const width = populated[0].length;
+        for (let i = 1; i < populated.length; i += 1) {
+            if (populated[i].length !== width) {
+                throw new CsvParseError(
+                    `Row ${i + 1} has ${populated[i].length} columns but the header has ${width}. ` +
+                        `A ragged row shifts every value after it into the wrong column.`
+                );
+            }
+        }
+    }
+    return populated;
 }
+
 
 function findColumn(headers: string[], hints: string[]): number {
     // Hints are ordered most-specific first so "compensation rate" wins over a
@@ -202,7 +257,14 @@ export function canonicalRateText(value: string | number): string {
 }
 
 export function parseGustoRateCsv(text: string): RateImportParse {
-    const grid = parseCsvGrid(text ?? "");
+    let grid: string[][];
+    try {
+        grid = parseCsvGrid(text ?? "");
+    } catch (error) {
+        // Surfaced like any other unreadable-row error, so the preview refuses
+        // and Save stays disabled rather than importing a misread file.
+        return { rows: [], errors: [error instanceof Error ? error.message : "That file could not be read."] };
+    }
     if (grid.length === 0) return { rows: [], errors: ["The file is empty."] };
 
     const headers = grid[0].map((cell) => cell.trim().toLowerCase());

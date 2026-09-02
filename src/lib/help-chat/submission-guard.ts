@@ -8,6 +8,7 @@
 // Pure except for the throttle's row count, which is injected — so the limits
 // are testable without a database.
 
+import { randomUUID } from "crypto";
 import { prisma } from "../prisma";
 
 export const HELP_TITLE_MAX = 200;
@@ -31,7 +32,20 @@ export const HELP_SUBMISSION_ID_MAX = 64;
 export const HELP_CURRENT_PAGE_PATTERN =
     /^(\/[^\s]{0,499}|mobile:[^\s]{1,120}( [^\s]{1,120}){0,5})$/;
 
-/** True when this submission came from the crew app rather than the web widget. */
+/**
+ * Is this caller the crew app?
+ *
+ * Derived from HOW THEY AUTHENTICATED — a mobile JWT — not from the body they
+ * sent. currentPage was the old signal, and a body field cannot establish
+ * anything about the client: anyone could post `currentPage: "mobile:..."` to
+ * be labelled a bug, or omit it to dodge the submissionId requirement that
+ * makes the app's retries safe.
+ */
+export function isMobileClient(auth: { via?: string | null } | null | undefined): boolean {
+    return auth?.via === "mobile-jwt";
+}
+
+/** Kept for the ISSUE LABELLING only — where the report came from, as the app describes it. */
 export function isMobileSubmission(currentPage: string | null | undefined): boolean {
     return typeof currentPage === "string" && currentPage.startsWith("mobile:");
 }
@@ -153,7 +167,37 @@ export function hourBucket(now: Date = new Date()): Date {
 
 export type ReserveResult =
     | { ok: true; id: string; existing: boolean; resume: boolean }
-    | { ok: false; reason: "throttled" };
+    | { ok: false; reason: "throttled" }
+    | { ok: false; reason: "in-flight" };
+
+/** How long a provider lease is honoured before another attempt may take it. */
+export const HELP_LEASE_MS = 2 * 60 * 1000;
+
+/**
+ * Claim the right to call GitHub for this report, atomically.
+ *
+ * Two attempts can reach the provider step at once — a double-tap, or a retry
+ * arriving while the first request is still running. Without a claim they both
+ * call GitHub and open two issues for one report; the marker search does not
+ * help, because neither issue exists yet when they both look.
+ *
+ * The claim is a compare-and-set on the row: take it only if nobody holds it or
+ * the previous holder's lease has expired. `count === 0` means somebody else is
+ * mid-flight, and the caller backs off rather than filing.
+ */
+export async function claimProviderLease(requestId: string): Promise<boolean> {
+    const token = randomUUID();
+    const now = new Date();
+    const expiry = new Date(now.getTime() + HELP_LEASE_MS);
+    const claimed = await prisma.$executeRaw`
+        UPDATE "HelpRequest"
+        SET "providerLeaseToken" = ${token}, "providerLeaseExpiresAt" = ${expiry}
+        WHERE "id" = ${requestId}
+          AND "providerState" IS DISTINCT FROM 'created'
+          AND ("providerLeaseExpiresAt" IS NULL OR "providerLeaseExpiresAt" < ${now})
+    `;
+    return claimed === 1;
+}
 
 /**
  * The marker stamped into every issue body. It is how a resumed submission can

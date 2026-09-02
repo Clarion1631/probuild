@@ -155,22 +155,29 @@ export default function TimeClockClient({
     const totalHours = useMemo(() => sortedEntries.reduce((s, e) => s + (e.durationHours || 0), 0), [sortedEntries]);
     const totalCost = useMemo(() => sortedEntries.reduce((s, e) => s + (e.laborCost || 0), 0), [sortedEntries]);
 
+    // A legacy flat-cost row: zero hours carrying a hand-typed cost. The editor
+    // prices from hours x stored rate, so opening one and saving would reprice
+    // it to $0 and destroy a real recorded cost. Read-only until somebody
+    // converts it deliberately; the server refuses these too.
+    const isLegacyUnitEntry = (entry: TimeEntryDetailed) =>
+        !(entry.durationHours && entry.durationHours > 0) && entry.laborCost != null && entry.laborCost !== 0;
+
     const openModal = (entry?: TimeEntryDetailed) => {
         if (entry) {
+            if (isLegacyUnitEntry(entry)) {
+                toast.error(
+                    "This is a legacy flat-cost entry. Editing it would reprice it from hours it does not have — delete it and re-enter the time."
+                );
+                return;
+            }
             setEditId(entry.id);
             setSelectedUserId(entry.userId);
             setSelectedCostCodeId(entry.costCodeId || "");
             const d = new Date(entry.startTime);
             setDate(d.toISOString().split('T')[0]);
-            if (entry.durationHours === 0 && entry.laborCost !== null) {
-                setEntryType("unit");
-                setManualCost(entry.laborCost.toString());
-                setHours("");
-            } else {
-                setEntryType("hourly");
-                setHours(entry.durationHours != null ? parseFloat(entry.durationHours.toFixed(2)).toString() : "");
-                setManualCost("");
-            }
+            setEntryType("hourly");
+            setHours(entry.durationHours != null ? parseFloat(entry.durationHours.toFixed(2)).toString() : "");
+            setManualCost("");
         } else {
             setEditId(null);
             setSelectedUserId(currentUser.id);

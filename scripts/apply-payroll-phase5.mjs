@@ -129,6 +129,9 @@ const STATEMENTS = [
     // tried" from "tried and finished".
     `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerIssueRef" TEXT`,
     `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerState" TEXT DEFAULT 'pending'`,
+    // CAS lease over the provider call — see the matching migration.
+    `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerLeaseToken" TEXT`,
+    `ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerLeaseExpiresAt" TIMESTAMPTZ(6)`,
     // Unique PER USER — a global key would collide across users and hand back
     // somebody else's report.
     `CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_userId_submissionId_key" ON "HelpRequest"("userId", "submissionId")`,

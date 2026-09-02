@@ -5,7 +5,9 @@ import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
 import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
+  claimProviderLease,
   HELP_THROTTLED_MESSAGE,
+  isMobileClient,
   isMobileSubmission,
   MOBILE_SUBMISSION_ID_REQUIRED,
   readJsonBody,
@@ -43,13 +45,17 @@ export async function POST(req: NextRequest) {
   // "Feature Request". A crew-app report is a BUG — the app posts here because
   // this is the endpoint its Bearer token can reach, not because someone is
   // asking for a feature. Classify on the marker the app actually sends.
-  const fromMobile = isMobileSubmission(currentPage);
+  // How they AUTHENTICATED, not what they posted: a body field cannot
+  // establish anything about the client.
+  const fromMobileClient = isMobileClient(auth);
+  // The label still follows what the app says about itself.
+  const fromMobile = fromMobileClient || isMobileSubmission(currentPage);
 
   // A mobile caller with no idempotency key cannot be retried safely: the app
   // retries on network failure, and without a key every retry is a new report
   // and a new GitHub issue. The web widget is a human clicking once, so it stays
   // optional there.
-  if (fromMobile && !submissionId) {
+  if (fromMobileClient && !submissionId) {
     return NextResponse.json(
       {
         error: "This version of the app can't report bugs safely. Please update it.",
@@ -103,6 +109,14 @@ export async function POST(req: NextRequest) {
     // Before filing, ask GitHub whether this submission is already there. A
     // resume happens precisely because the previous attempt's outcome is
     // unknown — it may have created the issue and died before recording it.
+    // Claim the right to call GitHub. Two attempts can reach this point at
+    // once — a double-tap, or a retry overlapping the first request — and both
+    // would file, because neither issue exists yet when they both search.
+    if (!(await claimProviderLease(requestId))) {
+      const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+      return NextResponse.json({ request: inFlight, duplicate: true, inFlight: true });
+    }
+
     const marker = submissionMarker(requestId);
     const alreadyFiled = reserved.resume ? await findIssueByMarker(marker) : null;
 

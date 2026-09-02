@@ -722,3 +722,30 @@ test("consecutive periods splitting one workweek each add up on their own", asyn
         assert.equal(detailOvertime, toHundredths(totals.overtimeHours), "overtime reconciles within the period");
     }
 });
+
+test("a detail row's paid hours equal its own regular + overtime, always", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // Odd minutes across a 40-hour crossing: the row that straddles the
+    // threshold is the one where a raw duration and the allocated split most
+    // easily disagree.
+    const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
+    const result = buildGustoExport({
+        entries: days.map((day) =>
+            entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
+        ),
+        users: [alice],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+    });
+    for (const row of result.detail) {
+        assert.equal(
+            toHundredths(row.paidHours),
+            toHundredths(row.regularHours) + toHundredths(row.overtimeHours),
+            `${row.dayKey}: a row that does not add up is the row a bookkeeper reconciles by hand`
+        );
+    }
+    // And the column still totals the employee's paid hours.
+    const paid = result.detail.reduce((sum, row) => sum + toHundredths(row.paidHours), 0);
+    assert.equal(paid, toHundredths(totalsFor(alice.id, result).totalHours));
+});

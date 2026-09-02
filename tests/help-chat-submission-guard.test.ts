@@ -165,7 +165,7 @@ test("the request route classifies a mobile submission as a bug, with bug labels
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
         "utf8"
     );
-    assert.match(source, /const fromMobile = isMobileSubmission\(currentPage\)/);
+    assert.match(source, /const fromMobile = fromMobileClient \|\| isMobileSubmission\(currentPage\)/);
     assert.match(source, /type: fromMobile \? "bug" : "feature_request"/);
     assert.match(source, /labelPrefix: fromMobile \? "Bug Fix" : "Feature Request"/);
     assert.match(source, /fromMobile \? \["bug-fix", "from-mobile"\]/);
@@ -272,7 +272,10 @@ test("a mobile caller with no submissionId is refused, with a coded error", () =
         path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
         "utf8"
     );
-    assert.match(source, /fromMobile && !submissionId/);
+    // Derived from HOW THEY AUTHENTICATED, never from the posted body: a body
+    // field cannot establish anything about the client.
+    assert.match(source, /const fromMobileClient = isMobileClient\(auth\)/);
+    assert.match(source, /fromMobileClient && !submissionId/);
     assert.match(source, /MOBILE_SUBMISSION_ID_REQUIRED/);
     assert.match(source, /status: 400/);
 });
@@ -328,4 +331,45 @@ test("a crash between provider and DB leaves a row a retry can finish", () => {
     );
     assert.match(bugFix, /"status" = 'submitted_no_issue', "providerState" = 'pending'/);
     assert.match(bugFix, /"providerState" = 'created'/);
+});
+
+test("the client type comes from the auth result, never the posted body", async () => {
+    const { isMobileClient } = await import("../src/lib/help-chat/submission-guard");
+    assert.equal(isMobileClient({ via: "mobile-jwt" }), true);
+    assert.equal(isMobileClient({ via: "next-auth" }), false);
+    assert.equal(isMobileClient(null), false);
+    assert.equal(isMobileClient({}), false);
+    // Anyone can post currentPage: "mobile:..." — it labels the issue, it does
+    // not establish who is calling.
+    const guard = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.match(guard, /export function isMobileClient/);
+    assert.match(guard, /auth\?\.via === "mobile-jwt"/);
+});
+
+test("the provider lease is a compare-and-set, taken before any GitHub call", () => {
+    const guard = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    const fn = guard.slice(guard.indexOf("export async function claimProviderLease"));
+    const body = fn.slice(0, fn.indexOf(String.fromCharCode(10) + "}"));
+    // Only if nobody holds it, or the previous holder's lease has expired.
+    assert.match(body, /providerLeaseExpiresAt" IS NULL OR "providerLeaseExpiresAt" < /);
+    assert.match(body, /providerState" IS DISTINCT FROM 'created'/);
+    assert.match(body, /return claimed === 1;/);
+
+    for (const route of ["request", "bug-fix"]) {
+        const source = readFileSync(
+            path.join(__dirname, "..", "src", "app", "api", "help-chat", route, "route.ts"),
+            "utf8"
+        );
+        assert.match(source, /await claimProviderLease\(requestId\)/, route);
+        // Two attempts reaching this point at once would BOTH file, because
+        // neither issue exists yet when they both search for the marker.
+        assert.ok(
+            source.indexOf("claimProviderLease(requestId)") < source.indexOf("findIssueByMarker("),
+            `${route}: claim the lease before looking, let alone filing`
+        );
+        assert.ok(
+            source.indexOf("claimProviderLease(requestId)") < source.indexOf("createHelpChatGitHubIssue("),
+            `${route}: claim the lease before creating`
+        );
+    }
 });

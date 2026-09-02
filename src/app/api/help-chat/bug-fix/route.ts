@@ -5,7 +5,10 @@ import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
 import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
+  claimProviderLease,
   HELP_THROTTLED_MESSAGE,
+  isMobileClient,
+  MOBILE_SUBMISSION_ID_REQUIRED,
   readJsonBody,
   reserveHelpRequest,
   submissionMarker,
@@ -46,6 +49,19 @@ export async function POST(req: NextRequest) {
   }
 
   const { title, description, steps, currentPage, conversationId, submissionId } = submission;
+
+  // Every mobile-JWT submission needs an idempotency key, on BOTH routes: the
+  // app retries on network failure, and without one each retry is a new report
+  // and a new GitHub issue.
+  if (isMobileClient(auth) && !submissionId) {
+    return NextResponse.json(
+      {
+        error: "This version of the app can't report bugs safely. Please update it.",
+        code: MOBILE_SUBMISSION_ID_REQUIRED,
+      },
+      { status: 400 }
+    );
+  }
   if (!conversationId) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
@@ -92,6 +108,14 @@ export async function POST(req: NextRequest) {
     // happens precisely because the previous attempt's outcome is unknown — it
     // may have created the issue and crashed before recording it — so ask
     // GitHub for the marker before filing anything.
+    // Claim the right to call GitHub. Two attempts can reach this point at
+    // once — a double-tap, or a retry overlapping the first request — and both
+    // would file, because neither issue exists yet when they both search.
+    if (!(await claimProviderLease(requestId))) {
+      const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
+      return NextResponse.json({ request: inFlight, duplicate: true, inFlight: true });
+    }
+
     const marker = submissionMarker(requestId);
     const alreadyFiled = reserved.resume ? await findIssueByMarker(marker) : null;
 

@@ -1,32 +1,26 @@
 "use server";
 
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { dayKeyFromDateOnly } from "@/lib/company-day";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import {
+    assertManualEntryDelete,
+    assertManualEntryWrite,
+    assertNotLegacyUnitEntry,
+    assertUsableDuration,
+} from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
 import { toNum } from "@/lib/prisma-helpers";
 import {
     appendZeroRateReview,
+    canAcknowledgeZeroRate,
     readOwnerRatesForUpdate,
     zeroRateBlocks,
     zeroRateManagerMessage,
 } from "@/lib/pay-rate-guard";
 
-// A bare session check let any signed-in account write hours against any
-// project. These rows are now direct field evidence on the schedule board, so
-// they get the same permission + project-access gate the rest of the app uses.
-async function assertTimeclockProjectAccess(projectId: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user && await canUseDevAuthFallback()) return;
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
-}
 
 
 /**
@@ -82,11 +76,13 @@ export async function createTimeEntry(data: {
     /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
     acknowledgeZeroRate?: boolean;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
-    const acknowledgeZeroRate = data.acknowledgeZeroRate === true;
-
-    await assertTimeclockProjectAccess(data.projectId);
+    // Crew write their OWN hours; only the office writes somebody else's.
+    // `userId` arrives in the request body, so this is the only thing standing
+    // between a crew member and posting hours against a colleague.
+    const actor = await assertManualEntryWrite(data.projectId, data.userId);
+    const durationHours = assertUsableDuration(data.durationHours);
+    const acknowledgeZeroRate =
+        data.acknowledgeZeroRate === true && canAcknowledgeZeroRate(actor, data.userId);
 
     // Company-local calendar day, NOT new Date(): new Date("2026-07-27") is UTC
     // midnight, which is the 26th here — the punch lands on the wrong day, in
@@ -108,7 +104,7 @@ export async function createTimeEntry(data: {
     // as much a payroll change as an edit. Check + write in one transaction
     // under the shared advisory lock (src/lib/payroll-period.ts).
     await withPayrollWriteTx({ instants: [startTime] }, async (tx) => {
-        const priced = await priceManualEntry(tx, data.userId, data.durationHours, acknowledgeZeroRate);
+        const priced = await priceManualEntry(tx, data.userId, durationHours, acknowledgeZeroRate);
         return (tx as unknown as typeof prisma).timeEntry.create({
             data: {
                 projectId: data.projectId,
@@ -117,7 +113,7 @@ export async function createTimeEntry(data: {
                 startTime,
                 // endTime stays NULL — durationHours is the paid time entered
                 // by hand, not a span (see time-expense-core.ts).
-                durationHours: data.durationHours,
+                durationHours,
                 ...priced,
                 scheduleTaskId
             }
@@ -137,10 +133,7 @@ export async function updateTimeEntry(id: string, data: {
     /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
     acknowledgeZeroRate?: boolean;
 }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
-    const acknowledgeZeroRate = data.acknowledgeZeroRate === true;
-
+    const durationHours = assertUsableDuration(data.durationHours);
     const timeZone = await resolveCompanyTimeZone();
     const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
     if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
@@ -150,10 +143,16 @@ export async function updateTimeEntry(id: string, data: {
     // would drop a good mobile binding on an ordinary hours edit.
     const existing = await prisma.timeEntry.findUnique({
         where: { id },
-        select: { projectId: true, startTime: true, estimateItemId: true },
+        select: { projectId: true, userId: true, startTime: true, estimateItemId: true, durationHours: true, laborCost: true },
     });
     if (!existing) throw new Error("Not found");
-    await assertTimeclockProjectAccess(existing.projectId);
+    // Authorized against the STORED row's project and owner, plus the target
+    // this edit would move it to — an id proves nothing about what it points at.
+    assertNotLegacyUnitEntry(existing);
+    const actor = await assertManualEntryWrite(existing.projectId, existing.userId);
+    await assertManualEntryWrite(existing.projectId, data.userId);
+    const acknowledgeZeroRate =
+        data.acknowledgeZeroRate === true && canAcknowledgeZeroRate(actor, data.userId);
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: data.userId,
         projectId: existing.projectId,
@@ -163,14 +162,14 @@ export async function updateTimeEntry(id: string, data: {
 
     // Both dates — editing inside a locked period, and moving a punch into one.
     await withPayrollWriteTx({ entryIds: [id], instants: [startTime] }, async (tx) => {
-        const priced = await priceManualEntry(tx, data.userId, data.durationHours, acknowledgeZeroRate);
+        const priced = await priceManualEntry(tx, data.userId, durationHours, acknowledgeZeroRate);
         return (tx as unknown as typeof prisma).timeEntry.update({
             where: { id },
             data: {
                 userId: data.userId,
                 costCodeId: data.costCodeId,
                 startTime,
-                durationHours: data.durationHours,
+                durationHours,
                 ...priced,
                 scheduleTaskId
             }
@@ -182,11 +181,9 @@ export async function updateTimeEntry(id: string, data: {
 }
 
 export async function deleteTimeEntry(id: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
-
-    const entry = await prisma.timeEntry.findUnique({ where: { id }});
-    if (!entry) throw new Error("Not found");
+    // Authorized against the STORED row: this used to be a bare session check,
+    // so any signed-in account could delete ANY entry in the system by id.
+    const { entry } = await assertManualEntryDelete(id);
 
     await withPayrollWriteTx({ entryIds: [id] }, (tx) =>
         (tx as unknown as typeof prisma).timeEntry.delete({ where: { id } })

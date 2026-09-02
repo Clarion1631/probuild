@@ -2706,6 +2706,12 @@ model HelpRequest {
   /// status alone could not tell "never tried" from "tried and finished".
   providerIssueRef  String?
   providerState     String?   @default("pending")
+  /// Compare-and-set lease over the provider call. Two attempts can reach the
+  /// GitHub step at once (a double-tap, or a retry overlapping the first
+  /// request) and both would file — the marker search cannot help, because
+  /// neither issue exists yet when they both look.
+  providerLeaseToken     String?
+  providerLeaseExpiresAt DateTime? @db.Timestamptz(6)
   createdAt         DateTime? @default(now()) @db.Timestamptz(6)
 
   @@unique([userId, submissionId])

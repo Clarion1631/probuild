@@ -666,7 +666,7 @@ test("the project timeclock action never accepts a caller-supplied cost", () => 
     assert.doesNotMatch(updateSig.slice(0, updateSig.indexOf("}")), /laborCost/);
     assert.doesNotMatch(source, /laborCost: data\.laborCost/);
     // Priced INSIDE the write transaction now, from a row-locked read.
-    assert.match(source, /priceManualEntry\(tx, data\.userId, data\.durationHours, acknowledgeZeroRate\)/);
+    assert.match(source, /priceManualEntry\(tx, data\.userId, durationHours, acknowledgeZeroRate\)/);
     // Derived from the STORED rates, with the same $0 policy as every other
     // write path: refused unless explicitly acknowledged, then flagged.
     assert.match(source, /readOwnerRatesForUpdate\(tx, userId, toNum\)/);

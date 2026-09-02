@@ -186,6 +186,12 @@ ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT;
 -- to know whether calling GitHub would duplicate an issue.
 ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerIssueRef" TEXT;
 ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerState" TEXT DEFAULT 'pending';
+
+-- Compare-and-set lease over the provider call: two attempts reaching the
+-- GitHub step at once would otherwise both file, and the marker search cannot
+-- help because neither issue exists yet when they both look.
+ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerLeaseToken" TEXT;
+ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "providerLeaseExpiresAt" TIMESTAMPTZ(6);
 -- Unique PER USER, not globally: a globally unique key means one user's value
 -- collides with another's, and the idempotency lookup then returns somebody
 -- else's report.

@@ -496,3 +496,73 @@ test("salaried rows carry a pay type, not an annual figure read as an hourly rat
     // The hourly row is unaffected by the salaried ones sharing the file.
     assert.equal(rows.find((row) => row.userId === "u1")?.newHourly, "28.50");
 });
+
+test("a ragged row is refused rather than shifting every value one column left", () => {
+    // "28,50" is not a decimal comma to a CSV reader — it is two columns. The
+    // row then has four fields against a three-field header, and every value
+    // after it lands in the wrong column: somebody's NAME in the rate column.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            "Tim Brennan,tim@example.com,28.50",
+            "Garrett Lane,garrett@example.com,28,50",
+        ].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.rows, [], "nothing is imported from a file that cannot be read exactly");
+    assert.equal(parsed.errors.length, 1);
+    assert.match(parsed.errors[0], /columns/);
+});
+
+test("a quoted thousands separator stays ONE field and is still refused as a rate", () => {
+    // "$1,200" quoted is a single field — legitimate CSV — but not a plausible
+    // hourly rate, so it is reported as an unreadable row rather than imported.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            'Tim Brennan,tim@example.com,"$1,200"',
+        ].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.rows, []);
+    assert.equal(parsed.errors.length, 1);
+    assert.match(parsed.errors[0], /could not read the rate/);
+});
+
+test("an unterminated quote is an error, not a file silently collapsed to one row", () => {
+    // The lenient reader swallowed the rest of the file into one field: a
+    // hundred-row import became one row and ninety-nine vanished with no error.
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            'Tim Brennan,"tim@example.com,28.50',
+            "Garrett Lane,garrett@example.com,29.00",
+        ].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.rows, []);
+    assert.match(parsed.errors[0], /unclosed|inside a quoted value/);
+});
+
+test("a stray quote mid-field is an error", () => {
+    const parsed = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", 'Tim Bre"nnan,tim@example.com,28.50'].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.rows, []);
+    assert.match(parsed.errors[0], /quote/);
+});
+
+test("properly quoted fields still parse, including embedded commas and quotes", () => {
+    const parsed = parseGustoRateCsv(
+        [
+            "Employee name,Email,Compensation rate",
+            '"Brennan, Tim",tim@example.com,28.50',
+            '"He said ""hi""",garrett@example.com,29.00',
+        ].join(String.fromCharCode(10))
+    );
+    assert.deepEqual(parsed.errors, []);
+    assert.deepEqual(
+        parsed.rows.map((row) => [row.name, row.hourlyRate]),
+        [
+            ["Brennan, Tim", "28.50"],
+            ['He said "hi"', "29.00"],
+        ]
+    );
+});

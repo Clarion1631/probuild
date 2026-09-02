@@ -15,10 +15,18 @@ import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timez
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
+import {
+    assertManualEntryDelete,
+    assertManualEntryWrite,
+    assertNotLegacyUnitEntry,
+    assertUsableDuration,
+    canWriteHoursFor,
+} from "@/lib/manual-time-entry-auth";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
 import { toNum } from "@/lib/prisma-helpers";
 import {
     appendZeroRateReview,
+    canAcknowledgeZeroRate,
     readOwnerRatesForUpdate,
     zeroRateBlocks,
     zeroRateManagerMessage,
@@ -83,8 +91,19 @@ export async function createTimeEntry(data: {
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
-    await assertTimeExpenseProjectAccess(data.projectId);
-    await createTimeEntryFromStoredRatesCore(data, session.user.email);
+    // Crew write their OWN hours; only the office writes somebody else's.
+    const actor = await assertManualEntryWrite(data.projectId, data.userId);
+    const durationHours = assertUsableDuration(data.durationHours);
+    await createTimeEntryFromStoredRatesCore(
+        {
+            ...data,
+            durationHours,
+            acknowledgeZeroRate:
+                (data as { acknowledgeZeroRate?: boolean }).acknowledgeZeroRate === true &&
+                canAcknowledgeZeroRate(actor, data.userId),
+        },
+        session.user.email
+    );
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
@@ -102,10 +121,7 @@ export async function updateTimeEntry(
         acknowledgeZeroRate?: boolean;
     }
 ) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
+    const durationHours = assertUsableDuration(data.durationHours);
     // Date-only input goes through the company-timezone helper, not new Date():
     // new Date("2026-07-27") is UTC midnight, which is the 26th in company time,
     // so a plain parse silently moves the entry back a day. createTimeEntryCore
@@ -113,9 +129,23 @@ export async function updateTimeEntry(
     const timeZone = await resolveCompanyTimeZone();
     const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
     if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
-    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, startTime: true, invoiceId: true, invoicedAt: true, estimateItemId: true } });
-    if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
+    const current = await prisma.timeEntry.findUnique({
+        where: { id },
+        select: {
+            projectId: true, userId: true, startTime: true, invoiceId: true, invoicedAt: true,
+            estimateItemId: true, durationHours: true, laborCost: true,
+        },
+    });
+    if (!current || current.projectId !== data.projectId) throw new Error("Forbidden");
+    // Authorized against the STORED row's project and owner, and against the
+    // person this edit would move it to.
+    assertNotLegacyUnitEntry(current);
+    const actor = await assertManualEntryWrite(current.projectId, current.userId);
+    await assertManualEntryWrite(current.projectId, data.userId);
     if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+    const acknowledgeZeroRate =
+        (data as { acknowledgeZeroRate?: boolean }).acknowledgeZeroRate === true &&
+        canAcknowledgeZeroRate(actor, data.userId);
 
     // Re-bind against the STORED row: this action never writes projectId, so a
     // client-supplied one could attach another project's task, and dropping the
@@ -141,7 +171,7 @@ export async function updateTimeEntry(
                 costCodeId: data.costCodeId,
                 startTime,
                 scheduleTaskId,
-                durationHours: data.durationHours,
+                durationHours,
                 // Cost and burden are DERIVED, inside this transaction, from the
                 // member's stored rates. They used to be parameters: a server
                 // action's arguments are an HTTP body, so a caller could post
@@ -151,8 +181,8 @@ export async function updateTimeEntry(
                 ...(await priceEntryFromStoredRates(
                     tx as never,
                     data.userId,
-                    data.durationHours,
-                    data.acknowledgeZeroRate === true
+                    durationHours,
+                    acknowledgeZeroRate
                 )),
             },
         })
@@ -164,12 +194,8 @@ export async function updateTimeEntry(
 }
 
 export async function deleteTimeEntry(id: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
-    const entry = await prisma.timeEntry.findUnique({ where: { id } });
-    if (!entry) throw new Error("Not found");
-    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
+    // Authorized against the STORED row: its project AND its owner.
+    const { entry } = await assertManualEntryDelete(id);
     if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
 
     // Deleting a punch out of an exported period changes hours that were paid —
@@ -193,11 +219,11 @@ export async function deleteTimeEntries(
 
     const entries = await prisma.timeEntry.findMany({
         where: { id: { in: ids } },
-        select: { id: true, projectId: true, startTime: true, invoiceId: true, invoicedAt: true },
+        select: { id: true, projectId: true, userId: true, startTime: true, invoiceId: true, invoicedAt: true },
     });
 
     const allowed = entries.filter(
-        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
+        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId) && canWriteHoursFor(user, e.userId)
     );
     if (!allowed.length) return { deleted: 0 };
 
