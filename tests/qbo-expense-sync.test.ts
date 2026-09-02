@@ -1176,3 +1176,23 @@ test("a receipt QBO HAS but we cannot store is counted, while a purchase with no
     assert.equal(unavailableResult.attachmentsIncomplete, true, "a receipt we could not store is");
     assert.ok((unavailableResult.attachmentsSkipped ?? 0) >= 1);
 });
+
+
+test("attachables that exist but cannot be fetched are unavailable, not absent", async () => {
+    const { attachQboReceipt } = await import("../src/lib/qbo-receipt-attachments");
+    void attachQboReceipt;
+    // Codex gate: the candidate filter drops attachables with no
+    // TempDownloadUri, so a purchase whose ONLY attachments lacked a download
+    // URL fell through to "no-attachment" — indistinguishable from a purchase
+    // QuickBooks has no receipt for, and therefore never counted. The rule is
+    // now: nothing in QBO at all -> no-attachment; something there we could
+    // not get at -> attachment-unavailable.
+    const { isAttachmentFailure } = await import("../src/lib/qbo-receipt-attachments");
+    assert.equal(isAttachmentFailure("attachment-unavailable"), true);
+    assert.equal(isAttachmentFailure("storage-unavailable"), true);
+    // The normal case stays clean.
+    assert.equal(isAttachmentFailure("no-attachment"), false);
+    assert.equal(isAttachmentFailure("attached"), false);
+    assert.equal(isAttachmentFailure("already-linked"), false);
+    assert.equal(isAttachmentFailure("no-expense"), false);
+});

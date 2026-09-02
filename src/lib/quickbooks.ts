@@ -9,6 +9,7 @@ import {
     getMockQboInvoice,
     mockSendQBPaymentCreate,
 } from "./quickbooks-mock";
+import { createHash } from "node:crypto";
 import { isEstimateSectionRow } from "./estimate-item-payload";
 
 export const QB_API_BASE = process.env.QB_SANDBOX === "true"
@@ -798,14 +799,16 @@ export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDead
         incomeAccountId = accounts[0].Id;
     } else {
         const created = await qbFetch("/account", tokens, {
+            qbDeadline: deadline,
             method: "POST",
             body: JSON.stringify({ Name: "Construction Income", AccountType: "Income", AccountSubType: "ServiceFeeIncome" }),
         });
-        if (!created.ok) throw new Error(`QB income account create failed: ${await created.text()}`);
+        if (!created.ok) throw await qboResponseError(created, "QB income account create");
         incomeAccountId = (await created.json()).Account.Id;
     }
 
     const res = await qbFetch("/item", tokens, {
+        qbDeadline: deadline,
         method: "POST",
         body: JSON.stringify({
             Name: QB_SERVICE_ITEM_NAME,
@@ -813,7 +816,7 @@ export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDead
             IncomeAccountRef: { value: incomeAccountId },
         }),
     });
-    if (!res.ok) throw new Error(`QB service item create failed: ${await res.text()}`);
+    if (!res.ok) throw await qboResponseError(res, "QB service item create");
     return (await res.json()).Item.Id;
 }
 
@@ -821,6 +824,16 @@ export async function ensureQBServiceItem(tokens: QBTokens, deadline?: RouteDead
  * Create a QBO invoice for ONE payment milestone, with QuickBooks Payments
  * (card + ACH) enabled so the customer gets Intuit's hosted "Review & Pay" page.
  */
+/**
+ * QBO's create-request idempotency key: a stable hash of the caller's own
+ * identifier, capped at QBO's 50-char requestid limit. Same pattern the receipt
+ * push uses. Sending the SAME requestid twice makes Intuit return the original
+ * object instead of creating a second one.
+ */
+export function qboRequestId(seed: string): string {
+    return createHash("sha256").update(seed).digest("hex").slice(0, 50);
+}
+
 export async function createQBMilestoneInvoice(
     tokens: QBTokens,
     input: {
@@ -836,7 +849,8 @@ export async function createQBMilestoneInvoice(
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
-    }
+    },
+    deadline?: RouteDeadline,
 ): Promise<{ qbId: string; qbUrl: string; total: number }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
@@ -870,8 +884,17 @@ export async function createQBMilestoneInvoice(
         ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
     };
 
-    const res = await qbFetch("/invoice", tokens, { method: "POST", body: JSON.stringify(payload) });
-    if (!res.ok) throw new Error(`QB milestone invoice create failed: ${await res.text()}`);
+    // A stable requestid, keyed on the milestone's DocNumber. Without it an
+    // ambiguous timeout — the request landed, the response did not — left the
+    // caller to retry and create a SECOND invoice for the same milestone, which
+    // is a duplicate bill to a client. With it, Intuit returns the original.
+    const requestId = qboRequestId(`milestone-invoice:${input.docNumber}`);
+    const res = await qbFetch(`/invoice?requestid=${encodeURIComponent(requestId)}`, tokens, {
+        method: "POST",
+        body: JSON.stringify(payload),
+        qbDeadline: deadline,
+    });
+    if (!res.ok) throw await qboResponseError(res, "QB milestone invoice create");
     const data = await res.json();
     const qbId = data.Invoice?.Id;
     const total = Number(data.Invoice?.TotalAmt ?? 0);

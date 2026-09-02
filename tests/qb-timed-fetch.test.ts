@@ -540,3 +540,53 @@ test("an ordinary error body is still read into the message", async () => {
     assert.equal(qboHttpStatus(error), 400);
     assert.match(error.message, /invalid_grant/);
 });
+
+
+// --- The milestone invoice create is idempotent ---
+
+test("createQBMilestoneInvoice sends a stable requestid so a retry cannot double-bill", async () => {
+    const { createQBMilestoneInvoice, qboRequestId } = await import("../src/lib/quickbooks");
+    const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
+    // Codex gate: without a requestid, an ambiguous timeout (the request landed,
+    // the response did not) left the caller to retry and create a SECOND
+    // invoice for the same milestone - a duplicate bill to a client.
+    const urls: string[] = [];
+    const impl = (async (url: string) => {
+        urls.push(String(url));
+        return new Response(JSON.stringify({ Invoice: { Id: "inv-1", TotalAmt: 500 } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        });
+    }) as unknown as typeof fetch;
+
+    const args = {
+        docNumber: "INV-00123-DEP",
+        customerId: "c1",
+        itemId: "i1",
+        description: "Deposit",
+        amount: 500,
+        dueDate: null,
+        billEmail: null,
+        privateNote: "note",
+    };
+
+    const original = globalThis.fetch;
+    globalThis.fetch = impl;
+    try {
+        await createQBMilestoneInvoice(TOKENS, args);
+        await createQBMilestoneInvoice(TOKENS, args); // the retry
+    } finally {
+        globalThis.fetch = original;
+    }
+
+    const expected = qboRequestId(`milestone-invoice:${args.docNumber}`);
+    assert.equal(urls.length, 2);
+    for (const url of urls) {
+        assert.match(url, /requestid=/, `no requestid on ${url}`);
+        assert.ok(url.includes(expected), "the SAME key both times, so Intuit returns the original");
+    }
+    // And it is derived from the milestone, not random.
+    assert.equal(qboRequestId(`milestone-invoice:${args.docNumber}`), expected);
+    assert.notEqual(qboRequestId("milestone-invoice:INV-00124-DEP"), expected);
+});
+

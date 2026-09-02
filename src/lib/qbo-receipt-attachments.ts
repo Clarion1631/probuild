@@ -61,7 +61,13 @@ export async function attachQboReceipt(
             return (right.Size ?? 0) - (left.Size ?? 0);
         });
     const attachment = candidates[0];
-    if (!attachment) return "no-attachment"; // QBO has no receipt for this purchase
+    if (!attachment) {
+        // Nothing usable. Distinguish "QuickBooks has no receipt here" (the
+        // normal case for most purchases, not a failure) from "QuickBooks HAS
+        // attachments and we could not get at any of them" — the latter is a
+        // receipt that should exist in ProBuild and does not.
+        return attachables.length > 0 ? "attachment-unavailable" : "no-attachment";
+    }
     // A candidate that survived the filters but carries no download URL is an
     // anomaly, not an absence: there IS a receipt and we cannot fetch it.
     if (!attachment.TempDownloadUri) return "attachment-unavailable";

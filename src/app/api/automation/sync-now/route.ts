@@ -51,7 +51,7 @@ export async function POST() {
                 overheadProjectId: process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || undefined,
             },
             undefined,
-            { tokens },
+            { tokens, deadline },
         );
         const counts = {
             imported: result.imported,
@@ -68,7 +68,15 @@ export async function POST() {
             source,
             detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });
-        return NextResponse.json({ ok: true, ...counts });
+        return NextResponse.json({
+            // A run that left receipts unlanded did not finish cleanly, and the
+            // Command Center must not show it as a clean pass.
+            ok: !incomplete,
+            ...(incomplete
+                ? { reason: "attachments-incomplete", attachmentsSkipped: result.attachmentsSkipped ?? 0 }
+                : {}),
+            ...counts,
+        });
     } catch (error) {
         if (error instanceof QBNotConnectedError) {
             await logAutomationEvent({ kind: "qbo-sync", status: "error", reason: "quickbooks-not-connected", source });

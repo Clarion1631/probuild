@@ -333,7 +333,7 @@ export async function pushMilestoneToQuickBooks(
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
-    });
+    }, deadline);
 
     // QBO Automated Sales Tax can recalculate on top of what we send — verify the
     // grand total still equals the milestone. A drift means the client would be
