@@ -203,6 +203,8 @@ export function evaluatePipelineHealth(input: {
     }
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
+        // Includes attachment-failed: a receipt that never reached QuickBooks
+        // is a failure someone has to act on, not a footnote.
         reasons.push(`errors-24h:${input.stuck.count}`);
     }
 
@@ -370,7 +372,17 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // to surface, even on a day with no receipt traffic at all.
         probe<number>(
             "stuck",
-            () => prisma.automationEvent.count({ where: { status: "error", createdAt: { gte: since24h } } }),
+            () => prisma.automationEvent.count({
+                where: {
+                    // attachment-failed is a TERMINAL failure that leaves a
+                    // booked Purchase with no receipt. It is not literally
+                    // "error", so it used to sail past this count and the digest
+                    // could still read "Pipeline OK" on the strength of one
+                    // other good receipt in the window.
+                    status: { in: ["error", ATTACHMENT_FAILED_STATUS] },
+                    createdAt: { gte: since24h },
+                },
+            }),
             0,
         ),
     ]);

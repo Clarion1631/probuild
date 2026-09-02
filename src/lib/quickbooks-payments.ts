@@ -21,6 +21,7 @@ import {
     type QBTokens,
     refreshQBToken,
     isQBTimeoutError,
+    qbQuery,
     isQboConnectionFailure,
     QboRetryableError,
     type QBInvoiceProbe,
@@ -777,6 +778,11 @@ export async function runQboRowLoop<T>(
 export interface PaymentsSyncQboClient {
     probeInvoice(qbInvoiceId: string): Promise<QBInvoiceProbe>;
     getPayment(paymentId: string): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null>;
+    /**
+     * One cheap authenticated read, used only to prove the connection works on
+     * a run with no rows to sync. Throws if QuickBooks is not actually usable.
+     */
+    verifyConnection(): Promise<void>;
 }
 
 export interface SyncQuickBooksPaymentsOptions {
@@ -790,6 +796,57 @@ export interface SyncQuickBooksPaymentsOptions {
     qboClient?: PaymentsSyncQboClient;
 }
 
+/** One database page. Small enough to stay responsive, big enough to be cheap. */
+const PAYMENTS_SYNC_PAGE_SIZE = 100;
+/** Hard ceiling on rows per run, so one huge backlog cannot run past the cron's window. */
+const PAYMENTS_SYNC_MAX_ROWS = 500;
+/** Wall-clock budget, comfortably inside the route's 120s maxDuration. */
+const PAYMENTS_SYNC_TIME_BUDGET_MS = 90_000;
+
+/**
+ * Walk a pending collection in stable id order, a page at a time.
+ *
+ * The old queries took an unordered first 100 and stopped: rows past the cap
+ * were neither checked nor counted as skipped, so the run reported a clean
+ * "ok" while work was silently left undone — and with no ORDER BY, Postgres was
+ * free to hand back the SAME first 100 every hour, starving later rows forever.
+ * Ordering by id makes the walk deterministic, and anything we do not reach is
+ * counted as skipped so the run is honestly reported as partial.
+ */
+async function forEachPendingPage<T extends { id: string }>(
+    result: QBPaymentSyncResult,
+    deadline: number,
+    fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
+    countRemaining: (cursorId: string | null) => Promise<number>,
+    handlePage: (rows: T[]) => Promise<void>,
+): Promise<void> {
+    let cursorId: string | null = null;
+    let processed = 0;
+
+    while (true) {
+        if (result.abortedOnQboOutage) break;
+        if (processed >= PAYMENTS_SYNC_MAX_ROWS) break;
+        if (Date.now() >= deadline) break;
+
+        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, PAYMENTS_SYNC_MAX_ROWS - processed);
+        const page = await fetchPage(cursorId, take);
+        if (page.length === 0) return; // exhausted — nothing was missed
+
+        await handlePage(page);
+        processed += page.length;
+        cursorId = page[page.length - 1].id;
+
+        // A short page means we reached the end of the collection.
+        if (page.length < take) return;
+    }
+
+    // Stopped early. Count what is genuinely left AFTER the cursor rather than
+    // subtracting from a stale total — rows settled during this run have
+    // already dropped out of the pending set.
+    const remaining = await countRemaining(cursorId).catch(() => 0);
+    if (remaining > 0) result.skipped += remaining;
+}
+
 export async function syncQuickBooksPayments(
     scope?: { invoiceId?: string; projectId?: string },
     options?: SyncQuickBooksPaymentsOptions,
@@ -799,39 +856,26 @@ export async function syncQuickBooksPayments(
         skipped: 0, abortedOnQboOutage: false, runFailed: false,
     };
 
-    const pending = await prisma.paymentSchedule.findMany({
-        where: {
-            status: "Pending",
-            qbInvoiceId: { not: null },
-            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
-            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
-        },
-        select: {
-            id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
-            invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
-        },
-        take: 100,
-    });
+    const pendingWhere = {
+        status: "Pending",
+        qbInvoiceId: { not: null },
+        ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+        ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
+    };
+    const pendingRowCount = await prisma.paymentSchedule.count({ where: pendingWhere });
 
     // Progress billings (src/lib/progress-billing.ts) staged/sent to QuickBooks
     // — a second, independent pass over the same QBO connection. Milestones
     // billed through a ProgressBilling are NOT in `pending` above (billing
     // them there doesn't touch PaymentSchedule.qbInvoiceId), so this pass is
     // the only place they get settled from a QuickBooks payment.
-    const pendingBillings = await prisma.progressBilling.findMany({
-        where: {
-            qbInvoiceId: { not: null },
-            status: { in: ["Staged", "Sent"] },
-            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
-            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
-        },
-        select: {
-            id: true, invoiceId: true, qbInvoiceId: true, code: true,
-            lines: { select: { scheduleId: true } },
-            invoice: { select: { code: true, estimateId: true } },
-        },
-        take: 100,
-    });
+    const billingWhere = {
+        qbInvoiceId: { not: null },
+        status: { in: ["Staged", "Sent"] },
+        ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+        ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
+    };
+    const billingRowCount = await prisma.progressBilling.count({ where: billingWhere });
 
     // Tokens FIRST, even with nothing to do. Recording "ok" before proving we
     // can talk to QuickBooks let a disconnected or expired integration emit a
@@ -851,7 +895,7 @@ export async function syncQuickBooksPayments(
         result.failureReason = preflight.reason;
         result.abortedOnQboOutage = preflight.abortedOnQboOutage;
         // Nothing was checked, so everything we loaded counts as skipped.
-        result.skipped = pending.length + pendingBillings.length;
+        result.skipped = pendingRowCount + billingRowCount;
         await recordPaymentsSyncEvent(result, options?.source);
         return result;
     }
@@ -859,10 +903,30 @@ export async function syncQuickBooksPayments(
     const qbo: PaymentsSyncQboClient = options?.qboClient ?? {
         probeInvoice: (qbInvoiceId) => probeQBInvoice(tokens, qbInvoiceId),
         getPayment: (paymentId) => getQBPayment(tokens, paymentId),
+        // CompanyInfo is the cheapest authenticated read in the API.
+        verifyConnection: async () => {
+            await qbQuery(tokens, "SELECT * FROM CompanyInfo");
+        },
     };
 
-    // Nothing to sync, but the credentials were just proven — a genuine "ok".
-    if (pending.length === 0 && pendingBillings.length === 0) {
+    // Nothing to sync. Holding tokens is NOT proof the rail works: a
+    // non-timeout refresh failure falls back to the stale pair, and stale
+    // credentials, a wrong realm, or revoked accounting access all still
+    // produce a token object. Without an actual API call this run would record
+    // a fresh "ok" every hour forever while nothing could ever sync. One cheap
+    // authenticated read settles it.
+    if (pendingRowCount === 0 && billingRowCount === 0) {
+        try {
+            await qbo.verifyConnection();
+        } catch (error) {
+            const verdict = classifyPreflightFailure(error);
+            result.runFailed = true;
+            result.failureReason = verdict.reason;
+            result.abortedOnQboOutage = verdict.abortedOnQboOutage;
+            result.errors.push(
+                `QuickBooks connectivity check failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            );
+        }
         await recordPaymentsSyncEvent(result, options?.source);
         return result;
     }
@@ -871,7 +935,28 @@ export async function syncQuickBooksPayments(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
-    await runQboRowLoop(pending, result, async (schedule) => {
+    const deadline = Date.now() + PAYMENTS_SYNC_TIME_BUDGET_MS;
+    const milestoneSelect = {
+        id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
+        invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
+    } as const;
+
+    await forEachPendingPage(
+        result,
+        deadline,
+        (cursorId, take) => prisma.paymentSchedule.findMany({
+            where: pendingWhere,
+            select: milestoneSelect,
+            // Stable key: without it Postgres may return the same first page
+            // every run and starve everything behind it.
+            orderBy: { id: "asc" },
+            take,
+            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+        }),
+        (cursorId) => prisma.paymentSchedule.count({
+            where: cursorId ? { ...pendingWhere, id: { gt: cursorId } } : pendingWhere,
+        }),
+        (page) => runQboRowLoop(page, result, async (schedule) => {
         result.checked++;
         {
             const probe = await qbo.probeInvoice(schedule.qbInvoiceId!);
@@ -932,23 +1017,10 @@ export async function syncQuickBooksPayments(
             if (probe.total > 0 && probe.balance <= 0) {
                 // Fully settled in QuickBooks (online payment OR a check Vanessa applied)
                 const paymentId = probe.paymentTxnIds[0] || null;
-                let paidAt = new Date();
-                let referenceNumber: string | null = null;
-                if (paymentId) {
-                    // Same abort rule as the probe: a timeout/401/403/408/429/5xx
-                    // here throws and stops the run rather than costing another
-                    // full deadline on every remaining settled invoice.
-                    const p = await qbo.getPayment(paymentId);
-                    // A null read means we could not learn WHEN this was paid.
-                    // Settling anyway used to stamp `new Date()` on it, quietly
-                    // recording today as the payment date — wrong money data,
-                    // reported as a clean run. Leave it Pending and retry.
-                    if (!p) {
-                        throw new Error(`QBO payment ${paymentId} could not be read; milestone left unsettled`);
-                    }
-                    if (p.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p.referenceNumber || null;
-                }
+                // Same abort rule as the probe: a timeout/401/403/408/429/5xx
+                // inside resolvePaymentDate throws and stops the run rather
+                // than costing another full deadline on every remaining row.
+                const { paidAt, referenceNumber } = await resolveSettlementDate(qbo, paymentId);
                 const recorded = await settleMilestoneFromQBPayment({
                     paymentScheduleId: schedule.id,
                     invoiceId: schedule.invoiceId,
@@ -965,8 +1037,9 @@ export async function syncQuickBooksPayments(
             }
         }
     }, (schedule, e) => {
-        result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
-    }, "milestones");
+            result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }, "milestones"),
+    );
 
     // ── Progress billings ───────────────────────────────────────────────────
     // Same probe → settle shape as the milestone loop above, but claims ONE
@@ -975,7 +1048,26 @@ export async function syncQuickBooksPayments(
     // (custom/change-order lines were materialized into a real PaymentSchedule
     // at billing-creation time — see createProgressBillingCore — so every line
     // has a scheduleId and settles like any other milestone; no special case).
-    await runQboRowLoop(pendingBillings, result, async (billing) => {
+    const billingSelect = {
+        id: true, invoiceId: true, qbInvoiceId: true, code: true,
+        lines: { select: { scheduleId: true } },
+        invoice: { select: { code: true, estimateId: true } },
+    } as const;
+
+    await forEachPendingPage(
+        result,
+        deadline,
+        (cursorId, take) => prisma.progressBilling.findMany({
+            where: billingWhere,
+            select: billingSelect,
+            orderBy: { id: "asc" },
+            take,
+            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+        }),
+        (cursorId) => prisma.progressBilling.count({
+            where: cursorId ? { ...billingWhere, id: { gt: cursorId } } : billingWhere,
+        }),
+        (page) => runQboRowLoop(page, result, async (billing) => {
         {
             const probe = await qbo.probeInvoice(billing.qbInvoiceId!);
             if (probe.state === "error") {
@@ -995,18 +1087,7 @@ export async function syncQuickBooksPayments(
             // probe.state === "ok"
             if (probe.total > 0 && probe.balance <= 0) {
                 const paymentId = probe.paymentTxnIds[0] || null;
-                let paidAt = new Date();
-                let referenceNumber: string | null = null;
-                if (paymentId) {
-                    const p = await qbo.getPayment(paymentId);
-                    // Same rule as the milestone loop: never settle a payment
-                    // whose date we could not read.
-                    if (!p) {
-                        throw new Error(`QBO payment ${paymentId} could not be read; progress billing left unsettled`);
-                    }
-                    if (p.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
-                    referenceNumber = p.referenceNumber || null;
-                }
+                const { paidAt, referenceNumber } = await resolveSettlementDate(qbo, paymentId);
                 const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });
                 if (settled) result.progressBillingsSettled++;
             } else if (probe.balance < probe.total) {
@@ -1014,8 +1095,9 @@ export async function syncQuickBooksPayments(
             }
         }
     }, (billing, e) => {
-        result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
-    }, "progress billings")
+            result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }, "progress billings"),
+    )
 
     if (newlyFlagged.length > 0) {
         const { notifyQBSyncIssues } = await import("./payment-notifications");
@@ -1024,6 +1106,41 @@ export async function syncQuickBooksPayments(
 
     await recordPaymentsSyncEvent(result, options?.source);
     return result;
+}
+
+/** Reason recorded when a settlement is refused for want of an authoritative date. */
+export const PAYMENT_DATE_MISSING = "payment-date-missing";
+
+/**
+ * The authoritative payment date, or refuse to settle.
+ *
+ * `paidAt` used to default to `new Date()` and was only replaced when a
+ * txnDate happened to be present, so an invoice with no linked payment id, a
+ * payment carrying a null/garbage txnDate, or an unreadable payment record all
+ * settled REAL milestones stamped with today — wrong money data, and it fires
+ * the mirror/notification side effects on the way out. There is no safe
+ * fallback for "when was this paid": leave the row Pending (the run becomes
+ * partial) and let a later run settle it with a real date.
+ */
+export async function resolveSettlementDate(
+    qbo: PaymentsSyncQboClient,
+    paymentId: string | null,
+): Promise<{ paidAt: Date; referenceNumber: string | null }> {
+    if (!paymentId) {
+        throw new Error(`QBO invoice is fully paid but carries no linked payment; ${PAYMENT_DATE_MISSING}`);
+    }
+    const payment = await qbo.getPayment(paymentId);
+    if (!payment) {
+        throw new Error(`QBO payment ${paymentId} could not be read; ${PAYMENT_DATE_MISSING}`);
+    }
+    if (!payment.txnDate) {
+        throw new Error(`QBO payment ${paymentId} has no TxnDate; ${PAYMENT_DATE_MISSING}`);
+    }
+    const paidAt = new Date(`${payment.txnDate}T12:00:00Z`);
+    if (Number.isNaN(paidAt.getTime())) {
+        throw new Error(`QBO payment ${paymentId} has an unparseable TxnDate "${payment.txnDate}"; ${PAYMENT_DATE_MISSING}`);
+    }
+    return { paidAt, referenceNumber: payment.referenceNumber || null };
 }
 
 /**

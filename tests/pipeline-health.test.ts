@@ -497,3 +497,43 @@ test("only a stored receipt counts as an attached booking", async () => {
         assert.equal(attachmentSucceeded(bad), false, String(bad));
     }
 });
+
+
+// --- attachment-failed must make health unhealthy, now ---
+
+test("an attachment-failed receipt is counted as stuck and turns the digest red", async () => {
+    const { ATTACHMENT_FAILED_STATUS } = await import("../src/lib/pipeline-health");
+    // Codex gate: the route recorded attachment-failed but `stuck` only
+    // matched literal "error", so another good receipt inside 72h left the
+    // subject line reading "Pipeline OK" while a Purchase sat in QuickBooks
+    // with no receipt attached.
+    assert.equal(ATTACHMENT_FAILED_STATUS, "attachment-failed");
+
+    // `stuck` is the count the health check receives; a non-zero value is red
+    // regardless of how fresh the rest of the pipeline looks.
+    const v = evaluatePipelineHealth(snapshot({ stuck: { status: "ok", count: 1 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["errors-24h:1"]);
+
+    const { subject } = formatPipelineDigest(sampleHealth({ ok: false, reasons: ["errors-24h:1"], stuck: { status: "ok", count: 1 } }));
+    assert.equal(subject, "Pipeline NEEDS ATTENTION");
+});
+
+test("the journey mapper renders attachment-failed as failed, not in-flight", async () => {
+    const { groupEventsIntoJourneys } = await import("../src/lib/automation-events");
+    const journeys = groupEventsIntoJourneys([
+        {
+            id: "e1", kind: "receipt-push", stage: null, status: "attachment-failed",
+            reason: "failed:fault", source: "apps-script", vendor: "Home Depot",
+            projectName: "Mueller Remodel", docNumber: "1AbCdEfGhIjKlMnOpQrSt",
+            fileName: "receipt.jpg", amountCents: 15000, taxCents: null,
+            qbPurchaseId: "99", driveFileId: "1AbCdEfGhIjKlMnOpQrStUv",
+            detail: null, createdAt: new Date("2026-09-01T12:00:00Z"),
+        },
+    ]);
+    const journey = [...journeys.values()][0];
+    // "in-flight" reads as "still working on it" for a receipt that is never
+    // arriving - the bot has already stopped.
+    assert.equal(journey.finalState, "error");
+    assert.equal(journey.finalReason, "failed:fault");
+});

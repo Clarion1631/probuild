@@ -128,7 +128,9 @@ export async function receiptDailyBuckets(days: number): Promise<AutomationDayBu
         // created — counting it again would double-count intake volume.
         if (row.status === "created") bucket.created += 1;
         else if (row.status === "fallback") bucket.fallback += 1;
-        else if (row.status === "error") bucket.error += 1;
+        // attachment-failed posted a Purchase but lost the receipt: an error
+        // on the graph, never a clean create.
+        else if (row.status === "error" || row.status === "attachment-failed") bucket.error += 1;
     }
     return [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
 }
@@ -170,12 +172,14 @@ export async function automationSummary(): Promise<AutomationSummary> {
             pushed += 1;
             amountCents += e.amountCents ?? 0;
             taxCents += e.taxCents ?? 0;
-        } else if (e.status === "fallback") {
+        } else if (e.status === "fallback" || e.status === "attachment-failed") {
+            // Booked without a receipt still needs a human to finish it, so it
+            // counts against the hands-free rate rather than as a clean push.
             fallback += 1;
         }
     }
     const created30 = last30.filter(e => e.status === "created").length;
-    const fb30 = last30.filter(e => e.status === "fallback").length;
+    const fb30 = last30.filter(e => e.status === "fallback" || e.status === "attachment-failed").length;
 
     return {
         pushedThisMonth: pushed,
@@ -297,12 +301,23 @@ function journeyFinalState(steps: JourneyStep[]): { state: ReceiptJourney["final
         if (s.stage === "push" && (s.status === "created" || s.status === "already-exists")) {
             return { state: "booked-api", reason: null };
         }
+        // Booked, but the receipt image never landed — surfaced as an error so
+        // it appears in the worklist instead of reading as a clean booking.
+        if (s.stage === "push" && s.status === "attachment-failed") {
+            return { state: "error", reason: s.reason ?? "attachment failed" };
+        }
         if (s.stage === "email-book" && s.status === "emailed") {
             return { state: "booked-email", reason: s.reason };
         }
     }
     const last = steps[steps.length - 1];
     if (!last) return { state: "in-flight", reason: null };
+    // A Purchase that posted without its receipt image. Terminal (the bot will
+    // not resend), so leaving it "in-flight" hid a receipt that is never
+    // arriving behind a status that reads like "still working on it".
+    if (last.status === "attachment-failed") {
+        return { state: "error", reason: last.reason ?? "attachment failed" };
+    }
     if (last.status === "parked") return { state: "parked", reason: last.reason };
     if (last.status === "quarantined") return { state: "quarantined", reason: last.reason };
     if (last.status === "error") return { state: "error", reason: last.reason };

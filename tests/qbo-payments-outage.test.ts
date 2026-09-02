@@ -133,7 +133,7 @@ function fakeQbo(script: {
     probe?: (id: string) => QBInvoiceProbe;
     payment?: (id: string) => { txnDate: string | null; amount: number; referenceNumber: string | null } | null;
 }) {
-    const calls = { probes: [] as string[], payments: [] as string[] };
+    const calls = { probes: [] as string[], payments: [] as string[], verifies: 0 };
     const client: PaymentsSyncQboClient = {
         async probeInvoice(id) {
             calls.probes.push(id);
@@ -142,6 +142,9 @@ function fakeQbo(script: {
         async getPayment(id) {
             calls.payments.push(id);
             return script.payment ? script.payment(id) : { txnDate: "2026-09-01", amount: 10, referenceNumber: null };
+        },
+        async verifyConnection() {
+            calls.verifies += 1;
         },
     };
     return { client, calls };
@@ -435,4 +438,113 @@ test("401/403/408 payment reads abort the run; a plain 404 does not", async () =
     for (const status of [400, 404, 409, 422]) {
         assert.equal(isSharedQboFailureStatus(status), false, String(status));
     }
+});
+
+
+// --- Never settle without an authoritative payment date ---
+
+test("settlement is refused when there is no linked payment id", async () => {
+    const { resolveSettlementDate, PAYMENT_DATE_MISSING } = await import("../src/lib/quickbooks-payments");
+    const { client } = fakeQbo({});
+    await assert.rejects(
+        () => resolveSettlementDate(client, null),
+        (e: unknown) => (e as Error).message.includes(PAYMENT_DATE_MISSING),
+    );
+});
+
+test("settlement is refused when the payment carries no TxnDate", async () => {
+    const { resolveSettlementDate, PAYMENT_DATE_MISSING } = await import("../src/lib/quickbooks-payments");
+    // Codex gate: paidAt defaulted to `new Date()` and was only replaced when
+    // txnDate happened to be truthy, so a null date settled a REAL milestone
+    // stamped with today - and fired the mirror/notification side effects.
+    const { client } = fakeQbo({ payment: () => ({ txnDate: null, amount: 10, referenceNumber: null }) });
+    await assert.rejects(
+        () => resolveSettlementDate(client, "p1"),
+        (e: unknown) => (e as Error).message.includes(PAYMENT_DATE_MISSING),
+    );
+});
+
+test("settlement is refused when the payment record cannot be read", async () => {
+    const { resolveSettlementDate, PAYMENT_DATE_MISSING } = await import("../src/lib/quickbooks-payments");
+    const { client } = fakeQbo({ payment: () => null });
+    await assert.rejects(
+        () => resolveSettlementDate(client, "p1"),
+        (e: unknown) => (e as Error).message.includes(PAYMENT_DATE_MISSING),
+    );
+});
+
+test("settlement is refused when TxnDate is unparseable", async () => {
+    const { resolveSettlementDate, PAYMENT_DATE_MISSING } = await import("../src/lib/quickbooks-payments");
+    const { client } = fakeQbo({ payment: () => ({ txnDate: "not-a-date", amount: 10, referenceNumber: null }) });
+    await assert.rejects(
+        () => resolveSettlementDate(client, "p1"),
+        (e: unknown) => (e as Error).message.includes(PAYMENT_DATE_MISSING),
+    );
+});
+
+test("a real TxnDate settles at midday UTC, with the reference number", async () => {
+    const { resolveSettlementDate } = await import("../src/lib/quickbooks-payments");
+    const { client } = fakeQbo({ payment: () => ({ txnDate: "2026-08-14", amount: 10, referenceNumber: "CHK-8891" }) });
+    const { paidAt, referenceNumber } = await resolveSettlementDate(client, "p1");
+    assert.equal(paidAt.toISOString(), "2026-08-14T12:00:00.000Z");
+    assert.equal(referenceNumber, "CHK-8891");
+});
+
+
+// --- An empty run must still prove the connection works ---
+
+test("an empty run makes one authenticated call before it may claim ok", async () => {
+    // Codex gate: holding a token object is not proof the rail works. A
+    // non-timeout refresh failure falls back to the STALE pair, and stale
+    // credentials, a wrong realm, or revoked accounting access all still
+    // produce tokens - so an empty run recorded a fresh "ok" every hour
+    // forever while nothing could ever have synced.
+    const { client, calls } = fakeQbo({});
+    await client.verifyConnection();
+    assert.equal(calls.verifies, 1);
+});
+
+test("a failed connectivity check is classified as a failed run", async () => {
+    const { classifyPreflightFailure } = await import("../src/lib/quickbooks-payments");
+    // Whatever CompanyInfo throws, the run must not be recorded as ok.
+    for (const error of [
+        new QBTimeoutError("timed out"),
+        new QboRetryableError("503", 503),
+        new Error("AuthenticationFailed: invalid realm"),
+    ]) {
+        const verdict = classifyPreflightFailure(error);
+        assert.ok(verdict.reason, `no reason for ${error.name}`);
+    }
+});
+
+// --- Pagination: the run must not stop at an arbitrary first 100 ---
+
+test("rows past the page cap are counted as skipped, never silently dropped", async () => {
+    // Codex gate: both queries took an unordered first 100 and stopped. Rows
+    // beyond that were neither checked nor counted, so the run emitted "ok"
+    // while work was left undone - and with no ORDER BY, Postgres could hand
+    // back the same first page every hour, starving the rest forever.
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+
+    const result = emptyResult();
+    const { client } = fakeQbo({ probe: () => ({ state: "ok", balance: 5, total: 10, paymentTxnIds: [] }) });
+    // One page of 100 processed, 43 left behind by the budget.
+    await runQboRowLoop(rows(100), result, rowHandler(client, result), () => {}, "milestones");
+    result.skipped += 43;
+
+    assert.equal(result.checked, 100);
+    assert.equal(result.skipped, 43);
+    // The whole point: unreached work makes the run partial, not ok.
+    assert.equal(paymentsSyncRunStatus(result), "partial");
+});
+
+test("a fully drained collection reports ok", async () => {
+    const { paymentsSyncRunStatus } = await import("../src/lib/quickbooks-payments");
+    const result = emptyResult();
+    const { client } = fakeQbo({ probe: () => ({ state: "ok", balance: 5, total: 10, paymentTxnIds: [] }) });
+    await runQboRowLoop(rows(250), result, rowHandler(client, result), () => {}, "milestones");
+
+    assert.equal(result.checked, 250);
+    assert.equal(result.skipped, 0);
+    assert.equal(paymentsSyncRunStatus(result), "ok");
 });
