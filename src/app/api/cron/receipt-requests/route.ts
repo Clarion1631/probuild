@@ -12,6 +12,7 @@ import {
 } from "@/lib/review-alert-lifecycle";
 import type { ReasonCode } from "@/lib/review-alert-reasons";
 import {
+    COMPETING_LINE_ADJACENCY_DAYS,
     DEAD_INTAKE_STATES,
     RECEIPT_MATCH_DATE_SLOP_DAYS,
     RECEIPT_REQUEST_TARGET_TYPE,
@@ -899,6 +900,17 @@ async function processBatch(
         const fromDay = new Date(Math.min(...days) - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
         const toDay = new Date(Math.max(...days) + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000).toISOString().slice(0, 10);
         const componentRange = await evidenceRange(fromDay, toDay);
+        // WIDER, for the BankLine re-read only. `groupCompetingLines` can join a
+        // same-amount line up to `COMPETING_LINE_ADJACENCY_DAYS` (4 days) from
+        // an EDGE of this component — one day further than the ±2-day evidence
+        // fence above ever reaches. A line landing 3-4 days past an edge after
+        // the initial scan is a real new competitor for this component, but the
+        // evidence-width range would never select it, so the re-read's line
+        // count could never change to catch it. The join window, not the
+        // evidence window, is what decides whether a bank line belongs here.
+        const joinFromDay = new Date(Math.min(...days) - COMPETING_LINE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const joinToDay = new Date(Math.max(...days) + COMPETING_LINE_ADJACENCY_DAYS * 86_400_000).toISOString().slice(0, 10);
+        const joinRange = await evidenceRange(joinFromDay, joinToDay);
         const amounts = [...new Set(componentLines.map(row => row.amountCents))];
         const intakeInWindow = (value: Date | null) =>
             value !== null && value >= componentRange.calendar.gte && value < componentRange.calendar.lt;
@@ -989,7 +1001,11 @@ async function processBatch(
                         },
                     }),
                     lines: await tx.bankLine.findMany({
-                        where: { amountCents: { in: amounts }, postedDate: componentRange.calendar },
+                        // The JOIN window, not the evidence window — see
+                        // `joinRange` above. A same-amount line up to
+                        // `COMPETING_LINE_ADJACENCY_DAYS` past an edge could
+                        // have joined this component since it was planned.
+                        where: { amountCents: { in: amounts }, postedDate: joinRange.calendar },
                         select: { id: true, updatedAt: true, rawDescriptor: true },
                     }),
                     expenses: (await tx.expense.findMany({

@@ -229,5 +229,8 @@ test("the cron stamps all four inputs, at plan time and again under the lock", (
     }
     // Lines are re-read BY AMOUNT AND SPAN, not by an id list drawn from the
     // plan — that list is exactly what cannot see a line that just arrived.
-    assert.match(source, /where: \{ amountCents: \{ in: amounts \}, postedDate: componentRange\.calendar \}/);
+    // The span is the JOIN window (COMPETING_LINE_ADJACENCY_DAYS), not the
+    // narrower evidence window — a line up to 4 days past an edge can still
+    // join this component, and the re-read has to be wide enough to see it.
+    assert.match(source, /where: \{ amountCents: \{ in: amounts \}, postedDate: joinRange\.calendar \}/);
 });
