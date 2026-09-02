@@ -2,7 +2,7 @@
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
 import { prisma } from "@/lib/prisma";
-import { toCompanyDayKey } from "@/lib/company-day";
+import { COMPANY_TIME_ZONE, toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { dayLockKey, isPeriodLockedError } from "@/lib/payroll-period";
@@ -121,12 +121,27 @@ export async function settleDayWithinTx(
     return settleDayInTx(tx, userId, dayKey, closing, { alreadyGuarded: true });
 }
 
-/** Payroll guard for a settlement: takes the shared payroll advisory lock and refuses a locked day. */
+/**
+ * Payroll guard for a settlement: takes the shared payroll advisory lock and
+ * refuses a locked day.
+ *
+ * THE ZONE IS THE ONE THE DAY KEY WAS DERIVED IN, not the configured company
+ * zone. Every `dayKey` reaching settlement comes out of toCompanyDayKey, which
+ * is hardcoded to COMPANY_TIME_ZONE, and settlement then selects the rows it
+ * rewrites with that same helper (see settleDayInTx). Interpreting the key
+ * here through resolveCompanyTimeZone() made the guard and the write disagree
+ * the moment CompanySettings.timeZone moved off the default: "2026-08-17"
+ * would be read as New York midnight, three hours BEFORE the Los Angeles
+ * midnight the rows actually sit at, which falls outside a locked period's
+ * envelope — so the guard passed and settlement rewrote paid hours inside an
+ * already-exported period. A locked period carries the zone it was locked in
+ * and evaluates its own envelope in it (lockedPeriodFor), so nothing else here
+ * depends on the caller's zone.
+ */
 async function assertSettlementDayUnlocked(tx: Tx, userId: string, dayKey: string): Promise<void> {
     void userId;
     const { assertDayUnlockedInTx } = await import("./payroll-period");
-    const { resolveCompanyTimeZone } = await import("./company-timezone");
-    await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
+    await assertDayUnlockedInTx(tx as never, dayKey, COMPANY_TIME_ZONE);
 }
 
 type Tx = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
@@ -145,10 +160,10 @@ async function settleDayInTx(
             // whole day, so it is a payroll write like any other and must not
             // touch a locked period. Callers that already took the payroll lock
             // (in the right order, BEFORE the day lock) pass alreadyGuarded.
+            // Same helper as the guarded callers, so there is exactly ONE
+            // answer to "which zone is this day key in" on both sides.
             if (!options.alreadyGuarded) {
-                const { assertDayUnlockedInTx } = await import("./payroll-period");
-                const { resolveCompanyTimeZone } = await import("./company-timezone");
-                await assertDayUnlockedInTx(tx as never, dayKey, await resolveCompanyTimeZone());
+                await assertSettlementDayUnlocked(tx, userId, dayKey);
             }
 
             // The whole owner, not just the numbers: settlement REPRICES every

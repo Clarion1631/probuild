@@ -108,7 +108,8 @@ Phase 3 note (not Phase 5 work): `apps/mobile/app/(tabs)/expenses.tsx` will be r
 
 > **Implementation note (2026-09-01).** The three HUMAN DECISION items below did not block the build. They now live as
 > env-overridable **defaults** in `src/lib/payroll-config.ts`, labelled there and in `.env.example` as pending Justin:
-> `PAYROLL_PERIOD=biweekly`, `PAYROLL_WEEK_START=monday`, and `PAYROLL_SALARIED_EMAILS` defaulting to CJ + Richard.
+> `PAYROLL_PERIOD=biweekly`, `PAYROLL_WEEK_START=monday`, and `PAYROLL_SALARIED_EMAILS` defaulting to EMPTY — nobody is
+> guessed as salaried, because naming somebody drops their hours from the pay run and a wrong guess underpays them.
 > Changing any of them is an env change, not a code change. The Gusto tier question (risk 1) only affects the CSV
 > header names, which are one exported constant each in `src/lib/gusto-export-core.ts`
 > (`GUSTO_SUMMARY_CSV_HEADER` / `GUSTO_DETAIL_CSV_HEADER`). The endpoint and the `PayrollPeriod` table take an

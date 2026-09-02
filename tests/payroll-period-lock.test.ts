@@ -355,6 +355,60 @@ test("settlement itself refuses a day inside a locked period", async () => {
     await assertDayUnlockedInTx(tx, "2026-09-10", "America/Los_Angeles");
 });
 
+test("a day key means the zone it was DERIVED in — reading it in another zone misses the lock", async () => {
+    // Every dayKey that reaches settlement comes out of toCompanyDayKey, which
+    // is hardcoded to COMPANY_TIME_ZONE, and settlement selects the rows it
+    // rewrites with that same helper. This test is what makes the coupling
+    // load-bearing rather than incidental.
+    const { assertDayUnlockedInTx, isPeriodLockedError } = await import("../src/lib/payroll-period");
+    const { COMPANY_TIME_ZONE } = await import("../src/lib/company-day");
+    // A real locked period carries the zone it was locked in, so ITS envelope
+    // does not move when the company zone changes — only the caller's reading
+    // of the day key does. That asymmetry is the whole bug.
+    const tx = {
+        $executeRawUnsafe: async () => 0,
+        $queryRawUnsafe: async () => [],
+        payrollPeriod: { findMany: async () => [period({ timeZone: "America/Los_Angeles" })] },
+    };
+
+    // 2026-08-17 is the FIRST day of the locked period in company time.
+    await assert.rejects(
+        () => assertDayUnlockedInTx(tx, "2026-08-17", COMPANY_TIME_ZONE),
+        (error: Error) => isPeriodLockedError(error)
+    );
+    // The same key read as New York midnight is 04:00Z — three hours BEFORE the
+    // period starts, so the guard says the day is free. Nothing is wrong with
+    // assertDayUnlockedInTx here; this is the divergence that makes passing it
+    // a configurable zone, while the rows are keyed on a hardcoded one, unsafe.
+    await assertDayUnlockedInTx(tx, "2026-08-17", "America/New_York");
+});
+
+test("settlement stays locked out of an LA-day after the company zone is switched east", async () => {
+    // The regression, behaviourally: with CompanySettings/COMPANY_TIMEZONE moved
+    // to New York, settlement must STILL refuse the locked Los Angeles day whose
+    // rows it would rewrite. The old guard resolved the configured zone and read
+    // "2026-08-17" as 04:00Z, outside the envelope — it let the re-plan through
+    // and rewrote durationHours/laborCost inside an already-exported period.
+    const { settleDayWithinTx } = await import("../src/lib/wa-breaks-db");
+    const { isPeriodLockedError } = await import("../src/lib/payroll-period");
+    const before = process.env.COMPANY_TIMEZONE;
+    process.env.COMPANY_TIMEZONE = "America/New_York";
+    try {
+        const tx = {
+            $executeRawUnsafe: async () => 0,
+            $queryRawUnsafe: async () => [],
+            payrollPeriod: { findMany: async () => [period({ timeZone: "America/Los_Angeles" })] },
+        };
+        await assert.rejects(
+            () => settleDayWithinTx(tx as never, "u1", "2026-08-17"),
+            (error: Error) => isPeriodLockedError(error)
+        );
+    } finally {
+        if (before === undefined) delete process.env.COMPANY_TIMEZONE;
+        else process.env.COMPANY_TIMEZONE = before;
+    }
+});
+
 test("a write validates the row's STORED startTime, not the caller's stale copy", () => {
     // A concurrent writer can move a row after this request read it, and a
     // locker can then lock the period it moved into. The guard re-reads the row

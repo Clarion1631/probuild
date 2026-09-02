@@ -639,11 +639,17 @@ test("nobody is salaried by default — the list is empty until an operator sets
 test("no employee is named in the payroll source any more", () => {
     // The hardcoded list was the code asserting, on nobody's authority, that two
     // specific humans are salaried.
-    for (const file of ["src/lib/payroll-config.ts", "scripts/apply-payroll-phase5.mjs"]) {
+    // .env.example is on the list because it is COPIED, not read: an example
+    // that still named two people put the guessed list back into every fresh
+    // environment, whatever the code default says.
+    for (const file of ["src/lib/payroll-config.ts", "scripts/apply-payroll-phase5.mjs", ".env.example"]) {
         const source = read(file);
         assert.doesNotMatch(source, /cj@goldentouchremodeling\.com/, file);
         assert.doesNotMatch(source, /rlord@goldentouchremodeling\.com/, file);
     }
+    // And the example ships the empty value, not a commented-out one somebody
+    // would uncomment.
+    assert.match(read(".env.example"), /^PAYROLL_SALARIED_EMAILS=\s*$/m);
     // And the config says so out loud, so the next reader knows it is deliberate.
     assert.match(read("src/lib/payroll-config.ts"), /fails CLOSED/);
 });

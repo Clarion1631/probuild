@@ -10,7 +10,7 @@
 //
 //   PAYROLL_PERIOD          "weekly" | "biweekly"   (default: biweekly)
 //   PAYROLL_WEEK_START      "monday" | "sunday"     (default: monday)
-//   PAYROLL_SALARIED_EMAILS comma-separated emails  (default: CJ + Richard)
+//   PAYROLL_SALARIED_EMAILS comma-separated emails  (default: EMPTY — nobody)
 //
 // PAYROLL_WEEK_START moves the PAY PERIOD boundary only. Washington overtime
 // is a property of the Mon-Sun WORKWEEK and is computed in src/lib/overtime.ts,
