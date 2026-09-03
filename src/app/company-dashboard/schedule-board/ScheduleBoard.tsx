@@ -582,7 +582,10 @@ export function ScheduleBoard({
                             name: existing?.name ?? member?.name ?? member?.email ?? "Crew member",
                             status: existing?.status ?? "ACTIVATED",
                             userRole: existing?.userRole ?? member?.role ?? "FIELD_CREW",
-                            showOnDispatch: existing?.showOnDispatch ?? member?.showOnDispatch ?? false,
+                            // A new drag has no persisted membership row yet. Keep it visible
+                            // until the API-backed roster value arrives; FINANCE remains blocked
+                            // by isDispatchable regardless of this optimistic default.
+                            showOnDispatch: existing?.showOnDispatch ?? member?.showOnDispatch ?? true,
                             assignmentRole: assignment.role,
                         };
                     })

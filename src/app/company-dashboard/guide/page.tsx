@@ -76,7 +76,7 @@ export default async function CompanyDashboardGuidePage() {
                 <h2 className="text-base font-semibold text-hui-textMain mb-4">Dispatch — running the day</h2>
                 <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
                     <li><strong>Day</strong> shows one card per job with work on that day: the task, its status and progress, who&apos;s on it, and a materials count. People with nothing assigned sit on the <strong>Available</strong> bench up top. Use the <strong>←</strong> <strong>→</strong> arrows to plan tomorrow or next Monday the same way; <strong>Today</strong> jumps back.</li>
-                    <li>The strip above the cards is the morning checklist — it flags jobs with no one on them, tasks with no lead, double-bookings, and anything Blocked. Click a flag to jump to the problem. &quot;Day clear&quot; means today runs.</li>
+                    <li>The strip above the cards is the day checklist — it flags jobs with no one on them, tasks with no lead, double-bookings, and anything Blocked. Click a flag to jump to the problem. &quot;Day clear&quot; means the selected day runs.</li>
                     <li><strong>Week</strong> flips it: one row per person across the week, so you can see everyone&apos;s week at a glance. Click an empty day to give someone a task.</li>
                     <li><strong>Drag a crew chip onto a task</strong> to assign them. Chip changes pile up as drafts just like date moves.</li>
                     <li><strong>Review dispatch</strong> shows every change in plain English — &quot;Kevin → Framing (add)&quot; — before anything commits. One confirm saves it all together, or nothing at all if the schedule changed under you. Your drafts survive either way.</li>
@@ -85,17 +85,17 @@ export default async function CompanyDashboardGuidePage() {
             </div>
 
             <div className="hui-card p-6 mb-6">
-                <h2 className="text-base font-semibold text-hui-textMain mb-1">Every morning, in order</h2>
-                <p className="text-sm text-hui-textMuted mb-5">The crew app only shows what you confirm here. A job with no task for today is an empty screen for whoever is standing on it.</p>
+                <h2 className="text-base font-semibold text-hui-textMain mb-1">Dispatch day, in order</h2>
+                <p className="text-sm text-hui-textMuted mb-5">The crew app only shows what you confirm here. A job with no task for the selected day is an empty screen for whoever is standing on it.</p>
                 <ol className="list-none p-0 m-0">
                     <li>
                         <Step n={1} title="Check the strip">
-                            <p>Unstaffed today, Crewless job, Needs review, No field update. Click a flag to jump to it.</p>
+                            <p>Unstaffed, Crewless job, Needs review, No field update. Click a flag to jump to it.</p>
                         </Step>
                     </li>
                     <li>
-                        <Step n={2} title="Give every job a task for today">
-                            <p>A card that says &quot;No task planned today&quot; has crew but nothing to do. Click <strong>+ Task</strong> on the card, or pick the project in the Task bank and hit <strong>Schedule</strong> next to an unscheduled item. Planning ahead? Arrow to that day first.</p>
+                        <Step n={2} title="Give every job a task for the selected day">
+                            <p>A card that says &quot;No task planned for this day&quot; has crew but nothing to do. Click <strong>+ Task</strong> on the card, or pick the project in the Task bank and hit <strong>Schedule</strong> next to an unscheduled item. Planning ahead? Arrow to that day first.</p>
                         </Step>
                     </li>
                     <li>
