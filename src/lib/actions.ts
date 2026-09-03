@@ -15746,7 +15746,7 @@ export async function resolveUnknownOrphan(
         postVoidQbPurchaseId: null,
         // The worker must not be mid-anything with this row.
         claimToken: null,
-        updatedAt: seenAt,
+        updatedAt: seenAt,
     };
 
     let purchaseId: string | null = null;
