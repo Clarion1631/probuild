@@ -6,7 +6,13 @@ import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import { acquireCronLease } from "@/lib/cron-lease";
 import { logAutomationEvent } from "@/lib/automation-events";
-import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
+import {
+    downloadVerified,
+    inspectStoredObject,
+    // THE one builder for a lease-bearing CAS. See leaseFence.
+    leaseFence,
+    sealAndPublish,
+} from "@/lib/receipt-intake/stored-object";
 import {
     deleteObjectOrRecord,
     queueObjectCleanup,
@@ -391,7 +397,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     ],
                 },
                 select: {
-                    id: true, storagePath: true, mimeType: true, stateReason: true,
+                    // `state` is read rather than assumed from the WHERE above:
+                    // every mutation below fences on the row as OBSERVED, and a
+                    // hard-coded "STAGING" in the fence would be a second copy
+                    // of that fact that could drift from the query.
+                    id: true, state: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
                     uploadLeaseVersion: true, uploadLeaseNonce: true,
                 },
@@ -451,19 +461,29 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // correct bytes arriving a minute later would find the
                         // row already gone from STAGING.
                         if (leaseLive) { leaseActive++; continue; }
-                        await prisma.receiptIntake.updateMany({
-                            // Fenced on the lease this verdict was reached
-                            // about: a resumed /start bumps it, and the bytes
-                            // that mismatched belong to an upload nobody is
-                            // waiting for any more.
-                            where: {
-                                id: row.id,
-                                state: "STAGING",
-                                uploadLeaseVersion: row.uploadLeaseVersion,
-                            },
+                        // THE COMPLETE LEASE IDENTITY the verdict was reached
+                        // about — not state + version.
+                        //
+                        // `leaseLive` was computed from the SELECT at the top
+                        // of this sweep, and everything since (a storage round
+                        // trip per row) is time in which a /start retry can
+                        // extend the lease over the same path at the same
+                        // version, moving only the nonce and the expiry. A
+                        // fence of {state, version} still matched, so the sweep
+                        // parked a row whose upload URL had just been renewed
+                        // and whose client was still uploading to it. The
+                        // reject branch below already pinned the whole identity;
+                        // this is the same rule, applied to the writes that
+                        // forgot it.
+                        const { count: mismatchParked } = await prisma.receiptIntake.updateMany({
+                            where: { id: row.id, ...leaseFence(row) },
                             data: { state: "NEEDS_REVIEW", stateReason: "sha-mismatch", nextRetryAt: null },
                         });
-                        parked++;
+                        // COUNTED ONLY WHEN THE CAS LANDED. A losing write
+                        // reported a park that never happened, so the sweep's
+                        // own log said it had cleared rows it had not touched.
+                        if (mismatchParked > 0) parked++;
+                        else leaseActive++;
                         continue;
                     }
 
@@ -477,11 +497,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         seal: sealObject,
                         commit: async (tx, canonicalPath, values) => {
                             const { count } = await tx.receiptIntake.updateMany({
-                                where: {
-                                    id: row.id,
-                                    state: "STAGING",
-                                    uploadLeaseVersion: row.uploadLeaseVersion,
-                                },
+                                // Same complete identity as the parks. This one
+                                // publishes rather than parks, but a lease
+                                // refreshed since the inspection means the
+                                // client is mid-upload of something else — and
+                                // publishing that row would seal bytes it is
+                                // about to replace, then schedule the upload
+                                // path's cleanup against an expiry the live URL
+                                // outlives. The schedule below reads the SAME
+                                // snapshot this CAS pins, so the two agree by
+                                // construction.
+                                where: { id: row.id, ...leaseFence(row) },
                                 data: {
                                     state: "RECEIVED",
                                     nextRetryAt: null,
@@ -534,15 +560,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // connection came back to find its row already in the review
                     // queue. Wait until the URL cannot possibly land any more.
                     if (leaseLive) { leaseActive++; continue; }
-                    await prisma.receiptIntake.updateMany({
-                        where: {
-                            id: row.id,
-                            state: "STAGING",
-                            uploadLeaseVersion: row.uploadLeaseVersion,
-                        },
+                    // The complete identity again: `leaseLive` is a fact about
+                    // the SELECT, and a /start retry between it and here
+                    // renews the very URL this park says can no longer land.
+                    const { count: missingParked } = await prisma.receiptIntake.updateMany({
+                        where: { id: row.id, ...leaseFence(row) },
                         data: { state: "NEEDS_REVIEW", stateReason: "file-missing", nextRetryAt: null },
                     });
-                    parked++;
+                    if (missingParked > 0) parked++;
+                    else leaseActive++;
                     continue;
                 }
                 // Rejected: the object exists and is not acceptable.
@@ -560,7 +586,10 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 const dropped = await rejectRowAndQueueCleanup(
                     {
                         id: row.id,
-                        state: "STAGING",
+                        // The OBSERVED state, like every other field here — a
+                        // literal would be a second copy of the SELECT's own
+                        // predicate, free to drift from it.
+                        state: row.state,
                         stateReason: row.stateReason,
                         storagePath: row.storagePath,
                         uploadLeaseVersion: row.uploadLeaseVersion,

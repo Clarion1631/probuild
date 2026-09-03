@@ -1113,3 +1113,169 @@ test("PUBLISH vs REFRESH control: an UNrefreshed lease still publishes", async (
     assert.equal(store.get().state, "RECEIVED");
     assert.equal(queued, 1, "and the upload object's cleanup is queued in the commit");
 });
+
+// ── THE SWEEPER IS THE THIRD PUBLISHER (Codex round-14 item 2) ──────────────
+//
+// /finalize and the stale-STAGING sweep both move a STAGING row, and a /start
+// retry can extend its lease between either one's inspection and its write.
+// The sweep computes `leaseLive` from the SELECT at the top of the pass and
+// then spends a storage round trip per row, so that window is seconds wide.
+//
+// Its sha-mismatch park, its publish commit and its file-missing park all
+// fenced on {state, version} — which a refresh does not move — so the sweep
+// parked or published over a URL a client was still uploading to, and
+// scheduled the upload path's cleanup against an obsolete expiry. Only the
+// reject branch carried the whole identity, which is what proved the intent.
+
+/** What reuseLiveLease writes: same path, same version, new generation. */
+function refreshedInto(store: ReturnType<typeof rowStore>) {
+    store.set({
+        uploadLeaseNonce: "nonce-refreshed",
+        uploadUrlExpiresAt: new Date(EXPIRY.getTime() + 2 * 60 * 60_000),
+    });
+}
+
+/** The row the sweeper SELECTed, and the fence it must therefore carry. */
+function stagingRow() {
+    return rowStore({
+        id: "row-1",
+        state: "STAGING",
+        stateReason: null,
+        claimToken: null,
+        storagePath: "receipts/intake/row-1.v1.png",
+        uploadLeaseVersion: 1,
+        uploadLeaseNonce: NONCE,
+        uploadUrlExpiresAt: EXPIRY,
+    });
+}
+
+const observedStaging = (store: ReturnType<typeof rowStore>) => observedRow({
+    state: store.get().state as string,
+    stateReason: store.get().stateReason as string | null,
+    uploadLeaseVersion: store.get().uploadLeaseVersion as number,
+    uploadLeaseNonce: store.get().uploadLeaseNonce as string,
+    uploadUrlExpiresAt: store.get().uploadUrlExpiresAt as Date,
+});
+
+test("SWEEP vs REFRESH: a park loses to a lease reissued mid-inspection", async () => {
+    const store = stagingRow();
+    const observed = observedStaging(store);
+
+    // The storage round trip the sweep makes per row — and the /start retry
+    // that lands inside it.
+    refreshedInto(store);
+
+    // The park the sweep would then write, fenced exactly as the code does.
+    const parked = store.updateMany(
+        { id: "row-1", ...leaseFence(observed) },
+        { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+    );
+
+    assert.equal(parked, 0, "the park matched nothing");
+    assert.equal(store.get().state, "STAGING", "the client's row survives");
+    assert.equal(store.get().uploadLeaseNonce, "nonce-refreshed", "and its new lease stands");
+
+    // PRE-FIX CONTROL: the fence the sweep used to carry still matches, because
+    // a refresh moves neither the state nor the version.
+    const halfFence = { id: "row-1", state: "STAGING", uploadLeaseVersion: 1 };
+    const wouldHaveMatched = Object.entries(halfFence)
+        .every(([k, v]) => store.get()[k] === v);
+    assert.equal(wouldHaveMatched, true, "state + version cannot see a refresh — that was the bug");
+});
+
+test("SWEEP vs REFRESH: the publish commit loses too", async () => {
+    // Publishing is allowed while a lease is live, so this branch is reachable
+    // with a working URL by design — which is exactly why its CAS has to see a
+    // refresh. Sealing bytes the client is about to replace, and then
+    // scheduling the upload path's cleanup against the OLD expiry, is the
+    // orphan the schedule exists to prevent.
+    const store = stagingRow();
+    const observed = observedStaging(store);
+
+    let queuedExpiry: Date | null = null;
+    const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
+        seal: async (_u: string, canonical: string) => {
+            refreshedInto(store);
+            return canonical;
+        },
+        commit: async () => store.updateMany(
+            { id: "row-1", ...leaseFence(observed) },
+            { state: "RECEIVED", stateReason: null },
+        ),
+        queueUploadCleanup: async () => {
+            queuedExpiry = observed.uploadUrlExpiresAt;
+            return "ev-1";
+        },
+        settleUploadCleanup: async () => {},
+        currentStoragePath: async () => store.get().storagePath as string,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+
+    assert.equal(outcome?.published, false, "the sweep did not publish over the refreshed lease");
+    assert.equal(store.get().state, "STAGING");
+    assert.equal(queuedExpiry, null, "and queued no cleanup on the obsolete expiry");
+});
+
+test("SWEEP CONTROL: an unrefreshed row still parks and still publishes", async () => {
+    // Without this, a fence that simply never matched would pass both tests
+    // above while stopping the sweep from doing anything at all.
+    const parkStore = stagingRow();
+    assert.equal(
+        parkStore.updateMany(
+            { id: "row-1", ...leaseFence(observedStaging(parkStore)) },
+            { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+        ),
+        1,
+    );
+    assert.equal(parkStore.get().state, "NEEDS_REVIEW");
+
+    const pubStore = stagingRow();
+    const observed = observedStaging(pubStore);
+    const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
+        seal: async (_u: string, canonical: string) => canonical,
+        commit: async () => pubStore.updateMany(
+            { id: "row-1", ...leaseFence(observed) },
+            { state: "RECEIVED", stateReason: null },
+        ),
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async () => {},
+        currentStoragePath: async () => pubStore.get().storagePath as string,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+    assert.equal(outcome?.published, true);
+    assert.equal(pubStore.get().state, "RECEIVED");
+});
+
+test("THREE PUBLISHERS, one fence: /finalize, the sweeper and a /start refresh", () => {
+    // The interleaving as source: both publishers reach the same builder, and
+    // the sweep's parks now do too. A reader should not have to diff three
+    // where clauses to know they agree.
+    const finalize = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    );
+    const sweeper = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    const start = readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    );
+    assert.match(finalize, /where: \{ id, \.\.\.leaseFence\(row\), \.\.\.merged\.guard \}/);
+    // The sweep: sha-mismatch park, publish commit, file-missing park.
+    const sweep = sweeper.slice(
+        sweeper.indexOf("sweepStaleStaging: async"),
+        sweeper.indexOf("loadPhases:"),
+    );
+    assert.equal((sweep.match(/\.\.\.leaseFence\(row\)/g) ?? []).length, 3);
+    // ...and the counters only move when the CAS did.
+    assert.match(sweep, /if \(mismatchParked > 0\) parked\+\+;/);
+    assert.match(sweep, /if \(missingParked > 0\) parked\+\+;/);
+    // /start builds its fence inside the shared repath helper, so neither of
+    // its two branches can hand in half an identity.
+    assert.match(start, /where: \{ id: existing\.id, \.\.\.leaseFence\(existing\) \},/);
+    assert.equal((start.match(/await repathWithCleanup\(/g) ?? []).length, 2);
+});

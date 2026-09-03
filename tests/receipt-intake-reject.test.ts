@@ -263,10 +263,13 @@ test("/start hands a recoverable park a NEW url, and asks the shared rule which 
     assert.match(body, /fileSha256: "",/, "and the stale stored hash is cleared");
     // Fenced like every other publish-path write, and a lost fence writes
     // nothing rather than pointing a live row at an empty path.
-    // leaseFence, not publishFence: this branch REPATHS the row and drops the
-    // previous object, and a /start that refreshed the lease over the same
-    // path and version moves nothing publishFence can see.
-    assert.match(body, /\{ id: existing\.id, \.\.\.leaseFence\(existing\) \}/);
+    // The fence is no longer built at the call site at all: `repathWithCleanup`
+    // takes the OBSERVED ROW and builds it from leaseFence itself, so neither
+    // /start branch can hand in half a lease identity — and the Prisma call
+    // names the builder rather than an opaque parameter, which is what makes it
+    // visible to the tripwire in receipt-intake-lease-fence.test.ts.
+    assert.match(body, /await repathWithCleanup\(\s*\n?\s*existing,/);
+    assert.match(start, /where: \{ id: existing\.id, \.\.\.leaseFence\(existing\) \},/);
     assert.match(body, /return leaseConflict\(existing\.id\)/);
 });
 
@@ -503,14 +506,29 @@ test("the sweeper and /start both fence on the lease version", () => {
         "and every lost claim goes through it",
     );
 
-    // Every destructive sweeper write carries the version it observed.
+    // Every sweeper write carries the COMPLETE observed lease identity, and
+    // gets it from the one builder. Counting hand-rolled `uploadLeaseVersion:`
+    // pins is what let three of these four fence on half the identity while
+    // the fourth (the reject) carried all of it.
     const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
     const body = fn.slice(0, fn.indexOf("loadPhases:"));
     assert.equal(
-        (body.match(/uploadLeaseVersion: row\.uploadLeaseVersion/g) ?? []).length,
-        4,
-        "the two parks, the publish commit and the reject",
+        (body.match(/\.\.\.leaseFence\(row\)/g) ?? []).length,
+        3,
+        "the two parks and the publish commit",
     );
+    // The reject reaches the same builder through rejectRowAndQueueCleanup,
+    // which now builds its delete's where from leaseFence too.
+    assert.match(body, /cleanupNotBefore: cleanupNotBefore\(row\),/);
+    const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
+    assert.match(cleanup, /where: \{ id: row\.id, storagePath: row\.storagePath, \.\.\.leaseFence\(row\) \}/);
+    // The remaining `uploadLeaseVersion: row.uploadLeaseVersion` in this file
+    // is the RejectFence VALUE the sweeper hands to rejectRowAndQueueCleanup,
+    // not a where clause — and its type makes the list exhaustive, so a
+    // forgotten field is a compile error rather than a half fence. The
+    // where-clause rule itself is enforced for all six files by the tripwire in
+    // tests/receipt-intake-lease-fence.test.ts.
+    assert.match(body, /state: row\.state,/, "the reject fence pins the OBSERVED state");
     // ...and the reject also re-reads the row inside the transaction.
     assert.match(body, /fresh => uploadLeaseActive\(/);
 });

@@ -20,7 +20,7 @@
  * neither does this module — both /start branches go through it.
  */
 import { randomUUID } from "node:crypto";
-import { publishFence, uploadPathFor, type ObservedRow } from "./stored-object";
+import { leaseFence, publishFence, uploadPathFor, type ObservedRow } from "./stored-object";
 
 export interface LeaseRow extends ObservedRow {
     id: string;
@@ -219,13 +219,22 @@ export async function discardUnresumedLease(
     db: DiscardClient,
 ): Promise<"discarded" | "resumed"> {
     const { count } = await db.deleteMany({
+        // THE SHARED BUILDER, like every other lease-bearing write. The row was
+        // INSERTed by this request moments ago, so its state is "STAGING" and
+        // its reason and claim are null by construction — stating them through
+        // leaseFence costs nothing and keeps this delete inside the one rule
+        // rather than beside it. `storagePath` rides along for the same reason
+        // the reject's does: a delete must be sure which object it accounts for.
         where: {
             id: created.id,
-            state: "STAGING",
             storagePath: created.storagePath,
-            uploadLeaseVersion: created.uploadLeaseVersion,
-            uploadUrlExpiresAt: created.uploadUrlExpiresAt,
-            uploadLeaseNonce: created.uploadLeaseNonce,
+            ...leaseFence({
+                state: "STAGING",
+                stateReason: null,
+                uploadLeaseVersion: created.uploadLeaseVersion,
+                uploadLeaseNonce: created.uploadLeaseNonce,
+                uploadUrlExpiresAt: created.uploadUrlExpiresAt,
+            }),
         },
     });
     return count > 0 ? "discarded" : "resumed";

@@ -11,6 +11,7 @@ import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import {
     finalizeDisposition,
     leaseFence,
+    type ObservedRow,
     uploadPathFor,
     verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
@@ -324,7 +325,6 @@ export async function POST(req: Request) {
                 // or the row never moves.
                 const repathed = await repathWithCleanup(
                     existing,
-                    { id: existing.id, ...leaseFence(existing) },
                     {
                         storagePath: retryPath,
                         expectedSha256,
@@ -504,13 +504,25 @@ export async function POST(req: Request) {
             // BEFORE the signing — the CAS re-points the row whatever the
             // signer does next, so cleaning up only on the happy path left
             // every 503 below leaking an object nothing referenced.
+            //
+            // THE COMPLETE LEASE IDENTITY, not state + version.
+            //
+            // `reuseLiveLease` extends a lease over the SAME path at the SAME
+            // version, writing only the nonce and the expiry — so a fence of
+            // {state, version} still matched a row another request had just
+            // refreshed. Around the expiry boundary that is a live race: A
+            // reads the lease a millisecond before it lapses and extends it; B
+            // reads it a millisecond after, finds it dead, and falls through to
+            // here — where its CAS matched anyway, overwrote A's refresh,
+            // repathed the row and queued A's path for deletion. A had already
+            // returned a working-looking URL to a path nothing now references.
+            // `state` is provably "STAGING" here (the guard at :410 returned
+            // for everything else), so this is strictly stronger, never
+            // different. A lost CAS answers the same retryable 409 the re-arm
+            // branch does, and the retry re-reads and re-decides rather than
+            // orphaning anything — repathWithCleanup rolls back as one.
             const resumedRepath = await repathWithCleanup(
                 existing,
-                {
-                    id: existing.id,
-                    state: "STAGING",
-                    uploadLeaseVersion: existing.uploadLeaseVersion,
-                },
                 {
                     storagePath: resumePath,
                     uploadLeaseVersion: nextLease,
@@ -610,15 +622,26 @@ export async function POST(req: Request) {
  * capability would let its holder PUT the object straight back.
  */
 async function repathWithCleanup(
-    existing: { storagePath: string; uploadUrlExpiresAt: Date | null; createdAt: Date },
-    fence: Record<string, unknown>,
+    /**
+     * The row AS OBSERVED. The fence is built from it here rather than handed
+     * in: a `fence: Record<string, unknown>` parameter let a caller pass half
+     * the lease identity, and one did — the resume branch pinned state and
+     * version while `reuseLiveLease` moves only the nonce and the expiry. It
+     * also put the fence somewhere no source check could see it, because the
+     * Prisma call in this function names an opaque parameter rather than a
+     * builder. Taking the row closes both.
+     */
+    existing: ObservedRow & { id: string; storagePath: string; uploadUrlExpiresAt: Date | null; createdAt: Date },
     data: Record<string, unknown>,
     nextPath: string,
     reason: string,
 ): Promise<"moved" | "conflict" | "unavailable"> {
     try {
         return await prisma.$transaction(async tx => {
-            const { count } = await tx.receiptIntake.updateMany({ where: fence, data });
+            const { count } = await tx.receiptIntake.updateMany({
+                where: { id: existing.id, ...leaseFence(existing) },
+                data,
+            });
             if (count === 0) return "conflict" as const;
             // Only when the path actually MOVED. Queueing the path the row was
             // just re-pointed AT would mark the live upload target for deletion.

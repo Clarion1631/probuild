@@ -16,6 +16,7 @@ import type { Prisma } from "@prisma/client";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
 import { removeReceiptObject, uploadReceiptObject } from "./bucket";
+import { leaseFence } from "./stored-object";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
@@ -416,23 +417,13 @@ export async function rejectRowAndQueueCleanup(
             if (objection) throw new RejectFenceLost(`${row.id}: ${objection}`);
 
             const { count } = await tx.receiptIntake.deleteMany({
-                where: {
-                    id: row.id,
-                    state: row.state,
-                    stateReason: row.stateReason,
-                    claimToken: null,
-                    storagePath: row.storagePath,
-                    // The lease the caller INSPECTED. A resumed /start bumps
-                    // this and re-points the row at a new path, so a sweep
-                    // that decided on the old upload deletes nothing.
-                    uploadLeaseVersion: row.uploadLeaseVersion,
-                    // ...and the GENERATION, which is the only column a
-                    // same-path, same-version REFRESH moves. Without it a
-                    // /start that handed the client a fresh URL a millisecond
-                    // ago does not stop this delete.
-                    uploadLeaseNonce: row.uploadLeaseNonce,
-                    uploadUrlExpiresAt: row.uploadUrlExpiresAt,
-                },
+                // ONE BUILDER, shared with every other lease-bearing write:
+                // state, reason, claim, version, generation and expiry. Hand-
+                // rolling it here is how three sweeper writes came to pin only
+                // half of it. `storagePath` rides along because a delete is the
+                // one operation that must also be sure WHICH object it is
+                // accounting for.
+                where: { id: row.id, storagePath: row.storagePath, ...leaseFence(row) },
             });
             if (count !== 1) throw new RejectFenceLost(row.id);
             return event.id;
