@@ -225,6 +225,13 @@ jobs:
       # suite exercises, so it needs its OWN value here, not a reuse of
       # RECEIPT_INTAKE_SECRET.
       RECEIPT_BRIDGE_SECRET: "e2e-ci-receipt-bridge-secret"
+      # The deposit sweep's live-apply switch (src/lib/deposit-sweep.ts). It is
+      # OFF by default — booking money on an amount-only match is Justin's
+      # decision, not a default — so the e2e cases that exercise the MONEY
+      # WRITE need the server under test configured the way a live deployment
+      # would be. Everything here runs against the throwaway CI database with
+      # QuickBooks mocked (E2E_QBO_MOCK), so no real money can move.
+      DEPOSIT_SWEEP_LIVE_APPLY: "true"
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.

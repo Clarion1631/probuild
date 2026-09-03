@@ -35,10 +35,14 @@ const MAX_ATTEMPTS = 8;
  * its tx client) so the outbox row commits atomically with the payment. Not deduped: an
  * undo + re-pay is a new settlement event that must notify again — the upstream settle claim
  * is what guarantees this runs once per event.
+ *
+ * `suppressClientReceipt` is persisted on the row rather than passed to a notifier here,
+ * because delivery is ASYNC: the drainer (possibly the hourly cron, in a later process)
+ * is what actually calls the notifier, so the decision has to survive on the row.
  */
 export async function enqueueMilestonePaid(
     tx: Prisma.TransactionClient,
-    input: { scheduleId: string; scheduleType: ScheduleType },
+    input: { scheduleId: string; scheduleType: ScheduleType; suppressClientReceipt?: boolean },
 ): Promise<void> {
     await tx.paymentNotification.create({
         data: {
@@ -46,18 +50,22 @@ export async function enqueueMilestonePaid(
             scheduleType: input.scheduleType,
             kind: "milestone_paid",
             status: "PENDING",
+            ...(input.suppressClientReceipt ? { suppressClientReceipt: true } : {}),
         },
     });
 }
 
-async function deliver(row: { id: string; scheduleId: string; scheduleType: string }): Promise<{ ok: boolean }> {
+async function deliver(row: { id: string; scheduleId: string; scheduleType: string; suppressClientReceipt: boolean | null }): Promise<{ ok: boolean }> {
     const { notifyMilestonePaid, notifyEstimateMilestonePaid } = await import("./payment-notifications");
     // Pass the outbox row id as the dedupe key so the activity-log dedupe is per-settlement-EVENT,
     // not per-schedule — an undo + re-pay reuses the same scheduleId but gets a new outbox row,
     // and so correctly logs a second payment_received.
+    // suppressClientReceipt is only ever set by the deposit sweep, which settles INVOICE
+    // milestones, so it is handed to notifyMilestonePaid alone (see DEPOSIT-SWEEP-PLAN.md
+    // "Notifications"). Nothing enqueues a suppressed estimate-side row today.
     return row.scheduleType === "estimate"
         ? notifyEstimateMilestonePaid(row.scheduleId, { dedupeKey: row.id })
-        : notifyMilestonePaid(row.scheduleId, { dedupeKey: row.id });
+        : notifyMilestonePaid(row.scheduleId, { dedupeKey: row.id, suppressClientReceipt: row.suppressClientReceipt === true });
 }
 
 /**
@@ -92,7 +100,7 @@ export async function drainPaymentNotifications(
     const candidates = await prisma.paymentNotification.findMany({
         where,
         orderBy: { createdAt: "asc" },
-        select: { id: true, scheduleId: true, scheduleType: true, attempts: true, status: true },
+        select: { id: true, scheduleId: true, scheduleType: true, attempts: true, status: true, suppressClientReceipt: true },
         take: limit,
     });
 
@@ -125,7 +133,7 @@ export async function drainPaymentNotifications(
         let outcome: { ok: boolean } = { ok: false };
         let lastError: string | null = null;
         try {
-            outcome = await deliver({ id: row.id, scheduleId: row.scheduleId, scheduleType: row.scheduleType });
+            outcome = await deliver({ id: row.id, scheduleId: row.scheduleId, scheduleType: row.scheduleType, suppressClientReceipt: row.suppressClientReceipt });
         } catch (e: any) {
             lastError = String(e?.message ?? e).slice(0, 500);
         }
