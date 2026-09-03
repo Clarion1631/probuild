@@ -3824,7 +3824,10 @@ export async function breakQBInvoiceLink(
                 expectedState: ambiguousCreateFingerprint(schedule),
                 decision: "link-existing",
                 reason: "Break QB Link on a milestone whose create outcome was unknown",
-                actor: { id: user.id, email: user.email, role: user.role },
+                actor: {
+                    id: user.id, email: user.email, role: user.role,
+                    permissions: user.permissions, projectAccess: user.projectAccess, assignedProjects: user.assignedProjects,
+                },
             });
             if (!res.ok) return { success: false, error: res.message };
             revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
@@ -3889,7 +3892,10 @@ export async function resolveAmbiguousInvoiceCreate(input: {
         expectedState: input.expectedState,
         decision: input.decision,
         reason: input.reason,
-        actor: { id: user.id, email: user.email, role: user.role },
+        actor: {
+            id: user.id, email: user.email, role: user.role,
+            permissions: user.permissions, projectAccess: user.projectAccess, assignedProjects: user.assignedProjects,
+        },
     });
 
     if (res.ok) {

@@ -198,6 +198,24 @@ test("round 33 gate: DocNumber and PrivateNote match but the total differs — r
     assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked for manual review");
 });
 
+test("round 31 gate: a candidate whose QuickBooks total is unreadable (non-finite) is refused, not linked", async () => {
+    // matches[0].total comes from Number(TotalAmt) in findQBInvoicesByDocNumber
+    // — an unparseable TotalAmt reads as NaN, and Math.abs(NaN - x) > 0.005 is
+    // FALSE, which used to let a candidate whose amount could not even be read
+    // slip past the mismatch guard as though it matched.
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, NaN)], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written — an unreadable total must never be adopted blind");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked for manual review");
+});
+
 test("an invoice sharing the DocNumber but not our PrivateNote is NOT ours", async () => {
     // DocNumber is not unique in QuickBooks. Matching on it alone would adopt
     // somebody else's invoice as this milestone's bill.
@@ -307,8 +325,31 @@ test("round 30 gate: an ambiguous-create marker with NO readable timestamp (lega
     assert.equal(row.qbSyncError, legacyMarker, "still parked — nothing was cleared");
 });
 
-test("round 29 gate: a young create-in-flight marker with an EXACT match still links — adopting a real invoice does not depend on age", async () => {
+test("round 31 gate: a young create-in-flight marker with an EXACT match is refused, not linked — the original sender may still be running", async () => {
+    // If the original sender's own POST is still in flight, its post-create
+    // link write can lose the CAS to this one (quickbooks-payments.ts), which
+    // makes IT compensate — compensateAndUnlink then deletes the very invoice
+    // this resolver just adopted. Linking on age alone (round 29) was unsafe;
+    // an exact match on a fresh marker must refuse exactly like a clear does.
     const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, new Date()) });
+    const db = makeDb(row, null);
+    let asked = 0;
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "link-existing", expectedState: ambiguousCreateFingerprint(row) },
+        {
+            db, logEvent,
+            getTokens: async () => TOKENS,
+            findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
+        },
+    );
+    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(row.qbInvoiceId, null, "nothing written — the interleaving exact match must not be adopted");
+    assert.equal(asked, 0, "refused before ever asking QuickBooks");
+});
+
+test("round 31 gate: a create-in-flight marker past the staleness window CAN be linked on an exact match", async () => {
+    const oldAt = new Date(Date.now() - CREATE_IN_FLIGHT_STALE_MS - 60_000);
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, oldAt) });
     const db = makeDb(row, null);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "link-existing", expectedState: ambiguousCreateFingerprint(row) },
@@ -374,10 +415,37 @@ test("the role rule is narrower than the invoices permission", async () => {
         assert.equal(row.qbInvoiceId, null, `${role} must not be able to link`);
     }
     const finance = await resolveAmbiguousInvoiceCreateCore(
-        { ...base, expectedState: ambiguousCreateFingerprint(row), actor: { id: "u3", email: "f@x", role: "FINANCE" } },
+        {
+            ...base, expectedState: ambiguousCreateFingerprint(row),
+            actor: { id: "u3", email: "f@x", role: "FINANCE", projectAccess: [{ projectId: "proj-1" }] },
+        },
         deps([invoice("qb-9", MILESTONE_NOTE)], db),
     );
     assert.equal(finance.ok, true);
+});
+
+test("round 31 gate: a FINANCE user restricted to a different project is refused — no QuickBooks call, nothing written", async () => {
+    // canResolveAmbiguousCreate only proves FINANCE may resolve ambiguous
+    // creates somewhere — it says nothing about THIS row's project. The row
+    // belongs to "proj-1"; an actor scoped only to "proj-other" must be
+    // refused before QuickBooks is ever asked.
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    let asked = 0;
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        {
+            ...base, expectedState: ambiguousCreateFingerprint(row),
+            actor: { id: "u4", email: "f2@x", role: "FINANCE", projectAccess: [{ projectId: "proj-other" }] },
+        },
+        {
+            db, logEvent,
+            getTokens: async () => TOKENS,
+            findInvoices: async () => { asked++; return [invoice("qb-9", MILESTONE_NOTE)]; },
+        },
+    );
+    assert.equal(!res.ok && res.refusal, "forbidden");
+    assert.equal(asked, 0, "refused before ever asking QuickBooks");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
 });
 
 test("a row that moved since the page was rendered is refused as stale", async () => {
@@ -427,7 +495,9 @@ test("a progress billing resolves the same way, and comes back Staged", async ()
 });
 
 test("an in-flight marker is resolvable too — a crash leaves exactly that", async () => {
-    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY) });
+    // Past the staleness window: a genuinely crashed process, not one that
+    // might still be running (see the round 31 gate tests above for that case).
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT) });
     const db = makeDb(row, null);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: ambiguousCreateFingerprint(row) },

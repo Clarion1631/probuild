@@ -1797,8 +1797,24 @@ export async function syncEstimateToQB(
     // Error made the two indistinguishable to every caller upstream.
     if (!res.ok) throw await qboResponseError(res, "QB estimate sync");
 
-    const data = await res.json();
-    const qbId = data.Estimate?.Id;
+    // A 2xx header only proves QuickBooks accepted the request, not that we
+    // ever learned what it did with it. The old boundary ended above this
+    // line, so a stalled/truncated/malformed body here fell through to a
+    // plain QBTimeoutError/QboRetryableError — indistinguishable from a
+    // dispatch-time failure to the route's classifier, which advertised
+    // retry:true for what may already be a created estimate. Everything from
+    // here on is the same "outcome unknown" case as the dispatch catch above.
+    let qbId: string | undefined;
+    try {
+        const data = await res.json();
+        qbId = data.Estimate?.Id;
+    } catch (error) {
+        // A caller-originated abort must propagate as itself, same rule as
+        // qboResponseError/parseJsonOrNull — everything else (a timeout mid
+        // read, a dead connection, a truncated/malformed body) is ambiguous.
+        if (isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
+    }
     if (!qbId) {
         // A 2xx with no Estimate.Id is not a success — returning it as one
         // left every caller building URLs and persisting `txnId: undefined`.
@@ -1867,8 +1883,18 @@ export async function syncInvoiceToQB(
     // Same shared classification as the estimate push above.
     if (!res.ok) throw await qboResponseError(res, "QB invoice sync");
 
-    const data = await res.json();
-    const qbId = data.Invoice?.Id;
+    // See the matching comment on syncEstimateToQB above: a 2xx only proves
+    // QuickBooks accepted the request, so a body-read/parse failure here is
+    // the same "outcome unknown" case as a dispatch-time timeout, not a plain
+    // retryable error.
+    let qbId: string | undefined;
+    try {
+        const data = await res.json();
+        qbId = data.Invoice?.Id;
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
+    }
     if (!qbId) {
         // A 2xx with no Invoice.Id is not a success — see the matching comment
         // on syncEstimateToQB above.

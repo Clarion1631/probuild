@@ -23,7 +23,7 @@
  */
 import { prisma } from "./prisma";
 import { logAutomationEvent } from "./automation-events";
-import { canResolveAmbiguousCreate } from "./access-rules";
+import { canResolveAmbiguousCreate, canAccessProject, type ProjectScopedUser } from "./access-rules";
 import {
     createRouteDeadline,
     isQBTimeoutError,
@@ -82,7 +82,14 @@ export type ResolveAmbiguousCreateResult =
     | { ok: true; outcome: "cleared"; message: string }
     | { ok: false; refusal: AmbiguousCreateRefusal; message: string; candidates?: { qbInvoiceId: string; total: number }[] };
 
-export interface AmbiguousCreateActor {
+/**
+ * Extends `ProjectScopedUser` (role + permissions + project scope) so the
+ * horizontal check below — the row's project, not just the `invoices`/
+ * `resolveAmbiguousCreate` permission generally — can be enforced HERE,
+ * alongside the role rule, rather than trusted to whichever action wrapper
+ * happens to call this.
+ */
+export interface AmbiguousCreateActor extends ProjectScopedUser {
     id?: string | null;
     email?: string | null;
     role: string;
@@ -185,6 +192,19 @@ export async function resolveAmbiguousInvoiceCreateCore(
 
     const parked = await loadParkedRow(db, input.kind, input.id);
     if (!parked) return { ok: false, refusal: "not-found", message: "That row no longer exists." };
+    // canResolveAmbiguousCreate above only proves this actor may resolve
+    // ambiguous creates SOMEWHERE — it says nothing about THIS row's project.
+    // Without this, a FINANCE user scoped to one project could resolve (and
+    // potentially link a real QuickBooks invoice to) another project's row by
+    // id alone, before any QuickBooks call or write happens below. Fail
+    // CLOSED on an ownerless row, same as assertEstimateScope.
+    if (!parked.projectId || !canAccessProject(input.actor, parked.projectId)) {
+        return {
+            ok: false,
+            refusal: "forbidden",
+            message: "You do not have access to this project's invoices.",
+        };
+    }
     if (!parked.marker) {
         return {
             ok: false,
@@ -211,6 +231,37 @@ export async function resolveAmbiguousInvoiceCreateCore(
             refusal: "stale",
             message: "This changed since the page was loaded (someone may have already resolved it). Refresh and look again.",
         };
+    }
+
+    // A `create-in-flight` marker means the POST may STILL be running. A row
+    // promoted to `ambiguous-create` means OUR wait for that same request ended
+    // (a timeout, or a definite unknown-outcome failure) — but our deadline
+    // firing only means WE gave up; the original request can still be landing
+    // at QuickBooks' end for a while afterward, and may not be visible to the
+    // lookup below yet. Both kinds carry the ORIGINAL claim's timestamp (see
+    // composeCreateMarker), so both get the same cooldown here.
+    //
+    // This gate used to run only on the zero-match "confirmed-none" clear
+    // path, AFTER querying QuickBooks. That left an exact-match LINK on a
+    // fresh marker unguarded: if the original sender is still running, its own
+    // post-create link write can lose the race against this one (see the CAS
+    // in quickbooks-payments.ts), which makes IT compensate — and
+    // compensateAndUnlink deletes the very invoice this resolver just adopted.
+    // Running it here, before any QuickBooks call, refuses every outcome
+    // (link, clear, and mismatch alike) for as long as the original request
+    // might still be in flight. A marker without a readable claim time, or one
+    // younger than CREATE_IN_FLIGHT_STALE_MS, refuses outright. Neither table
+    // carries `updatedAt`, so an unreadable age is the common case today, not
+    // the exception — that is deliberately fail-closed.
+    if (parked.kind === CREATE_IN_FLIGHT_MARKER || parked.kind === AMBIGUOUS_CREATE_MARKER) {
+        const stillActive = parked.atMs == null || Date.now() - parked.atMs < CREATE_IN_FLIGHT_STALE_MS;
+        if (stillActive) {
+            return {
+                ok: false,
+                refusal: "create-still-active",
+                message: `${parked.code} may still be mid-create in QuickBooks right now — resolving this now could race the original request, letting a second invoice be created or a good one be deleted out from under you. Wait a few minutes and try again.`,
+            };
+        }
     }
 
     // Bounded: an unreachable QuickBooks must refuse quickly, not hang the
@@ -301,6 +352,22 @@ export async function resolveAmbiguousInvoiceCreateCore(
         // actually holds. A coincidental identity match (or a QuickBooks-side
         // edit) with the wrong total would otherwise be linked blind, attaching
         // a bill for money this row does not actually owe.
+        //
+        // `matches[0].total` comes from `Number(TotalAmt)` on the QBO row — an
+        // unparseable TotalAmt reads as NaN, and `Math.abs(NaN - x) > 0.005` is
+        // FALSE, which let a candidate whose amount could not even be read slip
+        // past this guard as though it matched. An unreadable total is exactly
+        // the "cannot confirm" case the rest of this block exists to refuse.
+        if (!Number.isFinite(matches[0].total)) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but its total could not be read from QuickBooks, ` +
+                    `so ProBuild cannot confirm it matches ${parked.code} — check invoice ${parked.identity.docNumber} ` +
+                    `in QuickBooks before doing anything else with this row. Nothing was changed here.`,
+            };
+        }
         if (
             parked.identity.expectedTotal != null
             && Math.abs(matches[0].total - parked.identity.expectedTotal) > 0.005
@@ -351,29 +418,10 @@ export async function resolveAmbiguousInvoiceCreateCore(
             message: `No QuickBooks invoice matches ${parked.identity.docNumber}. If you have checked QuickBooks yourself, confirm none exists to clear this and send again.`,
         };
     }
-    // A `create-in-flight` marker means the POST may STILL be running. A row
-    // promoted to `ambiguous-create` means OUR wait for that same request ended
-    // (a timeout, or a definite unknown-outcome failure) — but our deadline
-    // firing only means WE gave up; the original request can still be landing
-    // at QuickBooks' end for a while afterward, and may not be visible to the
-    // lookup above yet. Both kinds carry the ORIGINAL claim's timestamp (see
-    // composeCreateMarker), so both get the same cooldown here: clearing either
-    // one too early would let a second create go out — or let the operator
-    // conclude "none exists" — while the first request is still landing. A
-    // marker without a readable claim time, or one younger than
-    // CREATE_IN_FLIGHT_STALE_MS, refuses outright. Neither table carries
-    // `updatedAt`, so an unreadable age is the common case today, not the
-    // exception — that is deliberately fail-closed.
-    if (parked.kind === CREATE_IN_FLIGHT_MARKER || parked.kind === AMBIGUOUS_CREATE_MARKER) {
-        const stillActive = parked.atMs == null || Date.now() - parked.atMs < CREATE_IN_FLIGHT_STALE_MS;
-        if (stillActive) {
-            return {
-                ok: false,
-                refusal: "create-still-active",
-                message: `${parked.code} may still be mid-create in QuickBooks right now — clearing this could let a second invoice be created while the first is still landing. Wait a few minutes and try again.`,
-            };
-        }
-    }
+    // The liveness cooldown for a still-active marker is checked once, up
+    // front, before any QuickBooks call — see the comment there. By the time
+    // we get here it has already refused a fresh create-in-flight/ambiguous
+    // marker for every outcome, clearing included.
     const cleared = await delegate.updateMany({
         where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker },
         data: { qbSyncError: null },

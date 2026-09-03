@@ -2151,6 +2151,84 @@ test("syncInvoiceToQB: a 2xx response missing Invoice.Id is ambiguous", async ()
     assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
 });
 
+// --- Round 31 gate: the ambiguous boundary must cover the BODY READ too ---
+//
+// The two blocks above only proved a dispatch-time failure or a clean 2xx
+// missing an Id is ambiguous. A 2xx header followed by a body that stalls
+// or arrives truncated/malformed used to escape that classification — the
+// `try` closed right after `qbFetch` resolved, so `res.json()` ran unguarded
+// and a failure there surfaced as a plain QBTimeoutError/QboRetryableError.
+// The route's classifier treated that as an ordinary outage and advertised
+// retry:true, risking a genuine duplicate document. A caller-originated
+// AbortError is the one exception that must still propagate as itself.
+
+test("syncEstimateToQB: a body read that times out AFTER a 2xx header is ambiguous, not a plain timeout", async () => {
+    const { syncEstimateToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => ({
+            ok: true,
+            status: 200,
+            json: async () => { throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/estimate"); },
+        }) as any,
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error, "must throw, not resolve");
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncEstimateToQB: truncated/malformed JSON in a 2xx body is ambiguous, not a plain parse failure", async () => {
+    const { syncEstimateToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => new Response('{"Estimate": {"Id": "9"', { status: 200, headers: { "content-type": "application/json" } }),
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error, "must throw, not resolve");
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncEstimateToQB: a caller-originated abort during the body read propagates as itself, not ambiguous", async () => {
+    const { syncEstimateToQB } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => ({
+            ok: true,
+            status: 200,
+            json: async () => { const e = new Error("aborted"); e.name = "AbortError"; throw e; },
+        }) as any,
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(error?.name, "AbortError", "a caller's own cancellation must propagate as itself, not become ambiguous");
+});
+
+test("syncInvoiceToQB: a body read that times out AFTER a 2xx header is ambiguous, not a plain timeout", async () => {
+    const { syncInvoiceToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => ({
+            ok: true,
+            status: 200,
+            json: async () => { throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/invoice"); },
+        }) as any,
+        () => syncInvoiceToQB(TOKENS, INVOICE_INPUT as any),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncInvoiceToQB: truncated/malformed JSON in a 2xx body is ambiguous, not a plain parse failure", async () => {
+    const { syncInvoiceToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => new Response('{"Invoice": {"Id": "9"', { status: 200, headers: { "content-type": "application/json" } }),
+        () => syncInvoiceToQB(TOKENS, INVOICE_INPUT as any),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
 test("the /api/quickbooks/sync route classifies an ambiguous create distinctly, retry:false", async () => {
     const fs = await import("node:fs");
     const source = fs.readFileSync("src/app/api/quickbooks/sync/route.ts", "utf8");
