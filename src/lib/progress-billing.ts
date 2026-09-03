@@ -30,7 +30,7 @@
  *     are created without relying on Intuit's own invoice-email flow).
  */
 import { prisma } from "@/lib/prisma";
-import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { Prisma, ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, type RouteDeadline, type QBTokens } from "./quickbooks";
@@ -834,24 +834,37 @@ function currentBillingIssuanceHash(row: {
  */
 export async function finalizeProgressBillingLinkUnderLock(args: ProgressBillingLinkArgs): Promise<ProgressBillingLinkVerdict> {
     return withTxRetry(() => prisma.$transaction(async (tx): Promise<ProgressBillingLinkVerdict> => {
-        // Estimate → Invoice → Project → Client (tx-retry.ts). The INVOICE first,
-        // because which client this bills is a fact ABOUT the invoice and is read
-        // from it below — round 46: this used to lock `args.clientId`, a value the
-        // caller read before the transaction opened, and then read the real
-        // customer through `invoice.client`, a relation that takes no lock at all.
-        // A client re-pointed on the invoice in between left the locked row and
-        // the read row as two different clients.
-        await lockMoneyParents(tx, { invoiceId: args.invoiceId });
-        const parent = await tx.invoice.findUnique({
+        // Project → Estimate → Invoice → Client (tx-retry.ts). Round 46: this used
+        // to lock `args.clientId`, a value the caller read before the transaction
+        // opened, and then read the real customer through `invoice.client`, a
+        // relation that takes no lock at all. A client re-pointed on the invoice
+        // in between left the locked row and the read row as two different
+        // clients.
+        //
+        // PEEK first, lock-free, so the PROJECT can be locked before the
+        // Invoice — the order every attribution writer takes
+        // (`lockAttributionParents`). Nothing here trusts the peek: the same
+        // scalars are re-read under the locks below and any movement refuses.
+        const peek = await tx.invoice.findUnique({
             where: { id: args.invoiceId },
-            // The SCALAR, under the invoice's lock.
-            select: { clientId: true },
+            select: { projectId: true, clientId: true },
         });
-        if (!parent?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        if (!peek?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        if (peek.projectId) await lockProjectRow(tx, peek.projectId);
+        await lockMoneyParents(tx, { invoiceId: args.invoiceId });
         // FOR SHARE on the Client: this only reads the mapping, but it must not
         // straddle the FOR UPDATE remap in resolveCustomerAndItem.
-        await lockClientRow(tx, parent.clientId, "share");
-        if (parent.clientId !== args.clientId) {
+        await lockClientRow(tx, peek.clientId, "share");
+        const parent = await tx.invoice.findUnique({
+            where: { id: args.invoiceId },
+            // The SCALARS, re-read under the locks.
+            select: { projectId: true, clientId: true },
+        });
+        if (!parent?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        if (parent.projectId !== peek.projectId) {
+            return { outcome: "mismatch", detail: "its invoice moved to a different project while this was being prepared" };
+        }
+        if (parent.clientId !== peek.clientId || parent.clientId !== args.clientId) {
             return {
                 outcome: "mismatch",
                 detail: "its invoice now bills a different client than the one this create was prepared for",

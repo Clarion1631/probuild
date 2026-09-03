@@ -48,6 +48,8 @@ const state: {
     locksTaken: number;
     /** Every row lock taken, in order, as `SQL|values`. */
     locks: string[];
+    /** Fired as the FIRST row lock is granted — the peek-goes-stale window. */
+    onFirstLock: (() => void) | null;
     /** Fired inside the create, to model a concurrent edit mid-flight. */
     onCreate: (() => void) | null;
     /**
@@ -65,7 +67,7 @@ const state: {
     user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
     lookup: { estimates: [], invoices: [], throws: null, calls: [] },
     clientQbCustomerId: "42", locksTaken: 0, onCreate: null, onFirstRead: null, sentNotes: [], sentItems: [], sentTotals: [],
-    createdDocumentPatch: null, createdDocumentNull: false, sentTxnDates: [], projectClientId: "cli-1", locks: [],
+    createdDocumentPatch: null, createdDocumentNull: false, sentTxnDates: [], projectClientId: "cli-1", locks: [], onFirstLock: null,
 };
 
 function resetState() {
@@ -78,6 +80,7 @@ function resetState() {
     state.clientQbCustomerId = "42";
     state.locksTaken = 0;
     state.locks = [];
+    state.onFirstLock = null;
     state.onCreate = null;
     state.onFirstRead = null;
     state.sentNotes = [];
@@ -147,6 +150,12 @@ const fakePrisma = {
     $queryRaw: async (strings?: TemplateStringsArray, ...values: any[]) => {
         state.locksTaken++;
         if (strings) state.locks.push(`${strings.join("?")}|${values.join(",")}`);
+        // Fires as the FIRST lock is granted: after the lock-free peek, before
+        // the re-read that has to catch a document which moved in between.
+        if (state.locks.length === 1) {
+            const hook = state.onFirstLock;
+            if (hook) { state.onFirstLock = null; hook(); }
+        }
         return [];
     },
     $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(fakePrisma),
@@ -1105,29 +1114,32 @@ test("round 46: a REPLAY re-sends the original accounting date, not todays", asy
  * So the order has to be: lock the document, read from IT which project and
  * client it currently hangs off, lock those, and only then read the identity.
  */
-test("round 46: the decision locks Estimate then Project then Client, in that order", async () => {
+test("round 46: the decision locks Project first, then Estimate, then Client", async () => {
     state.user = ADMIN;
     seedEstimate();
 
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 200);
 
-    // The claim's transaction (the first three locks) — document, project,
-    // client, in the canonical direction.
-    assert.match(state.locks[0], /"Estimate"[\s\S]*FOR UPDATE[\s\S]*est-1/);
-    assert.match(state.locks[1], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    // PROJECT FIRST. Not the foreign-key direction — the direction every
+    // attribution writer takes (`lockAttributionParents`). A money path that
+    // locked the Estimate first and then reached for the Project would close a
+    // 40P01 cycle against a Project-first editor holding the project and
+    // waiting on the estimate.
+    assert.match(state.locks[0], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    assert.match(state.locks[1], /"Estimate"[\s\S]*FOR UPDATE[\s\S]*est-1/);
     assert.match(state.locks[2], /"Client"[\s\S]*FOR SHARE[\s\S]*cli-1/);
 });
 
-test("round 46: the invoice rail locks Invoice then Project then Client", async () => {
+test("round 46: the invoice rail locks Project first too", async () => {
     state.user = ADMIN;
     seedInvoice();
 
     const res = await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal(res.status, 200);
 
-    assert.match(state.locks[0], /"Invoice"[\s\S]*FOR UPDATE[\s\S]*inv-1/);
-    assert.match(state.locks[1], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    assert.match(state.locks[0], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    assert.match(state.locks[1], /"Invoice"[\s\S]*FOR UPDATE[\s\S]*inv-1/);
     assert.match(state.locks[2], /"Client"[\s\S]*FOR SHARE[\s\S]*cli-1/);
 });
 
@@ -1145,6 +1157,23 @@ test("round 46: a document re-pointed at another client is refused, never synced
     assert.match((await res.json()).error, /different client/);
     assert.equal(state.posts.length, 0, "refused BEFORE any QuickBooks call");
     assert.equal(row.qbSyncMarker, null, "and nothing was claimed");
+});
+
+test("round 46: a document moved to another PROJECT between peek and lock is refused", async () => {
+    // The peek only says which rows to lock. If the document moved between the
+    // peek and the locks, the transaction is holding the WRONG project row —
+    // refusing is the only honest answer.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    // The move commits while the first lock is being granted: the peek said
+    // proj-1 (and that is the row now held), the re-read says proj-2.
+    state.onFirstLock = () => { row.project = { ...row.project, id: "proj-2" }; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 503, JSON.stringify(await res.clone().json()));
+    assert.match((await res.json()).error, /different project/);
+    assert.equal(state.posts.length, 0, "refused BEFORE any QuickBooks call");
 });
 
 test("round 46: a project RENAMED between the claim and the link does not link", async () => {

@@ -524,3 +524,135 @@ test("progress-billing link: the control still links under the right client", { 
         await db.$disconnect();
     }
 });
+
+// --- Round 46 follow-up: ONE global lock order, Project first ---
+
+/**
+ * The cross-PR invariant: `Project → Estimate → Invoice → Client → child rows`.
+ *
+ * The attribution writers (`lockAttributionParents`, phase-invariant.ts) take
+ * Project before Estimate. The first round-46 commit had this rail take
+ * Estimate first and then reach for the Project, which is the other half of a
+ * 40P01 cycle: a Project-first editor holding `Project FOR UPDATE` and waiting
+ * on the Estimate, against a money path holding the Estimate and waiting on the
+ * Project. Neither can proceed and Postgres kills one.
+ *
+ * This reproduces exactly that shape. A real deadlock, not a simulated one:
+ * the holder takes the project and then blocks on the estimate, while the
+ * decision runs concurrently. With Project first there is no cycle and both
+ * complete; with the inverted order Postgres raises 40P01 (the pre-fix control
+ * below drives the same interleaving through raw SQL in the old order).
+ */
+async function projectFirstEditor(db: PrismaClient, ready: () => void, release: Promise<void>) {
+    return db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${ID.project} FOR UPDATE`;
+        ready();
+        await release;
+        // Then the estimate — the second half of the attribution order.
+        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ID.estimate} FOR UPDATE`;
+    }, { timeout: 20_000, maxWait: 20_000 });
+}
+
+test("lock order: a Project-first editor and decideUnderIdentity do NOT deadlock", { skip }, async () => {
+    const { decideUnderIdentity } = await import("../src/lib/qbo-document-sync");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const other = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        let ready = () => {};
+        const held = new Promise<void>((r) => { ready = r; });
+        let release = () => {};
+        const releasePromise = new Promise<void>((r) => { release = r; });
+
+        const editor = projectFirstEditor(other, ready, releasePromise);
+        await held; // the editor holds Project FOR UPDATE
+
+        // The decision now wants Project first as well, so it QUEUES behind the
+        // editor rather than holding the estimate and waiting for the project.
+        const decision = withPrisma(db, () => decideUnderIdentity({
+            kind: "estimate",
+            id: ID.estimate,
+            clientId: ID.client,
+            decide: async () => "decided" as const,
+        }));
+
+        // Let the editor finish; the decision then proceeds behind it.
+        release();
+        await editor;
+        const res = await decision;
+
+        assert.equal(res.ok, true, JSON.stringify(res));
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+        await other.$disconnect();
+    }
+});
+
+test("lock order: the reverse interleaving is also deadlock-free", { skip }, async () => {
+    // Same two transactions, started the other way round. One global order means
+    // neither arrival sequence can produce a cycle.
+    const { decideUnderIdentity } = await import("../src/lib/qbo-document-sync");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const other = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        const decision = withPrisma(db, () => decideUnderIdentity({
+            kind: "estimate",
+            id: ID.estimate,
+            clientId: ID.client,
+            decide: async () => "decided" as const,
+        }));
+        let ready = () => {};
+        const held = new Promise<void>((r) => { ready = r; });
+        const editor = projectFirstEditor(other, ready, Promise.resolve());
+        const [res] = await Promise.all([decision, editor, held]);
+        assert.equal(res.ok, true, JSON.stringify(res));
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+        await other.$disconnect();
+    }
+});
+
+test("lock order: the PRE-FIX order really does deadlock (control)", { skip }, async () => {
+    // Without this the two tests above would pass against any code at all: a
+    // transaction that takes no locks never deadlocks either. This drives the
+    // OLD order — Estimate first, then Project — through raw SQL against the
+    // same Project-first editor, and asserts Postgres kills one of them.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const other = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        let editorHolding = () => {};
+        const editorHeld = new Promise<void>((r) => { editorHolding = r; });
+        let moneyHolding = () => {};
+        const moneyHeld = new Promise<void>((r) => { moneyHolding = r; });
+
+        const editor = other.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${ID.project} FOR UPDATE`;
+            editorHolding();
+            await moneyHeld;
+            // Now wants the estimate the money path is holding.
+            await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ID.estimate} FOR UPDATE`;
+        }, { timeout: 20_000, maxWait: 20_000 });
+
+        const money = db.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ID.estimate} FOR UPDATE`;
+            moneyHolding();
+            await editorHeld;
+            // ...and now wants the project the editor is holding. Cycle.
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${ID.project} FOR SHARE`;
+        }, { timeout: 20_000, maxWait: 20_000 });
+
+        const results = await Promise.allSettled([editor, money]);
+        const deadlocked = results.some(
+            (r) => r.status === "rejected" && /40P01|deadlock/i.test(String((r.reason as any)?.message ?? r.reason)),
+        );
+        assert.equal(deadlocked, true, `expected a 40P01 deadlock, got ${JSON.stringify(results.map((r) => r.status))}`);
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+        await other.$disconnect();
+    }
+});

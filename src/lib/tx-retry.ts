@@ -83,6 +83,18 @@ export async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promis
  * money-path transaction locks in this same order, no two can deadlock on the
  * Estimate/Invoice/Client chain.
  *
+ * THE PROJECT COMES BEFORE ALL OF THESE. The full order, across this file and
+ * the attribution writers (`lockAttributionParents`, phase-invariant.ts), is:
+ *
+ *     Project → Estimate → Invoice → Client → child rows
+ *
+ * This helper deliberately does not take the Project lock, because most of its
+ * callers never touch one. A transaction that DOES need the project (see
+ * `lockProjectRow`) must take it BEFORE calling this — taking it afterwards is
+ * the inverse of the order every attribution writer uses, and a Project-first
+ * editor holding `Project FOR UPDATE` while waiting on the Estimate closes that
+ * cycle into a 40P01 deadlock.
+ *
  * `clientId` is usually NOT known up front — it is read off the Invoice — so
  * most callers take the first two locks here and then call `lockClientRow`
  * once they have read it. Passing it here is the shorthand for the callers
@@ -114,13 +126,21 @@ export async function lockMoneyParents(
 export type ClientLockMode = "share" | "update";
 
 /**
- * The PROJECT a money document hangs off, locked between the document and the
- * Client — so the canonical order is Estimate → Invoice → Project → Client.
+ * The PROJECT a money document hangs off. FIRST of all the parents:
+ * Project → Estimate → Invoice → Client → child rows.
  *
- * It sits there because that is the direction of the foreign keys: an estimate
- * points at a project, and the project points at the client it bills. Taking
- * it after the document and before the client means a reader walking
- * document → project → client never takes a lock it has already passed.
+ * That is not the foreign-key direction (an estimate points at a project, which
+ * points at its client) — it is the order the ATTRIBUTION writers already take
+ * (`lockAttributionParents`, phase-invariant.ts), and a global lock order only
+ * works if it is one order. A money path that took Estimate first and then
+ * reached for the Project would deadlock (40P01) against a Project-first editor
+ * holding the project and waiting on the estimate.
+ *
+ * A money document's project id is a fact stored ON the document, so locking
+ * the project first requires a LOCK-FREE PEEK of that id, then this lock, then
+ * the document's own — and then a re-read of the id under the locks, refusing if
+ * it moved. Callers that skip that last step have locked the wrong row and do
+ * not know it.
  *
  * Needed because `Project.name` is part of what a document-sync claim
  * fingerprints (it is in the PrivateNote QuickBooks stores), and the project's

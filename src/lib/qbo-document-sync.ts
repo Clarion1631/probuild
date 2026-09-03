@@ -835,7 +835,10 @@ async function currentDocumentOwner(
  * identity. The caller's `clientId` is still checked — if the document now
  * bills someone else, that is a refusal, not something to quietly follow.
  *
- * Canonical order: Estimate → Invoice → Project → Client.
+ * Canonical order: Project → Estimate → Invoice → Client → child rows — the same
+ * global order the attribution writers take (`lockAttributionParents` in
+ * phase-invariant.ts). Project comes FIRST, which is only possible because the
+ * project id is peeked lock-free and then re-checked under the locks.
  */
 export async function decideUnderIdentity<T>(args: {
     kind: "estimate" | "invoice";
@@ -856,8 +859,24 @@ export async function decideUnderIdentity<T>(args: {
     decide: (tx: Prisma.TransactionClient, facts: DocumentIdentityFacts) => Promise<T>;
 }): Promise<{ ok: true; value: T; facts: DocumentIdentityFacts } | { ok: false; reason: string }> {
     return withTxRetry(() => prisma.$transaction(async (tx) => {
-        // 1. The document itself. Everything else is reached THROUGH it, so
-        //    nothing below can be read before this lock is held.
+        // 1. PEEK, lock-free: which project and which client does this document
+        //    hang off? The answer is not trusted — step 4 re-reads it under the
+        //    locks and refuses if it moved — it only says which rows to lock, and
+        //    in which order.
+        const peek = await currentDocumentOwner(tx, args.kind, args.id);
+        if (!peek) {
+            return { ok: false as const, reason: "it no longer has a client and project to bill" };
+        }
+        // 2. PROJECT FIRST. The attribution writers (phase-invariant.ts,
+        //    lockAttributionParents) take Project before Estimate, and a
+        //    Project-first editor holding `Project FOR UPDATE` while waiting on
+        //    the Estimate is the other half of a 40P01 cycle if this took the
+        //    Estimate first and then reached for the Project. Peeking is what
+        //    makes Project-first possible at all: the project id is a fact about
+        //    the document, so without a lock-free read there is nothing to lock
+        //    until the document is already held.
+        if (peek.projectId) await lockProjectRow(tx, peek.projectId);
+        // 3. Then the money parents, in their own order, and the client last.
         await lockMoneyParents(
             tx,
             {
@@ -865,28 +884,31 @@ export async function decideUnderIdentity<T>(args: {
                 invoiceId: args.kind === "invoice" ? args.id : null,
             },
         );
-        // 2. Which project and client does it hang off RIGHT NOW? Scalars, read
-        //    under the document's lock — not relations, which take no lock of
-        //    their own, and not the caller's pre-transaction copy.
+        await lockClientRow(tx, peek.clientId, "share");
+        // 4. NOW re-read the same scalars under those locks. A document
+        //    re-pointed at another project or client between the peek and the
+        //    locks is holding the wrong rows: refuse rather than follow it, which
+        //    is the same answer as any other identity divergence here.
         const owner = await currentDocumentOwner(tx, args.kind, args.id);
         if (!owner) {
             return { ok: false as const, reason: "it no longer has a client and project to bill" };
         }
-        // 3. Those ACTUAL rows, in the canonical direction. `Project.name` rides
-        //    in the PrivateNote QuickBooks stores and the project's client is who
-        //    gets billed, so both have to be stable across the read below.
-        if (owner.projectId) await lockProjectRow(tx, owner.projectId);
-        await lockClientRow(tx, owner.clientId, "share");
+        if (owner.projectId !== peek.projectId) {
+            return { ok: false as const, reason: "it was moved to a different project while this was being prepared" };
+        }
+        if (owner.clientId !== peek.clientId) {
+            return { ok: false as const, reason: "it now bills a different client than the one this sync was prepared for" };
+        }
         // The caller resolved its customer against a client it read earlier. If
-        // the document has since been re-pointed at a different one, the payload
-        // and the record disagree about who is being billed: refuse.
+        // the document does not bill that client, the payload and the record
+        // disagree about who is being billed: refuse.
         if (owner.clientId !== args.clientId) {
             return {
                 ok: false as const,
                 reason: "it now bills a different client than the one this sync was prepared for",
             };
         }
-        // 4. Only now is the identity read meaningful.
+        // 5. Only now is the identity read meaningful.
         const facts = await loadDocumentIdentity(tx, args.kind, args.id);
         if (!facts) {
             return { ok: false as const, reason: "it no longer has a client and project to bill" };
