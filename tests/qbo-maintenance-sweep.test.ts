@@ -1431,9 +1431,19 @@ test("round 42: settling a pending-deletion row cancels the intent, both settle 
         ["src/lib/quickbooks-payments.ts", "settleMilestonePaidInTx"],
     ] as const) {
         const src = fs.readFileSync(file, "utf8");
-        const at = src.indexOf(fn);
-        assert.ok(at > -1, `${fn} not found`);
-        const body = src.slice(at, at + 4000);
+        // The DECLARATION, not the first mention: a comment naming the function
+        // above its own definition (round 51 added one) would otherwise anchor
+        // this slice thousands of characters early and the pin would fail for a
+        // reason unrelated to the property it guards.
+        const at = src.indexOf(`function ${fn}(`);
+        assert.ok(at > -1, `${fn} declaration not found`);
+        // A generous window on purpose. A fixed 4000 chars silently stopped
+        // covering the promotion the moment round 51 added the claim fence above
+        // it, and the test then failed for a reason that had nothing to do with
+        // the property — the promotion was still exactly where it should be, just
+        // outside the slice. The ORDER is what this asserts, so the window only
+        // has to be big enough to contain both landmarks.
+        const body = src.slice(at, at + 12000);
         const claim = body.indexOf("claim.count === 0");
         const cancel = body.indexOf("qbSyncError: PENDING_DELETION_MARKER");
         assert.ok(cancel > -1, `${fn} must cancel a pending-deletion intent on settle`);
@@ -1478,8 +1488,12 @@ test("round 43: settlement PROMOTES the deletion intent, it never clears it", as
         ["src/lib/quickbooks-payments.ts", "settleMilestonePaidInTx"],
     ] as const) {
         const src = fs.readFileSync(file, "utf8");
-        const at = src.indexOf(fn);
-        assert.ok(at > -1, `${fn} not found`);
+        // The DECLARATION, not the first mention: a comment naming the function
+        // above its own definition (round 51 added one) would otherwise anchor
+        // this slice thousands of characters early and the pin would fail for a
+        // reason unrelated to the property it guards.
+        const at = src.indexOf(`function ${fn}(`);
+        assert.ok(at > -1, `${fn} declaration not found`);
         const body = src.slice(at, at + 8000);
         const claim = body.indexOf("claim.count === 0");
         const promote = body.indexOf("qbSyncError: PENDING_DELETION_SETTLED_MARKER");
@@ -1820,39 +1834,44 @@ test("round 49: a settle that commits after the page read makes the CLAIM fail, 
     assert.equal(res.finished, 0);
 });
 
-test("round 49: a settle CANCELLING a live claim stops the delete at the last look", async () => {
-    // The other order: the claim is already held and the settle arrives while
-    // the sweep is between the claim and the remote call. Cancelling the claim
-    // (payment-record-core promotes it to the settled marker) is the only thing
-    // that can take it away, and the sweep re-checks immediately before the
-    // irreversible call.
-    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
-    const { createRouteDeadline } = await import("../src/lib/quickbooks");
-    const deleted: string[] = [];
-    const { db, live } = pendingDeletionDb(
-        [{ id: "ps-1", qbInvoiceId: "qb-1" }],
-        {
-            // Fires the instant the claim commits.
-            onClaimed: () => {
-                live[0].status = "Paid";
-                live[0].qbSyncError = "pending-deletion:settled";
-            },
-        },
-    );
+test("round 51: a settle cannot land at all while the deletion claim is held", async () => {
+    // Round 49 had the settle CANCEL a live claim, and the sweep re-read the
+    // claim just before dispatching. Round 51: a re-read is a READ, not a fence
+    // — a settle committing between it and the network call still won, and the
+    // delete destroyed the invoice of a milestone that had just been paid.
+    //
+    // The claim is now the exclusion: every settlement rail refuses a row whose
+    // marker is `pending-deletion:claimed:*`. So the interleaving this test used
+    // to stage — settle lands after the claim — cannot happen, and what is
+    // asserted instead is that the settle path itself declines it.
+    const { isIrreversibleClaimHeld, deletionClaimMarker, compensationClaimMarker } =
+        await import("../src/lib/qbo-create-markers");
 
-    await sweepPendingDeletions(
-        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
-        createRouteDeadline(30_000),
-        {
-            db: db as any,
-            deleteInvoice: async (_t, qbId) => { deleted.push(qbId); return true; },
-            unlink: async () => true,
-        },
-    );
+    assert.equal(isIrreversibleClaimHeld(deletionClaimMarker("abc123")), true);
+    assert.equal(isIrreversibleClaimHeld(compensationClaimMarker("abc123")), true);
+    // ...and nothing else is fenced: an ordinary deletion intent, a settled one,
+    // and a clean row all still settle normally.
+    for (const marker of ["pending-deletion", "pending-deletion:settled", "paylink-pending", null]) {
+        assert.equal(isIrreversibleClaimHeld(marker), false, String(marker));
+    }
 
-    assert.deepEqual(deleted, [], "the cancelled claim stops the delete");
+    // The manual rail consults it before claiming the row Paid.
+    const core = await import("node:fs").then((fs) => fs.readFileSync("src/lib/payment-record-core.ts", "utf8"));
+    const at = core.indexOf("function recordPaymentCore(");
+    assert.ok(at > -1);
+    const body = core.slice(at, at + 12000);
+    const fence = body.indexOf("isIrreversibleClaimHeld(");
+    const claim = body.indexOf("claim.count === 0");
+    assert.ok(fence > -1, "the manual settle must consult the fence");
+    assert.ok(fence < claim, "and it must do so BEFORE it claims the row Paid");
+
+    // The QuickBooks rail excludes both claims in its claim predicate.
+    const qbo = await import("node:fs").then((fs) => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const settleAt = qbo.indexOf("function settleMilestonePaidInTx(");
+    const settleBody = qbo.slice(settleAt, settleAt + 12000);
+    assert.match(settleBody, /COMPENSATION_CLAIMED_PREFIX/);
+    assert.match(settleBody, /PENDING_DELETION_CLAIMED_PREFIX/);
 });
-
 test("round 49: an UNCONTESTED row still deletes (the control)", async () => {
     // Without this, the three tests above would pass just as happily against a
     // sweep that had stopped deleting anything at all.

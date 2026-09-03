@@ -276,3 +276,30 @@ test("round 50: either portal session shape may dispatch; nothing else may", asy
         );
     }
 });
+
+test("round 50: a blocked dispatch says WHICH refusal it is", async () => {
+    // e2e/financial-action-auth.spec.ts proves an unauthenticated caller cannot
+    // run privileged actions. That proof only means something if a DENIAL can be
+    // told apart from Next answering "I have never heard of that action id" —
+    // otherwise a typo in an action id looks exactly like a successful defence
+    // and the whole block passes while proving nothing.
+    //
+    // This refusal happens at the EDGE, before Next sees the id, so it names
+    // itself rather than returning a bare 403 indistinguishable from an action's
+    // own authorization error.
+    await inProduction(async () => {
+        const { default: proxy, SERVER_ACTION_BLOCKED_REASON } = await loadProxy();
+        const { NextRequest } = await import("next/server");
+        const response = (await proxy(
+            new NextRequest("https://probuild.test/portal/estimates/abc", {
+                method: "POST",
+                headers: { "next-action": "deadbeef" },
+            }),
+            { waitUntil() {} } as any,
+        )) as Response;
+
+        assert.equal(response.status, 403);
+        assert.equal(response.headers.get("x-probuild-refusal"), SERVER_ACTION_BLOCKED_REASON);
+        assert.match(await response.text(), /server-action-blocked/);
+    });
+});

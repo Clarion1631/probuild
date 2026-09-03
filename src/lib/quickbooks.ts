@@ -1118,6 +1118,17 @@ export async function createQBMilestoneInvoice(
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
+        /**
+         * The `TxnDate` to send — the ACCOUNTING PERIOD this books to.
+         *
+         * Round 51: this contract did not have the field, so the milestone rail's
+         * `txnDate: identity.txnDate` was an excess property on a typed object
+         * literal and TypeScript said nothing — the caller believed it was sending
+         * the date its marker recorded while the payload below used today's. A
+         * replay of an unconfirmed create therefore booked into whatever period
+         * it happened to run in.
+         */
+        txnDate?: string;
     },
     deadline?: RouteDeadline,
 ): Promise<{ qbId: string; qbUrl: string; total: number; document: RemoteDocumentFacts | null }> {
@@ -1126,7 +1137,7 @@ export async function createQBMilestoneInvoice(
 
     const payload: Record<string, unknown> = {
         DocNumber: input.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN),
-        TxnDate: new Date().toISOString().split("T")[0],
+        TxnDate: input.txnDate ?? qboTxnDate(),
         CustomerRef: { value: input.customerId },
         // QuickBooks Payments is the ONLY payment rail (Stripe is disabled until
         // their 180-day hold clears) — the hosted page takes card, debit, AND bank.

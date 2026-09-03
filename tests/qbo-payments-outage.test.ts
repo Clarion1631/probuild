@@ -2879,10 +2879,24 @@ test("the push returns the concurrent winner's id instead of compensating", asyn
     const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
     const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
     const finalized = push.indexOf('linked.outcome === "already-finalized"');
-    const compensate = push.indexOf("compensateAndUnlink(");
+    // There are TWO compensation sites now, with different jobs, so this pins
+    // the one it is about — the LAST, which handles the genuinely abandoned
+    // create. The earlier one (round 51) refuses a document QuickBooks booked
+    // differently from the claim and runs BEFORE any link exists, so it
+    // legitimately precedes this check and pinning the first occurrence would
+    // have read that as a regression.
+    const compensate = push.lastIndexOf("compensateAndUnlink(");
+    const firstCompensate = push.indexOf("compensateAndUnlink(");
     assert.ok(finalized > -1, "the push must act on the already-finalized verdict");
     assert.ok(compensate > -1, "compensation is still there for the genuinely abandoned case");
-    assert.ok(finalized < compensate, "the success return must come BEFORE any compensating delete");
+    assert.ok(finalized < compensate, "the success return must come BEFORE the abandoned-case compensating delete");
+    // And the earlier one really is the mismatch guard, not a second abandoned-case
+    // path that drifted above the check.
+    assert.ok(
+        firstCompensate === compensate
+            || push.slice(0, firstCompensate).includes("documentMatchesClaim("),
+        "a compensation before the already-finalized check must be the create-mismatch guard",
+    );
 });
 
 

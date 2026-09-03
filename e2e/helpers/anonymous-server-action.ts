@@ -168,6 +168,17 @@ export function resolveServerActionId(exportedName: string, filename: string = A
  * precisely because the proxy only interrogates cookie-bearing requests. That
  * is the variant which proves the in-action guard fires.
  */
+/**
+ * A portal session cookie the PROXY accepts and every ACTION rejects.
+ *
+ * The proxy checks presence only (it runs on the edge and cannot verify a JWT
+ * without the signing secret); `resolveSessionClientId` does the real
+ * verification and will refuse this. That combination is exactly what a test
+ * of the action-level gate needs: past the outer layer, refused by the inner
+ * one.
+ */
+export const BOGUS_PORTAL_COOKIE = "client_portal_token=not-a-real-token";
+
 export const BOGUS_SESSION_COOKIE =
     "next-auth.session-token=not-a-real-session-token.forged-by-e2e.0000000000";
 
@@ -194,11 +205,23 @@ export async function invokeServerAction(
         args: unknown[];
         /** Attach a forged, undecodable NextAuth session cookie. */
         forgedCookie?: boolean;
+        /**
+         * Attach a portal session cookie, so the PROXY lets the dispatch through
+         * to Next and the ACTION's own gate is what answers.
+         *
+         * The proxy refuses any `next-action` on a bypassed path that carries no
+         * session evidence at all (src/proxy.ts). That is the outer layer and it
+         * is deliberate — but a test that wants to prove the INNER layer, the
+         * action's own authorization, has to get past it first. The value is not
+         * a valid token: the proxy only checks presence, and every action still
+         * verifies it properly.
+         */
+        portalCookie?: boolean;
         path?: string;
         baseURL?: string;
     }
 ): Promise<ServerActionInvocation> {
-    const { actionId, args, forgedCookie = false, path = "/portal", baseURL = "http://localhost:3000" } = options;
+    const { actionId, args, forgedCookie = false, portalCookie = false, path = "/portal", baseURL = "http://localhost:3000" } = options;
 
     const headers: Record<string, string> = {
         "next-action": actionId,
@@ -213,7 +236,10 @@ export async function invokeServerAction(
         // was written" would again be true for the wrong reason.
         origin: baseURL,
     };
-    if (forgedCookie) headers.cookie = BOGUS_SESSION_COOKIE;
+    const cookies: string[] = [];
+    if (forgedCookie) cookies.push(BOGUS_SESSION_COOKIE);
+    if (portalCookie) cookies.push(BOGUS_PORTAL_COOKIE);
+    if (cookies.length) headers.cookie = cookies.join("; ");
 
     const response = await request.post(`${baseURL}${path}`, {
         headers,

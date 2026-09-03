@@ -51,6 +51,7 @@ import {
     deleteQBInvoice,
     QB_DOC_NUMBER_MAX_LEN,
     canonicalPrivateNote,
+    qboTxnDate,
 } from "./quickbooks";
 import {
     AMBIGUOUS_CREATE_MARKER,
@@ -68,6 +69,7 @@ import {
     PENDING_DELETION_MARKER,
     PENDING_DELETION_SETTLED_MARKER,
     deletionClaimMarker,
+    COMPENSATION_CLAIMED_PREFIX,
     compensationClaimMarker,
     PENDING_DELETION_CLAIMED_PREFIX,
 } from "./qbo-create-markers";
@@ -76,6 +78,7 @@ import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 // health probe that counts it. A second literal here is how the row loop and
 // the preflight drifted apart in the first place.
 import { QBO_AUTH_EVENT_REASON as QBO_AUTH_SYNC_REASON } from "./pipeline-health";
+import { documentMatchesClaim } from "./qbo-document-sync";
 import type { QBSyncIssue } from "./payment-notifications";
 
 /**
@@ -518,14 +521,16 @@ export async function compensateAndUnlink(
             }
         }
         claimMarker = marker;
-        // Last look before the irreversible call: a settle racing us cancels the
-        // claim, and cancelling is the only thing that can.
-        if (delegate.count) {
-            const held = await delegate.count({
-                where: { id: rowId, qbSyncError: marker, ...claim.unsettled },
-            }).catch(() => 0);
-            if (held !== 1) return { deleted: false, unlinked: false, refused: true };
-        }
+        // NO re-count here, deliberately (round 51). A count is a READ, not a
+        // fence: a settlement committing between it and the network call below
+        // still won, and the delete destroyed a paid milestone's invoice.
+        //
+        // What fences the call is the CLAIM ITSELF: every settlement rail
+        // refuses a row whose marker is `compensating:*` (see
+        // isIrreversibleClaimHeld — payment-record-core.ts for the manual rail,
+        // settleMilestonePaidInTx for the QuickBooks and progress-billing ones).
+        // So once this CAS has committed, no settle can land until the claim is
+        // released, and the window the count was trying to cover does not exist.
     }
     let alreadyAbsent = false;
     try {
@@ -1031,13 +1036,10 @@ export async function sweepPendingDeletions(
                 checkpoint = row.id;
                 continue;
             }
-            // Last look. A settle landing between the claim and here cancels
-            // it, and cancelling is the only thing that can.
-            if (!(await claimStillHeld(row.id, claimMarker))) {
-                result.stillPending++;
-                checkpoint = row.id;
-                continue;
-            }
+            // No re-check here either, and for the same reason as
+            // compensateAndUnlink: `pending-deletion:claimed:*` is refused by
+            // every settlement rail, so holding the claim IS the exclusion. A
+            // read here would only have narrowed the window, not closed it.
             await remove(tokens, row.qbInvoiceId as string, deadline);
             // Pinned to the CLAIM, not to the marker the page observed: the
             // claim is what this sweep owns, and it is what a settle would have
@@ -2084,6 +2086,10 @@ export async function pushMilestoneToQuickBooks(
         tax,
         customerId,
     });
+    // Fixed BEFORE the identity, because the identity records it and the
+    // payload sends it: the marker and the document must agree about which
+    // accounting period this books to, on a replay as much as a first attempt.
+    const claimedAt = new Date();
     const identity = {
         docNumber, privateNote, issuanceHash,
         // The QBO invoice TOTAL this create expects to produce. DocNumber +
@@ -2098,11 +2104,18 @@ export async function pushMilestoneToQuickBooks(
         // row whose real invoice is collectible in the original company.
         realmId: tokens.realmId,
         customerId,
+        // ...and how that total is SPLIT, which ACCOUNTING PERIOD it books to,
+        // and which INCOME ACCOUNT the lines hit. Round 51: this rail recorded
+        // none of the three, so `documentMatchesClaim` silently skipped all
+        // three checks here while the document and progress-billing rails
+        // enforced them — the same QuickBooks response was accepted on one rail
+        // and refused on another.
+        expectedTax: tax ? tax.taxAmount : 0,
+        txnDate: qboTxnDate(claimedAt),
+        itemId,
     };
-    // Captured once and reused for the promotion below — the ambiguous-create
-    // marker must carry this SAME claim time, not a fresh one taken after the
-    // request ends. See composeCreateMarker's `at` param.
-    const claimedAt = new Date();
+    // The marker carries the SAME claim time the identity was built from, not
+    // a fresh one taken after the request ends. See composeCreateMarker's `at`.
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
     // Claimed UNDER the invoice lock, re-checking the progress-billing
     // relationship inside that same lock — see claimMilestonePreCreateUnderLock's
@@ -2126,6 +2139,10 @@ export async function pushMilestoneToQuickBooks(
             dueDate: schedule.dueDate,
             billEmail: invoice.client?.email || null,
             privateNote,
+            // FROM THE IDENTITY. `createQBMilestoneInvoice` used to compute the
+            // date itself from `new Date()`, so a replay of an unconfirmed
+            // create booked into whatever period today happened to be.
+            txnDate: identity.txnDate,
         }, pushDeadline);
     } catch (error) {
         if (!isAmbiguousCreateFailure(error)) {
@@ -2164,11 +2181,60 @@ export async function pushMilestoneToQuickBooks(
 
     const { qbId, total } = created;
 
-    // QBO Automated Sales Tax can recalculate on top of what we send — verify
-    // the grand total still equals the milestone. A drift means the client
-    // would be asked for a different amount than ProBuild expects.
-    if (Math.abs(total - amount) > 0.05) {
-        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+    // JUDGE WHAT QUICKBOOKS ACTUALLY BOOKED, before linking anything.
+    //
+    // This used to WARN on a total more than five cents out and link the
+    // invoice anyway, and it never looked at the document at all: a different
+    // DocNumber, customer, accounting date, service item or tax split all
+    // became payable. `documentMatchesClaim` is the same predicate the
+    // recovery path applies to a candidate it finds by DocNumber, so the
+    // identical QuickBooks response can no longer be accepted here and refused
+    // there.
+    //
+    // Checked while the row is still UNLINKED, so compensation is available.
+    const verdict = created.document
+        ? documentMatchesClaim(created.document, identity)
+        : { ok: false as const, reason: "QuickBooks did not describe the document it created" };
+    if (!verdict.ok) {
+        const detail = `QuickBooks created ${docNumber} (id ${qbId}), but ${verdict.reason}`;
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: "create-document-mismatch",
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, reason: verdict.reason },
+        }).catch(() => {});
+        // Never link it. Delete it if we still can; if not, park on the
+        // durable marker carrying the QuickBooks id so the next send refuses
+        // and a human can find the document.
+        // Named for what it means HERE: the compensation's verdict, not
+        // deleteQBInvoice's `false`-means-confirmed-absence boolean. Branching on
+        // the latter is the bug tests/qbo-maintenance-sweep.test.ts guards; this
+        // one has to be branched on, exactly as the abandoned-case path does.
+        const { deleted: compensated } = await compensateAndUnlink(
+            prisma.paymentSchedule,
+            schedule.id,
+            qbId,
+            () => deleteQBInvoice(tokens, qbId, createRouteDeadline(MILESTONE_CLEANUP_BUDGET_MS)),
+            {},
+            inFlightMarker,
+            { invoiceId: schedule.invoiceId, unsettled: { status: "Pending", qbPaymentId: null } },
+        );
+        if (!compensated) {
+            await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: null, qbSyncError: inFlightMarker },
+                data: {
+                    qbSyncError: composeCreateMarker(
+                        AMBIGUOUS_CREATE_MARKER,
+                        { ...identity, qbId },
+                        claimedAt,
+                    ),
+                },
+            }).catch(() => {});
+            throw new Error(`${detail}, and it could not be deleted — remove it in QuickBooks by hand, then retry.`);
+        }
+        throw new Error(`${detail}. The QuickBooks invoice was deleted; fix the tax or item setup, then re-send.`);
     }
 
     // Persist the link FIRST, before the pay-link fetch.
@@ -2355,8 +2421,24 @@ async function settleMilestonePaidInTx(
     // would drop a genuinely-received payment (the row would be excluded from the next
     // sync's `pending` query forever → client could be double-billed). The settle
     // wins; qbPaymentId below preserves the QBO audit link even if the id was cleared.
+    // FENCED. While a compensation or a deletion holds its claim on this row,
+    // some code is between its last check and an irreversible QuickBooks call
+    // for this very invoice. Settling behind it is what destroyed a paid
+    // milestone's invoice (round 51): the delete went through and this settle's
+    // own link was then pointing at nothing.
+    //
+    // This does NOT pin a marker the way the INVARIANT below forbids — it
+    // refuses ONLY the two short-lived claims that fence a network call, and
+    // the caller retries. A settle is never dropped, only deferred.
     const claim = await t.paymentSchedule.updateMany({
-        where: { id: paymentScheduleId, status: { not: "Paid" } },
+        where: {
+            id: paymentScheduleId,
+            status: { not: "Paid" },
+            NOT: [
+                { qbSyncError: { startsWith: COMPENSATION_CLAIMED_PREFIX } },
+                { qbSyncError: { startsWith: PENDING_DELETION_CLAIMED_PREFIX } },
+            ],
+        },
         data: {
             status: "Paid",
             paymentMethod: "quickbooks",

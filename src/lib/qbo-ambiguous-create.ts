@@ -46,6 +46,7 @@ import {
     getFreshQBTokens,
 } from "./quickbooks-payments";
 import { RESOLVE_REASON_MAX_LEN, type CreateIdentity } from "./qbo-create-markers";
+import { documentMatchesClaim } from "./qbo-document-sync";
 import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
 import { toNum } from "./prisma-helpers";
 
@@ -612,6 +613,23 @@ export async function resolveAmbiguousInvoiceCreateCore(
                     `(${remoteTax === null ? "unreadable" : `$${remoteTax.toFixed(2)}`}) does not match what ${parked.code} was sent with ` +
                     `($${parked.expectedTaxAmount.toFixed(2)}) — check invoice ${parked.identity.docNumber} in QuickBooks before doing anything else with this row. ` +
                     `Nothing was changed here.`,
+            };
+        }
+        // The remaining fields, through the SHARED predicate.
+        //
+        // The hand-written checks above cover note, total, customer and tax. They
+        // never covered the accounting DATE or the line ITEMS — so a document
+        // booked into another period, or against a different income account, was
+        // adopted here while the create path (which runs the same predicate)
+        // refused it. One rule, both directions.
+        const verdict = documentMatchesClaim(matches[0], parked.identity);
+        if (!verdict.ok) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but ${verdict.reason} — ` +
+                    `check it in QuickBooks before doing anything else with this row. Nothing was changed here.`,
             };
         }
         // QuickBooks is the truth: an invoice exists, whatever the operator

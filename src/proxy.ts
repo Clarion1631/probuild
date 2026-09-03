@@ -162,6 +162,29 @@ export function isMobileAuthenticatedRoute(pathname: string) {
  * the magic-link cookie alone, which refused every Google-authenticated client
  * and broke estimate SIGNING on the portal — a client-facing money path.
  */
+/**
+ * The refusal a BLOCKED action dispatch gets, and why it is distinguishable.
+ *
+ * `e2e/financial-action-auth.spec.ts` proves that an unauthenticated caller
+ * cannot run privileged actions. That proof only means something if a DENIAL
+ * can be told apart from Next answering "I have never heard of that action id"
+ * — otherwise a typo in an action id would look exactly like a successful
+ * defence, and the whole block would pass while proving nothing.
+ *
+ * Next signals the unknown-id case itself (404, "Failed to find Server
+ * Action"). This refusal happens EARLIER, at the edge, before Next sees the id
+ * at all, so it says so explicitly rather than returning a bare 403 that could
+ * be mistaken for an action's own authorization error.
+ */
+export const SERVER_ACTION_BLOCKED_REASON = "server-action-blocked";
+
+function serverActionBlocked() {
+    return new NextResponse(SERVER_ACTION_BLOCKED_REASON, {
+        status: 403,
+        headers: { "x-probuild-refusal": SERVER_ACTION_BLOCKED_REASON },
+    });
+}
+
 export function mayDispatchAction(req: any, pathname: string): boolean {
     const tree = ANONYMOUS_ACTION_COOKIE.find((t) => t.pattern.test(pathname));
     if (!tree) return false;
@@ -250,7 +273,7 @@ export default async function proxy(req: any, event: any) {
         // path that is not one of the two client-facing trees can never
         // dispatch; one that is still needs the cookie.
         if (!mayDispatchAction(req, pathname)) {
-            return new NextResponse("Forbidden", { status: 403 });
+            return serverActionBlocked();
         }
     }
 

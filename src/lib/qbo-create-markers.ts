@@ -229,6 +229,26 @@ export function isCompensationClaimed(marker: string | null | undefined): boolea
     return typeof marker === "string" && marker.startsWith(COMPENSATION_CLAIMED_PREFIX);
 }
 
+/**
+ * Is an IRREVERSIBLE remote call fenced on this row right now?
+ *
+ * Round 51 (P0). A claim is only a fence if the thing it excludes actually
+ * checks it. Round 50 claimed the row and then re-COUNTED it before dispatching
+ * the delete — but a count is a read, not a fence: a settlement committing
+ * between that read and the network call still won, the QuickBooks invoice of a
+ * paid milestone was destroyed, and the post-delete CAS then failed, leaving a
+ * paid row pointing at nothing.
+ *
+ * So settlement asks THIS. While either claim is held, some code is between
+ * `SELECT` and an irreversible QuickBooks call for this row, and a settle must
+ * not slip in behind it. The claim is short-lived and released on every path,
+ * so the refusal is a RETRY, never a lost payment: the caller (a person, a
+ * Stripe webhook, or the QBO pull) comes back and settles a moment later.
+ */
+export function isIrreversibleClaimHeld(marker: string | null | undefined): boolean {
+    return isCompensationClaimed(marker) || isDeletionClaimed(marker);
+}
+
 /** The claim marker for one compensation attempt on one row. */
 export function compensationClaimMarker(token: string): string {
     return `${COMPENSATION_CLAIMED_PREFIX}${token}`;

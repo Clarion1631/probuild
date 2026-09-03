@@ -2,7 +2,7 @@ import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum } from "./prisma-helpers";
-import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER, PENDING_DELETION_CLAIMED_PREFIX } from "./qbo-create-markers";
+import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER, PENDING_DELETION_CLAIMED_PREFIX, isIrreversibleClaimHeld } from "./qbo-create-markers";
 
 /**
  * Manual (non-QuickBooks) milestone settlement core — the transaction body of
@@ -59,6 +59,17 @@ export async function recordPaymentCore(
         if (!payment) return { success: false as const, error: "Milestone not found" };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" };
         if (payment.invoiceId !== invoiceId) return { success: false as const, error: "Milestone/invoice mismatch" };
+        // FENCED (round 51). A compensation or deletion holding its claim is
+        // between its last check and an irreversible QuickBooks call for this
+        // row. Settling behind it destroyed the invoice of a milestone that had
+        // just been paid. The claim is short-lived and released on every path,
+        // so this is a RETRY, not a lost payment.
+        if (isIrreversibleClaimHeld(payment.qbSyncError)) {
+            return {
+                success: false as const,
+                error: "This milestone is mid-way through a QuickBooks change. Try again in a moment.",
+            };
+        }
 
         const claim = await t.paymentSchedule.updateMany({
             where: { id: paymentId, status: { not: "Paid" } },
