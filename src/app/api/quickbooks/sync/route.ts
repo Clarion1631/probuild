@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getQBSettings, saveQBSettings } from "@/lib/integration-store";
+import { getQBSettings } from "@/lib/integration-store";
 import {
-    syncEstimateToQB, syncInvoiceToQB, ensureQBCustomer, ensureQBServiceItem,
+    syncEstimateToQB, syncInvoiceToQB,
     createRouteDeadline, isQBBudgetExhaustedError, isQBTimeoutError, isQboConnectionFailure,
     isQBAmbiguousDocumentCreateError,
-    type QBTokens, type RouteDeadline,
 } from "@/lib/quickbooks";
-import { getFreshQBTokens } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, resolveCustomerAndItem } from "@/lib/quickbooks-payments";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { currentStaffUserOrNull, hasPermission, canAccessProject, canAccessEstimate } from "@/lib/permissions";
@@ -22,23 +21,11 @@ const QB_SYNC_BUDGET_MS = 50_000;
 
 export const maxDuration = 60;
 
-async function resolveCustomerAndItem(
-    tokens: QBTokens,
-    client: { id: string; name: string; email: string | null; qbCustomerId: string | null },
-    deadline: RouteDeadline,
-) {
-    const customerId = await ensureQBCustomer(tokens, client, deadline);
-    if (customerId !== client.qbCustomerId) {
-        await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
-    }
-    const qb = await getQBSettings();
-    let itemId = qb.serviceItemId;
-    if (!itemId) {
-        itemId = await ensureQBServiceItem(tokens, deadline);
-        await saveQBSettings({ serviceItemId: itemId });
-    }
-    return { customerId, itemId };
-}
+// A byte-for-byte copy of `resolveCustomerAndItem` used to live here. It has
+// been deleted rather than fixed: re-pointing `Client.qbCustomerId` is a
+// money-path write that must take the canonical Client row lock (see
+// tx-retry.ts), and a second copy of that rule is a second place for it to be
+// forgotten. There is now exactly one writer of that column.
 
 export async function POST(req: NextRequest) {
     // ONE budget for the request, created at the entry and threaded through
@@ -96,9 +83,7 @@ export async function POST(req: NextRequest) {
             }
             const tokens = await getFreshQBTokens(deadline);
 
-            const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
-                id: client.id, name: client.name, email: client.email ?? null, qbCustomerId: client.qbCustomerId ?? null,
-            }, deadline);
+            const { customerId, itemId } = await resolveCustomerAndItem(tokens, client.id, deadline);
 
             const result = await syncEstimateToQB(tokens, {
                 id: estimate.id,
@@ -142,10 +127,7 @@ export async function POST(req: NextRequest) {
         }
         const tokens = await getFreshQBTokens(deadline);
 
-        const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
-            id: invoice.client.id, name: invoice.client.name,
-            email: invoice.client.email ?? null, qbCustomerId: invoice.client.qbCustomerId ?? null,
-        }, deadline);
+        const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.client.id, deadline);
 
         const result = await syncInvoiceToQB(tokens, {
             code: invoice.code,
