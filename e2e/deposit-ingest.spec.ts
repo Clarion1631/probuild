@@ -961,6 +961,12 @@ const B = {
     schedule: "di-e2e-bank-photofirst-schedule", amount: 8537.55,
     fileId: "di-e2e-file-bank-photofirst", bankReference: "e2ebank0000006",
   },
+  classGate: {
+    project: "di-e2e-bank-classgate-project", projectName: "Nnexo Bankclassgate Project",
+    invoice: "di-e2e-bank-classgate-invoice", invoiceCode: "INV-DI-BANK-CLASSGATE",
+    schedule: "di-e2e-bank-classgate-schedule", amount: 8737.77,
+    qbInvoiceId: "di-mock-inv-bank-classgate", bankReference: "e2ebank0000008",
+  },
   bankFirst: {
     project: "di-e2e-bank-bankfirst-project", projectName: "Nnexo Bankbankfirst Project",
     invoice: "di-e2e-bank-bankfirst-invoice", invoiceCode: "INV-DI-BANK-BANKFIRST",
@@ -972,20 +978,27 @@ const B = {
 
 const BANK_PROJECT_IDS = [
   B.replay.project, B.collide.project, B.dry.project, B.prebooked.project,
-  B.photoFirst.project, B.bankFirst.project,
+  B.photoFirst.project, B.bankFirst.project, B.classGate.project,
 ];
 const BANK_FILE_IDS = [
   `bank:${B.replay.bankReference}`, `bank:${B.collide.refA}`, `bank:${B.collide.refB}`,
   `bank:${B.dry.bankReference}`, `bank:${B.prebooked.bankReference}`,
   `bank:${B.photoFirst.bankReference}`, `bank:${B.bankFirst.bankReference}`,
+  `bank:${B.classGate.bankReference}`,
   B.photoFirst.fileId, B.bankFirst.fileId,
 ];
 const BANK_SCHEDULE_IDS = [
   B.replay.schedule, B.collide.schedule, B.dry.schedule, B.prebooked.schedule,
-  B.photoFirst.schedule, B.bankFirst.schedule,
+  B.photoFirst.schedule, B.bankFirst.schedule, B.classGate.schedule,
 ];
 
-type BankCreditSpec = { bankReference: string; amount: number; transactionDetail?: string };
+type BankCreditSpec = {
+  bankReference: string;
+  amount: number;
+  transactionDetail?: string;
+  description?: string;
+  baiCode?: string;
+};
 
 /** The full SweepCounts shape (src/lib/deposit-sweep.ts). Asserted whole, not
  *  matched partially: the counts must PARTITION the batch, and a bucket that
@@ -1001,9 +1014,14 @@ async function postBankBatch(
   request: APIRequestContext,
   opts: { postDate?: string; credits: BankCreditSpec[]; dryRun?: boolean; overrides?: Record<string, unknown> },
 ) {
+  // The real Washington Trust shape for a customer deposit (BAI 174 /
+  // OTHER DEPOSITS / a DEPOSIT-or-MOBILE detail) unless a case is deliberately
+  // posting some other class of credit — only a customer deposit is sweepable.
   const credits = opts.credits.map((c) => ({
     bankReference: c.bankReference,
     amount: c.amount,
+    baiCode: c.baiCode ?? "174",
+    description: c.description ?? "OTHER DEPOSITS",
     transactionDetail: c.transactionDetail ?? "DEPOSIT - DDA/MMKT",
     customerReference: null,
   }));
@@ -1040,7 +1058,7 @@ test.describe.serial("Deposit sweep — bank source", () => {
     // The QBO mock replaces the network, not the connection state.
     await saveQBSettings({ connected: true, accessToken: "e2e-mock", refreshToken: "e2e-mock", realmId: "e2e-mock-realm" });
 
-    for (const f of [B.replay, B.collide, B.dry, B.prebooked, B.bankFirst]) {
+    for (const f of [B.replay, B.collide, B.dry, B.prebooked, B.bankFirst, B.classGate]) {
       await seedFixture({
         projectId: f.project, projectName: f.projectName,
         invoiceId: f.invoice, invoiceCode: f.invoiceCode,
@@ -1233,6 +1251,28 @@ test.describe.serial("Deposit sweep — bank source", () => {
     expect(photo.body.reason).toContain(B.bankFirst.bankReference);
     expect(photo.body.officeTaskId).toBeTruthy();
     expect((await getQboMockState(request)).calls.paymentCreate, "exactly one payment for one check").toBe(1);
+  });
+
+  // ── B8: only a customer deposit is sweepable ──────────────────────────────
+  test("B8: a non-deposit credit at a requested milestone's exact amount never books", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.classGate.qbInvoiceId, B.classGate.amount, "di-mock-cust-bank-classgate");
+
+    // Owner capital / an ACH refund / a transfer, landing on the exact cents of
+    // a requested milestone — the case amount-only matching cannot survive.
+    const { body } = await postBankBatch(request, {
+      credits: [{
+        bankReference: B.classGate.bankReference, amount: B.classGate.amount,
+        baiCode: "165", description: "ACH CREDIT", transactionDetail: "OWNER CONTRIBUTION",
+      }],
+    });
+
+    const credit = bankCredit(body, B.classGate.bankReference);
+    expect(credit.status).toBe("unmatched");
+    expect(credit.reason).toContain("not a customer deposit class");
+    expect(credit.officeTaskId, "it looks like a payment, so a human is asked").toBeTruthy();
+    expect((await getQboMockState(request)).calls.paymentCreate, "no QuickBooks write for a non-deposit").toBe(0);
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.classGate.schedule } })).status).toBe("Pending");
   });
 
   // ── B7: batch validation ──────────────────────────────────────────────────

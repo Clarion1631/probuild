@@ -136,6 +136,11 @@ const BAI_TOTAL_CREDITS = "100";
 const BAI_TOTAL_DEBITS = "400";
 const BAI_CHECK_PAID = "475";
 const POST_TIMEOUT_MS = 30_000;
+// The sweep endpoint processes a whole day sequentially, each credit worth up
+// to two QuickBooks round trips, inside a 60-second function. Abandoning that
+// request early would leave a batch mid-money-write with nobody reading the
+// answer, so the client waits LONGER than the server can possibly take.
+const SWEEP_POST_TIMEOUT_MS = 90_000;
 
 /** Collapse internal whitespace runs to one space and trim. Hash stability. */
 function collapseWs(value) { return value.trim().replace(/\s+/g, " "); }
@@ -358,9 +363,14 @@ export function buildDayStatements(csvText, account) {
                 bankReference: iBankRef === -1 ? "" : (rec[iBankRef] ?? "").trim(),
                 amount: cents / 100,
                 amountCents: cents,
-                // The combined Description + Transaction Detail text, i.e. the
-                // same string the ledger stores as rawDescriptor.
-                transactionDetail: rawDescriptor || null,
+                // The three fields the endpoint classifies on, kept SEPARATE and
+                // unmerged: only an actual customer deposit may be booked as a
+                // customer payment, and that decision reads the BAI code, the
+                // description and the detail independently. (The ledger's
+                // combined rawDescriptor is no use for it.)
+                baiCode: bai || null,
+                description: desc || null,
+                transactionDetail: collapseWs(detail) || null,
                 customerReference: custRef || null,
             });
         }
@@ -467,6 +477,8 @@ export function buildSweepPayload(day, opts = {}) {
     const credits = day.credits.map(c => ({
         bankReference: c.bankReference,
         amount: c.amount,
+        baiCode: c.baiCode,
+        description: c.description,
         transactionDetail: c.transactionDetail,
         customerReference: c.customerReference,
     }));
@@ -500,7 +512,7 @@ export async function postSweep(baseUrl, secret, day, opts = {}) {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
         body: JSON.stringify(buildSweepPayload(day, opts)),
-        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(SWEEP_POST_TIMEOUT_MS),
     });
     let body = null;
     try { body = await res.json(); } catch { /* non-JSON error body */ }

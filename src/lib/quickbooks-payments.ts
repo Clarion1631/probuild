@@ -14,7 +14,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
-import { BANK_DEPOSIT_SOURCE, MONEY_BOUNDARY_CLAIM_STATUSES } from "./deposit-sweep";
+import { BANK_DEPOSIT_SOURCE, MONEY_IN_FLIGHT_STATUSES } from "./deposit-sweep";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
@@ -467,6 +467,14 @@ export async function settleProgressBillingPaidCore(
  * "Payment Confirmed" email for money no human has looked at. So this function
  * asks the database whether a bank-sourced deposit owns this milestone. Either
  * signal suppresses; neither one can be lost by which caller happened to win.
+ *
+ * The question is asked about THIS payment, not about the schedule's history.
+ * A finished (`applied`) deposit row only suppresses when its own qbPaymentId
+ * is the payment being settled — otherwise an undo-and-repay months later
+ * would inherit the old sweep's silence and swallow the client's receipt. A
+ * row that is still mid-flight (including one parked in `reconcile`, which is
+ * very much still the sweep's money) suppresses on status alone, because its
+ * QuickBooks payment id may not be known yet.
  */
 export async function settleMilestoneFromQBPayment(input: {
     paymentScheduleId: string;
@@ -495,7 +503,13 @@ export async function settleMilestoneFromQBPayment(input: {
             where: {
                 source: BANK_DEPOSIT_SOURCE,
                 paymentScheduleId,
-                status: { in: [...MONEY_BOUNDARY_CLAIM_STATUSES] },
+                OR: [
+                    // (a) this exact payment came from the sweep, whatever state
+                    //     the row has since reached;
+                    ...(payment.qbPaymentId ? [{ qbPaymentId: payment.qbPaymentId }] : []),
+                    // (b) a sweep is mid-flight on this milestone right now.
+                    { status: { in: [...MONEY_IN_FLIGHT_STATUSES] } },
+                ],
             },
             select: { id: true },
         });

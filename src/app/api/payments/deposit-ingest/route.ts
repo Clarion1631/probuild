@@ -29,7 +29,10 @@ import {
     crossSourceClaimNote,
     describeCandidates,
     findCollisions,
+    isCustomerDepositClass,
     isDeterministicQboGuardFailure,
+    isNotCustomerDepositReason,
+    notCustomerDepositNote,
     isoDateToUtc,
     isoDaysAfter,
     isoDaysBefore,
@@ -43,7 +46,12 @@ import {
 } from "@/lib/deposit-sweep";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+// A bank batch processes its whole day sequentially in ONE invocation (capped
+// at MAX_BANK_CREDITS_PER_BATCH), each credit potentially making two QuickBooks
+// round trips. 30s left no headroom for a slow day; the runner's own timeout is
+// larger still, so the server always gets to answer rather than the client
+// abandoning a batch that is mid-money-write.
+export const maxDuration = 60;
 
 /**
  * Deposit auto-apply pipeline (Phase B1). The GTR receipt bot classifies an
@@ -725,6 +733,10 @@ interface BankPayload extends NormalizedPayload {
     bankReference: string;
     postDate: string;
     amountCents: number;
+    /** The three fields the deposit-class allowlist reads, kept separate and
+     *  unmerged (see isCustomerDepositClass). */
+    baiCode: string | null;
+    description: string | null;
     transactionDetail: string | null;
     customerReference: string | null;
 }
@@ -780,6 +792,8 @@ function bankPayloadFor(credit: BankCredit, postDate: string): BankPayload {
         bankReference: credit.bankReference,
         postDate,
         amountCents: credit.amountCents,
+        baiCode: credit.baiCode,
+        description: credit.description,
         transactionDetail: credit.transactionDetail,
         customerReference: credit.customerReference,
         fileId: bankFileId(credit.bankReference),
@@ -1050,7 +1064,11 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     }
     if (row.status === "unmatched" || row.status === "reconcile") {
         const kind = row.status === "reconcile" ? "reconcile" : "unmatched";
-        const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? kind, kind);
+        // Heal a task lost to a crash — EXCEPT for a row that deliberately never
+        // had one (a credit that is not a customer deposit). Without this the
+        // daily replay would file the very task the class gate declined to file.
+        const heals = !isNotCustomerDepositReason(row.lastError);
+        const officeTaskId = heals ? (row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? kind, kind)) : row.officeTaskId;
         return { kind: "settled", response: NextResponse.json({ ok: true, status: row.status, reason: row.lastError, officeTaskId }) };
     }
 
@@ -1064,6 +1082,11 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     const needsLease = row.status !== "failed" && row.status !== "proposed";
     const retriable = row.status === "processing" || row.status === "failed" || row.status === "proposed";
     const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt);
+    // A `proposed` row is re-evaluated by EVERY daily POST — that is its whole
+    // purpose — so those replays must not consume the retry budget. Counting
+    // them turned a clean shadow-week row into a fabricated `reconcile`
+    // incident on the ninth day, for a credit that had never failed at anything.
+    const consumesAttempt = row.status !== "proposed";
     const claim = await prisma.depositIngest.updateMany({
         where: {
             id: row.id, status: row.status,
@@ -1071,7 +1094,8 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
         },
         data: {
             status: retriable ? "processing" : row.status,
-            attempts: { increment: 1 }, processingStartedAt: new Date(),
+            ...(consumesAttempt ? { attempts: { increment: 1 } } : {}),
+            processingStartedAt: new Date(),
             ...(retriable && !boundaryMarked ? { extracted: JSON.stringify(payload), paymentScheduleId: null, ...columns } : {}),
         },
     });
@@ -1125,6 +1149,22 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     }
 
     const amountLabel = `$${payload.amount.toFixed(2)}`;
+
+    // A bank credit is any money IN — an owner contribution, interest, an ACH
+    // refund, a transfer between accounts. Any of those can land on the exact
+    // cents of a requested milestone, and this sweep matches on amount alone,
+    // so only an actual customer deposit may ever be booked as a customer
+    // payment. Checked BEFORE anything else: no reservation, no QuickBooks.
+    if (!isCustomerDepositClass(payload)) {
+        const reason = notCustomerDepositNote(payload);
+        // Most of these are routine noise (interest, transfers) and filing a
+        // task for each would bury the real ones. A task is only worth a
+        // human's attention when the amount could plausibly BE a milestone
+        // payment — then somebody should look at why it arrived this way.
+        const lookalikes = await requestedMilestonesAt(payload.amountCents);
+        return await finalizeUnmatched(row, reason, { fileTask: lookalikes > 0 });
+    }
+
     const requested: BankCandidate[] = await prisma.paymentSchedule.findMany({
         where: {
             status: "Pending",
@@ -1215,6 +1255,20 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code },
         payload,
     );
+}
+
+/** How many REQUESTED, still-pending milestones sit at exactly this amount.
+ *  Used only to decide whether a non-deposit credit is worth a human's time. */
+async function requestedMilestonesAt(amountCents: number): Promise<number> {
+    const requested = await prisma.paymentSchedule.findMany({
+        where: {
+            status: "Pending",
+            qbInvoiceSentAt: { not: null },
+            invoice: { status: { in: OPEN_INVOICE_STATUSES } },
+        },
+        select: BANK_CANDIDATE_SELECT,
+    });
+    return requested.filter(c => centsOf(c.amount) === amountCents).length;
 }
 
 async function bankNoMatchReason(
@@ -1356,11 +1410,20 @@ async function findAppliedTwin(
 // reverse order would leave a NON-terminal row that re-runs the match on the next
 // retry and files a duplicate task. A briefly-missing task is also visible
 // elsewhere (the bot parks the file in _Needs Review); a duplicate would not be.
-async function finalizeUnmatched(row: DepositIngest, reason: string): Promise<NextResponse> {
+async function finalizeUnmatched(
+    row: DepositIngest,
+    reason: string,
+    opts: { fileTask?: boolean } = {},
+): Promise<NextResponse> {
     // "unmatched" is not in the partial reservation index's status list, so this
     // transition releases any held milestone reservation by itself.
     await prisma.depositIngest.update({ where: { id: row.id }, data: { status: "unmatched", lastError: reason.slice(0, 1000) } });
-    const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched");
+    // `fileTask: false` is for rows nobody needs to see — a bank credit that is
+    // simply not a customer deposit. The row still exists (and still blocks a
+    // re-sweep, since its reference is terminal), it just isn't noise on the
+    // /tasks board.
+    const fileTask = opts.fileTask ?? true;
+    const officeTaskId = fileTask ? (row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched")) : row.officeTaskId;
     return NextResponse.json({ ok: true, status: "unmatched", reason, officeTaskId });
 }
 

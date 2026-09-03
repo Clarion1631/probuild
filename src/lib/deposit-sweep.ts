@@ -33,9 +33,14 @@ export const PAID_UNION_WINDOW_DAYS = 14;
 /** Window for the cross-source claim check and the applied-twin lookup. */
 export const CROSS_SOURCE_CLAIM_WINDOW_DAYS = 14;
 
-/** One POST carries ONE day. A real day has a handful of credits; this cap
- *  only stops a malformed or merged export from becoming a huge batch. */
-export const MAX_BANK_CREDITS_PER_BATCH = 500;
+/**
+ * One POST carries ONE day, and every credit in it is processed sequentially
+ * inside a single serverless invocation — so the cap is a DEADLINE budget, not
+ * just a sanity check. A real Washington Trust day is a handful of credits; a
+ * batch of dozens means a merged or mis-ranged export, and pushing it through
+ * a 60-second function would leave a half-processed day behind.
+ */
+export const MAX_BANK_CREDITS_PER_BATCH = 50;
 
 /**
  * The cross-source claim check is DIRECTIONAL, so it has two status lists.
@@ -56,6 +61,21 @@ export const MAX_BANK_CREDITS_PER_BATCH = 500;
 export const CLAIMING_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied", "proposed"] as const;
 export const MONEY_BOUNDARY_CLAIM_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied"] as const;
 
+/**
+ * Statuses that mean a bank deposit is working on this milestone RIGHT NOW,
+ * used to decide receipt suppression when some other caller finishes the
+ * settle. Deliberately different from the list above in both directions:
+ *
+ *   - `reconcile` IS here. A sweep payment parked for manual reconciliation is
+ *     still the sweep's money; the client must not be emailed a receipt for it.
+ *   - `applied` is NOT here. A finished deposit is history, and history must
+ *     not suppress a LATER, unrelated settlement of the same milestone — an
+ *     undo-and-repay would otherwise silently swallow the client's receipt
+ *     forever. An applied row only suppresses when its own qbPaymentId matches
+ *     the payment being settled (see settleMilestoneFromQBPayment).
+ */
+export const MONEY_IN_FLIGHT_STATUSES = ["processing", "qbo_unknown", "qbo_created", "reconcile"] as const;
+
 /** BankImage.source that scripts/post-bank-images.mjs writes for WTB documents. */
 export const BANK_IMAGE_SOURCE = "WTB_ONLINE";
 
@@ -73,8 +93,62 @@ export interface BankCredit {
     /** Positive dollars, exactly representable in cents. */
     amount: number;
     amountCents: number;
+    /** The bank's transaction class code, e.g. "174" for OTHER DEPOSITS. */
+    baiCode: string | null;
+    /** The bank's Description column, e.g. "OTHER DEPOSITS". */
+    description: string | null;
+    /** The bank's Transaction Detail column, e.g. "DEPOSIT - DDA/MMKT". */
     transactionDetail: string | null;
     customerReference: string | null;
+}
+
+/**
+ * ONLY a customer deposit may be booked as a customer payment.
+ *
+ * A bank credit is any money in: an owner capital contribution, interest, an
+ * ACH refund from a supplier, a transfer between accounts. Every one of those
+ * can land on the exact cents of a requested milestone, and the sweep matches
+ * on amount alone — so without this gate a $13,447.68 transfer would retire a
+ * customer's milestone and invoice them for money they never paid.
+ *
+ * This is an ALLOWLIST, not a denylist: a class nobody anticipated is refused
+ * rather than swept. The shape comes from the real Washington Trust export
+ * (docs/WTB-CHECK-IMAGES.md): BAI 174 / "OTHER DEPOSITS", whose Transaction
+ * Detail distinguishes a branch deposit ("DEPOSIT - DDA/MMKT") from a remote
+ * one ("MOBILE D..."). Those two are the only ways a customer check reaches
+ * this account.
+ */
+export const CUSTOMER_DEPOSIT_BAI_CODE = "174";
+export const CUSTOMER_DEPOSIT_DESCRIPTION = "OTHER DEPOSITS";
+export const CUSTOMER_DEPOSIT_DETAIL_PREFIXES = ["DEPOSIT", "MOBILE D"] as const;
+
+export function isCustomerDepositClass(credit: {
+    baiCode?: string | null;
+    description?: string | null;
+    transactionDetail?: string | null;
+}): boolean {
+    const norm = (v: string | null | undefined) => (v ?? "").trim().toUpperCase().replace(/\s+/g, " ");
+    if (norm(credit.baiCode) !== CUSTOMER_DEPOSIT_BAI_CODE) return false;
+    if (norm(credit.description) !== CUSTOMER_DEPOSIT_DESCRIPTION) return false;
+    const detail = norm(credit.transactionDetail);
+    return CUSTOMER_DEPOSIT_DETAIL_PREFIXES.some(prefix => detail.startsWith(prefix));
+}
+
+/** Marker prefix so the row's own reason says why it was never swept — and so
+ *  the replay healer can tell a deliberate no-task row from a lost one. */
+export const NOT_CUSTOMER_DEPOSIT_PREFIX = "not a customer deposit class";
+
+export function notCustomerDepositNote(credit: {
+    description?: string | null;
+    transactionDetail?: string | null;
+}): string {
+    return `${NOT_CUSTOMER_DEPOSIT_PREFIX} (${credit.description ?? "no description"} / ${credit.transactionDetail ?? "no detail"})`;
+}
+
+/** True for a row that was filed WITHOUT an OfficeTask on purpose: a bank
+ *  credit that is simply not a customer deposit is noise, not a task. */
+export function isNotCustomerDepositReason(reason: string | null | undefined): boolean {
+    return typeof reason === "string" && reason.startsWith(NOT_CUSTOMER_DEPOSIT_PREFIX);
 }
 
 export interface BankBatch {
@@ -153,7 +227,16 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
     if (!Array.isArray(raw.credits)) return { ok: false, reason: "credits must be an array" };
     if (raw.credits.length === 0) return { ok: false, reason: "credits must not be empty" };
     if (raw.credits.length > MAX_BANK_CREDITS_PER_BATCH) {
-        return { ok: false, reason: `credits exceeds the ${MAX_BANK_CREDITS_PER_BATCH}-row batch cap` };
+        return {
+            ok: false,
+            reason: `credits exceeds the ${MAX_BANK_CREDITS_PER_BATCH}-row batch cap — post one day at a time ` +
+                `(a batch this size means a merged or mis-ranged export, and it cannot be processed inside one request)`,
+        };
+    }
+    // A truthiness test here would read "true", 1 or "yes" as LIVE, which is the
+    // wrong way round for a flag whose whole job is to stop money moving.
+    if (raw.dryRun !== undefined && typeof raw.dryRun !== "boolean") {
+        return { ok: false, reason: "dryRun must be a boolean (omit it for a live run)" };
     }
 
     const credits: BankCredit[] = [];
@@ -184,6 +267,8 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
             bankReference,
             amount: amountCents / 100,
             amountCents,
+            baiCode: boundedString(c.baiCode, 10),
+            description: boundedString(c.description, 200),
             transactionDetail: boundedString(c.transactionDetail, 500),
             customerReference: boundedString(c.customerReference, 200),
         });
@@ -207,6 +292,7 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
     }
 
     return { ok: true, batch: { postDate, credits, dryRun: raw.dryRun === true } };
+    // (raw.dryRun is already known to be a boolean or absent by here.)
 }
 
 function boundedString(value: unknown, max: number): string | null {

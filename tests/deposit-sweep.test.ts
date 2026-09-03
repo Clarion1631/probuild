@@ -38,7 +38,11 @@ import {
     bankImageKeyPrefix,
     crossSourceClaimNote,
     findCollisions,
+    isCustomerDepositClass,
     isDeterministicQboGuardFailure,
+    isNotCustomerDepositReason,
+    notCustomerDepositNote,
+    MAX_BANK_CREDITS_PER_BATCH,
     parseBankBatch,
     qboGuardNote,
     reservationLostNote,
@@ -70,6 +74,9 @@ const same = (a: unknown, b: unknown): boolean => {
 function matchWhere(row: Row | null | undefined, where: Row): boolean {
     if (!row) return false;
     for (const [key, cond] of Object.entries(where)) {
+        if (key === "OR") { if (!(cond as Row[]).some(c => matchWhere(row, c))) return false; continue; }
+        if (key === "AND") { if (!(cond as Row[]).every(c => matchWhere(row, c))) return false; continue; }
+        if (key === "NOT") { if (matchWhere(row, cond as Row)) return false; continue; }
         const value = row[key];
         if (cond === undefined) continue;
         if (isPlainObject(cond)) {
@@ -383,13 +390,20 @@ function seedMilestone(opts: {
     return id;
 }
 
-function bankBatch(credits: Array<{ ref: string; amount: number; detail?: string }>, overrides: Row = {}) {
+function bankBatch(
+    credits: Array<{ ref: string; amount: number; detail?: string; description?: string; bai?: string }>,
+    overrides: Row = {},
+) {
     return {
         source: "bank",
         postDate: SETTLED_DAY,
         credits: credits.map(c => ({
             bankReference: c.ref,
             amount: c.amount,
+            // The real WTB shape for a branch deposit, unless a test is
+            // deliberately posting some other class of credit.
+            baiCode: c.bai ?? "174",
+            description: c.description ?? "OTHER DEPOSITS",
             transactionDetail: c.detail ?? "DEPOSIT - DDA/MMKT",
             customerReference: null,
         })),
@@ -472,7 +486,8 @@ test("batch gate: sub-cent and non-positive amounts are refused", () => {
 
 const credit = (ref: string, amount: number) => ({
     bankReference: ref, amount, amountCents: Math.round(amount * 100),
-    transactionDetail: null, customerReference: null,
+    baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT",
+    customerReference: null,
 });
 
 test("collisions: two DIFFERENT references at the same amount flag each other", () => {
@@ -536,6 +551,77 @@ test("messages name the row on the other side of the collision", () => {
         /already being applied by the deposit sweep \(bank ref 262/,
     );
     assert.equal(reservationLostNote(null), "milestone already being applied by another deposit");
+});
+
+test("deposit class: ONLY a real customer deposit is sweepable", async t => {
+    const row = (over: Record<string, string | null> = {}) => ({
+        baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", ...over,
+    });
+
+    await t.test("a branch deposit and a mobile deposit are customer deposits", () => {
+        assert.equal(isCustomerDepositClass(row()), true);
+        assert.equal(isCustomerDepositClass(row({ transactionDetail: "MOBILE DEPOSIT" })), true);
+        assert.equal(isCustomerDepositClass(row({ transactionDetail: "MOBILE D 2343776286" })), true);
+        // Whitespace and case are the bank's, not ours.
+        assert.equal(isCustomerDepositClass(row({ description: "  other   deposits ", transactionDetail: "deposit - dda/mmkt  " })), true);
+    });
+
+    await t.test("everything else is refused — this is an ALLOWLIST", () => {
+        // Each of these can land on the exact cents of a requested milestone.
+        assert.equal(isCustomerDepositClass(row({ baiCode: "165", description: "INTEREST PAID" })), false, "interest");
+        assert.equal(isCustomerDepositClass(row({ description: "INTEREST PAID" })), false, "interest under a deposit BAI");
+        assert.equal(isCustomerDepositClass(row({ baiCode: "165", description: "ACH CREDIT", transactionDetail: "ACH REFUND" })), false, "ACH credit");
+        assert.equal(isCustomerDepositClass(row({ baiCode: "195", description: "INCOMING WIRE", transactionDetail: "WIRE IN" })), false, "wire");
+        assert.equal(isCustomerDepositClass(row({ description: "TRANSFER FROM SAVINGS", transactionDetail: "TRANSFER" })), false, "transfer");
+        // An owner capital contribution that arrives under the deposit
+        // description but a detail we do not recognise.
+        assert.equal(isCustomerDepositClass(row({ transactionDetail: "CAPITAL CONTRIBUTION" })), false, "owner deposit, unknown detail");
+        // Missing fields fail CLOSED (an older runner that sends none of them).
+        assert.equal(isCustomerDepositClass({}), false);
+        assert.equal(isCustomerDepositClass(row({ baiCode: null })), false);
+        assert.equal(isCustomerDepositClass(row({ transactionDetail: null })), false);
+    });
+
+    await t.test("the reason names what the bank actually said", () => {
+        const note = notCustomerDepositNote({ description: "INTEREST PAID", transactionDetail: "INTEREST" });
+        assert.match(note, /not a customer deposit class \(INTEREST PAID \/ INTEREST\)/);
+        assert.equal(isNotCustomerDepositReason(note), true);
+        assert.equal(isNotCustomerDepositReason("no requested pending milestone matches $10.00"), false);
+        assert.equal(isNotCustomerDepositReason(null), false);
+    });
+});
+
+test("batch cap: a day is a handful of credits, not fifty-one", () => {
+    assert.equal(MAX_BANK_CREDITS_PER_BATCH, 50);
+    const many = Array.from({ length: MAX_BANK_CREDITS_PER_BATCH + 1 }, (_, i) => ({ ref: `R${i}`, amount: (i + 1) / 100 }));
+    const parsed = parseBankBatch(bankBatch(many, {
+        creditCount: many.length,
+        creditSum: many.reduce((sum, c) => sum + Math.round(c.amount * 100), 0) / 100,
+    }));
+    assert.equal(parsed.ok, false);
+    assert.match((parsed as { reason: string }).reason, /50-row batch cap/);
+    assert.match((parsed as { reason: string }).reason, /one day at a time/);
+
+    // …and exactly the cap is fine.
+    const atCap = many.slice(0, MAX_BANK_CREDITS_PER_BATCH);
+    assert.equal(parseBankBatch(bankBatch(atCap, {
+        creditCount: atCap.length,
+        creditSum: atCap.reduce((sum, c) => sum + Math.round(c.amount * 100), 0) / 100,
+    })).ok, true);
+});
+
+test("dryRun is a BOOLEAN — a truthy string must never read as live", () => {
+    // The wrong way round is catastrophic: "true" would be treated as live and
+    // the shadow week would book real money.
+    for (const value of ["true", "false", 1, 0, null, {}, []]) {
+        const parsed = parseBankBatch(bankBatch([{ ref: "A1", amount: 10 }], { dryRun: value }));
+        assert.equal(parsed.ok, false, `dryRun ${JSON.stringify(value)} must be refused`);
+        assert.match((parsed as { reason: string }).reason, /dryRun must be a boolean/);
+    }
+    // The two real values, and absence.
+    assert.equal((parseBankBatch(bankBatch([{ ref: "A1", amount: 10 }], { dryRun: true })) as { batch: { dryRun: boolean } }).batch.dryRun, true);
+    assert.equal((parseBankBatch(bankBatch([{ ref: "A1", amount: 10 }], { dryRun: false })) as { batch: { dryRun: boolean } }).batch.dryRun, false);
+    assert.equal((parseBankBatch(bankBatch([{ ref: "A1", amount: 10 }])) as { batch: { dryRun: boolean } }).batch.dryRun, false);
 });
 
 test("M1: a deterministic QuickBooks guard failure is explained, not retried", () => {
@@ -1128,6 +1214,61 @@ test("M3: the SYNC path suppresses the client receipt on its own when a bank dep
         assert.notEqual(tables.paymentNotification.rows[0].suppressClientReceipt, true);
     });
 
+    await t.test("undo-and-repay: a FINISHED sweep does not silence a later, unrelated payment", async () => {
+        // The bug: suppressing on "any applied bank row for this schedule"
+        // means the client never gets a receipt again, for any future payment
+        // on that milestone, because history never changes.
+        seedSettleFixture("sched-repaid");
+        tables.depositIngest.rows.push({
+            id: "bank-old", fileId: bankFileId("REF-OLD"), status: "applied", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-OLD", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-repaid",
+            qbPaymentId: "qb-payment-THE-OLD-ONE", updatedAt: new Date(),
+        });
+
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-repaid", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-A-DIFFERENT-ONE", paidAt: new Date(), referenceNumber: "5678",
+        });
+        assert.notEqual(
+            tables.paymentNotification.rows[0].suppressClientReceipt, true,
+            "a new payment on the same milestone is a new event — the client hears about it",
+        );
+    });
+
+    await t.test("…but the SAME payment still suppresses, whatever state the row reached", async () => {
+        seedSettleFixture("sched-same-payment");
+        tables.depositIngest.rows.push({
+            id: "bank-done", fileId: bankFileId("REF-SAME"), status: "applied", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-SAME", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-same-payment",
+            qbPaymentId: "qb-payment-THE-SWEPT-ONE", updatedAt: new Date(),
+        });
+
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-same-payment", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-THE-SWEPT-ONE", paidAt: new Date(), referenceNumber: "REF-SAME",
+        });
+        assert.equal(tables.paymentNotification.rows[0].suppressClientReceipt, true);
+    });
+
+    await t.test("a sweep parked in RECONCILE is still the sweep's money", async () => {
+        // It was missing from the status list, so the hourly recovery of a
+        // reconcile-parked sweep payment emailed the client a receipt.
+        seedSettleFixture("sched-reconcile");
+        tables.depositIngest.rows.push({
+            id: "bank-reconcile", fileId: bankFileId("REF-RECONCILE"), status: "reconcile", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-RECONCILE", extracted: "{}", attempts: 3, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-reconcile", updatedAt: new Date(),
+        });
+
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-reconcile", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-recovered", paidAt: new Date(), referenceNumber: "REF-RECONCILE",
+        });
+        assert.equal(tables.paymentNotification.rows[0].suppressClientReceipt, true);
+    });
+
     await t.test("a TERMINAL-but-unmatched bank row does not suppress — it owns nothing", async () => {
         seedSettleFixture("sched-released");
         tables.depositIngest.rows.push({
@@ -1170,6 +1311,74 @@ test("M2 (round 2): a credit left in qbo_created — a REAL payment awaiting rec
     const row = depositRow("REF-QBO-CREATED")!;
     assert.equal(row.status, "qbo_created");
     assert.ok(row.qbPaymentId, "the QuickBooks payment id is preserved for the resume");
+});
+
+test("P0: a credit that is not a customer deposit NEVER books, even at the exact amount", async t => {
+    await t.test("an owner/interest/transfer credit at a requested amount files for a human", async () => {
+        // The dangerous case: money in that is not a customer payment, landing
+        // on the exact cents of a requested milestone.
+        const milestone = seedMilestone({ amount: 25000 });
+        const { body } = await post(bankBatch([{
+            ref: "REF-OWNER", amount: 25000, bai: "165", description: "ACH CREDIT", detail: "OWNER CONTRIBUTION",
+        }]));
+
+        const result = creditResult(body, "REF-OWNER");
+        assert.equal(result.status, "unmatched");
+        assert.match(String(result.reason), /not a customer deposit class \(ACH CREDIT \/ OWNER CONTRIBUTION\)/);
+        assert.equal(calls.buildQBPaymentRequest.length, 0, "no QuickBooks call at all");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+        assert.ok(result.officeTaskId, "it LOOKS like a payment, so a human is asked");
+    });
+
+    await t.test("the same credit at an amount nobody is owed is filed silently", async () => {
+        seedMilestone({ amount: 25000 });
+        const { body } = await post(bankBatch([{
+            ref: "REF-INTEREST", amount: 3.17, bai: "165", description: "INTEREST PAID", detail: "INTEREST",
+        }]));
+
+        const result = creditResult(body, "REF-INTEREST");
+        assert.equal(result.status, "unmatched");
+        assert.match(String(result.reason), /not a customer deposit class/);
+        assert.equal(result.officeTaskId, null, "routine interest must not become a task every single day");
+        assert.equal(tables.officeTask.rows.length, 0);
+    });
+
+    await t.test("…and the daily replay does not resurrect the task it declined to file", async () => {
+        seedMilestone({ amount: 25000 });
+        const batch = bankBatch([{ ref: "REF-INTEREST", amount: 3.17, bai: "165", description: "INTEREST PAID", detail: "INTEREST" }]);
+        await post(batch);
+        const { body } = await post(batch);
+        assert.equal(creditResult(body, "REF-INTEREST").status, "unmatched");
+        assert.equal(tables.officeTask.rows.length, 0, "a quiet row stays quiet on every replay");
+    });
+
+    await t.test("a mobile deposit IS a customer deposit and applies", async () => {
+        const milestone = seedMilestone({ amount: 4242.42 });
+        const { body } = await post(bankBatch([{
+            ref: "REF-MOBILE", amount: 4242.42, detail: "MOBILE D 2343776286",
+        }]));
+        const result = creditResult(body, "REF-MOBILE");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+});
+
+test("P1: a `proposed` row survives a long shadow run without inventing a reconcile", async () => {
+    // Every daily POST re-evaluates a proposed row. Counting those as retries
+    // turned a clean dry-run credit into a fabricated `reconcile` incident on
+    // the ninth day — an incident report for a credit that never failed.
+    seedMilestone({ amount: 5959.59 });
+    const batch = bankBatch([{ ref: "REF-SHADOW", amount: 5959.59 }], { dryRun: true });
+
+    for (let day = 1; day <= 12; day++) {
+        const { body } = await post(batch);
+        const result = creditResult(body, "REF-SHADOW");
+        assert.equal(result.status, "proposed", `day ${day}: ${result.reason}`);
+    }
+    const row = depositRow("REF-SHADOW")!;
+    assert.equal(row.status, "proposed");
+    assert.equal(row.attempts, 1, "twelve re-evaluations consumed no retry budget");
+    assert.equal(tables.officeTask.rows.length, 0, "and filed no incident");
 });
 
 test("the batch response carries the counts the Bot Health line is built from", async () => {

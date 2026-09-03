@@ -284,8 +284,10 @@ test("the hash-format epoch is separate from the source-of-truth boundary", () =
 // ── Deposit sweep (--sweep): the trigger this script carries for the daily
 //    bank-credit auto-apply. See docs/plans/DEPOSIT-SWEEP-PLAN.md.
 
-const CREDIT = (d: string, amt: string, bankRef: string, detail = "DEPOSIT - DDA/MMKT") =>
-    row(d, "OTHER DEPOSITS", "165", amt, "Cleared", "", detail, bankRef);
+/** The real Washington Trust shape for a customer deposit: BAI 174 /
+ *  OTHER DEPOSITS, with the Transaction Detail saying how it arrived. */
+const CREDIT = (d: string, amt: string, bankRef: string, detail = "DEPOSIT - DDA/MMKT", desc = "OTHER DEPOSITS", bai = "174") =>
+    row(d, desc, bai, amt, "Cleared", "", detail, bankRef);
 
 test("sweep: a day carries its CREDIT rows, keyed by the bank reference", () => {
     const { complete } = build([
@@ -300,11 +302,16 @@ test("sweep: a day carries its CREDIT rows, keyed by the bank reference", () => 
     assert.equal(complete.length, 1);
     const day = complete[0];
     assert.equal(day.credits.length, 1, "only money IN is a credit");
+    // The three class fields stay SEPARATE and unmerged: the endpoint's
+    // allowlist reads them independently, and the ledger's combined descriptor
+    // is no use for deciding whether this is a customer payment at all.
     assert.deepEqual(day.credits[0], {
         bankReference: "26236015002406",
         amount: 13447.68,
         amountCents: 1344768,
-        transactionDetail: "OTHER DEPOSITS DEPOSIT - DDA/MMKT",
+        baiCode: "174",
+        description: "OTHER DEPOSITS",
+        transactionDetail: "DEPOSIT - DDA/MMKT",
         customerReference: null,
     });
     assert.equal(day.totalCreditsCents, 1344768);
@@ -332,10 +339,10 @@ test("sweep: the payload carries the BANK's own control totals", () => {
     assert.equal(payload.creditCount, 2);
     assert.equal(payload.creditSum, 1500);
     assert.deepEqual(payload.credits.map((c: any) => c.bankReference), ["REF-A", "REF-B"]);
-    // Only the four fields the endpoint reads — amountCents stays internal.
+    // Exactly the fields the endpoint reads — amountCents stays internal.
     assert.deepEqual(
         Object.keys(payload.credits[0]).sort(),
-        ["amount", "bankReference", "customerReference", "transactionDetail"],
+        ["amount", "baiCode", "bankReference", "customerReference", "description", "transactionDetail"],
     );
     assert.equal("dryRun" in payload, false, "a live sweep sends no dryRun flag at all");
     assert.equal(buildSweepPayload(complete[0], { dryRun: true }).dryRun, true);
@@ -502,5 +509,32 @@ test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async
                 `${status} is a clean outcome`,
             );
         }
+    });
+});
+
+test("sweep: a non-deposit credit is SENT, with the class fields the endpoint judges it by", () => {
+    // The runner does not decide what is a customer payment — it reports what
+    // the bank said and lets the endpoint's allowlist rule. Filtering here
+    // would hide an interest or transfer credit from the audit trail entirely,
+    // and would put the money rule in the browser-automation script instead of
+    // the server that owns every other money rule.
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1503.17"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1503.17"),
+        CREDIT("08/24/2026", "1500.00", "REF-DEP"),
+        CREDIT("08/24/2026", "3.17", "REF-INT", "INTEREST", "INTEREST PAID", "165"),
+    ]);
+
+    const payload = buildSweepPayload(complete[0]);
+    assert.equal(payload.creditCount, 2, "both credits are posted");
+    const interest = payload.credits.find((c: any) => c.bankReference === "REF-INT");
+    assert.deepEqual(interest, {
+        bankReference: "REF-INT",
+        amount: 3.17,
+        baiCode: "165",
+        description: "INTEREST PAID",
+        transactionDetail: "INTEREST",
+        customerReference: null,
     });
 });
