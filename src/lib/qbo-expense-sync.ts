@@ -19,7 +19,11 @@ import { dateOnlyInTimeZone } from "./tz-date";
 import { resolveCompanyTimeZone } from "./company-timezone";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { lockExpense } from "./expense-lock";
-import { assertPhaseOfProjectTx, type PhaseTxClient as PhaseTxLike } from "./phase-invariant";
+import {
+    assertPhaseOfProjectTx,
+    lockAttributionParents,
+    type PhaseTxClient as PhaseTxLike,
+} from "./phase-invariant";
 import { prismaPhaseDataSource } from "./project-phases-db";
 // Shared with the register merge layer (register-merge.ts, Unified Money
 // Register plan §4) so the classification values this module WRITES can
@@ -1292,6 +1296,13 @@ export type QboCostCodeSuggestionResult =
     | "phase-not-on-project"
     /** Already coded, or coded by a human: the guard held. */
     | "not-written"
+    /**
+     * The row changed jobs between the scope read and the locked re-read — a
+     * fallback-attributed expense whose estimate was moved. The suggestion was
+     * computed for the job it LEFT, so it is dropped and the next sync run
+     * re-scopes it against the job it joined (round 37, item 3).
+     */
+    | "scope-moved"
     | "written";
 
 /**
@@ -1407,6 +1418,21 @@ export async function applyQboExpenseCostCodeSuggestion(
     // shared locks and the write happens on that same snapshot.
     if (typeof client.$transaction === "function") {
         return client.$transaction(async tx => {
+            // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37,
+            // item 3): Project -> Estimate -> EstimateItem -> CostCode.
+            //
+            // `resolveExpenseProjectUnderLock` below share-locks the ESTIMATE,
+            // and `assertPhaseOfProjectTx` after it reaches for the PROJECT.
+            // On their own that is Estimate -> Project, a deadlock cycle
+            // against a job editor holding its Project row FOR UPDATE — and
+            // this is the unattended pass, so the victim Postgres picks is as
+            // likely to be the person's save. `projectId` is the scope this
+            // suggestion was computed for.
+            await lockAttributionParents(tx, {
+                projectId,
+                estimateId: stored.estimateId,
+                costCodeId,
+            });
             // THE JOB IS RESOLVED AGAIN, INSIDE THE TRANSACTION (round 19, item 4).
             //
             // `projectId` above came from a read on the global client. For a
@@ -1423,6 +1449,15 @@ export async function applyQboExpenseCostCodeSuggestion(
                 estimateId: stored.estimateId,
             });
             if (!lockedProjectId) return "skipped-no-project";
+            // ...AND IF IT MOVED, THIS PASS STOPS HERE (round 37, item 3).
+            //
+            // Continuing would ask the phase question about a job whose
+            // Project row is NOT in the set locked above, i.e. take
+            // Estimate -> Project after all, one job over. It would also be a
+            // suggestion computed from the phase list of the job the row left.
+            // Refusing costs one sync cycle; the next run reads the new
+            // attribution and re-scopes from scratch.
+            if (lockedProjectId !== projectId) return "scope-moved";
             if (isOverheadProject(lockedProjectId)) return "skipped-overhead";
             const verdict = await assertPhaseOfProjectTx(tx, lockedProjectId, costCodeId);
             if (!verdict.ok) return "phase-not-on-project";

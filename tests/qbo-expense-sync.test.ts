@@ -2582,6 +2582,14 @@ test("an estimate REASSIGNED mid-suggestion is not coded for its old job", async
     // The read that produced `projectId` happened on the global client; the
     // estimate moves before the transaction resolves it again. Coding the row
     // now would apply a phase list belonging to a job it is no longer on.
+    //
+    // Since round 37 item 3 the pass STOPS at the disagreement rather than
+    // re-asking the phase question about the new job: that job's Project row
+    // is not in the lock set this transaction took at its top, so reaching for
+    // it would be the Estimate -> Project inversion the canonical order
+    // forbids. `phaseOk: false` is left in place deliberately — the outcome
+    // must not depend on whether the code happens to be a phase of the job the
+    // row joined, because that question is no longer asked.
     const { client, writes } = suggestionTxClient({
         stored: {
             ...(STORED_DEFAULT as object), projectId: null, estimateId: "estimate-1",
@@ -2593,9 +2601,29 @@ test("an estimate REASSIGNED mid-suggestion is not coded for its old job", async
     });
     assert.equal(
         await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
-        "phase-not-on-project",
+        "scope-moved",
     );
     assert.equal(writes.length, 0, "nothing is written on the old job's reasoning");
+});
+
+test("...and it stops there even when the code IS a phase of the new job", async () => {
+    // The control for the test above. Without it, "scope-moved" could be the
+    // phase check failing under another name; this one would sail through the
+    // phase check and still must not write, because the suggestion was
+    // computed from the OLD job's scope and the new job's rows are not held.
+    const { client, writes } = suggestionTxClient({
+        stored: {
+            ...(STORED_DEFAULT as object), projectId: null, estimateId: "estimate-1",
+            estimate: { projectId: "project-1" },
+        } as StoredForSuggestion,
+        estimateProject: "project-2",
+        phaseOk: true,
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "scope-moved",
+    );
+    assert.equal(writes.length, 0, "the next sync re-scopes it from scratch");
 });
 
 test("an estimate that lost its project mid-suggestion is skipped", async () => {

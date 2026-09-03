@@ -1266,6 +1266,31 @@ test("a human's decisions on an existing row are never overwritten", async () =>
     assert.ok(rec.expenseUpdates.every((u: any) => u.where.id === "expense-1"));
 });
 
+test("a bookkeeper's CLEARED phase survives an intake retry", async () => {
+    // ROUND 37, ITEM 1  the recovery this guard exists for, end to end.
+    //
+    // A bookkeeper opens a booked receipt, decides the machine's phase is
+    // wrong, and clears it. That writes `costCodeId: null` with
+    // `costCodeSource: "manual-none"`  a DECISION, not an absence (see
+    // HUMAN_COST_CODE_SOURCES). Booking's fill predicate used to spell its own
+    // exclusion list as ["capture", "manual"], so "manual-none" fell straight
+    // through it: the next retry of the SAME document  a lost QBO response, a
+    // re-delivery, a worker re-run  matched the row (its code IS null) and
+    // wrote the machine's suggestion back on top. The clear was undone within
+    // minutes and nothing recorded that it had happened.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null,
+        costCodeSource: "manual-none", taxAmount: 9.99, taxAtSource: true,
+        installedAtCustomer: false, estimate: { projectId: "proj-1" },
+    };
+    const result = await bookReceipt(row({ costCodeId: "cc-demo", costCodeSource: "user" }), rec.deps);
+    assert.equal(result.outcome, "booked");
+    const after = rec.existingExpense;
+    assert.equal(after.costCodeId, null, "the cleared phase stays cleared");
+    assert.equal(after.costCodeSource, "manual-none", "and so does the person's provenance");
+});
+
 test("a PATCH landing between the read and the fill is not overrun", async () => {
     // The read happens inside the transaction, but a bookkeeper's PATCH can
     // still commit before these writes. Deciding from the read and writing

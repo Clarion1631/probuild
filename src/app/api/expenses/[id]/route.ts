@@ -20,7 +20,7 @@ import { lockExpense } from "@/lib/expense-lock";
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
-import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
@@ -313,6 +313,22 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // and this route stamps "manual", which no automated pass may correct.
         const legacyWrite = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE ATTRIBUTION PARENTS, IN THE CANONICAL ORDER, BEFORE ANYTHING
+            // ELSE (round 37, item 3): Project -> Estimate -> EstimateItem ->
+            // CostCode -> Expense.
+            //
+            // The three calls below reach these tables in scattered order —
+            // `resolveExpenseProjectUnderLock` share-locks the Estimate, then
+            // `assertPhaseOfProjectTx` reaches for the Project — and the
+            // per-expense lock came first, so a booking taking the parents
+            // before its Expense lock and this handler taking them after it
+            // are a cycle from both ends. One acquisition, one order.
+            await lockAttributionParents(raw, {
+                projectId: resolvedProjectId,
+                estimateId: expense.estimateId,
+                itemId: body.itemId || null,
+                costCodeId: editsCostCode ? nextCostCodeId : null,
+            });
             // THE SHARED PER-EXPENSE LOCK (round 35, item 1).
             //
             // The tax PATCH has taken it since round 17; this handler never
@@ -330,6 +346,15 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             const lockedProjectId = await resolveExpenseProjectUnderLock(raw, expense);
             if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
                 return { expense: null, phaseRejected: null, denied: "forbidden" } as const;
+            }
+            // ...AND IF IT IS NOT THE JOB WHOSE ROWS ARE HELD, THIS REQUEST
+            // STOPS (round 37, item 3). A fallback-attributed row whose
+            // estimate moved between the pre-transaction read and here answers
+            // for a Project that is NOT in the locked set, so continuing would
+            // take Estimate -> Project after all. The editor reopens and
+            // retries against the job the row actually joined.
+            if (lockedProjectId !== resolvedProjectId) {
+                return { expense: null, phaseRejected: null, denied: "moved" } as const;
             }
             // BOTH RE-CHECKS ANSWER ABOUT `lockedProjectId` (round 21, item 2).
             //
@@ -1135,6 +1160,16 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // does not.
         const written = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE ATTRIBUTION PARENTS FIRST, IN THE CANONICAL ORDER (round 37,
+            // item 3): Project -> Estimate -> EstimateItem -> CostCode ->
+            // Expense. Same reason as the PUT handler above — the two calls
+            // below take the Estimate before the Project on their own, which
+            // is a cycle against a Project-first job editor.
+            await lockAttributionParents(raw, {
+                projectId,
+                estimateId: expense.estimateId,
+                costCodeId: editsCostCode ? nextCostCodeId : null,
+            });
             await lockExpense(raw, id);
             // THE JOB, RE-RESOLVED UNDER LOCK (round 19, item 3). For a row
             // with no `projectId` of its own the answer lives on the estimate,
@@ -1142,6 +1177,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             const lockedProjectId = await resolveExpenseProjectUnderLock(raw, expense);
             if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
                 return { count: 0, phaseRejected: null, denied: "forbidden" } as const;
+            }
+            // The row moved out of the locked job (see the PUT handler): the
+            // predicate below would match nothing anyway, and asking the phase
+            // question about the new job would take its Project row out of
+            // order. `count: 0` is the 409 "reopen and retry" the client
+            // already understands.
+            if (lockedProjectId !== projectId) {
+                return { count: 0, phaseRejected: null, denied: null } as const;
             }
             // THE PHASE ANSWER THAT COUNTS, taken here (round 17, item 5).
             //

@@ -83,6 +83,24 @@ jobs:
         env:
           PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The deploy bridge's TRIGGERS. Every other test of them reads the SQL as
+      # text; only a real server can say whether a BEFORE UPDATE trigger
+      # actually keeps an old writer's amount change from leaving a stale tax
+      # classification — or from failing the CHECK constraints outright.
+      - name: Expense attribution compatibility triggers against real Postgres
+        run: npx tsx --test tests/expense-attribution-triggers-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # The Project/Estimate acquisition order, both ways round. Carries its own
+      # pre-fix CONTROL: the old Estimate-then-Project sequence really does
+      # raise 40P01 against a Project-first editor, so the tests that follow are
+      # measuring the fix rather than an interleaving that never collided.
+      - name: Attribution lock order against real Postgres
+        run: npx tsx --test tests/attribution-lock-order-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

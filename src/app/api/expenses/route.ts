@@ -5,7 +5,7 @@ import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-
 import { resolveCostCode } from "@/lib/cost-coding";
 import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
-import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { itemBelongsToEstimateTx, lockEstimateAttribution } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
@@ -164,6 +164,23 @@ export async function POST(req: NextRequest) {
         // "capture", which no automated pass may then correct.
         const created = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37,
+            // item 3): Project -> Estimate -> EstimateItem -> CostCode.
+            //
+            // The three helpers below each take a SLICE of that set, and left
+            // to themselves they take it in the wrong order —
+            // `lockEstimateAttribution` share-locks the Estimate and only then
+            // does `assertPhaseOfProjectTx` reach for the Project. Against a
+            // job editor holding its Project row FOR UPDATE that is a cycle,
+            // and Postgres resolves a cycle by killing somebody (40P01).
+            // Acquiring the whole set here makes each of them a free
+            // re-acquisition of a lock this transaction already owns.
+            await lockAttributionParents(raw, {
+                projectId,
+                estimateId,
+                itemId: itemId || null,
+                costCodeId,
+            });
             // THE PAIR, RE-READ UNDER LOCK (round 20, item 3). Everything above
             // resolved the estimate's project and then did other work; an
             // estimate moved in that window would be inserted alongside the OLD

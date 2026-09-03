@@ -20,10 +20,14 @@
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
 import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
-import { isPlausibleReceiptTax, taxNotHumanDecidedWhere } from "@/lib/expense-attribution";
+import {
+    isPlausibleReceiptTax,
+    notHumanCodedExpenseWhere,
+    taxNotHumanDecidedWhere,
+} from "@/lib/expense-attribution";
 import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
-import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -721,6 +725,21 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
         const booked = await deps.db.$transaction(async tx => {
+            // THE ATTRIBUTION PARENTS FIRST, IN THE CANONICAL ORDER (round 37,
+            // item 3): Project -> Estimate -> EstimateItem -> CostCode ->
+            // Expense.
+            //
+            // `assertPhaseOfProjectTx` below takes most of this set already,
+            // but it takes NOTHING when the booking carries no cost code — and
+            // the fills further down still share-lock the Estimate through
+            // `lockEstimateAttribution`. That leaves an uncoded booking
+            // holding an Estimate lock with no Project lock, which is a
+            // different acquisition order from a coded one. One call, one
+            // order, whatever this row turns out to carry.
+            await lockAttributionParents(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                { projectId: project.id, estimateId, costCodeId },
+            );
             // THE PHASE IS RE-ASKED HERE, THROUGH THIS TRANSACTION
             // (round 16 item 2; round 17 item 5).
             //
@@ -793,10 +812,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // made of — the booking said BOOKED and the report saw nothing.
             //
             // So the gaps are filled and only the gaps: a human's decision
-            // outranks anything this pass knows. `costCodeSource` "capture" or
-            // "manual" is untouchable, and an `installedAtCustomer` that is
-            // already answered (true OR false) is a tax answer nobody but a
-            // bookkeeper may change.
+            // outranks anything this pass knows. Every `costCodeSource` in
+            // `HUMAN_COST_CODE_SOURCES` is untouchable, and an
+            // `installedAtCustomer` that is already answered (true OR false)
+            // is a tax answer nobody but a bookkeeper may change.
             if (existing) {
                 // The lock taken above orders this fill against the tax PATCH
                 // and the QBO sync. The guarded predicates below stay anyway:
@@ -871,14 +890,25 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                             id: existing.id,
                             projectId: expectedProjectId ?? row.projectId,
                             costCodeId: null,
-                            // A human's phase outranks anything booking knows.
-                            // The explicit NULL branch matters: SQL `NOT IN`
-                            // drops NULL rows, and an unset source is the
+                            // A human's phase outranks anything booking knows
+                            //  through the ONE shared definition of "a human
+                            // chose this", never a list restated here.
+                            //
+                            // THIS LIST USED TO BE HAND-ROLLED AS ["capture",
+                            // "manual"] (round 37, item 1). "manual-none"  a
+                            // bookkeeper who looked at the receipt and cleared
+                            // the phase  was therefore NOT excluded, so the
+                            // next intake retry of the same document matched
+                            // the row and restored the machine's code on top
+                            // of the person's decision. The clear looked like
+                            // it had never happened.
+                            //
+                            // `notHumanCodedExpenseWhere()` reads
+                            // HUMAN_COST_CODE_SOURCES, and its explicit NULL
+                            // branch is what keeps legacy rows eligible: SQL
+                            // `NOT IN` drops NULLs, and an unset source is the
                             // common case.
-                            OR: [
-                                { costCodeSource: null },
-                                { costCodeSource: { notIn: ["capture", "manual"] } },
-                            ],
+                            ...notHumanCodedExpenseWhere(),
                         },
                         data: { costCodeId, costCodeSource, costCodeConfidence },
                     });

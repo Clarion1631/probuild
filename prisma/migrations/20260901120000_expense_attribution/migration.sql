@@ -268,6 +268,96 @@ FOR EACH ROW
 EXECUTE FUNCTION probuild_expense_estimate_pair_guard();
 
 
+-- ...AND THE SAME WINDOW, POINTED AT THE TAX FIGURES (round 37, item 2).
+--
+-- The guard above protects the attribution pair and nothing else. The OLD
+-- build's QBO sync writes the whole expense record, `amount` included, with a
+-- Prisma client that predates every tax column -- so during the drain window
+-- it can move the gross under a tax classification it cannot see. The stale
+-- figures stay reportable without review, and if the new gross is smaller than
+-- the recorded tax (or leaves the deduction base above `amount - taxAmount`)
+-- the row violates a CHECK added above and the old sync simply fails.
+--
+-- This trigger re-applies the NEW build's own rules to any statement that
+-- moves the gross: it is a transcription of planExpenseUpdate
+-- (src/lib/qbo-expense-sync.ts), branch for branch, which is what makes it
+-- safe to leave firing while the new build is also serving -- that build has
+-- already computed these values, so the trigger recomputes the same answer.
+-- It never invents a figure: a figure that no longer fits is CLEARED, with
+-- the provenance that described it, and the row is flagged for review.
+--
+-- Dropped again at the end of this file, like the guard above: in production
+-- the drop is the --post-deploy pass; here the two run back to back so a
+-- database built from these migrations ends in production's END state.
+CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $guard$
+DECLARE
+    base_ceiling NUMERIC;
+    was_classified BOOLEAN;
+BEGIN
+    IF NEW."amount" IS NOT DISTINCT FROM OLD."amount" OR NEW."amount" IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Did this row carry a tax answer BEFORE the write? Read off OLD, the
+    -- same way planExpenseUpdate reads it off the stored row.
+    was_classified :=
+        OLD."taxAmount" IS NOT NULL
+        OR OLD."taxDeductibleBase" IS NOT NULL
+        OR OLD."installedAtCustomer" IS NOT NULL
+        OR COALESCE(OLD."taxSource", '') IN ('manual', 'manual-none');
+
+    -- 1. The recorded tax cannot fit the new gross: it points the other
+    --    way, or it is bigger. Everything the row claimed about tax goes,
+    --    provenance included.
+    IF NEW."taxAmount" IS NOT NULL
+       AND NEW."taxAmount" <> 0
+       AND (sign(NEW."taxAmount") <> sign(NEW."amount")
+            OR abs(NEW."taxAmount") > abs(NEW."amount"))
+    THEN
+        NEW."taxAmount" := NULL;
+        NEW."installedAtCustomer" := NULL;
+        NEW."taxDeductibleBase" := NULL;
+        NEW."taxDeductibleBaseSource" := NULL;
+        NEW."taxSource" := NULL;
+        NEW."needsTaxReview" := true;
+    -- 2. The tax still fits, but the hand allocation no longer does.
+    --    Clearing it silently would leave a row that still reads as a
+    --    valid deduction of the WHOLE pre-tax total, so it is flagged.
+    ELSIF NEW."taxDeductibleBase" IS NOT NULL AND NEW."taxDeductibleBase" <> 0 THEN
+        base_ceiling := NEW."amount" - COALESCE(NEW."taxAmount", 0);
+        IF sign(NEW."taxDeductibleBase") <> sign(base_ceiling)
+           OR abs(NEW."taxDeductibleBase") > abs(base_ceiling)
+        THEN
+            NEW."taxDeductibleBase" := NULL;
+            NEW."taxDeductibleBaseSource" := NULL;
+            NEW."needsTaxReview" := true;
+        END IF;
+    END IF;
+
+    -- 3. ANY movement in the gross re-opens a classification that survived
+    --    the two branches above. The numbers still satisfy every CHECK,
+    --    which is exactly why nothing else would ever ask.
+    IF was_classified THEN
+        NEW."needsTaxReview" := true;
+    END IF;
+
+    -- ...and the derived flag agrees with the figure, whatever happened.
+    NEW."taxAtSource" := (NEW."taxAmount" IS NOT NULL AND NEW."taxAmount" <> 0);
+    RETURN NEW;
+END;
+$guard$;
+
+DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense";
+
+CREATE TRIGGER probuild_expense_amount_tax_guard
+BEFORE UPDATE OF "amount" ON "Expense"
+FOR EACH ROW
+EXECUTE FUNCTION probuild_expense_amount_tax_guard();
+
+
 -- THE BACKFILL READS THE ESTIMATE UNDER A LOCK (Codex round 32). A plain
 -- `UPDATE ... FROM "Estimate"` join takes no row lock, so under READ COMMITTED
 -- an estimate moved to another job right after the read leaves the expense
@@ -316,3 +406,5 @@ END $$;
 -- future writer that legitimately moves an estimate without restating the job.
 DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense";
 DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard();
+DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense";
+DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard();

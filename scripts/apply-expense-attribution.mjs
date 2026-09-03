@@ -389,6 +389,154 @@ export const SPLIT_JOB_GUARD_DROP_SQL = [
 ];
 
 /**
+ * THE SAME ROLLOUT WINDOW, POINTED AT THE TAX FIGURES (round 37, item 2).
+ *
+ * The guard above protects the attribution pair. It protects nothing else, and
+ * the old build can damage more than the pair on its way past:
+ *
+ *   1. this script adds `taxAmount`, `taxDeductibleBase`, `needsTaxReview` and
+ *      the two CHECK constraints that keep them coherent with `amount`.
+ *   2. the OLD build is still serving. Its QBO sync writes the whole expense
+ *      record on every changed purchase, and `amount` is part of that record —
+ *      but its Prisma client predates every tax column, so it cannot restate
+ *      one and has never heard of `needsTaxReview`.
+ *   3. it re-syncs a $412.10 receipt as $498.30 and the row keeps a recorded
+ *      $34.06 of tax, an `installedAtCustomer` yes and a hand-allocated
+ *      deduction base that all describe a purchase that no longer exists. The
+ *      new build would have flagged every one of those for review
+ *      (`planExpenseUpdate`, src/lib/qbo-expense-sync.ts). The old one says
+ *      nothing, and the tax report reads a stale figure as certified.
+ *   4. and if the new gross is SMALLER than the recorded tax, or leaves the
+ *      allocation above `amount - taxAmount`, the row violates a CHECK this
+ *      script just added and the old sync simply fails — repeatedly, on a
+ *      Purchase that already exists in QuickBooks.
+ *
+ * So the same window gets the same treatment: a BEFORE UPDATE OF "amount"
+ * trigger, created in the pre-deploy step and dropped by --post-deploy, that
+ * re-applies the new build's own rules to any statement that moves the gross.
+ *
+ * IT IS A TRANSCRIPTION OF `planExpenseUpdate`, NOT A NEW POLICY — the three
+ * branches below are its `taxCannotFitGross`, its `baseCannotFit` and its
+ * `classified && amountMoved`, in the same order, with the same outcomes.
+ * That is what makes it safe to leave firing while the NEW build is also
+ * serving (a deploy window has both): the new build has already computed these
+ * values before its UPDATE reaches here, so the trigger recomputes the same
+ * answer and changes nothing. A discriminator on "did the writer restate the
+ * tax columns?" was the alternative and it is worse — a new-build PUT that
+ * moves the amount without touching tax is legitimate and would have been
+ * clobbered by it.
+ *
+ * IT NEVER INVENTS A NUMBER. Where a figure no longer fits it is CLEARED and
+ * the row is flagged for review, along with the provenance that described it —
+ * a surviving "manual" beside a cleared figure would keep claiming a person
+ * answered a question about money that is gone. Where the figures still fit,
+ * nothing is cleared and only the review flag is raised: the classification
+ * may well still be right, and the report reads the flag as "not until a
+ * person looks".
+ *
+ * `taxAtSource` is re-derived last, unconditionally, because it is not an
+ * independent answer — `Expense_taxAtSource_check` defines it as
+ * `"taxAmount" IS NOT NULL AND "taxAmount" <> 0`, so recomputing it can only
+ * ever avoid a violation.
+ *
+ * Idempotent by DROP-then-CREATE, same as the guard above: Postgres has no
+ * CREATE TRIGGER IF NOT EXISTS and a re-run must not fail on its own trigger.
+ */
+export const AMOUNT_TAX_GUARD_SQL = [
+    `CREATE OR REPLACE FUNCTION probuild_expense_amount_tax_guard()
+     RETURNS trigger
+     LANGUAGE plpgsql
+     AS $guard$
+     DECLARE
+         base_ceiling NUMERIC;
+         was_classified BOOLEAN;
+     BEGIN
+         IF NEW."amount" IS NOT DISTINCT FROM OLD."amount" OR NEW."amount" IS NULL THEN
+             RETURN NEW;
+         END IF;
+
+         -- Did this row carry a tax answer BEFORE the write? Read off OLD, the
+         -- same way planExpenseUpdate reads it off the stored row.
+         was_classified :=
+             OLD."taxAmount" IS NOT NULL
+             OR OLD."taxDeductibleBase" IS NOT NULL
+             OR OLD."installedAtCustomer" IS NOT NULL
+             OR COALESCE(OLD."taxSource", '') IN ('manual', 'manual-none');
+
+         -- 1. The recorded tax cannot fit the new gross: it points the other
+         --    way, or it is bigger. Everything the row claimed about tax goes,
+         --    provenance included.
+         IF NEW."taxAmount" IS NOT NULL
+            AND NEW."taxAmount" <> 0
+            AND (sign(NEW."taxAmount") <> sign(NEW."amount")
+                 OR abs(NEW."taxAmount") > abs(NEW."amount"))
+         THEN
+             NEW."taxAmount" := NULL;
+             NEW."installedAtCustomer" := NULL;
+             NEW."taxDeductibleBase" := NULL;
+             NEW."taxDeductibleBaseSource" := NULL;
+             NEW."taxSource" := NULL;
+             NEW."needsTaxReview" := true;
+         -- 2. The tax still fits, but the hand allocation no longer does.
+         --    Clearing it silently would leave a row that still reads as a
+         --    valid deduction of the WHOLE pre-tax total, so it is flagged.
+         ELSIF NEW."taxDeductibleBase" IS NOT NULL AND NEW."taxDeductibleBase" <> 0 THEN
+             base_ceiling := NEW."amount" - COALESCE(NEW."taxAmount", 0);
+             IF sign(NEW."taxDeductibleBase") <> sign(base_ceiling)
+                OR abs(NEW."taxDeductibleBase") > abs(base_ceiling)
+             THEN
+                 NEW."taxDeductibleBase" := NULL;
+                 NEW."taxDeductibleBaseSource" := NULL;
+                 NEW."needsTaxReview" := true;
+             END IF;
+         END IF;
+
+         -- 3. ANY movement in the gross re-opens a classification that survived
+         --    the two branches above. The numbers still satisfy every CHECK,
+         --    which is exactly why nothing else would ever ask.
+         IF was_classified THEN
+             NEW."needsTaxReview" := true;
+         END IF;
+
+         -- ...and the derived flag agrees with the figure, whatever happened.
+         NEW."taxAtSource" := (NEW."taxAmount" IS NOT NULL AND NEW."taxAmount" <> 0);
+         RETURN NEW;
+     END;
+     $guard$`,
+    `DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense"`,
+    `CREATE TRIGGER probuild_expense_amount_tax_guard
+     BEFORE UPDATE OF "amount" ON "Expense"
+     FOR EACH ROW
+     EXECUTE FUNCTION probuild_expense_amount_tax_guard()`,
+];
+
+/**
+ * Dropped by --post-deploy for the same reason the split-job guard is: it is
+ * scaffolding for one deploy. The new build enforces these rules itself, in
+ * `planExpenseUpdate` and in the expense PUT/PATCH handlers, where it can also
+ * tell a bookkeeper what happened. Left standing, the trigger would silently
+ * re-open a review on every amount edit a human makes deliberately.
+ */
+export const AMOUNT_TAX_GUARD_DROP_SQL = [
+    `DROP TRIGGER IF EXISTS probuild_expense_amount_tax_guard ON "Expense"`,
+    `DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard()`,
+];
+
+/**
+ * The compatibility triggers, by name, and which run they belong to.
+ *
+ * The main (pre-deploy) run must END with both of them present — that is the
+ * state the drain window needs — and the --post-deploy run must end with
+ * neither. Verified from `pg_trigger` rather than assumed, because both are
+ * created by `CREATE OR REPLACE` + `DROP`/`CREATE` pairs whose failure mode is
+ * silence.
+ */
+export const COMPATIBILITY_TRIGGERS = [
+    "probuild_expense_estimate_pair_guard",
+    "probuild_expense_amount_tax_guard",
+];
+
+/**
  * The repair, for a database where the guard was NOT in place — an earlier run
  * of this script, or a deploy that went out before this fix existed.
  *
@@ -633,10 +781,13 @@ END $$`,
     // those were written by time-expense-core, which has always used the shared
     // parser.
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
-    // THE COMPATIBILITY GUARD GOES IN BEFORE THE FILL, not after: from the
-    // moment the column carries values, an old instance moving `estimateId`
-    // can split the row across two jobs. See SPLIT_JOB_GUARD_SQL.
+    // THE COMPATIBILITY GUARDS GO IN BEFORE THE FILL, not after: from the
+    // moment the columns carry values, an old instance moving `estimateId`
+    // can split the row across two jobs, and one moving `amount` can leave a
+    // stale tax classification reportable — or fail the CHECK constraints
+    // added above. See SPLIT_JOB_GUARD_SQL and AMOUNT_TAX_GUARD_SQL.
     ...SPLIT_JOB_GUARD_SQL,
+    ...AMOUNT_TAX_GUARD_SQL,
     // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it.
     PROJECT_ID_BACKFILL,
 
@@ -684,6 +835,11 @@ export function postDeployTeardownStatements({ repairSplitJobs = false } = {}) {
     return [
         ...(repairSplitJobs ? [SPLIT_JOB_REPAIR] : []),
         ...SPLIT_JOB_GUARD_DROP_SQL,
+        // The amount/tax guard comes out in the same pass and for the same
+        // reason (see AMOUNT_TAX_GUARD_DROP_SQL). AFTER the repair, which
+        // rewrites `projectId` and `attributionAnchoredAt` and never touches
+        // `amount`, so this trigger never sees it either way.
+        ...AMOUNT_TAX_GUARD_DROP_SQL,
     ];
 }
 
@@ -909,7 +1065,7 @@ async function main() {
             ? [...postDeployStatements(companyTimeZone), ...postDeployTeardownStatements({ repairSplitJobs })]
             : [...statements, reanchorSql(companyTimeZone)];
         if (postDeployOnly) {
-            console.log("--post-deploy: the three backfills, then the compatibility guard comes out (see PROJECT_ID_BACKFILL).");
+            console.log("--post-deploy: the three backfills, then BOTH compatibility guards come out (see PROJECT_ID_BACKFILL and AMOUNT_TAX_GUARD_SQL).");
             console.log(
                 repairSplitJobs
                     ? "--repair-split-jobs: ALSO re-deriving projectId from the estimate for QBO-synced rows whose pair disagrees. Read SPLIT_JOB_REPAIR before trusting this on a database where humans have re-attributed expenses."
@@ -1027,6 +1183,43 @@ async function main() {
             }
             console.log(`verified index ${name}: ${row.def}`);
         }
+
+        // THE COMPATIBILITY TRIGGERS, IN WHICHEVER STATE THIS RUN OWES
+        // (round 37, item 2).
+        //
+        // Both are created by `CREATE OR REPLACE` + `DROP`/`CREATE` pairs and
+        // dropped by `DROP ... IF EXISTS`; every one of those statements
+        // succeeds silently on a database where it did nothing useful. The
+        // pre-deploy run must END with both triggers standing — that IS the
+        // expected mid-deploy state, and the drain window is unprotected
+        // without them — and the --post-deploy run must end with neither, or
+        // scaffolding stays live and quietly overrules the real build.
+        const triggerRows = await prisma.$queryRawUnsafe(
+            `SELECT t.tgname AS name
+               FROM pg_trigger t
+               JOIN pg_class c ON c.oid = t.tgrelid
+              WHERE c.relname = 'Expense' AND NOT t.tgisinternal`,
+        );
+        const liveTriggers = new Set(triggerRows.map(row => row.name));
+        for (const name of COMPATIBILITY_TRIGGERS) {
+            const present = liveTriggers.has(name);
+            if (postDeployOnly && present) {
+                console.error(`VERIFY FAILED: compatibility trigger ${name} is STILL on "Expense" after --post-deploy`);
+                process.exit(1);
+            }
+            if (!postDeployOnly && !present) {
+                console.error(
+                    `VERIFY FAILED: compatibility trigger ${name} is missing from "Expense". ` +
+                    `The drain window is unprotected — do NOT deploy the new build until this run succeeds.`,
+                );
+                process.exit(1);
+            }
+        }
+        console.log(
+            postDeployOnly
+                ? `verified teardown: ${COMPATIBILITY_TRIGGERS.length} compatibility trigger(s) dropped`
+                : `verified compatibility triggers standing for the drain window: ${COMPATIBILITY_TRIGGERS.join(", ")}`,
+        );
 
         // The backfill's own assertion: after this script, no expense may have
         // a NULL projectId while its estimate knows one. A count, not a sample

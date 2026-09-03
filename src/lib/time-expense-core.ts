@@ -2,7 +2,7 @@ import { prisma } from "./prisma";
 import { resolveCostCode } from "./cost-coding";
 import { prismaCostCodingDataSource } from "./cost-coding-db";
 import { isCostCodeAllowedForProject } from "./project-phases";
-import { assertPhaseOfProjectTx } from "./phase-invariant";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "./phase-invariant";
 import {
     expenseStillOnProjectWhere,
     itemBelongsToEstimateTx,
@@ -224,6 +224,17 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
     // inserts the row.
     return prisma.$transaction(async tx => {
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, FIRST (round 37, item 3):
+        // Project -> Estimate -> EstimateItem -> CostCode. Same reason as the
+        // POST route — the three helpers below take slices of this set, and on
+        // their own they reach the Estimate before the Project, which is a
+        // deadlock cycle against a Project-first job editor.
+        await lockAttributionParents(raw, {
+            projectId: estimate.projectId,
+            estimateId,
+            itemId: data.itemId || null,
+            costCodeId,
+        });
         // THE PAIR, RE-READ UNDER LOCK (round 20, item 3): same reason as the
         // POST route. The estimate's project was resolved before the cost-code
         // and receipt-file lookups; writing it now without re-reading can put

@@ -646,9 +646,19 @@ test("the tax PATCH writes under the shared per-expense lock", async () => {
     fakePrisma.$queryRawUnsafe = async (...args: unknown[]) => { locks.push(args); return [{}]; };
     try {
         await patch({ installedAtCustomer: true });
-        assert.equal(locks.length, 1, "exactly one lock, taken before the write");
-        assert.match(String(locks[0][0]), /pg_advisory_xact_lock/);
-        assert.equal(locks[0][1], "expense:e1", "namespaced per expense");
+        // The attribution parents are share-locked ahead of it (round 37,
+        // item 3), so this counts the per-expense lock specifically rather
+        // than every raw statement.
+        const advisory = locks.filter(call => /pg_advisory_xact_lock/.test(String(call[0])));
+        assert.equal(advisory.length, 1, "exactly one per-expense lock, taken before the write");
+        assert.equal(advisory[0][1], "expense:e1", "namespaced per expense");
+        // ...and it is taken AFTER the parents, never before them: parents
+        // first, then the row, is the one global order.
+        assert.ok(
+            locks.findIndex(call => /FOR SHARE/.test(String(call[0]))) <
+                locks.findIndex(call => /pg_advisory_xact_lock/.test(String(call[0]))),
+            "the attribution parents are locked before the expense row",
+        );
     } finally {
         fakePrisma.$queryRawUnsafe = originalLock;
     }
@@ -1287,9 +1297,28 @@ test("...and the same from MANUAL-NONE", async () => {
     assert.equal(updateArgs?.data.taxDeductibleBase, null);
 });
 
-// ── both re-checks answer about the LOCKED job (round 21, item 2) ───────────
+// ── neither re-check ever answers about the PRE-READ job ────────────────────
+//
+// Round 21, item 2 made both re-checks answer about `lockedProjectId` instead
+// of the value read before the transaction. Round 37, item 3 went one step
+// further: when the locked answer DISAGREES with the pre-read one, the request
+// is refused outright (409) rather than re-validated against the job the row
+// just joined. Two reasons, and the first is the reason the second is safe:
+//
+//   * the row's new job is NOT in the lock set this transaction took at its
+//     top (`lockAttributionParents` was given the pre-read project), so
+//     validating against it means reaching for a second Project row while
+//     already holding Estimate locks — the Estimate -> Project inversion the
+//     canonical order exists to forbid; and
+//   * it is what every CREATE path already does. `api/expenses` POST returns
+//     ESTIMATE_REATTRIBUTED, `createExpenseCore` throws, and receipt-ingest
+//     raises AttributionRaceError, all on exactly this condition. The two edit
+//     handlers were the outliers.
+//
+// The property round 21 bought is unchanged and is what these still assert:
+// the phase is NEVER validated against the job the row left.
 
-test("the phase is validated against the job the LOCK found, not the pre-read one", async () => {
+test("the phase is never validated against the pre-read job — the edit is refused", async () => {
     // A fallback-attributed row (no projectId of its own) resolves through its
     // estimate, and the estimate can move between the authorization and the
     // write. The route re-resolves under lock and then validated the phase
@@ -1312,14 +1341,17 @@ test("the phase is validated against the job the LOCK found, not the pre-read on
     // point — a stale check that says yes is the one that gets through.
     costCodes = [{ id: "cc-frame", code: "02-FRAME", isActive: true }];
     phaseItems = [{ projectId: "job-1", costCodeId: "cc-frame" }];
-    await call({ costCodeId: "cc-frame" });
+    const res = await call({ costCodeId: "cc-frame" });
+    assert.equal(res.status, 409, "the row moved out from under the edit");
+    assert.equal((await res.json()).code, "EXPENSE_REATTRIBUTED");
     assert.deepEqual(
-        phaseProjectIds, ["job-2"],
-        "asked about the job it is on now, never the job it left",
+        phaseProjectIds, [],
+        "never asked about the job it left — and not about the new one either, whose row is not held",
     );
+    assert.equal(updateArgs, null, "nothing was written");
 });
 
-test("the item link is re-checked against the LOCKED job", async () => {
+test("the item link is never re-checked against the pre-read job either", async () => {
     // Same staleness, the other column: the pre-transaction check passed
     // against job-1's estimates, and the row is written onto job-2.
     storedExpense = {
@@ -1335,7 +1367,8 @@ test("the item link is re-checked against the LOCKED job", async () => {
         projectIds: ["job-1", "job-2"],
     };
     const res = await call({ itemId: "item-own" });
-    assert.equal(res.status, 400, "item-own is on job-1, and the row is now on job-2");
+    assert.equal(res.status, 409, "item-own is on job-1, and the row is now on job-2");
+    assert.equal((await res.json()).code, "EXPENSE_REATTRIBUTED");
     assert.equal(updateArgs, null, "nothing was written");
 });
 
@@ -1461,9 +1494,16 @@ test("the PUT writes under the shared per-expense lock", async () => {
     fakePrisma.$queryRawUnsafe = async (...args: unknown[]) => { locks.push(args); return [{}]; };
     try {
         await call({ amount: "100.00" });
-        assert.equal(locks.length, 1, "exactly one lock, taken before the write");
-        assert.match(String(locks[0][0]), /pg_advisory_xact_lock/);
-        assert.equal(locks[0][1], "expense:e1", "the same key the PATCH uses");
+        // Filtered, for the same reason as the PATCH's copy of this test: the
+        // attribution parents are share-locked first (round 37, item 3).
+        const advisory = locks.filter(call => /pg_advisory_xact_lock/.test(String(call[0])));
+        assert.equal(advisory.length, 1, "exactly one per-expense lock, taken before the write");
+        assert.equal(advisory[0][1], "expense:e1", "the same key the PATCH uses");
+        assert.ok(
+            locks.findIndex(call => /FOR SHARE/.test(String(call[0]))) <
+                locks.findIndex(call => /pg_advisory_xact_lock/.test(String(call[0]))),
+            "the attribution parents are locked before the expense row",
+        );
     } finally {
         fakePrisma.$queryRawUnsafe = originalLock;
     }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { assertPhaseOfProjectTx } from "@/lib/phase-invariant";
+import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -259,6 +259,19 @@ export async function POST(req: Request) {
                 select: { id: true },
             });
             if (alreadyIngested) return null;
+
+            // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, BEFORE THE LOOP
+            // (round 37, item 3): Project -> Estimate -> EstimateItem, then
+            // each group's CostCode inside `assertPhaseOfProjectTx`.
+            //
+            // Per group this used to reach `lockEstimateAttribution` (the
+            // Estimate) before `assertPhaseOfProjectTx` (the Project), which
+            // is a deadlock cycle against a job editor holding its Project row
+            // FOR UPDATE. Hoisted out of the loop because the set is the same
+            // for every group of one document, and because the FIRST lock this
+            // transaction takes on these tables is the one that fixes the
+            // order for the rest of it.
+            await lockAttributionParents(raw, { projectId: project.id, estimateId });
 
             const outcomes: GroupResult[] = [];
             for (const [groupIndex, group] of body.groups.entries()) {

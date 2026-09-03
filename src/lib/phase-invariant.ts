@@ -66,12 +66,143 @@ function eligibleEstimateStatuses(): string[] {
     return (PHASE_ELIGIBLE_ESTIMATE_STATUSES ?? []).map((status) => status);
 }
 
+/** Everything an attribution transaction may need held still. */
+export interface AttributionLockTargets {
+    /** The job the decision is being made about. */
+    projectId?: string | null;
+    /** A SPECIFIC estimate the caller reads or writes the attribution pair from. */
+    estimateId?: string | null;
+    /** A SPECIFIC line item the caller links the expense to. */
+    itemId?: string | null;
+    /** The cost code being proposed. */
+    costCodeId?: string | null;
+}
+
+/**
+ * THE ONE PLACE THE ATTRIBUTION LOCK SET IS ACQUIRED (round 37, item 3).
+ *
+ * THE GLOBAL ORDER, for every writer that touches expense attribution:
+ *
+ *     Project -> Estimate -> EstimateItem -> CostCode -> Expense
+ *
+ * ...with ascending `id` WITHIN each table, the same rule
+ * `lockMoneyParentsMany` uses, so a scan here and a money-path transaction
+ * cannot invert against each other inside the Estimate table.
+ *
+ * WHY IT HAD TO BECOME ONE CALL. Every live writer took the set in TWO pieces
+ * and got the order backwards between them: `lockEstimateAttribution` and
+ * `resolveExpenseProjectUnderLock` share-lock the ESTIMATE first, to re-read
+ * the attribution pair, and only afterwards does `assertPhaseOfProjectTx`
+ * reach for the PROJECT. That is Estimate -> Project inside one transaction —
+ * the exact inversion the order above exists to prevent, in the four writers
+ * (`api/expenses` POST, `time-expense-core`, `api/integrations/receipt-ingest`,
+ * the QBO cost-code suggester) and the two expense edit handlers. Against a
+ * Project-first writer — a job editor holding its Project row FOR UPDATE and
+ * then reaching for an estimate — that is a cycle, and Postgres breaks a cycle
+ * by killing one side with 40P01, half the time the person's save rather than
+ * the background pass. The backfill's own deadlock test claimed the system did
+ * not have that cycle; it only proved the backfill did not.
+ *
+ * So a writer calls this ONCE, at the top of its transaction, naming
+ * everything it might touch. The narrower helpers still take their own locks
+ * afterwards; re-acquiring a share lock this transaction already holds is
+ * free, so they become assertions rather than acquisitions and the order is
+ * fixed here whatever sequence they run in.
+ *
+ * A caller passes the project id it resolved BEFORE the transaction. If the
+ * re-read under the lock disagrees (a fallback-attributed row whose estimate
+ * moved), the caller must REFUSE rather than continue: reaching for the new
+ * project's row now would be the same Estimate -> Project inversion again, one
+ * job over.
+ *
+ * FOR SHARE, not FOR UPDATE — none of these rows is modified here, they only
+ * have to hold still. Two callers of this helper therefore never block each
+ * other at all; the order only matters against something taking these rows
+ * exclusively.
+ *
+ * KNOWN, PRE-EXISTING TENSION, recorded so the next reader does not think it
+ * was missed. `createInvoiceFromEstimate` (src/lib/billing-core.ts) and
+ * `restoreEstimateItemAssociations` (src/lib/actions.ts) deliberately take
+ * Estimate FOR UPDATE *before* Project FOR UPDATE, for reasons documented at
+ * both sites, so they and this family can still invert. That predates this
+ * helper and is not widened by it — `lockPhaseRowsForShare` has led with
+ * Project since it was written — and both of those callers run under
+ * `withTxRetry`, which re-runs a cleanly rolled-back 40P01. Do not "fix" it by
+ * flipping this helper: Project -> Estimate is also the order a `Project`
+ * cascade delete takes, and the order tests/phase-invariant-db.test.ts pins.
+ */
+export async function lockAttributionParents(
+    tx: PhaseTxClient,
+    targets: AttributionLockTargets,
+): Promise<void> {
+    const projectId = targets.projectId ?? null;
+    const estimateId = targets.estimateId ?? null;
+    const itemId = targets.itemId ?? null;
+    const costCodeId = targets.costCodeId ?? null;
+
+    // 1. The job.
+    if (projectId) {
+        await tx.$queryRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR SHARE`, projectId);
+    }
+    // 2. The estimates: the job's, AND any the caller named, in ONE ordered
+    //    statement. One statement rather than two, because a separate lock on
+    //    the named estimate would put it ahead of the job's ascending-id scan
+    //    and two callers naming different estimates of the same job would then
+    //    walk the table in different orders.
+    const estimateClauses: string[] = [];
+    const estimateParams: unknown[] = [];
+    if (projectId) {
+        estimateParams.push(projectId);
+        estimateClauses.push(`"projectId" = $${estimateParams.length}`);
+    }
+    if (estimateId) {
+        estimateParams.push(estimateId);
+        estimateClauses.push(`id = $${estimateParams.length}`);
+    }
+    if (estimateClauses.length) {
+        await tx.$queryRawUnsafe(
+            `SELECT id FROM "Estimate" WHERE ${estimateClauses.join(" OR ")} ORDER BY id FOR SHARE`,
+            ...estimateParams,
+        );
+    }
+    // 3. The line items that carry the codes. `FOR SHARE OF ei` keeps the lock
+    //    off the joined estimate rows, which step 2 already holds.
+    const itemClauses: string[] = [];
+    const itemParams: unknown[] = [];
+    if (projectId) {
+        itemParams.push(projectId);
+        itemClauses.push(`e."projectId" = $${itemParams.length}`);
+    }
+    if (itemId) {
+        itemParams.push(itemId);
+        itemClauses.push(`ei.id = $${itemParams.length}`);
+    }
+    if (itemClauses.length) {
+        await tx.$queryRawUnsafe(
+            `SELECT ei.id FROM "EstimateItem" ei
+           JOIN "Estimate" e ON e.id = ei."estimateId"
+          WHERE ${itemClauses.join(" OR ")}
+          ORDER BY ei.id
+            FOR SHARE OF ei`,
+            ...itemParams,
+        );
+    }
+    // 4. The cost code itself, when the caller named one: `isActive` is a
+    //    company-wide switch that has nothing to do with this job.
+    if (costCodeId) {
+        await tx.$queryRawUnsafe(`SELECT id FROM "CostCode" WHERE id = $1 FOR SHARE`, costCodeId);
+    }
+}
+
 /**
  * Take the four share locks, in the ONE order every caller uses.
  *
  * Exported so a caller that needs the job's whole phase list held still (the
  * attribution backfill re-reads it under the lock) can take the same locks in
  * the same order rather than inventing a second ordering to deadlock against.
+ *
+ * A thin projection of `lockAttributionParents` — the project-scoped shape of
+ * the same acquisition — so the order has exactly ONE definition.
  */
 export async function lockPhaseRowsForShare(
     tx: PhaseTxClient,
@@ -79,28 +210,7 @@ export async function lockPhaseRowsForShare(
     costCodeId?: string | null,
 ): Promise<void> {
     if (!projectId) return;
-    // 1. The job.
-    await tx.$queryRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR SHARE`, projectId);
-    // 2. Its estimates. Ordered, so two holders acquire them the same way.
-    await tx.$queryRawUnsafe(
-        `SELECT id FROM "Estimate" WHERE "projectId" = $1 ORDER BY id FOR SHARE`,
-        projectId,
-    );
-    // 3. The line items that carry the codes. `FOR SHARE OF ei` keeps the lock
-    //    off the joined estimate rows, which step 2 already holds.
-    await tx.$queryRawUnsafe(
-        `SELECT ei.id FROM "EstimateItem" ei
-           JOIN "Estimate" e ON e.id = ei."estimateId"
-          WHERE e."projectId" = $1
-          ORDER BY ei.id
-            FOR SHARE OF ei`,
-        projectId,
-    );
-    // 4. The cost code itself, when the caller named one: `isActive` is a
-    //    company-wide switch that has nothing to do with this job.
-    if (costCodeId) {
-        await tx.$queryRawUnsafe(`SELECT id FROM "CostCode" WHERE id = $1 FOR SHARE`, costCodeId);
-    }
+    await lockAttributionParents(tx, { projectId, costCodeId });
 }
 
 /**

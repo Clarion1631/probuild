@@ -23,6 +23,9 @@ import {
     expectedConstraints,
     expectedIndexes,
     expectedReceiptIntakeColumns,
+    AMOUNT_TAX_GUARD_DROP_SQL,
+    AMOUNT_TAX_GUARD_SQL,
+    COMPATIBILITY_TRIGGERS,
     indexDrift,
     needsReanchorPredicate,
     pickCompanyTimeZone,
@@ -241,17 +244,18 @@ test("every statement is additive — nothing drops, renames, or rewrites data",
         // 1. the tax CHECK is dropped and re-added by name so a database
         //    carrying the OLD definition (which refused every refund) is
         //    corrected rather than skipped; and
-        // 2. the rollout-window guard drops its own trigger immediately before
-        //    creating it — Postgres has no CREATE TRIGGER IF NOT EXISTS, so
-        //    drop-then-create is the only way a re-run does not fail on the
-        //    trigger the previous run left. It drops a TRIGGER, never a row.
+        // 2. the two rollout-window guards drop their own trigger immediately
+        //    before creating it — Postgres has no CREATE TRIGGER IF NOT
+        //    EXISTS, so drop-then-create is the only way a re-run does not
+        //    fail on the trigger the previous run left. They drop a TRIGGER,
+        //    never a row.
         //
         // Nothing else may drop anything, and nothing may drop a table, column
         // or index.
         const isConstraintReplace =
             /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase|taxAtSource)_check"/.test(statement);
         const isGuardTriggerReplace =
-            /^DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard ON "Expense"$/.test(statement.trim());
+            /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair|amount_tax)_guard ON "Expense"$/.test(statement.trim());
         assert.ok(
             isConstraintReplace || isGuardTriggerReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,
@@ -896,13 +900,88 @@ test("the guard is idempotent: it drops its own trigger before creating it", () 
     assert.ok(dropIndex < createIndex, "drop must come before create");
 });
 
-test("the post-deploy pass takes the guard back out", () => {
-    // It is compatibility scaffolding for ONE deploy. Left standing it would
-    // overrule a future writer that legitimately moves an estimate.
+test("the post-deploy pass takes BOTH guards back out", () => {
+    // They are compatibility scaffolding for ONE deploy. Left standing, the
+    // split-job guard would overrule a future writer that legitimately moves
+    // an estimate, and the amount/tax guard would re-open a review on every
+    // amount edit a bookkeeper makes deliberately.
     const teardown = postDeployTeardownStatements();
-    assert.ok(teardown.some(s => /DROP TRIGGER IF EXISTS probuild_expense_estimate_pair_guard/.test(s)));
-    assert.ok(teardown.some(s => /DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard/.test(s)));
-    assert.deepEqual(teardown, SPLIT_JOB_GUARD_DROP_SQL);
+    for (const name of COMPATIBILITY_TRIGGERS) {
+        assert.ok(
+            teardown.some(s => new RegExp(`DROP TRIGGER IF EXISTS ${name}`).test(s)),
+            `${name}'s trigger is never dropped`,
+        );
+        assert.ok(
+            teardown.some(s => new RegExp(`DROP FUNCTION IF EXISTS ${name}`).test(s)),
+            `${name}'s function is never dropped`,
+        );
+    }
+    assert.deepEqual(teardown, [...SPLIT_JOB_GUARD_DROP_SQL, ...AMOUNT_TAX_GUARD_DROP_SQL]);
+});
+
+test("the amount/tax guard is a transcription of planExpenseUpdate, not a new policy", () => {
+    // Every branch of src/lib/qbo-expense-sync.ts's planExpenseUpdate, in the
+    // same order and with the same outcomes. Asserting the SHAPE here is what
+    // keeps the two from drifting into different answers about the same row;
+    // the BEHAVIOUR is proved against a real Postgres in
+    // tests/expense-attribution-triggers-db.test.ts.
+    const fn = AMOUNT_TAX_GUARD_SQL.find(s => s.includes("CREATE OR REPLACE FUNCTION"))!;
+    // It fires only on a gross that actually moved.
+    assert.match(fn, /NEW\."amount" IS NOT DISTINCT FROM OLD\."amount"[\s\S]{0,60}RETURN NEW/);
+    // Branch 1: the tax cannot fit — the figure AND every provenance that
+    // described it are cleared. A surviving "manual" would keep claiming a
+    // person answered about money that is gone.
+    for (const column of ["taxAmount", "installedAtCustomer", "taxDeductibleBase", "taxDeductibleBaseSource", "taxSource"]) {
+        assert.match(fn, new RegExp(`NEW\."${column}" := NULL`), `branch 1 never clears ${column}`);
+    }
+    // Branch 2: the allocation alone cannot fit.
+    assert.match(fn, /base_ceiling := NEW\."amount" - COALESCE\(NEW\."taxAmount", 0\)/);
+    // Branch 3: an ordinary move that breaks nothing still re-opens a review,
+    // read off the OLD row exactly as planExpenseUpdate reads it off `existing`.
+    assert.match(fn, /was_classified :=[\s\S]{0,300}OLD\."taxSource", ''\) IN \('manual', 'manual-none'\)/);
+    // ...and the review flag is the only thing branch 3 sets.
+    assert.match(fn, /IF was_classified THEN\s+NEW\."needsTaxReview" := true;\s+END IF;/);
+    // The derived flag is re-derived last, so no path can leave the row in
+    // violation of Expense_taxAtSource_check.
+    assert.match(fn, /NEW\."taxAtSource" := \(NEW\."taxAmount" IS NOT NULL AND NEW\."taxAmount" <> 0\);\s+RETURN NEW/);
+    // It NEVER invents a figure: nothing is assigned a computed tax amount.
+    assert.ok(
+        !/NEW\."(taxAmount|taxDeductibleBase)" := (?!NULL)/.test(fn),
+        "the guard must clear a figure it cannot keep, never compute a replacement",
+    );
+});
+
+test("the amount/tax trigger fires BEFORE UPDATE OF amount, per row", () => {
+    const trigger = AMOUNT_TAX_GUARD_SQL.find(s => /^CREATE TRIGGER/.test(s.trim()))!;
+    assert.match(trigger, /BEFORE UPDATE OF "amount" ON "Expense"/);
+    assert.match(trigger, /FOR EACH ROW/);
+    // BEFORE, not AFTER: an AFTER trigger cannot change the row that is
+    // landing, so a gross that violates a CHECK would still fail the old
+    // writer instead of being made coherent.
+    assert.ok(!/AFTER UPDATE/.test(trigger));
+});
+
+test("the amount/tax guard is idempotent to re-create", () => {
+    // Same rule as the split-job guard: no CREATE TRIGGER IF NOT EXISTS
+    // exists, so the drop has to come first or a second run of this script
+    // fails on the trigger the first one left.
+    const dropIndex = AMOUNT_TAX_GUARD_SQL.findIndex(s => /^DROP TRIGGER IF EXISTS/.test(s.trim()));
+    const createIndex = AMOUNT_TAX_GUARD_SQL.findIndex(s => /^CREATE TRIGGER/.test(s.trim()));
+    assert.ok(dropIndex > -1 && createIndex > -1);
+    assert.ok(dropIndex < createIndex, "drop must come before create");
+    assert.match(AMOUNT_TAX_GUARD_SQL[0], /CREATE OR REPLACE FUNCTION/);
+});
+
+test("both guards go in BEFORE the projectId backfill", () => {
+    // From the moment the columns carry values, an old instance can damage
+    // them. A guard created after the fill leaves exactly that window open.
+    const fillAt = (statements as string[]).indexOf(PROJECT_ID_BACKFILL);
+    assert.ok(fillAt > -1);
+    for (const create of [SPLIT_JOB_GUARD_SQL, AMOUNT_TAX_GUARD_SQL]) {
+        const at = (statements as string[]).indexOf(create[create.length - 1]);
+        assert.ok(at > -1, "the CREATE TRIGGER is not in the main run at all");
+        assert.ok(at < fillAt, "the guard must be standing before the fill runs");
+    }
 });
 
 test("the split-job repair is OPT-IN and never runs by default", () => {
@@ -959,5 +1038,20 @@ test("the guard and its teardown are BOTH in the committed migration", () => {
     const drop = migrationSql.lastIndexOf("DROP FUNCTION IF EXISTS probuild_expense_estimate_pair_guard");
     assert.ok(create > -1 && fill > -1 && drop > -1);
     assert.ok(create < fill, "the guard has to exist before the fill gives the column values");
+    assert.ok(fill < drop, "and it comes out only after the fill is done");
+});
+
+test("the amount/tax guard and its teardown are BOTH in the committed migration", () => {
+    // Same contract as the split-job guard above: a fresh CI/dev database
+    // replays this migration end to end and must finish in production's END
+    // state — with neither trigger standing.
+    for (const sql of [...AMOUNT_TAX_GUARD_SQL, ...AMOUNT_TAX_GUARD_DROP_SQL]) {
+        assert.ok(normalizedMigration.includes(normalize(sql).replace(/;$/, "")), `migration.sql is missing:\n  ${sql}`);
+    }
+    const create = migrationSql.indexOf("CREATE TRIGGER probuild_expense_amount_tax_guard");
+    const fill = migrationSql.indexOf('UPDATE "Expense" e SET "projectId" = locked."projectId"');
+    const drop = migrationSql.lastIndexOf("DROP FUNCTION IF EXISTS probuild_expense_amount_tax_guard");
+    assert.ok(create > -1 && fill > -1 && drop > -1);
+    assert.ok(create < fill, "the guard has to exist before the fill gives the columns values");
     assert.ok(fill < drop, "and it comes out only after the fill is done");
 });
