@@ -112,6 +112,10 @@ type ScheduleSpec = {
   qbInvoiceId?: string | null;
   qbPaymentId?: string | null;
   status?: "Pending" | "Paid";
+  /** Stamps qbInvoiceSentAt — the rail-neutral REQUEST marker. Only the bank
+   *  sweep's candidate query looks at it (the photo path never did), so it
+   *  defaults to unset and no existing case changes. */
+  requested?: boolean;
 };
 
 async function seedFixture(opts: {
@@ -145,12 +149,16 @@ async function seedFixture(opts: {
     const paidFields = status === "Paid"
       ? { paidAt: new Date(), paymentDate: new Date(), paymentMethod: "quickbooks" }
       : { paidAt: null, paymentDate: null, paymentMethod: null };
+    // Requested 30 days BEFORE anything posts. Stamping "now" put the request
+    // AFTER the credit's post date, which the chronology rule (correctly)
+    // refuses: money cannot pay a bill that had not been sent when it arrived.
+    const qbInvoiceSentAt = s.requested ? new Date(Date.now() - 30 * 86_400_000) : null;
     await prisma.paymentSchedule.upsert({
       where: { id: s.id },
-      update: { status, amount: s.amount, qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, referenceNumber: null, ...paidFields },
+      update: { status, amount: s.amount, qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, referenceNumber: null, qbInvoiceSentAt, ...paidFields },
       create: {
         id: s.id, invoiceId: opts.invoiceId, name: s.name, amount: s.amount, status,
-        qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, ...paidFields,
+        qbInvoiceId: s.qbInvoiceId ?? null, qbPaymentId: s.qbPaymentId ?? null, qbInvoiceSentAt, ...paidFields,
       },
     });
   }
@@ -508,13 +516,20 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     const unmatched = [a, b].filter((r) => r.body.status === "unmatched");
     expect(applied, "exactly one of the two deposits applies").toHaveLength(1);
     expect(unmatched, "exactly one is refused by the reservation").toHaveLength(1);
-    expect(unmatched[0].body.reason).toContain("already being applied by another deposit");
+    // Both photos reach for the SAME milestone, so the reservation index (P2002)
+    // is what arbitrates — the cross-source claim check is scoped to the other
+    // source and does not fire between two photos. The loser's reason now NAMES
+    // the row that won, which is the point of the enriched message.
+    const loserIsA = unmatched[0].body === a.body;
+    const loserFileId = loserIsA ? F.reserve.fileIdA : F.reserve.fileIdB;
+    const winnerFileId = loserIsA ? F.reserve.fileIdB : F.reserve.fileIdA;
+    expect(unmatched[0].body.reason).toContain("already being applied by a deposit photo");
+    expect(unmatched[0].body.reason, "the loser's task names the row that won").toContain(winnerFileId);
     expect(unmatched[0].body.officeTaskId).toBeTruthy();
 
     const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.reserve.schedule } });
     expect(schedule.status).toBe("Paid");
 
-    const loserFileId = unmatched[0].body === a.body ? F.reserve.fileIdA : F.reserve.fileIdB;
     const loserRow = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: loserFileId } });
     expect(loserRow.status).toBe("unmatched");
     expect(loserRow.paymentScheduleId, "the losing row never holds the reservation").toBeNull();
@@ -899,5 +914,394 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     expect(res.status()).toBe(400);
     expect(body.ok).toBe(false);
     expect(body.reason).toContain("2 decimal places");
+  });
+});
+
+/**
+ * Deposit sweep — the bank source (docs/plans/DEPOSIT-SWEEP-PLAN.md).
+ *
+ * Same hermetic rig as the photo cases above: real HTTP against the Playwright
+ * webServer, QuickBooks replaced by E2E_QBO_MOCK and read back through
+ * /api/payments/test-only/qbo-mock. What is exercised here is the batch
+ * contract and the ORDERINGS that no unit test can see end to end — one bank
+ * reference is one payment forever, a re-POST of the same day is a replay
+ * rather than a collision, and whichever of the two paths runs second says so
+ * in plain English instead of filing an alarming generic task.
+ *
+ * Amounts are deliberately odd and unique across the whole database: the bank
+ * candidate query runs across ALL projects (a bank line names none), so a
+ * round number would risk colliding with another spec's fixture.
+ */
+const B = {
+  postDate: new Date(Date.now() - 4 * 86_400_000).toISOString().slice(0, 10),
+  replay: {
+    project: "di-e2e-bank-replay-project", projectName: "Nnexo Bank Replay Project",
+    invoice: "di-e2e-bank-replay-invoice", invoiceCode: "INV-DI-BANK-REPLAY",
+    schedule: "di-e2e-bank-replay-schedule", amount: 8137.11,
+    qbInvoiceId: "di-mock-inv-bank-replay", bankReference: "e2ebank0000001",
+  },
+  collide: {
+    project: "di-e2e-bank-collide-project", projectName: "Nnexo Bank Collide Project",
+    invoice: "di-e2e-bank-collide-invoice", invoiceCode: "INV-DI-BANK-COLLIDE",
+    schedule: "di-e2e-bank-collide-schedule", amount: 8237.22,
+    qbInvoiceId: "di-mock-inv-bank-collide", refA: "e2ebank0000002", refB: "e2ebank0000003",
+  },
+  dry: {
+    project: "di-e2e-bank-dry-project", projectName: "Nnexo Bank Dry Project",
+    invoice: "di-e2e-bank-dry-invoice", invoiceCode: "INV-DI-BANK-DRY",
+    schedule: "di-e2e-bank-dry-schedule", amount: 8337.33,
+    qbInvoiceId: "di-mock-inv-bank-dry", bankReference: "e2ebank0000004",
+  },
+  prebooked: {
+    project: "di-e2e-bank-prebooked-project", projectName: "Nnexo Bank Prebooked Project",
+    invoice: "di-e2e-bank-prebooked-invoice", invoiceCode: "INV-DI-BANK-PREBOOKED",
+    schedule: "di-e2e-bank-prebooked-schedule", amount: 8437.44,
+    qbInvoiceId: "di-mock-inv-bank-prebooked", bankReference: "e2ebank0000005",
+  },
+  photoFirst: {
+    project: "di-e2e-bank-photofirst-project", projectName: "Nnexo Bankphotofirst Project",
+    invoice: "di-e2e-bank-photofirst-invoice", invoiceCode: "INV-DI-BANK-PHOTOFIRST",
+    schedule: "di-e2e-bank-photofirst-schedule", amount: 8537.55,
+    fileId: "di-e2e-file-bank-photofirst", bankReference: "e2ebank0000006",
+  },
+  classGate: {
+    project: "di-e2e-bank-classgate-project", projectName: "Nnexo Bankclassgate Project",
+    invoice: "di-e2e-bank-classgate-invoice", invoiceCode: "INV-DI-BANK-CLASSGATE",
+    schedule: "di-e2e-bank-classgate-schedule", amount: 8737.77,
+    qbInvoiceId: "di-mock-inv-bank-classgate", bankReference: "e2ebank0000008",
+  },
+  bankFirst: {
+    project: "di-e2e-bank-bankfirst-project", projectName: "Nnexo Bankbankfirst Project",
+    invoice: "di-e2e-bank-bankfirst-invoice", invoiceCode: "INV-DI-BANK-BANKFIRST",
+    schedule: "di-e2e-bank-bankfirst-schedule", amount: 8637.66,
+    qbInvoiceId: "di-mock-inv-bank-bankfirst", fileId: "di-e2e-file-bank-bankfirst",
+    bankReference: "e2ebank0000007",
+  },
+};
+
+const BANK_PROJECT_IDS = [
+  B.replay.project, B.collide.project, B.dry.project, B.prebooked.project,
+  B.photoFirst.project, B.bankFirst.project, B.classGate.project,
+];
+const BANK_FILE_IDS = [
+  `bank:${B.replay.bankReference}`, `bank:${B.collide.refA}`, `bank:${B.collide.refB}`,
+  `bank:${B.dry.bankReference}`, `bank:${B.prebooked.bankReference}`,
+  `bank:${B.photoFirst.bankReference}`, `bank:${B.bankFirst.bankReference}`,
+  `bank:${B.classGate.bankReference}`,
+  B.photoFirst.fileId, B.bankFirst.fileId,
+];
+const BANK_SCHEDULE_IDS = [
+  B.replay.schedule, B.collide.schedule, B.dry.schedule, B.prebooked.schedule,
+  B.photoFirst.schedule, B.bankFirst.schedule, B.classGate.schedule,
+];
+
+type BankCreditSpec = {
+  bankReference: string;
+  amount: number;
+  transactionDetail?: string;
+  description?: string;
+  baiCode?: string;
+};
+
+/** The full SweepCounts shape (src/lib/deposit-sweep.ts). Asserted whole, not
+ *  matched partially: the counts must PARTITION the batch, and a bucket that
+ *  quietly stopped being reported is exactly the bug `unresolved` exists for. */
+function sweepCounts(over: Partial<Record<string, number>> = {}) {
+  return {
+    credits: 0, applied: 0, proposed: 0, unmatched: 0, reconcile: 0,
+    failed: 0, qboUnknown: 0, unresolved: 0, replay: 0, ...over,
+  };
+}
+
+async function postBankBatch(
+  request: APIRequestContext,
+  opts: { postDate?: string; credits: BankCreditSpec[]; dryRun?: boolean; overrides?: Record<string, unknown> },
+) {
+  // The real Washington Trust shape for a customer deposit (BAI 174 /
+  // OTHER DEPOSITS / a DEPOSIT-or-MOBILE detail) unless a case is deliberately
+  // posting some other class of credit — only a customer deposit is sweepable.
+  const credits = opts.credits.map((c) => ({
+    bankReference: c.bankReference,
+    amount: c.amount,
+    baiCode: c.baiCode ?? "174",
+    description: c.description ?? "OTHER DEPOSITS",
+    transactionDetail: c.transactionDetail ?? "DEPOSIT - DDA/MMKT",
+    customerReference: null,
+  }));
+  const body = {
+    source: "bank",
+    postDate: opts.postDate ?? B.postDate,
+    credits,
+    creditCount: credits.length,
+    creditSum: credits.reduce((sum, c) => sum + Math.round(c.amount * 100), 0) / 100,
+    ...(opts.dryRun ? { dryRun: true } : {}),
+    ...(opts.overrides ?? {}),
+  };
+  const res = await request.post(DEPOSIT_INGEST_PATH, {
+    headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+    data: JSON.stringify(body),
+  });
+  return { res, body: await safeJson(res) };
+}
+
+const bankCredit = (body: any, bankReference: string) =>
+  body.credits.find((c: any) => c.bankReference === bankReference);
+
+test.describe.serial("Deposit sweep — bank source", () => {
+  test.beforeEach(() => {
+    test.skip(!SECRET, "requires DEPOSIT_INGEST_SECRET on the server under test — see .github/workflows/ci.yml / docs/TESTING.md");
+  });
+
+  test.beforeAll(async () => {
+    await prisma.officeBoardColumn.upsert({
+      where: { id: "di-e2e-office-column" },
+      update: {},
+      create: { id: "di-e2e-office-column", name: "To Do", position: 0 },
+    });
+    // The QBO mock replaces the network, not the connection state.
+    await saveQBSettings({ connected: true, accessToken: "e2e-mock", refreshToken: "e2e-mock", realmId: "e2e-mock-realm" });
+
+    for (const f of [B.replay, B.collide, B.dry, B.prebooked, B.bankFirst, B.classGate]) {
+      await seedFixture({
+        projectId: f.project, projectName: f.projectName,
+        invoiceId: f.invoice, invoiceCode: f.invoiceCode,
+        schedules: [{
+          id: (f as any).schedule, name: "Bank Sweep Milestone", amount: f.amount,
+          qbInvoiceId: (f as any).qbInvoiceId, requested: true,
+        }],
+      });
+    }
+    // photoFirst is deliberately NOT QBO-linked: the photo path settles it
+    // through recordPaymentCore, so the ordering test needs no QBO seeding.
+    await seedFixture({
+      projectId: B.photoFirst.project, projectName: B.photoFirst.projectName,
+      invoiceId: B.photoFirst.invoice, invoiceCode: B.photoFirst.invoiceCode,
+      schedules: [{ id: B.photoFirst.schedule, name: "Bank Sweep Milestone", amount: B.photoFirst.amount, requested: true }],
+    });
+  });
+
+  test.afterAll(async () => {
+    try {
+      await saveQBSettings({ connected: false, accessToken: undefined, refreshToken: undefined, realmId: undefined });
+      await prisma.paymentNotification.deleteMany({ where: { scheduleId: { in: BANK_SCHEDULE_IDS } } });
+      await prisma.activityLog.deleteMany({ where: { projectId: { in: BANK_PROJECT_IDS } } });
+      for (const fileId of BANK_FILE_IDS) {
+        await prisma.officeTask.deleteMany({ where: { notes: { contains: fileId } } });
+      }
+      await prisma.depositIngest.deleteMany({ where: { fileId: { in: BANK_FILE_IDS } } });
+      await prisma.invoice.deleteMany({ where: { projectId: { in: BANK_PROJECT_IDS } } }); // cascades PaymentSchedule
+      await prisma.project.deleteMany({ where: { id: { in: BANK_PROJECT_IDS } } });
+    } finally {
+      await prisma.$disconnect();
+    }
+  });
+
+  // ── B1: one reference is one payment, forever ────────────────────────────
+  test("B1: the same bank reference POSTed twice yields ONE QuickBooks payment; the replay is alreadyApplied, not a collision", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.replay.qbInvoiceId, B.replay.amount, "di-mock-cust-bank-replay");
+
+    const first = await postBankBatch(request, { credits: [{ bankReference: B.replay.bankReference, amount: B.replay.amount }] });
+    expect(first.res.status()).toBe(200);
+    expect(first.body.ok).toBe(true);
+    const firstCredit = bankCredit(first.body, B.replay.bankReference);
+    expect(firstCredit.status, `unexpected outcome: ${firstCredit.reason}`).toBe("applied");
+    expect(firstCredit.scheduleId).toBe(B.replay.schedule);
+    expect(first.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1 }));
+
+    const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.replay.schedule } });
+    expect(schedule.status).toBe("Paid");
+    expect(schedule.referenceNumber, "the bank reference IS the instrument reference").toBe(B.replay.bankReference);
+    expect(schedule.paymentDate?.toISOString().slice(0, 10)).toBe(B.postDate);
+
+    // The money write carries the WTB deposit account (Decision 3) …
+    const mock = await getQboMockState(request);
+    expect(mock.calls.paymentCreate).toBe(1);
+    const sent = JSON.parse(mock.paymentCreateCalls[0].requestBody);
+    expect(sent.DepositToAccountRef).toEqual({ value: "154" });
+    expect(sent.PaymentRefNum).toBe(B.replay.bankReference);
+
+    // … and the settlement suppresses the CLIENT receipt only.
+    const notes = await prisma.paymentNotification.findMany({ where: { scheduleId: B.replay.schedule } });
+    expect(notes, "the outbox row still exists — the team email and activity log fire as usual").toHaveLength(1);
+    expect(notes[0].suppressClientReceipt, "a swept bank credit never emails the client a receipt").toBe(true);
+
+    // ── Replay ──
+    const second = await postBankBatch(request, { credits: [{ bankReference: B.replay.bankReference, amount: B.replay.amount }] });
+    const replayCredit = bankCredit(second.body, B.replay.bankReference);
+    expect(replayCredit.status).toBe("applied");
+    expect(replayCredit.alreadyApplied).toBe(true);
+    expect(replayCredit.replay).toBe(true);
+    expect(second.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1, replay: 1 }));
+    expect(second.body.ok, "a replay of an applied credit is a clean batch").toBe(true);
+    expect((await getQboMockState(request)).calls.paymentCreate, "a replay creates no second payment").toBe(1);
+    expect(await prisma.depositIngest.count({ where: { fileId: `bank:${B.replay.bankReference}` } })).toBe(1);
+  });
+
+  // ── B2: two references, same day, same amount ─────────────────────────────
+  test("B2: two different references on one day for the same amount both go to a human, with no QuickBooks write", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.collide.qbInvoiceId, B.collide.amount, "di-mock-cust-bank-collide");
+
+    const { body } = await postBankBatch(request, {
+      credits: [
+        { bankReference: B.collide.refA, amount: B.collide.amount },
+        { bankReference: B.collide.refB, amount: B.collide.amount },
+      ],
+    });
+    for (const ref of [B.collide.refA, B.collide.refB]) {
+      const credit = bankCredit(body, ref);
+      expect(credit.status, `${ref} must go to a human`).toBe("unmatched");
+      expect(credit.reason).toContain("different bank credits");
+      expect(credit.officeTaskId).toBeTruthy();
+    }
+    expect(body.counts).toEqual(sweepCounts({ credits: 2, unmatched: 2 }));
+    expect(body.ok, "credits sent to a human are still a clean batch").toBe(true);
+    expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.collide.schedule } })).status).toBe("Pending");
+  });
+
+  // ── B3: dry run ───────────────────────────────────────────────────────────
+  test("B3: dryRun records `proposed` with the would-apply milestone and creates no QuickBooks payment", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.dry.qbInvoiceId, B.dry.amount, "di-mock-cust-bank-dry");
+
+    const { body } = await postBankBatch(request, {
+      credits: [{ bankReference: B.dry.bankReference, amount: B.dry.amount }],
+      dryRun: true,
+    });
+    expect(bankCredit(body, B.dry.bankReference).status).toBe("proposed");
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, proposed: 1 }));
+    expect(body.ok).toBe(true);
+
+    const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: `bank:${B.dry.bankReference}` } });
+    expect(row.status).toBe("proposed");
+    expect(row.source).toBe("bank");
+    expect(row.bankReference).toBe(B.dry.bankReference);
+    expect(row.amountCents).toBe(Math.round(B.dry.amount * 100));
+    expect(row.paymentScheduleId, "the would-apply milestone is recorded for the shadow week").toBe(B.dry.schedule);
+    expect(row.qbRequestPayload, "a dry run never reaches a money boundary").toBeNull();
+
+    expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.dry.schedule } })).status).toBe("Pending");
+  });
+
+  // ── B4: already booked in QuickBooks ──────────────────────────────────────
+  test("B4: a QuickBooks invoice already paid by a human (balance mismatch) creates no duplicate payment", async ({ request }) => {
+    await resetQboMock(request);
+    // Marge already booked it: the QBO invoice has no open balance left.
+    await seedQboInvoice(request, B.prebooked.qbInvoiceId, 0, "di-mock-cust-bank-prebooked");
+
+    const { body } = await postBankBatch(request, {
+      credits: [{ bankReference: B.prebooked.bankReference, amount: B.prebooked.amount }],
+    });
+    const credit = bankCredit(body, B.prebooked.bankReference);
+    // Deterministic guard: terminal and explained, not eight retries of a
+    // request that can never succeed.
+    expect(credit.status, "a balance mismatch means a human already booked it").toBe("unmatched");
+    expect(credit.reason).toContain("probably already booked");
+    expect(credit.officeTaskId).toBeTruthy();
+    expect(body.ok, "asking a human is still a clean batch").toBe(true);
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, unmatched: 1 }));
+    expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
+
+    const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: `bank:${B.prebooked.bankReference}` } });
+    expect(row.qbPaymentId).toBeNull();
+    expect(row.lastError).toContain("probably already booked");
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.prebooked.schedule } })).status).toBe("Pending");
+  });
+
+  // ── B5: photo first, then the sweep ───────────────────────────────────────
+  test("B5: photo-then-bank — the sweep's task says the photo already applied this check", async ({ request }) => {
+    await resetQboMock(request);
+
+    const photo = await postDeposit(request, {
+      fileId: B.photoFirst.fileId, projectName: B.photoFirst.projectName, amount: B.photoFirst.amount,
+      checkDate: B.postDate, checkNumber: "9101",
+    });
+    expect(photo.body.status, `photo leg failed: ${photo.body.reason}`).toBe("applied");
+
+    const { body } = await postBankBatch(request, {
+      credits: [{ bankReference: B.photoFirst.bankReference, amount: B.photoFirst.amount }],
+    });
+    const credit = bankCredit(body, B.photoFirst.bankReference);
+    expect(credit.status).toBe("unmatched");
+    expect(credit.reason).toContain("already applied from a deposit photo");
+    expect(credit.reason).toContain(B.photoFirst.fileId);
+    expect(credit.reason).toContain("Verify, then archive this task");
+    expect(body.counts).toEqual(sweepCounts({ credits: 1, unmatched: 1 }));
+    expect((await getQboMockState(request)).calls.paymentCreate, "the sweep books nothing on top of the photo").toBe(0);
+  });
+
+  // ── B6: the sweep first, then a photo of the same check ───────────────────
+  test("B6: bank-then-photo — the photo's task says the deposit sweep already applied it", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.bankFirst.qbInvoiceId, B.bankFirst.amount, "di-mock-cust-bank-bankfirst");
+
+    const sweep = await postBankBatch(request, {
+      credits: [{ bankReference: B.bankFirst.bankReference, amount: B.bankFirst.amount }],
+    });
+    const swept = bankCredit(sweep.body, B.bankFirst.bankReference);
+    expect(swept.status, `sweep leg failed: ${swept.reason}`).toBe("applied");
+    expect(sweep.body.counts).toEqual(sweepCounts({ credits: 1, applied: 1 }));
+
+    const photo = await postDeposit(request, {
+      fileId: B.bankFirst.fileId, projectName: B.bankFirst.projectName, amount: B.bankFirst.amount,
+      checkDate: B.postDate, checkNumber: "9202",
+    });
+    expect(photo.body.status).toBe("unmatched");
+    expect(photo.body.reason).toContain("already applied by the deposit sweep from bank ref");
+    expect(photo.body.reason).toContain(B.bankFirst.bankReference);
+    expect(photo.body.officeTaskId).toBeTruthy();
+    expect((await getQboMockState(request)).calls.paymentCreate, "exactly one payment for one check").toBe(1);
+  });
+
+  // ── B8: only a customer deposit is sweepable ──────────────────────────────
+  test("B8: a non-deposit credit at a requested milestone's exact amount never books", async ({ request }) => {
+    await resetQboMock(request);
+    await seedQboInvoice(request, B.classGate.qbInvoiceId, B.classGate.amount, "di-mock-cust-bank-classgate");
+
+    // Owner capital / an ACH refund / a transfer, landing on the exact cents of
+    // a requested milestone — the case amount-only matching cannot survive.
+    const { body } = await postBankBatch(request, {
+      credits: [{
+        bankReference: B.classGate.bankReference, amount: B.classGate.amount,
+        baiCode: "165", description: "ACH CREDIT", transactionDetail: "OWNER CONTRIBUTION",
+      }],
+    });
+
+    const credit = bankCredit(body, B.classGate.bankReference);
+    expect(credit.status).toBe("unmatched");
+    expect(credit.reason).toContain("not a customer deposit class");
+    expect(credit.officeTaskId, "it looks like a payment, so a human is asked").toBeTruthy();
+    expect((await getQboMockState(request)).calls.paymentCreate, "no QuickBooks write for a non-deposit").toBe(0);
+    expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.classGate.schedule } })).status).toBe("Pending");
+  });
+
+  // ── B7: batch validation ──────────────────────────────────────────────────
+  test("B7: a control-total mismatch is a 400 and writes nothing; auth is the same fail-closed gate", async ({ request }) => {
+    const before = await prisma.depositIngest.count();
+
+    const mismatch = await postBankBatch(request, {
+      credits: [{ bankReference: "e2ebank-controltotal", amount: 12.34 }],
+      overrides: { creditSum: 99.99 },
+    });
+    expect(mismatch.res.status()).toBe(400);
+    expect(mismatch.body.reason).toContain("creditSum");
+
+    const missingRef = await request.post(DEPOSIT_INGEST_PATH, {
+      headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` },
+      data: JSON.stringify({ source: "bank", postDate: B.postDate, credits: [{ amount: 12.34 }], creditCount: 1, creditSum: 12.34 }),
+    });
+    expect(missingRef.status()).toBe(400);
+    expect((await safeJson(missingRef)).reason).toContain("bankReference");
+
+    const noAuth = await request.post(DEPOSIT_INGEST_PATH, {
+      headers: { "content-type": "application/json" },
+      data: JSON.stringify({ source: "bank", postDate: B.postDate, credits: [], creditCount: 0, creditSum: 0 }),
+    });
+    expect(noAuth.status()).toBe(401);
+
+    expect(await prisma.depositIngest.count(), "a refused batch writes no rows at all").toBe(before);
   });
 });

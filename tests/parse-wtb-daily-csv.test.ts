@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDayStatements, REPOST_FLOOR, DAILY_CANONICAL_FROM } from "../scripts/parse-wtb-daily-csv.mjs";
+import {
+    buildDayStatements,
+    looksLikeCustomerDeposit,
+    parseArgs,
+    sweepableReferences,
+    sweepDay,
+    sweepExcludedWarning,
+    buildSweepPayload,
+    canSweepDay,
+    postSweep,
+    resolveSweepSecret,
+    sweepBatchFailed,
+    sweepCreditLine,
+    sweepCreditNeedsAttention,
+    sweepSummaryLine,
+    REPOST_FLOOR,
+    DAILY_CANONICAL_FROM,
+} from "../scripts/parse-wtb-daily-csv.mjs";
 
 // Fixture note: none of this is real Golden Touch financial data. These are
 // synthetic "Balances and Transactions" CSV rows built to the same column
@@ -21,8 +38,9 @@ function row(
     status = "",
     custRef = "",
     detail = "",
+    bankRef = "",
 ) {
-    return `${date},${ACCT},${desc},${bai},${amount},${status},,,${custRef},${detail},,`;
+    return `${date},${ACCT},${desc},${bai},${amount},${status},,${bankRef},${custRef},${detail},,`;
 }
 
 function build(lines: string[]) {
@@ -269,4 +287,629 @@ test("the hash-format epoch is separate from the source-of-truth boundary", () =
     // exists to prevent.
     assert.notEqual(REPOST_FLOOR, DAILY_CANONICAL_FROM);
     assert.ok(REPOST_FLOOR > DAILY_CANONICAL_FROM);
+});
+
+// ── Deposit sweep (--sweep): the trigger this script carries for the daily
+//    bank-credit auto-apply. See docs/plans/DEPOSIT-SWEEP-PLAN.md.
+
+/** The real Washington Trust shape for a customer deposit: BAI 174 /
+ *  OTHER DEPOSITS, with the Transaction Detail saying how it arrived. */
+const CREDIT = (d: string, amt: string, bankRef: string, detail = "DEPOSIT - DDA/MMKT", desc = "OTHER DEPOSITS", bai = "174") =>
+    row(d, desc, bai, amt, "Cleared", "", detail, bankRef);
+
+test("sweep: a day carries its CREDIT rows, keyed by the bank reference", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "100.00"),
+        CLOSE("08/24/2026", "13537.68"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "13447.68"),
+        row("08/24/2026", "TOTAL DEBITS", "400", "-10.00"),
+        CREDIT("08/24/2026", "13447.68", "26236015002406"),
+        row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+    ]);
+
+    assert.equal(complete.length, 1);
+    const day = complete[0];
+    assert.equal(day.credits.length, 1, "only money IN is a credit");
+    // The three class fields stay SEPARATE and unmerged: the endpoint's
+    // allowlist reads them independently, and the ledger's combined descriptor
+    // is no use for deciding whether this is a customer payment at all.
+    assert.deepEqual(day.credits[0], {
+        bankReference: "26236015002406",
+        amount: 13447.68,
+        amountCents: 1344768,
+        baiCode: "174",
+        description: "OTHER DEPOSITS",
+        transactionDetail: "DEPOSIT - DDA/MMKT",
+        customerReference: null,
+    });
+    assert.equal(day.totalCreditsCents, 1344768);
+
+    // The sweep fields must never ride along on a LEDGER line: the statement
+    // route content-addresses those objects, so an extra key would re-hash
+    // every stored day and 409 the whole pipeline.
+    for (const line of day.lines) {
+        assert.deepEqual(Object.keys(line).sort(), ["amountCents", "checkNumber", "postedDate", "rawDescriptor"]);
+    }
+});
+
+test("sweep: the payload carries the BANK's own control totals", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1500.00"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1500.00"),
+        CREDIT("08/24/2026", "500.00", "REF-A"),
+        CREDIT("08/24/2026", "1000.00", "REF-B"),
+    ]);
+
+    const payload = buildSweepPayload(complete[0]);
+    assert.equal(payload.source, "bank");
+    assert.equal(payload.postDate, "2026-08-24");
+    assert.equal(payload.creditCount, 2);
+    assert.equal(payload.creditSum, 1500);
+    assert.deepEqual(payload.credits.map((c: any) => c.bankReference), ["REF-A", "REF-B"]);
+    // Exactly the fields the endpoint reads — amountCents stays internal.
+    assert.deepEqual(
+        Object.keys(payload.credits[0]).sort(),
+        ["amount", "baiCode", "bankReference", "customerReference", "description", "transactionDetail"],
+    );
+    assert.equal("dryRun" in payload, false, "a live sweep sends no dryRun flag at all");
+    assert.equal(buildSweepPayload(complete[0], { dryRun: true }).dryRun, true);
+});
+
+test("sweep: a credit-bearing day with NO independent TOTAL CREDITS row is not swept", async t => {
+    const withoutControlRow = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "750.25"),
+        CREDIT("08/24/2026", "750.25", "REF-SOLO"),
+    ]).complete[0];
+
+    await t.test("canSweepDay refuses it, and calls it a job failure", () => {
+        // Deriving creditSum from the rows it is meant to check makes the
+        // endpoint's control total a tautology: a day whose export silently
+        // dropped a deposit would post a sum matching the rows perfectly.
+        const verdict = canSweepDay(withoutControlRow);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, true);
+        assert.match(verdict.reason, /no TOTAL CREDITS control row, sweep skipped/);
+    });
+
+    await t.test("and buildSweepPayload refuses to invent one", () => {
+        assert.throws(() => buildSweepPayload(withoutControlRow), /no TOTAL CREDITS control row/);
+    });
+
+    await t.test("a day with the control row sweeps normally", () => {
+        const withControlRow = build([
+            OPEN("08/24/2026", "0.00"),
+            CLOSE("08/24/2026", "750.25"),
+            row("08/24/2026", "TOTAL CREDITS", "100", "750.25"),
+            CREDIT("08/24/2026", "750.25", "REF-SOLO"),
+        ]).complete[0];
+        assert.equal(canSweepDay(withControlRow).ok, true);
+        assert.equal(buildSweepPayload(withControlRow).creditSum, 750.25);
+    });
+
+    await t.test("a day with NO credits needs no control row and is not a failure", () => {
+        const quiet = build([
+            OPEN("08/24/2026", "100.00"),
+            CLOSE("08/24/2026", "90.00"),
+            row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+        ]).complete[0];
+        const verdict = canSweepDay(quiet);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, false, "nothing to sweep is not a failure");
+    });
+});
+
+test("sweep: a debit-only day has nothing to sweep", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "100.00"),
+        CLOSE("08/24/2026", "90.00"),
+        row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+    ]);
+    assert.deepEqual(complete[0].credits, []);
+});
+
+test("sweep: the secret comes from the environment, and its absence fails BEFORE any network call", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => { fetches += 1; return new Response("{}"); }) as typeof fetch;
+    try {
+        assert.throws(() => resolveSweepSecret({} as unknown as NodeJS.ProcessEnv), /DEPOSIT_INGEST_SECRET/);
+        assert.throws(() => resolveSweepSecret({ DEPOSIT_INGEST_SECRET: "" } as unknown as NodeJS.ProcessEnv), /DEPOSIT_INGEST_SECRET/);
+        assert.equal(resolveSweepSecret({ DEPOSIT_INGEST_SECRET: "s3cret" } as unknown as NodeJS.ProcessEnv), "s3cret");
+        assert.equal(fetches, 0, "an unconfigured sweep must not have talked to the network");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's batch as its body", async () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1500.00"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1500.00"),
+        CREDIT("08/24/2026", "1500.00", "REF-POST"),
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; init: any }> = [];
+    globalThis.fetch = (async (url: any, init: any) => {
+        seen.push({ url: String(url), init });
+        return new Response(JSON.stringify({
+            ok: true, source: "bank", postDate: "2026-08-24",
+            counts: { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
+            credits: [{ bankReference: "REF-POST", status: "applied", replay: false }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+        const result = await postSweep("https://probuild.example", "s3cret", complete[0], { dryRun: true });
+        assert.equal(result.status, 200);
+        assert.equal(result.body.counts.applied, 1);
+        assert.equal(sweepBatchFailed(result.body, new Set(["REF-POST"])), false, "a well-formed answer passes every check");
+
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].url, "https://probuild.example/api/payments/deposit-ingest");
+        assert.equal(seen[0].init.headers.authorization, "Bearer s3cret");
+        const sent = JSON.parse(seen[0].init.body);
+        assert.equal(sent.source, "bank");
+        assert.equal(sent.postDate, "2026-08-24");
+        assert.equal(sent.creditCount, 1);
+        assert.equal(sent.creditSum, 1500);
+        assert.equal(sent.dryRun, true);
+        assert.deepEqual(sent.credits[0].bankReference, "REF-POST");
+        // The secret travels in the header only — never in the URL or the body.
+        assert.equal(seen[0].url.includes("s3cret"), false);
+        assert.equal(seen[0].init.body.includes("s3cret"), false);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("sweep: the Bot Health line reports every outcome bucket", () => {
+    const clean = { credits: 4, applied: 1, proposed: 1, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 3 };
+    assert.equal(
+        sweepSummaryLine("2026-08-24", clean),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay",
+    );
+    // A day that hit a QuickBooks outage must not read like a quiet day.
+    assert.equal(
+        sweepSummaryLine("2026-08-24", { ...clean, failed: 2, qboUnknown: 1 }),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay, 2 failed, 1 qbo-unknown",
+    );
+    // …nor may a credit stuck mid-flight (a created QuickBooks payment whose
+    // settle threw) hide inside a line that mentions no such thing.
+    assert.equal(
+        sweepSummaryLine("2026-08-24", { ...clean, unresolved: 1 }),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay, 0 failed, 0 qbo-unknown, 1 unresolved",
+    );
+});
+
+test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async t => {
+    const counts = (over: Record<string, number> = {}) => ({
+        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0, ...over,
+    });
+    /** A well-formed answer: the counts AND a per-credit line for each one. */
+    const answer = (status: string, over: Record<string, number> = {}) => ({
+        ok: true,
+        counts: counts({ applied: status === "applied" ? 1 : 0, [status]: 1, ...over }),
+        credits: [{ bankReference: "A", status }],
+    });
+
+    await t.test("a clean day is not a failure", () => {
+        assert.equal(sweepBatchFailed(answer("applied")), false);
+    });
+
+    await t.test("credits sent to a HUMAN are not a failure — that is the sweep working", () => {
+        assert.equal(sweepBatchFailed(answer("unmatched")), false);
+    });
+
+    await t.test("failed / qbo_unknown / reconcile are", () => {
+        for (const bucket of ["failed", "qboUnknown", "reconcile"]) {
+            const status = bucket === "qboUnknown" ? "qbo_unknown" : bucket;
+            // Well-formed in every other respect: the bucket alone fails it.
+            assert.equal(
+                sweepBatchFailed({
+                    ok: true,
+                    counts: counts({ applied: 0, [bucket]: 1 }),
+                    credits: [{ bankReference: "A", status }],
+                }),
+                true,
+                `${bucket} must fail the run`,
+            );
+        }
+    });
+
+    await t.test("the endpoint's own ok:false is authority, whatever the counts say", () => {
+        assert.equal(sweepBatchFailed({ ok: false, counts: counts() }), true);
+    });
+
+    await t.test("a MISSING ok is not a pass — 'I could not tell' is never success", () => {
+        assert.equal(sweepBatchFailed({ counts: counts(), credits: [{ bankReference: "A", status: "applied" }] }), true);
+        assert.equal(sweepBatchFailed({ ok: "true", counts: counts(), credits: [{ bankReference: "A", status: "applied" }] }), true);
+    });
+
+    await t.test("the response must account for every credit, one by one", () => {
+        // An empty array with healthy counts would otherwise read as a clean
+        // day for credits nobody can prove were ever seen.
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts(), credits: [] }), true);
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts() }), true, "no credits array at all");
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 2, applied: 2 }), credits: [{ bankReference: "A", status: "applied" }] }), true, "short array");
+    });
+
+    await t.test("…and they must be the SAME credits that were submitted", () => {
+        const submitted = new Set(["A", "B"]);
+        const body = (refs: string[]) => ({
+            ok: true,
+            counts: counts({ credits: refs.length, applied: refs.length }),
+            credits: refs.map(r => ({ bankReference: r, status: "applied" })),
+        });
+        assert.equal(sweepBatchFailed(body(["A", "B"]), submitted), false);
+        assert.equal(sweepBatchFailed(body(["A", "C"]), submitted), true, "a substituted reference");
+        assert.equal(sweepBatchFailed(body(["A", "A"]), submitted), true, "a duplicated reference");
+        assert.equal(sweepBatchFailed(body(["A"]), new Set(["A", "B"])), true, "another day's answer");
+    });
+
+    await t.test("counts alone still catch it if a deployment answers without the flag", () => {
+        assert.equal(sweepBatchFailed({ counts: counts({ applied: 0, failed: 1 }) }), true);
+    });
+
+    await t.test("the catch-all bucket fails even a well-formed answer", () => {
+        assert.equal(
+            sweepBatchFailed({
+                ok: true,
+                counts: counts({ applied: 0, unresolved: 1 }),
+                credits: [{ bankReference: "A", status: "qbo_created" }],
+            }),
+            true,
+        );
+    });
+
+    await t.test("a missing or non-object body is a failure, never a silent pass", () => {
+        assert.equal(sweepBatchFailed(null), true);
+        assert.equal(sweepBatchFailed(undefined), true);
+        assert.equal(sweepBatchFailed("nope"), true);
+        assert.equal(sweepBatchFailed({ ok: true }), true, "no counts at all is not a clean day");
+    });
+
+    await t.test("the catch-all bucket fails the run", () => {
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ applied: 0, unresolved: 1 }) }), true);
+    });
+
+    await t.test("a count that is not a whole, non-negative number is a failure", () => {
+        // Well-formed in EVERY other respect — a matching credits array and a
+        // clean status — so the count shape is the only thing that can fail it.
+        const wellFormed = (over: Record<string, unknown>) => ({
+            ok: true,
+            counts: counts(over as never),
+            credits: [{ bankReference: "A", status: "applied" }],
+        });
+        // The partition ties (1 = 2 + -1) but describes something impossible.
+        assert.equal(sweepBatchFailed(wellFormed({ credits: 1, applied: 2, unmatched: -1 })), true);
+        assert.equal(sweepBatchFailed(wellFormed({})), false, "control: the same body with sane counts passes");
+        for (const bad of [-1, 1.5, NaN, "3", null, undefined]) {
+            assert.equal(sweepBatchFailed(wellFormed({ applied: bad })), true, `applied ${bad}`);
+            assert.equal(sweepBatchFailed(wellFormed({ replay: bad })), true, `replay ${bad}`);
+        }
+    });
+
+    await t.test("buckets that do not add up to the credit count are a failure", () => {
+        // Some outcome went uncounted — an older deployment, or a status added
+        // since. Reporting success off an incomplete tally is the exact bug.
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 3 }) }), true);
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 2, applied: 3 }) }), true);
+    });
+
+    await t.test("a per-credit status outside the clean set fails, whatever the counts claim", () => {
+        // The round-2 residual, seen from the runner: an endpoint that tallies
+        // qbo_created as nothing would still be caught here, on the RAW result.
+        assert.equal(
+            sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status: "qbo_created" }] }),
+            true,
+        );
+        assert.equal(
+            sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status: "something-new" }] }),
+            true,
+        );
+        for (const status of ["applied", "proposed", "unmatched"]) {
+            assert.equal(
+                sweepBatchFailed({ ok: true, counts: counts(), credits: [{ bankReference: "A", status }] }),
+                false,
+                `${status} is a clean outcome`,
+            );
+        }
+    });
+});
+
+test("sweep: a non-deposit credit is SENT, with the class fields the endpoint judges it by", () => {
+    // The runner does not decide what is a customer payment — it reports what
+    // the bank said and lets the endpoint's allowlist rule. Filtering here
+    // would hide an interest or transfer credit from the audit trail entirely,
+    // and would put the money rule in the browser-automation script instead of
+    // the server that owns every other money rule.
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1503.17"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1503.17"),
+        CREDIT("08/24/2026", "1500.00", "REF-DEP"),
+        CREDIT("08/24/2026", "3.17", "REF-INT", "INTEREST", "INTEREST PAID", "165"),
+    ]);
+
+    const payload = buildSweepPayload(complete[0]);
+    assert.equal(payload.creditCount, 2, "both credits are posted");
+    const interest = payload.credits.find((c: any) => c.bankReference === "REF-INT");
+    assert.deepEqual(interest, {
+        bankReference: "REF-INT",
+        amount: 3.17,
+        baiCode: "165",
+        description: "INTEREST PAID",
+        transactionDetail: "INTEREST",
+        customerReference: null,
+    });
+});
+
+test("sweep: every credit a human must look at gets its own line, with the money on it", async t => {
+    await t.test("unmatched is printed even though the batch is clean", () => {
+        // `unmatched` is a clean batch outcome, so it is not a failure — but it
+        // IS the thing a human is being asked to act on, and a count in a
+        // summary line is not a worklist.
+        assert.equal(sweepCreditNeedsAttention({ status: "unmatched" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "reconcile" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "failed" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "qbo_created" }), true, "and anything unknown");
+        assert.equal(sweepCreditNeedsAttention({ status: "applied" }), false);
+        // Suggest-only mode has no confirm button yet (Phase C), so this log
+        // line IS the operator's worklist.
+        assert.equal(sweepCreditNeedsAttention({ status: "proposed" }), true);
+    });
+
+    await t.test("a proposed credit is named with its candidate milestone", () => {
+        // The endpoint's own reason already carries the candidate, so the
+        // operator gets reference, money, state and "would apply to …" on one
+        // line without the runner having to know anything about milestones.
+        assert.equal(
+            sweepCreditLine({
+                bankReference: "26236015002406",
+                status: "proposed",
+                reason: 'suggest-only: ... would apply to "Rough In complete" (Hoppe Hall Bath, INV-00173)',
+            }, 13447.68),
+            '26236015002406 $13447.68: proposed — suggest-only: ... would apply to "Rough In complete" (Hoppe Hall Bath, INV-00173)',
+        );
+    });
+
+    await t.test("the line carries reference, amount and reason", () => {
+        assert.equal(
+            sweepCreditLine({ bankReference: "26236015002406", status: "unmatched", reason: "3 milestones match" }, 13447.68),
+            "26236015002406 $13447.68: unmatched — 3 milestones match",
+        );
+        // A reference the batch cannot price is still named, not dropped.
+        assert.equal(
+            sweepCreditLine({ bankReference: "REF-X", status: "reconcile", reason: null }, undefined),
+            "REF-X unknown amount: reconcile — ",
+        );
+    });
+});
+
+test("args: an unknown flag stops the run before anything is posted", async t => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => { fetches += 1; return new Response("{}"); }) as typeof fetch;
+    try {
+        await t.test("a typo'd flag is refused, not ignored", () => {
+            // The dangerous direction: `--sweep-dryrun` silently dropped meant
+            // the cron POSTed a LIVE batch believing it was shadowing.
+            assert.throws(() => parseArgs(["daily.csv", "--sweep-dryrun"]), /unknown flag --sweep-dryrun/);
+            assert.throws(() => parseArgs(["daily.csv", "--dryrun"]), /unknown flag --dryrun/);
+            assert.throws(() => parseArgs(["daily.csv", "--sweep", "--nope"]), /unknown flag --nope/);
+        });
+
+        await t.test("a stray positional argument is refused too", () => {
+            assert.throws(() => parseArgs(["daily.csv", "other.csv"]), /unexpected argument other\.csv/);
+        });
+
+        await t.test("the real flags still parse", () => {
+            const args = parseArgs(["daily.csv", "--sweep-dry-run", "--post", "https://probuild.example", "--account", "WTB-0723"]);
+            assert.equal(args.csvPath, "daily.csv");
+            assert.equal(args.sweep, true);
+            assert.equal(args.sweepDryRun, true);
+            assert.equal(args.post, "https://probuild.example");
+            assert.equal(parseArgs(["daily.csv", "--dry-run"]).dryRun, true);
+            assert.equal(parseArgs(["daily.csv", "--sweep"]).sweepDryRun, false);
+        });
+
+        assert.equal(fetches, 0, "argument parsing never touches the network");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ── A credit with no Bank Reference (first prod dry run, 2026-08-28) ────────
+//
+// It cannot be swept: the reference IS the idempotency key. The first cut
+// refused the whole day for it, which also stopped every LATER day — so one
+// unreferenced row would have failed the 6pm job forever. It is now declared
+// and skipped, with the bank's own day totals unchanged so the arithmetic
+// still has to tie.
+
+test("sweep: an unreferenced credit is excluded from the batch, not fatal", async t => {
+    const day = () => build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "1600.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "1600.00"),
+        CREDIT("08/28/2026", "1500.00", "REF-OK"),
+        CREDIT("08/28/2026", "100.00", ""), // the real row: no Bank Reference
+    ]).complete[0];
+
+    await t.test("the day is still sweepable", () => {
+        assert.equal(canSweepDay(day()).ok, true);
+    });
+
+    await t.test("the payload posts the sweepable credit and DECLARES the other", () => {
+        const payload = buildSweepPayload(day());
+        assert.equal(payload.credits.length, 1);
+        assert.equal(payload.credits[0].bankReference, "REF-OK");
+        assert.deepEqual(payload.excluded, [{
+            amount: 100,
+            description: "OTHER DEPOSITS",
+            transactionDetail: "DEPOSIT - DDA/MMKT",
+            reason: "no bank reference",
+        }]);
+        // The bank's OWN day figures, unchanged: the endpoint ties them to
+        // credits + excluded, so an exclusion cannot hide a deposit.
+        assert.equal(payload.creditCount, 2);
+        assert.equal(payload.creditSum, 1600);
+    });
+
+    await t.test("a day where EVERY credit lacks a reference is skipped, not failed", () => {
+        const allMissing = build([
+            OPEN("08/28/2026", "0.00"),
+            CLOSE("08/28/2026", "100.00"),
+            row("08/28/2026", "TOTAL CREDITS", "100", "100.00"),
+            CREDIT("08/28/2026", "100.00", ""),
+        ]).complete[0];
+        const verdict = canSweepDay(allMissing);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, false, "nothing to sweep is not a job failure");
+        assert.match(verdict.reason, /no credits carry a bank reference/);
+    });
+
+    await t.test("an excluded credit that looks like a customer payment is WARNED about", () => {
+        const deposit = { amount: 100, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" };
+        assert.equal(looksLikeCustomerDeposit(deposit), true);
+        assert.equal(
+            sweepExcludedWarning("2026-08-28", deposit),
+            "WARNING 2026-08-28: a customer-deposit credit of $100.00 has NO Bank Reference, so it cannot be swept — " +
+            "check it by hand (OTHER DEPOSITS / DEPOSIT - DDA/MMKT)",
+            "the amount and the date are in the line, because that is what a human searches for",
+        );
+    });
+
+    await t.test("…but routine non-deposit credits are excluded quietly", () => {
+        // Interest, transfers and ACH credits are not customer payments; a
+        // daily WARNING for each would bury the one that matters.
+        for (const credit of [
+            { amount: 3.17, baiCode: "165", description: "INTEREST PAID", transactionDetail: "INTEREST" },
+            { amount: 500, baiCode: "195", description: "TRANSFER FROM SAVINGS", transactionDetail: "TRANSFER" },
+            { amount: 20, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "ACH REFUND" },
+            // Isolates the BAI clause: everything else reads like a deposit, so
+            // only the code itself can refuse this one.
+            { amount: 75, baiCode: "165", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" },
+        ]) {
+            assert.equal(looksLikeCustomerDeposit(credit), false, `${credit.baiCode} / ${credit.description} / ${credit.transactionDetail}`);
+        }
+    });
+
+    await t.test("the summary line reports the exclusions", () => {
+        const counts = { credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 };
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 1),
+            "sweep 2026-08-28: 1 credits (1 excluded: no bank reference), 1 applied, 0 need-human, 0 proposed, 0 replay",
+        );
+        assert.equal(
+            sweepSummaryLine("2026-08-28", counts, 0),
+            "sweep 2026-08-28: 1 credits, 1 applied, 0 need-human, 0 proposed, 0 replay",
+            "and says nothing when there are none",
+        );
+    });
+});
+
+// ── REPRO: 2026-08-28 in prod, after the excluded-credits fix ───────────────
+//
+// The day swept, its one $24,000 credit came back `unmatched` (need-human,
+// exactly right), and the runner then called the whole day a failure, printed
+// "unresolved credits", marked it NOT POSTED, stopped every later day and
+// exited 1.
+test("REPRO: an unmatched credit alongside an EXCLUDED one is a clean day", () => {
+    const body = {
+        ok: true,
+        counts: { credits: 1, applied: 0, proposed: 0, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
+        excludedCount: 1,
+        credits: [{ bankReference: "26241015003021", status: "unmatched", reason: "no requested pending milestone matches $24000.00" }],
+    };
+    // The set sweepDay used to build: every credit ON THE DAY, including the
+    // one with no reference — so it never matched what the endpoint answered.
+    const everyCredit = new Set(["26241015003021", ""]);
+    const posted = new Set(["26241015003021"]);
+
+    assert.equal(sweepBatchFailed(body, posted), false, "asking a human is a clean outcome");
+    assert.equal(
+        sweepBatchFailed(body, everyCredit), true,
+        "…and this is the bug: an excluded credit was counted as submitted, so the answer never tied",
+    );
+
+    // The fix, end to end: the payload and the expected-reference set come from
+    // ONE definition of "what this day posts", so they cannot disagree again.
+    const day = build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "24100.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "24100.00"),
+        CREDIT("08/28/2026", "24000.00", "26241015003021"),
+        CREDIT("08/28/2026", "100.00", ""), // the unreferenced row
+    ]).complete[0];
+
+    const payload = buildSweepPayload(day);
+    const expected = sweepableReferences(day);
+    assert.deepEqual([...expected], payload.credits.map((c: any) => c.bankReference));
+    assert.equal(expected.size, 1, "the excluded credit was never submitted");
+    assert.equal(payload.excluded.length, 1);
+    assert.equal(
+        sweepBatchFailed({ ...body, counts: { ...body.counts, credits: payload.credits.length } }, expected),
+        false,
+        "the response the endpoint actually sends, checked against what was actually posted",
+    );
+});
+
+test("REPRO at the call site: sweepDay reports the 2026-08-28 day as clean", async () => {
+    // The whole path, the way the cron runs it: a day with one sweepable credit
+    // and one unreferenced one, answered by the endpoint exactly as prod
+    // answered it. This is the test that would have caught the bug — the
+    // expected-reference set is built INSIDE sweepDay, so a test that calls the
+    // helper directly cannot see it go wrong.
+    const day = build([
+        OPEN("08/28/2026", "0.00"),
+        CLOSE("08/28/2026", "24100.00"),
+        row("08/28/2026", "TOTAL CREDITS", "100", "24100.00"),
+        CREDIT("08/28/2026", "24000.00", "26241015003021"),
+        CREDIT("08/28/2026", "100.00", ""),
+    ]).complete[0];
+
+    const originalFetch = globalThis.fetch;
+    const logged: string[] = [];
+    const errored: string[] = [];
+    const originalLog = console.log, originalError = console.error, originalWarn = console.warn;
+    console.log = (...args: unknown[]) => { logged.push(args.join(" ")); };
+    console.warn = (...args: unknown[]) => { logged.push(args.join(" ")); };
+    console.error = (...args: unknown[]) => { errored.push(args.join(" ")); };
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+        ok: true,
+        source: "bank",
+        postDate: "2026-08-28",
+        counts: { credits: 1, applied: 0, proposed: 0, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0 },
+        excludedCount: 1,
+        credits: [{ bankReference: "26241015003021", status: "unmatched", replay: false, reason: "no requested pending milestone matches $24000.00" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+
+    let stalledCalls = 0;
+    try {
+        const ok = await sweepDay(
+            { post: "https://probuild.example", sweepDryRun: false },
+            "s3cret",
+            day,
+            () => { stalledCalls += 1; },
+        );
+        assert.equal(ok, true, "a credit sent to a human is a clean day — later days must keep posting");
+        assert.equal(stalledCalls, 0, "and the day is never marked NOT POSTED");
+        assert.equal(
+            errored.some(line => line.includes("unresolved credits")), false,
+            "the 'unresolved' line is only for failed / qbo_unknown / reconcile / unresolved",
+        );
+        // It still SAYS what happened: the summary, the exclusion, and the
+        // credit the human has to look at.
+        const output = logged.join("\n");
+        assert.match(output, /sweep 2026-08-28: 1 credits \(1 excluded: no bank reference\)/);
+        assert.match(output, /26241015003021 \$24000\.00: unmatched/);
+        assert.match(output, /WARNING 2026-08-28: a customer-deposit credit of \$100\.00 has NO Bank Reference/);
+    } finally {
+        globalThis.fetch = originalFetch;
+        console.log = originalLog; console.error = originalError; console.warn = originalWarn;
+    }
 });
