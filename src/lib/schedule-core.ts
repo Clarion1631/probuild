@@ -2992,7 +2992,7 @@ async function runApplyChangeOrderToSchedule(
                     const task = await createTask({
                         name: `${co.code} payment`,
                         startDate: blockEnd,
-                        endDate: addDays(blockEnd, 1),
+                        endDate: blockEnd, // milestones store end == start (schedule-dates.ts)
                         color: "#f59e0b",
                         order: nextOrder++,
                         type: "milestone",
@@ -3083,7 +3083,7 @@ async function runApplyChangeOrderToSchedule(
                 const mTask = await createTask({
                     name: `${co.code} payment`,
                     startDate: blockEnd,
-                    endDate: addDays(blockEnd, 1),
+                    endDate: blockEnd, // milestones store end == start (schedule-dates.ts)
                     color: "#f59e0b",
                     order: nextOrder++,
                     type: "milestone",

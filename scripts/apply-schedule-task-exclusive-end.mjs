@@ -31,7 +31,7 @@ export const SELECT_LEGACY_ROWS = `
 
 export const UPDATE_LEGACY_ROWS = `
     UPDATE "ScheduleTask"
-    SET "endDate" = "startDate" + interval '1 day'
+    SET "endDate" = "startDate" + interval '1 day', "updatedAt" = NOW()
     WHERE "projectId" IS NOT NULL AND "type" <> 'milestone' AND "endDate" <= "startDate"`;
 
 // Milestones store end == start (schedule-task-core forces it on every update;
@@ -44,7 +44,7 @@ export const SELECT_MILESTONE_ROWS = `
 
 export const UPDATE_MILESTONE_ROWS = `
     UPDATE "ScheduleTask"
-    SET "endDate" = "startDate"
+    SET "endDate" = "startDate", "updatedAt" = NOW()
     WHERE "projectId" IS NOT NULL AND "type" = 'milestone' AND "endDate" <> "startDate"`;
 
 // Human-curated correction for multi-day tasks whose End was typed into the
@@ -56,7 +56,7 @@ export const UPDATE_MILESTONE_ROWS = `
 // touched.
 export const EXTEND_ROW = `
     UPDATE "ScheduleTask"
-    SET "endDate" = "endDate" + interval '1 day'
+    SET "endDate" = "endDate" + interval '1 day', "updatedAt" = NOW()
     WHERE "id" = $1
       AND "projectId" IS NOT NULL
       AND "type" <> 'milestone'
