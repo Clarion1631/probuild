@@ -197,7 +197,7 @@ const fakePrisma: Row = {
             queries.paymentSchedule.push(args);
             return tables.paymentSchedule.findMany(args);
         },
-        findUnique: (args: Row) => tables.paymentSchedule.findUnique(args),
+        findUnique: (args: { where: Row }) => tables.paymentSchedule.findUnique(args),
     },
     officeTask: tables.officeTask,
     officeBoardColumn: tables.officeBoardColumn,
@@ -461,10 +461,10 @@ test("messages name the row on the other side of the collision", () => {
         appliedTwinNote({ source: BANK_DEPOSIT_SOURCE, fileId: "bank:262", bankReference: "262", postDate: "2026-08-24" }),
         /already applied by the deposit sweep from bank ref 262 on 2026-08-24/,
     );
-    assert.match(
-        crossSourceClaimNote({ fileId: "drive-1", source: null, bankReference: null, status: "processing", paymentScheduleId: "sched-9", postDate: "2026-08-24" }),
-        /deposit photo \(file drive-1\).*working \(processing\).*sched-9/s,
-    );
+    const claimNote = crossSourceClaimNote({ fileId: "drive-1", source: null, bankReference: null, status: "processing", paymentScheduleId: "sched-9", postDate: "2026-08-24" });
+    assert.match(claimNote, /deposit photo \(file drive-1\)/);
+    assert.match(claimNote, /working \(processing\)/);
+    assert.match(claimNote, /milestone sched-9/);
     assert.match(
         reservationLostNote({ fileId: "bank:262", source: BANK_DEPOSIT_SOURCE, bankReference: "262", status: "applied", paymentScheduleId: "s1", postDate: null }),
         /already being applied by the deposit sweep \(bank ref 262/,
