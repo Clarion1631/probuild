@@ -693,6 +693,20 @@ test("the verify reads DEFAULTS, and reports drift", async () => {
     assert.equal(right.notes.length, 1);
 
     // A column with NO default at all is drift too, not an absence to shrug at.
+    // THE TABLE AND COLUMN ARE BOUND PARAMETERS, not SQL text. This is not
+    // pedantry: the DB-gated probe in receipt-intake-claim-db.test.ts pointed
+    // itself at a stand-in table by rewriting the SQL string, which substituted
+    // nothing, so the check silently ran against the REAL table and reported
+    // clean. Anything redirecting this query must rewrite the ARGS.
+    const calls: { sql: string; args: unknown[] }[] = [];
+    await verifyColumnDefaults(async (sql: string, ...args: unknown[]) => {
+        calls.push({ sql, args });
+        return [{ column_default: "'STAGING'::text" }];
+    });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].args, ["ReceiptIntake", "state"], "passed as $1 and $2");
+    assert.ok(!calls[0].sql.includes("ReceiptIntake"), "and NOT interpolated into the SQL");
+
     const none = await verifyColumnDefaults(async () => [{ column_default: null }]);
     assert.equal(none.problems.length, 1);
     assert.match(none.problems[0], /default is \(none\)/);

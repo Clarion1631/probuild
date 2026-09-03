@@ -623,8 +623,22 @@ test("apply REPAIRS a table created with the old default", { skip }, async () =>
         assert.ok(names.some(r => r.column_name === "state"), "the column is present in both shapes");
 
         // ...and the default check catches it.
-        const before = await verifyColumnDefaults(
-            (sql: string, ...args: unknown[]) => db!.$queryRawUnsafe(sql.replace("ReceiptIntake", DEFAULT_PROBE), ...args),
+        //
+        // ROUTED BY ARGUMENT, not by rewriting the SQL: verifyColumnDefaults
+        // passes the table name as $1, so a `sql.replace("ReceiptIntake", ...)`
+        // shim substitutes nothing and the query silently runs against the REAL
+        // table — which, correctly migrated, reports clean and hides the probe.
+        const routed: unknown[][] = [];
+        const probeQuery = (sql: string, ...args: unknown[]) => {
+            const swapped = args.map(a => (a === "ReceiptIntake" ? DEFAULT_PROBE : a));
+            routed.push(swapped);
+            return db!.$queryRawUnsafe(sql, ...swapped);
+        };
+
+        const before = await verifyColumnDefaults(probeQuery);
+        assert.ok(
+            routed.length > 0 && routed.every(a => a.includes(DEFAULT_PROBE)),
+            `the verify was pointed at the probe table: ${JSON.stringify(routed)}`,
         );
         assert.equal(before.problems.length, 1, JSON.stringify(before));
 
@@ -635,9 +649,7 @@ test("apply REPAIRS a table created with the old default", { skip }, async () =>
         );
         assert.match(String(await probeDefault()), /STAGING/, "repaired");
 
-        const after = await verifyColumnDefaults(
-            (sql: string, ...args: unknown[]) => db!.$queryRawUnsafe(sql.replace("ReceiptIntake", DEFAULT_PROBE), ...args),
-        );
+        const after = await verifyColumnDefaults(probeQuery);
         assert.deepEqual(after.problems, [], "and the verify is clean");
 
         // Idempotent: running it again changes nothing.
