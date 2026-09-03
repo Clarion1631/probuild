@@ -10,6 +10,30 @@ import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
 import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
+import { attributeDeposit, type MilestoneCandidate } from "@/lib/deposit-attribution";
+import {
+    BANK_APPLY_MIN_AGE_DAYS,
+    BANK_DEPOSIT_SOURCE,
+    BANK_DEPOSIT_TO_ACCOUNT_ID,
+    BANK_IMAGE_SOURCE,
+    CLAIMING_STATUSES,
+    CROSS_SOURCE_CLAIM_WINDOW_DAYS,
+    PAID_UNION_WINDOW_DAYS,
+    appliedTwinNote,
+    bankCreditIsOldEnough,
+    bankFileId,
+    bankImageKeyPrefix,
+    crossSourceClaimNote,
+    describeCandidates,
+    findBatchCollisions,
+    isoDateToUtc,
+    isoDaysAfter,
+    isoDaysBefore,
+    parseBankBatch,
+    reservationLostNote,
+    selectPayerBearingImage,
+    type BankCredit,
+} from "@/lib/deposit-sweep";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -22,6 +46,20 @@ export const maxDuration = 30;
  * the deposit against the one Pending milestone it uniquely matches, in
  * QuickBooks (if the milestone is QBO-linked) AND ProBuild, or files an
  * OfficeTask for a human when the match isn't clean.
+ *
+ * TWO SOURCES, ONE STATE MACHINE (docs/plans/DEPOSIT-SWEEP-PLAN.md):
+ *   - the PHOTO path above, one POST per Drive file; and
+ *   - the DEPOSIT SWEEP, `{ source: "bank", ... }`, ONE POST per day carrying
+ *     the complete day's Washington Trust credit rows plus the CSV's own
+ *     control totals. It exists because a deposit that reaches the bank
+ *     without ever being photographed used to sit unbooked indefinitely (the
+ *     Hoppe check: 9 days, $13,447.68), and the QuickBooks API cannot see an
+ *     unbooked deposit at all.
+ * The bank branch reuses this file's claim/reservation/QBO/settle machinery
+ * verbatim — see handleBankBatch. It adds NO money-write path; what it adds is
+ * a stricter match (requested-only candidates, a 14-day Paid union, a
+ * cross-source claim check, a 2-day wait) because a bank credit carries no
+ * project name and no check number, only an amount.
  *
  * Auth: Authorization: Bearer ${DEPOSIT_INGEST_SECRET}. `/api/payments/*` is
  * already in the generic proxy bypass (src/proxy.ts), so this in-handler
@@ -40,6 +78,13 @@ export const maxDuration = 30;
  *   qbo_created  — the QBO Payment exists (qbPaymentId set); ProBuild settle
  *                  is pending. Resume from settle.
  *   applied      — terminal success.
+ *   proposed     — BANK ROWS ONLY. The match resolved to exactly one milestone
+ *                  but nothing was written to QuickBooks or ProBuild: either a
+ *                  dry run (Phase A shadow week) or the credit is younger than
+ *                  the 2-day wait. Terminal to the bot for today; the next
+ *                  daily POST re-evaluates it as a replay. Holds no
+ *                  reservation (it is outside the partial index's predicate)
+ *                  but IS visible to the cross-source claim check.
  *   unmatched    — terminal to the bot (an OfficeTask was filed). A human can
  *                  force a retry with ?force=1 after fixing the cause, UNLESS
  *                  the row already crossed the QBO boundary (never force-reset
@@ -117,6 +162,10 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
     }
 
+    // The deposit sweep's daily batch. Split BEFORE any photo-payload
+    // validation: a bank batch has no fileId/projectName/amount of its own.
+    if (raw.source === BANK_DEPOSIT_SOURCE) return await handleBankBatch(raw);
+
     const fileId = String(raw.fileId ?? "").trim();
     const projectName = String(raw.projectName ?? "").trim();
     const rawAmount = Number(raw.amount);
@@ -151,6 +200,15 @@ export async function POST(req: Request) {
 
     const force = new URL(req.url).searchParams.get("force") === "1";
 
+    // Persisted for BOTH sources so the cross-source claim check is an indexed
+    // query in both directions (a photo row must be findable by the sweep, not
+    // just the other way round). An unparseable checkDate leaves postDate null
+    // — that row is already headed for `unmatched`.
+    const photoColumns = {
+        amountCents,
+        postDate: isValidCheckDate(payload.checkDate) ? isoDateToUtc(payload.checkDate) : null,
+    };
+
     // ── Idempotency / claim ─────────────────────────────────────────────────
     let row = await prisma.depositIngest.findUnique({ where: { fileId } });
     let freshlyClaimed = false;
@@ -164,6 +222,7 @@ export async function POST(req: Request) {
                     extracted: JSON.stringify(payload),
                     attempts: 1,
                     processingStartedAt: new Date(),
+                    ...photoColumns,
                 },
             });
             freshlyClaimed = true;
@@ -219,7 +278,7 @@ export async function POST(req: Request) {
             data: {
                 status: "processing", extracted: JSON.stringify(payload),
                 attempts: { increment: 1 }, processingStartedAt: new Date(),
-                lastError: null, paymentScheduleId: null,
+                lastError: null, paymentScheduleId: null, ...photoColumns,
             },
         });
         if (reclaimed.count === 0) {
@@ -260,7 +319,7 @@ export async function POST(req: Request) {
                 attempts: { increment: 1 }, processingStartedAt: new Date(),
                 // qbo_unknown/qbo_created resumes deliberately replay the ORIGINAL
                 // extracted values (see resumeFromQboUnknown/resumeFromQboCreated).
-                ...(retriable && !boundaryMarked ? { extracted: JSON.stringify(payload), paymentScheduleId: null } : {}),
+                ...(retriable && !boundaryMarked ? { extracted: JSON.stringify(payload), paymentScheduleId: null, ...photoColumns } : {}),
             },
         });
         if (claim.count > 0) {
@@ -295,37 +354,47 @@ export async function POST(req: Request) {
         if (row.status === "qbo_unknown") return await resumeFromQboUnknown(row);
         return await matchAndApply(row, payload);
     } catch (e: any) {
-        // Any exception that escapes this far is, by construction, one the QBO-crossing
-        // steps (send, settle) didn't already handle internally — but re-read the row's
-        // PERSISTED state rather than assume, since e.g. settleMilestoneFromQBPayment can
-        // throw AFTER qbPaymentId was already committed (a real QuickBooks Payment exists).
-        const message = e instanceof Error ? e.message : String(e);
-        const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
-        const crossedQboBoundary = !!fresh.qbPaymentId || !!fresh.qbRequestPayload;
-        const crossedAnyBoundary = crossedQboBoundary || !!fresh.settleStartedAt;
-        if (fresh.attempts >= MAX_ATTEMPTS) {
-            // Reservation survives exhaustion whenever ANY money boundary was crossed —
-            // the reconcile human must see which milestone this deposit may have paid.
-            return await finalizeReconcile(fresh, message, { nullReservation: !crossedAnyBoundary });
-        }
-        const retryStatus = !crossedQboBoundary ? "failed" : fresh.qbPaymentId ? "qbo_created" : "qbo_unknown";
-        await prisma.depositIngest.updateMany({
-            // Conditioned on an active status: a throw AFTER a terminal write (e.g. the
-            // review-task transaction hiccuping post-finalize) must never regress
-            // applied/unmatched/reconcile back into the retry loop.
-            where: { id: fresh.id, status: { in: ["processing", "qbo_unknown", "qbo_created", "failed"] } },
-            data: {
-                status: retryStatus, lastError: message.slice(0, 1000),
-                // Pre-boundary "failed" releases the milestone (NULL leaves the partial
-                // index; that retry re-matches and re-reserves from scratch). Past the
-                // NON-QBO boundary (settleStartedAt) the reservation is preserved — and
-                // "failed" is in the index predicate, so the hold stays continuously
-                // indexed and no second file can slip in before the retry resumes.
-                ...(retryStatus === "failed" && !fresh.settleStartedAt ? { paymentScheduleId: null } : {}),
-            },
-        });
-        return NextResponse.json({ ok: false, status: retryStatus, reason: message });
+        return await recordAttemptFailure(row, e);
     }
+}
+
+/**
+ * Persist the outcome of an attempt that threw. Shared by the photo POST above
+ * and the bank sweep's per-credit loop so both classify a failure the same way
+ * — this is the money-boundary logic, and a second copy of it would drift.
+ *
+ * Any exception that reaches here is, by construction, one the QBO-crossing
+ * steps (send, settle) didn't already handle internally — but re-read the row's
+ * PERSISTED state rather than assume, since e.g. settleMilestoneFromQBPayment can
+ * throw AFTER qbPaymentId was already committed (a real QuickBooks Payment exists).
+ */
+async function recordAttemptFailure(row: DepositIngest, e: unknown): Promise<NextResponse> {
+    const message = e instanceof Error ? e.message : String(e);
+    const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
+    const crossedQboBoundary = !!fresh.qbPaymentId || !!fresh.qbRequestPayload;
+    const crossedAnyBoundary = crossedQboBoundary || !!fresh.settleStartedAt;
+    if (fresh.attempts >= MAX_ATTEMPTS) {
+        // Reservation survives exhaustion whenever ANY money boundary was crossed —
+        // the reconcile human must see which milestone this deposit may have paid.
+        return await finalizeReconcile(fresh, message, { nullReservation: !crossedAnyBoundary });
+    }
+    const retryStatus = !crossedQboBoundary ? "failed" : fresh.qbPaymentId ? "qbo_created" : "qbo_unknown";
+    await prisma.depositIngest.updateMany({
+        // Conditioned on an active status: a throw AFTER a terminal write (e.g. the
+        // review-task transaction hiccuping post-finalize) must never regress
+        // applied/unmatched/reconcile back into the retry loop.
+        where: { id: fresh.id, status: { in: ["processing", "qbo_unknown", "qbo_created", "failed"] } },
+        data: {
+            status: retryStatus, lastError: message.slice(0, 1000),
+            // Pre-boundary "failed" releases the milestone (NULL leaves the partial
+            // index; that retry re-matches and re-reserves from scratch). Past the
+            // NON-QBO boundary (settleStartedAt) the reservation is preserved — and
+            // "failed" is in the index predicate, so the hold stays continuously
+            // indexed and no second file can slip in before the retry resumes.
+            ...(retryStatus === "failed" && !fresh.settleStartedAt ? { paymentScheduleId: null } : {}),
+        },
+    });
+    return NextResponse.json({ ok: false, status: retryStatus, reason: message });
 }
 
 function requireDepositIngestAuth(req: Request): NextResponse | null {
@@ -412,22 +481,27 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
         });
         const amountMatches = candidates.filter(c => Math.abs(toNum(c.amount) - payload.amount) <= 0.005);
         if (amountMatches.length !== 1) {
-            return await finalizeUnmatched(row, amountMatches.length === 0
-                ? `no pending milestone on "${project.name}" matches $${payload.amount}`
-                : `${amountMatches.length} pending milestones on "${project.name}" match $${payload.amount} — ambiguous`);
+            if (amountMatches.length > 0) {
+                return await finalizeUnmatched(row, `${amountMatches.length} pending milestones on "${project.name}" match $${payload.amount} — ambiguous`);
+            }
+            // Before the generic (and alarming) zero-match message: the sweep may
+            // simply have booked this same check first, which makes the milestone
+            // Paid and therefore invisible to the Pending query above.
+            const twin = await findAppliedTwin(row, Math.round(payload.amount * 100), payload.checkDate, BANK_DEPOSIT_SOURCE);
+            const base = `no pending milestone on "${project.name}" matches $${payload.amount}`;
+            return await finalizeUnmatched(row, twin ? `${base} — ${appliedTwinNote(twin)}` : base);
         }
         const picked = amountMatches[0];
 
         // Reserve — the partial unique index (scripts/apply-deposit-ingest-schema.mjs)
-        // stops a second deposit file from claiming the same milestone concurrently.
-        try {
-            await prisma.depositIngest.update({ where: { id: row.id }, data: { paymentScheduleId: picked.id } });
-        } catch (e: any) {
-            if (e?.code === "P2002") {
-                return await finalizeUnmatched(row, "milestone already being applied by another deposit");
-            }
-            throw e;
-        }
+        // stops a second deposit file from claiming the same milestone concurrently,
+        // and the cross-source claim check inside the same transaction stops the OTHER
+        // path from reserving a DIFFERENT milestone for this same money.
+        const reserved = await reserveMilestone(row, picked.id, {
+            amountCents: Math.round(payload.amount * 100),
+            postDate: isValidCheckDate(payload.checkDate) ? payload.checkDate : null,
+        });
+        if (!reserved.ok) return await finalizeUnmatched(row, reserved.reason);
         schedule = { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code };
     }
 
@@ -476,11 +550,13 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
 
 async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
     const tokens = await getFreshQBTokens(); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
+    const opts = applyOptionsForRow(row);
 
     const built = await buildQBPaymentRequest(tokens, schedule.qbInvoiceId!, {
         amount: payload.amount,
         txnDate: payload.checkDate!,
         paymentRefNum: payload.checkNumber!,
+        ...(opts.depositToAccountId ? { depositToAccountId: opts.depositToAccountId } : {}),
     });
     if (!built.ok) {
         throw new Error(`QuickBooks guard failed (${built.reason}) for invoice ${schedule.invoiceCode}`);
@@ -496,7 +572,24 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
     const requestId = depositRequestId(payload.fileId);
     return await sendAndSettle(row.id, schedule, {
         checkDate: payload.checkDate!, checkNumber: payload.checkNumber!, requestId, requestBody: built.requestBody,
+        suppressClientReceipt: opts.suppressClientReceipt,
     }, tokens);
+}
+
+/**
+ * Money-write options derived from the row's SOURCE, not from a caller's
+ * argument, so a crash-recovery resume (which re-enters from the persisted row,
+ * not the original request) makes the same choices the first attempt did.
+ *
+ * Bank rows deposit straight to the Washington Trust account and never email
+ * the client a receipt: the sweep books money no human has looked at yet, and
+ * the back-date rule cannot suppress that (a 2-day-old payment is well inside
+ * BACKDATED_RECEIPT_CUTOFF_DAYS). The team email and activity log still fire.
+ */
+function applyOptionsForRow(row: DepositIngest): { depositToAccountId?: string; suppressClientReceipt?: boolean } {
+    return row.source === BANK_DEPOSIT_SOURCE
+        ? { depositToAccountId: BANK_DEPOSIT_TO_ACCOUNT_ID, suppressClientReceipt: true }
+        : {};
 }
 
 async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
@@ -520,6 +613,7 @@ async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
     const requestId = depositRequestId(extracted.fileId);
     return await sendAndSettle(row.id, schedule, {
         checkDate: extracted.checkDate!, checkNumber: extracted.checkNumber!, requestId, requestBody: row.qbRequestPayload!,
+        suppressClientReceipt: applyOptionsForRow(row).suppressClientReceipt,
     }, tokens);
 }
 
@@ -529,13 +623,14 @@ async function resumeFromQboCreated(row: DepositIngest): Promise<NextResponse> {
     const extracted = JSON.parse(row.extracted) as NormalizedPayload;
     return await settleAndFinalize(row.id, schedule, {
         checkDate: extracted.checkDate!, checkNumber: extracted.checkNumber!, qbPaymentId: row.qbPaymentId!,
+        suppressClientReceipt: applyOptionsForRow(row).suppressClientReceipt,
     });
 }
 
 async function sendAndSettle(
     rowId: string,
     schedule: MatchedSchedule,
-    ctx: { checkDate: string; checkNumber: string; requestId: string; requestBody: string },
+    ctx: { checkDate: string; checkNumber: string; requestId: string; requestBody: string; suppressClientReceipt?: boolean },
     tokens: QBTokens,
 ): Promise<NextResponse> {
     let paymentId: string;
@@ -559,13 +654,16 @@ async function sendAndSettle(
         data: { status: "qbo_created", qbPaymentId: paymentId, lastError: null },
     });
 
-    return await settleAndFinalize(rowId, schedule, { checkDate: ctx.checkDate, checkNumber: ctx.checkNumber, qbPaymentId: paymentId });
+    return await settleAndFinalize(rowId, schedule, {
+        checkDate: ctx.checkDate, checkNumber: ctx.checkNumber, qbPaymentId: paymentId,
+        suppressClientReceipt: ctx.suppressClientReceipt,
+    });
 }
 
 async function settleAndFinalize(
     rowId: string,
     schedule: MatchedSchedule,
-    ctx: { checkDate: string; checkNumber: string; qbPaymentId: string },
+    ctx: { checkDate: string; checkNumber: string; qbPaymentId: string; suppressClientReceipt?: boolean },
 ): Promise<NextResponse> {
     const paidAt = new Date(`${ctx.checkDate}T12:00:00Z`);
     const settled = await settleMilestoneFromQBPayment({
@@ -574,6 +672,7 @@ async function settleAndFinalize(
         qbPaymentId: ctx.qbPaymentId,
         paidAt,
         referenceNumber: ctx.checkNumber,
+        suppressClientReceipt: ctx.suppressClientReceipt,
     });
 
     if (!settled) {
@@ -590,6 +689,551 @@ async function settleAndFinalize(
 
     await prisma.depositIngest.update({ where: { id: rowId }, data: { status: "applied", lastError: null } });
     return NextResponse.json({ ok: true, status: "applied", scheduleId: schedule.id, invoiceCode: schedule.invoiceCode, qbPaymentId: ctx.qbPaymentId });
+}
+
+// ── Deposit sweep: the bank source ───────────────────────────────────────────
+
+/**
+ * The bank variant's per-credit payload. A SUPERSET of NormalizedPayload, so
+ * every shared helper below reads it verbatim — finalizeUnmatched →
+ * ensureReviewTask → createDepositReviewTask, the reserved-row resume,
+ * applyQboLinked, settleAndFinalize. The bank reference stands in as the
+ * instrument reference (there is no check number on a bank line, by
+ * construction; the reference is what Vanessa sees in the feed) and the CSV
+ * post date as the transaction date.
+ */
+interface BankPayload extends NormalizedPayload {
+    source: typeof BANK_DEPOSIT_SOURCE;
+    bankReference: string;
+    postDate: string;
+    amountCents: number;
+    transactionDetail: string | null;
+    customerReference: string | null;
+}
+
+interface BankCreditResult {
+    bankReference: string;
+    status: string;
+    replay: boolean;
+    reason?: string | null;
+    scheduleId?: string | null;
+    qbPaymentId?: string | null;
+    officeTaskId?: string | null;
+    alreadyApplied?: boolean;
+}
+
+const BANK_CANDIDATE_SELECT = {
+    id: true, name: true, status: true, amount: true, invoiceId: true, qbInvoiceId: true,
+    invoice: { select: { code: true, project: { select: { name: true } }, client: { select: { name: true } } } },
+} as const;
+
+type BankCandidate = {
+    id: string;
+    name: string;
+    status: string;
+    amount: unknown;
+    invoiceId: string;
+    qbInvoiceId: string | null;
+    invoice: { code: string; project: { name: string } | null; client: { name: string } | null };
+};
+
+const centsOf = (amount: unknown) => Math.round(toNum(amount) * 100);
+
+const describeOne = (c: BankCandidate) => ({
+    milestoneName: c.name,
+    projectName: c.invoice.project?.name ?? null,
+    invoiceCode: c.invoice.code,
+});
+
+const toMilestoneCandidate = (c: BankCandidate): MilestoneCandidate => ({
+    id: c.id,
+    projectName: c.invoice.project?.name ?? c.invoice.code,
+    customerName: c.invoice.client?.name ?? null,
+    milestoneName: c.name,
+    amountCents: centsOf(c.amount),
+    status: c.status,
+});
+
+const isoOf = (value: Date | null) => (value ? value.toISOString().slice(0, 10) : null);
+
+function bankPayloadFor(credit: BankCredit, postDate: string): BankPayload {
+    return {
+        source: BANK_DEPOSIT_SOURCE,
+        bankReference: credit.bankReference,
+        postDate,
+        amountCents: credit.amountCents,
+        transactionDetail: credit.transactionDetail,
+        customerReference: credit.customerReference,
+        fileId: bankFileId(credit.bankReference),
+        // A bank credit names no project — the sweep matches across all of them.
+        projectName: "",
+        amount: credit.amount,
+        fileUrl: null,
+        fileName: `bank ref ${credit.bankReference}`,
+        payerName: null,
+        checkDate: postDate,
+        checkNumber: credit.bankReference,
+        memo: credit.transactionDetail,
+    };
+}
+
+/**
+ * ONE POST per day, carrying the COMPLETE day's credit rows plus the CSV's own
+ * control totals (docs/BANK-DATA-SOURCES.md). The whole batch is refused (400,
+ * nothing written) when the totals don't tie — a half-seen day is exactly the
+ * state that makes an amount look unique when it is not.
+ *
+ * Then, before any money write, two preflight steps in this order:
+ *   1. REPLAY resolution. A credit whose bankReference already has a row is a
+ *      replay of that row, never a new deposit — a terminal row returns its
+ *      stored outcome, a `proposed` row is re-evaluated now (it may have aged
+ *      past the wait rule), a stale in-flight row is reclaimed. Replays are
+ *      EXCLUDED from collision classification (Codex round 2, R3): the daily
+ *      job re-posts the same day repeatedly, and treating that as a collision
+ *      would send every credit to a human forever.
+ *   2. COLLISION detection on what remains: a DIFFERENT bankReference, in this
+ *      batch or already stored, with the same postDate and amountCents. Both
+ *      go to a human — an amount is all a bank credit carries.
+ */
+async function handleBankBatch(raw: Record<string, unknown>): Promise<NextResponse> {
+    const parsed = parseBankBatch(raw);
+    if (!parsed.ok) return NextResponse.json({ ok: false, reason: parsed.reason }, { status: 400 });
+    const { postDate, credits, dryRun } = parsed.batch;
+
+    const fileIds = credits.map(c => bankFileId(c.bankReference));
+    const existing = await prisma.depositIngest.findMany({
+        where: { fileId: { in: fileIds } },
+        select: { fileId: true },
+    });
+    const replays = new Set(existing.map(r => r.fileId));
+    const fresh = credits.filter(c => !replays.has(bankFileId(c.bankReference)));
+
+    const collisions = findBatchCollisions(fresh);
+    const storedSameDay = fresh.length > 0
+        ? await prisma.depositIngest.findMany({
+            where: {
+                source: BANK_DEPOSIT_SOURCE,
+                postDate: isoDateToUtc(postDate),
+                amountCents: { in: [...new Set(fresh.map(c => c.amountCents))] },
+                fileId: { notIn: fileIds },
+            },
+            select: { bankReference: true, amountCents: true },
+        })
+        : [];
+    for (const stored of storedSameDay) {
+        if (!stored.bankReference) continue;
+        for (const credit of fresh) {
+            if (credit.amountCents !== stored.amountCents) continue;
+            const others = collisions.get(credit.bankReference) ?? [];
+            if (!others.includes(stored.bankReference)) others.push(stored.bankReference);
+            collisions.set(credit.bankReference, others);
+        }
+    }
+
+    const results: BankCreditResult[] = [];
+    for (const credit of credits) {
+        results.push(await processBankCredit(credit, postDate, {
+            dryRun,
+            replay: replays.has(bankFileId(credit.bankReference)),
+            collidesWith: collisions.get(credit.bankReference) ?? [],
+        }));
+    }
+
+    // The counts the Hermes job turns into its one Bot Health line. `replay` is
+    // orthogonal to the others (a replay still has an outcome) and is reported
+    // so "ran but did nothing new" is distinguishable from "ran but saw
+    // nothing" — the failure mode a browser-automated CSV export actually has.
+    const counts = {
+        credits: credits.length,
+        applied: results.filter(r => r.status === "applied").length,
+        needsHuman: results.filter(r => r.status === "unmatched" || r.status === "reconcile").length,
+        proposed: results.filter(r => r.status === "proposed").length,
+        replay: results.filter(r => r.replay).length,
+    };
+    return NextResponse.json({ ok: true, source: BANK_DEPOSIT_SOURCE, postDate, dryRun, counts, credits: results });
+}
+
+async function processBankCredit(
+    credit: BankCredit,
+    postDate: string,
+    opts: { dryRun: boolean; replay: boolean; collidesWith: string[] },
+): Promise<BankCreditResult> {
+    const payload = bankPayloadFor(credit, postDate);
+    const claim = await claimBankRow(payload);
+    if (claim.kind === "settled") return await bankResult(credit.bankReference, opts.replay, claim.response);
+    const row = claim.row;
+
+    if (opts.collidesWith.length > 0) {
+        return await bankResult(credit.bankReference, opts.replay, await finalizeUnmatched(row,
+            `${opts.collidesWith.length + 1} different bank credits on ${postDate} are for exactly $${credit.amount.toFixed(2)} ` +
+            `(this one is ${credit.bankReference}; the other(s) are ${opts.collidesWith.join(", ")}) — a bank line carries ` +
+            `nothing but an amount, so a human must say which milestone each one settles`));
+    }
+    if (row.attempts > MAX_ATTEMPTS) {
+        const crossedAnyBoundary = !!row.qbPaymentId || !!row.qbRequestPayload || !!row.settleStartedAt;
+        return await bankResult(credit.bankReference, opts.replay, await finalizeReconcile(
+            row,
+            `exceeded ${MAX_ATTEMPTS} retry attempts (last error: ${row.lastError ?? "none"})`,
+            { nullReservation: !crossedAnyBoundary },
+        ));
+    }
+    try {
+        const response = row.status === "qbo_created" ? await resumeFromQboCreated(row)
+            : row.status === "qbo_unknown" ? await resumeFromQboUnknown(row)
+            : await matchAndApplyBank(row, payload, opts);
+        return await bankResult(credit.bankReference, opts.replay, response);
+    } catch (e) {
+        return await bankResult(credit.bankReference, opts.replay, await recordAttemptFailure(row, e));
+    }
+}
+
+/** Flatten one credit's own response into the batch response, so a per-credit
+ *  outcome never becomes a second source of truth. */
+async function bankResult(bankReference: string, replay: boolean, response: NextResponse): Promise<BankCreditResult> {
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    return {
+        bankReference,
+        replay,
+        status: typeof body?.status === "string" ? body.status : "error",
+        reason: typeof body?.reason === "string" ? body.reason : null,
+        scheduleId: typeof body?.scheduleId === "string" ? body.scheduleId : null,
+        qbPaymentId: typeof body?.qbPaymentId === "string" ? body.qbPaymentId : null,
+        officeTaskId: typeof body?.officeTaskId === "string" ? body.officeTaskId : null,
+        ...(body?.alreadyApplied === true ? { alreadyApplied: true } : {}),
+    };
+}
+
+type BankClaim = { kind: "claimed"; row: DepositIngest } | { kind: "settled"; response: NextResponse };
+
+/**
+ * Claim ONE bank credit's row. Mirrors the photo path's claim above, minus
+ * `?force=1` (an unattended daily job must never re-run a row a human has
+ * already been asked about) and plus `proposed`, which every daily POST
+ * re-evaluates.
+ */
+async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
+    const columns = {
+        source: BANK_DEPOSIT_SOURCE,
+        bankReference: payload.bankReference,
+        postDate: isoDateToUtc(payload.postDate),
+        amountCents: payload.amountCents,
+    };
+    let row = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
+    if (!row) {
+        try {
+            return {
+                kind: "claimed",
+                row: await prisma.depositIngest.create({
+                    data: {
+                        fileId: payload.fileId, status: "processing", extracted: JSON.stringify(payload),
+                        attempts: 1, processingStartedAt: new Date(), ...columns,
+                    },
+                }),
+            };
+        } catch (e: any) {
+            if (e?.code !== "P2002") throw e;
+            // Lost the create race to a concurrent duplicate — fall through.
+            row = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
+        }
+    }
+    if (!row) return { kind: "settled", response: NextResponse.json({ ok: false, status: "claim-race" }) };
+
+    if (row.status === "applied") {
+        let invoiceCode: string | undefined;
+        if (row.paymentScheduleId) {
+            const s = await prisma.paymentSchedule.findUnique({
+                where: { id: row.paymentScheduleId },
+                select: { invoice: { select: { code: true } } },
+            });
+            invoiceCode = s?.invoice.code;
+        }
+        return {
+            kind: "settled",
+            response: NextResponse.json({
+                ok: true, status: "applied", alreadyApplied: true,
+                scheduleId: row.paymentScheduleId, qbPaymentId: row.qbPaymentId, invoiceCode,
+            }),
+        };
+    }
+    if (row.status === "unmatched" || row.status === "reconcile") {
+        const kind = row.status === "reconcile" ? "reconcile" : "unmatched";
+        const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? kind, kind);
+        return { kind: "settled", response: NextResponse.json({ ok: true, status: row.status, reason: row.lastError, officeTaskId }) };
+    }
+
+    const reclaimable = ["proposed", "processing", "qbo_unknown", "qbo_created", "failed"];
+    if (!reclaimable.includes(row.status)) {
+        return { kind: "settled", response: NextResponse.json({ ok: true, status: row.status, reason: row.lastError }) };
+    }
+    // `failed` has no lease, and `proposed` is deliberately re-evaluated by
+    // every daily POST — both reclaim immediately. The in-flight states only
+    // reclaim once their 5-minute lease is stale.
+    const needsLease = row.status !== "failed" && row.status !== "proposed";
+    const retriable = row.status === "processing" || row.status === "failed" || row.status === "proposed";
+    const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt);
+    const claim = await prisma.depositIngest.updateMany({
+        where: {
+            id: row.id, status: row.status,
+            ...(needsLease ? { processingStartedAt: { lt: new Date(Date.now() - STALE_PROCESSING_MS) } } : {}),
+        },
+        data: {
+            status: retriable ? "processing" : row.status,
+            attempts: { increment: 1 }, processingStartedAt: new Date(),
+            ...(retriable && !boundaryMarked ? { extracted: JSON.stringify(payload), paymentScheduleId: null, ...columns } : {}),
+        },
+    });
+    if (claim.count === 0) {
+        const current = await prisma.depositIngest.findUnique({ where: { id: row.id }, select: { status: true } });
+        return {
+            kind: "settled",
+            response: NextResponse.json({ ok: true, status: current?.status ?? row.status, reason: "in progress — retry shortly" }),
+        };
+    }
+    return { kind: "claimed", row: (await prisma.depositIngest.findUnique({ where: { id: row.id } }))! };
+}
+
+/**
+ * Match ONE bank credit. Two photo-path rules do not apply here, because a
+ * bank line has neither a project name nor a check number: project-first
+ * matching is skipped (the candidate query runs across ALL projects), and a
+ * missing check number is not `unmatched`. Everything else is stricter:
+ *
+ *  - candidates must be REQUESTED (PaymentSchedule.qbInvoiceSentAt, the
+ *    rail-neutral request marker billing-core.ts stamps only once the client
+ *    email actually went out). A qbInvoiceId-only milestone was created in
+ *    QuickBooks but never asked for, so it is not a candidate — that is what
+ *    resolves the Hoppe case, where three Pending milestones sat at exactly
+ *    $13,447.68 and only one had been requested;
+ *  - uniqueness is taken over a UNION with anything at this amount settled in
+ *    the last 14 days by ANY source, so money the photo path just booked still
+ *    counts against uniqueness even though its milestone is now Paid;
+ *  - auto-apply additionally requires qbInvoiceId (the QBO write path needs
+ *    the linked invoice);
+ *  - the credit must be at least 2 days old (younger credits are held
+ *    `proposed`), and the reservation carries a cross-source claim check.
+ */
+async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts: { dryRun: boolean }): Promise<NextResponse> {
+    if (row.paymentScheduleId) {
+        // A prior crashed attempt already reserved a milestone: resume THAT
+        // reservation with the PRESERVED payload rather than re-matching, same
+        // as the photo path's reserved branch.
+        let preserved: BankPayload;
+        try {
+            preserved = JSON.parse(row.extracted) as BankPayload;
+        } catch {
+            return await finalizeReconcile(row, "reserved row has unreadable extracted payload", {});
+        }
+        const reserved = await loadMatchedSchedule(row.paymentScheduleId);
+        if (!reserved) return await finalizeReconcile(row, "reserved milestone no longer exists", {});
+        if (!reserved.qbInvoiceId) {
+            return await finalizeReconcile(row, "reserved milestone lost its QuickBooks invoice link mid-flight", {});
+        }
+        return await applyQboLinked(row, reserved, preserved);
+    }
+
+    const amountLabel = `$${payload.amount.toFixed(2)}`;
+    const requested: BankCandidate[] = await prisma.paymentSchedule.findMany({
+        where: {
+            status: "Pending",
+            qbInvoiceSentAt: { not: null },
+            invoice: { status: { in: OPEN_INVOICE_STATUSES } },
+        },
+        select: BANK_CANDIDATE_SELECT,
+    });
+    const pending = requested.filter(c => centsOf(c.amount) === payload.amountCents);
+
+    const paid: BankCandidate[] = await prisma.paymentSchedule.findMany({
+        where: {
+            status: "Paid",
+            paymentDate: { gte: isoDateToUtc(isoDaysBefore(payload.postDate, PAID_UNION_WINDOW_DAYS)) },
+        },
+        select: BANK_CANDIDATE_SELECT,
+    });
+    const union = [
+        ...pending,
+        ...paid.filter(p => centsOf(p.amount) === payload.amountCents && !pending.some(x => x.id === p.id)),
+    ];
+
+    if (union.length !== 1 || union[0].status !== "Pending") {
+        return await finalizeUnmatched(row, await bankNoMatchReason(row, payload, union, amountLabel));
+    }
+    const picked = union[0];
+
+    // Payer corroboration, when there is any. Images are selected by IDENTITY
+    // (the bank reference, prefix-matched because the key carries a :front /
+    // :back side suffix — scripts/post-bank-images.mjs), never by a date/amount
+    // window. Zero payer-bearing images is the NORMAL case for a branch deposit
+    // (docs/WTB-CHECK-IMAGES.md) and is not an error; two or more is a conflict.
+    const images = await prisma.bankImage.findMany({
+        where: {
+            source: BANK_IMAGE_SOURCE,
+            sourceExternalId: { startsWith: bankImageKeyPrefix(payload.bankReference) },
+        },
+        select: { payerName: true, memoText: true, normalizedCheckNumber: true, amountCents: true, documentDate: true },
+    });
+    const evidence = selectPayerBearingImage(images);
+    if (evidence.kind === "conflict") {
+        return await finalizeUnmatched(row,
+            `${evidence.count} check images filed under bank reference ${payload.bankReference} name a payer — ` +
+            `one deposit cannot have two payers, so a human must say what this is`);
+    }
+    const attribution = attributeDeposit(
+        {
+            id: payload.bankReference,
+            postedDate: payload.postDate,
+            amountCents: payload.amountCents,
+            rawDescriptor: payload.transactionDetail ?? "",
+        },
+        {
+            checkImage: evidence.kind === "one" ? {
+                payerName: evidence.image.payerName,
+                memo: evidence.image.memoText,
+                checkNumber: evidence.image.normalizedCheckNumber,
+                amountCents: evidence.image.amountCents,
+                documentDate: isoOf(evidence.image.documentDate),
+            } : null,
+            milestones: union.map(toMilestoneCandidate),
+        },
+    );
+    // namesAgree already encodes the wrong-family guards; any conflict it finds
+    // (image vs milestone customer, or an image that isn't for this deposit) is
+    // a human's call, reported with its own reason verbatim.
+    if (attribution.confidence === "conflict") return await finalizeUnmatched(row, attribution.reason);
+
+    if (!picked.qbInvoiceId) {
+        return await finalizeUnmatched(row,
+            `${amountLabel} uniquely matches ${describeCandidates([describeOne(picked)])}, but that milestone has no ` +
+            `QuickBooks invoice link — the sweep only books QBO-linked milestones, so record this one by hand`);
+    }
+    if (opts.dryRun) {
+        return await finalizeProposed(row, picked.id, `dry run — would apply to ${describeCandidates([describeOne(picked)])}`);
+    }
+    if (!bankCreditIsOldEnough(payload.postDate, new Date())) {
+        return await finalizeProposed(row, picked.id,
+            `waiting ${BANK_APPLY_MIN_AGE_DAYS} days from ${payload.postDate} before booking (a fresh check belongs to the ` +
+            `photo path first) — would apply to ${describeCandidates([describeOne(picked)])}`);
+    }
+
+    const reserved = await reserveMilestone(row, picked.id, { amountCents: payload.amountCents, postDate: payload.postDate });
+    if (!reserved.ok) return await finalizeUnmatched(row, reserved.reason);
+
+    return await applyQboLinked(
+        row,
+        { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code },
+        payload,
+    );
+}
+
+async function bankNoMatchReason(
+    row: DepositIngest,
+    payload: BankPayload,
+    union: BankCandidate[],
+    amountLabel: string,
+): Promise<string> {
+    if (union.length > 1) {
+        return `${amountLabel} matches ${union.length} milestones: ${describeCandidates(union.map(describeOne))} — ` +
+            `a bank line carries nothing but an amount, so a human must say which one this deposit settles`;
+    }
+    // Before the generic zero-match message: the photo path may already have
+    // applied this same check, which makes the milestone Paid and therefore
+    // invisible to the Pending query — the common SEQUENTIAL case.
+    const base = union.length === 0
+        ? `no requested pending milestone matches ${amountLabel} (a milestone only becomes a candidate once its invoice has actually been sent)`
+        : `the only milestone at ${amountLabel} — ${describeCandidates(union.map(describeOne))} — is already ${union[0].status}`;
+    const twin = await findAppliedTwin(row, payload.amountCents, payload.postDate, null);
+    return twin ? `${base} — ${appliedTwinNote(twin)}` : base;
+}
+
+/** `proposed`: the match resolved, nothing was written. Terminal for today;
+ *  the next daily POST re-evaluates it. The would-apply milestone is recorded
+ *  so the shadow week can be compared against QuickBooks by hand — and so the
+ *  cross-source claim check can see the intent. */
+async function finalizeProposed(row: DepositIngest, scheduleId: string, note: string): Promise<NextResponse> {
+    await prisma.depositIngest.update({
+        where: { id: row.id },
+        data: { status: "proposed", paymentScheduleId: scheduleId, lastError: note.slice(0, 1000) },
+    });
+    return NextResponse.json({ ok: true, status: "proposed", scheduleId, reason: note });
+}
+
+class CrossSourceClaimError extends Error {}
+
+/**
+ * Reserve a milestone for this deposit, with the CROSS-SOURCE CLAIM CHECK in
+ * the same transaction (Codex round 2, R1). The partial unique index only
+ * arbitrates two rows reaching for the SAME milestone; it says nothing about
+ * two sources reaching for two DIFFERENT milestones with the same money, which
+ * is the shape the photo and bank paths can collide in (photo candidates need
+ * no qbInvoiceSentAt, so a photo can reserve an unrequested milestone while the
+ * sweep reserves the requested one). Whoever writes first wins; the other
+ * stands down and files for a human.
+ *
+ * Used by BOTH paths, which is why photo rows now persist amountCents/postDate:
+ * the query has to work in both directions.
+ */
+async function reserveMilestone(
+    row: DepositIngest,
+    scheduleId: string,
+    claim: { amountCents: number | null; postDate: string | null },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+        await prisma.$transaction(async (tx) => {
+            if (claim.amountCents != null && claim.postDate) {
+                const other = await tx.depositIngest.findFirst({
+                    where: {
+                        id: { not: row.id },
+                        amountCents: claim.amountCents,
+                        postDate: {
+                            gte: isoDateToUtc(isoDaysBefore(claim.postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
+                            lte: isoDateToUtc(isoDaysAfter(claim.postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
+                        },
+                        status: { in: [...CLAIMING_STATUSES] },
+                    },
+                    select: { fileId: true, source: true, bankReference: true, status: true, paymentScheduleId: true, postDate: true },
+                });
+                if (other) throw new CrossSourceClaimError(crossSourceClaimNote({ ...other, postDate: isoOf(other.postDate) }));
+            }
+            await tx.depositIngest.update({ where: { id: row.id }, data: { paymentScheduleId: scheduleId } });
+        });
+        return { ok: true };
+    } catch (e: any) {
+        if (e instanceof CrossSourceClaimError) return { ok: false, reason: e.message };
+        if (e?.code === "P2002") {
+            const winner = await prisma.depositIngest.findFirst({
+                where: { id: { not: row.id }, paymentScheduleId: scheduleId },
+                orderBy: { updatedAt: "desc" },
+                select: { fileId: true, source: true, bankReference: true, status: true, paymentScheduleId: true, postDate: true },
+            });
+            return { ok: false, reason: reservationLostNote(winner ? { ...winner, postDate: isoOf(winner.postDate) } : null) };
+        }
+        throw e;
+    }
+}
+
+/** The applied row from the OTHER source that most likely IS this same money
+ *  (`wantSource` null = the photo path, "bank" = the sweep). */
+async function findAppliedTwin(
+    row: DepositIngest,
+    amountCents: number | null,
+    postDate: string | null,
+    wantSource: string | null,
+): Promise<{ source: string | null; fileId: string; bankReference: string | null; postDate: string | null } | null> {
+    if (amountCents == null || !postDate) return null;
+    const twin = await prisma.depositIngest.findFirst({
+        where: {
+            id: { not: row.id },
+            status: "applied",
+            source: wantSource,
+            amountCents,
+            postDate: {
+                gte: isoDateToUtc(isoDaysBefore(postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
+                lte: isoDateToUtc(isoDaysAfter(postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
+            },
+        },
+        orderBy: { updatedAt: "desc" },
+        select: { source: true, fileId: true, bankReference: true, postDate: true },
+    });
+    return twin ? { ...twin, postDate: isoOf(twin.postDate) } : null;
 }
 
 // ── Terminal-state helpers ───────────────────────────────────────────────────

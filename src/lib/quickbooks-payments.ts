@@ -465,8 +465,11 @@ export async function settleMilestoneFromQBPayment(input: {
     qbPaymentId: string | null;
     paidAt: Date;
     referenceNumber: string | null;
+    /** Deposit sweep only: skip the CLIENT receipt for this settlement (team
+     *  email + activity log still fire). See payment-outbox.enqueueMilestonePaid. */
+    suppressClientReceipt?: boolean;
 }): Promise<boolean> {
-    const { paymentScheduleId, invoiceId, ...payment } = input;
+    const { paymentScheduleId, invoiceId, suppressClientReceipt, ...payment } = input;
     return withTxRetry(() => prisma.$transaction(async (t) => {
         // Canonical lock order: Estimate → Invoice → schedules. This settle mirrors onto the
         // estimate copy, so read the estimate link (non-locking) and lock Estimate before Invoice,
@@ -478,7 +481,7 @@ export async function settleMilestoneFromQBPayment(input: {
         if (!claimed) return false;
 
         // Durable notification, enqueued in-tx (delivered by the drainer after commit).
-        await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice" });
+        await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice", suppressClientReceipt });
         return true;
     }));
 }
