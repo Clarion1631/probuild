@@ -372,8 +372,8 @@ export async function updateScheduleTaskInTransaction(
         const startDate = data.startDate === undefined ? persisted.startDate : parseStartDateInput(data.startDate);
         const requestedEndDate = data.endDate === undefined ? persisted.endDate : parseStartDateInput(data.endDate);
         const endDate = persisted.type === "milestone" ? startDate : requestedEndDate;
-        if (persisted.type !== "milestone" && endDate <= startDate) {
-            throw new Error("Task end date must be after its start date");
+        if (persisted.type !== "milestone" && endDate < startDate) {
+            throw new Error("Task end date cannot be before its start date");
         }
         updateData.startDate = startDate;
         updateData.endDate = endDate;
