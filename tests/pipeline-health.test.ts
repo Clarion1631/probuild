@@ -824,13 +824,58 @@ test("round 38: probes never exceed the concurrency cap, and none is failed for 
     assert.deepEqual(results.map((r) => r.value), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
 });
 
-test("round 38: a probe that times out still frees its slot", async () => {
-    // The release is in `finally`. Without it one wedged probe would
-    // permanently shrink the gate, and four of them would close it for good.
+test("round 43: a timed-out probe KEEPS its slot until the query settles", async () => {
+    // The release used to sit in a `finally` on the race, so it fired the moment
+    // the JS timeout won — while the Prisma operation was still running and
+    // still holding a pool connection. A queued probe then started against a
+    // pool that was already full: the cap was counting callers, not work.
     const limiter = createLimiter(1);
-    const wedged = await runProbe("wedged", () => new Promise<number>(() => {}), -1, 20,
-        { withDb: passThrough, limiter });
-    assert.equal(wedged.reason, "timeout");
-    const after = await runProbe("after", async () => 1, -1, 500, { withDb: passThrough, limiter });
+    let finishFirst: (v: unknown) => void = () => {};
+    const held: ProbeRunner = <T,>() =>
+        new Promise<T>((resolve) => { finishFirst = resolve as (v: unknown) => void; });
+
+    const wedged = await runProbe("wedged", async () => 1, -1, 20, { withDb: held, limiter });
+    assert.equal(wedged.reason, "timeout", "the caller is answered immediately");
+
+    // The slot is STILL held, so the next probe cannot start — that is the whole
+    // point. It gives up rather than queueing forever.
+    const blocked = await runProbe("blocked", async () => 2, -1, 500,
+        { withDb: passThrough, limiter, acquireTimeoutMs: 30 });
+    assert.equal(blocked.reason, "skipped", "reported as skipped, not silently piled on");
+    assert.equal(blocked.status, "error", "and it still forces ok:false");
+
+    // Once the database actually lets go, the gate reopens.
+    finishFirst(1);
+    await new Promise((r) => setTimeout(r, 10));
+    const after = await runProbe("after", async () => 1, -1, 500,
+        { withDb: passThrough, limiter, acquireTimeoutMs: 200 });
     assert.deepEqual(after, { status: "ok", value: 1 }, "the gate reopened");
+});
+
+test("round 43: concurrency never exceeds the cap, even when callers have timed out", async () => {
+    // The control for the above: with the release on the race, all nine of these
+    // would be in flight against a five-slot gate at once.
+    const limiter = createLimiter(PROBE_CONCURRENCY);
+    let inFlight = 0;
+    let peak = 0;
+    const finishers: Array<() => void> = [];
+    const held: ProbeRunner = <T,>() => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        return new Promise<T>((resolve) => {
+            finishers.push(() => { inFlight--; resolve(undefined as T); });
+        });
+    };
+
+    // Nine probes, each timing out well before its query settles.
+    const results = await Promise.all(
+        Array.from({ length: 9 }, (_, i) =>
+            runProbe(`p${i}`, async () => i, -1, 15, { withDb: held, limiter, acquireTimeoutMs: 40 })),
+    );
+    assert.ok(peak <= PROBE_CONCURRENCY, `at most ${PROBE_CONCURRENCY} queries at once, saw ${peak}`);
+    assert.ok(
+        results.some((r) => r.reason === "skipped"),
+        "the ones behind are reported as skipped rather than started anyway",
+    );
+    for (const f of finishers) f();
 });

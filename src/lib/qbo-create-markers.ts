@@ -69,21 +69,26 @@ export const PENDING_CREATE_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKE
  * the delete is confirmed, and this marker is what records the intent in the
  * meantime.
  *
- * SETTLEMENT CANCELS THE INTENT. A payment arriving for a milestone whose
- * QuickBooks invoice is queued for deletion is a contradiction, and money wins:
- * both settle paths (recordPaymentCore for a manual payment,
- * settleMilestonePaidInTx for a QuickBooks one) clear this marker in the SAME
- * transaction as the settle. Refusing the settle instead would have blocked
- * recording real money over a cleanup task, and QuickBooks will not delete an
- * invoice with a payment attached anyway — the intent was already doomed.
+ * SETTLEMENT DOES NOT CANCEL THE INTENT — it RECORDS ITSELF ALONGSIDE IT.
  *
- * Without that rule the two formed a state nothing could leave: the sweep still
- * selected the row, but the final unlink requires `status != Paid`, so a
- * confirmed remote deletion left a permanent link to a document that no longer
- * exists, and a live one was retried forever. `sweepPendingDeletions` also
- * handles a Paid row it still finds (a legacy row, or a settle that raced): it
- * probes rather than deletes, clears the intent if the invoice is there, and
- * parks with a specific reason if it is gone.
+ * The first cut had the settle paths clear this marker, on the reasoning that
+ * money beats cleanup. That opened a worse hole than it closed. Break-QB-Link
+ * writes the marker, performs the IRREVERSIBLE remote delete, and only then
+ * unlinks; a settle landing in that window cleared the marker and set Paid, so
+ * the post-delete unlink CAS lost on BOTH counts and the row was left Paid,
+ * still linked to an invoice that no longer exists, carrying no marker at all —
+ * invisible to the sweep that exists to find exactly that.
+ *
+ * So a settle leaves the intent in place and promotes it to
+ * PENDING_DELETION_SETTLED_MARKER in the same transaction. The row stays
+ * selectable by `sweepPendingDeletions`, whose Paid branch probes rather than
+ * deletes and reaches a terminal state either way. Break-QB-Link, when its
+ * post-delete unlink loses, writes PAID_PENDING_DELETION_FLAG itself rather
+ * than walking away, so the outcome does not depend on the sweep getting there.
+ *
+ * Neither marker ever blocks the settle: both are written by a SEPARATE
+ * statement inside the settle transaction, never as a clause on the settle
+ * claim, so recording real money is never conditional on a cleanup flag.
  *
  * Deliberately NOT one of PENDING_CREATE_MARKERS. Those mean "an invoice may
  * exist even though qbInvoiceId is null"; this row still HAS its qbInvoiceId,
@@ -92,6 +97,17 @@ export const PENDING_CREATE_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKE
  * invoice somebody is trying to remove.
  */
 export const PENDING_DELETION_MARKER = "pending-deletion";
+
+/**
+ * The row was SETTLED while a deletion was pending.
+ *
+ * Still a deletion intent (`isPendingDeletion` matches it, and the sweep
+ * selects it), but one that can no longer be finished the ordinary way: the
+ * unlink refuses a Paid row, and a paid QuickBooks invoice must never be
+ * deleted. It exists so the sweep can tell 'nobody has settled this' from
+ * 'somebody did, mid-delete', and so the row is never left unmarked.
+ */
+export const PENDING_DELETION_SETTLED_MARKER = "pending-deletion:settled";
 
 /** Is this row waiting for a QuickBooks delete to be confirmed? */
 export function isPendingDeletion(qbSyncError: string | null | undefined): boolean {

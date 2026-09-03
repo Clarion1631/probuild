@@ -836,3 +836,46 @@ test("round 42: an edit before the claim is SENT, not just fingerprinted", async
     assert.equal(state.sentTotals[0], 500);
     assert.equal(row.qbEstimateId, "qb-est-1", "and the link is recorded");
 });
+
+// ─── Round 43 gate, finding 2: an unreadable marker is answered ───
+
+test("round 43: an unrecognised marker gets an explicit 409, not a silent CAS miss", async () => {
+    // It used to fall through to the FRESH-CLAIM branch, whose CAS requires
+    // `qbSyncMarker: null` — so it could never match, and the caller got the
+    // generic "another sync claimed it first" with nothing to act on, forever.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    row.qbSyncMarker = "legacy-value-nobody-writes-any-more";
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 409);
+    assert.equal(body.reason, "sync-marker-unrecognised");
+    assert.equal(body.retry, false, "retrying cannot help — only an admin can clear it");
+    assert.equal(body.markerLength, row.qbSyncMarker.length);
+    // The value itself is an opaque string of unknown provenance on a money-path
+    // record: enough to recognise it in the database, never the whole thing.
+    assert.ok(!String(body.error).includes(row.qbSyncMarker), "the full value is not echoed");
+    assert.equal(state.posts.length, 0, "and nothing was sent to QuickBooks");
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 43: the invoice rail refuses one too", async () => {
+    state.user = ADMIN;
+    const row = seedInvoice();
+    row.qbSyncMarker = "??";
+    const res = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).reason, "sync-marker-unrecognised");
+    assert.equal(state.posts.length, 0);
+});
+
+test("round 43: a CLEAN row still syncs (the control)", async () => {
+    // Without this, a guard that refused everything would satisfy both tests
+    // above and break the product.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+});

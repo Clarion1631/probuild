@@ -2,7 +2,7 @@ import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum } from "./prisma-helpers";
-import { PENDING_DELETION_MARKER } from "./qbo-create-markers";
+import { PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER } from "./qbo-create-markers";
 
 /**
  * Manual (non-QuickBooks) milestone settlement core — the transaction body of
@@ -73,19 +73,19 @@ export async function recordPaymentCore(
         });
         if (claim.count === 0) return { success: false as const, error: "Milestone already paid" };
 
-        // Money beats cleanup. A milestone whose QuickBooks invoice was queued
-        // for deletion has just been PAID, so the deletion intent is cancelled
-        // here, in the same transaction as the settle. Left standing it formed a
-        // state nothing could leave: the sweep kept selecting the row, but the
-        // final unlink requires `status != Paid`, so a confirmed remote deletion
-        // left a permanent link to a document that no longer exists.
+        // A milestone whose QuickBooks invoice is queued for deletion has just
+        // been PAID. The intent is RECORDED, not cleared: Break-QB-Link writes the
+        // marker, performs the irreversible remote delete, and only then unlinks,
+        // so clearing it here left the post-delete CAS losing on both counts and
+        // the row Paid, still linked to a deleted invoice, carrying no marker at
+        // all — invisible to the sweep that exists to find exactly that.
         //
         // A separate write rather than a clause on the claim above: a settle must
         // never be made conditional on a marker (see the INVARIANT on
         // settleMilestonePaidInTx), and this is idempotent either way.
         await t.paymentSchedule.updateMany({
             where: { id: paymentId, qbSyncError: PENDING_DELETION_MARKER },
-            data: { qbSyncError: null },
+            data: { qbSyncError: PENDING_DELETION_SETTLED_MARKER },
         });
 
         // Recalculate from scratch (matches Stripe webhook) to avoid drift.

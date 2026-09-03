@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, sweepPendingDeletions, automationSettingCursorStore } from "@/lib/quickbooks-payments";
-import { decideUnderIdentity, documentSyncMarkerWhere, sweepPendingDocumentSyncs } from "@/lib/qbo-document-sync";
+import { decideUnderIdentity, sweepPendingDocumentSyncs } from "@/lib/qbo-document-sync";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -333,11 +333,16 @@ export async function POST(req: Request) {
         // still makes the run ok:false via `docSyncsFailed`), never allowed to
         // throw away the results of the repairs that succeeded.
         try {
-            // Recognised markers only, IN THE QUERY. Selecting every non-null
-            // value and filtering afterwards meant a page of legacy or corrupt
-            // ones came back empty, which the pager read as exhaustion — and
-            // every valid row behind it went unvisited.
-            const markerWhere = { OR: documentSyncMarkerWhere() };
+            // EVERY non-null marker, not just the recognised ones.
+            //
+            // Filtering to recognised prefixes in the query fixed one starvation
+            // bug and created a blind spot: an unreadable value was then invisible
+            // to both the page AND the count, so `unrecognised` could never be
+            // anything but zero and a run carrying corrupt markers reported
+            // ok:true. The sweep already steps its cursor over a row it cannot
+            // read (and counts it), so selecting everything is safe — and it is
+            // the only way the count can tell the truth.
+            const markerWhere = { qbSyncMarker: { not: null } } as const;
             docSyncs = await sweepPendingDocumentSyncs(tokens, deadline, {
                 isExhausted: isBudgetExhausted,
                 // ONE page of ONE rail, after that rail cursor. The sweep owns the
@@ -362,10 +367,10 @@ export async function POST(req: Request) {
                             select: { id: true, qbSyncMarker: true, clientId: true },
                             orderBy: { id: "asc" }, take,
                         });
-                    // No in-memory filter: the WHERE above already restricts this
-                    // to markers the vocabulary knows, and the sweep steps over
-                    // (and counts) anything that still slips through, so a page is
-                    // only ever empty when the rail really is.
+                    // No in-memory filter: the sweep steps its cursor over a row it
+                    // cannot read and counts it as `unrecognised`, so a page is only
+                    // ever empty when the rail really is, and nothing is hidden from
+                    // the tally by being dropped here.
                     return rows.map((r) => ({
                         id: r.id,
                         marker: r.qbSyncMarker as string,
@@ -421,6 +426,12 @@ export async function POST(req: Request) {
     }
     const docSyncsParked = docSyncs?.stillParked ?? 0;
     const docSyncsUnvisited = docSyncs?.unvisited ?? 0;
+    // Never auto-cleared: a value nobody in this codebase writes is sitting on a
+    // money-path record, and only a human can decide what it meant. It makes the
+    // run ok:false until an admin clears it (breakQBInvoiceLink for the
+    // milestone rail; for a document row, an admin edit gated by
+    // canAccessProject) so it cannot sit unnoticed.
+    const docSyncsUnrecognised = docSyncs?.unrecognised ?? 0;
 
     // Work left undone, by any route: the options loop stopped early, the
     // pay-link sweep hit its per-rail cap, rows were skipped inside it, or it
@@ -428,6 +439,7 @@ export async function POST(req: Request) {
     const truncated = abortedReason !== null || !!payLinks?.truncated
         || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0 || deletionsPending > 0
         || docSyncsParked > 0 || docSyncsUnvisited > 0 || docSyncsFailed !== null
+        || docSyncsUnrecognised > 0
         || (deletions?.unvisited ?? 0) > 0;
 
     // `ok` reflects the RUN, not the fact that the handler returned. A run that
@@ -453,6 +465,7 @@ export async function POST(req: Request) {
         // {ok:false, truncated:true, retry:true} with nothing at all to act on.
         ?? (docSyncsFailed ? "document-sync-failed" : null)
         ?? (deletionsPending > 0 ? "pending-deletions-outstanding" : null)
+        ?? (docSyncsUnrecognised > 0 ? "sync-marker-unrecognised" : null)
         ?? (docSyncsParked > 0 ? "document-sync-parked" : null);
 
     return NextResponse.json({

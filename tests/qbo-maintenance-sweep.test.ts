@@ -1113,13 +1113,16 @@ test("round 41: a page of unrecognised markers is stepped over, not read as exha
     assert.equal(res.checked, 1, "only the readable row cost a QuickBooks call");
 });
 
-test("round 41: the maintenance query filters recognised markers itself", async () => {
-    // Stepping over junk in the loop is the belt; filtering in the QUERY is the
-    // braces — without it a page of a thousand corrupt rows would spend the whole
-    // run stepping over them.
+test("round 43: maintenance selects EVERY non-null marker, so corrupt ones are counted", async () => {
+    // Filtering to recognised prefixes in the query fixed one starvation bug and
+    // created a blind spot: an unreadable value was then invisible to both the
+    // page AND the count, so `unrecognised` could never be anything but zero and
+    // a run carrying corrupt markers reported ok:true. The sweep steps its cursor
+    // over a row it cannot read and counts it, so selecting everything is safe.
     const { documentSyncMarkerWhere } = await import("../src/lib/qbo-document-sync");
-    const where = documentSyncMarkerWhere();
-    assert.deepEqual(where, [
+    // Still exported and still correct — the sync route uses it to recognise a
+    // marker; it is the maintenance QUERY that must not filter on it.
+    assert.deepEqual(documentSyncMarkerWhere(), [
         { qbSyncMarker: "create-in-flight" },
         { qbSyncMarker: { startsWith: "create-in-flight:" } },
         { qbSyncMarker: "ambiguous-create" },
@@ -1128,10 +1131,13 @@ test("round 41: the maintenance query filters recognised markers itself", async 
 
     const src = await import("node:fs").then((fs) =>
         fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
-    assert.match(src, /const markerWhere = \{ OR: documentSyncMarkerWhere\(\) \}/,
-        "the page query, and the parked COUNT, must use the same predicate");
-    assert.doesNotMatch(src, /qbSyncMarker: \{ not: null \}/,
-        "selecting every non-null marker is the bug this closes");
+    assert.match(src, /const markerWhere = \{ qbSyncMarker: \{ not: null \} \}/,
+        "the page query, and the parked COUNT, must see every marker");
+    assert.doesNotMatch(src, /OR: documentSyncMarkerWhere\(\)/,
+        "filtering recognised prefixes in the query is the blind spot this closes");
+    // ...and an unreadable marker is outstanding work, not a clean pass.
+    assert.match(src, /docSyncsUnrecognised > 0/);
+    assert.match(src, /"sync-marker-unrecognised"/);
 });
 
 // ─── Round 42 gate ───
@@ -1251,7 +1257,12 @@ test("round 42: a Paid pending-deletion row reaches a terminal state, both ways"
         const deleted: string[] = [];
         const db = {
             paymentSchedule: {
-                async findMany() { return [{ id: "ps-1", qbInvoiceId: "qb-1", status: "Paid" }]; },
+                async findMany() {
+                    // Carrying the SETTLED intent: a settle promotes the marker
+                    // rather than clearing it, so this is the shape the sweep
+                    // actually meets after a payment landed mid-delete.
+                    return [{ id: "ps-1", qbInvoiceId: "qb-1", status: "Paid", qbSyncError: "pending-deletion:settled" }];
+                },
                 async count() { return 1; },
                 async updateMany(args: any) { writes.push(args); return { count: 1 }; },
             },
@@ -1266,8 +1277,8 @@ test("round 42: a Paid pending-deletion row reaches a terminal state, both ways"
         assert.deepEqual(deleted, [], `${label}: a Paid invoice must never be deleted`);
         assert.equal(writes.length, 1, label);
         assert.equal(writes[0].data.qbSyncError, expectFlag, label);
-        assert.equal(writes[0].where.qbSyncError, "pending-deletion",
-            "the release is CAS-pinned to the intent it is clearing");
+        assert.equal(writes[0].where.qbSyncError, "pending-deletion:settled",
+            "the release is CAS-pinned to the intent state it OBSERVED, not a constant");
     }
 });
 
@@ -1308,4 +1319,92 @@ test("round 42: the maintenance response explains both new sweeps", async () => 
     ]) {
         assert.ok(src.includes(reason), `the reason chain must include ${reason}`);
     }
+});
+
+// ─── Round 43 gate ───
+
+/**
+ * Break-QB-Link writes the deletion marker, performs the IRREVERSIBLE remote
+ * delete, and only then unlinks. Round 42 had settlement CLEAR the marker; a
+ * settle landing in that window therefore cleared it and set Paid, so the
+ * post-delete unlink CAS lost on both counts and the row was left Paid, still
+ * linked to an invoice that no longer exists, carrying no marker at all —
+ * invisible to the sweep that exists to find exactly that.
+ */
+test("round 43: settlement PROMOTES the deletion intent, it never clears it", async () => {
+    const fs = await import("node:fs");
+    for (const [file, fn] of [
+        ["src/lib/payment-record-core.ts", "recordPaymentCore"],
+        ["src/lib/quickbooks-payments.ts", "settleMilestonePaidInTx"],
+    ] as const) {
+        const src = fs.readFileSync(file, "utf8");
+        const at = src.indexOf(fn);
+        assert.ok(at > -1, `${fn} not found`);
+        const body = src.slice(at, at + 8000);
+        const claim = body.indexOf("claim.count === 0");
+        const promote = body.indexOf("qbSyncError: PENDING_DELETION_SETTLED_MARKER");
+        assert.ok(promote > -1, `${fn} must RECORD the intent, not clear it`);
+        assert.ok(claim > -1 && promote > claim,
+            `${fn}: the promotion must follow the settle claim, never gate it`);
+        // The old rule, gone: clearing it is what made the row invisible.
+        const pinned = body.indexOf("where: { id: paymentId, qbSyncError: PENDING_DELETION_MARKER }");
+        const pinned2 = body.indexOf("where: { id: paymentScheduleId, qbSyncError: PENDING_DELETION_MARKER }");
+        const where = pinned > -1 ? pinned : pinned2;
+        assert.ok(where > -1, `${fn}: the promotion must be CAS-pinned to the pending intent`);
+    }
+});
+
+test("round 43: a lost post-delete unlink flags the row itself", async () => {
+    // The delete is irreversible, so losing that CAS cannot end in a shrug. This
+    // path flags the row rather than hoping the sweep gets there.
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/actions.ts", "utf8"));
+    const at = src.indexOf("export async function breakQBInvoiceLink");
+    const fn = src.slice(at, src.indexOf("\nexport ", at + 10));
+
+    const unlink = fn.indexOf("clearedAfterDelete");
+    assert.ok(unlink > -1, "the post-delete unlink moved");
+    // Searched from AFTER the unlink: the function destructures the flag from
+    // its import at the top, which is not the write this is asserting.
+    const flag = fn.indexOf("data: { qbSyncError: PAID_PENDING_DELETION_FLAG }", unlink);
+    assert.ok(flag > -1, "the lost-CAS branch must flag the row for reconciliation");
+    // Re-read, then CAS on what the row says NOW: what it carries at that point
+    // is precisely what this path does not know.
+    assert.match(fn, /qbSyncError: now\.qbSyncError/,
+        "the flag write must be CAS-pinned to the re-read value");
+    assert.match(fn, /now\?\.qbInvoiceId === schedule\.qbInvoiceId/,
+        "and only while the row still points at the invoice we deleted");
+});
+
+test("round 43: the sweep still finds a row settled mid-delete", async () => {
+    // The promotion is only useful if the sweep selects the promoted state too.
+    const src = await import("node:fs").then((fs) =>
+        fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    assert.match(src,
+        /qbSyncError: \{ in: \[PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER\] \}/,
+        "sweepPendingDeletions must select BOTH intent states");
+});
+
+test("round 43: an unreadable marker makes the maintenance run ok:false", async () => {
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            railFirst: "estimate",
+            pageSize: 2,
+            listParked: async (rail, after) =>
+                rail === "estimate" && !after
+                    ? [
+                        { id: "est-1", marker: "gibberish", kind: "estimate" as const, clientId: "cli-1" },
+                        { id: "est-2", marker: "ambiguous-create:@1|EST-2|note", kind: "estimate" as const, clientId: "cli-1" },
+                    ]
+                    : [],
+            probe: (async () => ({ state: "found", qbId: "qb-2" })) as any,
+            adopt: async () => 1,
+            // The count now sees EVERY non-null marker, so the corrupt row is in it.
+            countParked: async () => 1,
+        },
+    );
+    assert.equal(res.unrecognised, 1, "reachable at last: the count no longer filters it out");
+    assert.equal(res.recovered, 1, "and the valid row behind it is still processed");
 });

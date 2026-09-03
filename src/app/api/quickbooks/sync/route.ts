@@ -152,6 +152,35 @@ function parked(code: string, reason: string, qbId: string | null) {
     );
 }
 
+/**
+ * A marker this rail cannot read at all.
+ *
+ * It used to fall through to the FRESH-CLAIM branch, whose CAS requires
+ * `qbSyncMarker: null` — so it could never match, and the caller got the generic
+ * "another sync claimed it first" with nothing to act on, forever. It is not a
+ * race and it is not transient: some value nobody in this codebase writes is
+ * sitting in the column, and only a human can decide what it meant.
+ *
+ * The value itself is NOT echoed. It is an opaque string of unknown provenance
+ * on a money-path record; its length and first few characters are enough to
+ * recognise it in the database without putting it in a response body or a log.
+ */
+function unrecognisedMarker(code: string, marker: string) {
+    return NextResponse.json(
+        {
+            error:
+                `${code} carries a QuickBooks sync marker ProBuild does not recognise ` +
+                `(${marker.length} characters, starting "${marker.slice(0, 12)}"), so it cannot be synced ` +
+                `or recovered automatically. An admin must clear it after checking QuickBooks.`,
+            retry: false,
+            reason: "sync-marker-unrecognised",
+            markerLength: marker.length,
+            markerPrefix: marker.slice(0, 12),
+        },
+        { status: 409 },
+    );
+}
+
 function retryLater(code: string, reason: string) {
     return NextResponse.json(
         {
@@ -376,6 +405,12 @@ export async function POST(req: NextRequest) {
             let estimateMarker: string;
             let estimateFacts: DocumentIdentityFacts;
             let estimateClaimedAt = new Date();
+            // Checked BEFORE the claim: an unreadable marker is neither a recovery
+            // nor a fresh claim, and falling through to the latter produced a CAS
+            // that could never match.
+            if (estimate.qbSyncMarker && !syncMarkerKind(estimate.qbSyncMarker)) {
+                return unrecognisedMarker(estimate.code, estimate.qbSyncMarker);
+            }
             if (syncMarkerKind(estimate.qbSyncMarker)) {
                 const stored = estimate.qbSyncMarker as string;
                 estimateClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());
@@ -530,6 +565,9 @@ export async function POST(req: NextRequest) {
         let invoiceMarker: string;
         let invoiceFacts: DocumentIdentityFacts;
         let invoiceClaimedAt = new Date();
+        if (invoice.qbSyncMarker && !syncMarkerKind(invoice.qbSyncMarker)) {
+            return unrecognisedMarker(invoice.code, invoice.qbSyncMarker);
+        }
         if (syncMarkerKind(invoice.qbSyncMarker)) {
             const stored = invoice.qbSyncMarker as string;
             invoiceClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());

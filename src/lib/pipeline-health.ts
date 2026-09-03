@@ -26,7 +26,7 @@ export const RECEIPT_STALE_HOURS = 72;
 
 export type ProbeStatus = "ok" | "error";
 /** Why a probe reports "error" — surfaced so a hang is distinguishable from a throw. */
-export type ProbeFailure = "timeout" | "error";
+export type ProbeFailure = "timeout" | "error" | "skipped";
 
 /** Statuspage indicators: "none" | "minor" | "major" | "critical"; "unknown" is ours. */
 export interface IntuitProbe {
@@ -423,8 +423,19 @@ export type ProbeRunner = <T>(timeoutMs: number, fn: (db: ProbeDb) => Promise<T>
 
 /** A slot-limited gate. Exported so a test can drive one it can observe. */
 export interface Limiter {
-    acquire(): Promise<() => void>;
+    /** `null` when the wait timed out: the caller did NOT get a slot. */
+    acquire(timeoutMs?: number): Promise<(() => void) | null>;
 }
+
+/**
+ * How long a probe will wait for a slot before giving up on running at all.
+ *
+ * A wedged database is the case this exists for: the probes ahead now hold
+ * their slots until their queries actually settle, so without a bound the ones
+ * behind would queue until the platform killed the whole request. Reporting a
+ * skipped probe is strictly better than reporting nothing at all.
+ */
+export const PROBE_ACQUIRE_TIMEOUT_MS = 2_000;
 
 export function createLimiter(limit: number): Limiter {
     let inFlight = 0;
@@ -435,8 +446,30 @@ export function createLimiter(limit: number): Limiter {
         if (next) next();
     };
     return {
-        async acquire() {
-            if (inFlight >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+        async acquire(timeoutMs?: number) {
+            if (inFlight >= limit) {
+                let ticket: () => void = () => {};
+                const queued = new Promise<boolean>((resolve) => {
+                    ticket = () => resolve(true);
+                    waiting.push(ticket);
+                });
+                const got = timeoutMs === undefined
+                    ? await queued
+                    : await Promise.race([
+                        queued,
+                        new Promise<boolean>((resolve) => {
+                            const t = setTimeout(() => resolve(false), timeoutMs);
+                            if (typeof t === "object" && t && "unref" in t) (t as { unref(): void }).unref();
+                        }),
+                    ]);
+                if (!got) {
+                    // Drop the ticket, or the next release hands a slot to a waiter
+                    // that has already given up and the gate leaks one permanently.
+                    const at = waiting.indexOf(ticket);
+                    if (at > -1) waiting.splice(at, 1);
+                    return null;
+                }
+            }
             inFlight++;
             let released = false;
             // Idempotent: a double release would let the gate drift open.
@@ -501,18 +534,37 @@ export async function runProbe<T>(
     run: (db: ProbeDb) => Promise<T>,
     onError: T,
     timeoutMs: number = PROBE_TIMEOUT_MS,
-    deps?: { withDb?: ProbeRunner; limiter?: Limiter },
+    deps?: { withDb?: ProbeRunner; limiter?: Limiter; acquireTimeoutMs?: number },
 ): Promise<ProbeResult<T>> {
     const withDb = deps?.withDb ?? statementTimeoutRunner();
     const limiter = deps?.limiter ?? probeLimiter;
+    const acquireTimeoutMs = deps?.acquireTimeoutMs ?? PROBE_ACQUIRE_TIMEOUT_MS;
     const TIMED_OUT = Symbol("probe-timeout");
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const releaseSlot = await limiter.acquire();
+    const releaseSlot = await limiter.acquire(acquireTimeoutMs);
+    if (!releaseSlot) {
+        // Every slot is held by a probe whose query has not come back. Starting
+        // anyway is what the cap exists to prevent, and waiting forever turns a
+        // slow database into no answer at all.
+        console.error(`[pipeline-health] probe skipped, limiter saturated: ${name}`);
+        return { status: "error", reason: "skipped", value: onError };
+    }
+    // THE SLOT FOLLOWS THE QUERY, NOT THE RACE.
+    //
+    // Releasing it in a `finally` on the race handed it back the moment the JS
+    // timeout won — while the Prisma operation was still running and still
+    // holding a pool connection. A queued probe then started against a pool that
+    // was already full, so nine probes could pile onto five connections: the cap
+    // was counting callers, not work. The release is attached to the underlying
+    // promise instead, so a timed-out probe answers its caller immediately and
+    // still occupies its slot until the database actually lets go.
+    const work = withDb(timeoutMs, run);
+    void work.then(() => releaseSlot(), () => releaseSlot());
     try {
         const deadline = new Promise<typeof TIMED_OUT>(resolve => {
             timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
         });
-        const result = await Promise.race([withDb(timeoutMs, run), deadline]);
+        const result = await Promise.race([work, deadline]);
         if (result === TIMED_OUT) {
             console.error(`[pipeline-health] probe timed out after ${timeoutMs}ms: ${name}`);
             return { status: "error", reason: "timeout", value: onError };
@@ -522,9 +574,9 @@ export async function runProbe<T>(
         console.error(`[pipeline-health] probe failed: ${name}`, error instanceof Error ? error.name : "UnknownError");
         return { status: "error", reason: "error", value: onError };
     } finally {
-        // Never leave a pending timer holding the event loop open.
+        // Never leave a pending timer holding the event loop open. The slot is
+        // deliberately NOT released here: `work` owns it now.
         clearTimeout(timer);
-        releaseSlot();
     }
 }
 

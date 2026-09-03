@@ -3863,6 +3863,7 @@ export async function breakQBInvoiceLink(
 
     const {
         claimQBInvoiceUnlink, getFreshQBTokens, BREAK_QB_LINK_BUDGET_MS, PENDING_DELETION_MARKER,
+        PAID_PENDING_DELETION_FLAG,
         isPendingDeletion,
     } = await import("./quickbooks-payments");
 
@@ -3932,6 +3933,33 @@ export async function breakQBInvoiceLink(
         const clearedAfterDelete = await claimQBInvoiceUnlink(
             prisma, schedule.id, schedule.qbInvoiceId, PENDING_DELETION_MARKER,
         );
+        // THE DELETE IS IRREVERSIBLE, so losing this CAS cannot end in a shrug.
+        // The commonest way to lose it is a settle landing between the delete and
+        // here: the row goes Paid and its marker is promoted, so the unlink refuses
+        // on both counts. Left there it is a Paid milestone linked to an invoice
+        // that no longer exists — precisely the state the sweep hunts for, so this
+        // path flags it ITSELF rather than hoping the sweep gets there. Re-read and
+        // CAS on what the row says NOW: the value it carries is exactly what we do
+        // not know at this point.
+        if (!clearedAfterDelete) {
+            const now = await prisma.paymentSchedule.findUnique({
+                where: { id: schedule.id },
+                select: { qbInvoiceId: true, qbSyncError: true },
+            });
+            // Only while the row still points at the invoice we just deleted. If it
+            // has moved on, somebody else already resolved this and the flag would
+            // be a lie.
+            if (now?.qbInvoiceId === schedule.qbInvoiceId) {
+                await prisma.paymentSchedule.updateMany({
+                    where: {
+                        id: schedule.id,
+                        qbInvoiceId: schedule.qbInvoiceId,
+                        qbSyncError: now.qbSyncError,
+                    },
+                    data: { qbSyncError: PAID_PENDING_DELETION_FLAG },
+                }).catch(() => ({ count: 0 }));
+            }
+        }
         revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
         revalidatePath(`/invoices`);
         revalidatePath(`/portal`);
@@ -3940,7 +3968,8 @@ export async function breakQBInvoiceLink(
             : {
                 success: true,
                 warning: `The QuickBooks invoice was deleted, but the link in ProBuild could not be cleared — ` +
-                    `the row moved while the delete was running. Refresh and break the link again.`,
+                    `the milestone was settled or changed while the delete was running. It is flagged for ` +
+                    `reconciliation; open it in QuickBooks and confirm what happened.`,
             };
     }
 
