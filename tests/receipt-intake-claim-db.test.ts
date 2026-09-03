@@ -892,8 +892,15 @@ test("CONTROL: the drifted table WITHOUT the upgrade keeps the old default", { s
             await tx.$executeRawUnsafe(DRIFTED_TABLE);
             // Only the CREATE half of the shipped list -- what a script whose
             // repair lived inside CREATE TABLE IF NOT EXISTS would achieve.
+            //
+            // Asserted by NAME, not by count: the list grows (ReceiptObjectClaim
+            // arrived in round 21), and a bare number turns every new table into
+            // a failure of a test that is not about tables at all.
             const createOnly = (statements as string[]).filter(sql => /CREATE TABLE IF NOT EXISTS/.test(sql));
-            assert.equal(createOnly.length, 1);
+            assert.ok(
+                createOnly.some(sql => sql.includes('"ReceiptIntake"')),
+                "the shipped list still creates the table this control is about",
+            );
             for (const sql of createOnly) await tx.$executeRawUnsafe(sql);
         }, { timeout: 30_000 });
 
