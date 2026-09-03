@@ -101,6 +101,15 @@ jobs:
         env:
           PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # The excise deduction's FILTER, against the real planner. A relation
+      # filter like `{ estimate: { projectId: null } }` compiles to an EXISTS,
+      # so it silently excludes rows with no estimate at all -- the shape
+      # ON DELETE SET NULL creates. Only a real database can answer that.
+      - name: Tax-at-source report filter against real Postgres
+        run: npx tsx --test tests/tax-at-source-report-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

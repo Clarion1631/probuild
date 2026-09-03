@@ -74,17 +74,21 @@ test("a named estimate joins the job's ORDERED scan instead of jumping it", asyn
     await lockAttributionParents(rec.tx, { projectId: "job-1", estimateId: "est-1" });
     const estimate = rec.queries.find(query => tableOf(query) === "Estimate")!;
     assert.equal(rec.queries.filter(query => tableOf(query) === "Estimate").length, 1);
-    assert.match(estimate, /"projectId" = \$1 OR id = \$2/);
+    // ARRAYS, not scalars (round 43, item 2): the helper takes SEVERAL jobs and
+    // SEVERAL estimates at once so a re-attribution can lock the job it leaves
+    // and the job it joins in ONE pass per table. A single id renders as a
+    // one-element array, which Postgres handles identically.
+    assert.match(estimate, /"projectId" = ANY\(\$1::text\[\]\) OR id = ANY\(\$2::text\[\]\)/);
     assert.match(estimate, /ORDER BY id/);
     assert.ok(estimate.indexOf("ORDER BY id") < estimate.indexOf("FOR SHARE"));
-    assert.deepEqual(rec.params[1], ["job-1", "est-1"]);
+    assert.deepEqual(rec.params[1], [["job-1"], ["est-1"]]);
 });
 
 test("a named line item joins the job's ORDERED item scan, and locks only the item", async () => {
     const rec = recorder();
     await lockAttributionParents(rec.tx, { projectId: "job-1", itemId: "item-1" });
     const item = rec.queries.find(query => /"EstimateItem"/.test(query))!;
-    assert.match(item, /e\."projectId" = \$1 OR ei\.id = \$2/);
+    assert.match(item, /e\."projectId" = ANY\(\$1::text\[\]\) OR ei\.id = \$2/);
     assert.match(item, /ORDER BY ei\.id/);
     // `FOR SHARE OF ei` and not a bare `FOR SHARE`: the joined Estimate rows
     // are held by the scan before this one, and locking them again here would
@@ -103,7 +107,7 @@ test("only what the caller named is locked", async () => {
     const estimateOnly = recorder();
     await lockAttributionParents(estimateOnly.tx, { estimateId: "est-1" });
     assert.deepEqual(estimateOnly.queries.map(tableOf), ["Estimate"]);
-    assert.match(estimateOnly.queries[0], /WHERE id = \$1 ORDER BY id FOR SHARE/);
+    assert.match(estimateOnly.queries[0], /WHERE id = ANY\(\$1::text\[\]\) ORDER BY id FOR SHARE/);
 
     const projectOnly = recorder();
     await lockAttributionParents(projectOnly.tx, { projectId: "job-1", costCodeId: "cc-1" });
@@ -111,7 +115,7 @@ test("only what the caller named is locked", async () => {
     // The project-only shape is byte-for-byte what `lockPhaseRowsForShare`
     // emitted before it was folded into this helper, so nothing about the
     // established order moved.
-    assert.match(projectOnly.queries[1], /^SELECT id FROM "Estimate" WHERE "projectId" = \$1 ORDER BY id FOR SHARE$/);
+    assert.match(projectOnly.queries[1], /^SELECT id FROM "Estimate" WHERE "projectId" = ANY\(\$1::text\[\]\) ORDER BY id FOR SHARE$/);
 });
 
 // ── the tripwire ───────────────────────────────────────────────────────────
@@ -463,20 +467,10 @@ test("no expense write moves projectId without moving estimateId with it", () =>
     assert.ok(checked >= 4, `only ${checked} expense writes set projectId — has the scan stopped reaching them?`);
 });
 
-test("the ONE re-attribution helper moves both halves under the canonical locks", () => {
-    // The tripwire above says what must not happen; this says where the thing
-    // that MAY happen lives, so the next writer copies it instead of inventing
-    // a third shape.
-    const source = readFileSync(path.join(ROOT, "src/lib/expense-attribution.ts"), "utf8");
-    const helper = source.slice(source.indexOf("export async function reattributeExpense"));
-    const body = helper.slice(0, helper.indexOf("\n}\n"));
-    assert.match(body, /lockAttributionParents\(/, "the parents are locked first");
-    assert.match(
-        body,
-        /data:\s*\{\s*projectId:[^,]+,\s*estimateId:[^}]+\}/,
-        "both halves land in one statement",
-    );
-    // ...and the write is a CAS on the attribution it decided from, so a
-    // concurrent move loses rather than interleaving.
-    assert.match(body, /where:\s*\{[\s\S]{0,400}?projectId: before\.projectId,\s*estimateId: before\.estimateId,/);
-});
+// The re-attribution helper is covered BEHAVIOURALLY in
+// tests/attribution-lock-order-db.test.ts (round 43, item 2): two connections,
+// real row locks, both orders, and the estimate-inserted-between-peek-and-lock
+// refusal. A regex over its source used to stand in for that and could not see
+// the two things that actually mattered -- that it locked per PROJECT rather
+// than per TABLE, and that it chose the target estimate with an unlocked read.
+

@@ -13,6 +13,9 @@ import {
     expenseStillOnProjectWhere,
     hasTaxClassification,
     parseCostCodeIdEdit,
+    parseTaxReviewAck,
+    TAX_REVIEW_ACK_MALFORMED_MESSAGE,
+    taxReviewAckIsComplete,
     planTaxRevalidation,
     taxDeductibleBaseFits,
     isPlausibleReceiptTax,
@@ -195,45 +198,19 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // Present-but-malformed is a client bug and is refused rather than
         // quietly ignored, because ignoring it would look exactly like a
         // successful certification to the caller.
-        const num = (value: unknown) =>
-            typeof value === "number" && Number.isFinite(value) ? value : null;
-        const numOrNull = (value: unknown) =>
-            value === null || (typeof value === "number" && Number.isFinite(value));
-        let reviewAck:
-            | {
-                amount: number;
-                taxAmount: number | null;
-                taxDeductibleBase: number | null;
-                installedAtCustomer: boolean | null;
-            }
-            | null = null;
-        if (Object.prototype.hasOwnProperty.call(body, "taxReviewAck")) {
-            const ack = body.taxReviewAck as Record<string, unknown> | null;
-            const shaped =
-                !!ack &&
-                typeof ack === "object" &&
-                !Array.isArray(ack) &&
-                num(ack.amount) !== null &&
-                numOrNull(ack.taxAmount) &&
-                numOrNull(ack.taxDeductibleBase) &&
-                (ack.installedAtCustomer === null || typeof ack.installedAtCustomer === "boolean");
-            if (!shaped) {
-                return NextResponse.json(
-                    {
-                        error: "taxReviewAck must be an object carrying amount, taxAmount, taxDeductibleBase and installedAtCustomer — the figures reviewed, and the total they were reviewed against.",
-                        code: "TAX_REVIEW_ACK_MALFORMED",
-                    },
-                    { status: 400 },
-                );
-            }
-            reviewAck = {
-                amount: num(ack!.amount)!,
-                taxAmount: ack!.taxAmount === null ? null : (ack!.taxAmount as number),
-                taxDeductibleBase:
-                    ack!.taxDeductibleBase === null ? null : (ack!.taxDeductibleBase as number),
-                installedAtCustomer: (ack!.installedAtCustomer as boolean | null) ?? null,
-            };
+        // ONE PARSER, shared with the PATCH (round 43, item 1). This route
+        // needs the OBJECT form: it may not write the tax columns, so its ack
+        // has to NAME the figures already on the row rather than replace them.
+        // A bare boolean is the PATCH's form and means nothing here, because
+        // there would be no figures beside it to certify.
+        const parsedAck = parseTaxReviewAck(body);
+        if (parsedAck.kind === "invalid" || parsedAck.kind === "flag") {
+            return NextResponse.json(
+                { error: TAX_REVIEW_ACK_MALFORMED_MESSAGE, code: "TAX_REVIEW_ACK_MALFORMED" },
+                { status: 400 },
+            );
         }
+        const reviewAck = parsedAck.kind === "figures" ? parsedAck : null;
         /** Two nullable money figures, compared in whole cents. */
         const sameFigure = (a: number | null, b: number | null) =>
             a === null || b === null
@@ -964,9 +941,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         //
         // A tax edit WITHOUT the ack is still accepted — a partial correction
         // is normal work — it simply leaves the flag standing.
-        if (has("taxReviewAck") && body.taxReviewAck !== true && body.taxReviewAck !== false) {
+        // ONE PARSER, shared with the PUT (round 43, item 1). This route WRITES
+        // the tax columns, so its ack is the bare boolean and the answers
+        // travel beside it in the same body; the object form belongs to the PUT
+        // and means nothing here.
+        const patchAck = parseTaxReviewAck(body);
+        if (patchAck.kind === "invalid" || patchAck.kind === "figures") {
             return NextResponse.json(
-                { error: "taxReviewAck must be true or false." },
+                { error: TAX_REVIEW_ACK_MALFORMED_MESSAGE, code: "TAX_REVIEW_ACK_MALFORMED" },
                 { status: 400 },
             );
         }
@@ -1006,7 +988,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         }
         const taxIsUnknown = editsTaxAmount && body.taxAmount === null && body.taxKnown === false;
 
-        const acknowledgesReview = body.taxReviewAck === true;
+        const acknowledgesReview = patchAck.kind === "flag";
         if (acknowledgesReview) {
             const gross = Number(expense.amount);
             // STRICT TYPE, not `Number(value)`. After JSON parsing, a real
@@ -1037,18 +1019,43 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             // whole classification — so certifying one while staying silent
             // about the other is exactly the half-answer the flag exists to
             // prevent. Each may be a coherent number or an explicit null.
-            const bothPresent = expense.needsTaxReview ? editsTaxAmount && editsBase : editsTaxAmount;
+            // ...AND `installedAtCustomer` IS ONE OF THEM (round 43, item 1).
+            //
+            // It was optional here on the reasoning that "a null reads as
+            // unanswered and the report skips the row" — true of a null, and
+            // beside the point. Omitting the key does not write a null; it
+            // PRESERVES whatever is stored, and the excise report keys on
+            // exactly `installedAtCustomer: true` + `needsTaxReview: false`. So
+            // a flagged row whose stored answer was already `true` had its
+            // review cleared by a request that never mentioned installation,
+            // and the receipt went straight back into the return on an
+            // eligibility nobody re-checked.
+            //
+            // Required only when a flag is actually being CLEARED: an ordinary
+            // ack on an unflagged row certifies nothing that was in doubt. A
+            // `null` answer is still an answer ("I do not know whether this was
+            // resold"), and the report reads it as not deductible — what is
+            // refused is SILENCE.
+            const complete = expense.needsTaxReview
+                ? taxReviewAckIsComplete({
+                    taxAmount: editsTaxAmount,
+                    taxDeductibleBase: editsBase,
+                    installedAtCustomer: editsInstalled,
+                })
+                : editsTaxAmount;
             const answered =
-                bothPresent &&
+                complete &&
                 (body.taxAmount === null || coherent(body.taxAmount)) &&
                 (!editsBase || body.taxDeductibleBase === null || coherent(body.taxDeductibleBase));
             if (!answered) {
                 return NextResponse.json(
                     {
                         error: expense.needsTaxReview
-                            ? "Acknowledging a tax review needs both taxAmount and taxDeductibleBase in the same request — each a figure, or an explicit null."
+                            ? "Acknowledging a tax review needs taxAmount, taxDeductibleBase AND installedAtCustomer in the same request — the whole classification, not part of it."
                             : "Acknowledging a tax review needs taxAmount in the same request — a figure, or an explicit null meaning this receipt has no sales tax.",
-                        code: "TAX_REVIEW_INCOMPLETE",
+                        code: expense.needsTaxReview && !editsInstalled
+                            ? "TAX_REVIEW_ACK_MALFORMED"
+                            : "TAX_REVIEW_INCOMPLETE",
                     },
                     { status: 400 },
                 );

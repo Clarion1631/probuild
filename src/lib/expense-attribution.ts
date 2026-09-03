@@ -165,6 +165,15 @@ export function expenseNotOnProjectWhere(projectId: string): Prisma.ExpenseWhere
         OR: [
             // Attributed directly, to some other job.
             { AND: [{ projectId: { not: null } }, { NOT: { projectId } }] },
+            // NO ESTIMATE AT ALL (round 43, item 3). `{ estimate: { ... } }` is
+            // a filter on a RELATED ROW: Prisma compiles it to an EXISTS, so it
+            // requires an estimate to be there. A row with `estimateId: null`
+            // matches no branch below and fell out of every caller — and
+            // `ON DELETE SET NULL` (round 42, item 4b) creates exactly that
+            // shape the moment an estimate is deleted. The tax report then
+            // dropped a qualifying receipt silently, which is the one direction
+            // an excise deduction must never fail in.
+            { AND: [{ projectId: null }, { estimateId: null }] },
             // Not attributed directly, and the estimate names no job either.
             { AND: [{ projectId: null }, { estimate: { projectId: null } }] },
             // Not attributed directly; the estimate names some other job.
@@ -391,6 +400,112 @@ export function taxDeductibleBaseFits(
     if (!Number.isFinite(ceiling)) return false;
     if (Math.sign(base) !== Math.sign(amount)) return false;
     return Math.abs(base) <= Math.abs(ceiling);
+}
+
+/** The tri-state a person can answer the installation question with. */
+export type InstalledAnswer = boolean | null;
+
+/** What a request said about acknowledging a tax review. */
+export type TaxReviewAck =
+    /** The key was absent. Not a review; the flag stands. */
+    | { kind: "absent" }
+    /** `taxReviewAck: false` — an explicit "I am not certifying anything". */
+    | { kind: "declined" }
+    /**
+     * The PATCH's form: a bare `true`, certifying the figures carried in the
+     * SAME request. `installedAtCustomer` is read off the body beside it,
+     * because this route may write it.
+     */
+    | { kind: "flag" }
+    /**
+     * The PUT's form: an object naming the figures ALREADY on the row and the
+     * total they were reviewed against. That route may not write the tax
+     * columns, so its ack has to describe the row rather than replace it.
+     */
+    | {
+        kind: "figures";
+        amount: number;
+        taxAmount: number | null;
+        taxDeductibleBase: number | null;
+        installedAtCustomer: InstalledAnswer;
+    }
+    | { kind: "invalid" };
+
+export const TAX_REVIEW_ACK_MALFORMED_MESSAGE =
+    "taxReviewAck must be true/false, or an object carrying amount, taxAmount, taxDeductibleBase and installedAtCustomer — the figures reviewed, and the total they were reviewed against.";
+
+/**
+ * THE ONE READING OF `taxReviewAck` (Codex round 43, item 1).
+ *
+ * Two shapes, because the two handlers can do different things and an ack has
+ * to mean the same thing in both: "a person has re-checked THIS receipt's
+ * whole tax classification".
+ *
+ *   * The PATCH writes the tax columns, so its ack is a bare `true` and the
+ *     answers travel beside it in the same body.
+ *   * The PUT may not write them, so its ack has to NAME them — the figures on
+ *     the row and the gross they were judged against — and they are compared
+ *     under the lock.
+ *
+ * What the two must never disagree about is COMPLETENESS, and they did:
+ * `installedAtCustomer` was required in the PUT's object and optional in the
+ * PATCH's, so a flagged row whose stored answer was already `true` could have
+ * its review cleared by a request that never mentioned it. The tax report reads
+ * exactly `installedAtCustomer: true` + `needsTaxReview: false`, so the receipt
+ * was re-admitted to the excise return on an eligibility nobody re-checked.
+ * `taxReviewAckIsComplete` is now the single answer to "is this enough to clear
+ * a flag?", and both callers ask it.
+ *
+ * Anything that is neither shape is INVALID rather than ignored: ignoring it
+ * looks exactly like a successful certification to the caller.
+ */
+export function parseTaxReviewAck(body: unknown, key = "taxReviewAck"): TaxReviewAck {
+    if (!body || typeof body !== "object") return { kind: "absent" };
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return { kind: "absent" };
+    const value = (body as Record<string, unknown>)[key];
+    if (value === true) return { kind: "flag" };
+    if (value === false) return { kind: "declined" };
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "invalid" };
+
+    const ack = value as Record<string, unknown>;
+    const finite = (input: unknown) => typeof input === "number" && Number.isFinite(input);
+    const finiteOrNull = (input: unknown) => input === null || finite(input);
+    const shaped =
+        finite(ack.amount) &&
+        finiteOrNull(ack.taxAmount) &&
+        finiteOrNull(ack.taxDeductibleBase) &&
+        (ack.installedAtCustomer === null || typeof ack.installedAtCustomer === "boolean");
+    if (!shaped) return { kind: "invalid" };
+    return {
+        kind: "figures",
+        amount: ack.amount as number,
+        taxAmount: ack.taxAmount === null ? null : (ack.taxAmount as number),
+        taxDeductibleBase:
+            ack.taxDeductibleBase === null ? null : (ack.taxDeductibleBase as number),
+        installedAtCustomer: (ack.installedAtCustomer as InstalledAnswer) ?? null,
+    };
+}
+
+/**
+ * Does this acknowledgement name every part of the classification it is
+ * clearing?
+ *
+ * The flag means the WHOLE classification is in doubt, so certifying some of it
+ * while staying silent about the rest is the half-answer the flag exists to
+ * prevent. Three parts, and `installedAtCustomer` is not the optional one it
+ * was treated as: it is the single field the excise report keys on, so an
+ * omission there preserves a stored `true` and re-admits the receipt.
+ *
+ * A `null` installation answer IS an answer — "I do not know whether this was
+ * resold" — and the report reads it as not deductible, which is the safe
+ * direction. What is refused is SILENCE.
+ */
+export function taxReviewAckIsComplete(named: {
+    taxAmount: boolean;
+    taxDeductibleBase: boolean;
+    installedAtCustomer: boolean;
+}): boolean {
+    return named.taxAmount && named.taxDeductibleBase && named.installedAtCustomer;
 }
 
 /** The columns a tax re-validation may clear, exactly as they are written. */
@@ -810,7 +925,16 @@ export async function lockEstimateAttribution(
 /** What a re-attribution did, or why it did nothing. */
 export type ReattributionOutcome =
     | { moved: true; projectId: string; estimateId: string | null }
-    | { moved: false; reason: "no-such-expense" | "already-there" | "lost-the-race" };
+    | {
+        moved: false;
+        /**
+         * "target-moved": the target job's estimate changed between the
+         * lock-free peek and the re-read under lock, so the row this write
+         * would derive from is one the lock set does not cover. A 409 for a
+         * caller; the next attempt re-peeks against the truth.
+         */
+        reason: "no-such-expense" | "already-there" | "lost-the-race" | "target-moved";
+    };
 
 /** The transaction-client subset `reattributeExpense` needs. */
 export interface ReattributeTxClient extends ExpenseTxClient {
@@ -885,27 +1009,61 @@ export async function reattributeExpense(
     if (!before) return { moved: false, reason: "no-such-expense" };
     if (before.projectId === input.toProjectId) return { moved: false, reason: "already-there" };
 
-    // BOTH jobs, in the canonical order, before anything is read for the
-    // decision. The estimate this row is on now is locked with the job it is
-    // leaving; the target job is locked because the new estimate's foreign key
-    // will take FOR KEY SHARE on it.
-    for (const projectId of [before.projectId, input.toProjectId].filter(Boolean).sort()) {
-        await lockAttributionParents(tx, { projectId: projectId as string });
-    }
-    if (before.estimateId) {
-        await lockAttributionParents(tx, { estimateId: before.estimateId });
-    }
-
+    // PEEK FIRST, LOCK ONCE, THEN RE-READ (round 43, item 2).
+    //
+    // Everything the lock set depends on is resolved WITHOUT taking a lock, so
+    // the acquisition below can be a single pass in the global table order.
+    // Two things have to be known before it:
+    //
+    //   * the job the row is LEAVING. A fallback-attributed row (no
+    //     `projectId` of its own) answers through its estimate, and reading
+    //     that under a lock would mean locking the estimate before the
+    //     project — the inversion this helper exists to avoid.
+    //   * the estimate it is JOINING. Picking it after the lock would select a
+    //     row the lock set never covered, so an estimate inserted in between
+    //     could be chosen and moved onto while nothing held it.
+    //
+    // `peekEstimateProjectId` and the peeked `findFirst` take no row locks, so
+    // neither contributes to the order. Both answers are re-checked under the
+    // lock below and a disagreement REFUSES rather than proceeding.
     const statuses = input.eligibleEstimateStatuses;
-    const target = await tx.estimate.findFirst({
-        where: {
-            projectId: input.toProjectId,
-            archivedAt: null,
-            ...(statuses?.length ? { status: { in: [...statuses] } } : {}),
-        },
+    const targetEstimateWhere = {
+        projectId: input.toProjectId,
+        archivedAt: null,
+        ...(statuses?.length ? { status: { in: [...statuses] } } : {}),
+    };
+    const fromProjectId =
+        before.projectId ??
+        (before.estimateId ? await peekEstimateProjectId(tx, before.estimateId) : null);
+    const peekedTarget = await tx.estimate.findFirst({
+        where: targetEstimateWhere,
         orderBy: { createdAt: "desc" },
         select: { id: true },
     });
+
+    // ONE PASS, ALL TABLES: every Project row before every Estimate row before
+    // every EstimateItem row, ascending id within each. Both jobs and both
+    // estimates go in together — the target job because the new `estimateId`'s
+    // foreign key takes FOR KEY SHARE on it, the source job because the current
+    // one holds it.
+    await lockAttributionParents(tx, {
+        projectIds: [fromProjectId, input.toProjectId],
+        estimateIds: [before.estimateId, peekedTarget?.id ?? null],
+    });
+
+    // ...AND THE PEEK IS RE-ASKED UNDER THAT LOCK. If the answer moved, the row
+    // this write would land on is one the lock set does not cover: an estimate
+    // created after the peek, or the chosen one archived or moved to another
+    // job. Refusing is the only safe answer — proceeding would write an
+    // attribution derived from an unlocked row.
+    const lockedTarget = await tx.estimate.findFirst({
+        where: targetEstimateWhere,
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+    });
+    if ((lockedTarget?.id ?? null) !== (peekedTarget?.id ?? null)) {
+        return { moved: false, reason: "target-moved" };
+    }
 
     const written = await tx.expense.updateMany({
         // The attribution this decision was MADE on, both halves. A row that
@@ -915,10 +1073,10 @@ export async function reattributeExpense(
             projectId: before.projectId,
             estimateId: before.estimateId,
         },
-        data: { projectId: input.toProjectId, estimateId: target?.id ?? null },
+        data: { projectId: input.toProjectId, estimateId: lockedTarget?.id ?? null },
     });
     if (written.count === 0) return { moved: false, reason: "lost-the-race" };
-    return { moved: true, projectId: input.toProjectId, estimateId: target?.id ?? null };
+    return { moved: true, projectId: input.toProjectId, estimateId: lockedTarget?.id ?? null };
 }
 
 /** One job an estimate's expenses are already pinned to, and how many. */

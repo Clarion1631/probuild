@@ -894,7 +894,10 @@ test("the project fill takes PROJECT, estimate, then the row — the canonical o
 
     const kinds = trace.map(entry => entry.kind);
     assert.equal(kinds[0], "project-share", "the JOB is locked before anything else");
-    assert.deepEqual(trace[0].args, ["job-1"], "and it is the job about to be stamped");
+    // ARRAY, not scalar (round 43, item 2): the helper takes SEVERAL jobs at
+    // once so a re-attribution can lock the job it leaves and the job it joins
+    // in ONE pass per table. A single id renders as a one-element array.
+    assert.deepEqual(trace[0].args, [["job-1"]], "and it is the job about to be stamped");
     const expenseLockAt = kinds.lastIndexOf("expense-lock");
     assert.ok(expenseLockAt > 0, "the per-expense lock is still taken");
     assert.ok(

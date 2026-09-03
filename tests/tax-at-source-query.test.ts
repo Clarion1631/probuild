@@ -161,15 +161,20 @@ test("the query excludes the Shop/overhead bucket, both ways round", async () =>
 
     const branches = recorded[0].where.OR as Record<string, any>[];
     assert.ok(Array.isArray(branches), "the exclusion must reach the query");
-    assert.equal(branches.length, 3, "direct, unattributed, and estimate-fallback");
-    // Direct attribution to the bucket is out...
-    assert.ok(JSON.stringify(branches[0]).includes(OVERHEAD_PROJECT_ID));
-    // ...and so is reaching it through the estimate.
-    assert.ok(JSON.stringify(branches[2]).includes(OVERHEAD_PROJECT_ID));
-    // ...while a row attributed to NOTHING still survives.
-    assert.deepEqual(branches[1], {
-        AND: [{ projectId: null }, { estimate: { projectId: null } }],
-    });
+    // Direct attribution to the bucket is out, and so is reaching it through
+    // the estimate. WHICH branches exist is not asserted here any more: a
+    // deep-equality check over the predicate object agreed with itself and
+    // could not see that `{ estimate: { projectId: null } }` requires an
+    // estimate to EXIST, so an estimate-less row matched nothing and dropped
+    // out of the report (round 43, item 3). What the predicate MEANS to
+    // Postgres is proved in tests/tax-at-source-report-db.test.ts, against a
+    // real database, which is the only place that question can be answered.
+    const rendered = JSON.stringify(branches);
+    assert.ok(rendered.includes(OVERHEAD_PROJECT_ID), "the bucket is named in the exclusion");
+    assert.ok(
+        branches.some(branch => JSON.stringify(branch).includes('"estimateId":null')),
+        "and a row with NO estimate has a branch of its own",
+    );
 });
 
 test("a row awaiting re-review is not a deduction", async () => {

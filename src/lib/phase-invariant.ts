@@ -70,12 +70,31 @@ function eligibleEstimateStatuses(): string[] {
 export interface AttributionLockTargets {
     /** The job the decision is being made about. */
     projectId?: string | null;
+    /**
+     * SEVERAL jobs at once — a re-attribution touches the one it is leaving and
+     * the one it is joining (round 43, item 2). Locking them with two calls
+     * would walk Project A, Estimates A, Items A, Project B: the table order
+     * broken between the calls, which is the whole thing this helper exists to
+     * prevent.
+     */
+    projectIds?: readonly (string | null | undefined)[];
     /** A SPECIFIC estimate the caller reads or writes the attribution pair from. */
     estimateId?: string | null;
+    /** SEVERAL specific estimates — the source's and the target's. */
+    estimateIds?: readonly (string | null | undefined)[];
     /** A SPECIFIC line item the caller links the expense to. */
     itemId?: string | null;
     /** The cost code being proposed. */
     costCodeId?: string | null;
+}
+
+/** Unique, non-empty, ascending — the acquisition order WITHIN a table. */
+function idSet(
+    single: string | null | undefined,
+    many: readonly (string | null | undefined)[] | undefined,
+): string[] {
+    const all = [single, ...(many ?? [])].filter((id): id is string => !!id);
+    return [...new Set(all)].sort();
 }
 
 /**
@@ -139,10 +158,17 @@ export async function lockAttributionParents(
     const estimateId = targets.estimateId ?? null;
     const itemId = targets.itemId ?? null;
     const costCodeId = targets.costCodeId ?? null;
+    // EVERY project first, EVERY estimate next, EVERY item after that — one
+    // statement per TABLE, never one pass per target (round 43, item 2).
+    const projectIds = idSet(projectId, targets.projectIds);
+    const estimateIds = idSet(estimateId, targets.estimateIds);
 
-    // 1. The job.
-    if (projectId) {
-        await tx.$queryRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR SHARE`, projectId);
+    // 1. The jobs, ascending.
+    if (projectIds.length) {
+        await tx.$queryRawUnsafe(
+            `SELECT id FROM "Project" WHERE id = ANY($1::text[]) ORDER BY id FOR SHARE`,
+            projectIds,
+        );
     }
     // 2. The estimates: the job's, AND any the caller named, in ONE ordered
     //    statement. One statement rather than two, because a separate lock on
@@ -151,13 +177,13 @@ export async function lockAttributionParents(
     //    walk the table in different orders.
     const estimateClauses: string[] = [];
     const estimateParams: unknown[] = [];
-    if (projectId) {
-        estimateParams.push(projectId);
-        estimateClauses.push(`"projectId" = $${estimateParams.length}`);
+    if (projectIds.length) {
+        estimateParams.push(projectIds);
+        estimateClauses.push(`"projectId" = ANY($${estimateParams.length}::text[])`);
     }
-    if (estimateId) {
-        estimateParams.push(estimateId);
-        estimateClauses.push(`id = $${estimateParams.length}`);
+    if (estimateIds.length) {
+        estimateParams.push(estimateIds);
+        estimateClauses.push(`id = ANY($${estimateParams.length}::text[])`);
     }
     if (estimateClauses.length) {
         await tx.$queryRawUnsafe(
@@ -169,9 +195,9 @@ export async function lockAttributionParents(
     //    off the joined estimate rows, which step 2 already holds.
     const itemClauses: string[] = [];
     const itemParams: unknown[] = [];
-    if (projectId) {
-        itemParams.push(projectId);
-        itemClauses.push(`e."projectId" = $${itemParams.length}`);
+    if (projectIds.length) {
+        itemParams.push(projectIds);
+        itemClauses.push(`e."projectId" = ANY($${itemParams.length}::text[])`);
     }
     if (itemId) {
         itemParams.push(itemId);

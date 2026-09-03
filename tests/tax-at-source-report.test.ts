@@ -323,14 +323,23 @@ test("the exclusion is written POSITIVELY so unattributed rows survive it", () =
     // is three positive branches instead.
     const where = expenseNotOnProjectWhere("overhead-1");
     const branches = where.OR as Record<string, unknown>[];
-    assert.equal(branches.length, 3);
+    // FOUR branches since round 43, item 3. `{ estimate: { ... } }` is a filter
+    // on a RELATED ROW and compiles to an EXISTS, so it requires an estimate to
+    // be there — a row with `estimateId: null` matched nothing and dropped out
+    // of the report. `ON DELETE SET NULL` creates that shape the moment an
+    // estimate is deleted. What the predicate MEANS to Postgres is proved in
+    // tests/tax-at-source-report-db.test.ts; this only pins the branches.
+    assert.equal(branches.length, 4);
     assert.deepEqual(branches[0], {
         AND: [{ projectId: { not: null } }, { NOT: { projectId: "overhead-1" } }],
     });
     assert.deepEqual(branches[1], {
-        AND: [{ projectId: null }, { estimate: { projectId: null } }],
+        AND: [{ projectId: null }, { estimateId: null }],
     });
     assert.deepEqual(branches[2], {
+        AND: [{ projectId: null }, { estimate: { projectId: null } }],
+    });
+    assert.deepEqual(branches[3], {
         AND: [
             { projectId: null },
             { estimate: { projectId: { not: null } } },

@@ -35,6 +35,7 @@ import { PrismaClient } from "@prisma/client";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "../src/lib/phase-invariant";
 import {
     lockEstimateAttribution,
+    reattributeExpense,
     resolveExpenseProjectUnderLock,
 } from "../src/lib/expense-attribution";
 import { lockExpense } from "../src/lib/expense-lock";
@@ -853,5 +854,185 @@ test("a fallback-attributed row whose estimate is deleted keeps NOTHING it shoul
         assert.deepEqual(survivor, { estimateId: null, projectId: null }, "the cost survives, unattributed");
     } finally {
         await cleanup();
+    }
+});
+
+// ── re-attribution locks per TABLE, not per project (round 43, item 2) ──────
+//
+// `reattributeExpense` touches TWO jobs: the one the row leaves and the one it
+// joins. Locking them with two calls walks Project A, Estimates A, Items A,
+// Project B — the global table order broken between the calls, which is the one
+// thing the helper exists to keep. A job editor holding Project B while
+// reaching for an estimate of A closes the cycle.
+
+const TARGET_PROJECT = `${PFX}-project-2`;
+const TARGET_ESTIMATE = `${PFX}-estimate-2`;
+const NEWER_ESTIMATE = `${PFX}-estimate-3`;
+
+async function seedTwoJobs() {
+    await seed();
+    await writerDb!.project.create({
+        data: { id: TARGET_PROJECT, name: "Attribution Lock Order 2", clientId: CLIENT, status: "In Progress" },
+    });
+    await writerDb!.estimate.create({
+        data: {
+            id: TARGET_ESTIMATE, title: "Attribution Lock Order 2", code: `EST-${PFX}-2`,
+            projectId: TARGET_PROJECT, status: "Approved", totalAmount: 500, balanceDue: 500,
+        },
+    });
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: PROJECT } });
+}
+
+async function cleanupTwoJobs() {
+    await writerDb!.expense.deleteMany({ where: { id: EXPENSE } });
+    await writerDb!.estimate.deleteMany({ where: { id: { in: [TARGET_ESTIMATE, NEWER_ESTIMATE] } } });
+    await writerDb!.project.deleteMany({ where: { id: TARGET_PROJECT } });
+    await cleanup();
+}
+
+/** Holds ONE project FOR UPDATE, then reaches for the OTHER job's estimate. */
+function crossJobEditor(held: ReturnType<typeof gate>, holdProject: string, wantEstimate: string) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                await tx.$executeRawUnsafe(`SELECT id FROM "Project" WHERE id = $1 FOR UPDATE`, holdProject);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 750));
+                await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, wantEstimate);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+test("CONTROL: locking one project at a time really does invert the order", { skip }, async () => {
+    // The pre-fix sequence, verbatim: two calls, one per job. The writer ends
+    // up holding the SOURCE job's estimates while still reaching for the TARGET
+    // job's Project row.
+    await seedTwoJobs();
+    try {
+        const held = gate();
+        const editor = crossJobEditor(held, TARGET_PROJECT, ESTIMATE);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            for (const projectId of [PROJECT, TARGET_PROJECT]) {
+                await lockAttributionParents(raw, { projectId });
+            }
+        }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from per-project locking; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanupTwoJobs();
+    }
+});
+
+for (const holdSource of [true, false]) {
+    const label = holdSource ? "the SOURCE" : "the TARGET";
+    test(`the real move waits out an editor holding ${label} job`, { skip }, async () => {
+        // Both orders, through the ACTUAL helper. One pass per table means the
+        // writer simply queues behind whichever Project row the editor holds.
+        await seedTwoJobs();
+        try {
+            const held = gate();
+            const editor = crossJobEditor(
+                held,
+                holdSource ? PROJECT : TARGET_PROJECT,
+                holdSource ? TARGET_ESTIMATE : ESTIMATE,
+            );
+            await held.reached;
+
+            let writerError: unknown = null;
+            let outcome: unknown = null;
+            await writerDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                outcome = await reattributeExpense(tx as never, {
+                    expenseId: EXPENSE,
+                    toProjectId: TARGET_PROJECT,
+                });
+            }, { timeout: 30_000 }).catch(caught => { writerError = caught; });
+
+            await editor.done;
+
+            assert.equal(deadlocked(writerError), false, `the move was killed by a deadlock: ${writerError}`);
+            assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+            assert.equal(writerError, null, `the move failed: ${writerError}`);
+            assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+            assert.deepEqual(
+                outcome,
+                { moved: true, projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE },
+                "it waited and then moved BOTH halves",
+            );
+            const after = await editorDb!.expense.findUnique({
+                where: { id: EXPENSE },
+                select: { projectId: true, estimateId: true },
+            });
+            assert.deepEqual(after, { projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE });
+        } finally {
+            await cleanupTwoJobs();
+        }
+    });
+}
+
+test("an estimate created between the peek and the lock is REFUSED, not moved onto", { skip }, async () => {
+    // The other half of the contract. The target estimate is chosen by a
+    // lock-free peek so the acquisition can be one ordered pass; a newer
+    // estimate landing after that peek is a row the lock set never covered, so
+    // moving onto it would derive an attribution from something nothing holds.
+    await seedTwoJobs();
+    try {
+        let peeks = 0;
+        const outcome = await writerDb!.$transaction(async tx => {
+            const real = tx as unknown as Record<string, unknown>;
+            const client = new Proxy(real, {
+                get(target, prop: string) {
+                    if (prop !== "estimate") return target[prop];
+                    const estimate = target.estimate as {
+                        findFirst(args: unknown): Promise<{ id: string } | null>;
+                    };
+                    return {
+                        findFirst: async (args: unknown) => {
+                            const answer = await estimate.findFirst(args);
+                            // AFTER the peek, before the locked re-read: a
+                            // second connection commits a NEWER estimate on the
+                            // target job.
+                            if (++peeks === 1) {
+                                await editorDb!.estimate.create({
+                                    data: {
+                                        id: NEWER_ESTIMATE, title: "Newer", code: `EST-${PFX}-3`,
+                                        projectId: TARGET_PROJECT, status: "Approved",
+                                        totalAmount: 900, balanceDue: 900,
+                                    },
+                                });
+                            }
+                            return answer;
+                        },
+                    };
+                },
+            });
+            return reattributeExpense(client as never, { expenseId: EXPENSE, toProjectId: TARGET_PROJECT });
+        }, { timeout: 30_000 });
+
+        assert.equal(peeks, 2, "the peek and the locked re-read both ran");
+        assert.deepEqual(outcome, { moved: false, reason: "target-moved" });
+        const untouched = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true, estimateId: true },
+        });
+        assert.deepEqual(untouched, { projectId: PROJECT, estimateId: ESTIMATE }, "nothing moved");
+    } finally {
+        await cleanupTwoJobs();
     }
 });

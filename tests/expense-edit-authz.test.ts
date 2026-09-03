@@ -920,7 +920,7 @@ test("an acknowledgement that OMITS taxAmount is refused, not half-applied", asy
     // Supplying only the amount IS enough (the base is computed), so the
     // refusal is specifically about the key being absent.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxDeductibleBase: 50 });
+    const res = await patch({ taxReviewAck: true, taxDeductibleBase: 50, installedAtCustomer: true });
     assert.equal(res.status, 400);
     assert.equal((await res.json()).code, "TAX_REVIEW_INCOMPLETE");
     assert.equal(updateArgs, null, "nothing is written");
@@ -932,13 +932,13 @@ test("on a FLAGGED row an ack needs BOTH keys, not just the tax", async () => {
     // silent about the other is the half-answer the flag exists to prevent.
     // Tested through the API, not the modal: the modal is one caller of many.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const only = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    const only = await patch({ taxReviewAck: true, taxAmount: 16.55, installedAtCustomer: true });
     assert.equal(only.status, 400);
     assert.equal((await only.json()).code, "TAX_REVIEW_INCOMPLETE");
     assert.equal(updateArgs, null as typeof updateArgs, "nothing is written, so the flag stands");
 
     // An explicit null counts as present for either key.
-    const both = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: null });
+    const both = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: null, installedAtCustomer: true });
     assert.equal(both.status, 200);
     assert.equal(updateArgs?.data.needsTaxReview, false);
     assert.equal(updateArgs?.data.taxSource, "manual");
@@ -1159,6 +1159,7 @@ test("a FLAGGED no-tax workflow: ack + null clears the flag as manual-none", asy
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
     const res = await patch({
         taxReviewAck: true, taxAmount: null, taxKnown: true, taxDeductibleBase: null,
+        installedAtCustomer: true,
     });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, null);
@@ -1188,7 +1189,7 @@ test("an ack whose base exceeds the receipt is refused", async () => {
 
 test("a coherent ack still clears the flag", async () => {
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50 });
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50, installedAtCustomer: true });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.needsTaxReview, false);
 });
@@ -1927,4 +1928,77 @@ test("a deduction base that stopped fitting under the lock is refused, not writt
     } finally {
         fakePrisma.expense.findUnique = originalFind;
     }
+});
+
+// ── an ack must name the installation answer too (Codex round 43, item 1) ───
+
+test("clearing a flag WITHOUT naming installedAtCustomer is refused", async () => {
+    // THE CASE FROM THE REVIEW. `installedAtCustomer` was optional here on the
+    // reasoning that "a null reads as unanswered and the report skips the row"
+    // — true of a null, and beside the point. Omitting the key does not write a
+    // null, it PRESERVES what is stored, and the excise report keys on exactly
+    // `installedAtCustomer: true` + `needsTaxReview: false`. So a flagged row
+    // whose stored answer was already `true` had its review cleared by a
+    // request that never mentioned installation, and the receipt went straight
+    // back into the return on an eligibility nobody re-checked.
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, installedAtCustomer: true,
+    } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50 });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_REVIEW_ACK_MALFORMED");
+    assert.equal(updateArgs, null, "nothing is written, so the flag stands");
+});
+
+test("...and naming it explicitly clears the flag", async () => {
+    // The control. A person who states all three parts has done the thing the
+    // flag asks for.
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, installedAtCustomer: true,
+    } as Record<string, unknown>;
+    const res = await patch({
+        taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50, installedAtCustomer: true,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+    assert.equal(updateArgs?.data.installedAtCustomer, true);
+});
+
+test("an explicit NULL installation answer is an answer, and clears the flag", async () => {
+    // "I do not know whether this was resold" is a real thing to conclude, and
+    // the report reads it as not deductible — the safe direction. What the rule
+    // refuses is SILENCE, not uncertainty.
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, installedAtCustomer: true,
+    } as Record<string, unknown>;
+    const res = await patch({
+        taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: 50, installedAtCustomer: null,
+    });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, false);
+    assert.equal(updateArgs?.data.installedAtCustomer, null, "the stored true is retracted");
+});
+
+test("an ack on an UNFLAGGED row does not need the installation answer", async () => {
+    // Nothing was in doubt, so there is nothing to re-certify. Requiring it
+    // here would break ordinary tax edits for no gain.
+    storedExpense = { ...(storedExpense as object), needsTaxReview: false } as Record<string, unknown>;
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    assert.equal(res.status, 200);
+});
+
+test("both handlers refuse the OTHER one's ack shape", async () => {
+    // One parser, two shapes, and each route accepts only the one it can
+    // actually act on: the PATCH writes the tax columns so its ack is a bare
+    // boolean beside the figures; the PUT may not, so its ack has to NAME them.
+    // Accepting the wrong shape would look like a certification and do nothing.
+    const objectToPatch = await patch({
+        taxReviewAck: { amount: 207.74, taxAmount: 16.55, taxDeductibleBase: 50, installedAtCustomer: true },
+    });
+    assert.equal(objectToPatch.status, 400);
+    assert.equal((await objectToPatch.json()).code, "TAX_REVIEW_ACK_MALFORMED");
+
+    const booleanToPut = await call({ amount: "150.00", taxReviewAck: true });
+    assert.equal(booleanToPut.status, 400);
+    assert.equal((await booleanToPut.json()).code, "TAX_REVIEW_ACK_MALFORMED");
 });
