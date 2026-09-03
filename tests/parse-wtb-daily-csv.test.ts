@@ -3,6 +3,7 @@ import test from "node:test";
 import {
     buildDayStatements,
     buildSweepPayload,
+    canSweepDay,
     postSweep,
     resolveSweepSecret,
     sweepBatchFailed,
@@ -348,15 +349,48 @@ test("sweep: the payload carries the BANK's own control totals", () => {
     assert.equal(buildSweepPayload(complete[0], { dryRun: true }).dryRun, true);
 });
 
-test("sweep: with no TOTAL CREDITS row the payload falls back to the summed rows", () => {
-    const { complete } = build([
+test("sweep: a credit-bearing day with NO independent TOTAL CREDITS row is not swept", async t => {
+    const withoutControlRow = build([
         OPEN("08/24/2026", "0.00"),
         CLOSE("08/24/2026", "750.25"),
         CREDIT("08/24/2026", "750.25", "REF-SOLO"),
-    ]);
-    const payload = buildSweepPayload(complete[0]);
-    assert.equal(payload.creditSum, 750.25);
-    assert.equal(payload.creditCount, 1);
+    ]).complete[0];
+
+    await t.test("canSweepDay refuses it, and calls it a job failure", () => {
+        // Deriving creditSum from the rows it is meant to check makes the
+        // endpoint's control total a tautology: a day whose export silently
+        // dropped a deposit would post a sum matching the rows perfectly.
+        const verdict = canSweepDay(withoutControlRow);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, true);
+        assert.match(verdict.reason, /no TOTAL CREDITS control row, sweep skipped/);
+    });
+
+    await t.test("and buildSweepPayload refuses to invent one", () => {
+        assert.throws(() => buildSweepPayload(withoutControlRow), /no TOTAL CREDITS control row/);
+    });
+
+    await t.test("a day with the control row sweeps normally", () => {
+        const withControlRow = build([
+            OPEN("08/24/2026", "0.00"),
+            CLOSE("08/24/2026", "750.25"),
+            row("08/24/2026", "TOTAL CREDITS", "100", "750.25"),
+            CREDIT("08/24/2026", "750.25", "REF-SOLO"),
+        ]).complete[0];
+        assert.equal(canSweepDay(withControlRow).ok, true);
+        assert.equal(buildSweepPayload(withControlRow).creditSum, 750.25);
+    });
+
+    await t.test("a day with NO credits needs no control row and is not a failure", () => {
+        const quiet = build([
+            OPEN("08/24/2026", "100.00"),
+            CLOSE("08/24/2026", "90.00"),
+            row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+        ]).complete[0];
+        const verdict = canSweepDay(quiet);
+        assert.equal(verdict.ok, false);
+        assert.equal(verdict.failure, false, "nothing to sweep is not a failure");
+    });
 });
 
 test("sweep: a debit-only day has nothing to sweep", () => {
@@ -404,6 +438,7 @@ test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's b
         const result = await postSweep("https://probuild.example", "s3cret", complete[0], { dryRun: true });
         assert.equal(result.status, 200);
         assert.equal(result.body.counts.applied, 1);
+        assert.equal(sweepBatchFailed(result.body, new Set(["REF-POST"])), false, "a well-formed answer passes every check");
 
         assert.equal(seen.length, 1);
         assert.equal(seen[0].url, "https://probuild.example/api/payments/deposit-ingest");
@@ -446,19 +481,31 @@ test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async
     const counts = (over: Record<string, number> = {}) => ({
         credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0, ...over,
     });
+    /** A well-formed answer: the counts AND a per-credit line for each one. */
+    const answer = (status: string, over: Record<string, number> = {}) => ({
+        ok: true,
+        counts: counts({ applied: status === "applied" ? 1 : 0, [status]: 1, ...over }),
+        credits: [{ bankReference: "A", status }],
+    });
 
     await t.test("a clean day is not a failure", () => {
-        assert.equal(sweepBatchFailed({ ok: true, counts: counts() }), false);
+        assert.equal(sweepBatchFailed(answer("applied")), false);
     });
 
     await t.test("credits sent to a HUMAN are not a failure — that is the sweep working", () => {
-        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ applied: 0, unmatched: 1 }) }), false);
+        assert.equal(sweepBatchFailed(answer("unmatched")), false);
     });
 
     await t.test("failed / qbo_unknown / reconcile are", () => {
         for (const bucket of ["failed", "qboUnknown", "reconcile"]) {
+            const status = bucket === "qboUnknown" ? "qbo_unknown" : bucket;
+            // Well-formed in every other respect: the bucket alone fails it.
             assert.equal(
-                sweepBatchFailed({ ok: false, counts: counts({ applied: 0, [bucket]: 1 }) }),
+                sweepBatchFailed({
+                    ok: true,
+                    counts: counts({ applied: 0, [bucket]: 1 }),
+                    credits: [{ bankReference: "A", status }],
+                }),
                 true,
                 `${bucket} must fail the run`,
             );
@@ -469,8 +516,45 @@ test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async
         assert.equal(sweepBatchFailed({ ok: false, counts: counts() }), true);
     });
 
+    await t.test("a MISSING ok is not a pass — 'I could not tell' is never success", () => {
+        assert.equal(sweepBatchFailed({ counts: counts(), credits: [{ bankReference: "A", status: "applied" }] }), true);
+        assert.equal(sweepBatchFailed({ ok: "true", counts: counts(), credits: [{ bankReference: "A", status: "applied" }] }), true);
+    });
+
+    await t.test("the response must account for every credit, one by one", () => {
+        // An empty array with healthy counts would otherwise read as a clean
+        // day for credits nobody can prove were ever seen.
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts(), credits: [] }), true);
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts() }), true, "no credits array at all");
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ credits: 2, applied: 2 }), credits: [{ bankReference: "A", status: "applied" }] }), true, "short array");
+    });
+
+    await t.test("…and they must be the SAME credits that were submitted", () => {
+        const submitted = new Set(["A", "B"]);
+        const body = (refs: string[]) => ({
+            ok: true,
+            counts: counts({ credits: refs.length, applied: refs.length }),
+            credits: refs.map(r => ({ bankReference: r, status: "applied" })),
+        });
+        assert.equal(sweepBatchFailed(body(["A", "B"]), submitted), false);
+        assert.equal(sweepBatchFailed(body(["A", "C"]), submitted), true, "a substituted reference");
+        assert.equal(sweepBatchFailed(body(["A", "A"]), submitted), true, "a duplicated reference");
+        assert.equal(sweepBatchFailed(body(["A"]), new Set(["A", "B"])), true, "another day's answer");
+    });
+
     await t.test("counts alone still catch it if a deployment answers without the flag", () => {
         assert.equal(sweepBatchFailed({ counts: counts({ applied: 0, failed: 1 }) }), true);
+    });
+
+    await t.test("the catch-all bucket fails even a well-formed answer", () => {
+        assert.equal(
+            sweepBatchFailed({
+                ok: true,
+                counts: counts({ applied: 0, unresolved: 1 }),
+                credits: [{ bankReference: "A", status: "qbo_created" }],
+            }),
+            true,
+        );
     });
 
     await t.test("a missing or non-object body is a failure, never a silent pass", () => {

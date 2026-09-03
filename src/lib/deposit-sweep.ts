@@ -16,6 +16,9 @@
  * lands (docs/BANK-DATA-SOURCES.md).
  */
 
+import { COMPANY_TIME_ZONE } from "./company-day";
+import { dayKeyInTimeZone } from "./tz-date";
+
 /** DepositIngest.source for a swept bank credit (null means the photo path). */
 export const BANK_DEPOSIT_SOURCE = "bank";
 
@@ -43,23 +46,46 @@ export const CROSS_SOURCE_CLAIM_WINDOW_DAYS = 14;
 export const MAX_BANK_CREDITS_PER_BATCH = 50;
 
 /**
- * The cross-source claim check is DIRECTIONAL, so it has two status lists.
+ * The states in which a DepositIngest row can still HOLD a milestone
+ * reservation — byte-for-byte the predicate of the partial unique index in
+ * scripts/apply-deposit-ingest-schema.mjs:
+ *
+ *   WHERE status IN ('processing','qbo_unknown','qbo_created','applied',
+ *                    'reconcile','failed') AND "paymentScheduleId" IS NOT NULL
+ *
+ * The claim lists below are DERIVED from this rather than enumerated by hand,
+ * which is how `reconcile` and `failed` went missing: both sit past a money
+ * boundary and keep their reservation on purpose (a reconcile row so the human
+ * can see which milestone is at stake, a boundary-marked failed row so no
+ * second file slips in before the retry resumes). Leaving them out let a photo
+ * and a bank credit reserve two DIFFERENT milestones for the same deposit —
+ * the exact hole the claim check exists to close.
+ */
+export const RESERVATION_RETAINING_STATUSES = [
+    "processing", "qbo_unknown", "qbo_created", "applied", "reconcile", "failed",
+] as const;
+
+/**
+ * The cross-source claim check is DIRECTIONAL, so it has two status lists, and
+ * both start from "can that row still be holding a milestone?".
  *
  * CLAIMING_STATUSES — what the BANK side treats as a claim by the photo path:
- * everything, because any live photo row is closer to the money than a bank
- * credit is (it carries a project name; the sweep has only an amount).
+ * every reservation-retaining state, plus `proposed` for completeness (a photo
+ * row can never be proposed; the sweep's own rows can, and this list is the
+ * conservative one). Any live photo row is closer to the money than a bank
+ * credit is — it carries a project name; the sweep has only an amount.
  *
  * MONEY_BOUNDARY_CLAIM_STATUSES — what the PHOTO side treats as a claim by the
- * sweep: only rows at or past the money boundary. `proposed` is deliberately
- * ABSENT. A proposed row is a bank credit that matched but was held back — by a
- * dry run, or by the 2-day wait whose entire purpose is to give the
- * evidence-rich photo first dibs. Counting it as a claim would invert that: the
- * photo would stand down during exactly the window reserved for it. When the
- * proposed row is re-evaluated after the photo settles, the 14-day Paid union
- * and the applied-row lookup route it to a human with the right explanation.
+ * sweep: the reservation-retaining states, and NOT `proposed`. A proposed row
+ * is a bank credit that matched but was held back — by a dry run, or by the
+ * 2-day wait whose entire purpose is to give the evidence-rich photo first
+ * dibs. Counting it as a claim would invert that: the photo would stand down
+ * during exactly the window reserved for it. When the proposed row is
+ * re-evaluated after the photo settles, the 14-day Paid union and the
+ * applied-row lookup route it to a human with the right explanation.
  */
-export const CLAIMING_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied", "proposed"] as const;
-export const MONEY_BOUNDARY_CLAIM_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied"] as const;
+export const CLAIMING_STATUSES = [...RESERVATION_RETAINING_STATUSES, "proposed"] as const;
+export const MONEY_BOUNDARY_CLAIM_STATUSES = [...RESERVATION_RETAINING_STATUSES] as const;
 
 /**
  * Statuses that mean a bank deposit is working on this milestone RIGHT NOW,
@@ -190,14 +216,18 @@ export function isoDaysAfter(value: string, days: number): string {
 
 /**
  * The wait rule: a bank credit may only be applied for real once it is at
- * least BANK_APPLY_MIN_AGE_DAYS old. Calendar days, anchored to UTC — the same
- * anchor DepositIngest.postDate is stored on, so the answer never depends on
- * where the server runs. (A UTC day boundary sits mid-afternoon Pacific, so
- * the worst case is that a credit becomes eligible a few hours later than a
- * business-timezone reading would say. It never becomes eligible earlier.)
+ * least BANK_APPLY_MIN_AGE_DAYS old, counted in the COMPANY's calendar days.
+ *
+ * This used to read `now.toISOString()`, i.e. the UTC day — and the sweep runs
+ * at 6pm Pacific, by which time UTC is already tomorrow. An August 24 credit
+ * therefore looked two days old on the evening of August 25: one local day, not
+ * two, silently halving the window that exists to give the photo path first
+ * dibs. Post dates are the bank's own local calendar days, so they have to be
+ * compared against the company's day, never the server's.
  */
 export function bankCreditIsOldEnough(postDate: string, now: Date): boolean {
-    const today = now.toISOString().slice(0, 10);
+    const today = dayKeyInTimeZone(now, COMPANY_TIME_ZONE);
+    if (!today) return false; // an unreadable clock never unlocks a money write
     return isoDayDiff(postDate, today) >= BANK_APPLY_MIN_AGE_DAYS;
 }
 
@@ -276,12 +306,21 @@ export function parseBankBatch(raw: Record<string, unknown>): BankBatchParse {
 
     // Control totals, from the CSV's own ledger/total rows. Both must tie to
     // the rows actually present.
-    const creditCount = Number(raw.creditCount);
+    // Real numbers, not numeric strings: a control total is evidence, and
+    // evidence that needed coercing to compare is not evidence.
+    const creditCount = typeof raw.creditCount === "number" ? raw.creditCount : NaN;
     if (!Number.isInteger(creditCount) || creditCount !== credits.length) {
         return { ok: false, reason: `creditCount ${raw.creditCount} does not match the ${credits.length} credit row(s) posted` };
     }
-    const creditSum = Number(raw.creditSum);
-    if (!Number.isFinite(creditSum)) return { ok: false, reason: "creditSum is required" };
+    // Required, with no fallback anywhere in the chain: a creditSum derived from
+    // the same rows it is checking proves nothing. It must come from the bank's
+    // own per-day TOTAL CREDITS row, and a day that has no such row is not
+    // swept at all (see the runner's canSweepDay).
+    if (raw.creditSum === undefined || raw.creditSum === null) {
+        return { ok: false, reason: "creditSum is required (the bank's own TOTAL CREDITS figure for the day)" };
+    }
+    const creditSum = typeof raw.creditSum === "number" ? raw.creditSum : NaN;
+    if (!Number.isFinite(creditSum)) return { ok: false, reason: "creditSum must be a number" };
     const declaredCents = Math.round(creditSum * 100);
     const actualCents = credits.reduce((sum, c) => sum + c.amountCents, 0);
     if (Math.abs(creditSum * 100 - declaredCents) > 1e-6 || declaredCents !== actualCents) {

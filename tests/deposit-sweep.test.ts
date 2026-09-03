@@ -43,6 +43,9 @@ import {
     isNotCustomerDepositReason,
     notCustomerDepositNote,
     MAX_BANK_CREDITS_PER_BATCH,
+    CLAIMING_STATUSES,
+    MONEY_BOUNDARY_CLAIM_STATUSES,
+    RESERVATION_RETAINING_STATUSES,
     parseBankBatch,
     qboGuardNote,
     reservationLostNote,
@@ -455,6 +458,21 @@ test("batch gate: a control-total mismatch refuses the WHOLE batch", async t => 
         assert.match((parsed as { reason: string }).reason, /creditCount/);
     });
 
+    await t.test("creditSum is REQUIRED — a batch without the bank's own total is refused", () => {
+        // The runner never sends one it derived from the rows; a missing figure
+        // means the day had no independent TOTAL CREDITS row, and a control
+        // total that checks itself proves nothing.
+        for (const missing of [undefined, null]) {
+            const batch = bankBatch([{ ref: "A1", amount: 100 }]);
+            const parsed = parseBankBatch({ ...batch, creditSum: missing });
+            assert.equal(parsed.ok, false);
+            assert.match((parsed as { reason: string }).reason, /creditSum is required/);
+        }
+        const notANumber = parseBankBatch({ ...bankBatch([{ ref: "A1", amount: 100 }]), creditSum: "100" });
+        assert.equal(notANumber.ok, false);
+        assert.match((notANumber as { reason: string }).reason, /creditSum must be a number/);
+    });
+
     await t.test("a correct batch parses to exact cents", () => {
         const parsed = parseBankBatch(bankBatch([{ ref: "A1", amount: 13447.68 }]));
         assert.equal(parsed.ok, true);
@@ -511,10 +529,24 @@ test("collisions: a stored same-day row counts, whatever state a previous run le
 });
 
 test("wait rule: a credit posted yesterday is too young; two days old is eligible", () => {
-    const now = new Date("2026-08-26T10:00:00Z");
+    const now = new Date("2026-08-26T10:00:00Z"); // 3am Pacific on the 26th
     assert.equal(bankCreditIsOldEnough("2026-08-25", now), false);
     assert.equal(bankCreditIsOldEnough("2026-08-24", now), true);
     assert.equal(bankCreditIsOldEnough("2026-08-26", now), false);
+});
+
+test("wait rule: 6pm Pacific is still TODAY — the UTC day must not shorten the window", () => {
+    // The sweep runs at 6pm Pacific. Under the old `toISOString()` reading, UTC
+    // had already rolled over to the 26th, so an Aug 24 credit looked two days
+    // old after ONE local day — silently halving the window that exists to give
+    // the photo path first dibs on a fresh check.
+    const sixPmPacific = new Date("2026-08-26T01:00:00Z"); // 2026-08-25 18:00 PDT
+    assert.equal(sixPmPacific.toISOString().slice(0, 10), "2026-08-26", "premise: UTC is already tomorrow");
+
+    assert.equal(bankCreditIsOldEnough("2026-08-24", sixPmPacific), false, "one local day is not two");
+    assert.equal(bankCreditIsOldEnough("2026-08-23", sixPmPacific), true);
+    // The following evening it becomes eligible, as intended.
+    assert.equal(bankCreditIsOldEnough("2026-08-24", new Date("2026-08-27T01:00:00Z")), true);
 });
 
 test("image lookup: the key carries a :front / :back side suffix, so the match is a PREFIX", () => {
@@ -551,6 +583,25 @@ test("messages name the row on the other side of the collision", () => {
         /already being applied by the deposit sweep \(bank ref 262/,
     );
     assert.equal(reservationLostNote(null), "milestone already being applied by another deposit");
+});
+
+test("claim sets: every state that can still HOLD a milestone counts as a claim", () => {
+    // These are the partial reservation index's predicate
+    // (scripts/apply-deposit-ingest-schema.mjs). `reconcile` and `failed` were
+    // missing from the hand-written lists, and both sit past a money boundary
+    // holding their milestone on purpose — so a photo and a bank credit could
+    // each reserve a DIFFERENT milestone for the same deposit.
+    assert.deepEqual(
+        [...RESERVATION_RETAINING_STATUSES].sort(),
+        ["applied", "failed", "processing", "qbo_created", "qbo_unknown", "reconcile"],
+    );
+    for (const status of RESERVATION_RETAINING_STATUSES) {
+        assert.ok(CLAIMING_STATUSES.includes(status), `bank side must treat a photo row in ${status} as a claim`);
+        assert.ok(MONEY_BOUNDARY_CLAIM_STATUSES.includes(status), `photo side must treat a bank row in ${status} as a claim`);
+    }
+    // …and `proposed` stays non-blocking for the photo path only (C1).
+    assert.ok(CLAIMING_STATUSES.includes("proposed"));
+    assert.equal(MONEY_BOUNDARY_CLAIM_STATUSES.includes("proposed" as never), false);
 });
 
 test("deposit class: ONLY a real customer deposit is sweepable", async t => {
@@ -951,6 +1002,53 @@ test("the claim check is CROSS-source only: two bank credits days apart still re
     const result = creditResult(body, "REF-BANK-LATER");
     assert.equal(result.status, "applied", `a second bank credit is judged on the match rules, not the claim check: ${result.reason}`);
     assert.equal(result.scheduleId, requested);
+});
+
+test("claim check: a bank row in reconcile or failed still holds its milestone, so the photo stands down", async t => {
+    for (const status of ["reconcile", "failed"]) {
+        await t.test(`bank row in ${status} blocks the photo`, async () => {
+            for (const table of Object.values(tables)) table.rows = [];
+            tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
+            tables.project.rows.push({ id: "project-1", name: "Hoppe Hall Bath", client: { name: "Hoppe" } });
+            // A DIFFERENT milestone from the one the photo would reserve: this
+            // is the hole — two sources, same deposit, two milestones.
+            seedMilestone({ amount: 7373.73, requested: false, projectName: "Hoppe Hall Bath" });
+            tables.depositIngest.rows.push({
+                id: `bank-${status}`, fileId: bankFileId(`REF-${status.toUpperCase()}`), status,
+                source: BANK_DEPOSIT_SOURCE, bankReference: `REF-${status.toUpperCase()}`, extracted: "{}",
+                attempts: 1, amountCents: 737_373, postDate: utc(SETTLED_DAY),
+                paymentScheduleId: "sched-held-elsewhere", settleStartedAt: new Date(), updatedAt: new Date(),
+            });
+
+            const { body } = await post({
+                fileId: `drive-photo-vs-${status}`, projectName: "Hoppe Hall Bath", amount: 7373.73,
+                checkDate: SETTLED_DAY, checkNumber: "8001", payerName: "Hoppe",
+            });
+            assert.equal(body.status, "unmatched", `a ${status} bank row still owns this money`);
+            assert.match(String(body.reason), /deposit sweep \(bank ref REF-/);
+            assert.match(String(body.reason), /sched-held-elsewhere/);
+            assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+        });
+
+        await t.test(`photo row in ${status} blocks the bank credit`, async () => {
+            for (const table of Object.values(tables)) table.rows = [];
+            tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
+            const requested = seedMilestone({ amount: 7474.74 });
+            assert.notEqual(requested, "sched-photo-holds");
+            tables.depositIngest.rows.push({
+                id: `photo-${status}`, fileId: `drive-file-${status}`, status, source: null,
+                extracted: "{}", attempts: 1, amountCents: 747_474, postDate: utc(SETTLED_DAY),
+                paymentScheduleId: "sched-photo-holds", settleStartedAt: new Date(), updatedAt: new Date(),
+            });
+
+            const { body } = await post(bankBatch([{ ref: `REF-VS-${status.toUpperCase()}`, amount: 7474.74 }]));
+            const result = creditResult(body, `REF-VS-${status.toUpperCase()}`);
+            assert.equal(result.status, "unmatched", `a ${status} photo row still owns this money`);
+            assert.match(String(result.reason), /deposit photo \(file drive-file-/);
+            assert.match(String(result.reason), /sched-photo-holds/);
+            assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+        });
+    }
 });
 
 test("dedup messaging, photo first: the sweep's task says the photo already applied it", async () => {

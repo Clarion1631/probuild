@@ -464,14 +464,40 @@ async function postStatement(baseUrl, secret, statement) {
 }
 
 /**
+ * Can this day be swept at all?
+ *
+ * The control total is only evidence if it comes from somewhere OTHER than the
+ * rows it checks. Deriving creditSum from the credits themselves made the
+ * endpoint's check a tautology: a day whose export dropped a deposit row would
+ * have posted a sum that matched the rows perfectly and sailed through, which
+ * is precisely the "browser automation quietly saw half a day" failure the
+ * control totals exist to catch. So a credit-bearing day with no independent
+ * TOTAL CREDITS row (BAI 100) is NOT swept.
+ *
+ * A day with no credits at all is fine either way — there is nothing to sweep,
+ * and no money can be missed by not sweeping it.
+ */
+export function canSweepDay(day) {
+    if (day.credits.length === 0) return { ok: false, reason: "no credits", failure: false };
+    if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
+        return {
+            ok: false,
+            reason: "no TOTAL CREDITS control row, sweep skipped",
+            failure: true,
+        };
+    }
+    return { ok: true };
+}
+
+/**
  * The deposit-sweep batch for ONE complete day. Pure, so the payload shape is
  * unit-testable without a network.
  *
- * creditSum is the BANK's own TOTAL CREDITS figure when the export published
- * one (buildDayStatements has already refused the file if the cleared credits
- * disagree with it), falling back to the summed rows for a day the bank left
- * the row off. The endpoint re-checks both totals and refuses the whole batch
- * on a mismatch — nothing is written for a day that cannot be vouched for.
+ * creditSum is the BANK's own TOTAL CREDITS figure, and ONLY that — there is
+ * deliberately no fallback to the summed rows (see canSweepDay).
+ * buildDayStatements has already refused the whole file if the cleared credits
+ * disagree with that figure, and the endpoint re-checks it against the rows
+ * posted, so a day that cannot be vouched for is never written.
  */
 export function buildSweepPayload(day, opts = {}) {
     const credits = day.credits.map(c => ({
@@ -482,7 +508,13 @@ export function buildSweepPayload(day, opts = {}) {
         transactionDetail: c.transactionDetail,
         customerReference: c.customerReference,
     }));
-    const creditSumCents = day.totalCreditsCents ?? credits.reduce((sum, c) => sum + Math.round(c.amount * 100), 0);
+    if (day.totalCreditsCents === null || day.totalCreditsCents === undefined) {
+        // Unreachable via sweepDay (canSweepDay gates it); a hard error rather
+        // than a quiet fallback so no future caller can reintroduce the
+        // tautology.
+        throw new Error(`day ${day.periodStart} has no TOTAL CREDITS control row — it must not be swept`);
+    }
+    const creditSumCents = day.totalCreditsCents;
     return {
         source: "bank",
         postDate: day.periodStart,
@@ -557,11 +589,19 @@ export function sweepSummaryLine(postDate, counts) {
  *   2. the buckets do not add up to the credit count, so some outcome went
  *      uncounted (an older deployment, or a status added since);
  *   3. any per-credit status outside the clean set — the raw result, not a
- *      bucket, so a status nobody has a bucket for still fails the run.
+ *      bucket, so a status nobody has a bucket for still fails the run;
+ *   4. an answer that does not account for the credits that were submitted.
+ *
+ * @param {unknown} body
+ * @param {Set<string>|null} [submittedReferences]
+ * @returns {boolean}
  */
-export function sweepBatchFailed(body) {
+export function sweepBatchFailed(body, submittedReferences = null) {
     if (!body || typeof body !== "object") return true;
-    if (body.ok === false) return true;
+    // POSITIVE confirmation only. A missing `ok` is not a pass: it means the
+    // response is not the one this runner knows how to read, and an unattended
+    // job must never treat "I could not tell" as success.
+    if (body.ok !== true) return true;
 
     const counts = body.counts;
     if (!counts || typeof counts !== "object") return true;
@@ -569,8 +609,21 @@ export function sweepBatchFailed(body) {
     if (sum !== bucket(counts, "credits")) return true;
     if (bucket(counts, "reconcile") + bucket(counts, "failed") + bucket(counts, "qboUnknown") + bucket(counts, "unresolved") > 0) return true;
 
-    for (const credit of body.credits ?? []) {
+    // The response must actually account for the credits, one by one. An empty
+    // or short array with healthy-looking counts would otherwise pass: the
+    // runner would report a clean day for credits nobody can prove were seen.
+    if (!Array.isArray(body.credits)) return true;
+    if (body.credits.length !== bucket(counts, "credits")) return true;
+    for (const credit of body.credits) {
         if (!CLEAN_SWEEP_STATUSES.includes(credit?.status)) return true;
+    }
+
+    // …and they must be the SAME credits that were submitted, not some other
+    // day's. Set equality, so a duplicate or a substitution both fail.
+    if (submittedReferences) {
+        const answered = new Set(body.credits.map(c => c?.bankReference));
+        if (answered.size !== submittedReferences.size) return true;
+        for (const ref of submittedReferences) if (!answered.has(ref)) return true;
     }
     return false;
 }
@@ -585,6 +638,14 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
     if (statement.credits.length === 0) {
         console.log(`  sweep ${postDate}: 0 credits — nothing to apply`);
         return true;
+    }
+    const sweepable = canSweepDay(statement);
+    if (!sweepable.ok && sweepable.failure) {
+        // The day HAS credits but the bank published no independent total for
+        // them, so nothing about this batch can be vouched for.
+        console.error(`  sweep ${postDate}: ${sweepable.reason}`);
+        stalled();
+        return false;
     }
     const missingRef = statement.credits.filter(c => !c.bankReference);
     if (missingRef.length > 0) {
@@ -602,8 +663,9 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
     }
 
     // Always report the whole day, whichever way it went.
+    const submitted = new Set(statement.credits.map(c => c.bankReference));
     const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
-    const failed = sweepBatchFailed(body);
+    const failed = sweepBatchFailed(body, submitted);
     (failed ? console.error : console.log)(summary);
     // Anything that is not a clean outcome gets named, including a status this
     // runner has never heard of — the catch-all is the point.
