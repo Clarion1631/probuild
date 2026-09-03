@@ -96,6 +96,27 @@ test("an object that is really gone resolves to null, not to a broken link", asy
     assert.equal(signs, 1);
 });
 
+test("resolveReceiptUrls resolves a whole list, leaving non-references alone", async () => {
+    const rows = [
+        { id: "a", receiptUrl: REF },
+        { id: "b", receiptUrl: "https://legacy.test/receipt.png" },
+        { id: "c", receiptUrl: null },
+    ];
+    const signed: string[] = [];
+    const out = await resolveReceiptUrls(rows, 600, {
+        sign: async p => { signed.push(p); return `https://signed.test/${p}`; },
+        currentPath: async () => null,
+    });
+    assert.deepEqual(out, [
+        { id: "a", receiptUrl: `https://signed.test/${PATH}` },
+        { id: "b", receiptUrl: "https://legacy.test/receipt.png" },
+        { id: "c", receiptUrl: null },
+    ]);
+    // Only the reference was ever handed to storage — the legacy URL and the
+    // null both passed straight through.
+    assert.deepEqual(signed, [PATH]);
+});
+
 test("neither leg can take a page down", async () => {
     const out = await resolveReceiptUrl(REF, 600, {
         sign: async () => { throw new Error("storage is down"); },
@@ -139,6 +160,14 @@ test("every reader resolves the reference: the booker writes it, resolveDocUrl r
     assert.match(aiReview, /storageRoot\}sign\//);
     assert.match(aiReview, /allowed\.some\(prefix => receiptUrl\.startsWith\(prefix\)\)/);
     assert.match(aiReview, /fetch\(receiptUrl, \{ redirect: "error"/);
+
+    // The bookkeeper review queue renders receiptUrl straight into an href
+    // (ReceiptQueueClient) for BOTH lists it lists — the actionable "Pending"
+    // queue and the finalized QBO-imports panel — so both must be resolved
+    // before they reach the client.
+    const managerReceipts = readFileSync(path.join(root, "src/app/manager/receipts/page.tsx"), "utf8");
+    assert.match(managerReceipts, /resolveReceiptUrls\(pendingExpenses\)/);
+    assert.match(managerReceipts, /resolveReceiptUrls\(importedExpenses\)/);
 });
 
 // ── the shared list resolver (round 21, item 5) ────────────────────────────

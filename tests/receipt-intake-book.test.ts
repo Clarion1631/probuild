@@ -100,6 +100,7 @@ function row(overrides: Partial<BookableRow> = {}): BookableRow {
         sendAttempted: false,
         fileSha256: "s".repeat(64),
         claimToken: "claim-1",
+        stateReason: null,
         ...overrides,
     };
 }
@@ -240,6 +241,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         db: tx as any,
         isPushEnabled: () => true,
         isPushPaused: async () => false,
+        isDryRunEnabled: () => false,
         getTokens: async () => ({ accessToken: "t", realmId: "r" }) as any,
         createPurchase: atCreate(async (_tokens: any, input: any) => {
             purchaseCalls.push(input);
@@ -330,7 +332,12 @@ test("a successful booking creates the Expense at the gross amount and marks the
     assert.equal(r.expenses[0].estimateId, "est-1");
     assert.equal(r.expenses[0].costCodeId, "cc-plumb", "falls back to the model's phase suggestion");
     assert.equal(r.expenses[0].qbPurchaseId, "QB-1");
-    assert.equal(r.expenses[0].status, "Pending");
+    // QBO-managed from birth — status "Reviewed" keeps it out of the
+    // bookkeeper's actionable "Pending" queue (manager/receipts/page.tsx),
+    // matching every other qbPurchaseId-bearing Expense. approve/edit/delete
+    // reject anything with a qbPurchaseId (qbo-expense-guard.ts), so leaving
+    // it "Pending" would strand it in a queue nothing can act on.
+    assert.equal(r.expenses[0].status, "Reviewed");
     assert.equal(r.expenses[0].receiptUrl, "https://drive.google.com/file/d/FILE123/view");
 
     assert.equal(r.intakeUpdates[0].state, "BOOKED");
@@ -339,6 +346,26 @@ test("a successful booking creates the Expense at the gross amount and marks the
     assert.equal(r.events[0].source, "intake-worker");
     assert.equal(r.events[0].amountCents, 36498);
     assert.equal(r.events[0].taxCents, 2920, "the tax that actually posted");
+});
+
+test("a tax-implausible warning survives into BOOKED", async () => {
+    // Codex gate: READ->BOOKING used to clear stateReason unconditionally, and
+    // BOOKED cleared it again — so an automatically booked receipt with a bad
+    // tax read became indistinguishable from one with no tax read at all.
+    const r = recorder();
+    const result = await bookReceipt(row({ stateReason: "tax-implausible" }), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.intakeUpdates[0].state, "BOOKED");
+    assert.equal(r.intakeUpdates[0].stateReason, "tax-implausible");
+});
+
+test("a transient BOOKING reason (e.g. a past defer) does NOT survive into BOOKED", async () => {
+    const r = recorder();
+    const result = await bookReceipt(row({ stateReason: "push-paused" }), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.intakeUpdates[0].stateReason, null, "only the tax warning is meant to survive");
 });
 
 test("an explicitly chosen cost code beats the model's suggestion", async () => {
@@ -408,6 +435,65 @@ test("every PRE-send refusal releases the key; every POST-send one holds it", as
     assert.equal((result as any).releaseStrongKey, false);
 });
 
+test("round-31 P0: row.sendAttempted from an EARLIER attempt survives into every needs-review path", async () => {
+    // The sequence the finding described: attempt 1 reaches QBO and commits a
+    // Purchase, but the response or the Expense tx fails, so the row parks
+    // with row.sendAttempted persisted true. Attempt 2 re-reads the row and
+    // hits a refusal that, taken on its OWN, never touched QuickBooks this
+    // time — a deleted estimate, a missing object, an ok:false decision. None
+    // of those three shapes may release the strong key: QBO may already hold
+    // a Purchase from attempt 1, and releasing it lets a resubmission mint a
+    // second one.
+
+    // 1. parkedBeforeSend — pre-send refusals reached WITHOUT this attempt
+    //    ever calling QBO, on a row that already sent once.
+    for (const [rowOverrides, reason] of [
+        [{ projectId: null }, "no-estimate"],
+        [{ totalCents: 0 }, "refund-or-zero"],
+        [{ txnDate: null }, "invalid-date"],
+    ] as const) {
+        const r = recorder();
+        const result = await bookReceipt(row({ ...rowOverrides, sendAttempted: true }), r.deps);
+        assert.deepEqual(
+            result,
+            { outcome: "needs-review", reason, releaseStrongKey: false },
+            `${reason}: an earlier attempt may already hold a Purchase`,
+        );
+        assert.equal(r.purchaseCalls.length, 0, reason);
+    }
+
+    // The exact scenario named in the finding: the project's estimate was
+    // deleted between attempt 1 and attempt 2.
+    const deletedEstimate = recorder({}, { estimates: [] });
+    assert.deepEqual(
+        await bookReceipt(row({ sendAttempted: true }), deletedEstimate.deps),
+        { outcome: "needs-review", reason: "no-estimate", releaseStrongKey: false },
+    );
+
+    // Also named in the finding: the receipt object has since gone missing.
+    const missingObject = recorder({ downloadBytes: async () => ({ ok: false, kind: "missing" }) });
+    assert.deepEqual(
+        await bookReceipt(row({ sendAttempted: true }), missingObject.deps),
+        { outcome: "needs-review", reason: "receipt-bytes-missing", releaseStrongKey: false },
+    );
+
+    // 2. The terminal catch — THIS attempt throws before ever reaching the
+    //    create hook (sent.attempted stays false), but the row already sent.
+    const preCreateFault = recorder({ createPurchase: async () => { throw new QboVendorDuplicateError("Lowes"); } });
+    assert.deepEqual(
+        await bookReceipt(row({ sendAttempted: true }), preCreateFault.deps),
+        { outcome: "needs-review", reason: "qbo-fault:vendor-duplicate", releaseStrongKey: false },
+    );
+
+    // 3. ok:false — a deterministic refusal decided before qbCreateFn runs on
+    //    THIS attempt, but the row already sent on an earlier one.
+    const okFalse = recorder({ createPurchase: async () => ({ ok: false, reason: "missing-vendor" }) as any });
+    assert.deepEqual(
+        await bookReceipt(row({ sendAttempted: true }), okFalse.deps),
+        { outcome: "needs-review", reason: "qbo-fault:missing-vendor", releaseStrongKey: false },
+    );
+});
+
 test("the push kill switch and the pause switch defer without spending an attempt", async () => {
     const disabled = recorder({ isPushEnabled: () => false });
     assert.deepEqual(await bookReceipt(row(), disabled.deps), { outcome: "deferred", reason: "push-disabled" });
@@ -425,6 +511,17 @@ test("a dryRun row can never reach QuickBooks, even called directly", async () =
     const r = recorder();
     const result = await bookReceipt(row({ dryRun: true }), r.deps);
     assert.equal(result.outcome, "deferred");
+    assert.equal(r.purchaseCalls.length, 0);
+    assert.equal(r.expenses.length, 0);
+});
+
+test("the global kill switch stops a row even when its persisted flag says live", async () => {
+    // A row's dryRun flag is snapshotted once at intake, so it is not itself a
+    // kill switch: reverting RECEIPT_INTAKE_DRYRUN after rows were already
+    // claimed dryRun=false must still stop them from reaching QuickBooks.
+    const r = recorder({ isDryRunEnabled: () => true });
+    const result = await bookReceipt(row({ dryRun: false }), r.deps);
+    assert.deepEqual(result, { outcome: "deferred", reason: "push-disabled" });
     assert.equal(r.purchaseCalls.length, 0);
     assert.equal(r.expenses.length, 0);
 });

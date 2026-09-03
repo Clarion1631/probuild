@@ -14,6 +14,8 @@ import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/rec
 import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
 import {
+    decideSource,
+    MACHINE_SOURCES,
     MAX_INLINE_JSON_BYTES,
     MAX_INLINE_UPLOAD_BYTES,
     MAX_STORED_BYTES,
@@ -50,21 +52,6 @@ export const maxDuration = 30;
  * src/lib/receipt-intake/worker.ts. That is the ONLY thing that changes a
  * row's dryRun after intake.
  */
-
-/**
- * Sources a SHARED-SECRET forwarder may declare. A human caller can never pick
- * one of these: `source` is provenance, and a browser asserting "this came from
- * the Drive folder" is a claim it has no standing to make. It also feeds
- * booking identity — `drive` rows book under the Drive fileId so the DocNumber
- * stays continuous with v1 — so a forged `source` could aim a Purchase at
- * another document's idempotency key.
- */
-const MACHINE_SOURCES = new Set(["drive", "email", "chat"]);
-/** Minted server-side from the authenticated caller, never read off the body. */
-const USER_SOURCES = new Set(["mobile", "web"]);
-
-/** Client-supplied idempotency tokens must be real UUIDs — never a free-text key. */
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 interface ParsedBody {
     bytes: Buffer;
@@ -210,47 +197,29 @@ export async function POST(req: Request) {
     const mimeType = sniffMime(parsed.bytes, parsed.declaredMime);
     if (!mimeType) return unsupportedType(parsed.declaredMime);
 
-    // PROVENANCE AND IDENTITY ARE NOT CALLER INPUT for a human.
-    //
-    // A shared-secret forwarder owns both: its `sourceRef` is the only reason a
-    // replay is free, and its `source` is a fact it genuinely knows (which
-    // folder, which mailbox). A session or Bearer caller knows neither. Letting
-    // one pass `source: "drive"` plus a chosen `sourceRef` would let it claim
-    // another document's idempotency key — and `drive` rows book under the
-    // Drive fileId, so that key is what a QBO DocNumber is derived from.
-    let source: string;
-    let sourceRef: string;
-    if (auth.via === "secret") {
-        if (!MACHINE_SOURCES.has(parsed.source)) return bad("invalid-source");
-        if (!parsed.sourceRef) return bad("missing-sourceRef");
-        // The ref must live in the namespace the caller declared. Without this
-        // a chat forwarder could write `drive:<fileId>` and collide with — or
-        // pre-empt — the Drive pipeline's key for a file it does not own, and
-        // `drive` rows are the ones that book under the Drive fileId, i.e. the
-        // QBO DocNumber.
-        if (!parsed.sourceRef.startsWith(`${parsed.source}:`)) return bad("sourceRef-namespace-mismatch");
-        source = parsed.source;
-        sourceRef = parsed.sourceRef;
-    } else {
-        source = auth.userVia === "mobile-jwt" ? "mobile" : "web";
-        if (parsed.source && parsed.source !== source) return bad("invalid-source");
-        // A RAW sourceRef stays forbidden — provenance is not caller input.
-        if (parsed.sourceRef) return bad("sourceRef-not-allowed");
+    // Computed BEFORE decideSource, not just before the insert: a session/
+    // mobile caller with no uploadId is scoped by this hash, so decideSource
+    // needs it to mint a STABLE key rather than a random one.
+    const fileSha256 = createHash("sha256").update(parsed.bytes).digest("hex");
 
-        // But a phone on a bad connection needs SOME way to retry safely: a
-        // minted uuid makes every retry a new document, so a crew member who
-        // taps Send twice on a spinner books the same receipt twice. `uploadId`
-        // is the client's own idempotency token, and it is SCOPED TO THE USER
-        // server-side — two people cannot collide on the same uuid, and one
-        // user cannot reach another's row by guessing one.
-        if (parsed.uploadId) {
-            if (!UUID_PATTERN.test(parsed.uploadId)) return bad("invalid-uploadId");
-            sourceRef = `${source}:${auth.user.id}:${parsed.uploadId.toLowerCase()}`;
-        } else {
-            sourceRef = `${source}:${randomUUID()}`;
-        }
-    }
-    if (!USER_SOURCES.has(source) && !MACHINE_SOURCES.has(source)) return bad("invalid-source");
+    // PROVENANCE AND IDENTITY ARE NOT CALLER INPUT for a human, and the rules
+    // are decideSource()'s — THE SAME FUNCTION /start calls, not a copy.
+    //
+    // This block used to be a hand-written twin of it, and it had drifted in
+    // two ways that mattered: it checked the global MACHINE_SOURCES set instead
+    // of the sources THIS key owns (`auth.allowedSources`), and it validated
+    // only the namespace prefix, so `drive:` with an empty tail was accepted as
+    // a permanent, unique idempotency key that every later empty-tail forward
+    // then collided with. A forwarder reaching the two endpoints must not be
+    // able to tell them apart.
+    const decided = decideSource(auth, {
+        source: parsed.source,
+        sourceRef: parsed.sourceRef,
+        uploadId: parsed.uploadId,
+        checksum: fileSha256,
+    });
+    if (!decided.ok) return bad(decided.reason);
+    const { source, sourceRef } = decided;
 
     // A session/Bearer caller may only file against a project they can reach.
     // The secret caller is a trusted forwarder resolving the project from the
@@ -271,7 +240,6 @@ export async function POST(req: Request) {
     const id = randomUUID();
     const ext = EXT_BY_MIME[mimeType] ?? "bin";
     const storagePath = `receipts/intake/${id}.${ext}`;
-    const fileSha256 = createHash("sha256").update(parsed.bytes).digest("hex");
 
     // ROW FIRST, THEN THE OBJECT.
     //
@@ -382,11 +350,25 @@ export async function POST(req: Request) {
             );
         }
 
-        // Row deletion failure is SURFACED, not swallowed: the caller's retry
-        // would otherwise hit a sourceRef conflict against a row it was told
-        // did not exist.
+        // Row deletion is FENCED on state+path, NOT a bare delete by id.
+        //
+        // A concurrent replay carrying the same sourceRef can find this exact
+        // row via respondToSourceRefConflict, upload to ITS OWN path, and
+        // publish it — all while THIS request's upload is still failing. An
+        // unconditional `delete({ where: { id } })` would then destroy that
+        // now-RECEIVED row. The delete is a no-op unless the row is still
+        // exactly what THIS request created: still STAGING, still pointing at
+        // the path THIS request uploaded (or tried to upload) to.
+        //
+        // Failure to delete is still SURFACED, not swallowed: the caller's
+        // retry would otherwise hit a sourceRef conflict against a row it was
+        // told did not exist.
+        let deletedCount: number;
         try {
-            await prisma.receiptIntake.delete({ where: { id } });
+            const result = await prisma.receiptIntake.deleteMany({
+                where: { id, state: "STAGING", storagePath },
+            });
+            deletedCount = result.count;
         } catch (deleteError) {
             console.error("[receipts/intake] row delete failed after an ambiguous upload", id, deleteError);
             return NextResponse.json(
@@ -394,11 +376,31 @@ export async function POST(req: Request) {
                 { status: 503 },
             );
         }
+        if (deletedCount === 0) {
+            // Somebody else already moved this row on — most likely a
+            // concurrent replay published it via respondToSourceRefConflict's
+            // healing path. That is the outcome the caller wanted, even
+            // though THIS attempt's own upload failed, so report on what the
+            // row actually is now rather than a failure that no longer holds.
+            const current = await prisma.receiptIntake
+                .findUnique({
+                    where: { id },
+                    select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
+                })
+                .catch(() => null);
+            if (current?.state === "RECEIVED") {
+                return NextResponse.json({ ok: true, ...current, alreadyPublished: true });
+            }
+            return NextResponse.json(
+                { ok: false, reason: "publish-conflict", id, state: current?.state ?? "gone" },
+                { status: 409 },
+            );
+        }
         console.error("[receipts/intake] upload failed", uploadFailed);
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
     }
 
-    return publishStagedRow(id);
+    return publishStagedRow(id, storagePath);
 }
 
 /**
@@ -416,20 +418,37 @@ export async function POST(req: Request) {
 const storeObject = (storagePath: string, bytes: Buffer, mimeType: string) =>
     uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true });
 
-async function publishStagedRow(id: string, expectState = "STAGING"): Promise<NextResponse> {
+async function publishStagedRow(id: string, expectStoragePath: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
-        // EXACT-state CAS. `update` by id alone would publish a row that had
-        // since moved on — a booked row dragged back to RECEIVED and re-read,
-        // which is a second Purchase waiting to happen.
+        // EXACT-state, EXACT-path CAS. `update` by id and state alone would
+        // publish a row that had since moved on in a way that still matched
+        // `expectState` — a row re-armed onto a NEW upload path by a
+        // concurrent /start (or a heal in respondToSourceRefConflict) is
+        // still STAGING, but the object THIS caller verified is no longer
+        // the one the row points at. Publishing anyway would either point a
+        // RECEIVED row at bytes nobody uploaded, or (worse) race a second
+        // publisher onto the same state with two different ideas of which
+        // object is now canonical. Pinning storagePath makes that update
+        // match zero rows instead.
         const { count } = await prisma.receiptIntake.updateMany({
-            where: { id, state: expectState },
+            where: { id, state: expectState, storagePath: expectStoragePath },
             data: { state: "RECEIVED" },
         });
         if (count === 0) {
             const current = await prisma.receiptIntake.findUnique({
                 where: { id },
-                select: { state: true },
+                select: { state: true, storagePath: true },
             });
+            // Somebody else won the publish race. If the winner's row now
+            // points somewhere OTHER than the path THIS call expected, the
+            // object THIS call verified/uploaded is unreferenced by any row —
+            // concurrent same-byte replays each upload to their own random
+            // path (see /start), so nothing else will ever find this one to
+            // clean it up. Do it now, before reporting the idempotent outcome
+            // the loser is about to return.
+            if (current?.storagePath && current.storagePath !== expectStoragePath) {
+                await deleteObjectOrRecord(expectStoragePath, "orphaned-by-concurrent-publish");
+            }
             // Somebody else published it; that is the outcome the caller wanted.
             if (current?.state === "RECEIVED") {
                 return NextResponse.json({ ok: true, id, state: "RECEIVED", alreadyPublished: true });
@@ -586,7 +605,7 @@ async function respondToSourceRefConflict(
 
     // The object is there. A STAGING row means the previous request uploaded
     // successfully and only its publish UPDATE failed — finish it.
-    if (existing.state === "STAGING") return publishStagedRow(existing.id);
+    if (existing.state === "STAGING") return publishStagedRow(existing.id, existing.storagePath);
 
     return NextResponse.json({
         ok: true,

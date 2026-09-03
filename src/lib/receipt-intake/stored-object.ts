@@ -73,6 +73,20 @@ export interface SealPublishDeps {
     commit: (canonicalPath: string, check: { mimeType: string; fileSize: number; fileSha256: string }) => Promise<number>;
     /** Best-effort, AFTER the commit. Records a cleanup event on failure. */
     dropUpload: (uploadPath: string) => Promise<void>;
+    /**
+     * Consulted ONLY when the commit CAS is lost, to tell apart the two
+     * reasons that can happen. Returns wherever the row's storagePath points
+     * RIGHT NOW.
+     */
+    currentStoragePath: (rowId: string) => Promise<string | null>;
+    /**
+     * Best-effort, AFTER a lost commit CAS, and ONLY when the winner is
+     * proven to be pointing somewhere else (see below). Same shape as
+     * dropUpload — a separate dependency so each caller can record its own
+     * reason for the cleanup queue rather than reusing "sealed", which would
+     * describe the wrong event.
+     */
+    dropOrphanedCanonical: (canonicalPath: string) => Promise<void>;
 }
 
 export async function sealAndPublish(
@@ -86,13 +100,39 @@ export async function sealAndPublish(
     if (!sealed) return null;
 
     const moved = await deps.commit(canonicalPath, check);
-    // Only once the row points at the sealed copy is the upload object safe to
-    // remove — and only if we are the one who moved the row. A publisher that
-    // lost the CAS must not delete an object the winner may still be using.
-    if (moved > 0 && uploadPath !== canonicalPath) {
-        await deps.dropUpload(uploadPath);
+    if (moved > 0) {
+        // Only once the row points at the sealed copy is the upload object
+        // safe to remove — and only if we are the one who moved the row. A
+        // publisher that lost the CAS must not delete an object the winner
+        // may still be using.
+        if (uploadPath !== canonicalPath) await deps.dropUpload(uploadPath);
+        return { published: true, canonicalPath };
     }
-    return { published: moved > 0, canonicalPath };
+
+    // LOST THE CAS. Some other publish already moved the row — but "moved it
+    // where" is the whole question, and it splits into two very different
+    // cases:
+    //
+    //   - the row's storagePath is THIS exact canonicalPath: another
+    //     publisher raced this one on the SAME content (same rowId, same
+    //     bytes, same sha256 -> the identical content-addressed path — a
+    //     double /finalize, or /finalize racing the sweep on one row). The
+    //     object this call just sealed IS the object the winner committed;
+    //     deleting it would destroy what the winner is now pointing at.
+    //   - anything else: the winner published a DIFFERENT object — a
+    //     re-armed upload landed different bytes in the gap between this
+    //     call's read and its commit — and the copy THIS call sealed is an
+    //     orphan nothing will ever find on its own. It is not a STAGING row
+    //     any more (the winner moved it), so the stale-STAGING sweep will
+    //     never look at it again, and it would sit in the bucket forever.
+    //
+    // A failed lookup answers "don't know" as the first case: never delete
+    // on uncertainty about what the winner is using.
+    const winnerPath = await deps.currentStoragePath(rowId).catch(() => canonicalPath);
+    if (winnerPath !== canonicalPath) {
+        await deps.dropOrphanedCanonical(canonicalPath).catch(() => undefined);
+    }
+    return { published: false, canonicalPath };
 }
 
 export async function downloadVerified(

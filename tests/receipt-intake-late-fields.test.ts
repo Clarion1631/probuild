@@ -314,9 +314,23 @@ test("losing the publish CAS on a STAGING row is a conflict, NOT alreadyFinalize
     // acts on: the forwarders drop their copy of a receipt they are told we hold.
     const branch = FINALIZE.slice(FINALIZE.indexOf("if (!outcome.published)"));
     const body = branch.slice(0, branch.indexOf("alreadyFinalized"));
-    assert.match(body, /current\.state === "STAGING"/);
+    assert.match(body, /current\.state !== "STAGING"/);
     assert.match(body, /publish-conflict/);
     assert.match(body, /status: 409/);
+});
+
+test("losing the publish CAS demands POSITIVE evidence another publish landed THIS content, not just a non-STAGING state", () => {
+    // A concurrent /start rearm can move a recoverable NEEDS_REVIEW row onto a
+    // fresh upload lease without ever publishing it — "state !== STAGING" alone
+    // cannot tell that apart from a genuine second publisher. Only the row's
+    // canonical path (named after id+sha+mime, and writable ONLY by a
+    // successful sealAndPublish commit) landing on exactly what THIS call
+    // itself verified is proof.
+    const branch = FINALIZE.slice(FINALIZE.indexOf("if (!outcome.published)"));
+    const body = branch.slice(0, branch.indexOf("alreadyFinalized"));
+    assert.match(body, /current\.storagePath === outcome\.canonicalPath/);
+    assert.match(body, /current\.fileSha256 === fileSha256/);
+    assert.match(body, /positivelyPublished/);
 });
 
 // ── Revocation has to bite on the row's OWN project (Phase 3 gate) ──────────

@@ -42,12 +42,30 @@ export async function resolveCutoverBoundary(): Promise<Date | null> {
     return parseCutoverBoundary(raw ?? process.env.CUTOVER_V1_STOPPED_AT);
 }
 
+// Full RFC3339 date-time with a REQUIRED offset (`Z` or `±HH:MM`). `new
+// Date()`/`Date.parse()` also accept date-only strings ("2026-09-01", read as
+// UTC midnight) and naive local-time strings ("2026-09-01T10:00:00", read in
+// the SERVER's local zone) and even ambiguous formats ("9/1/2026") — every one
+// of those silently shifts the boundary by hours depending on where the
+// process runs, which either retires rows v1 never booked or lets a
+// v1-booked row slip through to be double-booked by v2. An explicit offset is
+// the only representation that names one unambiguous instant.
+const RFC3339_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
+
 /** Pure, so the parsing rules are testable without a database. */
 export function parseCutoverBoundary(value: string | null | undefined): Date | null {
     if (!value || !value.trim()) return null;
-    const at = new Date(value.trim());
-    if (!Number.isFinite(at.getTime())) return null;
-    return at;
+    const trimmed = value.trim();
+    if (!RFC3339_WITH_OFFSET.test(trimmed)) {
+        console.error(
+            "[cutover] boundary must be a full RFC3339 timestamp with an explicit Z or ±HH:MM offset " +
+            `(e.g. "2026-08-25T17:30:00Z") — rejecting ambiguous value: ${JSON.stringify(trimmed)}`,
+        );
+        return null;
+    }
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) return null;
+    return new Date(ms);
 }
 
 /** One parked shadow row, as the cutover sees it. */

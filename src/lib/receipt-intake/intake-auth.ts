@@ -92,19 +92,30 @@ export async function authenticateIntake(
         const ingest = process.env.RECEIPT_INTAKE_SECRET;
         const archive = process.env.RECEIPT_ARCHIVE_SECRET;
 
+        // THE TWO-SECRET INVARIANT MUST HOLD REGARDLESS OF WHAT WAS PRESENTED.
+        //
+        // Both secrets configured, non-empty, and distinct — checked BEFORE any
+        // compare against `provided`. Checking it only by way of "both matched
+        // the same value" (the old shape) missed the far more likely
+        // misconfiguration: just ONE var set (a rotation half-done, a preview
+        // env missing a copy-paste). With only RECEIPT_INTAKE_SECRET set,
+        // `secretMatches(provided, archive)` is false for every input — not
+        // because the caller lacks the archive key, but because there IS no
+        // archive key — so a caller holding the ingest secret sailed through
+        // untouched while the archive program was silently unreachable by
+        // anyone AND the ingest key was one env-var away from also being
+        // accepted as the archive key the moment someone filled it in wrong.
+        if (!ingest || !archive || ingest === archive) {
+            console.error("[receipts/intake] RECEIPT_INTAKE_SECRET / RECEIPT_ARCHIVE_SECRET misconfigured (missing or identical) — refusing every secret-authenticated request");
+            return { ok: false, response: unauthorized() };
+        }
+
         // Both compares always run: short-circuiting on the first match would
         // make the response time depend on WHICH key was presented.
         const isIngest = secretMatches(provided, ingest);
         const isArchive = secretMatches(provided, archive);
 
         if (!isIngest && !isArchive) return { ok: false, response: unauthorized() };
-
-        // A single value configured for both variables is a misconfiguration
-        // that would silently re-merge the two capabilities. Refuse it.
-        if (isIngest && isArchive) {
-            console.error("[receipts/intake] RECEIPT_INTAKE_SECRET and RECEIPT_ARCHIVE_SECRET are identical");
-            return { ok: false, response: unauthorized() };
-        }
 
         const capability: IntakeCapability = isIngest ? "ingest" : "archive";
         if (capability !== need) return { ok: false, response: wrongCapability(capability, need) };

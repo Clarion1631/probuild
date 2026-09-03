@@ -149,6 +149,25 @@ export function routeState(read: RouteInput, dedupHits: DedupHits, hasProject: b
 }
 
 /**
+ * The one dropped-tax-reading marker the reader appends to `stateReason` (see
+ * worker.ts's `note()`), separate from every other value that column carries
+ * (park reasons, weak-dup pointers, defer reasons). It must survive
+ * transitions that otherwise clear or overwrite `stateReason` on the way to
+ * BOOKED — an automatically booked receipt with a bad tax read must stay
+ * distinguishable from one with no tax read at all.
+ */
+export const TAX_IMPLAUSIBLE_REASON = "tax-implausible";
+
+/**
+ * Pull the tax-implausible marker back out of a `stateReason`, discarding
+ * anything else it may currently hold (a defer reason like "push-paused" must
+ * NOT ride along into BOOKED — only this one warning is meant to survive).
+ */
+export function preservedTaxWarning(stateReason: string | null | undefined): string | null {
+    return (stateReason ?? "").split(";").includes(TAX_IMPLAUSIBLE_REASON) ? TAX_IMPLAUSIBLE_REASON : null;
+}
+
+/**
  * Retry backoff for the booking step: attempts 1 gives 5m, 2 gives 15m,
  * 3 gives 1h, 4+ gives 6h. Exported here (rather than in book.ts) so the
  * schedule is testable without pulling QuickBooks into the test process.

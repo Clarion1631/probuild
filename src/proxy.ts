@@ -67,58 +67,43 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // Play specifically requires a public account-deletion URL.
 const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|api\/receipts\/intake\/?$|api\/receipts\/intake\/start\/?$|api\/receipts\/intake\/[^/]+\/(?:archived|finalize)\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
-// The legal pages are static server components that define no Server Actions.
-// Next's action IDs are global, so a bypassed path is a place an anonymous caller
-// could POST a `next-action` header for someone else's action; the portal routes
-// accept that tradeoff because they genuinely have anonymous actions, these don't.
-const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
-
-// The receipt-intake machine endpoints are route handlers that define no Server
-// Actions, and their ONLY gate is an in-handler `x-receipt-intake-secret` check.
-// That check never runs for an action dispatch: Next's action IDs are global, so
-// a `next-action` POST on a bypassed path invokes SOMEONE ELSE'S action and
-// never reaches this route's code at all. The stale-cookie guard above does not
-// cover it either — a machine caller carries no session cookie, so it takes the
-// anonymous path straight into the bypass.
+// WHICH PATHS MAY DISPATCH A SERVER ACTION WITHOUT A SESSION.
 //
-// Same reasoning as LEGAL_PAGE_PATTERN, and the same conclusion: bypassing the
-// proxy is never allowed to also mean bypassing the Server Action boundary. The
-// portal/api routes above accept that tradeoff because they genuinely have
-// anonymous actions; these do not.
+// Next's action IDs are GLOBAL: a `next-action` POST carries the id of the
+// action to run, and the path it is sent to only decides which route's
+// middleware and layout run first. So an anonymous action dispatch aimed at ANY
+// path that skips the proxy invokes whatever action that id names — the route's
+// own gate (a shared secret in a handler, a token check in a page) never runs,
+// because the request never reaches the handler at all.
 //
-// Exact match, mirroring the bypass entries themselves — a descendant that is
-// NOT bypassed still hits withAuth and needs no special case here.
-// NOTE on the matcher (bottom of this file): its FIRST entry is
-// `{ source: "/:path*", has: [{ type: "header", key: "next-action" }] }`, which
-// routes EVERY next-action request through this proxy regardless of path — the
-// exclusion list in the second entry does not apply to them. So these paths were
-// already reaching the code below; what waved them through was
-// PUBLIC_PROXY_BYPASS_PATTERN returning next() before any action check ran.
-// Widening this pattern is therefore the whole fix, and the matcher is left
-// alone: adding /api/cron, /api/webhook and friends to it would put middleware
-// (including a DB-touching staff lookup) in front of every ordinary webhook and
-// cron request, which is real latency and a new failure point on a hot path,
-// for no additional protection.
+// This was previously a DENYLIST (legal pages + machine endpoints), which is the
+// wrong shape for a global namespace: every public-bypass path nobody thought to
+// list — /api/auth, /api/mobile, /api/pdf/*, /login, /share/*, the static asset
+// patterns — was a live anonymous action dispatcher. An allowlist inverts the
+// default, so a new public path is closed until someone opens it deliberately.
 //
-// Deliberately NOT here: api/portal, api/payments, api/sub-portal and
-// api/selections/*. Those genuinely serve anonymous Server Actions — that is the
-// tradeoff their bypass exists for, and 403ing them would break the client
-// portal.
-const MACHINE_ENDPOINT_PATTERN = new RegExp(
-    "^\/api\/(?:" + [
-        // Receipt Pipeline v2 — secret/Bearer in the handler, exact paths.
-        "receipts\/intake(?:\/start|\/[^/]+\/(?:archived|finalize))?",
-        // Cron: Bearer CRON_SECRET, checked in each route.
-        "cron\/[^?]*",
-        // Machine-to-machine ingest: each carries its own shared secret.
-        "integrations\/[^?]*",
-        // Stripe / Twilio: signature-verified, never session-authenticated.
-        "webhook(?:s)?\/[^?]*",
-        "twilio\/[^?]*",
-        // Ops probe: Bearer CRON_SECRET or a staff session, checked in-route.
-        "health\/pipeline",
-    ].join("|") + ")\/?$",
-);
+// The list is the OUTPUT OF AN AUDIT, not a guess. Grepping the anonymous route
+// trees for server-action imports invoked from their client components:
+//
+//   /portal/**      — approveEstimate, approveContract, approveChangeOrder,
+//                     markEstimateViewed / markInvoiceViewed / markContractViewed,
+//                     createDecision, submitSelectionProposal, portalCreateMoodBoard,
+//                     setPortalStageOverride, addTaskCommentAsSub, ... Each
+//                     authorizes on its own client/token check inside the action.
+//   /sub-portal/**  — subPortalUploadCOI and the sub sign-in flow.
+//
+// Audited and deliberately NOT here, because they define and dispatch none:
+//   /login          — next-auth `signIn()`, which is a plain POST to
+//                     /api/auth/*, not an action dispatch.
+//   /share/**       — a server component that reads Prisma directly; its one
+//                     client child (ShareStudio) imports no actions.
+//   /privacy, /terms, /account-deletion, /support — static legal pages.
+//   /api/**         — route handlers. Next dispatches an action to the URL the
+//                     client is ON (a page), never to an API route, so no
+//                     legitimate dispatch is aimed at one. That includes the
+//                     machine endpoints whose only gate lives in the handler,
+//                     and the mobile/PDF/auth routes.
+const ANONYMOUS_SERVER_ACTION_PATHS = /^\/(?:portal|sub-portal)(?:\/|$)/;
 
 // Test-only action dispatchers that get the proxy bypass below. Explicit, not a
 // prefix match: the proxy checks only the environment gates, never the route's
@@ -209,14 +194,17 @@ export default async function proxy(req: any, event: any) {
         return NextResponse.next();
     }
 
-    // Legal pages are readable by anyone but are not an action endpoint.
-    if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
-        return new NextResponse("Forbidden", { status: 403 });
-    }
-
-    // Neither are the machine endpoints, whose only gate lives in the handler
-    // that an action dispatch never reaches.
-    if (isServerAction && typeof pathname === "string" && MACHINE_ENDPOINT_PATTERN.test(pathname)) {
+    // AN ANONYMOUS ACTION DISPATCH IS REFUSED UNLESS THE PATH IS ALLOWLISTED,
+    // and this runs BEFORE the public bypass — the bypass returning next() ahead
+    // of any action check is exactly what made every public path a dispatcher.
+    //
+    // A request carrying a session cookie has already been through the staff
+    // check above, so this is only about anonymous ones.
+    if (
+        isServerAction
+        && !hasNextAuthSessionCookie(req)
+        && !(typeof pathname === "string" && ANONYMOUS_SERVER_ACTION_PATHS.test(pathname))
+    ) {
         return new NextResponse("Forbidden", { status: 403 });
     }
 

@@ -2,11 +2,24 @@ export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
+import { resolveReceiptUrls } from "@/lib/receipt-intake/receipt-url";
+import { STAFF_READ_ROLES } from "@/lib/receipt-intake/intake-auth";
 import ReceiptQueueClient from "./ReceiptQueueClient";
 
 export default async function BookkeeperReceiptsPage() {
     const session = await getSessionOrDev();
     if (!session?.user) redirect("/login");
+
+    // Same role gate as the GET /api/receipts/intake staff-queue read
+    // (STAFF_READ_ROLES): this page queries Expense directly and mints
+    // short-lived signed URLs for every receipt, so a session check alone let
+    // ANY logged-in role — not just ADMIN/MANAGER/FINANCE — browse the
+    // bookkeeper queue and its receipt images. Deny-by-default: no matching
+    // User (outside local dev) is not staff.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email! } });
+    if (!user ? process.env.NODE_ENV !== "development" : !STAFF_READ_ROLES.includes(user.role)) {
+        return <div className="p-8 text-red-500">Access Denied. Bookkeeping staff only.</div>;
+    }
 
     const [
         pendingExpenses,
@@ -59,6 +72,15 @@ export default async function BookkeeperReceiptsPage() {
         }),
     ]);
 
+    // `receiptUrl` is a stable `receipt-intake://` REFERENCE for anything the
+    // v2 pipeline booked (book.ts), not a link — the client renders it
+    // straight into an `href`, so it must be a short-lived signed URL by the
+    // time it gets there. A legacy absolute URL passes through unchanged.
+    const [resolvedPendingExpenses, resolvedImportedExpenses] = await Promise.all([
+        resolveReceiptUrls(pendingExpenses),
+        resolveReceiptUrls(importedExpenses),
+    ]);
+
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
             <div>
@@ -82,8 +104,8 @@ export default async function BookkeeperReceiptsPage() {
             </div>
 
             <ReceiptQueueClient
-                expenses={JSON.parse(JSON.stringify(pendingExpenses))}
-                importedExpenses={JSON.parse(JSON.stringify(importedExpenses))}
+                expenses={JSON.parse(JSON.stringify(resolvedPendingExpenses))}
+                importedExpenses={JSON.parse(JSON.stringify(resolvedImportedExpenses))}
                 importedExpenseCount={importedExpenseCount}
                 projects={projects}
                 costCodes={costCodes}

@@ -7,6 +7,7 @@ import {
     QboAccountConfigError,
     QboVendorDuplicateError,
     QboPurchaseFaultError,
+    stableAttachmentFileName,
     type CreateQBReceiptPurchaseInput,
     type QboReceiptProjectCandidate,
     type QboReceiptPushDependencies,
@@ -867,7 +868,9 @@ test("already-exists uploads the receipt when the lost first attempt never attac
     });
     // Still idempotent on the books: no second Purchase.
     assert.equal(calls.creates.length, 0);
-    assert.deepEqual(uploads, [{ purchaseId: "99", fileName: "receipt.jpg" }]);
+    assert.deepEqual(uploads, [
+        { purchaseId: "99", fileName: stableAttachmentFileName(input.fileId, input.fileName) },
+    ]);
 });
 
 test("already-exists does NOT re-upload when the deterministic filename is already attached", async () => {
@@ -876,7 +879,7 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
     let uploadCount = 0;
     const { deps } = createDeps({
         existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
-        attachableRows: [attachableRow("99", "receipt.jpg")],
+        attachableRows: [attachableRow("99", stableAttachmentFileName(input.fileId, input.fileName))],
         uploadAttachment: async () => {
             uploadCount += 1;
             return "attached";
@@ -887,6 +890,31 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
 
     assert.equal(result.ok && result.alreadyExists && result.attachment, "already-attached");
     assert.equal(uploadCount, 0, "an existing attachment must never be duplicated");
+});
+
+test("already-exists does NOT treat an unrelated receipt's identical caller-chosen filename as a match", async () => {
+    // Two different receipts, both uploaded by a phone that names every photo
+    // "receipt.jpg" — the exact collision stableAttachmentFileName exists to
+    // prevent. The Attachable on file belongs to a DIFFERENT fileId, so it
+    // must never be read as "this receipt is already attached".
+    const input = baseInput({ ...FILE_INPUT, fileId: "totally-different-receipt-id" });
+    const marker = `[gtr-file:${input.fileId}]`;
+    let uploadCount = 0;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        // Same caller-chosen "FileName" as the unrelated receipt would have
+        // produced under the old naive scheme, but it is not OUR stable name.
+        attachableRows: [attachableRow("99", "receipt.jpg")],
+        uploadAttachment: async () => {
+            uploadCount += 1;
+            return "attached";
+        },
+    });
+
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok && result.alreadyExists && result.attachment, "attached");
+    assert.equal(uploadCount, 1, "an unrelated same-name attachment must not short-circuit the real upload");
 });
 
 test("already-exists ignores an Attachable that belongs to a different entity type", async () => {

@@ -17,7 +17,7 @@ import {
 } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
-import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
+import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
@@ -36,6 +36,7 @@ import {
     type ClaimResult,
     type CutoverRequest,
     isUniqueViolation,
+    readBudgetFor,
     runIntakeWorker,
     uploadLeaseActive,
     type ReadPatch,
@@ -77,7 +78,7 @@ const WORKER_ROW_SELECT = {
     taxAtSource: true, installedAtCustomer: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
-    createdAt: true, dedupWeakKey: true, busyPasses: true,
+    createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
 } as const;
 
 /**
@@ -263,34 +264,50 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             }
         }
 
+        const ELIGIBLE: Prisma.ReceiptIntakeWhereInput = {
+            // STAGING is absent on purpose: the row exists but its object
+            // does not, so claiming it would park a good receipt as
+            // "file-missing". sweepStaleStaging is what watches those.
+            state: { in: ["RECEIVED", "READ", "BOOKING"] },
+            OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+            ...NOT_DRY_RUN_PARKED,
+        };
+
         const due = await tx.receiptIntake.findMany({
-            where: {
-                // STAGING is absent on purpose: the row exists but its object
-                // does not, so claiming it would park a good receipt as
-                // "file-missing". sweepStaleStaging is what watches those.
-                state: { in: ["RECEIVED", "READ", "BOOKING"] },
-                OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-                ...NOT_DRY_RUN_PARKED,
-            },
+            where: ELIGIBLE,
             orderBy: { createdAt: "asc" },
             take: BATCH_SIZE,
-            select: WORKER_ROW_SELECT,
+            select: { id: true },
         });
         if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
 
-        // THE claim. Anything this run took is invisible to the next one for
-        // the lease, whether or not the advisory lock held — AND it is stamped
-        // with a fresh token, so a completing write can prove it still owns the
-        // row rather than merely having owned it once.
+        // THE claim is ATOMIC with the select it followed: the UPDATE re-checks
+        // the SAME eligibility predicate rather than blindly writing every id
+        // the SELECT returned. Between those two statements — even inside this
+        // one transaction, under READ COMMITTED — another writer with no reason
+        // to touch the advisory lock (a late `retryRow`, a `deferRead`, an admin
+        // action) can still move a row's `nextRetryAt` into the future or its
+        // state off the eligible list. Claiming by id alone would stomp that
+        // write and hand the row to this pass anyway; re-checking the predicate
+        // here means such a row is left untouched instead.
+        const ids = due.map(r => r.id);
         const claimToken = randomUUID();
-        await tx.receiptIntake.updateMany({
-            where: { id: { in: due.map(r => r.id) } },
+        const claimed = await tx.receiptIntake.updateMany({
+            where: { id: { in: ids }, ...ELIGIBLE },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS), claimToken, claimedAt: now },
         });
-        // The rows were SELECTed before the stamp, so hand back the token this
-        // pass just wrote rather than whatever they were carrying before.
+        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+
+        // Re-read by id AND the fresh token — never by the original id list —
+        // so only the rows this UPDATE actually touched are handed to the pass.
+        // A row the predicate above skipped keeps its OLD claimToken and is
+        // invisible here even though its id is still in `ids`.
+        const rows = await tx.receiptIntake.findMany({
+            where: { id: { in: ids }, claimToken },
+            select: WORKER_ROW_SELECT,
+        });
         return {
-            rows: due.map(row => ({ ...row, claimToken })) as WorkerRow[],
+            rows: rows as WorkerRow[],
             shadowRetired,
             requeued,
             shadowQuarantined,
@@ -313,14 +330,34 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // problem that does not exist while the real file sits there. Ask
             // storage about each one, and let a transient storage fault mean
             // "come back next pass" rather than either verdict.
-            const cutoff = new Date(Date.now() - STAGING_SWEEP_MINUTES * 60_000);
+            const sweptAt = new Date();
+            const cutoff = new Date(sweptAt.getTime() - STAGING_SWEEP_MINUTES * 60_000);
             const stale = await prisma.receiptIntake.findMany({
-                where: { state: "STAGING", createdAt: { lt: cutoff } },
+                // A LIVE LEASE IS NOT SWEEPABLE, and it must not occupy one of
+                // the ten slots either. Selecting it and skipping it inside the
+                // loop meant a handful of clients still uploading could fill the
+                // whole batch every pass, so the orphans behind them were never
+                // reached — the queue looked busy and cleared nothing.
+                where: {
+                    state: "STAGING",
+                    createdAt: { lt: cutoff },
+                    OR: [
+                        { uploadUrlExpiresAt: null },
+                        { uploadUrlExpiresAt: { lte: sweptAt } },
+                    ],
+                },
                 select: {
                     id: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
                     uploadLeaseVersion: true,
                 },
+                // Rows that never had a signed URL first (an inline upload that
+                // died mid-request is an orphan NOW, and nothing is coming for
+                // it), then oldest-first among the expired leases.
+                orderBy: [
+                    { uploadUrlExpiresAt: { sort: "asc", nulls: "first" } },
+                    { createdAt: "asc" },
+                ],
                 // Small on purpose: each row costs a storage round trip, and the
                 // sweep runs BEFORE any receipt is processed. A big batch here
                 // spends the invocation on housekeeping.
@@ -345,6 +382,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // object is a complete, correct object — but parking it as
                 // file-missing, or DELETING it as unacceptable, would destroy a
                 // receipt whose own upload link is still working.
+                // Belt and braces: the query already excluded live leases, but
+                // one can be re-armed between that SELECT and this check.
                 const leaseLive = uploadLeaseActive(row);
 
                 // THE SAME validator /finalize uses. Publishing on "the object
@@ -411,6 +450,19 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         },
                         dropUpload: uploadPath =>
                             deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+                        currentStoragePath: async rowId => {
+                            const r = await prisma.receiptIntake.findUnique({
+                                where: { id: rowId },
+                                select: { storagePath: true },
+                            });
+                            return r?.storagePath ?? null;
+                        },
+                        // A lost CAS here means /finalize (or a resumed
+                        // /start's re-armed lease) already moved this row
+                        // while the sweep was mid-inspection — best-effort,
+                        // same retry queue as every other orphan.
+                        dropOrphanedCanonical: canonicalPath =>
+                            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
                     });
                     if (outcome?.published) published++;
                     continue;
@@ -502,7 +554,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
 
-        read: (bytes, mime, phases) => readReceipt(bytes, mime, phases),
+        // The invocation's ONE deadline, not a fresh 25s per row (see
+        // readBudgetFor). A row reached late in the batch gets whatever
+        // runway is actually left instead of a full budget stacked on top
+        // of what the run has already spent — the same deadline that
+        // already governs every QuickBooks call below.
+        read: (bytes, mime, phases) => {
+            const budgetMs = readBudgetFor(remainingBudgetMs(invocationDeadline));
+            if (budgetMs <= 0) {
+                // Same answer readReceipt gives for an exhausted budget: the
+                // document was never read, so this costs no `attempts` — the
+                // row comes back next pass with a full budget again.
+                return Promise.resolve({ ok: false, decisive: false });
+            }
+            return readReceipt(bytes, mime, phases, { budgetMs });
+        },
 
         applyRead: async (rowId, patch: ReadPatch, ownership) => {
             try {
@@ -670,9 +736,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // hands the row straight to bookReceipt in this same pass, and both
             // its send mark and its BOOKED commit CAS on this token. Releasing
             // here would admit a second worker to the same booking.
+            //
+            // stateReason is left UNTOUCHED, not cleared: finishRouting is the
+            // ONLY path to READ (see worker.ts), and it never writes anything
+            // to this column besides null or "tax-implausible" — so whatever a
+            // READ row is carrying here is exactly that warning, and it must
+            // survive into BOOKING/BOOKED or an automatically booked receipt
+            // with a bad tax read becomes indistinguishable from one with no
+            // tax read at all.
             const { count } = await tx.receiptIntake.updateMany({
                 where: { id: rowId, state: "READ", claimToken },
-                data: { state: "BOOKING", stateReason: null },
+                data: { state: "BOOKING" },
             });
             if (count === 0) return { promoted: false, stale: true };
             return { promoted: true };
@@ -700,6 +774,9 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             deadline: invocationDeadline,
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
+            // Same env read as the worker's own isDryRunEnabled — read fresh
+            // here too, since book() is the last stop before a real QBO write.
+            isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
             getTokens: deadline => getFreshQBTokens(deadline),
             createPurchase: (tokens, input, deadline, onBeforeCreate, onExistingPurchase) =>
                 createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),

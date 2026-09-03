@@ -99,6 +99,60 @@ test("two overlapping claims never hand out the same row", { skip }, async () =>
     await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
 });
 
+test("a row whose nextRetryAt moved into the future between select and claim is skipped", { skip }, async () => {
+    // The regression: claim() used to SELECT the due rows and then claim them
+    // by id ALONE — `updateMany({ where: { id: { in: ids } } })` — instead of
+    // re-checking the same eligibility predicate. Anything that touches
+    // nextRetryAt/state WITHOUT going through the advisory lock (a late
+    // retryRow, a deferRead, an admin "snooze") can still land between those
+    // two statements even inside one transaction, under READ COMMITTED. The
+    // fixed claim re-checks the predicate in the UPDATE itself, so a row that
+    // moved out of eligibility in that window is left untouched.
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+    const ids = ["claimdb-race-a", "claimdb-race-b"];
+    for (const id of ids) await seed(id);
+
+    const now = new Date();
+    const ELIGIBLE = {
+        sourceRef: { startsWith: PREFIX },
+        state: { in: ["RECEIVED", "READ", "BOOKING"] },
+        OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+    };
+
+    const due = await db!.receiptIntake.findMany({ where: ELIGIBLE, select: { id: true } });
+    assert.deepEqual(due.map(r => r.id).sort(), ids.slice().sort(), "both rows start eligible");
+
+    // INTERLEAVING: between the select above and the claim below, something
+    // else (not this claim, not under its lock) pushes one row's lease into
+    // the future — exactly what a concurrent, unrelated write would do.
+    const future = new Date(now.getTime() + 30 * 60_000);
+    await db!.receiptIntake.update({
+        where: { id: "claimdb-race-a" },
+        data: { nextRetryAt: future },
+    });
+
+    const claimToken = "race-token";
+    const claimed = await db!.receiptIntake.updateMany({
+        where: { id: { in: due.map(r => r.id) }, ...ELIGIBLE },
+        data: { nextRetryAt: new Date(now.getTime() + 10 * 60_000), claimToken, claimedAt: now },
+    });
+    assert.equal(claimed.count, 1, "only the row that is STILL eligible is claimed");
+
+    const won = await db!.receiptIntake.findMany({
+        where: { id: { in: due.map(r => r.id) }, claimToken },
+        select: { id: true },
+    });
+    assert.deepEqual(won.map(r => r.id), ["claimdb-race-b"], "the raced row is skipped, not blindly reclaimed");
+
+    // The raced row is untouched by the claim: it keeps the future lease the
+    // interleaving write set, and never picked up the claim token at all.
+    const racedRow = await db!.receiptIntake.findUnique({ where: { id: "claimdb-race-a" } });
+    assert.equal(racedRow?.nextRetryAt?.getTime(), future.getTime());
+    assert.equal(racedRow?.claimToken, null);
+
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+});
+
 test("SHADOW_DONE and the new columns are writable — the CHECK really allows them", { skip }, async () => {
     // The cutover writes SHADOW_DONE on every shadow row in ONE statement. If
     // the CHECK constraint did not allow it, that fails inside the claim

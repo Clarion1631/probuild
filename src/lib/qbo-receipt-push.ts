@@ -365,6 +365,25 @@ export function attachmentFileName(rawFileName: string | undefined): string {
     return (rawFileName || "receipt").replace(/[\r\n"]/g, "") || "receipt";
 }
 
+/**
+ * The Attachable FileName idempotency actually runs on — derived from the
+ * receipt's OWN identity, never the caller-chosen display name.
+ *
+ * `fileId` is the Drive file id, or (for drive-less sources) the intake row's
+ * own cuid — see book.ts's `fileId = driveFileIdOf(row) ?? row.id` — so it is
+ * unique per receipt and cannot collide with a different document. Before
+ * this, `ensureAttachmentOnExistingPurchase` matched on the caller-supplied
+ * `fileName` alone, which is routinely identical across unrelated receipts
+ * (most phones name every photo "receipt.jpg" or worse). A Purchase that
+ * already carried a DIFFERENT receipt under that same generic name read as
+ * "already attached" for this one too, and the real bytes were never sent.
+ */
+export function stableAttachmentFileName(fileId: string, rawFileName: string | undefined): string {
+    const ext = (rawFileName || "").match(/\.[A-Za-z0-9]{1,8}$/)?.[0]?.toLowerCase() ?? "";
+    const safeId = fileId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 100) || "unknown";
+    return attachmentFileName(`receipt-${safeId}${ext}`);
+}
+
 export async function defaultUploadAttachment(
     tokens: QBTokens,
     purchaseId: string,
@@ -464,7 +483,7 @@ function planAttachmentUpload(
     if (!contentType) return null;
     if (!isValidBase64(input.fileBase64)) return null;
     if (Buffer.byteLength(input.fileBase64, "base64") > MAX_ATTACHMENT_BYTES) return null;
-    return { base64: input.fileBase64, contentType, fileName: attachmentFileName(input.fileName) };
+    return { base64: input.fileBase64, contentType, fileName: stableAttachmentFileName(input.fileId, input.fileName) };
 }
 
 /**

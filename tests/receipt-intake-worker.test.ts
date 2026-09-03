@@ -28,8 +28,11 @@ import {
     uploadLeaseActive,
     uploadLeaseExpiry,
     SIGNED_UPLOAD_TTL_MS,
+    readBudgetFor,
+    READ_MIN_BUDGET_MS,
+    READ_SAFETY_MARGIN_MS,
 } from "../src/lib/receipt-intake/worker";
-import { normalizeDocType, type ReadOutcome } from "../src/lib/receipt-intake/read";
+import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
 import { QBTimeoutError } from "../src/lib/quickbooks";
@@ -74,6 +77,7 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         sendAttempted: false,
         claimToken: "claim-1",
         fileSha256: "s".repeat(64),
+        stateReason: null,
         ...overrides,
     };
 }
@@ -207,11 +211,31 @@ test("DRY RUN: a row stuck at BOOKING is not booked either", async () => {
 });
 
 test("LIVE: a READ row with dryRun=false is promoted and booked", async () => {
-    const h = harness([workerRow({ state: "READ", dryRun: false })]);
+    const h = harness([workerRow({ state: "READ", dryRun: false })], { isDryRunEnabled: () => false });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(h.promoted, ["row-1"]);
     assert.equal(h.books, 1);
     assert.deepEqual(summary.byState, { BOOKED: 1 });
+});
+
+test("the global kill switch parks a dryRun=false row at READ, not just BOOKING", async () => {
+    // The row's persisted flag is snapshotted once at intake, so it is not
+    // itself a kill switch: reverting RECEIPT_INTAKE_DRYRUN to stop live QBO
+    // writes must still stop rows claimed dryRun=false before the switch was
+    // reverted — the row flag alone must never be trusted over the current
+    // global switch.
+    const h = harness([workerRow({ state: "READ", dryRun: false })], { isDryRunEnabled: () => true });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(h.promoted, [], "never even promoted to BOOKING");
+    assert.equal(h.books, 0, "the QBO purchase path is never called");
+    assert.deepEqual(summary.byState, { READ: 1 });
+});
+
+test("the global kill switch parks a dryRun=false row already at BOOKING", async () => {
+    const h = harness([workerRow({ state: "BOOKING", dryRun: false })], { isDryRunEnabled: () => true });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.books, 0, "the QBO purchase path is never called");
+    assert.deepEqual(summary.byState, { BOOKING: 1 });
 });
 
 test("a strong-key claim that loses re-routes against the owner and keeps no key", async () => {
@@ -447,6 +471,7 @@ test("two rows sharing a weak key SERIALIZE: the second is blocked, not booked",
             workerRow({ id: "row-b", state: "READ", dryRun: false, dedupWeakKey: WEAK }),
         ],
         {
+            isDryRunEnabled: () => false,
             // Stands in for the serialized transaction: the lock means this
             // body runs to completion for row-a before row-b enters it.
             promoteToBooking: async (id, weakKey) => {
@@ -469,7 +494,7 @@ test("rows with DIFFERENT weak keys never block each other", async () => {
     const h = harness([
         workerRow({ id: "row-a", state: "READ", dryRun: false, dedupWeakKey: "lowes|2026-08-03|364.98|amt" }),
         workerRow({ id: "row-b", state: "READ", dryRun: false, dedupWeakKey: "amazon|2026-08-03|12.00|amt" }),
-    ]);
+    ], { isDryRunEnabled: () => false });
     const summary = await runIntakeWorker(h.deps);
     assert.equal(h.books, 2);
     assert.deepEqual(summary.byState, { BOOKED: 2 });
@@ -477,6 +502,7 @@ test("rows with DIFFERENT weak keys never block each other", async () => {
 
 test("a weak-key twin already BOOKING blocks the transition and asks a human", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: false, dedupWeakKey: "lowes|2026-08-03|364.98|amt" })], {
+        isDryRunEnabled: () => false,
         promoteToBooking: async (id, weakKey) => {
             h.promoted.push(id);
             assert.equal(weakKey, "lowes|2026-08-03|364.98|amt", "the weak key is passed INTO the transition");
@@ -1036,6 +1062,7 @@ test("finishRouting is handed the token the pass claimed with", async () => {
 
 test("a predecessor superseded before promotion writes nothing and books nothing", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: false, claimToken: "old-token" })], {
+        isDryRunEnabled: () => false,
         // The CAS finds no row at {id, state: READ, claimToken: old-token}
         // because the successor re-claimed and re-stamped it.
         promoteToBooking: async (id, _weak, token) => {
@@ -1054,6 +1081,7 @@ test("a predecessor superseded before promotion writes nothing and books nothing
 test("a stale booking result is never written back", async () => {
     const applied: unknown[] = [];
     const h = harness([workerRow({ state: "BOOKING", dryRun: false })], {
+        isDryRunEnabled: () => false,
         book: async () => { h.books++; return { outcome: "stale" } as BookResult; },
         applyBookResult: async (_id, result) => { applied.push(result); },
     });
@@ -1067,6 +1095,7 @@ test("a stale booking result is never written back", async () => {
 test("every book result carries the row's claim token to the writer", async () => {
     const tokens: Array<string | null> = [];
     const h = harness([workerRow({ state: "BOOKING", dryRun: false, claimToken: "tok-9" })], {
+        isDryRunEnabled: () => false,
         applyBookResult: async (_id, _result, token) => { tokens.push(token); },
     });
     await runIntakeWorker(h.deps);
@@ -1198,20 +1227,55 @@ test("the lease a URL is issued under is exactly the signed-URL TTL", () => {
     assert.equal(SIGNED_UPLOAD_TTL_MS, 2 * 60 * 60_000);
 });
 
-test("/start stamps a lease on EVERY url it issues", () => {
+// ── A late read gets what's left, not a fresh 25s (Codex round-17 item 2) ──
+
+test("a read starting early in the run gets its full budget", () => {
+    // Plenty of runway left: capped at READ_BUDGET_MS, never handed more.
+    assert.equal(readBudgetFor(50_000), READ_BUDGET_MS);
+});
+
+test("a read starting late in the run gets only what's left, minus the safety margin", () => {
+    // 10s left in the whole invocation must not become a fresh 25s read that
+    // can straddle the platform's own ceiling — it gets 10s minus the margin
+    // reserved for writing the result back.
+    assert.equal(readBudgetFor(10_000), 10_000 - READ_SAFETY_MARGIN_MS);
+});
+
+test("too little runway skips the read entirely rather than starting a doomed one", () => {
+    // Exactly at the floor once the margin is reserved: still worth trying.
+    assert.equal(readBudgetFor(READ_MIN_BUDGET_MS + READ_SAFETY_MARGIN_MS), READ_MIN_BUDGET_MS);
+    // Under the floor: 0, meaning "don't even try" — the same AI_UNAVAILABLE
+    // answer as an exhausted budget, so the row costs no `attempts` and comes
+    // back next pass with a full budget again.
+    assert.equal(readBudgetFor(READ_MIN_BUDGET_MS + READ_SAFETY_MARGIN_MS - 1), 0);
+    assert.equal(readBudgetFor(1_000), 0);
+    assert.equal(readBudgetFor(0), 0);
+    assert.equal(readBudgetFor(-5_000), 0);
+});
+
+test("/start stamps a lease on every url it issues, including a live-lease retry", () => {
     const start = readFileSync(
         path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
         "utf8",
     );
-    // Three: the new row, the re-armed park, and the resumed STAGING upload.
-    // A URL handed out without a lease is one the sweeper cannot see coming.
+    // Four: the new row, the re-armed park, the resumed STAGING upload, AND a
+    // retry against a still-live lease. A URL handed out without a lease
+    // extension is one the sweeper cannot see coming — a resigned URL for an
+    // unexpired lease is good for a fresh ~2h window, so leaving the row's
+    // recorded expiry at its OLD value let the sweeper judge the lease dead
+    // while the client still held a perfectly live URL.
     assert.equal(
         (start.match(/uploadUrlExpiresAt: uploadLeaseExpiry\(\)/g) ?? []).length,
-        3,
-        "create, re-arm and resume all stamp the lease",
+        4,
+        "create, re-arm, resume, and the live-lease retry all stamp the lease",
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
-    assert.equal(signed, 3, "and those are all the places a URL is issued");
+    assert.equal(signed, 4, "one signUpload call per branch");
+    assert.match(
+        start,
+        /existing\.uploadUrlExpiresAt && existing\.uploadUrlExpiresAt\.getTime\(\) > Date\.now\(\)/,
+        "the live-lease retry's CAS is gated on the lease still being live",
+    );
 });
 
 // ── A finished row hands the claim back, whatever finished it ─────────────
@@ -1284,6 +1348,7 @@ test("a park decided AFTER a send reads the PERSISTED flag, not the claim snapsh
     // with a Purchase in the real books, and the next submission of the same
     // receipt booked it a second time.
     const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        isDryRunEnabled: () => false,
         book: async () => { throw new Error("connection reset after the create"); },
     });
     h.persistedSendAttempted = true; // markSendAttempted got there first
@@ -1302,6 +1367,7 @@ test("a park with nothing ever sent still releases the key", async () => {
     // The control. Holding a key against a booking that never happened sends
     // the corrected resubmission to a human for no reason.
     const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        isDryRunEnabled: () => false,
         book: async () => { throw new Error("connection reset"); },
     });
     h.persistedSendAttempted = false;
@@ -1312,9 +1378,54 @@ test("a park with nothing ever sent still releases the key", async () => {
 test("an unreadable send flag RETAINS the key", async () => {
     // Retaining costs a review item; releasing wrongly costs a second Purchase.
     const h = harness([workerRow({ state: "READ", dryRun: false, sendAttempted: false, attempts: 19 })], {
+        isDryRunEnabled: () => false,
         book: async () => { throw new Error("boom"); },
         sendAttemptedNow: async () => { throw new Error("db is down"); },
     });
     await runIntakeWorker(h.deps);
     assert.ok(!("dedupStrongKey" in (h.states[0].patch ?? {})));
+});
+
+// ── An inline STAGING orphan is not waiting for a URL (round-15 item 3) ────
+
+test("a row that never had a signed URL gets the SWEEP threshold, not the URL TTL", () => {
+    // The single-shot path writes its bytes through the server inside one
+    // request: such a row is either published or it failed mid-request. Giving
+    // it the two-hour signed-URL grace made every inline orphan invisible to the
+    // sweep for two hours, waiting on a URL that does not exist.
+    const inlineAge = (minutes: number) => ({
+        uploadUrlExpiresAt: null,
+        createdAt: new Date(NOW.getTime() - minutes * 60_000),
+    });
+    assert.equal(uploadLeaseActive(inlineAge(5), NOW), true, "still inside the sweep threshold");
+    assert.equal(uploadLeaseActive(inlineAge(20), NOW), false, "past it — an orphan now, not in 2 hours");
+    assert.equal(uploadLeaseActive(inlineAge(90), NOW), false);
+
+    // A two-step row is still judged by the promise /start actually made.
+    assert.equal(
+        uploadLeaseActive({
+            uploadUrlExpiresAt: new Date(NOW.getTime() + 60_000),
+            createdAt: new Date(NOW.getTime() - 90 * 60_000),
+        }, NOW),
+        true,
+        "an old row with a live lease is still uploading",
+    );
+});
+
+test("the sweep query excludes live leases and orders null-lease rows first", () => {
+    const sweeper = readFileSync(
+        path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+        "utf8",
+    );
+    const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));
+    const query = fn.slice(0, fn.indexOf("let published"));
+    // Filtered in SQL, not skipped in the loop: a handful of clients still
+    // uploading could otherwise fill all ten slots every pass, so the orphans
+    // behind them were never reached.
+    assert.match(query, /uploadUrlExpiresAt: null/);
+    assert.match(query, /uploadUrlExpiresAt: \{ lte: sweptAt \}/);
+    assert.match(query, /orderBy: \[/);
+    assert.match(query, /\{ uploadUrlExpiresAt: \{ sort: "asc", nulls: "first" \} \}/);
+    assert.match(query, /\{ createdAt: "asc" \}/);
+    assert.match(query, /take: STAGING_SWEEP_BATCH/);
 });

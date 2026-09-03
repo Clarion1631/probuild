@@ -90,28 +90,30 @@ export async function resolveReceiptUrl(
 }
 
 /**
- * Resolve `receiptUrl` on a LIST of expense rows, in place of the raw column.
+ * Resolve `receipt-intake://` references on a batch of rows to short-lived
+ * signed URLs, in parallel. A non-reference value (a legacy absolute URL, a
+ * data URL, or null) passes through unchanged — same rule as resolveReceiptUrl,
+ * just applied across a list instead of one row at a time.
+ *
+ * Every reader that renders `receiptUrl` as an href — the bookkeeper queue,
+ * the project expenses tab — must resolve it first: the column stores the
+ * stable reference book.ts writes, not a link a browser can open.
  *
  * ONE COPY, because there are two doors onto the same tab: the page's initial
  * server render and the client refresh after a save. The refresh returned the
  * raw column, so every `receipt-intake://…` receipt stopped opening the moment
  * a bookkeeper edited a tax figure — the row was there, the link was a scheme
  * the browser has never heard of.
- *
- * Legacy absolute URLs and data URLs come back unchanged; a reference that
- * cannot be resolved comes back null, which the tab renders as "no receipt".
  */
 export async function resolveReceiptUrls<T extends { receiptUrl: string | null }>(
-    expenses: T[],
+    rows: T[],
     ttlSeconds: number = RECEIPT_URL_TTL_SECONDS,
     deps: ReceiptUrlDeps = defaultDeps,
 ): Promise<T[]> {
-    return await Promise.all(
-        expenses.map(async expense => ({
-            ...expense,
-            receiptUrl: isReceiptUrlRef(expense.receiptUrl)
-                ? await resolveReceiptUrl(expense.receiptUrl, ttlSeconds, deps)
-                : expense.receiptUrl,
-        })),
-    );
+    return Promise.all(rows.map(async row => ({
+        ...row,
+        receiptUrl: isReceiptUrlRef(row.receiptUrl)
+            ? await resolveReceiptUrl(row.receiptUrl, ttlSeconds, deps)
+            : row.receiptUrl,
+    })));
 }
