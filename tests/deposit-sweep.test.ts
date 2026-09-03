@@ -282,7 +282,11 @@ const calls = {
     sendQBPaymentCreateRequest: [] as Row[],
     settleMilestoneFromQBPayment: [] as Row[],
     recordPaymentCore: [] as Row[],
+    pushMilestoneToQuickBooks: [] as Row[],
 };
+
+/** Milestones whose staging push must fail (the "could not create" branch). */
+let pushFailsFor = new Set<string>();
 
 let qboBalanceByInvoice = new Map<string, number>();
 
@@ -303,6 +307,16 @@ const fakeQuickbooks = {
 
 const fakeQuickbooksPayments = {
     getFreshQBTokens: async () => ({ accessToken: "t", refreshToken: "r", realmId: "realm" }),
+    /** The real one creates a QBO invoice and writes qbInvoiceId back onto the
+     *  milestone; that write is what the route reloads to find. */
+    pushMilestoneToQuickBooks: async (paymentScheduleId: string, tokens: Row) => {
+        calls.pushMilestoneToQuickBooks.push({ paymentScheduleId, tokens });
+        if (pushFailsFor.has(paymentScheduleId)) throw new Error("QB milestone invoice create failed: 500");
+        const schedule = tables.paymentSchedule.rows.find(r => r.id === paymentScheduleId);
+        const qbInvoiceId = `qb-inv-staged-${calls.pushMilestoneToQuickBooks.length}`;
+        if (schedule) schedule.qbInvoiceId = qbInvoiceId;
+        return { qbInvoiceId, payLink: null, qbTotal: undefined };
+    },
     settleMilestoneFromQBPayment: async (input: Row) => {
         calls.settleMilestoneFromQBPayment.push(input);
         const schedule = tables.paymentSchedule.rows.find(r => r.id === input.paymentScheduleId);
@@ -399,6 +413,8 @@ function seedMilestone(opts: {
     invoiceStatus?: string;
     name?: string;
     paymentDate?: Date | null;
+    /** The invoice's own date, for the payer-scoped chronology guard. */
+    invoiceIssueDate?: Date | null;
 }) {
     scheduleSeq += 1;
     const id = `sched-${scheduleSeq}`;
@@ -423,6 +439,12 @@ function seedMilestone(opts: {
             projectId: opts.projectId ?? "project-1",
             code: opts.invoiceCode ?? `INV-${scheduleSeq}`,
             status: opts.invoiceStatus ?? "Issued",
+            // Issued well before the credit posts — the realistic order, and
+            // what the payer-scoped chronology guard requires.
+            issueDate: opts.invoiceIssueDate === undefined
+                ? new Date(TODAY.getTime() - 45 * 86_400_000)
+                : opts.invoiceIssueDate,
+            createdAt: new Date(TODAY.getTime() - 60 * 86_400_000),
             project: { id: opts.projectId ?? "project-1", name: opts.projectName ?? "Hoppe Hall Bath" },
             client: { name: opts.clientName ?? "Hoppe" },
         },
@@ -475,6 +497,7 @@ beforeEach(() => {
     callLog.length = 0;
     for (const key of Object.keys(calls) as Array<keyof typeof calls>) calls[key] = [];
     qboBalanceByInvoice = new Map();
+    pushFailsFor = new Set();
     scheduleSeq = 0;
     tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
     process.env.DEPOSIT_INGEST_SECRET = SECRET;
@@ -2129,6 +2152,10 @@ test("B1: a COLLISION that cannot file its task is unresolved too, not a quiet u
     await t.test("a replay that still cannot file the task keeps saying so", async () => {
         // The daily re-POST used to answer a clean `unmatched` forever for a
         // review nobody could see.
+        // Two milestones at the amount, so the daily re-evaluation reaches the
+        // same ambiguous verdict the row already carries — the point here is
+        // the invisible task, not the match.
+        seedMilestone({ amount: 9292.92 });
         seedMilestone({ amount: 9292.92 });
         tables.depositIngest.rows.push({
             id: "row-taskless", fileId: bankFileId("REF-TASKLESS"), status: "unmatched", source: BANK_DEPOSIT_SOURCE,
@@ -2431,4 +2458,212 @@ test("the batch response carries the counts the Bot Health line is built from", 
         credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, unresolved: 0, replay: 0,
     });
     assert.equal(body.ok, true, "two credits sent to a human is still a clean batch");
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. Payer evidence admits an UNREQUESTED milestone
+//    (amendment 2026-09-03, Justin — the Christensen case: customers pay
+//    before the office sends the request)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** The real shape: a $25,000 cashier's check, bank ref 26236015002403, with a
+ *  filed image naming SANDI CHRISTENSEN, against a milestone nobody sent. */
+function seedChristensen(opts: { image?: string | null; amount?: number; ref?: string } = {}) {
+    const amount = opts.amount ?? 25000;
+    const ref = opts.ref ?? "26236015002403";
+    const milestone = seedMilestone({
+        amount,
+        requested: false,
+        qbInvoiceId: null,
+        projectName: "Christensen Remodel",
+        clientName: "Sandi Christensen",
+        invoiceCode: "INV-CHRIS",
+        name: "Upon arrival Construction Start",
+    });
+    if (opts.image !== null) {
+        tables.bankImage.rows.push({
+            id: `img-${ref}`, source: "WTB_ONLINE", sourceExternalId: `${ref}:front`, kind: "CHECK_FRONT",
+            payerName: opts.image ?? "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+            amountCents: Math.round(amount * 100), documentDate: utc(SETTLED_DAY),
+        });
+    }
+    return { milestone, ref, amount };
+}
+
+test("payer evidence admits an UNSENT milestone: the QBO invoice is staged, then the payment applied", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+    assert.equal(result.scheduleId, milestone);
+
+    // The invoice the office never sent is created exactly once, with the
+    // tokens the route already holds.
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+    assert.equal(calls.pushMilestoneToQuickBooks[0].paymentScheduleId, milestone);
+    assert.equal(calls.pushMilestoneToQuickBooks[0].tokens.realmId, "realm");
+
+    // …and the payment is built against THAT id, not the null the candidate
+    // was read with.
+    const staged = tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId;
+    assert.ok(staged, "the push must leave a qbInvoiceId behind");
+    assert.equal(calls.buildQBPaymentRequest.length, 1);
+    assert.equal(calls.buildQBPaymentRequest[0].qbInvoiceId, staged);
+
+    // Bank-row money options, unchanged by the new path.
+    assert.equal(calls.buildQBPaymentRequest[0].depositToAccountId, BANK_DEPOSIT_TO_ACCOUNT_ID);
+    assert.equal(calls.buildQBPaymentRequest[0].depositToAccountId, "154");
+    assert.equal(calls.settleMilestoneFromQBPayment[0].suppressClientReceipt, true);
+});
+
+test("no payer image: an unsent milestone is still not a candidate", async () => {
+    const { ref, amount } = seedChristensen({ image: null });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /no requested pending milestone matches/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+});
+
+test("a payer image naming a DIFFERENT customer does not admit the unsent milestone", async () => {
+    const { milestone, ref, amount } = seedChristensen({ image: "Sandi Mesplay" });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched", "a check from another family must never open a milestone up");
+    assert.match(String(result.reason), /no requested pending milestone matches/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("a dry run stages nothing — no QuickBooks invoice is created", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+
+    const { body } = await post(bankBatch([{ ref, amount }], { dryRun: true }));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "proposed");
+    assert.match(String(result.reason), /would create the QuickBooks invoice/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0, "a dry run must never create an invoice");
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+});
+
+test("two unsent milestones for the same payer at one amount is ambiguous, not a guess", async () => {
+    const { ref, amount } = seedChristensen();
+    seedMilestone({
+        amount, requested: false, qbInvoiceId: null,
+        projectName: "Christensen Remodel", clientName: "Sandi Christensen",
+        invoiceCode: "INV-CHRIS-2", name: "Upon rough-in",
+    });
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /matches 2 milestones/);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+});
+
+test("if the QuickBooks invoice cannot be created, no payment is attempted", async () => {
+    const { milestone, ref, amount } = seedChristensen();
+    pushFailsFor.add(milestone);
+
+    const { body } = await post(bankBatch([{ ref, amount }]));
+    const result = creditResult(body, ref);
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /could not create the QuickBooks invoice for/);
+    assert.match(String(result.reason), /QB milestone invoice create failed/);
+    assert.equal(calls.buildQBPaymentRequest.length, 0, "no payment is built against an invoice that does not exist");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(depositRow(ref)!.status, "unmatched");
+});
+
+test("an unmatched bank row is re-evaluated by the next POST, and heals once evidence arrives", async t => {
+    await t.test("it applies, and the review task it filed is closed", async () => {
+        const { milestone, ref, amount } = seedChristensen({ image: null });
+
+        const first = await post(bankBatch([{ ref, amount }]));
+        assert.equal(creditResult(first.body, ref).status, "unmatched");
+        const taskId = depositRow(ref)!.officeTaskId;
+        assert.ok(taskId, "the first pass files a review task");
+        const attemptsAfterFirst = depositRow(ref)!.attempts;
+
+        // The image lands the following week (the weekly WTB image job).
+        tables.bankImage.rows.push({
+            id: "img-late", source: "WTB_ONLINE", sourceExternalId: `${ref}:front`, kind: "CHECK_FRONT",
+            payerName: "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+            amountCents: Math.round(amount * 100), documentDate: utc(SETTLED_DAY),
+        });
+
+        const second = await post(bankBatch([{ ref, amount }]));
+        const result = creditResult(second.body, ref);
+        assert.equal(result.status, "applied", `expected the re-evaluation to apply, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        assert.equal(result.replay, true, "it is still reported as a replay of the same credit");
+        assert.equal(depositRow(ref)!.attempts, attemptsAfterFirst, "a daily re-look is not a retry — no attempt is consumed");
+
+        const task = tables.officeTask.rows.find(x => x.id === taskId)!;
+        assert.ok(task.archivedAt, "the answered review task must not sit on the board forever");
+        assert.match(String(task.notes), /re-evaluated and applied/);
+    });
+
+    await t.test("a NOT-a-customer-deposit row stays terminal — that verdict cannot change", async () => {
+        // Interest, a transfer, an owner contribution: nothing upstream turns
+        // one of those into a customer payment, so its replay is a no-op.
+        const credit = { ref: "REF-INTEREST", amount: 4242.42, bai: "108", description: "INTEREST" };
+        const { body: first } = await post(bankBatch([credit]));
+        assert.equal(creditResult(first, "REF-INTEREST").status, "unmatched");
+        assert.ok(isNotCustomerDepositReason(depositRow("REF-INTEREST")!.lastError));
+
+        // Now give it a milestone it WOULD have matched, to prove the replay
+        // never looks.
+        seedMilestone({ amount: 4242.42 });
+        const queriesBefore = queries.paymentSchedule.length;
+        const { body: second } = await post(bankBatch([credit]));
+        const result = creditResult(second, "REF-INTEREST");
+        assert.equal(result.status, "unmatched");
+        assert.ok(isNotCustomerDepositReason(String(result.reason)));
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "a non-deposit credit never books, however often it is re-posted");
+        // The proof that it is a no-op and not a fresh look: no candidate query
+        // ran at all, and the row still has the task the class gate declined to
+        // file (routine noise must not land on the board on the second day).
+        assert.equal(queries.paymentSchedule.length, queriesBefore, "the replay must not re-run the match");
+        assert.equal(depositRow("REF-INTEREST")!.officeTaskId ?? null, null);
+    });
+});
+
+test("payer-scoped chronology: an invoice raised AFTER the deposit is not a candidate", async t => {
+    await t.test("raised two days after the money arrived", async () => {
+        const milestone = seedMilestone({
+            amount: 25000, requested: false, qbInvoiceId: null,
+            projectName: "Christensen Remodel", clientName: "Sandi Christensen",
+            name: "Upon arrival Construction Start",
+            invoiceIssueDate: utc(isoDaysAgo(1)),
+        });
+        // …and created then too: this invoice did not exist when the money came in.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.invoice.createdAt = utc(isoDaysAgo(1));
+        tables.bankImage.rows.push({
+            id: "img-late-invoice", source: "WTB_ONLINE", sourceExternalId: "REF-LATE-INV:front", kind: "CHECK_FRONT",
+            payerName: "SANDI CHRISTENSEN", memoText: null, normalizedCheckNumber: "1027",
+            amountCents: 2_500_000, documentDate: utc(SETTLED_DAY),
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-LATE-INV", amount: 25000 }]));
+        const result = creditResult(body, "REF-LATE-INV");
+        assert.equal(result.status, "unmatched");
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("the same invoice, raised before the deposit, applies", async () => {
+        const { milestone, ref, amount } = seedChristensen({ ref: "REF-EARLY-INV" });
+
+        const { body } = await post(bankBatch([{ ref, amount }]));
+        const result = creditResult(body, ref);
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
 });

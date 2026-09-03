@@ -7,11 +7,11 @@ import { findBestProjectNameMatches, normalizeWords } from "@/lib/project-match"
 import { toNum } from "@/lib/prisma-helpers";
 import { recordPaymentCore } from "@/lib/payment-record-core";
 import { parsePaymentDateInput } from "@/lib/payment-date";
-import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
+import { getFreshQBTokens, pushMilestoneToQuickBooks, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
 import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
 import { withTxRetry } from "@/lib/tx-retry";
-import { attributeDeposit, type MilestoneCandidate } from "@/lib/deposit-attribution";
+import { attributeDeposit, namesAgree, type MilestoneCandidate } from "@/lib/deposit-attribution";
 import {
     BANK_APPLY_MIN_AGE_DAYS,
     BANK_DEPOSIT_SOURCE,
@@ -30,6 +30,7 @@ import {
     crossSourceClaimNote,
     describeCandidates,
     findCollisions,
+    hasPayerCorroboration,
     PROGRESS_CONFIDENCE,
     PROGRESS_WINDOW_DAYS,
     bankCreditFingerprint,
@@ -808,6 +809,11 @@ const BANK_CANDIDATE_SELECT = {
     invoice: {
         select: {
             code: true,
+            // The chronology guard for a payer-scoped candidate: the invoice had
+            // to EXIST when the money arrived. issueDate is nullable, so
+            // createdAt is the fallback (an invoice always has one).
+            issueDate: true,
+            createdAt: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true } },
         },
@@ -823,9 +829,18 @@ type BankCandidate = {
     qbInvoiceId: string | null;
     invoice: {
         code: string;
+        issueDate: Date | null;
+        createdAt: Date;
         project: { id: string; name: string } | null;
         client: { name: string } | null;
     };
+};
+
+/** When the candidate's invoice first existed. Nullable issueDate falls back to
+ *  the row's own createdAt, so the guard is never skipped for want of a date. */
+const invoiceExistedBy = (c: BankCandidate, instant: Date): boolean => {
+    const existedAt = c.invoice.issueDate ?? c.invoice.createdAt;
+    return existedAt != null && new Date(existedAt).getTime() <= instant.getTime();
 };
 
 const centsOf = (amount: unknown) => Math.round(toNum(amount) * 100);
@@ -880,13 +895,16 @@ function bankPayloadFor(credit: BankCredit, postDate: string): BankPayload {
  *   1. REPLAY resolution. A credit whose bankReference already has a row is a
  *      replay of that row, never a new deposit — a terminal row returns its
  *      stored outcome, a `proposed` row is re-evaluated now (it may have aged
- *      past the wait rule), a stale in-flight row is reclaimed. Replays are
- *      EXCLUDED from collision classification (Codex round 2, R3): the daily
- *      job re-posts the same day repeatedly, and treating that as a collision
- *      would send every credit to a human forever.
- *   2. COLLISION detection on what remains: a DIFFERENT bankReference, in this
- *      batch or already stored, with the same postDate and amountCents. Both
- *      go to a human — an amount is all a bank credit carries.
+ *      past the wait rule), a stale in-flight row is reclaimed. A replay is
+ *      reported as one, but it is NOT dropped from collision classification:
+ *      the verdict is a property of the DAY, not of how far a previous run
+ *      got, and a crash between "created as processing" and "filed as
+ *      unmatched" would otherwise erase it (see the note on storedSameDay).
+ *   2. COLLISION detection over the whole day: a DIFFERENT bankReference, in
+ *      this batch or already stored, with the same postDate and amountCents.
+ *      Both go to a human — an amount is all a bank credit carries. Re-posting
+ *      the same reference is never a collision with itself; findCollisions
+ *      keys on the reference, so the daily job's repeat POSTs are harmless.
  */
 async function handleBankBatch(raw: Record<string, unknown>): Promise<NextResponse> {
     const parsed = parseBankBatch(raw);
@@ -1112,7 +1130,15 @@ async function processBankCredit(
         const response = row.status === "qbo_created" ? await resumeFromQboCreated(row)
             : row.status === "qbo_unknown" ? await resumeFromQboUnknown(row)
             : await matchAndApplyBank(row, payload, opts);
-        return await bankResult(credit.bankReference, opts.replay, response);
+        const result = await bankResult(credit.bankReference, opts.replay, response);
+        // A re-evaluated row carries the task it filed when it could not match.
+        // Now that it has, that task is answered — leaving it open would put the
+        // sweep's own resolved question back on a human's board every day.
+        if (result.status === "applied" && row.officeTaskId) {
+            await closeReviewTask(row.officeTaskId,
+                `Closed by the deposit sweep: this credit was re-evaluated and applied to milestone ${result.scheduleId}.`);
+        }
+        return result;
     } catch (e) {
         return await bankResult(credit.bankReference, opts.replay, await recordAttemptFailure(row, e));
     }
@@ -1221,7 +1247,21 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
             }),
         };
     }
-    if (row.status === "unmatched" || row.status === "reconcile") {
+    // An `unmatched` BANK credit is a QUESTION, not a verdict: "nothing here
+    // matches this money YET". Treating it as terminal meant that fixing the
+    // cause upstream — the office finally sending the invoice, a check image
+    // arriving and naming the payer — healed nothing, because the daily POST
+    // never looked again. So it re-evaluates exactly like `proposed`: no lease,
+    // no attempt consumed, and the row keeps its officeTaskId so a re-run that
+    // still fails reuses the same task instead of filing a second one.
+    // A credit that simply is NOT a customer deposit stays terminal (that is a
+    // fact about the credit, and nothing upstream can change it), as does
+    // anything already in `reconcile`.
+    const reEvaluable = row.status === "unmatched"
+        && row.source === BANK_DEPOSIT_SOURCE
+        && !isNotCustomerDepositReason(row.lastError);
+
+    if ((row.status === "unmatched" && !reEvaluable) || row.status === "reconcile") {
         const kind = row.status === "reconcile" ? "reconcile" : "unmatched";
         // Heal a task lost to a crash — EXCEPT for a row that deliberately never
         // had one (a credit that is not a customer deposit). Without this the
@@ -1238,20 +1278,23 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     }
 
     const reclaimable = ["proposed", "processing", "qbo_unknown", "qbo_created", "failed"];
-    if (!reclaimable.includes(row.status)) {
+    if (!reclaimable.includes(row.status) && !reEvaluable) {
         return { kind: "settled", response: NextResponse.json({ ok: true, status: row.status, reason: row.lastError }) };
     }
-    // `failed` has no lease, and `proposed` is deliberately re-evaluated by
-    // every daily POST — both reclaim immediately. The in-flight states only
-    // reclaim once their 5-minute lease is stale.
-    const needsLease = row.status !== "failed" && row.status !== "proposed";
-    const retriable = row.status === "processing" || row.status === "failed" || row.status === "proposed";
+    // `failed` has no lease, and `proposed`/re-evaluable `unmatched` are
+    // deliberately re-examined by every daily POST — all three reclaim
+    // immediately. The in-flight states only reclaim once their 5-minute lease
+    // is stale.
+    const needsLease = row.status !== "failed" && row.status !== "proposed" && !reEvaluable;
+    const retriable = row.status === "processing" || row.status === "failed" || row.status === "proposed" || reEvaluable;
     const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt);
     // A `proposed` row is re-evaluated by EVERY daily POST — that is its whole
     // purpose — so those replays must not consume the retry budget. Counting
     // them turned a clean shadow-week row into a fabricated `reconcile`
     // incident on the ninth day, for a credit that had never failed at anything.
-    const consumesAttempt = row.status !== "proposed";
+    // …and neither does a re-evaluated `unmatched` row, for the same reason:
+    // the daily re-look is the design, not a retry of something that failed.
+    const consumesAttempt = row.status !== "proposed" && !reEvaluable;
     const claim = await prisma.depositIngest.updateMany({
         where: {
             id: row.id, status: row.status,
@@ -1286,6 +1329,18 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
  *    QuickBooks but never asked for, so it is not a candidate — that is what
  *    resolves the Hoppe case, where three Pending milestones sat at exactly
  *    $13,447.68 and only one had been requested;
+ *  - …UNLESS a filed check image NAMES THE CUSTOMER (amendment 2026-09-03,
+ *    Justin). Customers pay ahead of the office: Christensen's $25,000 cashier's
+ *    check landed on 2026-08-24 against a milestone with no qbInvoiceSentAt and
+ *    no qbInvoiceId at all, and under the requested-only rule it could never
+ *    heal. So payer evidence opens a SECOND candidate set — Pending, open
+ *    invoice, exact amount, invoice client agreeing with the payer by
+ *    namesAgree, and the invoice already in existence when the money arrived —
+ *    with no request requirement. Uniqueness is still taken over the union, so
+ *    two payer-scoped milestones at one amount remain a human's call. A picked
+ *    milestone with no QuickBooks invoice yet has one CREATED (a QBO invoice
+ *    create emails nobody — createQBMilestoneInvoice only POSTs /invoice)
+ *    before the payment is applied against it;
  *  - uniqueness is taken over a UNION with anything at this amount settled in
  *    the last 14 days by ANY source, so money the photo path just booked still
  *    counts against uniqueness even though its milestone is now Paid;
@@ -1330,6 +1385,27 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         return await finalizeUnmatched(row, reason, { fileTask: lookalikes > 0 });
     }
 
+    // Payer evidence FIRST, because it decides which candidate sets exist at
+    // all. Images are selected by IDENTITY (the bank reference, prefix-matched
+    // because the key carries a :front / :back side suffix —
+    // scripts/post-bank-images.mjs), never by a date/amount window. Zero
+    // payer-bearing images is the NORMAL case for a branch deposit
+    // (docs/WTB-CHECK-IMAGES.md) and is not an error; two or more is a conflict.
+    const images = await prisma.bankImage.findMany({
+        where: {
+            source: BANK_IMAGE_SOURCE,
+            sourceExternalId: { startsWith: bankImageKeyPrefix(payload.bankReference) },
+        },
+        select: { payerName: true, memoText: true, normalizedCheckNumber: true, amountCents: true, documentDate: true },
+    });
+    const evidence = selectPayerBearingImage(images);
+    if (evidence.kind === "conflict") {
+        return await finalizeUnmatched(row,
+            `${evidence.count} check images filed under bank reference ${payload.bankReference} name a payer — ` +
+            `one deposit cannot have two payers, so a human must say what this is`);
+    }
+    const payerName = evidence.kind === "one" ? (evidence.image.payerName ?? "").trim() : "";
+
     // Chronology: the milestone must already have been REQUESTED when the money
     // arrived. Money cannot pay a bill that had not been sent yet, and without
     // this bound, invoicing a new milestone for the same amount today would
@@ -1343,7 +1419,26 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         },
         select: BANK_CANDIDATE_SELECT,
     });
-    const pending = requested.filter(c => centsOf(c.amount) === payload.amountCents);
+
+    // The payer-scoped set: no request requirement, because the whole point is
+    // the customer who paid BEFORE the office asked. The check image naming
+    // them is the evidence that replaces the request marker. The chronology
+    // guard still applies, in the only form available here — the invoice had to
+    // exist when the money arrived.
+    const payerScoped: BankCandidate[] = payerName
+        ? (await prisma.paymentSchedule.findMany({
+            where: { status: "Pending", invoice: { status: { in: OPEN_INVOICE_STATUSES } } },
+            select: BANK_CANDIDATE_SELECT,
+        }) as BankCandidate[]).filter(c =>
+            centsOf(c.amount) === payload.amountCents
+            && namesAgree(payerName, c.invoice.client?.name ?? null)
+            && invoiceExistedBy(c, requestedBy))
+        : [];
+
+    const pending = [
+        ...requested.filter(c => centsOf(c.amount) === payload.amountCents),
+        ...payerScoped,
+    ].filter((c, i, all) => all.findIndex(x => x.id === c.id) === i);
 
     const paid: BankCandidate[] = await prisma.paymentSchedule.findMany({
         where: {
@@ -1362,24 +1457,7 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     }
     const picked = union[0];
 
-    // Payer corroboration, when there is any. Images are selected by IDENTITY
-    // (the bank reference, prefix-matched because the key carries a :front /
-    // :back side suffix — scripts/post-bank-images.mjs), never by a date/amount
-    // window. Zero payer-bearing images is the NORMAL case for a branch deposit
-    // (docs/WTB-CHECK-IMAGES.md) and is not an error; two or more is a conflict.
-    const images = await prisma.bankImage.findMany({
-        where: {
-            source: BANK_IMAGE_SOURCE,
-            sourceExternalId: { startsWith: bankImageKeyPrefix(payload.bankReference) },
-        },
-        select: { payerName: true, memoText: true, normalizedCheckNumber: true, amountCents: true, documentDate: true },
-    });
-    const evidence = selectPayerBearingImage(images);
-    if (evidence.kind === "conflict") {
-        return await finalizeUnmatched(row,
-            `${evidence.count} check images filed under bank reference ${payload.bankReference} name a payer — ` +
-            `one deposit cannot have two payers, so a human must say what this is`);
-    }
+    // Payer corroboration, when there is any (the image was selected above).
     const attribution = attributeDeposit(
         {
             id: payload.bankReference,
@@ -1403,13 +1481,21 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     // a human's call, reported with its own reason verbatim.
     if (attribution.confidence === "conflict") return await finalizeUnmatched(row, attribution.reason);
 
-    if (!picked.qbInvoiceId) {
+    // A milestone with no QBO invoice is normally a human's job — except when
+    // payer evidence says whose money this is. Then the invoice is simply the
+    // one the office never got around to sending, and the sweep stages it
+    // (below, AFTER the reservation and both hold-backs) rather than parking
+    // the money. Everything without that evidence keeps the old answer.
+    const needsQboInvoice = !picked.qbInvoiceId;
+    if (needsQboInvoice && !hasPayerCorroboration(attribution.confidence)) {
         return await finalizeUnmatched(row,
             `${amountLabel} uniquely matches ${describeCandidates([describeOne(picked)])}, but that milestone has no ` +
             `QuickBooks invoice link — the sweep only books QBO-linked milestones, so record this one by hand`);
     }
     if (opts.dryRun) {
-        return await finalizeProposed(row, picked.id, `dry run — would apply to ${describeCandidates([describeOne(picked)])}`);
+        return await finalizeProposed(row, picked.id, needsQboInvoice
+            ? `dry run — would create the QuickBooks invoice for ${describeCandidates([describeOne(picked)])} and apply`
+            : `dry run — would apply to ${describeCandidates([describeOne(picked)])}`);
     }
     if (!bankCreditIsOldEnough(payload.postDate, new Date())) {
         return await finalizeProposed(row, picked.id,
@@ -1439,9 +1525,36 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     const reserved = await reserveMilestone(row, picked.id, { amountCents: payload.amountCents, postDate: payload.postDate });
     if (!reserved.ok) return await finalizeUnmatched(row, reserved.reason);
 
+    let qbInvoiceId = picked.qbInvoiceId;
+    if (!qbInvoiceId) {
+        // Stage the invoice the office never sent. This is a QuickBooks write,
+        // but not a MONEY write and not a client-facing one: pushMilestone-
+        // ToQuickBooks → createQBMilestoneInvoice only POSTs /invoice, so
+        // nothing is emailed to the customer. It runs AFTER the reservation so
+        // the milestone cannot be claimed out from under it mid-push, and any
+        // failure goes `unmatched`, which releases that reservation by itself.
+        // Tokens fetched OUTSIDE the try: a QB outage must stay a retryable
+        // `failed` (top-level catch, pre-QBO, no boundary crossed), not a
+        // terminal review that says the invoice could not be created.
+        const tokens = await getFreshQBTokens();
+        let pushError: string | null = null;
+        try {
+            await pushMilestoneToQuickBooks(picked.id, tokens);
+        } catch (e) {
+            pushError = e instanceof Error ? e.message : String(e);
+        }
+        const staged = await loadMatchedSchedule(picked.id);
+        qbInvoiceId = staged?.qbInvoiceId ?? null;
+        if (!qbInvoiceId) {
+            return await finalizeUnmatched(row,
+                `could not create the QuickBooks invoice for ${describeCandidates([describeOne(picked)])}: ` +
+                `${pushError ?? "the milestone still has no QuickBooks invoice link"}`);
+        }
+    }
+
     return await applyQboLinked(
         row,
-        { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code },
+        { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId, invoiceCode: picked.invoice.code },
         payload,
     );
 }
@@ -1538,7 +1651,7 @@ async function bankNoMatchReason(
     // applied this same check, which makes the milestone Paid and therefore
     // invisible to the Pending query — the common SEQUENTIAL case.
     const base = union.length === 0
-        ? `no requested pending milestone matches ${amountLabel} (a milestone only becomes a candidate once its invoice has actually been sent)`
+        ? `no requested pending milestone matches ${amountLabel} (a milestone becomes a candidate once its invoice has actually been sent, or once a filed check image names its customer)`
         : `the only milestone at ${amountLabel} — ${describeCandidates(union.map(describeOne))} — is already ${union[0].status}`;
     const twin = await findAppliedTwin(row, payload.amountCents, payload.postDate, null);
     return twin ? `${base} — ${appliedTwinNote(twin)}` : base;
@@ -1758,6 +1871,30 @@ async function ensureReviewTask(row: DepositIngest, reason: string, kind: "unmat
     } catch (e) {
         console.error("[deposit-ingest] review-task create failed (will heal on next read):", e);
         return null;
+    }
+}
+
+/**
+ * Close a review task the sweep has now answered itself. `archivedAt` is what
+ * the board treats as done (archiveOfficeTask, src/lib/actions.ts) — OfficeTask
+ * has no other completion field; `status` is a legacy mirror of the column name.
+ * Never throws: the money is already applied by the time this runs, and a
+ * leftover task is a smaller problem than a false failure on top of a settle.
+ */
+async function closeReviewTask(officeTaskId: string, note: string): Promise<void> {
+    try {
+        const task = await prisma.officeTask.findUnique({
+            where: { id: officeTaskId },
+            select: { notes: true, archivedAt: true },
+        });
+        if (!task || task.archivedAt) return;
+        await prisma.officeTask.update({
+            where: { id: officeTaskId },
+            data: { archivedAt: new Date(), notes: [task.notes, note].filter(Boolean).join("\n") },
+        });
+        revalidatePath("/tasks");
+    } catch (e) {
+        console.error("[deposit-ingest] could not close the review task after a re-evaluation applied:", e);
     }
 }
 
