@@ -61,6 +61,10 @@
       "schedule": "0 2 * * *"
     },
     {
+      "path": "/api/cron/bank-register-pull?continue=1",
+      "schedule": "*/15 2-12 * * *"
+    },
+    {
       "path": "/api/cron/receipt-requests",
       "schedule": "0 13 * * *"
     },

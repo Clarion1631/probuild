@@ -828,12 +828,56 @@ test("a bank-pull probe that cannot answer says so, instead of reading as 'switc
     assert.ok(!verdict.reasons.includes("bank-pull-stale"));
 });
 
+test("stale ambiguity and a blocked pull are reported without inventing staleness", () => {
+    // Codex PR #443 gate round 33, findings 1 and 2, at the verdict.
+    //
+    // `bank-ambiguous-stale` is duplicate-identity groups reconcile could not
+    // pair from BEFORE the last pulled window. They used to be counted as
+    // current ambiguity, which withheld the pull's freshness stamp — so ONE
+    // unresolvable pair anywhere in history suppressed every owner's chase
+    // cards for good. Now they are a named backlog and nothing more.
+    //
+    // `bank-pull-blocked` is the pull withholding that stamp on purpose. On its
+    // own that is silent: the only other symptom is `bank-pull-stale` 36 hours
+    // later, which reads as a dead pull when the pull ran fine and one report
+    // inside it did not answer.
+    const verdict = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok",
+            enabled: true,
+            lastSuccessAt: iso(1 * HOUR),
+            ambiguousCount: 0,
+            staleAmbiguous: { count: 2, keys: ["WTB-0723|2026-06-01|-7400|US MARKET|-", "WTB-0723|2026-06-02|-500|CHEVRON|-"] },
+            blockedReason: "cleared-probe-failed",
+        },
+    }));
+    assert.ok(verdict.reasons.includes("bank-ambiguous-stale:2:WTB-0723|2026-06-01|-7400|US MARKET|-,WTB-0723|2026-06-02|-500|CHEVRON|-"),
+        verdict.reasons.join(","));
+    assert.ok(verdict.reasons.includes("bank-pull-blocked:cleared-probe-failed"));
+    assert.ok(!verdict.reasons.includes("bank-pull-stale"), "the marker IS fresh — the alarm must not double up");
+    assert.ok(!verdict.reasons.some(r => r.startsWith("bank-pull-ambiguous:")), "stale residue is not current ambiguity");
+});
+
+test("no stale ambiguity and no blocked reason is silent", () => {
+    const verdict = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok",
+            enabled: true,
+            lastSuccessAt: iso(1 * HOUR),
+            ambiguousCount: 0,
+            staleAmbiguous: { count: 0, keys: [] },
+            blockedReason: "",
+        },
+    }));
+    assert.deepEqual(verdict, { ok: true, reasons: [] });
+});
+
 test("the bank-pull read runs inside the Promise.all, as a probe", () => {
     const source = readFileSync(
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
         "utf8",
     );
-    assert.match(source, /probe<\{ enabled: boolean; lastSuccessAt: string \| null; ambiguousCount: number; unclearedCount: number \}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.match(source, /probe<\{[\s\S]{0,400}\}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
     assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));

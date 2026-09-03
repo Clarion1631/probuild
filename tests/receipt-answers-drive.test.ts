@@ -33,10 +33,17 @@ const FILE_ID = "1sEISJBJaGRYpivooQJBR";
  */
 const MATCHING_NAME = "MissingReceiptAffidavit_2026-08-16_LOWES_123.45_CJ.pdf";
 
-/** A `displayDetails` blob that has been CARDED (see hasRecordedMemoRequest). */
+/**
+ * The Chat thread the fixture's card went out in. An answer must name it: the
+ * thread is the ONLY thing binding a memo to the card that asked for it (Codex
+ * PR #443 gate round 33, finding 3).
+ */
+const CARD_THREAD = "spaces/x/threads/y";
+
+/** A `displayDetails` blob that has been CARDED (see matchCardAssociation). */
 const CARDED_DETAILS = JSON.stringify({
     amountCents: -12_345,
-    cards: [{ n: 1, date: "2026-08-16", threadName: "spaces/x/threads/y", messageName: "spaces/x/messages/z", requestId: "receipt-req-CJ-2026-08-16" }],
+    cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD, messageName: "spaces/x/messages/z", requestId: "receipt-req-CJ-2026-08-16" }],
 });
 
 type Probe =
@@ -177,12 +184,19 @@ function reset() {
     issues = new Map([["bl-1", { id: "ri-1", version: 3, displayDetails: CARDED_DETAILS, clearedAt: null }]]);
 }
 
+/**
+ * `thread` defaults to the fixture's own card thread, because that is what a
+ * real bridge answer carries — every one of these cases is otherwise about
+ * something else, and spelling it out in twenty bodies would only obscure the
+ * tests that ARE about the association. A case that cares passes its own
+ * `thread` (or `thread: undefined` to send none at all).
+ */
 const post = (body: Record<string, unknown>) => POST(new Request(
     "https://probuild.test/api/automation/receipt-requests/answers",
     {
         method: "POST",
         headers: { "content-type": "application/json", "x-receipt-intake-secret": "bridge-secret" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ thread: CARD_THREAD, ...body }),
     },
 ));
 
@@ -476,7 +490,7 @@ test("re-answering the SAME issue with the SAME pdf_id is not a reuse conflict",
             amountCents: -12_345,
             resolution: "memo-signed",
             pdfId: FILE_ID,
-            cards: [{ n: 1, date: "2026-08-16" }],
+            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD }],
         }),
         clearedAt: null,
     });
@@ -550,7 +564,7 @@ test("a PDF named for a SUPERSET amount ($112.34) does not satisfy a $12.34 char
     // `name.includes("12.34")` used to let "...112.34..." through: the target
     // digits are a substring of a completely different dollar amount.
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -569,7 +583,7 @@ test("a PDF named with an extra trailing digit ($12.345) does not satisfy a $12.
     // The amount field's own shape is always two decimal places; a third
     // digit is not "close enough", it is a different, unparseable field.
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -586,7 +600,7 @@ test("a PDF named with an extra trailing digit ($12.345) does not satisfy a $12.
 
 test("the EXACT amount field, and nothing else, satisfies the charge", async () => {
     reset();
-    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1 }] }), clearedAt: null });
+    issues.set("bl-small", { id: "ri-small", version: 1, displayDetails: JSON.stringify({ amountCents: -1_234, cards: [{ n: 1, threadName: CARD_THREAD }] }), clearedAt: null });
     probeResult = {
         kind: "found",
         id: FILE_ID,
@@ -596,6 +610,163 @@ test("the EXACT amount field, and nothing else, satisfies the charge", async () 
         mimeType: "application/pdf",
     };
     const res = await post({ fingerprint: "pb-bl-small", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
+});
+
+// ── The memo must come from the card that ASKED (Codex PR #443 gate round 33, finding 3) ──
+
+/** The probe answer for a real, well-named memo for bl-1's $123.45 charge. */
+function foundMatchingMemo(): void {
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+}
+
+test("a same-amount memo submitted from ANOTHER issue's thread is refused — 422 wrong-thread", async () => {
+    // THE HOLE THIS CLOSES. Two charges for the same amount mint affidavits
+    // with interchangeable filenames, so the amount check passes for both, and
+    // "some card once listed this item" passes for any carded charge. A memo
+    // minted for one charge, replayed against the other's fingerprint, closed a
+    // chase nobody had answered. The thread was stored and never compared.
+    reset();
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, thread: "spaces/x/threads/SOMEONE-ELSE" });
+    assert.equal(res.status, 422);
+    const payload = await res.json() as { ok: boolean; reason: string; detail: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "wrong-thread");
+    assert.match(payload.detail, /no card for this charge was posted in that thread/);
+    assert.deepEqual(writes, [], "nothing is recorded for an unbound memo");
+    assert.deepEqual(cleared, [], "and the chase stays open");
+});
+
+test("an answer carrying NO thread at all is refused too — fail-closed, never assumed", async () => {
+    reset();
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, thread: undefined });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "wrong-thread");
+    assert.deepEqual(writes, []);
+});
+
+test("the right thread but the wrong item number is refused — one card lists several charges", async () => {
+    // The thread alone can be satisfied by a SIBLING item on the same card, so
+    // when the bridge says which item it was, that has to agree as well.
+    reset();
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, n: 4 });
+    assert.equal(res.status, 422);
+    const payload = await res.json() as { reason: string; detail: string };
+    assert.equal(payload.reason, "wrong-thread");
+    assert.match(payload.detail, /under that number/);
+    assert.deepEqual(writes, []);
+});
+
+test("an answer naming a DIFFERENT card request is refused", async () => {
+    reset();
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, request_id: "receipt-req-CJ-2026-07-01" });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "wrong-thread");
+});
+
+test("the thread, n and request_id all agreeing is the happy path", async () => {
+    reset();
+    foundMatchingMemo();
+    const res = await post({
+        fingerprint: "pb-bl-1",
+        signed: true,
+        pdf_id: FILE_ID,
+        thread: CARD_THREAD,
+        n: 1,
+        request_id: "receipt-req-CJ-2026-08-16",
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, cleared: true, memoRecorded: true, targetKey: "bl-1" });
+    assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
+});
+
+test("a CLEARED issue that never had a card is 422 not-requested — round 32's exemption is gone", async () => {
+    // Round 32 read "already answered, no card record" as the card-history
+    // race and let it through with a 200. The race was real and is fixed at
+    // its source (recordCardOnIssues writes on cleared issues too), so the
+    // exemption only meant that any already-closed charge accepted a memo
+    // nobody had asked for.
+    reset();
+    issues.set("bl-closed", {
+        id: "ri-closed",
+        version: 1,
+        displayDetails: JSON.stringify({ amountCents: -12_345 }),
+        clearedAt: new Date("2026-08-20T00:00:00Z"),
+    });
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-closed", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "not-requested");
+    assert.deepEqual(writes, [], "a closed issue is not a free pass");
+    assert.deepEqual(cleared, []);
+});
+
+test("a CLEARED issue WITH a matching card record still records the memo — 200, nothing re-cleared", async () => {
+    // The invariant round 32 was protecting, kept: a memo signed after the
+    // matcher auto-closed the line is still evidence, and `resolution` is what
+    // suppresses a later reopen.
+    reset();
+    issues.set("bl-closed", {
+        id: "ri-closed",
+        version: 1,
+        displayDetails: CARDED_DETAILS,
+        clearedAt: new Date("2026-08-20T00:00:00Z"),
+    });
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-closed", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, alreadyCleared: true, memoRecorded: true, targetKey: "bl-closed" });
+    assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
+    assert.deepEqual(cleared, [], "an already-closed issue is not cleared again");
+});
+
+test("re-submitting the same memo on the same issue answers 200 alreadyResolved", async () => {
+    // The idempotency `alreadyResolved` now actually describes: the row
+    // ALREADY carried a resolution before this write.
+    reset();
+    issues.set("bl-1", {
+        id: "ri-1",
+        version: 3,
+        displayDetails: JSON.stringify({
+            amountCents: -12_345,
+            resolution: "memo-signed",
+            pdfId: FILE_ID,
+            cards: [{ n: 1, date: "2026-08-16", threadName: CARD_THREAD }],
+        }),
+        clearedAt: new Date("2026-08-20T00:00:00Z"),
+    });
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), {
+        ok: true,
+        alreadyCleared: true,
+        alreadyResolved: true,
+        memoRecorded: true,
+        targetKey: "bl-1",
+    });
+});
+
+test("the LEGACY single `card` slot is still a valid association", async () => {
+    // Rows written before `cards[]` existed carry only `card`. Reading just the
+    // array would refuse a reply in the one thread those rows know about.
+    reset();
+    issues.set("bl-legacy", {
+        id: "ri-legacy",
+        version: 1,
+        displayDetails: JSON.stringify({
+            amountCents: -12_345,
+            card: { n: 1, date: "2026-08-16", threadName: CARD_THREAD, requestId: "receipt-req-CJ-2026-08-16" },
+        }),
+        clearedAt: null,
+    });
+    foundMatchingMemo();
+    const res = await post({ fingerprint: "pb-bl-legacy", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 200);
     assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
 });

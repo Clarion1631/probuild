@@ -91,5 +91,5 @@ test("the bank pull records its last COMPLETE success, not its last run", () => 
     // window — if truncation persists the mark goes stale and bank-pull-stale
     // fires, which is exactly the signal wanted.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(source, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{[\s\S]*?BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(source, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{[\s\S]*?BANK_PULL_LAST_SUCCESS_KEY/);
 });

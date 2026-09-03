@@ -37,7 +37,7 @@
  * window may be marked complete.
  */
 
-import type { ReconcileAmbiguousGroup } from "@/lib/bank-ledger";
+import { reconcileScanSince, type ReconcileAmbiguousGroup, type ReconcilePairedGroup } from "@/lib/bank-ledger";
 import type { ClearedStatus } from "@/lib/register-types";
 
 export interface BankRegisterRowLike {
@@ -435,8 +435,17 @@ export interface BankRegisterIngestResult {
 }
 
 export interface BankRegisterPullDependencies {
-    /** Reads the QBO GL for [startDate, endDate] and returns its rows. */
-    fetchRows(startDate: string, endDate: string): Promise<{ rows: BankRegisterRowLike[]; stale: boolean }>;
+    /**
+     * Reads the QBO GL for [startDate, endDate] and returns its rows.
+     *
+     * `clearedProbeOk: false` means the CLEARANCE JOIN failed — the register
+     * came back but QuickBooks never said which of its rows had cleared, so
+     * every row's `clearedStatus` is "Unknown". The rows are still worth
+     * ingesting (clearedStatus is not identity), but nothing clearance-gated
+     * could run over them, so this run is NOT proof the register is current.
+     * `undefined` means the caller does not report it, which is treated as OK.
+     */
+    fetchRows(startDate: string, endDate: string): Promise<{ rows: BankRegisterRowLike[]; stale: boolean; clearedProbeOk?: boolean }>;
     /** Posts one batch through the bank-ledger ingest path (source QBO_REGISTER). */
     ingest(account: string, lines: BankRegisterIngestLine[]): Promise<BankRegisterIngestResult>;
     /**
@@ -449,7 +458,12 @@ export interface BankRegisterPullDependencies {
      * and without one the linker happily ran past the invocation's wall clock
      * and the platform killed the run before the checkpoint was written.
      */
-    reconcile(account: string, deadlineAt?: number): Promise<{
+    reconcile(account: string, deadlineAt?: number, scope?: {
+        /** Oldest postedDate the scan may read (YYYY-MM-DD). */
+        since: string;
+        /** The window this run pulled — ambiguity inside it is this run's to answer for. */
+        window: { startDate: string; endDate: string };
+    }): Promise<{
         linked: number;
         proposed: number;
         /** Chunks whose transaction rolled back. Their links did NOT persist. */
@@ -458,12 +472,22 @@ export interface BankRegisterPullDependencies {
         remaining?: number;
         /**
          * Same-identity groups reconcile refused to guess a pairing for
-         * (Codex round-31 gate, finding 2). Surfaced here rather than
-         * discarded, so a same-identity 2×2 statement-first group is visible
-         * instead of the run reporting "done" over it — resolution stays
-         * manual, this only makes the backlog seen.
+         * (Codex round-31 gate, finding 2), RESTRICTED to this run's window
+         * (round-33 gate, finding 2). Surfaced here rather than discarded, so
+         * a group reconcile could not resolve is visible instead of the run
+         * reporting "done" over it — resolution stays manual, this only makes
+         * the backlog seen.
          */
         ambiguous?: ReconcileAmbiguousGroup[];
+        /**
+         * The same thing, from BEFORE this run's window. Watched, reported —
+         * and deliberately not a blocker. An unresolved duplicate from two
+         * months ago used to hold the freshness stamp down forever, which
+         * silently switched every owner's chase cards off (round-33 gate).
+         */
+        ambiguousStale?: ReconcileAmbiguousGroup[];
+        /** Equal-cardinality groups paired deterministically by sorted order, recorded for audit. */
+        pairedByOrder?: ReconcilePairedGroup[];
     } | null>;
     /**
      * Mints canonical BankLines from still-unlinked QBO observations
@@ -528,6 +552,24 @@ export interface BankRegisterPullSummary {
     endDate: string;
     /** True when QBO didn't answer and a cached fetch was served. */
     stale: boolean;
+    /**
+     * Did the CLEARANCE PROBE answer? (Codex PR #443 gate round 33, finding 1.)
+     *
+     * `fetchBankRegister` deliberately lets the clearance join fail on its own —
+     * the register is still the register without it. What is NOT still true is
+     * that this run saw enough to act: every row comes back `Unknown`, so
+     * minting (which requires Cleared/Reconciled) can do nothing and the uncleared
+     * count is meaningless. A run in that state used to be reported as a complete
+     * pull and stamped the freshness clock, telling the health check and the
+     * chaser that the register was current while the one thing the register is
+     * FOR could not run.
+     */
+    clearedProbeOk: boolean;
+    /**
+     * WHY this run is not a complete, actable pull, when the cause is not a
+     * failure. Distinct from `error`, which means something went wrong.
+     */
+    reason?: string;
     rows: number;
     observations: number;
     skipped: number;
@@ -544,7 +586,15 @@ export interface BankRegisterPullSummary {
      * a no-op for them.
      */
     conflictQbTxnIds?: string[];
-    reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number; ambiguous?: ReconcileAmbiguousGroup[] } | null;
+    reconciled?: {
+        linked: number;
+        proposed: number;
+        chunkErrors?: number;
+        remaining?: number;
+        ambiguous?: ReconcileAmbiguousGroup[];
+        ambiguousStale?: ReconcileAmbiguousGroup[];
+        pairedByOrder?: ReconcilePairedGroup[];
+    } | null;
     /** The point this run resumed FROM, when it resumed. */
     resumedAfter?: { postedDate: string; qbTxnId: string } | null;
     /** The point the NEXT run should resume from, when this one stopped early. */
@@ -557,7 +607,7 @@ export interface BankRegisterPullSummary {
     fullSweep?: boolean;
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
-    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window";
+    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window" | "cleared-probe-failed";
     minted?: {
         minted: number;
         skipped: Record<string, number>;
@@ -604,6 +654,12 @@ export async function runBankRegisterPull(
     );
 
     const fetched = await dependencies.fetchRows(startDate, endDate);
+    // A caller that does not report the probe is treated as OK; only an
+    // explicit `false` is a failed probe. Nothing else may make this false —
+    // "we did not ask" and "we asked and could not get an answer" are the same
+    // shape of unknown, and inventing the second from the first would hold the
+    // stamp down for every caller that predates the field.
+    const clearedProbeOk = fetched.clearedProbeOk !== false;
     const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
 
     // A STALE fetch is QuickBooks not answering: the rows are a cached copy from
@@ -618,6 +674,7 @@ export async function runBankRegisterPull(
         startDate,
         endDate,
         stale: fetched.stale,
+        clearedProbeOk,
         rows: fetched.rows.length,
         observations: lines.length,
         skipped,
@@ -626,6 +683,18 @@ export async function runBankRegisterPull(
         existing: 0,
         ...(fetched.stale ? { error: "qbo-stale-cache" } : {}),
     };
+    // A FAILED CLEARANCE PROBE IS NOT A FAILED PULL, and it is not a complete
+    // one either. The rows land (clearedStatus is deliberately outside the
+    // identity hash, so storing them as "Unknown" cannot restate anything and
+    // the next good probe refreshes them), reconcile still links what it can —
+    // and nothing certifies the register as current. `complete: false` is what
+    // withholds the freshness stamp, holds minting back, and lets the chaser's
+    // own freshness gate hold today's cards until a run with a real clearance
+    // answer replaces this one.
+    if (!clearedProbeOk) {
+        summary.complete = false;
+        summary.reason = "cleared-probe-failed";
+    }
     // Divergent repeats inside the fetch are already a conflict, and the run is
     // already failed — but the NON-conflicting lines still post. They are good
     // evidence, the ingest is idempotent, and holding a whole night's register
@@ -750,7 +819,15 @@ export async function runBankRegisterPull(
     try {
         // The absolute deadline, minus the checkpoint reserve, so the linker's
         // own batch loop stops in time for this run to record where it got to.
-        const reconciled = await dependencies.reconcile(account, workDeadline());
+        // THE SCAN'S BOUND AND THIS RUN'S OWN WINDOW, both handed down (Codex
+        // round-33 gate, finding 2). Reconcile used to read the whole table and
+        // report every duplicate group it found as this run's problem, so one
+        // unresolvable pair from any month past could withhold the stamp — and
+        // the cards — permanently.
+        const reconciled = await dependencies.reconcile(account, workDeadline(), {
+            since: reconcileScanSince(startDate, new Date(nowMs)),
+            window: { startDate, endDate },
+        });
         summary.reconciled = reconciled;
         // A ROLLED-BACK CHUNK IS A FAILURE; LINKS NOT ATTEMPTED ARE MERELY
         // INCOMPLETE. Both leave observations unlinked, which starves the
@@ -789,16 +866,22 @@ export async function runBankRegisterPull(
     // part of its window, so an observation whose canonical line is in the part
     // it never read looks unmatched — and minting turns that into a permanent
     // duplicate BankLine that only a human can unpick.
-    const mintIsSafe = summary.ok && summary.complete && !fetched.stale && conflicts.length === 0;
+    // AND IT NEEDS A CLEARANCE ANSWER. Minting is gated on QuickBooks having
+    // said a row cleared; with the probe down every row reads "Unknown", so a
+    // mint pass could only ever skip everything — and reporting that as a
+    // finished mint is how the run came to look complete (round-33 gate).
+    const mintIsSafe = summary.ok && summary.complete && !fetched.stale && clearedProbeOk && conflicts.length === 0;
     if (dependencies.mintFromQbo && !mintIsSafe) {
         summary.minted = null;
         summary.mintSkipped = fetched.stale
             ? "stale-fetch"
             : conflicts.length > 0
                 ? "conflicts"
-                : summary.ok
-                    ? "incomplete-window"
-                    : "ingest-failed";
+                : !clearedProbeOk
+                    ? "cleared-probe-failed"
+                    : summary.ok
+                        ? "incomplete-window"
+                        : "ingest-failed";
     }
     if (dependencies.mintFromQbo && mintIsSafe) {
         try {

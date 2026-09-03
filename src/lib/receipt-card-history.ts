@@ -26,7 +26,7 @@
  * cannot be un-answered by it.
  */
 import { prisma } from "@/lib/prisma";
-import { appendCardRecord } from "@/lib/receipt-requests";
+import { appendCardRecord, type CardRecord } from "@/lib/receipt-requests";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import type { CardItem } from "@/lib/receipt-request-cards";
 
@@ -121,6 +121,91 @@ export async function recordCardOnIssues(
     }
     if (lostRaces > 0 && onLostRace === "throw") throw new CardHistoryRaceError(lost);
     return { recorded, skipped, lostRaces };
+}
+
+/**
+ * Every card record an issue carries, `cards[]` plus the legacy single `card`
+ * slot, as objects. Reading BOTH matters: rows written before `cards[]` existed
+ * carry only `card`, and a reply in that card's thread has to resolve against it.
+ */
+export function cardRecordsOf(details: Record<string, unknown> | null | undefined): CardRecord[] {
+    const raw = Array.isArray(details?.cards)
+        ? (details!.cards as unknown[])
+        : details?.card && typeof details.card === "object"
+            ? [details.card]
+            : [];
+    return raw.filter((entry): entry is CardRecord => !!entry && typeof entry === "object");
+}
+
+/** What a bridge answer claims about where it was signed. Absent fields are `null`, never guessed. */
+export interface AnswerAssociation {
+    /** The Chat thread the answer came from — `spaces/<s>/threads/<t>`. */
+    thread: string | null;
+    /** The "sign N" number on the card, when the answer carries it. */
+    n: number | null;
+    /** The card's request id, when the answer carries it. */
+    requestId: string | null;
+}
+
+export type CardAssociationVerdict =
+    | { kind: "never-carded" }
+    | { kind: "matched"; record: CardRecord }
+    | { kind: "wrong-thread"; detail: string };
+
+/**
+ * Does this answer come from a card WE posted about THIS issue?
+ *
+ * THE BINDING THE ARTIFACT CHECKS COULD NOT PROVIDE (Codex PR #443 gate round
+ * 33, finding 3). A signed affidavit was accepted on the strength of its
+ * filename's dollar amount plus the fact that SOME card had once listed the
+ * item. Neither is a link to the ask: two charges for the same amount produce
+ * interchangeable memo filenames, so a memo minted for one charge, replayed
+ * against another charge's fingerprint, satisfied both checks and closed a
+ * chase nobody had answered. The `thread` the bridge already sends was stored
+ * and never compared with the thread the card actually went out in.
+ *
+ * So the answer must name a card record ON THIS ISSUE: the thread exactly, and
+ * `n`/`requestId` too when it carries them. An answer with no thread at all
+ * cannot be associated with anything and is refused rather than assumed —
+ * fail-closed, because the whole point is that "we cannot tell" must never be
+ * recorded as "it checked out".
+ */
+export function matchCardAssociation(
+    details: Record<string, unknown> | null | undefined,
+    answer: AnswerAssociation,
+): CardAssociationVerdict {
+    const records = cardRecordsOf(details);
+    // NEVER CARDED is a different answer from WRONG THREAD, and the caller
+    // reports them differently: one means nobody ever asked about this charge,
+    // the other means somebody asked but not where this reply came from.
+    if (records.length === 0) return { kind: "never-carded" };
+
+    const thread = answer.thread?.trim() ?? "";
+    if (!thread) {
+        return { kind: "wrong-thread", detail: "the answer carries no originating thread" };
+    }
+
+    let candidates = records.filter(record => typeof record.threadName === "string" && record.threadName.trim() === thread);
+    if (candidates.length === 0) {
+        return { kind: "wrong-thread", detail: "no card for this charge was posted in that thread" };
+    }
+    // `n` and `requestId` NARROW an already-matching thread; they never widen
+    // it. A card lists several charges in one thread, so the thread alone can
+    // be satisfied by a sibling item — when the bridge tells us which item it
+    // was, that has to agree too.
+    if (answer.n !== null) {
+        candidates = candidates.filter(record => record.n === answer.n);
+        if (candidates.length === 0) {
+            return { kind: "wrong-thread", detail: "that thread's card did not ask about this charge under that number" };
+        }
+    }
+    if (answer.requestId !== null) {
+        candidates = candidates.filter(record => record.requestId === answer.requestId);
+        if (candidates.length === 0) {
+            return { kind: "wrong-thread", detail: "the answer names a different card request" };
+        }
+    }
+    return { kind: "matched", record: candidates[0] };
 }
 
 /** True when this issue already carries the record for a given card. */

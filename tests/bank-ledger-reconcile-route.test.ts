@@ -150,7 +150,7 @@ test("bank-ledger reconcile: happy path", async t => {
         const { handlers, persistLinksCalls } = makeHandlers();
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 
@@ -167,7 +167,7 @@ test("bank-ledger reconcile: happy path", async t => {
         });
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 1);
         assert.deepEqual(persistLinksCalls[0], [{ observationId: "obs1", bankLineId: "bl1" }]);
     });
@@ -184,7 +184,7 @@ test("bank-ledger reconcile: happy path", async t => {
             }],
         });
         const res = await handlers.POST(makeRequest({ all: true }));
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], pairedByOrder: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 

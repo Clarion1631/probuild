@@ -300,6 +300,13 @@ export interface ReconcileObservation {
     normalizedPayee: string;
     checkNumber: string | null;
     bankLineId: string | null;
+    /**
+     * The QBO transaction id (`BankLineObservation.sourceLineId`) on a
+     * QBO_REGISTER row. NOT part of the match key and never compared for
+     * equality — its only job is to be the deterministic tiebreaker when an
+     * equal-cardinality group is paired by sorted order below.
+     */
+    qbTxnId?: string | null;
 }
 
 export interface ReconcileBankLine {
@@ -328,9 +335,53 @@ export interface ReconcileAmbiguousGroup {
     bankLineIds: string[];
 }
 
+/**
+ * A group that WAS ambiguous by cardinality alone and was resolved by sorted
+ * order, recorded so the decision is auditable rather than invisible.
+ *
+ * `basis` is a single literal today. It is written down anyway: a link that a
+ * rule inferred and a link that a unique match proved are not the same claim,
+ * and a log line saying which is the only way anybody can tell them apart later.
+ */
+export interface ReconcilePairedGroup extends ReconcileAmbiguousGroup {
+    basis: "paired-by-order";
+    pairs: ReconcileLink[];
+}
+
 export interface ReconcileResult {
     links: ReconcileLink[];
     ambiguous: ReconcileAmbiguousGroup[];
+    /** Equal-cardinality groups paired deterministically; their pairs are also in `links`. */
+    pairedByOrder: ReconcilePairedGroup[];
+}
+
+/**
+ * How far back a reconciliation scan may look.
+ *
+ * THE SAME 60-DAY BOUNDARY the mint pass, the deep sweep and the missing-receipt
+ * chaser already use. An unbounded scan is what let ONE unresolvable duplicate
+ * group anywhere in history block the pull's freshness stamp — and therefore
+ * every owner's morning cards — for good. Sixty days is wide enough that a
+ * statement arriving weeks after the QBO row still links, and narrow enough that
+ * a group nobody has resolved eventually stops being this run's problem and
+ * becomes a reported backlog instead.
+ */
+export const RECONCILE_LOOKBACK_DAYS = 60;
+
+/**
+ * The oldest postedDate a reconciliation scan may read: the earlier of the pull
+ * window's own start and `RECONCILE_LOOKBACK_DAYS` before `now`.
+ *
+ * The window's start is included because a deep sweep legitimately reaches
+ * further back than the fixed lookback, and a scan narrower than the rows the
+ * run just ingested would leave its own observations unlinkable.
+ */
+export function reconcileScanSince(windowStartYmd: string | null, now: Date): string {
+    const floor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    floor.setUTCDate(floor.getUTCDate() - RECONCILE_LOOKBACK_DAYS);
+    const lookback = floor.toISOString().slice(0, 10);
+    if (!windowStartYmd) return lookback;
+    return windowStartYmd < lookback ? windowStartYmd : lookback;
 }
 
 /**
@@ -412,53 +463,118 @@ const reconcileKey = bankLineIdentity;
  * normalizePayee()) is never treated as a valid identity on either side, so
  * it can never match anything here either.
  *
- * A group only links when the pairing is UNAMBIGUOUS: exactly one unlinked
+ * A group links outright when the pairing is UNAMBIGUOUS: exactly one unlinked
  * observation and exactly one candidate BankLine share the key. Any group
  * with more than one on either side (Codex round-3, defect 1 — e.g. 1
  * observation + 2 identical candidates, or an N:N group) previously linked
- * arbitrarily by input order via `ids.shift()`; that guess is gone. Such a
- * group is reported back in `ambiguous` instead — visible, not silently
- * dropped and not silently guessed — and every id in it is left unmatched
- * for a human (or a future check-number/amount tiebreaker) to resolve.
+ * arbitrarily by input order via `ids.shift()`; that guess is gone.
+ *
+ * EQUAL CARDINALITY IS THE ONE CASE THAT IS NOT A GUESS, and refusing it was
+ * itself a defect (Codex PR #443 gate round 33, finding 2). Two legitimate
+ * identical purchases — same account, same day, same amount, same payee, same
+ * check number — arriving statement-first produce a permanent 2×2 group. Left
+ * ambiguous, it blocked the nightly pull's freshness stamp forever, which held
+ * back every owner's chase cards indefinitely: one duplicate charge switching
+ * the whole feature off.
+ *
+ * When both sides carry the SAME NUMBER of members, every field the identity is
+ * made of is identical across all of them by construction — that is what sharing
+ * the key means — so the choice is between bijections over two sets of
+ * indistinguishable elements. Any bijection asserts the same facts about dates,
+ * amounts, payees and check numbers; only the id-to-id assignment differs.
+ * Pairing them in sorted order (`postedDate, qbTxnId` against
+ * `postedDate, id` — the statement line's date and id) is therefore
+ * deterministic rather than arbitrary: the same input always produces the same
+ * pairing, so a re-run never re-shuffles the links. It is recorded in
+ * `pairedByOrder` with `basis: "paired-by-order"` precisely because it is an
+ * inference and not a proof.
+ *
+ * UNEQUAL cardinality stays ambiguous and untouched. There the assignment is a
+ * real choice — some member on the larger side must go unlinked, and nothing in
+ * the data says which — so it remains a human's call, reported and never
+ * guessed.
  */
 export function reconcileObservations(
     observations: ReconcileObservation[],
     bankLines: ReconcileBankLine[],
 ): ReconcileResult {
-    const bankLinesByKey = new Map<string, string[]>();
+    const bankLinesByKey = new Map<string, ReconcileBankLine[]>();
     for (const line of bankLines) {
         if (line.normalizedPayee === "") continue;
         const key = reconcileKey(line);
-        const ids = bankLinesByKey.get(key);
-        if (ids) ids.push(line.id);
-        else bankLinesByKey.set(key, [line.id]);
+        const group = bankLinesByKey.get(key);
+        if (group) group.push(line);
+        else bankLinesByKey.set(key, [line]);
     }
 
-    const observationsByKey = new Map<string, string[]>();
+    const observationsByKey = new Map<string, ReconcileObservation[]>();
     for (const obs of observations) {
         if (obs.bankLineId !== null) continue;
         if (obs.normalizedPayee === "") continue;
         const key = reconcileKey(obs);
-        const ids = observationsByKey.get(key);
-        if (ids) ids.push(obs.id);
-        else observationsByKey.set(key, [obs.id]);
+        const group = observationsByKey.get(key);
+        if (group) group.push(obs);
+        else observationsByKey.set(key, [obs]);
     }
 
     const links: ReconcileLink[] = [];
     const ambiguous: ReconcileAmbiguousGroup[] = [];
+    const pairedByOrder: ReconcilePairedGroup[] = [];
 
-    for (const [key, observationIds] of observationsByKey) {
-        const bankLineIds = bankLinesByKey.get(key);
-        if (!bankLineIds || bankLineIds.length === 0) continue; // no candidates at all — nothing to report, nothing to match
-        if (observationIds.length === 1 && bankLineIds.length === 1) {
-            links.push({ observationId: observationIds[0], bankLineId: bankLineIds[0] });
+    for (const [key, groupObservations] of observationsByKey) {
+        const groupLines = bankLinesByKey.get(key);
+        if (!groupLines || groupLines.length === 0) continue; // no candidates at all — nothing to report, nothing to match
+        if (groupObservations.length === 1 && groupLines.length === 1) {
+            links.push({ observationId: groupObservations[0].id, bankLineId: groupLines[0].id });
             continue;
         }
         const [account, postedDate, amountCents, normalizedPayee, checkNumber] = JSON.parse(key) as [string, string, number, string, string | null];
-        ambiguous.push({ account, postedDate, amountCents, normalizedPayee, checkNumber, observationIds: [...observationIds], bankLineIds: [...bankLineIds] });
+        if (groupObservations.length !== groupLines.length) {
+            ambiguous.push({
+                account, postedDate, amountCents, normalizedPayee, checkNumber,
+                observationIds: groupObservations.map(o => o.id),
+                bankLineIds: groupLines.map(l => l.id),
+            });
+            continue;
+        }
+        const sortedObservations = [...groupObservations].sort(compareObservationsForPairing);
+        const sortedLines = [...groupLines].sort(compareBankLinesForPairing);
+        const pairs = sortedObservations.map((observation, index) => ({
+            observationId: observation.id,
+            bankLineId: sortedLines[index].id,
+        }));
+        links.push(...pairs);
+        pairedByOrder.push({
+            account, postedDate, amountCents, normalizedPayee, checkNumber,
+            observationIds: sortedObservations.map(o => o.id),
+            bankLineIds: sortedLines.map(l => l.id),
+            basis: "paired-by-order",
+            pairs,
+        });
     }
 
-    return { links, ambiguous };
+    return { links, ambiguous, pairedByOrder };
+}
+
+/**
+ * The observation half of the order pairing. `postedDate` is constant inside a
+ * group (it is part of the key) and is compared first anyway, so the rule reads
+ * the same as it is documented and survives any future change to the key.
+ * `id` is the final tiebreaker for rows carrying no qbTxnId, so the sort is
+ * total and the pairing can never depend on input order.
+ */
+function compareObservationsForPairing(a: ReconcileObservation, b: ReconcileObservation): number {
+    if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
+    const left = a.qbTxnId ?? "";
+    const right = b.qbTxnId ?? "";
+    if (left !== right) return left < right ? -1 : 1;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/** The statement half: the line's own date, then its id. */
+function compareBankLinesForPairing(a: ReconcileBankLine, b: ReconcileBankLine): number {
+    if (a.postedDate !== b.postedDate) return a.postedDate < b.postedDate ? -1 : 1;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 // ── Refund sign validation ───────────────────────────────────────────────

@@ -4,7 +4,13 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
-import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_AMBIGUOUS_KEY, BANK_PULL_UNCLEARED_KEY } from "@/lib/pipeline-health";
+import {
+    BANK_PULL_LAST_SUCCESS_KEY,
+    BANK_PULL_AMBIGUOUS_KEY,
+    BANK_PULL_AMBIGUOUS_STALE_KEY,
+    BANK_PULL_BLOCKED_REASON_KEY,
+    BANK_PULL_UNCLEARED_KEY,
+} from "@/lib/pipeline-health";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import {
@@ -19,7 +25,7 @@ import {
 } from "@/lib/bank-register-pull";
 import { BANK_LINE_IDENTITY_LOCK, bankLineIdentityPayee, planQboMint } from "@/lib/bank-line-mint";
 import { bankLedgerIngestHandlers } from "@/app/api/integrations/bank-ledger/ingest/route";
-import { bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
+import { ambiguousGroupKey, bankLedgerReconcileHandlers } from "@/app/api/integrations/bank-ledger/reconcile/route";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -96,9 +102,44 @@ async function saveWindowState(next: PullWindowState): Promise<void> {
     });
 }
 
+/**
+ * Is there parked work a continuation pass should pick up?
+ *
+ * `continueAfter` is the intra-window resume point a budget-truncated ingest
+ * writes; `mintRemainingCursor` is where a truncated mint stopped. Either one
+ * means the last run left the register in a state it already reported as
+ * incomplete, so a continuation has real work. Both null means the last run
+ * finished, and a resume pass must cost nothing.
+ */
+export function pullContinuationPending(state: PullWindowState): boolean {
+    return (state.continueAfter ?? null) !== null || (state.mintRemainingCursor ?? null) !== null;
+}
+
 export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    /**
+     * THE CONTINUATION PASS (Codex PR #443 gate round 33, finding 4).
+     *
+     * The pull is resumable — a run that hits its wall clock parks
+     * `continueAfter` and reports `complete: false` — but it was invoked exactly
+     * once a night, at 02:00. So a truncated pull sat parked for eleven hours
+     * and the 13:00 chaser found a register that had never been certified
+     * current, held its cycle open, and the 14:30 cards did not go out. The
+     * backlog needed another invocation and nothing was scheduled to give it
+     * one.
+     *
+     * Checked BEFORE the lease, exactly as the chaser's own `?continue=1` does:
+     * a resume pass with nothing to do must not even briefly contend with the
+     * nightly run for the lease.
+     */
+    if (new URL(request.url).searchParams.get("continue") === "1") {
+        const parked = await readWindowState();
+        if (!pullContinuationPending(parked)) {
+            return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
+        }
     }
 
     // A DURABLE lease, held for the WHOLE pull including the token refresh.
@@ -286,7 +327,12 @@ async function runPull() {
             // Tokens are fetched lazily INSIDE fetchBankRegister (only on a
             // cache miss), and the call rides qbFetch's timeout budget.
             const register = await fetchBankRegister(getFreshQBTokens, startDate, endDate);
-            return { rows: register.rows, stale: register.stale };
+            // `clearedProbeOk` travels WITH the rows. It used to be dropped
+            // here, so a register fetched without any clearance answer was
+            // indistinguishable from a fully-answered one and the run stamped
+            // the freshness clock over it (Codex PR #443 gate round 33,
+            // finding 1).
+            return { rows: register.rows, stale: register.stale, clearedProbeOk: register.clearedProbeOk };
         },
 
         ingest: async (account: string, lines: BankRegisterIngestLine[]) => {
@@ -296,11 +342,13 @@ async function runPull() {
             return { status: response.status, body };
         },
 
-        reconcile: async (account: string, deadlineAt?: number) => {
+        reconcile: async (account: string, deadlineAt?: number, scope?: { since: string; window: { startDate: string; endDate: string } }) => {
             // The run's absolute deadline goes THROUGH to the linker's own
             // batch loop: links it cannot start come back in `remaining`
-            // instead of the platform killing this run mid-chunk.
-            const result = await bankLedgerReconcileHandlers.runReconcile(account, deadlineAt);
+            // instead of the platform killing this run mid-chunk. The scope
+            // goes through for the same reason — one implementation, told what
+            // it may read and which part of it this run answers for.
+            const result = await bankLedgerReconcileHandlers.runReconcile(account, deadlineAt, scope);
             return {
                 linked: result.linked,
                 proposed: result.proposed,
@@ -309,11 +357,12 @@ async function runPull() {
                 chunkErrors: result.chunkErrors.length,
                 remaining: result.remaining,
                 // Surfaced, not discarded (Codex round-31 gate, finding 2): a
-                // same-identity 2x2 statement-first group is a human call, not
-                // something reconcile can guess at. This used to be dropped
-                // here, so those groups never showed up anywhere the pull
-                // reported.
+                // group reconcile could not resolve is a human call, not
+                // something it can guess at. This used to be dropped here, so
+                // those groups never showed up anywhere the pull reported.
                 ambiguous: result.ambiguous,
+                ambiguousStale: result.ambiguousStale,
+                pairedByOrder: result.pairedByOrder,
             };
         },
 
@@ -360,8 +409,16 @@ async function runPull() {
     // in which case there is nothing new to report and the LAST recorded
     // count must stand rather than reading as "resolved".
     const ambiguousCount = summary.reconciled?.ambiguous?.length ?? 0;
+    const staleAmbiguous = summary.reconciled?.ambiguousStale ?? [];
+    const pairedByOrder = summary.reconciled?.pairedByOrder ?? [];
     if (ambiguousCount > 0) {
         console.warn("[cron/bank-register-pull] ambiguous reconcile groups need a human", ambiguousCount);
+    }
+    if (pairedByOrder.length > 0) {
+        // An INFERENCE, logged as one. Equal-cardinality groups are paired by
+        // sorted order rather than left to block the world (see
+        // reconcileObservations); that decision has to be findable afterwards.
+        console.log("[cron/bank-register-pull] groups paired by order", JSON.stringify(pairedByOrder.map(ambiguousGroupKey)));
     }
     if (summary.reconciled) {
         try {
@@ -373,6 +430,38 @@ async function runPull() {
         } catch (error) {
             console.error("[cron/bank-register-pull] ambiguous-count write failed", error instanceof Error ? error.message : "UnknownError");
         }
+        // RESIDUAL AMBIGUITY FROM BEFORE THIS WINDOW is recorded separately and
+        // never gates the stamp (Codex round-33 gate, finding 2). It is real and
+        // somebody has to resolve it, but a duplicate pair from two months ago
+        // is not evidence that TONIGHT'S register is unsettled — and treating it
+        // as such switched every owner's chase cards off indefinitely. The keys
+        // ride along so the health reason says WHICH groups, not just how many.
+        try {
+            const value = JSON.stringify({ count: staleAmbiguous.length, keys: staleAmbiguous.map(ambiguousGroupKey) });
+            await prisma.automationSetting.upsert({
+                where: { key: BANK_PULL_AMBIGUOUS_STALE_KEY },
+                update: { value },
+                create: { key: BANK_PULL_AMBIGUOUS_STALE_KEY, value },
+            });
+        } catch (error) {
+            console.error("[cron/bank-register-pull] stale-ambiguous write failed", error instanceof Error ? error.message : "UnknownError");
+        }
+    }
+
+    // WHY THE STAMP IS BEING WITHHELD, when it is and the cause is not a
+    // failure. `bank-pull-stale` eventually fires on its own, 36 hours later —
+    // this says which of the silent causes it was, immediately, the same way
+    // `chaser-blocked:<reason>` does for the sweep. Written on EVERY run so a
+    // recovered probe clears the alarm rather than leaving it latched.
+    try {
+        const value = summary.clearedProbeOk === false ? "cleared-probe-failed" : "";
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_BLOCKED_REASON_KEY },
+            update: { value },
+            create: { key: BANK_PULL_BLOCKED_REASON_KEY, value },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] blocked-reason write failed", error instanceof Error ? error.message : "UnknownError");
     }
 
     if (!summary.ok) {
@@ -396,8 +485,17 @@ async function runPull() {
     // same-identity group unmatched on purpose, and stamping the clock over it
     // told the health check the register was fully current while a manual
     // decision sat waiting. `bank-pull-ambiguous` is what surfaces that
-    // instead (see evaluatePipelineHealth).
-    if (summary.ok && summary.complete && ambiguousCount === 0) {
+    // instead (see evaluatePipelineHealth) — and only for ambiguity inside THIS
+    // run's window, because older residue is a backlog somebody owes an answer
+    // on, not a reason to hold back today's cards (round-33 gate, finding 2).
+    // A FAILED CLEARANCE PROBE is the third shape of the same lie, and the one
+    // this line used to be blind to: the register came back, the rows ingested,
+    // and nothing clearance-gated could run over any of them — every row reads
+    // "Unknown", so minting can do nothing and the uncleared count means
+    // nothing. `clearedProbeOk` is already folded into `complete`; it is named
+    // here too because THIS is the line the invariant is about, and a future
+    // change to `complete` must not quietly reopen it (round-33 gate, finding 1).
+    if (summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0) {
         try {
             await prisma.automationSetting.upsert({
                 where: { key: BANK_PULL_LAST_SUCCESS_KEY },

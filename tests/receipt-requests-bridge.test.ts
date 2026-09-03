@@ -227,16 +227,22 @@ test("a signed memo is recorded even when the issue was already auto-closed", ()
     // A cleared issue still gets the record, and is not re-cleared.
     assert.match(source, /alreadyCleared: issue\.clearedAt !== null/);
     assert.match(source, /alreadyCleared: true,[\s\S]{0,200}memoRecorded: true/);
-    // AND a memo for an issue that is already answered but carries NO record of
-    // ever having been asked is the card-history race, not an unrequested memo:
-    // 200 with `alreadyResolved`, never 422 not-requested (Codex PR #443 gate,
-    // finding 2). `never-requested` survives only for a still-OPEN issue.
-    assert.match(source, /if \(!requested && issue\.clearedAt === null\) return \{ kind: "never-requested" \};/);
+    // AND the idempotent answer is keyed off the row ALREADY carrying a
+    // resolution — a retry, or a second valid submission of the same memo —
+    // NOT off the issue lacking a card record. Round 32 read "already answered
+    // and never carded" as the card-history race; that race was fixed at its
+    // source (recordCardOnIssues writes on cleared issues too), and keeping the
+    // exemption meant any already-closed charge accepted a memo nobody had
+    // asked for (Codex PR #443 gate round 33, finding 3).
+    assert.match(source, /const alreadyAnswered = hasResolution\(details\);/);
+    assert.match(source, /alreadyResolved: alreadyAnswered,/);
     assert.match(source, /alreadyResolved: true/);
+    assert.doesNotMatch(source, /issue\.clearedAt === null\) return \{ kind: "never-requested" \}/,
+        "a cleared issue is no longer exempt from having to have been carded");
     // The artifact must still MATCH. The mismatch check is what stops a memo
     // for a different charge being waved through as "already resolved".
     const mismatchAt = source.indexOf('return { kind: "mismatch" };');
-    const resolvedAt = source.indexOf("alreadyResolved: !requested");
+    const resolvedAt = source.indexOf("alreadyResolved: alreadyAnswered");
     assert.ok(mismatchAt > 0 && resolvedAt > 0 && mismatchAt < resolvedAt,
         "the name/amount match is checked BEFORE a cleared issue is reported as already resolved");
 });
@@ -420,7 +426,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -483,7 +489,7 @@ test("reconciliation always runs; minting needs a fresh, conflict-free pull", ()
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     // No early return that would skip the backlog on an empty fetch.
     assert.doesNotMatch(lib, /if \(lines\.length === 0\) return summary;/);
-    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && conflicts\.length === 0;/);
+    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && clearedProbeOk && conflicts\.length === 0;/);
     assert.match(lib, /summary\.mintSkipped = fetched\.stale\s*\n\s*\? "stale-fetch"/);
     // A truncated window has its own reason, distinct from a failed ingest.
     assert.match(lib, /\? "incomplete-window"/);
@@ -832,7 +838,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
     // And the cursor is persisted, so a backlog that is not draining is visible.
     assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
 

@@ -10,6 +10,7 @@ import {
     hasResolution,
     isDurableArtifactUrl,
 } from "@/lib/receipt-requests";
+import { matchCardAssociation } from "@/lib/receipt-card-history";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
@@ -52,7 +53,32 @@ interface AnswerBody {
     job?: unknown;
     at?: unknown;
     message?: unknown;
+    /**
+     * The Chat thread the answer was signed in. NOT decoration: this is the
+     * only field that ties a memo to the card that asked for it, and it is
+     * compared against this issue's own card history (see the association
+     * block in POST).
+     */
     thread?: unknown;
+    /** The "sign N" number on the card, when the bridge carries it. */
+    n?: unknown;
+    /** The card's request id. Snake_case is the bridge file's convention; both are accepted. */
+    request_id?: unknown;
+    requestId?: unknown;
+}
+
+/** The card fields an answer may carry, normalized. Anything malformed reads as absent, never as a match. */
+function associationFromBody(body: AnswerBody): { thread: string | null; n: number | null; requestId: string | null } {
+    const requestId = typeof body.request_id === "string" && body.request_id.trim()
+        ? body.request_id.trim()
+        : typeof body.requestId === "string" && body.requestId.trim()
+            ? body.requestId.trim()
+            : null;
+    return {
+        thread: typeof body.thread === "string" && body.thread.trim() ? body.thread.trim() : null,
+        n: typeof body.n === "number" && Number.isInteger(body.n) ? body.n : null,
+        requestId,
+    };
 }
 
 /** A stored URL is display data; cap it so a stray blob cannot bloat the row. */
@@ -114,19 +140,6 @@ function affidavitNameMatchesIssue(name: string | null, amountCents: number): bo
     if (!name.startsWith(AFFIDAVIT_NAME_PREFIX)) return false;
     const fieldCents = affidavitAmountFieldCents(name);
     return fieldCents !== null && fieldCents === Math.abs(amountCents);
-}
-
-/**
- * A card asked about this item at least once — the `cards[]` (or legacy
- * `card`) history `recordCardOnIssues` appends when a chase card lists it
- * (`receipt-request-cards.ts`). Every card offers "sign N" alongside a photo
- * or a job name, so an item that was never carded never had that option to
- * begin with: a signature for one did not come from anything WE sent.
- */
-function hasRecordedMemoRequest(details: Record<string, unknown>): boolean {
-    const cards = details.cards;
-    if (Array.isArray(cards) && cards.length > 0) return true;
-    return details.card !== undefined && details.card !== null;
 }
 
 /**
@@ -310,6 +323,7 @@ export async function POST(request: Request) {
     let alreadyResolved = false;
     let missing = false;
     let neverRequested = false;
+    let wrongThread: string | null = null;
     let mismatch = false;
     let reused = false;
 
@@ -317,11 +331,14 @@ export async function POST(request: Request) {
         | { kind: "missing" }
         | { kind: "reused" }
         | { kind: "never-requested" }
+        | { kind: "wrong-thread"; detail: string }
         | { kind: "mismatch" }
         | { kind: "recorded"; alreadyCleared: boolean; alreadyResolved: boolean }
         | { kind: "lost-race" };
 
-    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !mismatch && !reused; attempt++) {
+    const association = associationFromBody(body);
+
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !wrongThread && !mismatch && !reused; attempt++) {
         const outcome: AttemptOutcome = await prisma.$transaction(async tx => {
             /**
              * THE PDF-ID LOCK — taken BEFORE the reuse check, and held through
@@ -359,18 +376,37 @@ export async function POST(request: Request) {
             // a corrected amount written since must survive.
             const details = parseMissingReceiptDetails(issue.displayDetails);
 
-            // NO RECORD OF THE ASK, on an issue that is ALREADY ANSWERED, is
-            // the card-history race — not an unrequested memo (Codex PR #443
-            // gate, finding 2). The card went out, the issue cleared before its
-            // thread record was written, and the person who then signed the
-            // memo in that thread got a 422 telling them nobody had asked. The
-            // ask is not in doubt here: the issue exists, it is resolved, and
-            // the artifact still has to match it. So this is reported as the
-            // idempotent success it is, and the memo is recorded exactly as it
-            // would be on any other cleared issue — nothing is CLOSED by it,
-            // because it is closed already.
-            const requested = hasRecordedMemoRequest(details);
-            if (!requested && issue.clearedAt === null) return { kind: "never-requested" };
+            /**
+             * THE ORIGINATING ASSOCIATION. A memo is evidence for the charge
+             * whose card asked for it, and for no other.
+             *
+             * "Some card once listed this item" was the old test, and it is not
+             * a link: it says an ask happened, not that THIS answer came from
+             * it. Two charges for the same amount mint memos with
+             * interchangeable filenames, so a memo signed for one charge,
+             * replayed against the other's fingerprint, satisfied the amount
+             * check and that ask-happened check together and closed a chase
+             * nobody had answered (Codex PR #443 gate round 33, finding 3).
+             * The `thread` the bridge sends was stored and never compared.
+             *
+             * Now the answer must name a card record ON THIS ISSUE — the thread
+             * exactly, plus `n`/`requestId` when it carries them.
+             *
+             * A CLEARED ISSUE IS NOT EXEMPT. Round 32 let a cleared issue with
+             * no card record through as the card-history race, which was a real
+             * race — but it was fixed at the source (recordCardOnIssues now
+             * writes on cleared issues too), and leaving the exemption here
+             * meant any already-closed charge accepted a memo that had never
+             * been asked for. The idempotent 200 survives only for an answer
+             * whose association MATCHES.
+             */
+            const verdict = matchCardAssociation(details, association);
+            if (verdict.kind === "never-carded") return { kind: "never-requested" };
+            if (verdict.kind === "wrong-thread") return { kind: "wrong-thread", detail: verdict.detail };
+            // Already answered BEFORE this write — the forwarder retrying, or a
+            // memo landing after the matcher auto-closed the line. Either way
+            // recording it again is idempotent, and nothing is closed by it.
+            const alreadyAnswered = hasResolution(details);
             const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
             if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
                 // Checked BEFORE the already-resolved answer below, so a memo
@@ -402,7 +438,7 @@ export async function POST(request: Request) {
                 return {
                     kind: "recorded",
                     alreadyCleared: issue.clearedAt !== null,
-                    alreadyResolved: !requested,
+                    alreadyResolved: alreadyAnswered,
                 };
             }
             return { kind: "lost-race" };
@@ -412,6 +448,7 @@ export async function POST(request: Request) {
             case "missing": missing = true; break;
             case "reused": reused = true; break;
             case "never-requested": neverRequested = true; break;
+            case "wrong-thread": wrongThread = outcome.detail; break;
             case "mismatch": mismatch = true; break;
             case "recorded":
                 recorded = { targetKey: bankLineId };
@@ -449,6 +486,22 @@ export async function POST(request: Request) {
             { status: 422 },
         );
     }
+    // A card DID ask about this charge — just not the one this answer came
+    // from. Terminal, like every other binding failure: re-sending the same
+    // memo from the same thread cannot make it belong to this charge. It is a
+    // separate reason from `not-requested` because it means something
+    // different, and the difference is what a human reading the log needs.
+    if (wrongThread) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "wrong-thread",
+                detail: wrongThread,
+                targetKey: bankLineId,
+            },
+            { status: 422 },
+        );
+    }
     if (mismatch) {
         return NextResponse.json(
             {
@@ -474,11 +527,12 @@ export async function POST(request: Request) {
     // it, which is the whole point — a later reopen is suppressed. Nothing to
     // clear.
     //
-    // `alreadyResolved` distinguishes the card-history race: the issue carried
-    // no record of ever having been asked, and it was already answered, so this
-    // signature is a valid late reply to a chase that has closed. A 200 with
-    // that flag, never a 422 — the forwarder must be able to retry it and get
-    // the same answer.
+    // `alreadyResolved` says the row ALREADY carried a resolution before this
+    // write: the forwarder retrying, or a second valid submission of the same
+    // memo. A 200 with that flag, never a 422 — the forwarder must be able to
+    // retry and get the same answer. It is only ever reached by an answer whose
+    // originating association matched (round-33 gate, finding 3); an
+    // already-closed charge with no card of its own is a 422, not a free pass.
     if (alreadyCleared) {
         return NextResponse.json({
             ok: true,

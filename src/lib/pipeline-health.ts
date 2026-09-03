@@ -129,6 +129,10 @@ export interface PipelineHealth {
         lastSuccessAt: string | null;
         ambiguousCount: number;
         unclearedCount?: number;
+        /** Ambiguity from before the last pulled window: reported, never a stamp blocker. */
+        staleAmbiguous?: { count: number; keys: string[] };
+        /** Why the pull withheld its own freshness stamp, when it did. */
+        blockedReason?: string | null;
     };
     /** The missing-receipt sweep's marker, including why it is holding back. */
     chaser?: {
@@ -245,6 +249,17 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
  *    chaser reads BankLine, so a dead pull silently starves it: every check
  *    stays green while the queue quietly stops finding anything. Only reported
  *    when the feature is actually on — an unset flag is not a failure.
+ *  - `bank-pull-blocked:<reason>` — the pull RAN and withheld its own freshness
+ *    stamp on purpose. Today's one reason is `cleared-probe-failed`: QuickBooks
+ *    served the register but not the clearance report, so every row is
+ *    "Unknown", nothing clearance-gated could run, and the run is not evidence
+ *    the register is current. Silent otherwise — the only other symptom is
+ *    `bank-pull-stale` 36 hours later, which reads as a dead pull when the pull
+ *    was fine and one report inside it was not.
+ *  - `bank-ambiguous-stale:<n>:<keys>` — duplicate-identity groups reconcile
+ *    could not pair, from BEFORE the window the pull last read. A backlog for a
+ *    human, never a stamp blocker: gating on these meant one unresolvable pair
+ *    anywhere in history switched every owner's chase cards off for good.
  *  - `chaser-stale:<hours>h` — the missing-receipt sweep has not COMPLETED a
  *    cycle in over a day (or has never completed one). Everything downstream
  *    reads its output: the Receipts tab's missing-receipt list is whatever it
@@ -291,7 +306,16 @@ export function evaluatePipelineHealth(input: {
      * as "the pull is switched off", i.e. as HEALTH — and the one check that
      * watches the chaser's whole input went quiet exactly when it was needed.
      */
-    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount?: number };
+    bankPull: {
+        status: ProbeStatus;
+        reason?: string;
+        enabled: boolean;
+        lastSuccessAt: string | null;
+        ambiguousCount: number;
+        unclearedCount?: number;
+        staleAmbiguous?: { count: number; keys: string[] };
+        blockedReason?: string | null;
+    };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
@@ -417,6 +441,25 @@ export function evaluatePipelineHealth(input: {
         reasons.push(`bank-pull-ambiguous:${input.bankPull.ambiguousCount}`);
     }
 
+    // AMBIGUITY OLDER THAN THE LAST PULLED WINDOW. Reported, and deliberately
+    // separate from the line above: it is a real backlog somebody owes an
+    // answer on, but it is NOT evidence that tonight's register is unsettled,
+    // and it no longer withholds the pull's freshness stamp. Before this split,
+    // one unresolvable duplicate pair anywhere in history suppressed every
+    // owner's chase cards for good (Codex PR #443 gate round 33, finding 2).
+    if (input.bankPull.status === "ok" && (input.bankPull.staleAmbiguous?.count ?? 0) > 0) {
+        reasons.push(staleAmbiguousReason(input.bankPull.staleAmbiguous!.count, input.bankPull.staleAmbiguous!.keys));
+    }
+
+    // THE PULL WITHHOLDING ITS OWN STAMP, said out loud. Same job as
+    // `chaser-blocked:<reason>` below: the withholding is correct, and on its
+    // own completely silent — the only other symptom is `bank-pull-stale` 36
+    // hours later, which reads as "the pull is dead" when the pull ran fine and
+    // one report inside it did not answer (round-33 gate, finding 1).
+    if (input.bankPull.status === "ok" && input.bankPull.blockedReason) {
+        reasons.push(`bank-pull-blocked:${input.bankPull.blockedReason}`);
+    }
+
     // THE CHASER REFUSING TO FINISH ON PURPOSE.
     //
     // Distinct from `chaser-stale`, and it has to be: the sweep stops stamping
@@ -523,6 +566,34 @@ export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
 export const BANK_PULL_UNCLEARED_KEY = "bankRegisterPullUnclearedCount";
 
 /**
+ * Ambiguous reconcile groups from BEFORE the window the pull last read, as
+ * `{"count":n,"keys":[...]}` (Codex PR #443 gate round 33, finding 2).
+ *
+ * DELIBERATELY NOT A STAMP BLOCKER. Two legitimate identical purchases that
+ * reconcile cannot pair are a real backlog, but they are last month's backlog:
+ * blocking the freshness stamp on them meant one such pair anywhere in history
+ * suppressed every owner's chase cards, permanently. So the count is reported
+ * here and the stamp is decided by ambiguity inside the current window alone.
+ * The keys ride along because "three of these" without "which three" sends
+ * somebody hunting through the table.
+ */
+export const BANK_PULL_AMBIGUOUS_STALE_KEY = "bankRegisterPullAmbiguousStale";
+
+/**
+ * Why the pull withheld its own freshness stamp on its most recent run, when it
+ * did and the cause was not an outright failure. Empty means nothing is holding
+ * it back.
+ *
+ * The one case today is `cleared-probe-failed`: QuickBooks answered the register
+ * but not the clearance question, so every row is "Unknown", nothing
+ * clearance-gated could run, and the run is not proof the register is current
+ * (round-33 gate, finding 1). Without this the only symptom is `bank-pull-stale`
+ * 36 hours later, which says the pull is dead when in fact it ran fine and one
+ * report inside it did not.
+ */
+export const BANK_PULL_BLOCKED_REASON_KEY = "bankRegisterPullBlockedReason";
+
+/**
  * Is the nightly pull on, and when did it last SUCCEED?
  *
  * A read failure reports `enabled: false` rather than "enabled and stale":
@@ -536,16 +607,58 @@ export const BANK_PULL_UNCLEARED_KEY = "bankRegisterPullUnclearedCount";
  * knows how to say "we could not read this" (`probe-failed:bankPull`) and how
  * to give up on a hung database instead of holding the whole health check open.
  */
-async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount: number }> {
+/** How many stale-ambiguity group keys a single health reason will name before it truncates. */
+export const STALE_AMBIGUOUS_KEYS_IN_REASON = 3;
+
+/**
+ * The stale-ambiguity reason string: the count, then the group keys.
+ *
+ * Exported and pure so the truncation rule is testable. A reason nobody can act
+ * on is noise, and "there are four duplicate groups somewhere" is exactly that —
+ * so the keys are in the string, capped, with the overflow counted rather than
+ * silently dropped.
+ */
+export function staleAmbiguousReason(count: number, keys: readonly string[]): string {
+    const shown = keys.slice(0, STALE_AMBIGUOUS_KEYS_IN_REASON);
+    const overflow = keys.length - shown.length;
+    const suffix = shown.length > 0 ? `:${shown.join(",")}${overflow > 0 ? `,+${overflow}` : ""}` : "";
+    return `bank-ambiguous-stale:${count}${suffix}`;
+}
+
+function parseStaleAmbiguous(raw: string | null | undefined): { count: number; keys: string[] } {
+    if (!raw) return { count: 0, keys: [] };
+    try {
+        const parsed = JSON.parse(raw) as { count?: unknown; keys?: unknown };
+        const count = typeof parsed.count === "number" && Number.isFinite(parsed.count) ? parsed.count : 0;
+        const keys = Array.isArray(parsed.keys) ? parsed.keys.filter((k): k is string => typeof k === "string") : [];
+        return { count, keys };
+    } catch {
+        // An unreadable value is NOT reported as zero — that is the
+        // null-means-OK trap this file exists to avoid. The count comes from the
+        // keys we could not read, so say one thing is wrong rather than nothing.
+        return { count: 1, keys: ["unparseable"] };
+    }
+}
+
+async function readBankPullState(): Promise<{
+    enabled: boolean;
+    lastSuccessAt: string | null;
+    ambiguousCount: number;
+    unclearedCount: number;
+    staleAmbiguous: { count: number; keys: string[] };
+    blockedReason: string | null;
+}> {
     // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
     // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    const [successRow, ambiguousRow, unclearedRow] = await Promise.all([
+    const [successRow, ambiguousRow, unclearedRow, staleAmbiguousRow, blockedRow] = await Promise.all([
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCLEARED_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_STALE_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_BLOCKED_REASON_KEY } }),
     ]);
     const parsedAmbiguous = ambiguousRow?.value ? Number.parseInt(ambiguousRow.value, 10) : 0;
     const parsedUncleared = unclearedRow?.value ? Number.parseInt(unclearedRow.value, 10) : 0;
@@ -554,6 +667,8 @@ async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: s
         lastSuccessAt: successRow?.value || null,
         ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
         unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
+        staleAmbiguous: parseStaleAmbiguous(staleAmbiguousRow?.value),
+        blockedReason: blockedRow?.value || null,
     };
 }
 
@@ -785,10 +900,17 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // IN the Promise.all, and probed: it used to be an unprobed `await`
         // after it, so a hung database held the whole health check open past
         // every other probe's deadline and then answered "switched off".
-        probe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number; unclearedCount: number }>(
+        probe<{
+            enabled: boolean;
+            lastSuccessAt: string | null;
+            ambiguousCount: number;
+            unclearedCount: number;
+            staleAmbiguous: { count: number; keys: string[] };
+            blockedReason: string | null;
+        }>(
             "bankPull",
             readBankPullState,
-            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, unclearedCount: 0 },
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null },
         ),
         // Can we authenticate to Drive? Asked here rather than at the moment a
         // memo arrives, because the answer "no" produces no symptom anywhere
@@ -882,6 +1004,8 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             lastSuccessAt: bankPull.value.lastSuccessAt,
             ambiguousCount: bankPull.value.ambiguousCount,
             unclearedCount: bankPull.value.unclearedCount,
+            staleAmbiguous: bankPull.value.staleAmbiguous,
+            blockedReason: bankPull.value.blockedReason,
         },
     };
 

@@ -295,12 +295,23 @@ Planner output for the executor: build exactly this; do not guess.
 - **THE ARTIFACT MUST BE BOUND TO THE ISSUE IT RESOLVES** (Codex PR #443 gate, finding
   3) — an existing, real PDF was previously accepted for ANY fingerprint the caller
   named, with nothing tying the two together. Three checks, all before the write:
-  1. **Requested.** The target `ReviewIssue` must carry `cards[]`/`card` history — a
-     chase card actually listed it, which is the only way the "sign N" reply flow can
-     have been reached. Otherwise **422** `not-requested`. (Not gated on the issue being
-     OPEN — a signature answering an issue the sweep already auto-closed is still
-     recorded, per the "RECORDED EVEN ON A CLEARED ISSUE" rule above; that invariant
-     stays as-is.)
+  1. **Requested, and from the card that asked.** The target `ReviewIssue` must carry
+     `cards[]`/`card` history — a chase card actually listed it, which is the only way the
+     "sign N" reply flow can have been reached. Otherwise **422** `not-requested`.
+     **TIGHTENED (round-33 gate, finding 3): the answer must name the originating card.**
+     "Some card once listed this item" says an ask happened, not that THIS reply came from
+     it — and two charges for the same amount mint memos with interchangeable filenames,
+     so a memo signed for one charge and replayed against the other's fingerprint
+     satisfied both this check and check 3. The `thread` the bridge already sends was
+     stored and never compared. It is now matched exactly against a card record on THIS
+     issue (plus `n`/`request_id` when the answer carries them); no match ⇒ **422**
+     `wrong-thread`, and an answer with no thread at all is refused the same way rather
+     than assumed. The cleared-issue exemption round 32 added here is GONE: it was a real
+     race, it was fixed at the source (`recordCardOnIssues` writes on cleared issues too),
+     and leaving it meant any already-closed charge accepted a memo nobody had asked for.
+     A cleared issue that never had a card is **422** `not-requested`. (Recording on a
+     cleared issue is otherwise unchanged, per "RECORDED EVEN ON A CLEARED ISSUE" above —
+     what changed is that it now requires a matching association first.)
   2. **Not reused.** The same `pdf_id` already recorded as `{resolution:"memo-signed"}`
      on a DIFFERENT `targetKey` is refused with **409** `artifact-reused` — one signed
      affidavit answers exactly one charge.
@@ -350,6 +361,29 @@ and must be an update, not a 409 restatement. `Unknown` never overwrites a store
 answer, so a failed probe stops new mints rather than erasing what QuickBooks already
 said.
 
+**And a failed probe is not a complete pull** (round-33 gate, finding 1). Stopping the
+mints was necessary and not sufficient: `clearedProbeOk` was computed in
+`fetchBankRegister` and then dropped at the cron's `fetchRows` boundary, so a run that
+had no clearance answer at all still reported a finished pull and stamped
+`bankRegisterPullLastSuccess`. The health check read the register as current, and the
+chaser released the cards, over a night when the one question the register is FOR went
+unanswered. The flag now travels through the pull summary; when it is false the run
+carries `reason: "cleared-probe-failed"`, is not `complete`, does not stamp, skips
+minting with `mintSkipped: "cleared-probe-failed"`, and records
+`bankRegisterPullBlockedReason` — which `pipeline-health` reports as
+`bank-pull-blocked:cleared-probe-failed`, immediately, instead of leaving
+`bank-pull-stale` to fire 36 hours later and read as a dead pull.
+
+**Reconciliation is bounded, and stale ambiguity does not block the world**
+(round-33 gate, finding 2). The scan reads back `RECONCILE_LOOKBACK_DAYS` (60, the same
+boundary as the mint pass and the chaser) or the pull window's start, whichever is
+earlier — it used to read the whole table. Equal-cardinality duplicate groups (a 2×2 of
+two legitimate identical purchases arriving statement-first) are paired deterministically
+in sorted order and recorded as `paired-by-order`; unequal cardinality stays ambiguous.
+Only ambiguity INSIDE the pulled window withholds the success stamp. Older residue is
+reported as `bank-ambiguous-stale:<n>:<keys>` and is a backlog for a human, never a
+reason to suppress every owner's cards.
+
 ## 5. Crons — `vercel.json` additions
 
 - **AS BUILT — the chaser runs as TWO invocations of one route.**
@@ -388,6 +422,32 @@ said.
     at `*/15 * * * *` runs six times between 13:00 and the 14:30 cards, so a
     cycle held open at 13:00 by a pull that recovers at 13:20 still completes and
     still delivers. No new cron was needed.
+- **AS BUILT — the register pull runs as TWO invocations too** (round-33 gate,
+  finding 4). It was one:
+  - `/api/cron/bank-register-pull`, `"0 2 * * *"` — the nightly pull.
+  - `/api/cron/bank-register-pull?continue=1`, `"*/15 2-12 * * *"` — the RESUME
+    pass, ending before the 13:00 chaser. The pull is resumable (it parks
+    `continueAfter` inside the window, and `mintRemainingCursor` for a truncated
+    mint) and reports `complete: false` when it truncates — but nothing invoked
+    it again, so a truncated pull sat parked for eleven hours, the chaser found a
+    register that had never been certified current, held its cycle open, and the
+    14:30 cards did not go out. Like the chaser's own resume, it does no work of
+    its own: with nothing parked it returns `{skipped:"nothing-in-progress"}`
+    before taking the lease, so a resume pass cannot contend with the nightly
+    run. Co-firing with the 02:00 slot is harmless for the same reason — with
+    nothing parked it exits, and with something parked either invocation does
+    exactly the same work from the same persisted state.
+
+### The pull's schedule, as built
+
+| Path | Schedule (UTC) | What it is |
+| --- | --- | --- |
+| `/api/cron/bank-register-pull` | `0 2 * * *` | The nightly pull. |
+| `/api/cron/bank-register-pull?continue=1` | `*/15 2-12 * * *` | Resume, 02:00–12:45. No-ops unless work is parked. |
+| `/api/cron/receipt-requests` | `0 13 * * *` | The full chaser sweep. |
+| `/api/cron/receipt-requests?continue=1` | `*/15 * * * *` | Chaser resume. |
+| `/api/cron/receipt-request-cards` | `30 14 * * 1-5` | Cards out. |
+| `/api/cron/receipt-request-cards?retry=1` | `30 16 * * 1-5` | Card retry. |
 - ORIGINAL PLAN (superseded by the two entries above):
   `/api/cron/receipt-requests`, `"0 13 * * *"` (6 AM Pacific, after the overnight QBO
   register push lands; NOTE: no in-repo register cron exists yet — ordering vs the
@@ -497,8 +557,10 @@ said.
    recorded on an issue that cleared between the confirmed post and the history write —
    the version CAS is the whole guard, and the write names only `displayDetails` and
    `version`, so a resolution can never be un-answered by it. A valid signed memo for an
-   already-answered chase is an idempotent `200 {ok:true, alreadyResolved:true}`;
-   `422 not-requested` survives only for a still-OPEN issue nobody ever asked about.
+   already-answered chase is an idempotent `200 {ok:true, alreadyResolved:true}` — but
+   ONLY when its originating association matches (round-33 gate, finding 3); a cleared
+   issue that never carried a card is `422 not-requested`, and a reply from a thread this
+   issue was never asked in is `422 wrong-thread`.
 2. **Beverly companion change** (§4 sign step) lives outside every repo here (Hermes
    runner on Justin's PC). Until it ships, "sign N" replies are recorded but no sign card
    appears — photo/job replies work day one. HUMAN DECISION on sequencing.

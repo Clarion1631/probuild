@@ -301,12 +301,19 @@ test("the thread export covers the whole retention window, cleared or not", () =
 
 test("a valid memo on an already-answered chase is an idempotent 200", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/automation/receipt-requests/answers/route.ts"), "utf8");
-    // `not-requested` survives ONLY for a still-open issue. On a closed one, no
-    // record of the ask means the card-history race, not a forged memo — and
-    // the forwarder has to be able to retry and get the same answer.
-    assert.match(source, /if \(!requested && issue\.clearedAt === null\) return \{ kind: "never-requested" \};/);
+    // SUPERSEDED IN PART by the round-33 gate (finding 3). Round 32 let a
+    // cleared issue with no card record through as the card-history race. That
+    // race was real and is now fixed where it happened — recordCardOnIssues
+    // writes on cleared issues too — so the exemption here only meant that any
+    // already-closed charge accepted a memo nobody had asked for. What survives
+    // is the idempotency it was protecting: a row that ALREADY carries a
+    // resolution answers 200 with `alreadyResolved`, so the forwarder can retry
+    // and get the same answer.
+    assert.match(source, /const alreadyAnswered = hasResolution\(details\);/);
+    assert.match(source, /alreadyResolved: alreadyAnswered,/);
     assert.match(source, /alreadyResolved: true/);
     assert.match(source, /reason: "not-requested"/, "the 422 still exists for the real case");
+    assert.match(source, /reason: "wrong-thread"/, "and a memo from a thread this charge was never asked in is its own 422");
 });
 
 // ── 3. A chaser cycle is only complete over a fresh register ────────────────
@@ -394,7 +401,7 @@ test("the sweep reads the pull marker the pull actually writes", () => {
     assert.match(sweep, /BANK_PULL_LAST_SUCCESS_KEY[\s\S]*from "@\/lib\/pipeline-health"/);
     assert.match(pull, /BANK_PULL_LAST_SUCCESS_KEY[\s\S]*from "@\/lib\/pipeline-health"/);
     // And the pull still only stamps a COMPLETE, unambiguous success.
-    assert.match(pull, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{/);
+    assert.match(pull, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{/);
     // A read failure is NOT fresh: "we could not check" is not evidence.
     assert.match(sweep, /return \{ fresh: false, lastSuccessAt: null \};/);
 });
