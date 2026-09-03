@@ -407,6 +407,13 @@ export async function loadCardItemTruth(
         const currentCodes = decodeReasonCodes(row.reasonCodes);
         const acked = new Set(decodeReasonCodes(row.acknowledgedCodes));
         const clearedAt = row.clearedAt;
+        // THE CHEAP CHECK IS ENOUGH HERE, deliberately (round-36 gate, finding 3).
+        // The matcher needs `hasBackedResolution` because it decides whether a
+        // chase may CLOSE; this only decides whether an item is worth a
+        // recompute, and it errs the safe way in both directions: a quarantined
+        // memo reads as unresolved (so the item is re-verified and carded), and
+        // a memo whose binding is missing is caught by the recompute below,
+        // which is artifact-backed.
         const resolved = hasResolution(details);
         const acknowledged = currentCodes.length > 0 && currentCodes.every(code => acked.has(code));
         /**

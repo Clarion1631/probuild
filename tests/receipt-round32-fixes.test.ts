@@ -381,7 +381,9 @@ test("a stale pull cannot stamp the cycle complete, and cannot close it either",
 test("the block is reported where a human will see it, not only in the summary", () => {
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // In the response…
-    assert.match(sweep, /\.\.\.\(bankPullStale \? \{ reason: BANK_PULL_STALE_REASON \} : \{\}\)/);
+    // And a second reason since round 36, finding 2: a register that arrived
+    // WHILE the pass was running leaves a list this cycle never judged.
+    assert.match(sweep, /\.\.\.\(bankPullStale[\s]*\? \{ reason: BANK_PULL_STALE_REASON \}[\s]*: ledgerMoved \? \{ reason: PULL_MOVED_REASON \} : \{\}\)/);
     assert.match(sweep, /bankPull: \{ fresh: bankPull\.fresh, lastSuccessAt: bankPull\.lastSuccessAt \}/);
     // …and on the marker the health check already reads, so it does not need a
     // probe of its own.
@@ -403,7 +405,7 @@ test("the sweep reads the pull marker the pull actually writes", () => {
     // And the pull still only stamps a COMPLETE, unambiguous success — with a
     // fifth condition since round 35: no days left uncertified behind this
     // window (a healthy 3-day overlap says nothing about the week before it).
-    assert.match(pull, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{/);
+    assert.match(pull, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
     // A read failure is NOT fresh: "we could not check" is not evidence.
     assert.match(sweep, /return \{ fresh: false, lastSuccessAt: null \};/);
 });

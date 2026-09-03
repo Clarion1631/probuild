@@ -82,7 +82,9 @@ test("the sweep stamps only a clean cycle, and the cards cron refuses without on
     // resume stamps as soon as the pull recovers — leaving it "done" would make
     // the resume exit with "nothing-in-progress" and lose the day's cards to an
     // outage that had already been fixed (Codex PR #443 gate, finding 3).
-    assert.match(sweep, /const decision = sweepCompletionDecision\(\{ computedPhase, bankPullStale \}\);/);
+    // The same holds for a pull that landed mid-pass (round-36 gate, finding 2):
+    // both inputs reach the one decision, and both can only hold a cycle open.
+    assert.match(sweep, /const decision = sweepCompletionDecision\(\{ computedPhase, bankPullStale, ledgerMoved \}\);/);
     // The block reason is RESTATED on every write, never carried forward, or
     // `chaser-blocked` would keep firing after the pull recovered.
     assert.match(sweep, /blockedReason,/);

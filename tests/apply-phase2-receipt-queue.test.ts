@@ -47,6 +47,23 @@ test("every statement the apply script runs is present in the committed migratio
     }
 });
 
+/**
+ * The ONE row rewrite this script is allowed to carry, recognised by shape.
+ *
+ * A repair UPDATE is idempotent when its WHERE clause is the very thing the
+ * update removes: this one selects `memo-signed` issues with no artifact of their
+ * own and rewrites that resolution to `memo-conflict`, so a second run's WHERE
+ * matches nothing. Both halves are required — the selecting predicate and the
+ * rewrite that extinguishes it — because either one alone is a statement that
+ * would run forever.
+ */
+function memoQuarantine(s: string): boolean {
+    return /^UPDATE "ReviewIssue"/i.test(s.trim())
+        && /= 'memo-signed'/.test(s)
+        && /NOT EXISTS/i.test(s)
+        && /"resolution":"memo-conflict"/.test(s);
+}
+
 test("both are additive and idempotent — a re-run must change nothing", () => {
     for (const statement of statements as string[]) {
         const s = statement.trim();
@@ -70,14 +87,35 @@ test("both are additive and idempotent — a re-run must change nothing", () => 
             // fresh cuid would insert a duplicate on every run while reporting
             // "ok", which is the same silent-drift failure the constraint
             // convergence above exists to avoid.
-            || (/^INSERT INTO /i.test(s) && /ON CONFLICT DO NOTHING$/i.test(s) && /md5\(/i.test(s));
+            || (/^INSERT INTO /i.test(s) && /ON CONFLICT DO NOTHING$/i.test(s) && /md5\(/i.test(s))
+            // A REPAIR UPDATE is idempotent when its WHERE clause is the very
+            // thing the update removes. The memo quarantine (round-36 gate,
+            // finding 3) selects `memo-signed` issues with no artifact of their
+            // own and rewrites that resolution to `memo-conflict`, so the second
+            // run's WHERE matches nothing. Asserted as a SHAPE — the selecting
+            // predicate AND the rewrite that extinguishes it — because either
+            // one alone is a statement that would run forever.
+            || memoQuarantine(s);
         assert.ok(guarded, `not idempotent:\n  ${s.slice(0, 120)}`);
-        // NOTHING HERE MAY DESTROY OR REWRITE DATA. A constraint is not data:
-        // dropping one to re-add it with the right definition changes no row,
-        // and is the only way to converge a stale check. Everything else that
-        // drops, truncates or rewrites is still forbidden.
+        // NOTHING HERE MAY DESTROY DATA. A constraint is not data: dropping one
+        // to re-add it with the right definition changes no row, and is the only
+        // way to converge a stale check.
         assert.doesNotMatch(s, /\bDROP\s+(?:TABLE|COLUMN|INDEX|SCHEMA|DATABASE)\b/i);
-        assert.doesNotMatch(s, /\bTRUNCATE\b|\bDELETE FROM\b|\bUPDATE\s+"/i);
+        assert.doesNotMatch(s, /\bTRUNCATE\b|\bDELETE FROM\b/i);
+        // AND EXACTLY ONE REWRITE IS ALLOWED: the memo quarantine (round-36
+        // gate, finding 3), which repairs rows the script's own backfill could
+        // not bind. It is carved out by SHAPE and then held to the four columns
+        // that repair needs — a carve-out for "UPDATE" as a keyword would let
+        // the next migration rewrite anything it liked.
+        if (/\bUPDATE\s+"/i.test(s)) {
+            assert.ok(memoQuarantine(s), "the memo quarantine is the ONLY row rewrite this script may carry");
+            const columns = [...s.matchAll(/^\s*(?:SET\s+)?"([A-Za-z]+)"\s*=/gm)].map(m => m[1]).sort();
+            assert.deepEqual(
+                columns,
+                ["clearedAt", "displayDetails", "updatedAt", "version"],
+                "the repair may touch the resolution, the reopen, the audit stamp and the version — nothing else",
+            );
+        }
         if (/\bDROP CONSTRAINT\b/i.test(s)) {
             const name = /DROP CONSTRAINT "([^"]+)"/.exec(s)?.[1];
             assert.ok(name, "a constraint drop must name the constraint");
@@ -269,6 +307,24 @@ test("the backfill records bindings that predate the table, and re-runs to nothi
     assert.match(backfill, /parsed\."resolution" = 'memo-signed'/, "only a memo resolution is a memo binding");
     assert.match(backfill, /ORDER BY/, "deterministic residue where the pre-fix bug already duplicated a pdfId");
     assert.ok(normalizedMigration.includes(normalize(backfill)), "and the committed migration does the same");
+});
+
+test("the losing side of a duplicated memo is REOPENED, not left closed on evidence it does not have", () => {
+    // The backfill binds the oldest claimant and `ON CONFLICT DO NOTHING` walks
+    // away from the rest — so without this the loser keeps a `memo-signed`
+    // resolution with no artifact, and `hasResolution` alone holds that chase
+    // closed forever on a memo that answered a different charge.
+    const repair = (statements as string[]).find(s => /^UPDATE "ReviewIssue"/i.test(s.trim()));
+    assert.ok(repair, "the migration must reopen the issues its own backfill could not bind");
+    assert.match(repair, /NOT EXISTS[\s\S]*"ReceiptMemoArtifact"[\s\S]*a\."issueId" = i\."id"/,
+        "the binding has to be THIS issue's — an artifact for another charge is what caused this");
+    assert.match(repair, /a\."pdfId" IS NOT DISTINCT FROM/,
+        "and THIS pdfId, so a stale binding cannot vouch for a different memo");
+    assert.match(repair, /"clearedAt" = NULL/, "reopened, or nobody is ever asked again");
+    assert.match(repair, /"version" = i\."version" \+ 1/, "so an in-flight optimistic write loses instead of clobbering the repair");
+    assert.match(repair, /"resolution":"memo-conflict"/, "quarantined under a resolution hasResolution does not honour");
+    assert.doesNotMatch(repair, /::jsonb/, "a jsonb cast would take the rollout down on a single bad row");
+    assert.ok(normalizedMigration.includes(normalize(repair)), "and the committed migration does the same");
 });
 
 test("the artifact table is verified by shape and carries RLS, like every other sensitive table here", () => {

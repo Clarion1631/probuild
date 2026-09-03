@@ -218,7 +218,8 @@ test("only a done phase carries the stamp, and contention cannot reach done", ()
     assert.match(sweepSource, /const computedPhase = sweepPhaseAfter\(\{[\s\S]{0,240}openContended,[\s\S]{0,240}lineContended,/);
     // A run that left contended work says so, and says there is more to do —
     // and so does one held open because the register pull was stale.
-    assert.match(sweepSource, /moreToProcess: !exhausted \|\| !openExhausted \|\| openContended > 0 \|\| lineContended > 0 \|\| bankPullStale/);
+    // — or because the ledger moved under the pass (round-36 gate, finding 2).
+    assert.match(sweepSource, /moreToProcess: !exhausted \|\| !openExhausted \|\| openContended > 0 \|\| lineContended > 0[\s]*\|\| bankPullStale \|\| ledgerMoved/);
 });
 
 test("a STABLE non-verdict does not block the cycle for ever", () => {

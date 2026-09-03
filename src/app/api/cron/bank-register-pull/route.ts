@@ -75,6 +75,28 @@ const PULL_BUDGET_MS = 50_000;
 /** Where the pull window's high-water mark and last deep sweep live. */
 const WINDOW_STATE_KEY = "bankRegisterPullWindow";
 
+/**
+ * READ ONE STORED FIELD, OR DROP IT (Codex PR #443 gate round 36, finding 5).
+ *
+ * Every date in this state is a `YYYY-MM-DD` the planner does arithmetic on.
+ * A `typeof === "string"` check let anything through, and the two failure modes
+ * are opposite and both bad: a bad `highWater` makes `Date.parse` return NaN,
+ * so the planned window is `NaN..NaN` and the run throws on every invocation;
+ * a bad `lastFullSweep` is worse for being quiet — `todayMs - NaN >= 7 days` is
+ * FALSE, so the deep sweep reads as "not due" and is suppressed forever.
+ *
+ * Dropping the field is the fallback in both directions, because for every one
+ * of them "unknown" means WIDER: no mark plans the full lookback, no sweep date
+ * makes the deep sweep due, and no continuation point re-reads the window from
+ * the top through an idempotent ingest.
+ */
+function readStoredYmd(value: unknown, field: string, dropped: string[]): string | null {
+    if (value === undefined || value === null) return null;
+    if (typeof value === "string" && isYmd(value)) return value;
+    dropped.push(field);
+    return null;
+}
+
 async function readWindowState(): Promise<PullWindowState> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
@@ -83,12 +105,24 @@ async function readWindowState(): Promise<PullWindowState> {
         const resume = parsed.continueAfter;
         const retry = parsed.retryPending;
         const uncertified = parsed.uncertifiedBounds;
-        return {
-            highWater: typeof parsed.highWater === "string" ? parsed.highWater : null,
-            lastFullSweep: typeof parsed.lastFullSweep === "string" ? parsed.lastFullSweep : null,
-            continueAfter: resume && typeof resume.postedDate === "string" && typeof resume.qbTxnId === "string"
+        // Named once, at the end, rather than a line per field: an operator
+        // needs to know the state was repaired and which part of it was lost,
+        // and one warning per run is what makes that findable instead of noise.
+        const dropped: string[] = [];
+        const state: PullWindowState = {
+            highWater: readStoredYmd(parsed.highWater, "highWater", dropped),
+            lastFullSweep: readStoredYmd(parsed.lastFullSweep, "lastFullSweep", dropped),
+            // THE WHOLE MARKER, or none of it. A resume point with an unusable
+            // date cannot be placed in the (postedDate, qbTxnId) order the split
+            // relies on, and half of one would silently discard the rows before
+            // it — the exact backdate loss `splitAtCursor` exists to prevent.
+            // Discarded, never fatal: the window is simply re-read from the top,
+            // which the ingest is idempotent under.
+            continueAfter: resume
+                && typeof resume.postedDate === "string" && isYmd(resume.postedDate)
+                && typeof resume.qbTxnId === "string" && resume.qbTxnId !== ""
                 ? { postedDate: resume.postedDate, qbTxnId: resume.qbTxnId }
-                : null,
+                : (resume ? (dropped.push("continueAfter"), null) : null),
             mintRemainingCursor: typeof parsed.mintRemainingCursor === "string" ? parsed.mintRemainingCursor : null,
             // VALIDATED FIELD BY FIELD, and dropped whole if any part is
             // unusable. A half-read marker would re-plan the pull over bounds
@@ -110,8 +144,27 @@ async function readWindowState(): Promise<PullWindowState> {
                 && uncertified.startDate <= uncertified.endDate
                 ? { startDate: uncertified.startDate, endDate: uncertified.endDate }
                 : null,
-            uncertifiedSince: typeof parsed.uncertifiedSince === "string" ? parsed.uncertifiedSince : null,
+            // An INSTANT, not a calendar day, and only used to say how long a
+            // hole has been open — so an unparseable one is dropped and the next
+            // failing run re-stamps it as "since now". Keeping a bad value would
+            // report an age no human could read.
+            uncertifiedSince: typeof parsed.uncertifiedSince === "string" && Number.isFinite(Date.parse(parsed.uncertifiedSince))
+                ? parsed.uncertifiedSince
+                : (typeof parsed.uncertifiedSince === "string" ? (dropped.push("uncertifiedSince"), null) : null),
+            // A count, and only a POSITIVE one is a backlog. Anything else —
+            // absent, zero, negative, a string written by an older build — is
+            // "nothing outstanding", which is the reading that cannot wedge the
+            // continuation pass on forever.
+            reconcileRemaining: Number.isFinite(parsed.reconcileRemaining) && (parsed.reconcileRemaining as number) > 0
+                ? (parsed.reconcileRemaining as number)
+                : null,
+            stampPending: parsed.stampPending === true,
+            continuationPending: parsed.continuationPending === true,
         };
+        if (dropped.length > 0) {
+            console.warn("[cron/bank-register-pull] dropped unusable window-state fields", dropped.join(","));
+        }
+        return state;
     } catch {
         // A corrupt or unreadable state is "we know nothing", which plans the
         // widest safe window — never a narrow one built on a bad mark.
@@ -126,6 +179,38 @@ async function saveWindowState(next: PullWindowState): Promise<void> {
         update: { value },
         create: { key: WINDOW_STATE_KEY, value },
     });
+}
+
+/**
+ * PARK — or release — the freshness stamp a run owed (round-36 gate, finding 4).
+ *
+ * Merged onto the RAW stored value, not onto `readWindowState()`'s normalised
+ * one: that reader answers a corrupt or unreadable row with an all-null default,
+ * and writing that back would erase a high-water mark over a transient read
+ * error. A parse failure here throws into the catch and changes nothing, which
+ * is the only safe direction for a repair write.
+ *
+ * Never throws: the run's own answer is already decided by the time this is
+ * called, and failing to record the obligation must not turn a 503 into a crash.
+ */
+async function persistStampPending(pending: boolean): Promise<void> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
+        const parsed = row?.value ? JSON.parse(row.value) as Record<string, unknown> : {};
+        // Unchanged is the common case, and a KV write nobody needs is a write
+        // that can fail for nothing.
+        if ((parsed.stampPending === true) === pending) return;
+        if (pending) parsed.stampPending = true;
+        else delete parsed.stampPending;
+        const value = JSON.stringify(parsed);
+        await prisma.automationSetting.upsert({
+            where: { key: WINDOW_STATE_KEY },
+            update: { value },
+            create: { key: WINDOW_STATE_KEY, value },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] stamp-pending write failed", error instanceof Error ? error.message : "UnknownError");
+    }
 }
 
 /**
@@ -144,11 +229,32 @@ async function saveWindowState(next: PullWindowState): Promise<void> {
  * cleared as finished and every 15-minute resume slot answered
  * `nothing-in-progress` while the register stayed uncertified until the next
  * night, long after the 13:00 chaser had given up on it.
+ *
+ * THE FOURTH AND FIFTH ARE THE SAME SHAPE AGAIN (round-36 gate, finding 1).
+ *
+ * A reconcile that stopped on its own cap leaves `reconcileRemaining`, and a
+ * window the PLANNER capped leaves nothing at all — its ingest finished, so
+ * `continueAfter` is cleared and the mark legitimately advances. Both report
+ * `complete: false` and both used to answer "nothing in progress", so a
+ * backlog wide enough to need several windows drained one NIGHT per window
+ * while the chaser waited on a stamp that could not come.
+ *
+ * `continuationPending` is the general form of the question the specific
+ * markers each answer a piece of: not "where do I pick up" but "is the picture
+ * finished". It is the run's own `complete` verdict, written on every save so
+ * it cannot outlive the state it describes — and NOT set for a failed clearance
+ * probe, whose retries are deliberately bounded (see PROBE_RETRY_LIMIT).
+ *
+ * The sixth is `stampPending`: a run that succeeded at everything except
+ * recording it (round-36 gate, finding 4).
  */
 export function pullContinuationPending(state: PullWindowState): boolean {
     return (state.continueAfter ?? null) !== null
         || (state.mintRemainingCursor ?? null) !== null
-        || (state.retryPending ?? null) !== null;
+        || (state.retryPending ?? null) !== null
+        || (state.reconcileRemaining ?? 0) > 0
+        || state.continuationPending === true
+        || state.stampPending === true;
 }
 
 export async function GET(request: Request) {
@@ -559,8 +665,20 @@ async function runPull() {
     // That was the fourth shape of the lie: a narrow, healthy, complete overlap
     // window stamped the clock over observations that had never been certified
     // and were never offered to the mint (round-35 gate, finding 1).
-    if (summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
-        && !summary.uncertified) {
+    const stampWarranted = summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
+        && !summary.uncertified;
+    /**
+     * A FAILED STAMP IS A FAILED RUN (round-36 gate, finding 4).
+     *
+     * This write is the run's actual output — the clock the chaser reads to
+     * decide whether the register it is about to certify is current. Logging the
+     * failure and answering 200 meant the platform surfaced nothing, nobody
+     * looked, and the first sign was `bank-pull-stale` thirty-six hours later on
+     * a pull that had been working perfectly. 503, because it is exactly that:
+     * the work landed, the record of it did not, and retrying is the fix.
+     */
+    let stampFailed = false;
+    if (stampWarranted) {
         try {
             await prisma.automationSetting.upsert({
                 where: { key: BANK_PULL_LAST_SUCCESS_KEY },
@@ -568,10 +686,20 @@ async function runPull() {
                 create: { key: BANK_PULL_LAST_SUCCESS_KEY, value: new Date().toISOString() },
             });
         } catch (error) {
+            stampFailed = true;
+            summary.ok = false;
+            summary.reason = "freshness-stamp-failed";
             console.error("[cron/bank-register-pull] last-success write failed", error instanceof Error ? error.message : "UnknownError");
         }
     }
+    // AND A CONTINUATION HAS TO COME BACK FOR IT. Every other marker this run
+    // could have left was cleared by a run that was, in every other respect, a
+    // complete success — so without this the resume pass answers
+    // `nothing-in-progress` and the stamp waits for tomorrow night. Released on
+    // any run that stamps, or that finds the stamp no longer warranted: the
+    // obligation is to the CLOCK, and a run that must not stamp does not owe it.
+    await persistStampPending(stampFailed);
 
-    const status = summary.ok ? 200 : 500;
+    const status = stampFailed ? 503 : summary.ok ? 200 : 500;
     return NextResponse.json(summary, { status });
 }

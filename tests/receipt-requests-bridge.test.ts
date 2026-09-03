@@ -203,7 +203,11 @@ test("the sweep recomputes source truth on an OCC retry instead of reapplying a 
     // `targetKey`, so the sweep's per-call behaviour is unchanged and it keeps
     // its own outer budget rather than inheriting the card cron's.
     assert.match(source, /async function recomputeCodesFor\(\s*targetKey: string,\s*cache\?: Map<string, ReasonCode\[\]>,\s*deadlineExceeded\?: \(\) => boolean,\s*\): Promise<ReasonCode\[\]> \{/);
-    assert.match(source, /if \(hasResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\)\)\) \{ cache\?\.set\(targetKey, \[\]\); return \[\]; \}/);
+    // ARTIFACT-BACKED since round 36, finding 3: a `memo-signed` blob with no
+    // ReceiptMemoArtifact of its own is a memo that answered a DIFFERENT charge,
+    // and reading it as an answer kept this one closed for ever.
+    assert.match(source, /if \(hasBackedResolution\(parseMissingReceiptDetails\(issue\?\.displayDetails \?\? null\), memoBinding\?\.pdfId \?\? null\)\) \{ cache\?\.set\(targetKey, \[\]\); return \[\]; \}/);
+    assert.match(source, /prisma\.receiptMemoArtifact\.findUnique\(\{[\s\S]{0,300}targetType_targetKey/);
 });
 
 test("the missing-receipt loader pages when an owner filter is set", () => {
@@ -294,7 +298,9 @@ test("card history is written only AFTER a validated post", () => {
 
 test("the bank pull fails loudly: any failure is a 500", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(source, /const status = summary\.ok \? 200 : 500;/);
+    // 503 for the one failure that is neither the work nor the platform: the
+    // run did everything and could not record it (round-36 gate, finding 4).
+    assert.match(source, /const status = stampFailed \? 503 : summary\.ok \? 200 : 500;/);
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-failed";/);
     assert.match(lib, /summary\.error = summary\.error \?\? "mint-failed";/);
@@ -434,7 +440,8 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,600}BANK_PULL_LAST_SUCCESS_KEY/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -846,7 +853,8 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,600}BANK_PULL_LAST_SUCCESS_KEY/);
     // And the cursor is persisted, so a backlog that is not draining is visible.
     assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
 

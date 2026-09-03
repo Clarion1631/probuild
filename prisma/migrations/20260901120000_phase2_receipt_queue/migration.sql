@@ -193,6 +193,42 @@ SELECT 'rma_' || md5(parsed."pdfId"), parsed."pdfId", i."targetType", i."targetK
  ORDER BY i."firstObservedAt", i."id"
  ON CONFLICT DO NOTHING;
 
+-- AND REOPEN THE ONES THAT LOST (Codex PR #443 gate round 36, finding 3).
+--
+-- `ON CONFLICT DO NOTHING` above binds the OLDEST claimant of a duplicated
+-- pdfId and walks away from the others — leaving them with a `memo-signed`
+-- resolution and no artifact. That is an answer nothing can vouch for: the
+-- memo was spent on a different charge, and `hasResolution` alone kept the
+-- chase closed forever. The same shape covers a `memo-signed` blob that never
+-- carried a pdfId at all — a claim with no evidence to check.
+--
+-- QUARANTINED, NOT DELETED: the resolution becomes `memo-conflict`, which
+-- `hasResolution` deliberately does not treat as an answer (see
+-- src/lib/receipt-requests.ts), and `clearedAt` is cleared — so the charge is
+-- chased again while the blob still records what happened. `version` is
+-- incremented so an in-flight optimistic write loses rather than clobbering
+-- the repair.
+--
+-- IDEMPOTENT: a re-run finds no `memo-signed` without a binding, because this
+-- one rewrote every such row.
+UPDATE "ReviewIssue" i
+   SET "displayDetails" = regexp_replace(
+           i."displayDetails",
+           '"resolution"[[:space:]]*:[[:space:]]*"memo-signed"',
+           '"resolution":"memo-conflict"'),
+       "clearedAt" = NULL,
+       "updatedAt" = CURRENT_TIMESTAMP,
+       "version" = i."version" + 1
+ WHERE i."displayDetails" LIKE '%memo-signed%'
+   AND substring(i."displayDetails" from '"resolution"[[:space:]]*:[[:space:]]*"([^"]+)"') = 'memo-signed'
+   AND NOT EXISTS (
+       SELECT 1
+         FROM "ReceiptMemoArtifact" a
+        WHERE a."issueId" = i."id"
+          AND a."pdfId" IS NOT DISTINCT FROM
+              substring(i."displayDetails" from '"pdfId"[[:space:]]*:[[:space:]]*"([^"]+)"')
+   );
+
 -- RLS, matching ReceiptRequestCard: ENABLE without FORCE, so the owner/service
 -- role the app connects as is unaffected while anon and authenticated get
 -- nothing.

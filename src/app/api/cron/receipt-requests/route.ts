@@ -27,6 +27,7 @@ import {
     groupCompetingLines,
     isComponentKey,
     pageComponents,
+    hasBackedResolution,
     hasResolution,
     mergeReceiptRequestDetails,
     planReceiptRequests,
@@ -140,8 +141,48 @@ const PHASE_KEY = SWEEP_MARKER_KEY;
  */
 const BANK_PULL_CYCLE_WINDOW_MS = BANK_PULL_CHASER_WINDOW_HOURS * 60 * 60_000;
 
-/** The one `blockedReason` this sweep writes. */
+/** The one `blockedReason` this sweep writes for a register that was not current. */
 export const BANK_PULL_STALE_REASON = "bank-pull-stale";
+
+/**
+ * The `blockedReason` for a register that moved UNDER this pass (round-36 gate,
+ * finding 2).
+ *
+ * Distinct from `bank-pull-stale` on purpose: stale means the pull never
+ * delivered, this means it delivered halfway through the sweep. The operator
+ * response is different — nothing is wrong, the next continuation just has to
+ * read the lines that arrived.
+ */
+export const PULL_MOVED_REASON = "pull-moved";
+
+/**
+ * Did canonical lines land in the window AFTER the line pass loaded its
+ * snapshot? (round-36 gate, finding 2.)
+ *
+ * The line pass reads `windowLines` once and then works from that list for the
+ * rest of the run, while the freshness marker is read at the END. A pull that
+ * mints lines in between satisfies both: the marker is fresh, the snapshot is
+ * stale, and the cycle stamps "complete" over charges it never looked at — the
+ * cards then go out saying the list is finished.
+ *
+ * COUNTED FROM THE LEDGER, not from the pull's own marker. A mint is not the
+ * only way a line appears (a statement import and the receipt-intake worker
+ * both write them), and a pull that minted lines and then failed its own stamp
+ * would move the ledger without moving the marker at all.
+ *
+ * A COUNT THAT CANNOT BE TAKEN IS TREATED AS MOVED. "We could not check" is not
+ * evidence that nothing arrived, and the safe direction is the one that
+ * withholds the stamp for fifteen minutes rather than certifying a list that
+ * may be short.
+ */
+export async function ledgerMovedDuringPass(countNewLines: () => Promise<number>): Promise<boolean> {
+    try {
+        return (await countNewLines()) > 0;
+    } catch (error) {
+        console.error("[cron/receipt-requests] ledger watermark read failed", error instanceof Error ? error.message : "UnknownError");
+        return true;
+    }
+}
 
 /**
  * Is a recorded pull success fresh enough for this cycle? PURE, so the boundary
@@ -175,14 +216,27 @@ export function bankPullFresh(lastSuccessAt: string | null, now: Date): boolean 
 export function sweepCompletionDecision(input: {
     computedPhase: SweepPhase;
     bankPullStale: boolean;
+    /**
+     * Lines appeared in the window after the line pass loaded its snapshot, so
+     * this cycle judged a list it already knows is short (round-36 gate,
+     * finding 2). Held open exactly like a stale pull, and for the same reason:
+     * the next continuation re-runs the line pass over the fuller ledger and
+     * stamps then, hours before the cards.
+     */
+    ledgerMoved?: boolean;
 }): { phase: SweepPhase; complete: boolean; blockedReason: string | null } {
-    const phase: SweepPhase = input.bankPullStale && input.computedPhase === "done" ? "lines" : input.computedPhase;
+    const held = input.bankPullStale || input.ledgerMoved === true;
+    const phase: SweepPhase = held && input.computedPhase === "done" ? "lines" : input.computedPhase;
     return {
         phase,
         complete: phase === "done",
         // Restated every write, never carried forward, or `chaser-blocked`
-        // would keep firing after the pull recovered.
-        blockedReason: input.bankPullStale ? BANK_PULL_STALE_REASON : null,
+        // would keep firing after the pull recovered. A register that never
+        // arrived outranks one that arrived late: it is the bigger claim about
+        // the same input, and only one reason fits in the marker.
+        blockedReason: input.bankPullStale
+            ? BANK_PULL_STALE_REASON
+            : input.ledgerMoved === true ? PULL_MOVED_REASON : null,
     };
 }
 
@@ -560,7 +614,7 @@ export async function recomputeCodesFor(
     // still worth serving after the deadline.
     if (deadlineExceeded?.()) throw new ComponentDeadlineExceededError(0);
 
-    const [line, issue] = await Promise.all([
+    const [line, issue, memoBinding] = await Promise.all([
         prisma.bankLine.findUnique({
             where: { id: targetKey },
             // Same shape as every other BankLine read here, `updatedAt`
@@ -572,11 +626,18 @@ export async function recomputeCodesFor(
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
             select: { displayDetails: true },
         }),
+        // THE BINDING, read alongside the issue (round-36 gate, finding 3): a
+        // `memo-signed` resolution is only an answer if the artifact table says
+        // this charge is the one that memo answers.
+        prisma.receiptMemoArtifact.findUnique({
+            where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey } },
+            select: { pdfId: true },
+        }),
     ]);
     // A line that no longer exists cannot owe a receipt.
     if (!line) { cache?.set(targetKey, []); return []; }
     // An answered issue is never re-asked.
-    if (hasResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null))) { cache?.set(targetKey, []); return []; }
+    if (hasBackedResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null), memoBinding?.pdfId ?? null)) { cache?.set(targetKey, []); return []; }
 
     // THE COMPLETE COMPETING SET, not this line alone. One-to-one assignment is
     // a property of the batch: two identical charges and one receipt resolve
@@ -635,10 +696,19 @@ export async function recomputeCodesFor(
 
     // Resolutions across the whole competing set, so a sibling's signed memo
     // does not get re-asked just because we came in through a retry.
-    const siblingIssues = await prisma.reviewIssue.findMany({
-        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lines.map(l => l.id) } },
-        select: { targetKey: true, clearedAt: true, displayDetails: true },
-    });
+    const [siblingIssues, siblingBindings] = await Promise.all([
+        prisma.reviewIssue.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lines.map(l => l.id) } },
+            select: { targetKey: true, clearedAt: true, displayDetails: true },
+        }),
+        // Same set, same reason as above: a sibling's memo counts as an answer
+        // only where the artifact table binds it to that sibling's charge.
+        prisma.receiptMemoArtifact.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lines.map(l => l.id) } },
+            select: { targetKey: true, pdfId: true },
+        }),
+    ]);
+    const siblingBoundPdfIds = new Map(siblingBindings.map(row => [row.targetKey, row.pdfId]));
 
     const plan = planReceiptRequests({
         bankLines: lines,
@@ -675,7 +745,10 @@ export async function recomputeCodesFor(
         evidenceLoadedTo: toYmd,
         openIssueKeys: siblingIssues.filter(i => i.clearedAt === null).map(i => i.targetKey),
         resolvedIssueKeys: siblingIssues
-            .filter(i => hasResolution(parseMissingReceiptDetails(i.displayDetails)))
+            .filter(i => hasBackedResolution(
+                parseMissingReceiptDetails(i.displayDetails),
+                siblingBoundPdfIds.get(i.targetKey) ?? null,
+            ))
             .map(i => i.targetKey),
         now: new Date(),
     });
@@ -723,10 +796,23 @@ async function loadIssueSnapshot(): Promise<{
     const detailsByKey = new Map(
         allIssues.map(issue => [issue.targetKey, parseMissingReceiptDetails(issue.displayDetails)]),
     );
+    // EVERY memo binding, in one read (round-36 gate, finding 3). The table
+    // holds one row per answered charge, so this is small — and it is the only
+    // evidence that a `memo-signed` blob is this charge's answer rather than a
+    // copy of one that was spent on another.
+    const boundPdfIds = new Map(
+        (await prisma.receiptMemoArtifact.findMany({
+            where: { targetType: RECEIPT_REQUEST_TARGET_TYPE },
+            select: { targetKey: true, pdfId: true },
+        })).map(row => [row.targetKey, row.pdfId]),
+    );
     return {
         openIssues: allIssues.filter(issue => issue.clearedAt === null).map(issue => ({ targetKey: issue.targetKey })),
         resolvedIssueKeys: allIssues
-            .filter(issue => hasResolution(detailsByKey.get(issue.targetKey)))
+            .filter(issue => hasBackedResolution(
+                detailsByKey.get(issue.targetKey),
+                boundPdfIds.get(issue.targetKey) ?? null,
+            ))
             .map(issue => issue.targetKey),
         detailsByKey,
     };
@@ -1544,6 +1630,10 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // keys are grouped into competition components up front, and pages are cut
     // BETWEEN components (`pageComponents`); a component larger than BATCH_SIZE
     // gets its own oversized page rather than being split.
+    // THE INSTANT THE SNAPSHOT WAS TAKEN (round-36 gate, finding 2). Everything
+    // below judges this one list; a line that arrives after this point is one
+    // this cycle cannot have chased, and the completion stamp has to know.
+    const linePassFrom = new Date();
     const windowLines = await prisma.bankLine.findMany({
         where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
@@ -1691,7 +1781,34 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // as the marker is fresh, with hours to spare before the 14:30 cards.
     const bankPull = await readBankPullFreshness(new Date());
     const bankPullStale = !bankPull.fresh;
-    const decision = sweepCompletionDecision({ computedPhase, bankPullStale });
+    /**
+     * AND THE LEDGER IT READ HAS TO HAVE HELD STILL (round-36 gate, finding 2).
+     *
+     * A fresh marker says the pull succeeded; it does not say WHEN. The pull
+     * runs on its own schedule and can mint lines while this sweep is part way
+     * through its pages — and those lines were never in `windowLines`, so no
+     * chase was opened for them. Stamping there certifies a list that is short
+     * by exactly the charges the pull just delivered.
+     *
+     * Same handling as a stale pull: no stamp, phase held at "lines", and the
+     * every-15-minutes continuation re-runs the line pass over the fuller
+     * ledger. The closes and opens this run made all stand — they were right
+     * about the lines it did see.
+     */
+    // ASKED ONLY WHERE IT CAN CHANGE THE ANSWER. A cycle that did not reach
+    // "done", or one already held by a stale pull, is held open by that — so an
+    // extra count on every 15-minute slot buys nothing, and a count that could
+    // not be taken would attach a second, misleading reason to it.
+    const ledgerMoved = computedPhase === "done" && !bankPullStale
+        ? await ledgerMovedDuringPass(() => prisma.bankLine.count({
+            where: {
+                postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) },
+                amountCents: { lt: 0 },
+                createdAt: { gte: linePassFrom },
+            },
+        }))
+        : false;
+    const decision = sweepCompletionDecision({ computedPhase, bankPullStale, ledgerMoved });
     const phase = decision.phase;
     // A CLEAN, COMPLETE cycle stamps the clock the cards cron reads. Anything
     // else leaves the previous stamp alone: yesterday's completion is still a
@@ -1712,7 +1829,9 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // Why this cycle is not stamping complete, when that is the reason.
         // Named in the summary as well as the marker so a cron log answers the
         // question without a database read.
-        ...(bankPullStale ? { reason: BANK_PULL_STALE_REASON } : {}),
+        ...(bankPullStale
+            ? { reason: BANK_PULL_STALE_REASON }
+            : ledgerMoved ? { reason: PULL_MOVED_REASON } : {}),
         bankPull: { fresh: bankPull.fresh, lastSuccessAt: bankPull.lastSuccessAt },
         window: { start: windowStart, end: windowEnd },
         batches,
@@ -1731,7 +1850,8 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // Work remains if EITHER pass has more to do — including a pass that
         // exhausted its pages but left a component unreconciled, and including a
         // cycle held open because the register it read was not current.
-        moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0 || bankPullStale,
+        moreToProcess: !exhausted || !openExhausted || openContended > 0 || lineContended > 0
+            || bankPullStale || ledgerMoved,
         cursor,
         elapsedMs: Date.now() - startedAt,
         ...totals,

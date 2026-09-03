@@ -329,6 +329,64 @@ export interface PullWindowState {
     uncertifiedBounds?: PullUncertifiedBounds | null;
     /** When the oldest still-outstanding uncertified window first failed (ISO). */
     uncertifiedSince?: string | null;
+    /**
+     * LINKS THE LAST RECONCILE COULD NOT GET TO (Codex PR #443 gate round 36,
+     * finding 1).
+     *
+     * A reconcile that hits its own cap or this run's deadline reports
+     * `remaining > 0`, and the run correctly refuses to call the picture
+     * complete — but that refusal lived only in the response body. The saved
+     * state said "finished": `continueAfter` is cleared by a window that was
+     * fully ingested (which this one was), so `pullContinuationPending`
+     * answered no and every 15-minute slot exited with
+     * `nothing-in-progress`. A backlog of hundreds of links then drained one
+     * NIGHT at a time while the freshness stamp — and with it the day's cards —
+     * waited on it.
+     *
+     * A COUNT, not a cursor: the linker re-plans from the still-unlinked
+     * observations every run, so a link it made is no longer a candidate and
+     * the next run continues by construction. What was missing was the
+     * knowledge that there IS a next run's worth of work.
+     */
+    reconcileRemaining?: number | null;
+    /**
+     * THIS RUN LEFT THE PICTURE PARTIAL, AND ANOTHER RUN CAN ADVANCE IT
+     * (round-36 gate, finding 1).
+     *
+     * The specific markers each answer "where do I pick up": the resume point,
+     * the mint cursor, the reconcile backlog, the retry window. None of them
+     * answers the plainer question the continuation pass actually asks — "is
+     * there more of today's register to read" — and the case that fell through
+     * all of them is the window the PLANNER capped: it ingested everything it
+     * asked for, so nothing was parked, the mark advanced correctly, and the
+     * days behind it waited for the next NIGHT.
+     *
+     * So a run records whether it finished the picture. `complete` is exactly
+     * that judgement, already made and already reported.
+     *
+     * GATED ON A WORKING CLEARANCE PROBE, deliberately. A dead QuickBooks report
+     * endpoint also leaves `complete: false`, and it is the one incompleteness
+     * that repeating cannot fix — `retryPending` gives it PROBE_RETRY_LIMIT
+     * attempts and then stops on purpose, so that a dead endpoint cannot burn
+     * all 44 continuation slots every day. Recording it here as ordinary
+     * unfinished work would undo that.
+     */
+    continuationPending?: boolean;
+    /**
+     * THE FRESHNESS STAMP A RUN OWED AND COULD NOT WRITE (round-36 gate,
+     * finding 4).
+     *
+     * The stamp is the last write of a fully successful run, and its failure
+     * used to be logged and nothing else: the run answered 200 with
+     * `ok: true`, so the platform surfaced nothing, while the clock the chaser
+     * reads had not moved. Thirty-six hours later `bank-pull-stale` fired for a
+     * pull that had been working perfectly the whole time.
+     *
+     * Set by the route when the stamp write itself fails, so a continuation
+     * comes back for it; cleared by the first run that either stamps or finds
+     * the stamp no longer warranted.
+     */
+    stampPending?: boolean;
 }
 
 /**
@@ -1232,6 +1290,18 @@ export async function runBankRegisterPull(
         try {
             await dependencies.saveWindowState({
                 mintRemainingCursor: summary.minted?.remainingCursor ?? null,
+                // THE RECONCILE BACKLOG, WRITTEN DOWN (round-36 gate, finding 1).
+                // `complete` already said this run left links undone; this is the
+                // half that survives the response and gives the continuation
+                // something to see. Null when there is nothing outstanding, so a
+                // drained backlog stops waking the resume pass.
+                reconcileRemaining: (summary.reconciled?.remaining ?? 0) > 0
+                    ? summary.reconciled?.remaining ?? null
+                    : null,
+                // AND THE PLAIN FACT THAT THIS RUN DID NOT FINISH. Written on
+                // every save, so the flag can never outlive the state it
+                // describes; false the moment a run completes the picture.
+                continuationPending: !summary.complete && clearedProbeOk,
                 highWater,
                 // Same rule: a sweep nobody could certify is not a sweep that
                 // happened, and recording it would push the next one a week out.

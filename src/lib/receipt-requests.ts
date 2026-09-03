@@ -983,9 +983,62 @@ export function mergeReceiptRequestDetails(
     return merged;
 }
 
-/** True when a details blob records an answer that closes the chase. */
+/** The resolution a signed affidavit writes. The only one that needs evidence. */
+export const MEMO_SIGNED_RESOLUTION = "memo-signed";
+
+/**
+ * The resolution a QUARANTINED memo binding carries (Codex PR #443 gate round
+ * 36, finding 3).
+ *
+ * Before `ReceiptMemoArtifact` existed, one signed PDF could be recorded
+ * against two charges. The backfill that created the table binds the OLDEST
+ * claimant and — by `ON CONFLICT DO NOTHING` — leaves the loser with a
+ * `memo-signed` resolution and no artifact: an answer the database cannot
+ * vouch for, closing a charge whose memo was spent elsewhere.
+ *
+ * The migration rewrites exactly those to this value. It is deliberately NOT a
+ * closing resolution — `hasResolution` is false for it — so the chase reopens
+ * and the owner is asked again, while the blob still says what happened rather
+ * than losing the history to a blank field.
+ */
+export const MEMO_CONFLICT_RESOLUTION = "memo-conflict";
+
+/**
+ * True when a details blob records an answer that closes the chase.
+ *
+ * A quarantined memo is NOT one: it is the record of an answer that turned out
+ * to belong to a different charge.
+ */
 export function hasResolution(details: Record<string, unknown> | null | undefined): boolean {
-    return typeof details?.resolution === "string" && details.resolution !== "";
+    const resolution = details?.resolution;
+    return typeof resolution === "string"
+        && resolution !== ""
+        && resolution !== MEMO_CONFLICT_RESOLUTION;
+}
+
+/**
+ * True when a resolution closes the chase AND the database can vouch for it
+ * (round-36 gate, finding 3).
+ *
+ * `boundPdfId` is the pdfId of the `ReceiptMemoArtifact` bound to THIS charge,
+ * or null when the charge has no binding. Every resolution except a memo is
+ * self-evidencing — a found receipt is an Expense row, an acknowledgement is a
+ * human's click — and passes on `hasResolution` alone. A `memo-signed` claims
+ * one specific signed PDF, and that claim is only true if the artifact table,
+ * where `pdfId` is UNIQUE, agrees this charge is the one it answers.
+ *
+ * Everything written since the artifact table exists satisfies this by
+ * construction: the answers route creates the row in the SAME transaction as
+ * the resolution. What it catches is the historical residue — and any future
+ * path that writes a memo resolution without binding it.
+ */
+export function hasBackedResolution(
+    details: Record<string, unknown> | null | undefined,
+    boundPdfId: string | null | undefined,
+): boolean {
+    if (!hasResolution(details)) return false;
+    if (details?.resolution !== MEMO_SIGNED_RESOLUTION) return true;
+    return typeof boundPdfId === "string" && boundPdfId !== "" && boundPdfId === details?.pdfId;
 }
 
 export interface CardRecord {
