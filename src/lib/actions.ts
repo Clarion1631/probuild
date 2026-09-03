@@ -5971,14 +5971,28 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
+/** Unsigned statuses that may be printed/proofed; signed ones use the executed PDF. */
+const PRINTABLE_CONTRACT_STATUSES = new Set(["Draft", "Sent", "Viewed"]);
+
 /**
- * Merge data for printing one contract, scoped by the contract itself: any staff
- * user with the `contracts` permission who can see the contract gets the values
- * for ITS owning project/lead (never caller-supplied ids).
+ * Everything the client needs to print one contract, built from a FRESH server
+ * snapshot: any staff user with the `contracts` permission who can see the
+ * contract gets its persisted title/body plus merge data for ITS owning
+ * project/lead (never caller-supplied ids). Printable status is enforced here.
  */
-export async function getContractPrintMergeData(contractId: string): Promise<Record<string, string>> {
+export async function getContractPrintPayload(contractId: string): Promise<{
+    title: string; body: string; mergeData: Record<string, string>;
+}> {
     const { projectId, leadId } = await assertContractAccess(contractId);
-    return buildContractMergeData(projectId, leadId);
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { title: true, body: true, status: true, originalPdfPath: true },
+    });
+    if (!contract) throw new Error("Contract not found");
+    if (!PRINTABLE_CONTRACT_STATUSES.has(contract.status)) throw new Error("Signed contracts print from their executed PDF.");
+    if (contract.originalPdfPath) throw new Error("Imported PDF contracts print from the PDF viewer.");
+    const mergeData = await buildContractMergeData(projectId, leadId);
+    return { title: contract.title, body: contract.body || "", mergeData };
 }
 
 // `getContracts` was deleted here. It had no callers anywhere — the live staff

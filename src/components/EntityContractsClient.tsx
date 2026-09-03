@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import {
     createContractFromTemplate, createContractBlank, sendContractToClient,
     deleteContract, getContractSigningHistory, updateContract, signContractAsContractor,
-    getResolvedMergePreview, getContractPrintMergeData, getContractSendDefaults, countersignContractAsCompany,
+    getResolvedMergePreview, getContractPrintPayload, getContractSendDefaults, countersignContractAsCompany,
     createContractFromPdf,
 } from "@/lib/actions";
 import { toast } from "sonner";
@@ -550,11 +550,16 @@ export default function EntityContractsClient({
     // Opens an unsigned (Draft/Sent/Viewed) HTML contract as the customer reads it —
     // merge fields resolved, signing placeholders drawn as signature lines — in a
     // print-ready tab and triggers the browser print dialog, whose "Save as PDF"
-    // printer yields an emailable copy. Signed/Finalized contracts are excluded on
-    // purpose: their authoritative copy is the executed PDF (Download PDF button).
+    // printer yields an emailable copy. It prints the PERSISTED contract from a fresh
+    // server snapshot (unsaved edits must be saved first) and never stamps stored
+    // signatures: this is a proof copy, the executed PDF is the signed record.
     const [printing, setPrinting] = useState(false);
     const handlePrint = async () => {
         if (!editingContract) return;
+        if (hasUnsavedEdits(editingContract)) {
+            toast.error("Save your changes first, then print.");
+            return;
+        }
         // Open synchronously inside the click so popup blockers allow it; fill it after the await.
         const win = window.open("", "_blank");
         if (!win) { toast.error("Your browser blocked the print window. Allow pop-ups for this site and try again."); return; }
@@ -563,9 +568,8 @@ export default function EntityContractsClient({
         setPrinting(true);
         try {
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-            // Resolved server-side from the contract's own job (this list also shows
-            // contracts owned by the linked lead/project) under the `contracts` permission.
-            const mergeData = await getContractPrintMergeData(editingContract.id);
+            const payload = await getContractPrintPayload(editingContract.id);
+            const mergeData = payload.mergeData;
             // payment_schedule is a formatted <table> and is inserted raw (DOMPurify
             // sanitizes the whole document below); every other value is plain text.
             const RAW_HTML_FIELDS = new Set(["payment_schedule"]);
@@ -576,20 +580,14 @@ export default function EntityContractsClient({
             };
             const line = (label: string, width: number) =>
                 `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
-            const contractorDate = editingContract.contractorSignedAt ? fmtDate(editingContract.contractorSignedAt) : "";
-            // Stamp the stored contractor signature/date only onto the exact text it signed:
-            // updateContract clears the signature when either title or body changes.
-            const signedSnapshotIntact = editTitle === (editingContract.title || "") && editBody === (editingContract.body || "");
             const SIGN_LINES: Record<string, string> = {
                 SIGNATURE_BLOCK: line("Client signature", 240),
                 INITIAL_BLOCK: line("Initials", 70),
                 DATE_BLOCK: line("Date", 120),
-                CONTRACTOR_DATE_BLOCK: contractorDate && signedSnapshotIntact ? `<strong>${contractorDate}</strong>` : line("Date", 120),
-                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl && signedSnapshotIntact
-                    ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
-                    : line("Contractor signature", 240),
+                CONTRACTOR_DATE_BLOCK: line("Date", 120),
+                CONTRACTOR_SIGNATURE_BLOCK: line("Contractor signature", 240),
             };
-            let html = editBody;
+            let html = payload.body;
             // Signing placeholders first (both raw {{KEY}} and TipTap data-merge-field spans).
             html = html.replace(/\{\{(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)\}\}|<span[^>]*data-merge-field="(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)"[^>]*>[\s\S]*?<\/span>/g,
                 (_m, k1, k2) => SIGN_LINES[k1 || k2]);
@@ -597,7 +595,8 @@ export default function EntityContractsClient({
             html = html.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g, (m, key) => fill(key) ?? m);
             html = html.replace(/\{\{(\w+)\}\}/g, (m, key) => fill(key) ?? m);
             html = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
-            const title = escapeHtml(editTitle || editingContract.title || "Contract");
+            const title = escapeHtml(payload.title || "Contract");
+            const subtitle = escapeHtml([mergeData.project_name, mergeData.client_name].filter(Boolean).join(" · "));
             const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
 <style>
   @page { size: letter; margin: 0.75in; }
@@ -617,7 +616,7 @@ export default function EntityContractsClient({
   @media print { .toolbar { display: none; } .page { padding: 0; max-width: none; } }
 </style></head><body>
 <div class="toolbar"><button onclick="window.print()">Print / Save as PDF</button><span>Choose “Save as PDF” as the printer to get a PDF you can email.</span></div>
-<div class="page"><h1 class="doc-title">${title}</h1><p class="doc-sub">${escapeHtml([mergeData.project_name, mergeData.client_name].filter(Boolean).join(" · "))}</p>${html}</div>
+<div class="page"><h1 class="doc-title">${title}</h1><p class="doc-sub">${subtitle}</p>${html}</div>
 <script>window.addEventListener("load", function () { setTimeout(function () { window.print(); }, 300); });</script>
 </body></html>`;
             win.document.open();
