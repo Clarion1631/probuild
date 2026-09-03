@@ -17,7 +17,12 @@ import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/wo
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
 import { statements, verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
-import { acquireObjectClaim } from "../src/lib/receipt-intake/storage-cleanup";
+import {
+    acquireObjectClaim,
+    DELETE_CLAIM_LEASE_MS,
+    renewObjectClaim,
+} from "../src/lib/receipt-intake/storage-cleanup";
+import { STORAGE_CALL_MAX_MS } from "../src/lib/receipt-intake/bucket";
 import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
@@ -1095,4 +1100,106 @@ test("PRE-FIX CONTROL: without the lock, both claimants commit", { skip }, async
     assert.ok(published.made, "BOTH committed -- different rows, no conflict, no lock");
 
     await db!.automationEvent.deleteMany({ where: { detail: { contains: eventPrefix } } });
+});
+
+// -- A DELETE MAY NOT OUTLIVE ITS CLAIM (round-22, real Postgres) ---------
+//
+// The sweep took its claim with an expiry derived from the instant the PASS
+// opened. A late item reached the delete tens of seconds later and then spent
+// up to STORAGE_CALL_MAX_MS inside the removal itself, so the claim could
+// lapse mid-flight -- and a publisher that took the path in that window had
+// its freshly sealed object deleted by a call that was already in the air.
+//
+// The renewal is what closes it, and it can only be shown against a real
+// database: the takeover it prevents is another connection's transaction.
+
+test("a publisher CANNOT take a path whose delete renewed its claim", { skip }, async () => {
+    await clearClaims();
+    const opened = new Date();
+
+    // The sweeper claims with a SHORT lease, as a pass that opened long ago
+    // effectively has.
+    const shortLease = new Date(opened.getTime() + 1_000);
+    const taken = await dbA!.$transaction(async tx => acquireObjectClaim(
+        tx as unknown as Prisma.TransactionClient,
+        RACE_PATH,
+        "deleting",
+        shortLease,
+        opened,
+    ), { maxWait: 20_000, timeout: 20_000 });
+    assert.equal(taken.ok, true);
+    const token = (taken as { token: string }).token;
+
+    // ...and RENEWS it immediately before the delete, from CURRENT time.
+    const now = new Date();
+    const renewed = await dbA!.$transaction(async tx => renewObjectClaim(
+        tx as unknown as Prisma.TransactionClient,
+        RACE_PATH,
+        "deleting",
+        token,
+        new Date(now.getTime() + DELETE_CLAIM_LEASE_MS),
+        now,
+    ), { maxWait: 20_000, timeout: 20_000 });
+    assert.equal(renewed, true, "the renewal took");
+
+    // The delete is now notionally in flight. Past the ORIGINAL expiry, a
+    // publisher tries to take over -- and is refused, because the claim it
+    // would have inherited was extended to cover the call still running.
+    await settle(1_200);
+    assert.ok(new Date() > shortLease, "we are past the claim's original expiry");
+
+    const publisher = await dbB!.$transaction(async tx => acquireObjectClaim(
+        tx as unknown as Prisma.TransactionClient,
+        RACE_PATH,
+        "publishing",
+        new Date(Date.now() + 60_000),
+        new Date(),
+    ), { maxWait: 20_000, timeout: 20_000 });
+
+    assert.equal(publisher.ok, false, "the delete still holds the path");
+    assert.equal((publisher as { heldBy: string }).heldBy, "deleting");
+
+    const held = await db!.receiptObjectClaim.findUnique({ where: { storagePath: RACE_PATH } });
+    assert.equal(held?.token, token, "and it is still the deleter's own claim");
+    assert.ok(
+        held!.expiresAt.getTime() - now.getTime() >= STORAGE_CALL_MAX_MS,
+        "renewed for longer than a delete can take",
+    );
+});
+
+test("PRE-FIX CONTROL: WITHOUT the renewal the publisher takes the path", { skip }, async () => {
+    // The same interleaving with the claim left on its original expiry --
+    // which is what a claim measured from the pass's opening instant amounts
+    // to by the time a late item reaches its delete.
+    await clearClaims();
+    const opened = new Date();
+    const shortLease = new Date(opened.getTime() + 1_000);
+
+    const taken = await dbA!.$transaction(async tx => acquireObjectClaim(
+        tx as unknown as Prisma.TransactionClient,
+        RACE_PATH,
+        "deleting",
+        shortLease,
+        opened,
+    ), { maxWait: 20_000, timeout: 20_000 });
+    assert.equal(taken.ok, true);
+
+    // No renewal. The delete is in flight; the claim lapses under it.
+    await settle(1_200);
+
+    const publisher = await dbB!.$transaction(async tx => acquireObjectClaim(
+        tx as unknown as Prisma.TransactionClient,
+        RACE_PATH,
+        "publishing",
+        new Date(Date.now() + 60_000),
+        new Date(),
+    ), { maxWait: 20_000, timeout: 20_000 });
+
+    assert.equal(
+        publisher.ok,
+        true,
+        "the publisher takes the path out from under a delete that is still running",
+    );
+    const held = await db!.receiptObjectClaim.findUnique({ where: { storagePath: RACE_PATH } });
+    assert.equal(held?.kind, "publishing", "and its seal is what the in-flight delete would remove");
 });

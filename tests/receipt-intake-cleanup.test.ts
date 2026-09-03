@@ -245,6 +245,8 @@ import {
     CLEANUP_SWEEPABLE_STATUSES,
     claimsConflict,
     acquireObjectClaim,
+    renewObjectClaim,
+    DELETE_CLAIM_LEASE_MS,
     claimObjectPath,
     recordPendingCleanup,
     objectClaimDueAt,
@@ -357,6 +359,15 @@ function world(now: Date = T0) {
                         ? { ...held, ...update }
                         : { ...(create as { storagePath: string; token: string; kind: string; expiresAt: Date }) };
                     claims.set(where.storagePath, next as ClaimRow);
+                    return next;
+                },
+                update: async (
+                    { where, data }: { where: { storagePath: string }; data: Partial<ClaimRow> },
+                ) => {
+                    const held = claims.get(where.storagePath);
+                    if (!held) throw new Error(`no claim for ${where.storagePath}`);
+                    const next = { ...held, ...data };
+                    claims.set(where.storagePath, next);
                     return next;
                 },
                 deleteMany: async ({ where }: { where: { storagePath: string; token: string } }) => {
@@ -1576,6 +1587,15 @@ function claimTx(seed: ClaimRow[] = []) {
                 claims.set(where.storagePath, next as ClaimRow);
                 return next;
             },
+            update: async (
+                { where, data }: { where: { storagePath: string }; data: Partial<ClaimRow> },
+            ) => {
+                const held = claims.get(where.storagePath);
+                if (!held) throw new Error(`no claim for ${where.storagePath}`);
+                const next = { ...held, ...data };
+                claims.set(where.storagePath, next);
+                return next;
+            },
             deleteMany: async () => ({ count: 0 }),
         },
     } as unknown as Prisma.TransactionClient;
@@ -1628,4 +1648,120 @@ test("A LAPSED claim is taken over, so a dead holder cannot wedge a path", async
         "and the token changes, so the old holder's own re-read tells it it lost",
     );
     assert.equal(w.claims.size, 1, "still one row: the path is the primary key");
+});
+// -- A DELETE MAY NOT OUTLIVE THE CLAIM IT RUNS UNDER (round-22) -----------
+//
+// Every expiry in the sweep derived from a `now` captured when the pass
+// started. A late item could reach the delete ten seconds later -- two short
+// transactions on a loaded pool -- and then spend up to STORAGE_CALL_MAX_MS
+// inside the removal itself. A claim measured from the opening instant lapses
+// in that window; a publisher takes the path, seals the canonical object, and
+// the delete still in flight removes the bytes it just published. The row is
+// RECEIVED and points at nothing.
+
+test("the claim is RENEWED from CURRENT time immediately before the delete", async () => {
+    const w = world();
+    const CANON = "receipts/row-1/v1/late.png";
+    w.objects.add(CANON);
+    w.events.push({ id: "ev-late", status: "pending", detail: JSON.stringify({ storagePath: CANON }) });
+
+    // The pass opens, and then a long time passes before this item is reached --
+    // exactly what a batch of earlier items does to the last one in it.
+    w.onAfterClaim(() => w.advance(40_000));
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1, "it still deletes");
+    assert.equal(w.objects.has(CANON), false);
+
+    // THE PROPERTY: the claim it ran under expires AFTER the renewal, not after
+    // the pass's opening instant -- and by more than a storage call can take.
+    const held = w.claims.get(CANON);
+    assert.ok(held, "the claim row survives the delete for the sweeper to settle");
+    const renewedFor = held.expiresAt.getTime() - w.sweep.now().getTime();
+    assert.ok(
+        renewedFor >= STORAGE_CALL_MAX_MS,
+        `the claim outlives a full-length delete (${renewedFor}ms vs ${STORAGE_CALL_MAX_MS}ms)`,
+    );
+    assert.equal(DELETE_CLAIM_LEASE_MS, STORAGE_CALL_MAX_MS + 15_000, "cap plus margin");
+    assert.ok(
+        DELETE_CLAIM_LEASE_MS > STORAGE_CALL_MAX_MS,
+        "the delete's own bound is STRICTLY shorter than the claim it runs under",
+    );
+});
+
+test("PRE-FIX CONTROL: a claim measured from the pass's opening instant has lapsed", () => {
+    // The arithmetic the old code did, with the finding's own numbers: an item
+    // that starts just before the 40s soft stop and then spends up to ten
+    // seconds in its two short transactions on a loaded pool reaches the delete
+    // fifty seconds after the pass opened. OBJECT_CLAIM_LEASE_MS measured from
+    // THAT opening instant has ten seconds left -- and the delete it is about
+    // to start may take fifteen.
+    const openedAt = new Date("2026-09-03T12:00:00.000Z");
+    const reachedAt = new Date(openedAt.getTime() + 50_000);
+    const staleExpiry = new Date(openedAt.getTime() + OBJECT_CLAIM_LEASE_MS);
+    const leftForTheDelete = staleExpiry.getTime() - reachedAt.getTime();
+    assert.ok(
+        leftForTheDelete < STORAGE_CALL_MAX_MS,
+        `a delete could outlive it (${leftForTheDelete}ms left, ${STORAGE_CALL_MAX_MS}ms needed)`,
+    );
+
+    // Renewed from CURRENT time, the same moment has the full lease ahead of it.
+    const renewed = new Date(reachedAt.getTime() + DELETE_CLAIM_LEASE_MS);
+    assert.ok(renewed.getTime() - reachedAt.getTime() > STORAGE_CALL_MAX_MS);
+});
+
+test("a renewal is REFUSED once somebody else holds the path", async () => {
+    // The renewal is a claim check as well as an extension: a sweeper whose
+    // claim lapsed and was taken over must not extend the new holder's row.
+    const PATH = "receipts/intake/row-1.v1.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimTx([{
+        storagePath: PATH,
+        token: "somebody-else",
+        kind: "publishing",
+        expiresAt: new Date(now.getTime() + 60_000),
+    }]);
+
+    const ours = await renewObjectClaim(
+        w.tx, PATH, "deleting", "our-old-token", new Date(now.getTime() + 60_000), now,
+    );
+    assert.equal(ours, false, "not our token, not our kind");
+    assert.equal(w.claims.get(PATH)?.token, "somebody-else", "and we did not touch it");
+
+    // ...nor may an expired claim of our own be renewed: it is gone, and the
+    // path may already have been taken and released again.
+    const lapsed = claimTx([{
+        storagePath: PATH,
+        token: "ours",
+        kind: "deleting",
+        expiresAt: new Date(now.getTime() - 1),
+    }]);
+    assert.equal(
+        await renewObjectClaim(lapsed.tx, PATH, "deleting", "ours", new Date(now.getTime() + 60_000), now),
+        false,
+        "an expired claim cannot be resurrected in place",
+    );
+
+    // CONTROL: a live claim of ours renews, and the expiry really moves.
+    const mine = claimTx([{
+        storagePath: PATH,
+        token: "ours",
+        kind: "deleting",
+        expiresAt: new Date(now.getTime() + 1_000),
+    }]);
+    const until = new Date(now.getTime() + DELETE_CLAIM_LEASE_MS);
+    assert.equal(await renewObjectClaim(mine.tx, PATH, "deleting", "ours", until, now), true);
+    assert.equal(mine.claims.get(PATH)?.expiresAt.getTime(), until.getTime());
+    assert.ok(mine.locks() >= 1, "and it took the lock to do it");
+});
+
+test("the worker binds the sweep's delete to the INVOCATION's deadline", () => {
+    // The default dependency passes none, so every delete took a fresh
+    // STORAGE_CALL_MAX_MS however late in the pass it started -- which is what
+    // let one outlive its claim in the first place.
+    const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
+    assert.match(cleanup, /export function liveSweepDepsFor\(deadline: RouteDeadline \| undefined\)/);
+    assert.match(cleanup, /remove: \(storagePath: string\) => removeReceiptObject\(storagePath, deadline\)/);
+
+    const cron = readFileSync(path.join(ROOT, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
+    assert.match(cron, /liveSweepDepsFor\(invocationDeadline\)/, "and the worker passes its own");
 });

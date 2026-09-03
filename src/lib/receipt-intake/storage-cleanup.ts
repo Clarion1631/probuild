@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import type { Prisma } from "@prisma/client";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
-import { removeReceiptObject, uploadReceiptObject } from "./bucket";
+import { removeReceiptObject, STORAGE_CALL_MAX_MS, uploadReceiptObject } from "./bucket";
 import { leaseFence } from "./stored-object";
 import type { RouteDeadline } from "@/lib/quickbooks";
 
@@ -508,6 +508,49 @@ export async function acquireObjectClaim(
     return { ok: true, token };
 }
 
+/**
+ * HOW LONG A CLAIM TAKEN IMMEDIATELY BEFORE A REMOTE DELETE MUST LIVE.
+ *
+ * Strictly longer than the delete it covers. `removeReceiptObject` is bounded
+ * by STORAGE_CALL_MAX_MS, so a claim of that plus a margin cannot expire
+ * while its own delete is still in flight -- which is the failure this
+ * exists for: the sweep derived every expiry from a `now` captured at the
+ * top of the pass, so a late item could spend ten seconds in its two short
+ * transactions and then start a fifteen-second delete under a claim with
+ * seconds left. Once it lapsed a publisher took the path, sealed the
+ * canonical object, and the delete still in flight removed the bytes it had
+ * just published: a RECEIVED row pointing at nothing.
+ */
+export const DELETE_CLAIM_LEASE_MS = STORAGE_CALL_MAX_MS + 15_000;
+
+/**
+ * CONFIRM THE CLAIM IS STILL OURS, AND EXTEND IT, in one locked step.
+ *
+ * Called immediately before the remote delete, with CURRENT time -- never
+ * the pass's opening timestamp. A confirmation that does not also extend is
+ * a promise about the instant it was taken, and the delete outlives that
+ * instant.
+ */
+export async function renewObjectClaim(
+    tx: Prisma.TransactionClient,
+    storagePath: string,
+    want: ObjectClaimKind,
+    token: string,
+    until: Date,
+    now: Date,
+): Promise<boolean> {
+    await lockObjectPath(tx, storagePath);
+    const held = await tx.receiptObjectClaim.findUnique({ where: { storagePath } });
+    if (!held
+        || held.token !== token
+        || held.kind !== want
+        || held.expiresAt.getTime() <= now.getTime()) {
+        return false;
+    }
+    await tx.receiptObjectClaim.update({ where: { storagePath }, data: { expiresAt: until } });
+    return true;
+}
+
 /** Is `token` still the live claim over `storagePath`, of the kind we took? */
 export async function claimIsStillOurs(
     tx: Prisma.TransactionClient,
@@ -864,11 +907,28 @@ const liveSweepDeps: CleanupSweepDeps = {
         await prisma.automationEvent.update({ where: { id: eventId }, data: { status: "abandoned" } });
     },
     inShortTx,
-    // The sweep runs inside the worker's invocation; `retryPendingCleanups`
-    // threads that deadline in, so this default is only for a bare call.
+    // A BARE CALL ONLY. The worker builds its own deps with the invocation's
+    // deadline (see liveSweepDepsFor): a delete issued with none takes a fresh
+    // STORAGE_CALL_MAX_MS regardless of how much of the pass is left, which is
+    // how one came to outlive the claim it was running under.
     remove: (storagePath: string) => removeReceiptObject(storagePath, undefined),
     now: () => new Date(),
 };
+
+/**
+ * The live sweep dependencies, bound to ONE invocation's deadline.
+ *
+ * The delete is the only external call this sweep makes, and it must be
+ * strictly shorter than the claim it runs under -- see DELETE_CLAIM_LEASE_MS.
+ * Bounding it by the invocation's remaining budget can only make it shorter,
+ * never longer, so the relation holds however late in the pass it starts.
+ */
+export function liveSweepDepsFor(deadline: RouteDeadline | undefined): CleanupSweepDeps {
+    return {
+        ...liveSweepDeps,
+        remove: (storagePath: string) => removeReceiptObject(storagePath, deadline),
+    };
+}
 
 /**
  * Retry the deletions that failed earlier — and run the ones that were never
@@ -1033,6 +1093,14 @@ export async function retryPendingCleanups(
         // committed and closed. This confirms, in its own short transaction,
         // that the claim written there is still ours and still live — so a
         // delete can only proceed on a path nothing else has taken since.
+        // RENEWED WITH CURRENT TIME, not confirmed against a stale one.
+        //
+        // Everything above derives from `now`, captured when the pass started.
+        // A late item reaches this point seconds later, and the delete that
+        // follows takes up to STORAGE_CALL_MAX_MS more -- so a claim measured
+        // from the opening instant can lapse while its own delete is still in
+        // flight, and a publisher that takes the path in that window has its
+        // freshly sealed object removed by it.
         const stillOurs = await deps.inShortTx(async tx => {
             const fresh = await tx.automationEvent.findUnique({
                 where: { id: event.id },
@@ -1040,7 +1108,15 @@ export async function retryPendingCleanups(
             });
             if (!fresh || !CLEANUP_SWEEPABLE_STATUSES.includes(fresh.status as CleanupStatus)) return false;
             // Against the CLAIM TABLE, which is the one place a claim lives.
-            return claimIsStillOurs(tx, storagePath, "deleting", claim.token, deps.now());
+            const at = deps.now();
+            return renewObjectClaim(
+                tx,
+                storagePath,
+                "deleting",
+                claim.token,
+                new Date(at.getTime() + DELETE_CLAIM_LEASE_MS),
+                at,
+            );
         }).catch(() => false);
         if (!stillOurs) continue;
 

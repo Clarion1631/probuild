@@ -19,6 +19,7 @@ import {
     claimObjectPath,
     resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
+    liveSweepDepsFor,
     retryPendingCleanups,
     sealObject,
     settleQueuedCleanup,
@@ -772,7 +773,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         companyTimeZone: resolveCompanyTimeZone,
 
-        retryStorageCleanups: shouldStop => retryPendingCleanups(STAGING_SWEEP_BATCH, shouldStop),
+        // WITH THE INVOCATION'S DEADLINE. The default dependency passes none,
+        // so every delete took a fresh fifteen seconds -- long enough to
+        // outlive the claim it was running under, whatever the pass had left.
+        retryStorageCleanups: shouldStop => retryPendingCleanups(
+            STAGING_SWEEP_BATCH,
+            shouldStop,
+            liveSweepDepsFor(invocationDeadline),
+        ),
 
         promoteToBooking: async (rowId, weakKey, claimToken) => prisma.$transaction(async tx => {
             // LAST weak-dedup check, taken INSIDE the transition. The check at
