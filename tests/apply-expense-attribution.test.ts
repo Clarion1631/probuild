@@ -22,6 +22,8 @@ import {
     APPLY_TARGETS,
     PRODUCTION_BASELINE_MIGRATION,
     parseTarget,
+    projectRefFromUrl,
+    projectRefVerdict,
     resolveTargetDatabaseUrl,
     targetBanner,
     targetHostVerdict,
@@ -1555,4 +1557,63 @@ test("THE ACTUAL SCRIPT refuses an ambient local URL, before any DDL", () => {
     assert.notEqual(asProd.code, 0);
     assert.match(asProd.output, /REFUSING/);
     assert.doesNotMatch(asProd.output, /localhost/, "the ambient URL is not even echoed as a candidate");
+});
+
+test("the HOST is not the identity — the project ref is", () => {
+    // Supabase pooler hostnames are shared REGIONALLY and every project's
+    // database is called `postgres`, so host + database name + baseline row
+    // all match a migrated staging clone just as well as they match
+    // production. The ref in the URL username is the only thing that does not.
+    const PROD = "postgresql://postgres.ghzdbzdnwjxazvmcefbh:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true";
+    const CLONE = "postgresql://postgres.stagingprojectref:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true";
+
+    assert.equal(projectRefFromUrl(PROD), "ghzdbzdnwjxazvmcefbh");
+    assert.equal(projectRefFromUrl(CLONE), "stagingprojectref");
+    // The direct-connection spelling puts the ref in the HOST instead. Read
+    // too, so changing connection style cannot silently disable the check.
+    assert.equal(
+        projectRefFromUrl("postgresql://postgres:pw@db.ghzdbzdnwjxazvmcefbh.supabase.co:5432/postgres"),
+        "ghzdbzdnwjxazvmcefbh",
+    );
+    assert.equal(projectRefFromUrl("postgresql://probuild:probuild@localhost:5432/probuild"), null);
+
+    const env = { APPLY_EXPECT_PROJECT_REF: "ghzdbzdnwjxazvmcefbh" } as unknown as NodeJS.ProcessEnv;
+    assert.equal(projectRefVerdict("prod", PROD, env), null, "the real project passes");
+    const refused = projectRefVerdict("prod", CLONE, env);
+    assert.match(refused ?? "", /this URL is for project stagingprojectref, not ghzdbzdnwjxazvmcefbh/);
+    assert.match(refused ?? "", /shared across projects in a region/, "and it says WHY the other checks did not catch it");
+});
+
+test("an UNSET APPLY_EXPECT_PROJECT_REF is a refusal, not a skipped check", () => {
+    // A guard that turns itself off when its input is missing protects nothing
+    // on the machine that matters — the one where somebody is in a hurry.
+    const PROD = "postgresql://postgres.ghzdbzdnwjxazvmcefbh:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
+    for (const env of [{}, { APPLY_EXPECT_PROJECT_REF: "" }, { APPLY_EXPECT_PROJECT_REF: "   " }]) {
+        assert.match(
+            projectRefVerdict("prod", PROD, env as unknown as NodeJS.ProcessEnv) ?? "",
+            /requires APPLY_EXPECT_PROJECT_REF/,
+        );
+    }
+    // The name is shared with the other apply scripts on purpose: one variable,
+    // set once, covers all of them.
+    assert.match(
+        projectRefVerdict("prod", PROD, {} as unknown as NodeJS.ProcessEnv) ?? "",
+        /APPLY_EXPECT_PROJECT_REF/,
+    );
+    // ...and CI never asks for one: a throwaway container has no project ref.
+    assert.equal(
+        projectRefVerdict("ci", "postgresql://probuild:probuild@localhost:5432/probuild_apply", {} as unknown as NodeJS.ProcessEnv),
+        null,
+    );
+});
+
+test("the banner names the project, still redacted", () => {
+    const line = targetBanner("prod", {
+        url: "postgresql://postgres.ghzdbzdnwjxazvmcefbh:sup3rs3cret@aws-0-us-west-2.pooler.supabase.com:6543/postgres",
+        from: ".env.production.local",
+        db: "postgres",
+        host: "10.0.0.5",
+    });
+    assert.match(line, /project="ghzdbzdnwjxazvmcefbh"/);
+    assert.doesNotMatch(line, /sup3rs3cret/);
 });

@@ -13,6 +13,7 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import * as tzDate from "../src/lib/tz-date";
 import type { ComponentType } from "react";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -161,6 +162,13 @@ before(async () => {
         id: string,
     ) {
         if (id === "@/lib/prisma") return { prisma: fakePrisma };
+        // The company zone comes from the DATABASE. Every other test here
+        // stops before that read; the date tests do not, and in CI (no
+        // DATABASE_URL) the singleton throws on construction. The date
+        // PARSERS are the real ones — they are what is under test.
+        if (id === "@/lib/company-timezone") {
+            return { ...tzDate, resolveCompanyTimeZone: async () => "America/Los_Angeles" };
+        }
         if (id === "@/lib/permissions") {
             return {
                 getCurrentUserWithPermissions: async () => currentUser,

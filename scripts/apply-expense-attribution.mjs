@@ -83,6 +83,13 @@ export const APPLY_TARGETS = {
         requireBaseline: true,
         hostMustMatch: /(^|\.)pooler\.supabase\.com$/i,
         hostDescription: "the Supabase pooler",
+        // THE HOST IS NOT THE IDENTITY. Supabase's pooler hostnames are shared
+        // REGIONALLY — `aws-0-us-west-2.pooler.supabase.com` is every project
+        // in that region — and the database is called `postgres` in all of
+        // them. A migrated staging clone therefore matches the host, the
+        // database name AND the baseline row. What actually names the project
+        // is the URL's USERNAME: `postgres.<project-ref>`.
+        requireProjectRef: true,
     },
     ci: {
         envFile: null,
@@ -90,6 +97,9 @@ export const APPLY_TARGETS = {
         requireBaseline: false,
         hostMustNotMatch: /supabase\.(co|com)$/i,
         hostDescription: "a throwaway container",
+        // A container has no project ref, and requiring one would only mean
+        // inventing a fake to satisfy the check.
+        requireProjectRef: false,
     },
 };
 
@@ -164,9 +174,60 @@ export function targetHostVerdict(name, url) {
     return null;
 }
 
+/**
+ * The Supabase PROJECT REF out of a connection URL, or null.
+ *
+ * The pooler username is `postgres.<project-ref>`; a direct connection uses a
+ * bare `postgres` with the ref in the HOST (`db.<ref>.supabase.co`). Both are
+ * read, because a future change of connection style must not silently turn the
+ * check off.
+ */
+export function projectRefFromUrl(url) {
+    let parsed;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return null;
+    }
+    const user = decodeURIComponent(parsed.username ?? "");
+    const dotted = /^postgres\.([a-z0-9]+)$/i.exec(user);
+    if (dotted) return dotted[1];
+    const host = /^db\.([a-z0-9]+)\.supabase\.co$/i.exec(parsed.hostname ?? "");
+    return host ? host[1] : null;
+}
+
+/**
+ * Is this the project the operator meant? `APPLY_EXPECT_PROJECT_REF` is the
+ * shared name every apply script uses, so setting it once covers all of them.
+ *
+ * UNSET IS A REFUSAL, not a skip. A guard that disables itself when its input
+ * is missing protects nothing on the machine that matters — the one where
+ * somebody is running this in a hurry.
+ */
+export function projectRefVerdict(name, url, env = process.env) {
+    const target = APPLY_TARGETS[name];
+    if (!target?.requireProjectRef) return null;
+    const expected = (env.APPLY_EXPECT_PROJECT_REF ?? "").trim();
+    if (!expected) {
+        return `--target ${name} requires APPLY_EXPECT_PROJECT_REF (the Supabase project ref, e.g. the value in postgres.<ref>). Set it and re-run.`;
+    }
+    const actual = projectRefFromUrl(url);
+    if (!actual) {
+        return `--target ${name} could not read a project ref from the connection URL — expected a postgres.<ref> username or a db.<ref>.supabase.co host.`;
+    }
+    if (actual !== expected) {
+        return `REFUSING: this URL is for project ${actual}, not ${expected}. The pooler host and the database name are shared across projects in a region, so they cannot tell production from a staging clone.`;
+    }
+    return null;
+}
+
 /** The one line printed before any DDL, with the credentials removed. */
 export function targetBanner(name, { url, from, db, host }) {
-    return `TARGET ${name}: db="${db}" server="${host || "(local socket)"}" url=${maskUrl(url)} (from ${from})`;
+    const ref = projectRefFromUrl(url);
+    return (
+        `TARGET ${name}: db="${db}" server="${host || "(local socket)"}" ` +
+        `project="${ref ?? "(none)"}" url=${maskUrl(url)} (from ${from})`
+    );
 }
 
 export function maskUrl(url) {
@@ -1687,6 +1748,13 @@ async function main() {
     const hostProblem = targetHostVerdict(chosen.name, url);
     if (hostProblem) {
         console.error(`REFUSING: ${hostProblem}`);
+        process.exit(1);
+    }
+    // ...and WHICH project, not just which kind of host. Checked before the
+    // client is even constructed, so a wrong ref never opens a connection.
+    const refProblem = projectRefVerdict(chosen.name, url);
+    if (refProblem) {
+        console.error(refProblem.startsWith("REFUSING") ? refProblem : `REFUSING: ${refProblem}`);
         process.exit(1);
     }
     const prisma = new PrismaClient({ datasources: { db: { url } } });
