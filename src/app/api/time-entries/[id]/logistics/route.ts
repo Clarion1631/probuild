@@ -43,6 +43,7 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
         select: {
             id: true, userId: true, projectId: true, routedFromProjectId: true, rawNote: true, notes: true,
             invoiceId: true, invoicedAt: true, endTime: true, routedAt: true, routedById: true,
+            changeOrderId: true,
             project: { select: { isLogistics: true } },
         },
     });
@@ -84,6 +85,19 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
         // and the job-cost "unbilled" filter would both be wrong.
         if (entry.invoiceId != null || entry.invoicedAt != null) {
             return NextResponse.json({ error: "This time was already invoiced and cannot be re-routed", code: "ALREADY_INVOICED" }, { status: 409 });
+        }
+        // A change-order tag belongs to the job the entry is ON. Moving the
+        // entry and leaving the tag behind would bill this job's hours against
+        // another job's change order — the same wrong outcome the tagging
+        // path's own race guard refuses (tagTimeEntriesToChangeOrderCore).
+        // REFUSED rather than cleared: dropping somebody's cost-plus tag as a
+        // silent side effect of a re-route is not a decision this route gets to
+        // make. Untag on /time-expenses first, then re-route.
+        if (entry.changeOrderId != null) {
+            return NextResponse.json(
+                { error: "This time is tagged to a change order — remove the change-order tag before re-routing it", code: "CHANGE_ORDER_TAGGED" },
+                { status: 409 }
+            );
         }
         // A worker's routing is the clock-out decision, not a standing power to
         // re-cost history: open or freshly closed entries only, and never after
@@ -145,7 +159,10 @@ async function PATCHHandler(req: Request, { params }: { params: Promise<{ id: st
         (tx as unknown as typeof prisma).timeEntry.updateMany({
         where: {
             id,
-            ...(routing ? { invoiceId: null, invoicedAt: null } : {}),
+            // changeOrderId pinned for the same reason invoiceId is: a tag
+            // landing between the read above and this write must win, or the
+            // entry leaves the job its change order belongs to.
+            ...(routing ? { invoiceId: null, invoicedAt: null, changeOrderId: null } : {}),
             ...(routing && !isPrivileged ? { OR: [{ routedById: null }, { routedById: user.id }] } : {}),
         },
         data,

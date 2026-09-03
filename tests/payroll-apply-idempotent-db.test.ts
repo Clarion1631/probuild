@@ -14,7 +14,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import path from "node:path";
 import { PrismaClient } from "@prisma/client";
 
@@ -31,13 +31,36 @@ function runScript(args: string[]): string {
     });
 }
 
+/**
+ * The same run, but the EXIT CODE is the thing under test.
+ *
+ * runScript() throws on a nonzero exit, which was fine while `--dry-run`
+ * always exited 0 — and that was the bug: a verification step that cannot fail
+ * verifies nothing. Drift now exits 1, so the drift case needs a runner that
+ * returns the status instead of throwing on it.
+ */
+function runScriptForStatus(args: string[]): { status: number | null; out: string } {
+    const result = spawnSync(process.execPath, [path.join(root, "scripts", "apply-payroll-phase5.mjs"), ...args], {
+        cwd: root,
+        env: { ...process.env, DATABASE_URL: databaseUrl!, DIRECT_URL: databaseUrl! },
+        encoding: "utf8",
+    });
+    return { status: result.status, out: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+}
+
 test("--dry-run reports 'nothing to do' once every object is present", { skip }, async () => {
     // Apply for real first, so the database is in the state production is in.
     runScript([]);
 
-    const out = runScript(["--dry-run"]);
+    const clean = runScriptForStatus(["--dry-run"]);
+    const out = clean.out;
     assert.match(out, /nothing to do/, out);
     assert.match(out, /no statement was executed/);
+    // The control for the drift case below: a matching database exits 0, so
+    // that test's `status === 1` is about the drift and not about the script
+    // failing for some unrelated reason.
+    assert.equal(clean.status, 0, out);
+    assert.doesNotMatch(out, /FAILED/, out);
     // Nothing was guessed: the seed reports itself as a no-op when the env var
     // is unset, which is exactly production's configuration.
     assert.match(out, /PAYROLL_SALARIED_EMAILS is not set/);
@@ -50,12 +73,17 @@ test("--dry-run executes NO statement — it is safe to point at production", { 
         // A dry run that repairs anything is not a dry run.
         await db.$executeRawUnsafe(`DROP INDEX IF EXISTS "PayrollPeriod_discardedAt_idx"`);
 
-        const out = runScript(["--dry-run"]);
+        const { status, out } = runScriptForStatus(["--dry-run"]);
         // Round 20 replaced the presence-only check with a definition-level one,
         // so the wording is "missing or drifted" and each line is prefixed with
         // the table. This assertion was left describing the old output.
         assert.match(out, /1 of \d+ object\(s\) are missing or drifted/, out);
         assert.match(out, /index PayrollPeriod\.PayrollPeriod_discardedAt_idx: missing/, out);
+        // Drift is a FAILURE. The dry run is the verification step of a deploy,
+        // so a caller that reads the exit code has to be able to tell this apart
+        // from a clean database — it exited 0 for both until now.
+        assert.equal(status, 1, out);
+        assert.match(out, /FAILED: 1 drift item\(s\)/, out);
 
         const after = (await db.$queryRawUnsafe(
             `SELECT 1 FROM pg_indexes WHERE indexname = 'PayrollPeriod_discardedAt_idx'`

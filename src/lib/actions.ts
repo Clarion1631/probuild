@@ -15222,11 +15222,19 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
 
     const entry = await prisma.timeEntry.findUnique({
         where: { id: entryId },
-        select: { id: true, projectId: true, routedFromProjectId: true, invoiceId: true, invoicedAt: true, project: { select: { isLogistics: true } } },
+        select: { id: true, projectId: true, routedFromProjectId: true, invoiceId: true, invoicedAt: true, changeOrderId: true, project: { select: { isLogistics: true } } },
     });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.project.isLogistics && !entry.routedFromProjectId) throw new Error("Not a logistics entry");
     if (entry.invoiceId != null || entry.invoicedAt != null) throw new Error("This time was already invoiced and cannot be re-routed");
+    // A change-order tag belongs to the job the entry is ON — moving the entry
+    // and leaving the tag would bill this job's hours against another job's
+    // change order. Refused, not silently cleared: same rule and same wording
+    // as PATCH /api/time-entries/[id]/logistics, which is the other door to
+    // this exact write.
+    if (entry.changeOrderId != null) {
+        throw new Error("This time is tagged to a change order — remove the change-order tag before re-routing it");
+    }
 
     // Guarded at write time (Codex): an invoice landing between our read and
     // the write must win — count 0 means "changed underneath you".
@@ -15240,11 +15248,11 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
             const restoreProjectId = entry.routedFromProjectId;
             const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
                 (tx as unknown as typeof prisma).timeEntry.updateMany({
-                where: { id: entryId, invoiceId: null, invoicedAt: null },
+                where: { id: entryId, invoiceId: null, invoicedAt: null, changeOrderId: null },
                 data: { projectId: restoreProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
                 })
             );
-            if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+            if (r.count === 0) throw new Error("This entry changed underneath you (invoiced, or tagged to a change order?) — reload");
         }
     } else {
         const job = await prisma.project.findUnique({ where: { id: routeToProjectId }, select: { id: true, isLogistics: true, status: true } });
@@ -15253,7 +15261,7 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
         if (!costCode) throw new Error(`${LOGISTICS_COST_CODE} cost code is missing`);
         const r = await withPayrollWriteForRoute({ entryIds: [entryId] }, async (tx) =>
             (tx as unknown as typeof prisma).timeEntry.updateMany({
-            where: { id: entryId, invoiceId: null, invoicedAt: null },
+            where: { id: entryId, invoiceId: null, invoicedAt: null, changeOrderId: null },
             data: {
                 projectId: job.id,
                 costCodeId: costCode.id,
@@ -15264,7 +15272,7 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
             },
             })
         );
-        if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+        if (r.count === 0) throw new Error("This entry changed underneath you (invoiced, or tagged to a change order?) — reload");
     }
     revalidatePath("/manager/logistics");
     revalidatePath("/manager/time-entries");

@@ -9,7 +9,7 @@ import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrew
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
-import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
+import { createExpenseCore, createTimeEntryFromStoredRatesCore, findCrewMatches } from "@/lib/time-expense-core";
 import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
 import { logActivity } from "@/lib/activity-log";
 import {
@@ -1327,7 +1327,7 @@ function createHandler(actor: RouteMcpActor) {
                 if (!resolvedProjectId) return { ...textResult({ error: "Change order not found" }), isError: true };
                 const project = await prisma.project.findUnique({
                     where: { id: resolvedProjectId },
-                    select: { name: true, crew: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } } },
+                    select: { name: true, crew: { select: { id: true, name: true, email: true } } },
                 });
                 if (!project) return { ...textResult({ error: "Project not found" }), isError: true };
                 const matches = findCrewMatches(project.crew, crewMember);
@@ -1335,19 +1335,34 @@ function createHandler(actor: RouteMcpActor) {
                     return { ...textResult({ error: matches.length ? `Crew name "${crewMember}" is ambiguous.` : `Crew member "${crewMember}" was not found.`, crew: project.crew.map(row => ({ name: row.name, email: row.email })) }), isError: true };
                 }
                 const member = matches[0];
-                const costs = calculateCrewTimeCosts(hours, Number(member.hourlyRate ?? 0), Number(member.burdenRate ?? 0), burdenCost);
-                const entry = await createTimeEntryCore({
-                    projectId: resolvedProjectId,
-                    changeOrderId: changeOrderId ?? null,
-                    userId: member.id,
-                    date,
-                    durationHours: hours,
-                    laborCost: costs.laborCost,
-                    burdenCost: costs.burdenCost,
-                    notes: note,
-                    isBillable: Boolean(changeOrderId),
-                }, "ChatGPT connector");
-                return textResult({ id: entry.id, projectId: resolvedProjectId, changeOrderId: entry.changeOrderId, crewMember: member.name || member.email, hours, laborCost: Number(entry.laborCost), burdenCost: Number(entry.burdenCost ?? 0), url: `https://probuild.goldentouchremodeling.com/projects/${resolvedProjectId}/time-expenses` });
+                // Priced from the member's STORED rates, read FOR UPDATE inside
+                // the write transaction — this tool does not get to name a
+                // labor cost. It used to compute one here from a plain read of
+                // project.crew and hand it over, which walked straight past the
+                // $0-rate guard: an hourly crew member with no rate got a
+                // completed entry worth $0, unflagged, and payroll had nothing
+                // to notice. Burden is still overridable (it is a real
+                // per-entry number a caller can know); labor never is.
+                try {
+                    const entry = await createTimeEntryFromStoredRatesCore({
+                        projectId: resolvedProjectId,
+                        changeOrderId: changeOrderId ?? null,
+                        userId: member.id,
+                        date,
+                        durationHours: hours,
+                        burdenCostOverride: burdenCost,
+                        notes: note,
+                        isBillable: Boolean(changeOrderId),
+                    }, "ChatGPT connector");
+                    return textResult({ id: entry.id, projectId: resolvedProjectId, changeOrderId: entry.changeOrderId, crewMember: member.name || member.email, hours, laborCost: Number(entry.laborCost), burdenCost: Number(entry.burdenCost ?? 0), url: `https://probuild.goldentouchremodeling.com/projects/${resolvedProjectId}/time-expenses` });
+                } catch (err: any) {
+                    // A refused $0 rate, a locked pay period or a bad change
+                    // order is a tool ERROR, not a 500: the connector shows the
+                    // message and the operator can act on it. Nothing here
+                    // acknowledges a $0 rate — a chat client is not the office
+                    // control that decision belongs to.
+                    return { ...textResult({ error: err?.message || "Time could not be logged" }), isError: true };
+                }
             },
         );
 

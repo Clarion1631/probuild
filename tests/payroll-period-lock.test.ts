@@ -1088,7 +1088,9 @@ test("the guarded writers really are wrapped, not merely listed", () => {
     // classifying it; this one proves the classification is not a fiction.
     const cases: Array<[string, RegExp]> = [
         ["lib/actions.ts", /withPayrollWrite\({ entryIds: \[entryId\] }/],
-        ["lib/time-expense-core.ts", /withPayrollWrite\({ entryIds: input\.ids }/],
+        // `ids` is input.ids de-duplicated — the tag path counts matched rows
+        // against it, so a repeated id must not make the count look short.
+        ["lib/time-expense-core.ts", /withPayrollWrite\({ entryIds: ids }/],
         ["app/api/time-entries/[id]/logistics/route.ts", /withPayrollWrite\({ entryIds: \[id\] }/],
         ["app/api/time-entries/[id]/meal-skip/route.ts", /withPayrollWrite\({ entryIds: \[id\] }/],
         ["app/api/time-entries/route.ts", /withPayrollWrite\({ entryIds: \[latest\.id\] }/],

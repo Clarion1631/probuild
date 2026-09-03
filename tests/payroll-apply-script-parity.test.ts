@@ -96,7 +96,7 @@ test("the script VERIFIES what it wrote, and exits nonzero when it drifted", () 
     // A DDL script that reports success without checking is how the round-16
     // gap would have surfaced only when somebody clicked Discard in production.
     assert.match(script, /const drift = await findSchemaDrift\(prisma\)/);
-    assert.match(script, /drift\.length > 0/);
+    assert.match(script, /const verdict = driftVerdict\(drift\)/);
     assert.match(script, /process\.exit\(1\)/);
     assert.match(script, /objects present and matching their expected definitions/);
     // The old count-only checks are gone: they asked whether things EXISTED,
@@ -105,6 +105,40 @@ test("the script VERIFIES what it wrote, and exits nonzero when it drifted", () 
     assert.doesNotMatch(script, /cols\.length !== 9/);
     // The FK conversion check stays.
     assert.match(script, /cascading\.length !== 0\) process\.exit\(1\)/);
+});
+
+test("drift makes the script EXIT NONZERO — in the dry run as well as the real one", async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+
+    // The control. Without this the assertion below passes for a function that
+    // returns 1 unconditionally, which would be a different bug wearing the
+    // same green tick.
+    const clean = driftVerdict([], 12);
+    assert.equal(clean.exitCode, 0);
+    assert.match(clean.line, /verified 12\/12 objects present and matching/);
+
+    const dirty = driftVerdict(
+        [
+            { object: { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_discardedAt_idx" }, reason: "missing" },
+            { object: { kind: "column", table: "User", name: "payrollRevision" }, reason: "nullable", actual: "true" },
+        ],
+        12
+    );
+    assert.equal(dirty.exitCode, 1, "a drifted schema must not report success");
+    assert.match(dirty.line, /^FAILED: 2 drift item\(s\)/);
+
+    // And the script ACTS on the verdict in the dry-run branch, not only in the
+    // apply branch. `--dry-run` is documented as the verification step of a
+    // deploy: it reported its drift and then exited 0, so every caller that
+    // reads an exit code — CI, a deploy script — was told production matched
+    // this branch when it did not.
+    const script = read(SCRIPT);
+    const main = script.slice(script.indexOf("async function main()"));
+    const gate = main.slice(main.indexOf("if (dryRun) {"), main.indexOf("for (const sql of STATEMENTS)"));
+    assert.match(gate, /const verdict = driftVerdict\(drift\)/, "the dry run must reach a verdict, not just print one");
+    assert.match(gate, /process\.exitCode = verdict\.exitCode/);
+    // Still read-only: the exit code changed, the database behaviour did not.
+    assert.doesNotMatch(gate, /\$executeRawUnsafe/);
 });
 
 test("--dry-run is read-only for the WHOLE script, not just the seed", async () => {

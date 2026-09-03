@@ -396,6 +396,32 @@ export async function findMissingObjects(db, expected = EXPECTED_OBJECTS) {
     return findSchemaDrift(db, expected);
 }
 
+/**
+ * The verdict a drift list implies — the one line to print, and the exit code.
+ *
+ * Both modes go through here so they cannot disagree. `--dry-run` used to
+ * print its drift and then exit 0, which made it useless as the thing it is
+ * documented to be: the verification step of a deploy. A CI job or a deploy
+ * script reads the exit code, so "production matches this branch" and
+ * "production is missing four objects" looked identical to every caller that
+ * was not a human reading stdout.
+ *
+ * Pure, and exported, so the exit-code contract can be tested without a
+ * database (tests/payroll-apply-script-parity.test.ts).
+ */
+export function driftVerdict(drift, total = EXPECTED_OBJECTS.length) {
+    if (drift.length === 0) {
+        return {
+            exitCode: 0,
+            line: `verified ${total}/${total} objects present and matching their expected definitions (columns, index columns, CHECK expressions, FK ON DELETE, RLS).`,
+        };
+    }
+    return {
+        exitCode: 1,
+        line: `FAILED: ${drift.length} drift item(s) — ${drift.length} of ${total} object(s) are missing or drifted.`,
+    };
+}
+
 const STATEMENTS = [
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRateSyncAt" TIMESTAMPTZ(6)`,
     `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payType" TEXT`,
@@ -604,6 +630,18 @@ async function main() {
                 }
             }
             console.log("[dry-run] no statement was executed.");
+            // Drift is a FAILURE here, not a report. Read-only is about what the
+            // database ends up holding, not about the exit code — a verification
+            // step that always succeeds verifies nothing.
+            //
+            // process.exitCode rather than process.exit() so the `finally` below
+            // still runs and the Prisma connection closes; the process then exits
+            // 1 on its own once main() returns.
+            const verdict = driftVerdict(drift);
+            if (verdict.exitCode !== 0) {
+                console.error(verdict.line);
+                process.exitCode = verdict.exitCode;
+            }
             return;
         }
 
@@ -752,8 +790,9 @@ async function main() {
         // them — which is the same class of miss as the apply-script/migration
         // divergence this file already carries a test for.
         const drift = await findSchemaDrift(prisma);
-        if (drift.length > 0) {
-            console.error(`FAILED: ${drift.length} of ${EXPECTED_OBJECTS.length} object(s) are missing or drifted:`);
+        const verdict = driftVerdict(drift);
+        if (verdict.exitCode !== 0) {
+            console.error(verdict.line);
             for (const { object, reason, actual } of drift) {
                 const label = `${object.kind} ${object.table ? object.table + "." : ""}${object.name ?? object.table}`;
                 console.error(`  ${label}: ${reason}`);
@@ -761,9 +800,7 @@ async function main() {
             }
             process.exit(1);
         }
-        console.log(
-            `verified ${EXPECTED_OBJECTS.length}/${EXPECTED_OBJECTS.length} objects present and matching their expected definitions (columns, index columns, CHECK expressions, FK ON DELETE, RLS).`
-        );
+        console.log(verdict.line);
     } finally {
         await prisma.$disconnect();
     }

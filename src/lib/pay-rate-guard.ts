@@ -174,6 +174,28 @@ export function zeroRateBlocks(owner: {
 }
 
 /**
+ * The same rule asked of the RESULT rather than of the rate: would this entry
+ * book $0 of labor onto somebody who is paid by the hour?
+ *
+ * zeroRateBlocks() can only answer for a cost this codebase derived itself. A
+ * caller that computes its own labor cost — the MCP `log_time` tool did, from
+ * an unlocked read of the crew list — never reaches it, and a $0 there is the
+ * identical silent free shift. Manual creation therefore decides on the number
+ * it is about to store (src/lib/time-expense-core.ts).
+ *
+ * The two agree wherever both apply: hours are always > 0 on a manual create,
+ * so `hours × rate` is $0 exactly when the rate is.
+ */
+export function zeroLaborBlocks(
+    owner: { role?: string | null; email?: string | null; payType?: string | null },
+    laborCost: number
+): boolean {
+    // Real money settles it, whoever they are.
+    if (laborCost > 0) return false;
+    return !isSalariedOwner(owner);
+}
+
+/**
  * 422 with the audience-appropriate message: the worker sees "your time is
  * still on the clock"; a manager closing someone else's punch sees where to go
  * and fix it. Same `code` either way so clients branch on one value.

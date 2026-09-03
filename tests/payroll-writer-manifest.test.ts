@@ -119,9 +119,9 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "the skip DECISION (approve/deny), wrapped in withPayrollWrite for the same reason as the request above",
     },
-    "app/api/time-entries/[id]/logistics/route.ts:145::updateMany": {
+    "app/api/time-entries/[id]/logistics/route.ts:159::updateMany": {
         kind: "guarded",
-        why: "voice-dump formalize and re-code, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
+        why: "voice-dump formalize and re-code, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs. Routing refuses a change-order-tagged entry and pins changeOrderId: null in the WHERE, so the tag cannot be left pointing at a job the entry has left",
     },
 
     // ---- server actions -----------------------------------------------------
@@ -137,21 +137,21 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "the meal-skip decision, wrapped in withPayrollWrite — it changes what the day's settlement owes",
     },
-    "lib/actions.ts:15242::updateMany": {
+    "lib/actions.ts:15250::updateMany": {
         kind: "guarded",
         why: "logistics routing: restoring an entry to its prior project, wrapped in withPayrollWrite — project and cost code are DETAIL csv inputs",
     },
-    "lib/actions.ts:15255::updateMany": {
+    "lib/actions.ts:15263::updateMany": {
         kind: "guarded",
         why: "logistics routing: routing an entry to a new project, wrapped in withPayrollWrite for the same reason as the restore above",
     },
-    "lib/time-expense-core.ts:145::create": {
+    "lib/time-expense-core.ts:186::create": {
         kind: "guarded",
         why: "createTimeEntryCore, wrapped in withPayrollWriteTx — the canonical manual create every server action funnels through",
     },
-    "lib/time-expense-core.ts:277::updateMany": {
+    "lib/time-expense-core.ts:350::updateMany": {
         kind: "guarded",
-        why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against",
+        why: "tagTimeEntriesToChangeOrder, wrapped in withPayrollWrite — retagging changes which change order the hours bill against. The change order and the rows are re-read INSIDE the lock and projectId is pinned in the WHERE, so an entry rerouted to another job between the pre-check and the write cannot pick up this project's change order",
     },
     "lib/time-expense-actions.ts:180::updateMany": {
         kind: "guarded",
