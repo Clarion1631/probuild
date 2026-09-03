@@ -130,6 +130,12 @@ export default function EntityContractsClient({
     useLayoutEffect(() => {
         editStateRef.current = { title: editTitle, body: editBody, requiresCountersign: editRequiresCountersign };
     }, [editTitle, editBody, editRequiresCountersign]);
+    // Which contract the editor currently shows, for handlers that await and must
+    // confirm the user has not closed it or opened another one meanwhile.
+    const editingContractIdRef = useRef<string | null>(null);
+    useLayoutEffect(() => {
+        editingContractIdRef.current = editingContract?.id ?? null;
+    }, [editingContract]);
 
     // ─── SEND DIALOG (editable CC) ───
     const [sendDialog, setSendDialog] = useState<{ contractId: string; toEmail: string; cc: string } | null>(null);
@@ -570,7 +576,11 @@ export default function EntityContractsClient({
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
             const payload = await getContractPrintPayload(editingContract.id);
             // Re-check after the await: the editor stays usable while the snapshot loads,
-            // and the snapshot must match what the user currently sees.
+            // so the same contract must still be open and the snapshot must match what
+            // the user currently sees.
+            if (editingContractIdRef.current !== editingContract.id) {
+                throw new Error("The contract was closed while preparing the print. Open it and print again.");
+            }
             if (hasUnsavedEdits(editingContract) || payload.title !== editStateRef.current.title || payload.body !== editStateRef.current.body) {
                 throw new Error("The contract changed while preparing the print. Save your changes, then print again.");
             }
@@ -806,8 +816,8 @@ export default function EntityContractsClient({
         const isReadOnly = ["Signed", "Finalized"].includes(editingContract.status);
         return (
             <div className="fixed inset-0 z-50 font-sans text-slate-900 flex flex-col bg-white">
-                <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shrink-0">
-                    <div className="flex items-center gap-3">
+                <header className="bg-white border-b border-slate-200 px-6 py-3 flex flex-wrap items-center justify-between gap-y-2 shrink-0">
+                    <div className="flex items-center gap-3 min-w-0">
                         <button onClick={() => { setEditingContract(null); setIsPreview(false); }} className="text-slate-400 hover:text-slate-700 transition p-1">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                         </button>
@@ -826,7 +836,7 @@ export default function EntityContractsClient({
                             <p className="text-xs text-slate-400">{entity.name} · {entity.clientName}</p>
                         </div>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3 gap-y-2">
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${STATUS_COLORS[editingContract.status] || STATUS_COLORS.Draft}`}>
                             {editingContract.status}
                         </span>
