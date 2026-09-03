@@ -15670,6 +15670,9 @@ export async function lockPayrollPeriod(
     const precheck = await loadGustoExport(periodStart, periodEnd, {
         startKey: range.startKey,
         endKey: range.endKey,
+        // The zone periodStart/periodEnd were derived from, asserted rather than
+        // re-resolved — see the `timeZone` option on loadGustoExport.
+        timeZone,
     });
     // An already-locked period is NOT re-lockable. Re-running the lock would
     // overwrite lockedAt, the locker, the hash and both snapshots — rewriting
@@ -15826,10 +15829,22 @@ export async function lockPayrollPeriod(
                 },
             });
 
+            // Everything this recompute reads — the company zone, the Gusto
+            // mappings, the period rows, the entries, the users — goes through
+            // `tx`, so it sees exactly the snapshot this transaction's locks are
+            // holding. It used to read the zone and the mappings on the GLOBAL
+            // client: two extra connections outside the transaction, free to
+            // pick up an edit the lock was specifically freezing, and free to
+            // block on a single-connection pool. `timeZone` is the value the row
+            // above was just written with, and loadGustoExport REFUSES if the
+            // zone it resolves under FOR SHARE disagrees — a zone change mid-lock
+            // rolls the lock back instead of freezing a period whose stored
+            // timeZone does not describe its own CSVs.
             const confirmed = await loadGustoExport(periodStart, periodEnd, {
                 client: tx,
                 startKey: range.startKey,
                 endKey: range.endKey,
+                timeZone,
             });
             if (confirmed.blocking.length > 0) {
                 throw new Error(

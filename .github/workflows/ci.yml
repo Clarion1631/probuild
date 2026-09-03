@@ -132,6 +132,20 @@ jobs:
           # skip prepared statements, which is harmless.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # The payroll export's OTHER inputs — the company time zone and the Gusto
+      # employee mappings. Those two reads used to go out on the GLOBAL prisma
+      # client from inside the lock's transaction, so a zone or mapping edit
+      # could land between them and the entry read and be hashed into a frozen
+      # pay period. The fake-client test pins which client each read uses; only
+      # this step shows PostgreSQL actually holds the writer off.
+      - name: Prove the export's FOR SHARE blocks a zone or mapping change
+        run: npx tsx --test tests/payroll-settings-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton (saveGustoSettings) — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

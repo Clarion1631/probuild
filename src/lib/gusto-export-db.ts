@@ -33,6 +33,51 @@ import {
 /** Either the base client or a transaction client — the lock action recomputes INSIDE its own transaction. */
 export type ExportDbClient = typeof prisma | Prisma.TransactionClient;
 
+/**
+ * Is this an interactive transaction client rather than the base client?
+ *
+ * Prisma builds a transaction client as the base client MINUS the members in
+ * `ITXClientDenyList` — `$transaction` among them — so the absence of that one
+ * method IS the distinction, at runtime, with no flag for a caller to forget to
+ * pass. Checked by NAME rather than by `instanceof`: there is no exported class
+ * to compare against, and a structural check keeps the test fakes working.
+ */
+function isTransactionClient(client: ExportDbClient): boolean {
+    return typeof (client as { $transaction?: unknown }).$transaction !== "function";
+}
+
+/**
+ * Pin the two MUTABLE, NON-entry inputs to the export — the company time zone
+ * and the Gusto employee mappings — for the rest of the caller's transaction.
+ *
+ * Both are read by name from single rows that live outside the payroll tables,
+ * so no row lock the payroll paths already take covers them, and both change the
+ * bytes of the CSV: the zone decides which company-local day (and therefore
+ * which workweek, and therefore how much of the period is overtime) every punch
+ * lands in, and the mappings fill the gustoEmployeeId column. A zone or mapping
+ * edit committed between the first read and the entry read would produce a
+ * hash over inputs that never existed together at any instant — and
+ * lockPayrollPeriod would freeze a pay period around it.
+ *
+ * FOR SHARE, not FOR UPDATE: concurrent exports do not conflict with each
+ * other, only with somebody CHANGING these rows (integration-store's
+ * updateIntegrationSettings takes FOR UPDATE on the same Integration row).
+ *
+ * Only meaningful inside a transaction. On the base client every statement is
+ * its own transaction, so the lock would be released before the next line —
+ * hence the guard rather than a lock that silently promises nothing. The page
+ * render and the download endpoint are ordinary reads and take nothing.
+ *
+ * LOCK ORDER: taken AFTER the payroll advisory lock (tier 1) and BEFORE any
+ * TimeEntry row lock, and nothing that holds these two rows ever goes on to
+ * wait for a payroll lock — so this adds no cycle to the order documented in
+ * payroll-period.ts.
+ */
+async function lockExportInputRows(client: Prisma.TransactionClient): Promise<void> {
+    await client.$queryRawUnsafe(`SELECT "id" FROM "CompanySettings" WHERE "id" = $1 FOR SHARE`, "singleton");
+    await client.$queryRawUnsafe(`SELECT "id" FROM "Integration" WHERE "id" = $1 FOR SHARE`, "system_settings");
+}
+
 export type LoadedGustoExport = GustoExport & {
     periodStart: Date;
     periodEnd: Date;
@@ -190,10 +235,45 @@ export async function loadGustoExport(
         endKey?: string;
         /** Read through a transaction client — used by lockPayrollPeriod to recompute inside its own transaction. */
         client?: ExportDbClient;
+        /**
+         * The zone the CALLER already resolved and is acting on — the one
+         * lockPayrollPeriod derived periodStart/periodEnd from and is about to
+         * persist on the period row.
+         *
+         * Not used as the answer: it is an ASSERTION. The zone is resolved once
+         * here, through `client`, under the FOR SHARE taken above, and a caller
+         * whose value disagrees is told so instead of quietly getting an export
+         * computed in a different zone from the one being recorded.
+         */
+        timeZone?: string;
     } = {}
 ): Promise<LoadedGustoExport> {
     const client = options.client ?? prisma;
-    const timeZone = await resolveCompanyTimeZone();
+
+    // FIRST, before any input is read: pin the zone and the mappings for the
+    // rest of the transaction (no-op outside one — see lockExportInputRows).
+    if (isTransactionClient(client)) {
+        await lockExportInputRows(client as Prisma.TransactionClient);
+    }
+
+    // Resolved ONCE, through `client`, and everything below is derived from it.
+    // A global-client read here would be a second connection outside the
+    // caller's transaction — free to see a zone the FOR SHARE above is holding
+    // still, and to hand back an envelope that disagrees with the entries.
+    const timeZone = await resolveCompanyTimeZone(client);
+    if (options.timeZone !== undefined && options.timeZone !== timeZone) {
+        throw new Error(
+            `The company time zone changed (${options.timeZone} to ${timeZone}) while this pay period was being read. ` +
+                "Nothing was changed - refresh and try again."
+        );
+    }
+
+    // The Gusto employee mappings, read in the SAME transaction and under the
+    // same lock. They fill a CSV column, so they are an input to the hash, and
+    // reading them on the global client after the entries meant the file could
+    // mix mappings from one instant with hours from another.
+    const gustoSettings = await getGustoSettings(client);
+    const employeeMappings = (gustoSettings.employeeMappings || {}) as Record<string, string>;
 
     // Full workweeks overlapping the period. This is BOTH the window the lock
     // freezes and the window the readiness check looks at, because overtime
@@ -205,11 +285,13 @@ export async function loadGustoExport(
     const startKey = options.startKey ?? dayKeyInTimeZone(periodStart, timeZone);
     const endKey = options.endKey ?? dayKeyInTimeZone(periodEnd, timeZone);
 
-    const [period, overlappingLocks] = await Promise.all([
-        findPayrollPeriod(startKey, endKey, client),
-        // Ownership: the pay-period range, on its stable day keys (see above).
-        findOverlappingLockedPeriods(startKey, endKey, client),
-    ]);
+    // SEQUENTIAL, not Promise.all. `client` may be an interactive transaction
+    // client, which is bound to ONE connection: firing both queries at once puts
+    // two statements on a single connection that has a statement in flight, and
+    // the saved round trip is worth nothing next to the entry query below.
+    const period = await findPayrollPeriod(startKey, endKey, client);
+    // Ownership: the pay-period range, on its stable day keys (see above).
+    const overlappingLocks = await findOverlappingLockedPeriods(startKey, endKey, client);
 
     // The query spans the FULL Mon-Sun workweeks overlapping the period, so a
     // period that opens mid-week still sees the hours that already pushed that
@@ -307,8 +389,6 @@ export async function loadGustoExport(
         payType: row.payType ?? null,
     }));
 
-    const gustoSettings = await getGustoSettings();
-    const employeeMappings = (gustoSettings.employeeMappings || {}) as Record<string, string>;
     const salaried = salariedEmails();
 
     const built = buildGustoExport({

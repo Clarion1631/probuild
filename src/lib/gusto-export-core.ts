@@ -241,6 +241,37 @@ function round2(value: number): number {
     return Math.round(value * 100) / 100;
 }
 
+/**
+ * Ordering comparator for EVERY sort whose result reaches a CSV — and therefore
+ * the export hash.
+ *
+ * `localeCompare()` with no arguments sorts by the RUNTIME's default locale, and
+ * that locale is process configuration (ICU build, LANG/LC_ALL, the container
+ * image), not application state. Two servers running the identical commit could
+ * therefore order "Ostrowski" and "Ötzi" differently and produce two different
+ * exportHash values for the same period — which the lock reads as "the hours in
+ * this period changed while it was being locked". A payroll freeze must not
+ * depend on an environment variable.
+ *
+ * Code points, compared one at a time over `Array.from` (so an astral character
+ * is ONE unit rather than two surrogate halves), are total, stable, and identical
+ * everywhere. The order is not the one a human would call alphabetical — nothing
+ * here is presented as an alphabetised list, and reproducibility is the property
+ * that actually matters for a hashed file.
+ */
+export function compareCodePoints(a: string, b: string): number {
+    const left = Array.from(a);
+    const right = Array.from(b);
+    const shared = Math.min(left.length, right.length);
+    for (let i = 0; i < shared; i += 1) {
+        const l = left[i].codePointAt(0) as number;
+        const r = right[i].codePointAt(0) as number;
+        if (l !== r) return l < r ? -1 : 1;
+    }
+    if (left.length === right.length) return 0;
+    return left.length < right.length ? -1 : 1;
+}
+
 function userLabel(user: ExportUser | undefined, fallbackId: string): string {
     return user?.name?.trim() || user?.email || fallbackId;
 }
@@ -340,7 +371,7 @@ export function blockingEntries(
         });
     }
     return blocking.sort(
-        (a, b) => a.startTime.getTime() - b.startTime.getTime() || a.id.localeCompare(b.id)
+        (a, b) => a.startTime.getTime() - b.startTime.getTime() || compareCodePoints(a.id, b.id)
     );
 }
 
@@ -413,7 +444,9 @@ export function unknownPayTypeBlockers(
             reason: "unknownPayType" as const,
         });
     }
-    return blockers.sort((a, b) => a.userLabel.localeCompare(b.userLabel) || a.userId.localeCompare(b.userId));
+    return blockers.sort(
+        (a, b) => compareCodePoints(a.userLabel, b.userLabel) || compareCodePoints(a.userId, b.userId)
+    );
 }
 
 /**
@@ -520,17 +553,19 @@ export function buildGustoExport(input: {
     }
 
     // Label, then id: two people can share a display name, and an unstable
-    // order would change the export hash for no real reason.
+    // order would change the export hash for no real reason. compareCodePoints,
+    // not localeCompare — the ordering feeds the CSVs and therefore the hash, so
+    // it must not depend on the process locale (see compareCodePoints).
     employees.sort(
         (a, b) =>
-            userLabel(a.user, a.user.id).localeCompare(userLabel(b.user, b.user.id)) ||
-            a.user.id.localeCompare(b.user.id)
+            compareCodePoints(userLabel(a.user, a.user.id), userLabel(b.user, b.user.id)) ||
+            compareCodePoints(a.user.id, b.user.id)
     );
     detail.sort(
         (a, b) =>
             a.startTime.getTime() - b.startTime.getTime() ||
-            userLabel(a.user, a.user.id).localeCompare(userLabel(b.user, b.user.id)) ||
-            a.entryId.localeCompare(b.entryId)
+            compareCodePoints(userLabel(a.user, a.user.id), userLabel(b.user, b.user.id)) ||
+            compareCodePoints(a.entryId, b.entryId)
     );
 
     return {

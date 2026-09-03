@@ -92,7 +92,13 @@ export async function POST(req: Request) {
                     { hourlyRate, burdenRate, payType: body.payType }
                 );
                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-                return created;
+                // RE-READ, inside the same transaction. `created` is the row as
+                // it was BEFORE applyRateChangeInTx ran its own update, so
+                // returning it answered 201 with hourlyRate/payType still null
+                // and payrollRevision/lastRateSyncAt still at their defaults —
+                // a body that contradicted the committed row and sent the
+                // caller's UI back to a rate nobody had entered.
+                return tx.user.findUniqueOrThrow({ where: { id: created.id } });
             });
         } catch (error) {
             if (error instanceof RateChangeError) {

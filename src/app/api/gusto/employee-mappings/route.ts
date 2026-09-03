@@ -21,10 +21,20 @@ export async function POST(req: NextRequest) {
         if (!validated.ok) {
             return NextResponse.json({ error: validated.error }, { status: 400 });
         }
+        // saveGustoSettings THROWS if it could not persist. It used to swallow
+        // every database error, so a failed write still reached the line below
+        // and told the caller `{ success: true }` — the map deciding whose hours
+        // are filed under which Gusto employee looked saved and was not.
         await saveGustoSettings({ employeeMappings: validated.mappings });
         return NextResponse.json({ success: true });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed";
-        return NextResponse.json({ error: msg }, { status: 500 });
+        // A fixed message, not `err.message`: the failures reaching here are now
+        // database errors, whose text is internal detail rather than something
+        // the caller can act on.
+        console.error("POST /api/gusto/employee-mappings failed:", err);
+        return NextResponse.json(
+            { error: "Could not save the Gusto employee mappings. Nothing was changed - try again." },
+            { status: 500 }
+        );
     }
 }

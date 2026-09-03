@@ -7,10 +7,16 @@ export async function POST(req: NextRequest) {
         if (typeof glMappings !== "object") {
             return NextResponse.json({ error: "glMappings must be an object" }, { status: 400 });
         }
+        // saveQBSettings THROWS if it could not persist — same reasoning as the
+        // Gusto mapping endpoint: a suppressed database error used to be
+        // reported to the caller as a successful save.
         await saveQBSettings({ glMappings });
         return NextResponse.json({ success: true });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed";
-        return NextResponse.json({ error: msg }, { status: 500 });
+        console.error("POST /api/quickbooks/gl-mappings failed:", err);
+        return NextResponse.json(
+            { error: "Could not save the QuickBooks GL mappings. Nothing was changed - try again." },
+            { status: 500 }
+        );
     }
 }
