@@ -547,8 +547,8 @@ export default function EntityContractsClient({
     };
 
     // ─── PRINT / SAVE AS PDF ───
-    // Opens an unsigned (Draft/Sent/Viewed) HTML contract as the customer reads it —
-    // merge fields resolved, signing placeholders drawn as signature lines — in a
+    // Opens an unsigned (Draft/Sent/Viewed) HTML contract as a proof copy — merge
+    // fields resolved, every signing placeholder drawn as a blank signature line — in a
     // print-ready tab and triggers the browser print dialog, whose "Save as PDF"
     // printer yields an emailable copy. It prints the PERSISTED contract from a fresh
     // server snapshot (unsaved edits must be saved first) and never stamps stored
@@ -569,6 +569,11 @@ export default function EntityContractsClient({
         try {
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
             const payload = await getContractPrintPayload(editingContract.id);
+            // Re-check after the await: the editor stays usable while the snapshot loads,
+            // and the snapshot must match what the user currently sees.
+            if (hasUnsavedEdits(editingContract) || payload.title !== editStateRef.current.title || payload.body !== editStateRef.current.body) {
+                throw new Error("The contract changed while preparing the print. Save your changes, then print again.");
+            }
             const mergeData = payload.mergeData;
             // payment_schedule is a formatted <table> and is inserted raw (DOMPurify
             // sanitizes the whole document below); every other value is plain text.
