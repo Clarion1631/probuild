@@ -11,7 +11,7 @@ import {
     resolveExpenseProjectUnderLock,
 } from "./expense-attribution";
 import { prismaPhaseDataSource } from "./project-phases-db";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
+import { CALENDAR_DATE_NOT_REAL, classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
@@ -80,8 +80,17 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     if (data.burdenCost != null && (!Number.isFinite(data.burdenCost) || data.burdenCost < 0)) {
         throw new Error("Burden cost cannot be negative");
     }
-    const startTime = /^\d{4}-\d{2}-\d{2}$/.test(data.date)
-        ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
+    // The shared validator, so an impossible day (`2026-02-31`) is refused by
+    // the same rule everywhere rather than throwing out of the parser with a
+    // different message (round 47, item 2).
+    const startVerdict = classifyCalendarDate(data.date);
+    // An impossible day is refused here rather than retried as an instant:
+    // `new Date("2026-02-31")` rolls forward to 3 March instead of failing.
+    if (startVerdict.kind === "invalid" && startVerdict.reason === CALENDAR_DATE_NOT_REAL) {
+        throw new Error("A valid time-entry date is required");
+    }
+    const startTime = startVerdict.kind === "valid"
+        ? dateOnlyInTimeZone(startVerdict.date, await resolveCompanyTimeZone())
         : new Date(data.date);
     if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
 
@@ -211,11 +220,19 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
         receiptUrl = receipt.url;
     }
-    const expenseDate = data.date
-        ? /^\d{4}-\d{2}-\d{2}$/.test(data.date)
-            ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
-            : new Date(data.date)
-        : null;
+    // Same rule as every other intake. `omitted` keeps the existing "no date"
+    // behaviour (null, not today); `invalid` falls through to the instant
+    // parse, and an unparseable value is refused rather than stored as an
+    // Invalid Date.
+    const expenseVerdict = classifyCalendarDate(data.date);
+    if (expenseVerdict.kind === "invalid" && expenseVerdict.reason === CALENDAR_DATE_NOT_REAL) {
+        throw new Error("A valid expense date is required");
+    }
+    const expenseDate = expenseVerdict.kind === "omitted"
+        ? null
+        : expenseVerdict.kind === "valid"
+            ? dateOnlyInTimeZone(expenseVerdict.date, await resolveCompanyTimeZone())
+            : new Date(data.date as string);
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
     // THE PHASE ANSWER THAT COUNTS, taken with the write (round 18, item 4).

@@ -13,7 +13,7 @@ import {
     parseCostCodeIdEdit,
 } from "@/lib/expense-attribution";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { CALENDAR_DATE_NOT_REAL, classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
 // chose the estimate) OR `projectId` (mobile flow — server picks the project's first
@@ -140,18 +140,28 @@ export async function POST(req: NextRequest) {
         // report would then file the receipt in the wrong month, and at a
         // quarter edge in the wrong return. A bare YYYY-MM-DD goes through the
         // shared parser; a full timestamp is kept as the instant it already is.
+        //
+        // ONE definition of "is this a calendar day", shared with the PUT, the
+        // receipt ingest and the AI parse (round 47, item 2): the shape AND a
+        // Date.UTC round trip, so `2026-02-31` is refused here rather than
+        // throwing inside the parser.
         let parsedDate: Date | null = null;
         if (date) {
-            if (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
-                try {
-                    parsedDate = dateOnlyInTimeZone(date, await resolveCompanyTimeZone());
-                } catch {
-                    return NextResponse.json({ error: "Invalid date" }, { status: 400 });
-                }
+            const verdict = classifyCalendarDate(date);
+            if (verdict.kind === "valid") {
+                parsedDate = dateOnlyInTimeZone(verdict.date, await resolveCompanyTimeZone());
+            } else if (verdict.kind === "invalid" && verdict.reason === CALENDAR_DATE_NOT_REAL) {
+                // A YYYY-MM-DD that names no real day. NOT retried as an
+                // instant: `new Date("2026-02-31")` rolls forward to 3 March
+                // rather than failing, which would store a date nobody typed.
+                return NextResponse.json({ error: "Invalid date", date: verdict.value }, { status: 400 });
             } else {
                 const d = new Date(date);
                 if (Number.isNaN(d.getTime())) {
-                    return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+                    return NextResponse.json(
+                        { error: "Invalid date", date: verdict.kind === "invalid" ? verdict.value : String(date) },
+                        { status: 400 },
+                    );
                 }
                 parsedDate = d;
             }

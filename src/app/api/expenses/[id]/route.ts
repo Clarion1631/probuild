@@ -31,7 +31,7 @@ import { prismaCostCodingDataSource } from "@/lib/cost-coding-db";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-invariant";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { CALENDAR_DATE_NOT_REAL, classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -350,6 +350,22 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 );
             }
             nextAmount = raw;
+        }
+        // THE DATE IS VALIDATED HERE, BEFORE ANY LOCK OR WRITE (round 47,
+        // item 2). It used to be resolved inline in the `data:` payload deep
+        // inside the write transaction, so a caller's typo — a well-shaped
+        // impossible day like 2026-02-31, which is what a bad OCR read looks
+        // like — threw out of the parser and came back as a 500.
+        let nextDate: Date | null | undefined;
+        try {
+            nextDate = Object.prototype.hasOwnProperty.call(body, "date")
+                ? (body.date ? await expenseDate(body.date) : null)
+                : undefined;
+        } catch (error) {
+            if (error instanceof InvalidExpenseDateError) {
+                return NextResponse.json({ error: error.message, date: error.value }, { status: 400 });
+            }
+            throw error;
         }
         const resultingAmount = nextAmount ?? Number(expense.amount);
         const existingBase =
@@ -695,7 +711,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 amount: nextAmount,
                 vendor: has("vendor") ? (body.vendor || null) : undefined,
                 // Same company-calendar-day rule as the POST — see there.
-                date: has("date") ? (body.date ? await expenseDate(body.date) : null) : undefined,
+                date: nextDate,
                 description: has("description") ? (body.description || null) : undefined,
                 itemId: has("itemId") ? (body.itemId || null) : undefined,
                 ...(editsCostCode
@@ -824,15 +840,44 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
  * a filing), but it is only half an answer unless a human can supply the real
  * figure afterwards. This is that path.
  */
+/** Thrown for a date the caller SENT and got wrong — a 400, never a 500. */
+export class InvalidExpenseDateError extends Error {
+    constructor(public readonly value: string, reason: string) {
+        super(`date ${reason}`);
+        this.name = "InvalidExpenseDateError";
+    }
+}
+
 /**
  * `Expense.date` is a COMPANY CALENDAR DAY. A bare YYYY-MM-DD goes through the
- * shared parser so it lands at local noon; anything else is already an instant.
+ * shared parser so it lands at local noon; a full timestamp is already an
+ * instant and is kept as one.
+ *
+ * ANYTHING ELSE IS A 400 (round 47, item 2). This used to end in
+ * `new Date(value)`, which turns junk into an Invalid Date and hands it to
+ * Prisma, and a well-shaped impossible day like `2026-02-31` passed the regex,
+ * reached the parser, and threw — answering a caller's typo with a 500.
  */
 async function expenseDate(value: unknown): Promise<Date> {
-    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
-        return dateOnlyInTimeZone(value, await resolveCompanyTimeZone());
+    const verdict = classifyCalendarDate(value);
+    if (verdict.kind === "valid") {
+        return dateOnlyInTimeZone(verdict.date, await resolveCompanyTimeZone());
     }
-    return new Date(value as string);
+    // A CALENDAR-DAY SHAPE THAT NAMES NO REAL DAY IS REFUSED HERE, and never
+    // retried as an instant: `new Date("2026-02-31")` does not fail, it rolls
+    // forward to 3 March, so the fallback below would turn an impossible date
+    // into a silently wrong one — worse than the 500 it replaced.
+    if (verdict.kind === "invalid" && verdict.reason === CALENDAR_DATE_NOT_REAL) {
+        throw new InvalidExpenseDateError(verdict.value, verdict.reason);
+    }
+    // A full timestamp is legitimate here and is NOT a calendar day, so it is
+    // tried before the verdict is treated as a refusal.
+    const instant = new Date(value as string);
+    if (!Number.isNaN(instant.getTime())) return instant;
+    throw new InvalidExpenseDateError(
+        verdict.kind === "invalid" ? verdict.value : String(value),
+        verdict.kind === "invalid" ? verdict.reason : "is not a valid date",
+    );
 }
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {

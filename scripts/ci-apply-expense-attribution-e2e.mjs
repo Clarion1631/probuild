@@ -67,7 +67,10 @@ try {
 console.log(`resolved server host: ${host || "(local socket)"}`);
 
 const script = path.join("scripts", "apply-expense-attribution.mjs");
-const guard = ["--yes", "--expect-db", DB, "--expect-host", host];
+// `--target ci`: ambient DATABASE_URL, no production baseline row, and the
+// script refuses outright if that URL looks like Supabase. The prod guard
+// therefore cannot be satisfied by this path even by accident.
+const guard = ["--target", "ci", "--yes", "--expect-db", DB, "--expect-host", host];
 const env = { DATABASE_URL: targetUrl };
 
 console.log("\n=== pre-deploy ===");

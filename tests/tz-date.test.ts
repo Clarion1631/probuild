@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     addCalendarDaysInTimeZone,
+    classifyCalendarDate,
     addDaysToKey,
     dayKeyInTimeZone,
     startOfDateInTimeZone,
@@ -83,4 +84,47 @@ test("startOfDateInTimeZone and endOfDateInTimeZone bracket a full company-local
     assert.equal(dayKeyInTimeZone(end, TZ), "2026-08-10");
     assert.ok(end.getTime() > start.getTime());
     assert.ok(end.getTime() - start.getTime() < 86_400_000); // 23:59:59.999, just under 24h
+});
+
+// ── the calendar-day validator (Codex round 47, item 2) ────────────────────
+
+test("classifyCalendarDate separates OMITTED from SUPPLIED-AND-WRONG", () => {
+    // Three answers, because the intakes need three different behaviours: an
+    // absent date may default to today, a malformed one may NOT (that is how a
+    // receipt from another quarter got booked into this one), and an
+    // impossible one may not reach the parser (that is how a typo became a
+    // 500).
+    for (const omitted of [null, undefined, "", "   "]) {
+        assert.deepEqual(classifyCalendarDate(omitted), { kind: "omitted" }, String(omitted));
+    }
+    assert.deepEqual(classifyCalendarDate("2026-08-14"), { kind: "valid", date: "2026-08-14" });
+    assert.deepEqual(classifyCalendarDate(" 2026-08-14 "), { kind: "valid", date: "2026-08-14" });
+
+    for (const malformed of ["07/14/2026", "Jul 14 2026", "2026-8-14", "20260814", "yesterday"]) {
+        const verdict = classifyCalendarDate(malformed);
+        assert.equal(verdict.kind, "invalid", malformed);
+        assert.equal((verdict as { value: string }).value, malformed.trim());
+        assert.match((verdict as { reason: string }).reason, /YYYY-MM-DD/);
+    }
+});
+
+test("...and it rejects a well-shaped IMPOSSIBLE day", () => {
+    // The shape a bad OCR read produces most often. JavaScript rolls
+    // 2026-02-31 forward to 3 March rather than refusing it, so only a round
+    // trip detects it.
+    for (const impossible of ["2026-02-31", "2026-13-01", "2026-00-10", "2026-04-31", "2025-02-29"]) {
+        const verdict = classifyCalendarDate(impossible);
+        assert.equal(verdict.kind, "invalid", impossible);
+        assert.match((verdict as { reason: string }).reason, /not a real calendar date/);
+    }
+    // ...while a real leap day passes.
+    assert.deepEqual(classifyCalendarDate("2024-02-29"), { kind: "valid", date: "2024-02-29" });
+});
+
+test("a non-string is invalid, not omitted", () => {
+    // `{ date: 20260814 }` is a caller bug. Treating it as absent would book
+    // the row on today and say nothing.
+    for (const value of [20260814, {}, [], true]) {
+        assert.equal(classifyCalendarDate(value).kind, "invalid", JSON.stringify(value));
+    }
 });

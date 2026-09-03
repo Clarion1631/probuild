@@ -49,6 +49,126 @@ export function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
 }
 
+/**
+ * WHICH DATABASE, SAID OUT LOUD (cross-PR rule, round 46).
+ *
+ * `resolveDatabaseUrl` above prefers an AMBIENT `DATABASE_URL`. That is the
+ * right default for a driver that hands the script a throwaway container, and
+ * the wrong one for a person: a developer with a local Postgres in their shell
+ * runs this, watches every "verified ..." line print, and merges believing
+ * production has the columns. Nothing in the output contradicts them —
+ * `--expect-db postgres --expect-host ...` can be satisfied by a local server
+ * as easily as by the real one, because the operator supplies both sides of
+ * that comparison.
+ *
+ * So the TARGET is now an explicit argument, and each target decides where the
+ * URL may come from:
+ *
+ *   * `--target prod` reads `.env.production.local` and IGNORES the ambient
+ *     `DATABASE_URL` entirely — the file Vercel writes is the only thing that
+ *     can name production — and additionally requires the pooler host and the
+ *     production baseline migration row.
+ *   * `--target ci` is the throwaway container: ambient `DATABASE_URL`, no
+ *     baseline row (a database built from `migrate deploy` in a fresh
+ *     container has one, but a hand-rolled fixture may not), and it REFUSES a
+ *     Supabase-looking URL so the CI path can never be pointed at prod.
+ *
+ * Both are named on the command line. There is deliberately no default: a
+ * missing `--target` is an error, not a guess.
+ */
+export const APPLY_TARGETS = {
+    prod: {
+        envFile: ".env.production.local",
+        allowAmbient: false,
+        requireBaseline: true,
+        hostMustMatch: /(^|\.)pooler\.supabase\.com$/i,
+        hostDescription: "the Supabase pooler",
+    },
+    ci: {
+        envFile: null,
+        allowAmbient: true,
+        requireBaseline: false,
+        hostMustNotMatch: /supabase\.(co|com)$/i,
+        hostDescription: "a throwaway container",
+    },
+};
+
+/** The migration whose presence proves this is the real, baselined database. */
+export const PRODUCTION_BASELINE_MIGRATION = "20260814000000_baseline_production";
+
+/**
+ * `--target <name>` out of an argv array. Returns the name or an error string;
+ * never throws, so `main()` can print and exit rather than stack-trace.
+ */
+export function parseTarget(argv) {
+    const idx = argv.indexOf("--target");
+    if (idx < 0) {
+        return { error: `--target is required: one of ${Object.keys(APPLY_TARGETS).join(", ")}.` };
+    }
+    const name = argv[idx + 1];
+    if (!name || !Object.prototype.hasOwnProperty.call(APPLY_TARGETS, name)) {
+        return { error: `Unknown --target ${JSON.stringify(name ?? null)}: expected one of ${Object.keys(APPLY_TARGETS).join(", ")}.` };
+    }
+    return { name, target: APPLY_TARGETS[name] };
+}
+
+/**
+ * The URL this target is allowed to use.
+ *
+ * `env` and the two fs functions are parameters so the rule can be tested
+ * without a `.env.production.local` on the machine running the tests — and so
+ * the "ambient DATABASE_URL is ignored for prod" claim is checked rather than
+ * asserted.
+ */
+export function resolveTargetDatabaseUrl(
+    name,
+    { env = process.env, exists = fs.existsSync, read = file => fs.readFileSync(file, "utf8") } = {},
+) {
+    const target = APPLY_TARGETS[name];
+    if (!target) return { error: `Unknown target ${name}.` };
+    if (target.envFile) {
+        if (!exists(target.envFile)) {
+            return { error: `--target ${name} reads ${target.envFile}, which does not exist. Run: vercel env pull ${target.envFile}` };
+        }
+        const match = String(read(target.envFile)).match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+        if (!match) return { error: `${target.envFile} has no DATABASE_URL.` };
+        // Deliberately NOT falling back to the ambient value: for this target
+        // the file is the only authority, and a missing key is an error rather
+        // than a reason to use whatever is in the shell.
+        return { url: match[1], from: target.envFile };
+    }
+    if (!env.DATABASE_URL) return { error: `--target ${name} needs DATABASE_URL in the environment.` };
+    return { url: env.DATABASE_URL, from: "process.env.DATABASE_URL" };
+}
+
+/**
+ * Does the URL's HOST agree with what this target is? Checked on the URL and
+ * not on `inet_server_addr()`, because the latter is an IP address and "is
+ * this the pooler" is a question about the name we dialled.
+ */
+export function targetHostVerdict(name, url) {
+    const target = APPLY_TARGETS[name];
+    if (!target) return `Unknown target ${name}.`;
+    let host;
+    try {
+        host = new URL(url).hostname;
+    } catch {
+        return `The resolved DATABASE_URL is not a valid URL.`;
+    }
+    if (target.hostMustMatch && !target.hostMustMatch.test(host)) {
+        return `--target ${name} expects ${target.hostDescription}, but the URL points at ${host}.`;
+    }
+    if (target.hostMustNotMatch && target.hostMustNotMatch.test(host)) {
+        return `--target ${name} must never point at ${host} — that is production.`;
+    }
+    return null;
+}
+
+/** The one line printed before any DDL, with the credentials removed. */
+export function targetBanner(name, { url, from, db, host }) {
+    return `TARGET ${name}: db="${db}" server="${host || "(local socket)"}" url=${maskUrl(url)} (from ${from})`;
+}
+
 export function maskUrl(url) {
     return url.replace(/:[^:@]*@/, ":****@");
 }
@@ -1536,6 +1656,13 @@ export function indexDrift(expected, actual) {
 export const expectedReceiptIntakeColumns = ["taxAtSource", "installedAtCustomer", "costCodeSource"];
 
 async function main() {
+    // FLAGS ARE PARSED HERE, never at module scope: importing this file must
+    // do nothing at all (tests/apply-scripts-inert-on-import.test.ts).
+    const chosen = parseTarget(process.argv);
+    if (chosen.error) {
+        console.error(`REFUSING: ${chosen.error}`);
+        process.exit(1);
+    }
     if (!process.argv.includes("--yes")) {
         console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
         process.exit(1);
@@ -1547,18 +1674,54 @@ async function main() {
         process.exit(1);
     }
 
-    const { url, from } = resolveDatabaseUrl();
-    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
+    // The TARGET decides where the URL comes from — for `prod` that is
+    // `.env.production.local` and the ambient `DATABASE_URL` is ignored, which
+    // is the whole point: a local server in the shell must not be able to
+    // impersonate production.
+    const resolved = resolveTargetDatabaseUrl(chosen.name);
+    if (resolved.error) {
+        console.error(`REFUSING: ${resolved.error}`);
+        process.exit(1);
+    }
+    const { url, from } = resolved;
+    const hostProblem = targetHostVerdict(chosen.name, url);
+    if (hostProblem) {
+        console.error(`REFUSING: ${hostProblem}`);
+        process.exit(1);
+    }
     const prisma = new PrismaClient({ datasources: { db: { url } } });
 
     try {
         const [actual] = await prisma.$queryRawUnsafe(
             `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
         );
-        console.log(`connected to db="${actual.db}" host="${actual.host}"`);
+        // The REDACTED target line, before a single statement of phase A —
+        // so what the operator sees first is which database is about to be
+        // changed, with the credentials removed.
+        console.log(targetBanner(chosen.name, { url, from, db: actual.db, host: actual.host }));
         if (!targetMatches(actual, expectDb, expectHost)) {
             console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
             process.exit(1);
+        }
+        // AND THE DATABASE'S OWN IDENTITY, not just the one we dialled. The
+        // production baseline row is written once, by the deliberate
+        // `migrate resolve --applied` step documented in CLAUDE.md; a local
+        // database somebody built with `db push` does not have it, and neither
+        // does a fresh container built from a subset of the migrations.
+        if (APPLY_TARGETS[chosen.name].requireBaseline) {
+            const baseline = await prisma.$queryRawUnsafe(
+                `SELECT 1 AS present FROM "_prisma_migrations"
+                  WHERE migration_name = $1 AND finished_at IS NOT NULL`,
+                PRODUCTION_BASELINE_MIGRATION,
+            );
+            if (!baseline?.length) {
+                console.error(
+                    `REFUSING: this database has no applied ${PRODUCTION_BASELINE_MIGRATION} row, ` +
+                    `so it is not the baselined production database.`,
+                );
+                process.exit(1);
+            }
+            console.log(`verified baseline ${PRODUCTION_BASELINE_MIGRATION} is applied here`);
         }
 
         // The company zone, for the legacy re-anchor below. Read before the DDL
@@ -1747,28 +1910,7 @@ async function main() {
             // EXPRESSION column (attnum 0) rather than dropping it — an
             // expression where a plain column belongs must read as a mismatch,
             // not as a shorter list that happens to compare equal.
-            const [row] = await prisma.$queryRawUnsafe(
-                `SELECT c.relname                              AS table_name,
-                        i.indisunique                          AS is_unique,
-                        -- A CONCURRENTLY build that fails or is interrupted
-                        -- leaves the index BEHIND, with the expected name and
-                        -- indisvalid = false (round 46, item 1).
-                        i.indisvalid                           AS is_valid,
-                        i.indisready                           AS is_ready,
-                        pg_get_expr(i.indpred, i.indrelid)     AS predicate,
-                        pg_get_indexdef(i.indexrelid)          AS def,
-                        (SELECT array_agg(a.attname ORDER BY k.ord)
-                           FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
-                           LEFT JOIN pg_attribute a
-                                  ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                          WHERE k.ord <= i.indnkeyatts)        AS key_columns
-                   FROM pg_index i
-                   JOIN pg_class ic     ON ic.oid = i.indexrelid
-                   JOIN pg_class c      ON c.oid  = i.indrelid
-                   JOIN pg_namespace n  ON n.oid  = ic.relnamespace
-                  WHERE ic.relname = $1 AND n.nspname = 'public'`,
-                name,
-            );
+            let row = await readIndexCatalog(prisma, name);
             if (!row) {
                 console.error(`VERIFY FAILED: index ${name} missing on ${table}`);
                 process.exit(1);
@@ -1798,6 +1940,25 @@ async function main() {
                     process.exit(1);
                 }
                 console.log(repair.message);
+                // THE CATALOG MOVED (round 47, item 3). Everything below reads
+                // `row` — the drift comparison, the definition it prints, the
+                // "verified" line — and after a rebuild that snapshot describes
+                // an index that no longer exists. An invalid index that was
+                // ALSO drifted got correctly rebuilt into the right shape and
+                // then reported as still drifted, with an instruction to drop
+                // the index the rebuild had just made correct.
+                row = await readIndexCatalog(prisma, name);
+                if (!row) {
+                    console.error(`VERIFY FAILED: index ${name} is missing after its rebuild`);
+                    process.exit(1);
+                }
+                if (row.is_valid !== true || row.is_ready !== true) {
+                    console.error(
+                        `VERIFY FAILED: index ${name} is still not usable after a rebuild ` +
+                        `(indisvalid=${row.is_valid}, indisready=${row.is_ready}).`,
+                    );
+                    process.exit(1);
+                }
             }
             // The mismatch reports the SAME remedy whatever it is, because it
             // is the only one that works: `CREATE INDEX IF NOT EXISTS` matched
@@ -1949,6 +2110,46 @@ async function main() {
  * (tests/apply-script-index-db.test.ts); `main()` only decides what to do with
  * the answer.
  */
+/**
+ * ONE catalog read per index, answering every question at once.
+ *
+ * `indkey` is cut to `indnkeyatts` so an INCLUDE column cannot pad the key
+ * list, and the LEFT JOIN leaves a NULL name for an EXPRESSION column
+ * (attnum 0) rather than dropping it — an expression where a plain column
+ * belongs must read as a mismatch, not as a shorter list that happens to
+ * compare equal.
+ *
+ * A FUNCTION, not an inline query, because it has to be called TWICE: once
+ * before the validity check and again after a rebuild (round 47, item 3). A
+ * rebuilt index is a different pg_class row, and verifying the new one against
+ * the old snapshot reports drift that was just repaired.
+ */
+export async function readIndexCatalog(prisma, name) {
+    const [row] = await prisma.$queryRawUnsafe(
+        `SELECT c.relname                              AS table_name,
+                        i.indisunique                          AS is_unique,
+                        -- A CONCURRENTLY build that fails or is interrupted
+                        -- leaves the index BEHIND, with the expected name and
+                        -- indisvalid = false (round 46, item 1).
+                        i.indisvalid                           AS is_valid,
+                        i.indisready                           AS is_ready,
+                        pg_get_expr(i.indpred, i.indrelid)     AS predicate,
+                        pg_get_indexdef(i.indexrelid)          AS def,
+                        (SELECT array_agg(a.attname ORDER BY k.ord)
+                           FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS k(attnum, ord)
+                           LEFT JOIN pg_attribute a
+                                  ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                          WHERE k.ord <= i.indnkeyatts)        AS key_columns
+                   FROM pg_index i
+                   JOIN pg_class ic     ON ic.oid = i.indexrelid
+                   JOIN pg_class c      ON c.oid  = i.indrelid
+                   JOIN pg_namespace n  ON n.oid  = ic.relnamespace
+                  WHERE ic.relname = $1 AND n.nspname = 'public'`,
+        name,
+    );
+    return row ?? null;
+}
+
 export async function rebuildInvalidIndex(prisma, name, state) {
     const preamble =
         `index ${name} is present but NOT USABLE ` +

@@ -250,7 +250,10 @@ test("the pair is written from the LOCKED estimate, together", async () => {
     const res = await post(PAYLOAD);
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), {
-        ok: true, created: 1, projectId: "job-1", projectName: "Berg ADU", warnings: [],
+        // `dateSource` joined the response in round 47, item 2: "this row is
+        // dated today because nobody sent a date" is the one outcome a caller
+        // cannot work out from its own payload.
+        ok: true, created: 1, projectId: "job-1", projectName: "Berg ADU", dateSource: "supplied", warnings: [],
     });
     assert.equal(created.length, 1);
     assert.equal(created[0].projectId, "job-1");
@@ -514,4 +517,81 @@ test("the id is stored EXACTLY as sent, never derived from the url", async () =>
     await post({ ...PAYLOAD, fileId: "1AbC_-dEf", fileUrl: "https://example.test/whatever" });
     assert.equal(created[0].sourceFileId, "1AbC_-dEf");
     assert.equal(created[0].receiptUrl, "https://example.test/whatever", "the url is still the human link");
+});
+
+// ── the DATE (Codex round 47, item 2) ──────────────────────────────────────
+
+/**
+ * Three situations, and the route used to have two answers for them.
+ *
+ *   * OMITTED — legitimate, books today, and NOBODY WAS TOLD.
+ *   * MALFORMED (`07/14/2026`, `Jul 14 2026`) — fell through the same branch
+ *     and also booked today, so a receipt from another quarter landed in this
+ *     one with a `created: 1` that looked like success.
+ *   * IMPOSSIBLE (`2026-02-31`, the shape a bad OCR read produces most often)
+ *     — passed the shape test, reached `dateOnlyInTimeZone`, and threw: a 500
+ *     for a caller's typo.
+ */
+const dayOf = (value: unknown) => new Date(value as Date).toISOString().slice(0, 10);
+
+test("a supplied date is used, and reported as supplied", async () => {
+    const res = await post(PAYLOAD);
+    const json = await res.json();
+    assert.equal(json.ok, true);
+    assert.equal(json.dateSource, "supplied");
+    // Noon company time on the day sent, not UTC midnight (which reads as the
+    // day before in Pacific and files the receipt in the wrong month).
+    assert.equal(dayOf(created[0].date), "2026-08-14");
+});
+
+test("an OMITTED date books today, and the response SAYS it did", async () => {
+    const { date: _omitted, ...noDate } = PAYLOAD;
+    const res = await post({ ...noDate, fileId: "drive-file-omitted" });
+    const json = await res.json();
+    assert.equal(res.status, 200, "omitting a date is allowed");
+    assert.equal(json.dateSource, "defaulted-today");
+    assert.ok(
+        json.warnings.some((warning: string) => /dated today/i.test(warning)),
+        `the caller is told: ${JSON.stringify(json.warnings)}`,
+    );
+    assert.equal(dayOf(created[0].date), new Date().toISOString().slice(0, 10));
+});
+
+test("a MALFORMED date is a 400 naming it, not a silent booking on today", async () => {
+    for (const bad of ["07/14/2026", "Jul 14 2026", "2026-8-14", "yesterday"]) {
+        created = [];
+        const res = await post({ ...PAYLOAD, date: bad, fileId: `drive-file-${bad}` });
+        assert.equal(res.status, 400, `${bad} must be refused`);
+        const json = await res.json();
+        assert.equal(json.reason, "invalid-date");
+        assert.equal(json.date, bad, "the offending value is named");
+        assert.deepEqual(created, [], "and nothing was written");
+    }
+});
+
+test("an IMPOSSIBLE but well-shaped date is a 400, not a 500", async () => {
+    // CONTROL for the old behaviour: this value passes `/^\d{4}-\d{2}-\d{2}$/`,
+    // which is the whole test the route used to apply, and then throws inside
+    // the parser. A 500 tells the Apps Script nothing it can act on, and it
+    // retries the same bytes forever.
+    const res = await post({ ...PAYLOAD, date: "2026-02-31", fileId: "drive-file-impossible" });
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.equal(json.reason, "invalid-date");
+    assert.equal(json.date, "2026-02-31");
+    assert.match(json.detail, /not a real calendar date/);
+    assert.deepEqual(created, [], "nothing was written");
+});
+
+test("the date is judged BEFORE any group is inserted", async () => {
+    // Ordering matters: a document refused for its date must not leave half its
+    // groups behind, the same rule the malformed-group check follows.
+    const res = await post({
+        ...PAYLOAD,
+        date: "2026-02-31",
+        fileId: "drive-file-order",
+        groups: [{ category: "Plumbing", amount: 10 }, { category: "Plumbing", amount: 20 }],
+    });
+    assert.equal(res.status, 400);
+    assert.deepEqual(created, []);
 });

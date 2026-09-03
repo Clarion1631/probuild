@@ -13,6 +13,13 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import type { ComponentType } from "react";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import TaxPhaseModal, {
+    buildTaxPatchBody,
+    type TaxPhaseExpense,
+} from "../src/app/projects/[id]/time-expenses/TaxPhaseModal";
 
 interface FakeUser {
     id: string;
@@ -2001,4 +2008,162 @@ test("both handlers refuse the OTHER one's ack shape", async () => {
     const booleanToPut = await call({ amount: "150.00", taxReviewAck: true });
     assert.equal(booleanToPut.status, 400);
     assert.equal((await booleanToPut.json()).code, "TAX_REVIEW_ACK_MALFORMED");
+});
+
+// ── the MODAL's ack body, through the REAL route (round 47, item 1) ────────
+
+/**
+ * The bug this closes could not be seen from either side alone. The server
+ * correctly requires all three fields to clear a flag; the modal sent the two
+ * numbers, and sent `installedAtCustomer` only when the person CHANGED it. So
+ * the most ordinary case there is — re-check the figures, leave the
+ * yes/no/unknown answer as it was — sent two of three keys and came back 400
+ * every time, which means the flag could not be cleared through the UI at all.
+ *
+ * These drive the modal's own body builder into the real PATCH handler, so a
+ * change to either side has to keep them agreeing.
+ */
+const FLAGGED: TaxPhaseExpense = {
+    id: "e1",
+    vendor: "Lowe's",
+    description: null,
+    amount: 207.74,
+    taxAmount: 16.55,
+    taxAtSource: true,
+    installedAtCustomer: true,
+    taxDeductibleBase: null,
+    needsTaxReview: true,
+    taxSource: "manual",
+    costCodeId: null,
+};
+
+/** The form as the modal opens it: every field showing the stored value. */
+const UNTOUCHED = {
+    installed: "yes" as const,
+    taxAmount: "16.55",
+    taxKnown: false,
+    base: "",
+    costCodeId: "",
+    reviewAck: true,
+};
+
+test("the modal's ack carries the installation answer even when it did not change", async () => {
+    const body = buildTaxPatchBody(FLAGGED, UNTOUCHED);
+    assert.equal(body.taxReviewAck, true);
+    assert.equal(body.taxAmount, 16.55, "the figure, re-certified");
+    assert.equal(body.taxDeductibleBase, null, "and the base, re-certified as 'the whole pre-tax total'");
+    assert.ok("installedAtCustomer" in body, "the field the excise report keys on is NAMED");
+    assert.equal(body.installedAtCustomer, true, "as the value on screen");
+});
+
+test("...and that body clears the flag through the real handler", async () => {
+    storedExpense = {
+        ...(storedExpense as object),
+        installedAtCustomer: true,
+        needsTaxReview: true,
+        taxSource: "manual",
+    } as Record<string, unknown>;
+    const res = await patch(buildTaxPatchBody(FLAGGED, UNTOUCHED));
+    assert.equal(res.status, 200, `the ack must be accepted: ${JSON.stringify(await res.clone().json())}`);
+    assert.equal(updateArgs?.data.needsTaxReview, false, "and the flag actually comes down");
+});
+
+test("CONTROL: the body the modal used to send is refused", async () => {
+    // Verbatim the old rule: the ack block sent the two numbers, and
+    // `installedAtCustomer` went only when it changed — which here it did not.
+    const preFix = { ...buildTaxPatchBody(FLAGGED, UNTOUCHED) };
+    delete preFix.installedAtCustomer;
+
+    storedExpense = {
+        ...(storedExpense as object),
+        installedAtCustomer: true,
+        needsTaxReview: true,
+        taxSource: "manual",
+    } as Record<string, unknown>;
+    const res = await patch(preFix);
+    assert.equal(res.status, 400, "this is what the bookkeeper got, every time");
+    assert.equal((await res.json()).code, "TAX_REVIEW_ACK_MALFORMED");
+    assert.equal(updateArgs, null, "and the flag stayed up");
+});
+
+test("a CHANGED installation answer still travels, and still only once", async () => {
+    // The other branch: the ordinary block already wanted to send it. The two
+    // blocks must not disagree about the value, and the key must not be sent
+    // twice with different values.
+    const body = buildTaxPatchBody(FLAGGED, { ...UNTOUCHED, installed: "unknown" });
+    assert.equal(body.installedAtCustomer, null);
+    storedExpense = {
+        ...(storedExpense as object),
+        installedAtCustomer: true,
+        needsTaxReview: true,
+        taxSource: "manual",
+    } as Record<string, unknown>;
+    const res = await patch(body);
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.installedAtCustomer, null, "the person's new answer is what lands");
+});
+
+test("an UNFLAGGED row still sends only what changed", async () => {
+    // The exception is scoped to a flag being cleared. On an ordinary edit,
+    // re-sending an untouched field would stamp provenance on it for no reason.
+    const body = buildTaxPatchBody(
+        { ...FLAGGED, needsTaxReview: false },
+        { ...UNTOUCHED, reviewAck: false, base: "50" },
+    );
+    assert.deepEqual(body, { taxDeductibleBase: 50 });
+});
+
+test("the checkbox says what it certifies", () => {
+    // The label is part of the contract: the body now re-certifies the
+    // installation answer, so the person ticking the box has to be told that is
+    // what they are doing.
+    const markup = renderToStaticMarkup(createElement(
+        TaxPhaseModal as unknown as ComponentType<Record<string, unknown>>,
+        { expense: FLAGGED, phases: [], onClose: () => {}, onSaved: () => {} },
+    ));
+    assert.match(markup, /installed at a customer job/i);
+    assert.match(markup, /re-checked the tax/i);
+});
+
+// ── the DATE, on the PUT (Codex round 47, item 2) ──────────────────────────
+
+test("an IMPOSSIBLE but well-shaped date is a 400, not a 500", async () => {
+    // `2026-02-31` passes `/^\d{4}-\d{2}-\d{2}$/`, which was the whole test
+    // this route applied, and then throws inside `dateOnlyInTimeZone` — so a
+    // typo came back as "Failed to update expense" with a 500, and the value
+    // that caused it was nowhere in the response.
+    const res = await call({ date: "2026-02-31" });
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.match(json.error, /not a real calendar date/);
+    assert.equal(json.date, "2026-02-31");
+    assert.equal(updateArgs, null, "and nothing was written");
+});
+
+test("...and unparseable junk is refused rather than stored as an Invalid Date", async () => {
+    const res = await call({ date: "yesterday" });
+    assert.equal(res.status, 400);
+    assert.equal(updateArgs, null);
+});
+
+test("a real calendar day and a full timestamp both still work", async () => {
+    const day = await call({ date: "2026-08-14" });
+    assert.equal(day.status, 200);
+    assert.equal(
+        (updateArgs?.data.date as Date).toISOString().slice(0, 10),
+        "2026-08-14",
+        "company noon on the day sent, not UTC midnight the day before",
+    );
+
+    updateArgs = null;
+    const instant = await call({ date: "2026-08-14T18:30:00.000Z" });
+    assert.equal(instant.status, 200);
+    const written = updateArgs as { data: Record<string, unknown> } | null;
+    assert.equal((written?.data.date as Date).toISOString(), "2026-08-14T18:30:00.000Z");
+});
+
+test("clearing the date is still possible", async () => {
+    const res = await call({ date: null });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.date, null);
 });

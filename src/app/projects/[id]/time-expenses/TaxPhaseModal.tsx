@@ -46,6 +46,82 @@ function money(value: number): string {
     return value.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
+/** Everything the form knows, as the PATCH body it turns into. */
+export interface TaxPatchFormState {
+    installed: "unknown" | "yes" | "no";
+    /** The tax field as typed: "" means blank. */
+    taxAmount: string;
+    /** Which kind of blank the tax field is: true = "there is no tax". */
+    taxKnown: boolean;
+    /** The deductible-base field as typed: "" means blank. */
+    base: string;
+    costCodeId: string;
+    /** The "I have re-checked this" box. Only meaningful on a flagged row. */
+    reviewAck: boolean;
+}
+
+/**
+ * THE PATCH BODY, AS A PURE FUNCTION (round 47, item 1).
+ *
+ * Only what actually changed — the endpoint refuses unknown keys, and sending
+ * a field back unchanged would stamp provenance on it for no reason. With ONE
+ * deliberate exception: an acknowledgement carries the WHOLE classification,
+ * changed or not.
+ *
+ * That exception is why this is extracted and exported. The bug it fixes was
+ * invisible from either side on its own: the ack block sent the two numbers,
+ * the ordinary block sent `installedAtCustomer` only when it changed, and the
+ * server requires all three on a flagged row. So the most ordinary case there
+ * is — re-check the figures, leave the yes/no/unknown answer alone — sent two
+ * of three keys and got `TAX_REVIEW_ACK_MALFORMED` back, every time. Tested
+ * body-out here and end-to-end through the real route in
+ * tests/expense-edit-authz.test.ts.
+ */
+export function buildTaxPatchBody(
+    expense: TaxPhaseExpense,
+    form: TaxPatchFormState,
+): Record<string, unknown> {
+    const body: Record<string, unknown> = {};
+    const parsedTax = form.taxAmount.trim() === "" ? null : Number(form.taxAmount);
+    const nextInstalled = form.installed === "unknown" ? null : form.installed === "yes";
+    if (nextInstalled !== expense.installedAtCustomer) body.installedAtCustomer = nextInstalled;
+    const taxStateChanged =
+        parsedTax !== expense.taxAmount ||
+        (parsedTax === null && form.taxKnown !== (expense.taxSource === "manual-none"));
+    if (taxStateChanged) {
+        body.taxAmount = parsedTax;
+        // WHICH BLANK this is. Only sent alongside the amount, because on its
+        // own it is not an edit.
+        if (parsedTax === null) body.taxKnown = form.taxKnown;
+        // `taxAtSource` is NOT sent: it is derived server-side from the figure,
+        // and the route refuses it outright (round 20, item 1). Two writers for
+        // one truth is how they came to disagree.
+    }
+    const nextBase = form.base.trim() === "" ? null : Number(form.base);
+    if (nextBase !== expense.taxDeductibleBase) body.taxDeductibleBase = nextBase;
+    const nextCode = form.costCodeId || null;
+    if (nextCode !== expense.costCodeId) body.costCodeId = nextCode;
+
+    // ACKNOWLEDGING A REVIEW SENDS THE WHOLE CLASSIFICATION, CHANGED OR NOT.
+    //
+    // The flag says the whole classification is in doubt because the gross
+    // moved underneath it, so "I did not edit that field" is not the same as "I
+    // checked it". `installedAtCustomer` is the field the excise report keys
+    // on, so leaving it out would preserve a stored `true` and re-admit the
+    // receipt — which is why the server requires all three keys, and why
+    // sending the CURRENT value here is a certification rather than a silent
+    // re-assertion: the checkbox says what is being certified and the value is
+    // the one on screen.
+    if (expense.needsTaxReview && form.reviewAck) {
+        body.taxReviewAck = true;
+        body.taxAmount = parsedTax;
+        if (parsedTax === null) body.taxKnown = form.taxKnown;
+        body.taxDeductibleBase = nextBase;
+        body.installedAtCustomer = nextInstalled;
+    }
+    return body;
+}
+
 export default function TaxPhaseModal({
     expense,
     phases,
@@ -105,40 +181,9 @@ export default function TaxPhaseModal({
             return;
         }
 
-        const body: Record<string, unknown> = {};
-        const nextInstalled = installed === "unknown" ? null : installed === "yes";
-        if (nextInstalled !== expense.installedAtCustomer) body.installedAtCustomer = nextInstalled;
-        const taxStateChanged =
-            parsedTax !== expense.taxAmount ||
-            (parsedTax === null && taxKnown !== (expense.taxSource === "manual-none"));
-        if (taxStateChanged) {
-            body.taxAmount = parsedTax;
-            // WHICH BLANK this is. Only sent alongside the amount, because on
-            // its own it is not an edit.
-            if (parsedTax === null) body.taxKnown = taxKnown;
-            // `taxAtSource` is NOT sent: it is derived server-side from the
-            // figure, and the route refuses it outright (round 20, item 1).
-            // Two writers for one truth is how they came to disagree.
-        }
-        const nextBase = base.trim() === "" ? null : Number(base);
-        if (nextBase !== expense.taxDeductibleBase) body.taxDeductibleBase = nextBase;
-        const nextCode = costCodeId || null;
-        if (nextCode !== expense.costCodeId) body.costCodeId = nextCode;
-
-        // ACKNOWLEDGING A REVIEW SENDS THE FIGURES, CHANGED OR NOT.
-        //
-        // The flag says the whole classification is in doubt because the gross
-        // moved underneath it, so "I did not edit that field" is not the same
-        // as "I checked it". The server refuses an ack that does not carry both
-        // numbers, which is what makes the confirmation mean something.
-        if (expense.needsTaxReview && reviewAck) {
-            body.taxReviewAck = true;
-            // BOTH figures, changed or not: the server requires both keys on a
-            // flagged row, because the flag is about the whole classification.
-            body.taxAmount = parsedTax;
-            if (parsedTax === null) body.taxKnown = taxKnown;
-            body.taxDeductibleBase = nextBase;
-        }
+        const body = buildTaxPatchBody(expense, {
+            installed, taxAmount, taxKnown, base, costCodeId, reviewAck,
+        });
 
         if (Object.keys(body).length === 0) {
             onClose();
@@ -190,8 +235,9 @@ export default function TaxPhaseModal({
                                     onChange={event => setReviewAck(event.target.checked)}
                                 />
                                 <span>
-                                    I have re-checked the tax and the deductible amount below. Until this is
-                                    ticked the receipt stays out of the excise report.
+                                    I have re-checked the tax, the deductible amount and whether this was
+                                    installed at a customer job, as shown below. Until this is ticked the
+                                    receipt stays out of the excise report.
                                 </span>
                             </label>
                         </div>

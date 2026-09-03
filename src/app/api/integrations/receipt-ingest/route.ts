@@ -4,7 +4,7 @@ import { assertPhaseOfProjectTx, lockAttributionParents } from "@/lib/phase-inva
 import { lockEstimateAttribution } from "@/lib/expense-attribution";
 import { resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { matchProjectByName, matchCostCode } from "@/lib/project-match";
 
 export const dynamic = "force-dynamic";
@@ -134,9 +134,24 @@ export async function POST(req: Request) {
     // answer by luck rather than by rule. The shared parser makes it a company
     // calendar day like every other writer.
     const companyTimeZone = await resolveCompanyTimeZone();
-    const date = body.date && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
-        ? dateOnlyInTimeZone(body.date, companyTimeZone)
-        : new Date();
+    // OMITTED IS NOT THE SAME AS WRONG (round 47, item 2). This used to be one
+    // ternary: anything that did not match YYYY-MM-DD became `new Date()`, so
+    // `07/14/2026` booked the receipt on the day it happened to be imported —
+    // possibly in the wrong quarter, with nothing in the response saying the
+    // date had been replaced. And a well-shaped impossible day (`2026-02-31`,
+    // the shape a bad OCR read produces most often) passed that test, reached
+    // the parser, and threw: a 500 for a caller error.
+    const verdict = classifyCalendarDate(body.date);
+    if (verdict.kind === "invalid") {
+        return NextResponse.json(
+            { ok: false, reason: "invalid-date", date: verdict.value, detail: `date ${verdict.reason}` },
+            { status: 400 },
+        );
+    }
+    const date = verdict.kind === "valid" ? dateOnlyInTimeZone(verdict.date, companyTimeZone) : new Date();
+    // Said out loud, in the response and the log: a row dated today because
+    // nobody sent a date is a fact the archive step and any audit need.
+    const dateSource = verdict.kind === "valid" ? "supplied" : "defaulted-today";
 
     // EVERY GROUP IS VALIDATED BEFORE ANY OF THEM IS INSERTED (round 33,
     // item 2 — the failure mode this replaces).
@@ -394,5 +409,10 @@ export async function POST(req: Request) {
     // a 400 at the top, and a group that would have produced it is now the 422
     // above — which, unlike the old 200-with-`ok: false`, cannot be read as
     // "handled, archive the file".
-    return NextResponse.json({ ok: true, created, projectId: project.id, projectName: project.name, warnings });
+    // `dateSource` is part of the answer, not decoration: "defaulted-today"
+    // is the one outcome a caller cannot infer from its own payload.
+    if (dateSource === "defaulted-today") {
+        warnings.push("No date was supplied, so these expenses are dated today.");
+    }
+    return NextResponse.json({ ok: true, created, projectId: project.id, projectName: project.name, dateSource, warnings });
 }

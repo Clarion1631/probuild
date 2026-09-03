@@ -19,6 +19,9 @@ import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
 import {
     INDEX_STATEMENTS,
+    expectedIndexes,
+    indexDrift,
+    readIndexCatalog,
     rebuildInvalidIndex,
     toConcurrentIndexSql,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -161,6 +164,61 @@ test("...and a rebuild blocked by real duplicates fails LOUDLY, naming them", { 
     } finally {
         await cleanup();
         // Leave the database as we found it for the suites that follow.
+        await db!.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${INDEX}"`).catch(() => {});
+        await db!.$executeRawUnsafe(
+            toConcurrentIndexSql((INDEX_STATEMENTS as string[]).find(sql => sql.includes(INDEX))!),
+        );
+    }
+});
+
+
+test("an index that is BOTH invalid and DRIFTED is verified from the REBUILT one", { skip }, async () => {
+    // ROUND 47, ITEM 3. The rebuild was correct and the verification that
+    // followed it was not: `indexDrift` was handed the PRE-rebuild snapshot, so
+    // an index that was invalid AND the wrong shape got rebuilt into the right
+    // shape and then reported as still drifted — with an instruction to drop
+    // the index the rebuild had just made correct.
+    await seed();
+    const expected = (expectedIndexes as {
+        name: string; table: string; unique: boolean; keyColumns: string[]; predicate: RegExp | null;
+    }[]).find(index => index.name === INDEX)!;
+    try {
+        // Drift AND invalidity in one fixture: not unique, no partial
+        // predicate, one key column instead of two, and marked unusable the way
+        // an interrupted CONCURRENTLY build leaves it.
+        await db!.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${INDEX}"`);
+        await db!.$executeRawUnsafe(`CREATE INDEX "${INDEX}" ON "Expense" ("sourceFileId")`);
+        await db!.$executeRawUnsafe(
+            `UPDATE pg_index SET indisvalid = false, indisready = false
+              WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = $1)`,
+            INDEX,
+        );
+
+        const stale = await readIndexCatalog(db, INDEX);
+        assert.equal(stale.is_valid, false, "the fixture really is unusable");
+        const staleDrift = indexDrift(expected, stale);
+        assert.ok(staleDrift, `CONTROL: the pre-rebuild snapshot reports drift (${staleDrift})`);
+
+        const repair = await rebuildInvalidIndex(db, INDEX, stale);
+        assert.equal(repair.ok, true, `the rebuild should have worked: ${repair.error}`);
+
+        // THE CONTROL, restated as the bug: the snapshot the old code verified
+        // from still says "drifted" even though the database is now correct.
+        assert.ok(
+            indexDrift(expected, stale),
+            "the stale row is still drifted — verifying from it is the bug",
+        );
+
+        const fresh = await readIndexCatalog(db, INDEX);
+        assert.equal(indexDrift(expected, fresh), null, "the REBUILT index is the right shape");
+        assert.deepEqual(
+            { valid: fresh.is_valid, ready: fresh.is_ready },
+            { valid: true, ready: true },
+        );
+        assert.match(fresh.def, /CREATE UNIQUE INDEX/);
+        assert.match(fresh.def, /WHERE \("sourceFileId" IS NOT NULL\)/);
+    } finally {
+        await cleanup();
         await db!.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${INDEX}"`).catch(() => {});
         await db!.$executeRawUnsafe(
             toConcurrentIndexSql((INDEX_STATEMENTS as string[]).find(sql => sql.includes(INDEX))!),

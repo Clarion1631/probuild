@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { classifyCalendarDate, dateOnlyInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import Anthropic from "@anthropic-ai/sdk";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
@@ -271,6 +271,12 @@ export async function POST(req: NextRequest) {
         // Always tell the caller whether the expense was created and why not, so a
         // mobile UI can show the right toast (vs silently assuming success).
         let expenseCreated = false;
+        // The model returned something in the date field that is not a date
+        // (round 47, item 2). The row is still created — this is a
+        // convenience row — but dated TODAY rather than on a guess, and the
+        // caller is told, because "the date on screen is not the one on the
+        // receipt" is not something it can work out for itself.
+        let dateUnreadable: string | undefined;
         let expenseId: string | undefined;
         let expenseSkipReason:
             | "no-project"
@@ -305,10 +311,17 @@ export async function POST(req: NextRequest) {
                 // midnight — which reads as 30 June in Pacific and files the
                 // receipt in the wrong quarter. Resolved BEFORE the transaction
                 // so a settings read never holds the estimate lock open.
-                const expenseDate =
-                    typeof parsed.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
-                        ? dateOnlyInTimeZone(parsed.date, await resolveCompanyTimeZone())
-                        : (parsed.date ? new Date(parsed.date as string) : new Date());
+                // AND THE MODEL'S DATE IS NOT TRUSTED TO BE A DATE (round 47,
+                // item 2). `2026-02-31` is a shape a bad OCR read produces
+                // often, it passed the old regex, and the parser threw on it —
+                // a 500 for a model misread. Here an unusable answer is
+                // treated as NO answer (today, the convenience row's default),
+                // and the warning below says the date was not the model's.
+                const dateVerdict = classifyCalendarDate(parsed.date);
+                if (dateVerdict.kind === "invalid") dateUnreadable = dateVerdict.value;
+                const expenseDate = dateVerdict.kind === "valid"
+                    ? dateOnlyInTimeZone(dateVerdict.date, await resolveCompanyTimeZone())
+                    : new Date();
                 // THE PAIR, RE-READ UNDER LOCK (round 21, item 1). The estimate
                 // was picked before an image upload, an access check and a
                 // model call; if it moved to another job in that window,
@@ -344,6 +357,7 @@ export async function POST(req: NextRequest) {
             expenseCreated,
             ...(expenseId ? { expenseId } : {}),
             ...(expenseSkipReason ? { expenseSkipReason } : {}),
+            ...(dateUnreadable ? { dateUnreadable, dateSource: "defaulted-today" } : {}),
         });
     } catch (err) {
         await cleanupUpload();

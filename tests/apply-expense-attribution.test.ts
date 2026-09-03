@@ -16,8 +16,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import {
+    APPLY_TARGETS,
+    PRODUCTION_BASELINE_MIGRATION,
+    parseTarget,
+    resolveTargetDatabaseUrl,
+    targetBanner,
+    targetHostVerdict,
     expectedCheckConstraints,
     expectedColumns,
     expectedConstraints,
@@ -1406,4 +1413,146 @@ test("the index verifier checks that an index is USABLE, not just present", () =
     assert.match(script, /DROP INDEX CONCURRENTLY IF EXISTS/);
     assert.match(script, /toConcurrentIndexSql\(rebuild\)/);
     assert.match(script, /is STILL invalid after a rebuild/, "and gives up loudly rather than looping");
+});
+
+
+// ── WHICH DATABASE (cross-PR rule, round 46) ───────────────────────────────
+
+/**
+ * A developer with a local Postgres in their shell could run this script,
+ * watch every "verified ..." line print, and merge believing production had
+ * the columns. `--expect-db` / `--expect-host` did not stop it: the operator
+ * supplies BOTH sides of that comparison, so a local server satisfies it as
+ * easily as the real one. The target has to be named, and prod's URL has to
+ * come from the deployed env file rather than the shell.
+ */
+test("no --target is a refusal, not a default", () => {
+    const missing = parseTarget(["node", "apply.mjs", "--yes"]);
+    assert.match(missing.error ?? "", /--target is required/);
+    // A misspelling is not a silent fallback to prod either.
+    const wrong = parseTarget(["node", "apply.mjs", "--target", "production"]);
+    assert.match(wrong.error ?? "", /Unknown --target/);
+    const bare = parseTarget(["node", "apply.mjs", "--target"]);
+    assert.match(bare.error ?? "", /Unknown --target/);
+    assert.equal(parseTarget(["node", "apply.mjs", "--target", "prod"]).name, "prod");
+    assert.equal(parseTarget(["node", "apply.mjs", "--target", "ci", "--yes"]).name, "ci");
+});
+
+test("an ambient DATABASE_URL cannot impersonate production", () => {
+    // The failure this exists for, exactly: a local database in the shell.
+    const ambient = { DATABASE_URL: "postgresql://probuild:probuild@localhost:5432/probuild" } as unknown as NodeJS.ProcessEnv;
+    const files = {
+        ".env.production.local":
+            "NEXTAUTH_SECRET=irrelevant\n" +
+            'DATABASE_URL="postgresql://postgres.ref:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true"\n',
+    };
+    const io = {
+        env: ambient,
+        exists: (file: unknown) => String(file) in files,
+        read: (file: unknown) => files[String(file) as keyof typeof files],
+    };
+
+    const prod = resolveTargetDatabaseUrl("prod", io);
+    assert.equal(prod.from, ".env.production.local", "the file, never the shell");
+    assert.match(prod.url ?? "", /pooler\.supabase\.com/);
+    assert.doesNotMatch(prod.url ?? "", /localhost/, "the ambient value is not consulted at all");
+
+    // ...and with no such file, prod REFUSES rather than falling back to it.
+    const noFile = resolveTargetDatabaseUrl("prod", { ...io, exists: () => false });
+    assert.match(noFile.error ?? "", /\.env\.production\.local, which does not exist/);
+    assert.equal(noFile.url, undefined, "no URL is produced, so no DDL can run");
+
+    // The CI target is the one that DOES read the environment.
+    const ci = resolveTargetDatabaseUrl("ci", io);
+    assert.equal(ci.url, ambient.DATABASE_URL);
+    assert.equal(ci.from, "process.env.DATABASE_URL");
+});
+
+test("each target refuses the other one's host", () => {
+    assert.match(
+        targetHostVerdict("prod", "postgresql://u:p@localhost:5432/probuild") ?? "",
+        /expects the Supabase pooler, but the URL points at localhost/,
+    );
+    assert.equal(
+        targetHostVerdict("prod", "postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres"),
+        null,
+    );
+    // The reverse guard: the CI path must never be pointed at production, so
+    // the throwaway-container mode cannot become a way around the prod checks.
+    assert.match(
+        targetHostVerdict("ci", "postgresql://u:p@db.ghzdbzdnwjxazvmcefbh.supabase.co:5432/postgres") ?? "",
+        /must never point at .*supabase\.co — that is production/,
+    );
+    assert.equal(targetHostVerdict("ci", "postgresql://u:p@localhost:5432/probuild_apply"), null);
+});
+
+test("only prod demands the production baseline row", () => {
+    assert.equal(APPLY_TARGETS.prod.requireBaseline, true);
+    assert.equal(APPLY_TARGETS.ci.requireBaseline, false);
+    // The name is the one CLAUDE.md documents as marked applied in prod by the
+    // deliberate one-off `migrate resolve --applied` step.
+    assert.equal(PRODUCTION_BASELINE_MIGRATION, "20260814000000_baseline_production");
+    assert.ok(
+        readFileSync(path.resolve(__dirname, "..", "prisma", "migrations", PRODUCTION_BASELINE_MIGRATION, "migration.sql"), "utf8").length > 0,
+        "and it is a real migration in this repo",
+    );
+});
+
+test("the banner names the database and REDACTS the credentials", () => {
+    const line = targetBanner("prod", {
+        url: "postgresql://postgres.ref:sup3rs3cret@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true",
+        from: ".env.production.local",
+        db: "postgres",
+        host: "10.0.0.5",
+    });
+    assert.doesNotMatch(line, /sup3rs3cret/, "the password never reaches the terminal");
+    assert.match(line, /:\*\*\*\*@/);
+    assert.match(line, /TARGET prod/);
+    assert.match(line, /db="postgres"/);
+    assert.match(line, /server="10\.0\.0\.5"/);
+    assert.match(line, /from \.env\.production\.local/);
+});
+
+test("the CI driver passes --target ci, so the prod guard cannot be met by accident", () => {
+    const driver = readFileSync(
+        path.resolve(__dirname, "..", "scripts", "ci-apply-expense-attribution-e2e.mjs"),
+        "utf8",
+    );
+    assert.match(driver, /"--target", "ci"/);
+    assert.doesNotMatch(driver, /"--target", "prod"/);
+});
+
+test("THE ACTUAL SCRIPT refuses an ambient local URL, before any DDL", () => {
+    // The refusal has to happen in the real process, not just in the pure
+    // helpers: `main()` could call them and ignore the answer. Both attempts
+    // below exit before a PrismaClient is even constructed, which is why this
+    // needs no database.
+    const script = path.resolve(__dirname, "..", "scripts", "apply-expense-attribution.mjs");
+    const ambient = {
+        ...process.env,
+        DATABASE_URL: "postgresql://probuild:probuild@localhost:5432/probuild",
+    };
+    const attempt = (args: string[]) => {
+        try {
+            const stdout = execFileSync(process.execPath, [script, ...args], {
+                env: ambient, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+            });
+            return { code: 0, output: stdout };
+        } catch (error) {
+            const failure = error as { status?: number; stdout?: string; stderr?: string };
+            return { code: failure.status ?? -1, output: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+        }
+    };
+
+    const noTarget = attempt(["--yes", "--expect-db", "probuild", "--expect-host", "127.0.0.1"]);
+    assert.notEqual(noTarget.code, 0, "it must not run");
+    assert.match(noTarget.output, /REFUSING: --target is required/);
+    assert.doesNotMatch(noTarget.output, /applied|verified/, "nothing was executed against the database");
+
+    // ...and naming prod does not rescue it: the URL would come from
+    // .env.production.local, which is not checked in and is not on CI.
+    const asProd = attempt(["--target", "prod", "--yes", "--expect-db", "probuild", "--expect-host", "127.0.0.1"]);
+    assert.notEqual(asProd.code, 0);
+    assert.match(asProd.output, /REFUSING/);
+    assert.doesNotMatch(asProd.output, /localhost/, "the ambient URL is not even echoed as a candidate");
 });
