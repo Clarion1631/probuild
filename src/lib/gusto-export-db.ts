@@ -350,6 +350,45 @@ export function isNonStaffOnPayrollError(error: unknown): error is NonStaffOnPay
 }
 
 /**
+ * A label row this export prints went away, or moved, while the period was
+ * being frozen.
+ *
+ * Round 10 pinned Project.name and CostCode.code with FOR SHARE, which stops a
+ * RENAME. It did not stop a DELETE. `TimeEntry_costCodeId_fkey` is
+ * ON DELETE SET NULL, so a cost code deleted between the entry query and the
+ * moment the lock takes its row locks commits happily: the FOR SHARE then finds
+ * no row, and the `??` fallback quietly reused the code the first query had
+ * joined - freezing a CSV that no longer matched committed data (round 11,
+ * finding 2).
+ *
+ * `TimeEntry_projectId_fkey` is ON DELETE RESTRICT (converted from CASCADE by
+ * this branch's own migration), so a project with hours cannot be deleted at
+ * all and that side is genuinely safe. It is checked here anyway: "safe because
+ * of a constraint three files away" is exactly the kind of claim that stops
+ * being true without anyone noticing, and the check costs one comparison.
+ *
+ * There is no correct file to freeze here, so this REFUSES. The alternative -
+ * emitting a blank column, or the stale label - is a payroll file that disagrees
+ * with the database it was built from, which is the whole thing the lock exists
+ * to prevent.
+ */
+export class LabelRowMissingError extends Error {
+    readonly entryIds: string[];
+    constructor(detail: string, entryIds: string[]) {
+        super(
+            `A project or cost code on this pay period changed while it was being read (${detail}). ` +
+                "Nothing was locked - refresh and try again."
+        );
+        this.name = "LabelRowMissingError";
+        this.entryIds = entryIds;
+    }
+}
+
+export function isLabelRowMissingError(error: unknown): error is LabelRowMissingError {
+    return error instanceof Error && error.name === "LabelRowMissingError";
+}
+
+/**
  * Is this locked row complete enough to serve? Exported so the callers and the
  * tests share ONE definition of "complete" with the loader.
  *
@@ -452,17 +491,34 @@ export async function loadLockedSnapshot(
     startKey: string,
     endKey: string,
     client: ExportDbClient = prisma
-): Promise<{ summaryCsv: string; detailCsv: string; exportHash: string; period: PayrollPeriodRow } | null> {
-    const period = await findPayrollPeriod(startKey, endKey, client);
-    if (!period?.lockedAt) return null;
+): Promise<{ summaryCsv: string; detailCsv: string; exportHash: string } | null> {
+    // A DEDICATED select: the frozen bytes, the hash, and the two flags that
+    // decide whether this row is a period at all. NO RELATIONS.
+    //
+    // It used to call findPayrollPeriod, whose shared select joins `lockedBy` -
+    // so downloading a file that was frozen months ago read a LIVE User row, and
+    // the promise that a locked download touches no live state was not quite
+    // true (round 11, finding 3).
+    const period = await client.payrollPeriod.findUnique({
+        where: { periodStartKey_periodEndKey: { periodStartKey: startKey, periodEndKey: endKey } },
+        select: {
+            lockedAt: true,
+            // A DISCARDED row is not a period - every reader is blind to it, or
+            // a retired wrong-range row would still serve its snapshot.
+            discardedAt: true,
+            exportHash: true,
+            summaryCsvSnapshot: true,
+            detailCsvSnapshot: true,
+        },
+    });
+    if (!period || period.discardedAt || !period.lockedAt) return null;
     if (!lockedSnapshotIsComplete(period)) {
-        throw new LockedSnapshotMissingError(period.periodStartKey ?? startKey, period.periodEndKey ?? endKey);
+        throw new LockedSnapshotMissingError(startKey, endKey);
     }
     return {
         summaryCsv: period.summaryCsvSnapshot as string,
         detailCsv: period.detailCsvSnapshot as string,
         exportHash: period.exportHash as string,
-        period,
     };
 }
 
@@ -612,12 +668,62 @@ export async function loadGustoExport(
     // stand - the same rule the settings rows and the roster follow.
     const projectIds = [...new Set(rows.map((row) => row.projectId).filter((id): id is string => !!id))].sort();
     const costCodeIds = [...new Set(rows.map((row) => row.costCodeId).filter((id): id is string => !!id))].sort();
-    const lockedProjectNames = isTransactionClient(client)
-        ? await readProjectNamesForShare(client as Prisma.TransactionClient, projectIds)
-        : new Map<string, string | null>();
-    const lockedCostCodes = isTransactionClient(client)
-        ? await readCostCodesForShare(client as Prisma.TransactionClient, costCodeIds)
-        : new Map<string, string | null>();
+    let lockedProjectNames = new Map<string, string | null>();
+    let lockedCostCodes = new Map<string, string | null>();
+    // Inside a transaction the locked maps ARE the labels; outside one nothing
+    // is held and the joined values are all there is. The flag keeps those two
+    // worlds from mixing, so no `??` can quietly bridge them.
+    const labelsAreLocked = isTransactionClient(client);
+    if (labelsAreLocked) {
+        const tx = client as Prisma.TransactionClient;
+        lockedProjectNames = await readProjectNamesForShare(tx, projectIds);
+        lockedCostCodes = await readCostCodesForShare(tx, costCodeIds);
+
+        // NOW VERIFY, under the locks just taken. A rename is held off by the
+        // FOR SHARE above; a DELETE that committed BEFORE it is not, and
+        // TimeEntry.costCodeId is ON DELETE SET NULL - so the row simply is not
+        // there and the entry no longer points at it. Re-reading the foreign
+        // keys in this transaction sees that committed state (READ COMMITTED,
+        // new statement, new snapshot), and comparing them against the first
+        // read is what turns "the label vanished" into a refusal instead of a
+        // silently stale CSV (round 11, finding 2).
+        const entryIds = rows.map((row) => row.id);
+        const current = (entryIds.length === 0
+            ? []
+            : ((await tx.$queryRawUnsafe(
+                  `SELECT "id", "projectId", "costCodeId" FROM "TimeEntry" WHERE "id" = ANY($1::text[])`,
+                  entryIds
+              )) as Array<{ id: string; projectId: string | null; costCodeId: string | null }>)) as Array<{
+            id: string;
+            projectId: string | null;
+            costCodeId: string | null;
+        }>;
+        const byId = new Map(current.map((row) => [row.id, row]));
+
+        const moved: string[] = [];
+        const missing: string[] = [];
+        for (const row of rows) {
+            const now = byId.get(row.id);
+            // The entry itself vanished, or its labels moved, between the two
+            // reads. Either way the file this transaction is about to hash was
+            // built from something that is no longer true.
+            if (!now || now.projectId !== row.projectId || now.costCodeId !== row.costCodeId) {
+                moved.push(row.id);
+                continue;
+            }
+            if (row.projectId && !lockedProjectNames.has(row.projectId)) missing.push(row.id);
+            if (row.costCodeId && !lockedCostCodes.has(row.costCodeId)) missing.push(row.id);
+        }
+        if (moved.length > 0 || missing.length > 0) {
+            const detail = [
+                moved.length > 0 ? `${moved.length} entr${moved.length === 1 ? "y" : "ies"} re-coded or removed` : "",
+                missing.length > 0 ? `${missing.length} referenced label row missing` : "",
+            ]
+                .filter(Boolean)
+                .join("; ");
+            throw new LabelRowMissingError(detail, [...new Set([...moved, ...missing])]);
+        }
+    }
 
     const entries: ExportEntry[] = rows.map((row) => ({
         id: row.id,
@@ -630,13 +736,25 @@ export async function loadGustoExport(
         mealOutcome: row.mealOutcome ?? null,
         needsReview: row.needsReview,
         isEdited: row.isEdited,
-        // The LOCKED value wins. `??` on the map lookup rather than `has`: a row
-        // that is genuinely absent falls back to the joined label instead of
-        // blanking a column, and TimeEntry.projectId is RESTRICT so a project
-        // with hours cannot disappear underneath this anyway.
-        projectName: (row.projectId ? lockedProjectNames.get(row.projectId) : undefined) ?? row.project?.name ?? null,
-        costCodeLabel:
-            (row.costCodeId ? lockedCostCodes.get(row.costCodeId) : undefined) ?? (row.costCode ? row.costCode.code : null),
+        // Inside a transaction the LOCKED value is the ONLY value - there is no
+        // fallback to the joined one at all. The verify step above has already
+        // refused if any referenced row went missing or moved, so a fallback
+        // could only ever paper over that, and papering over it is precisely
+        // how a deleted cost code used to freeze its own stale code into a
+        // locked CSV (round 11, finding 2).
+        //
+        // Outside a transaction nothing is locked and the joined labels stand:
+        // the review page and an unlocked download are ordinary reads.
+        projectName: labelsAreLocked
+            ? row.projectId
+                ? lockedProjectNames.get(row.projectId) ?? null
+                : null
+            : row.project?.name ?? null,
+        costCodeLabel: labelsAreLocked
+            ? row.costCodeId
+                ? lockedCostCodes.get(row.costCodeId) ?? null
+                : null
+            : row.costCode?.code ?? null,
     }));
 
     // Everyone paid by the hour appears even with no hours (Gusto still wants a

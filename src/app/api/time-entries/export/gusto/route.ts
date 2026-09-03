@@ -5,6 +5,7 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 import { validatePayrollRange } from "@/lib/payroll-config";
 import {
+    isLabelRowMissingError,
     isLockedSnapshotMissingError,
     isNonStaffOnPayrollError,
     loadGustoExport,
@@ -96,13 +97,11 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             const range = validatePayrollRange(startKey, endKey);
             if (!range.ok) return NextResponse.json({ error: range.error }, { status: 400 });
 
-            const timeZone = await dependencies.resolveTimeZone();
-            const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
-            const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
-
-            // THE FROZEN FILE FIRST. One row, no live inputs, so a period that
-            // was locked and paid stays downloadable no matter what has
-            // happened to the integration settings or the roster since.
+            // THE FROZEN FILE FIRST - before the company time zone is even
+            // resolved. The day keys identifying a period are stable text, so
+            // finding its frozen row needs no zone at all; resolving one first
+            // put a live CompanySettings read in front of a download that is
+            // supposed to depend on nothing live (round 11, finding 3).
             const lastDayKey = addDaysToKey(range.endKey, -1);
             try {
                 const snapshot = await dependencies.loadSnapshot({
@@ -132,6 +131,12 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 throw error;
             }
 
+            // No frozen file for this exact range, so this is a LIVE export and
+            // everything below is allowed to depend on live state.
+            const timeZone = await dependencies.resolveTimeZone();
+            const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+            const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+
             let result: LoadedGustoExport;
             try {
                 // The SAME `timeZone` periodStart/periodEnd were just derived
@@ -160,6 +165,15 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 if (isNonStaffOnPayrollError(error)) {
                     return NextResponse.json(
                         { error: error.message, code: "NON_STAFF_ON_PAYROLL", userIds: error.userIds },
+                        { status: 409 }
+                    );
+                }
+                // A project or cost code this file prints was deleted or
+                // re-coded while the period was being read. Refusing beats
+                // freezing a CSV that disagrees with the database.
+                if (isLabelRowMissingError(error)) {
+                    return NextResponse.json(
+                        { error: error.message, code: "LABEL_ROW_MISSING", entryIds: error.entryIds },
                         { status: 409 }
                     );
                 }

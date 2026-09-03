@@ -42,6 +42,9 @@ const SAFE_KEYS = new Set([
     "periodStart",
     "periodEnd",
     "userIds",
+    // A list of TimeEntry IDS in a refusal body, not entries — structurally
+    // identical to `userIds` above (round 11, finding 2).
+    "entryIds",
     "id",
     "mealSkipStatus",
     "mealSkipDecidedAt",

@@ -250,3 +250,209 @@ test("outside a transaction the labels are NOT locked — a released lock would 
         await writer.$disconnect().catch(() => {});
     }
 });
+
+// ── A label row that is DELETED mid-lock refuses (round 11, finding 2) ───────
+//
+// Round 10 pinned the labels with FOR SHARE, which stops a RENAME. It did not
+// stop a DELETE. `TimeEntry_costCodeId_fkey` is ON DELETE SET NULL, so a cost
+// code deleted between the entry query and the moment the locks are taken
+// commits happily: the FOR SHARE then finds no row, and the `??` fallback
+// quietly reused the code the first query had joined — freezing a CSV that no
+// longer matched committed data.
+//
+// The interleave is staged for real, at the exact instant it matters: the
+// export runs against a PROXY of the transaction client whose
+// `timeEntry.findMany` commits the delete on a SECOND connection before it
+// returns. So the loader has read the entries, has not yet taken its label
+// locks, and the delete is already committed — which is the race, not a
+// simulation of it.
+
+/**
+ * The caller's transaction client, with ONE seam: the first `timeEntry.findMany`
+ * runs `between()` after the query and before handing the rows back.
+ *
+ * Everything else passes through bound to the real client — the loader issues
+ * raw SQL, settings reads and roster reads through it and all of them have to
+ * be the genuine article for this to be a test of the loader.
+ */
+function clientWithInterleave(tx: unknown, between: () => Promise<void>) {
+    let fired = false;
+    const target = tx as Record<string, unknown>;
+    return new Proxy(target, {
+        get(_t, prop, receiver) {
+            if (prop === "timeEntry") {
+                const real = target.timeEntry as { findMany: (args: unknown) => Promise<unknown> };
+                return new Proxy(real, {
+                    get(_r, method) {
+                        if (method !== "findMany") {
+                            const value = (real as Record<string, unknown>)[method as string];
+                            return typeof value === "function" ? value.bind(real) : value;
+                        }
+                        return async (args: unknown) => {
+                            const rows = await real.findMany(args);
+                            if (!fired) {
+                                fired = true;
+                                await between();
+                            }
+                            return rows;
+                        };
+                    },
+                });
+            }
+            const value = Reflect.get(target, prop, receiver);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    });
+}
+
+test("a cost code DELETED between the entry read and the lock REFUSES", { skip }, async () => {
+    const { loadGustoExport, isLabelRowMissingError } = await import("../src/lib/gusto-export-db");
+    const reader = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const deleter = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(reader, "ccdelete");
+
+    try {
+        // The control FIRST: this export is perfectly good, and it prints the
+        // cost code. Without it a later refusal proves nothing about deletion.
+        const before = await loadGustoExport(PERIOD_START, PERIOD_END, EXPORT_OPTIONS);
+        assert.ok(before.detailCsv.includes("01-ORIG"), "the cost code really is a column of this file");
+
+        await assert.rejects(
+            () =>
+                reader.$transaction(
+                    async (tx) => {
+                        const client = clientWithInterleave(tx, async () => {
+                            // Committed on ANOTHER connection, after the entries
+                            // were read and before the labels are locked. The FK
+                            // is ON DELETE SET NULL, so this succeeds and the
+                            // entry stops pointing at the code.
+                            await deleter.$executeRawUnsafe(
+                                `DELETE FROM "CostCode" WHERE "id" = $1`,
+                                seeded.costCodeId
+                            );
+                        });
+                        return loadGustoExport(PERIOD_START, PERIOD_END, {
+                            ...EXPORT_OPTIONS,
+                            client: client as never,
+                        });
+                    },
+                    { timeout: 30_000 }
+                ),
+            (error: Error) => isLabelRowMissingError(error) && /project or cost code/.test(error.message),
+            "a deleted label must refuse the lock, not freeze the stale code"
+        );
+
+        // THE PRE-FIX SHAPE, stated as a fact about the data: the code the old
+        // fallback would have frozen is not what the database says any more.
+        const after = await loadGustoExport(PERIOD_START, PERIOD_END, EXPORT_OPTIONS);
+        assert.ok(
+            !after.detailCsv.includes("01-ORIG"),
+            "committed state no longer has that code — freezing it would have been a lie"
+        );
+    } finally {
+        await seeded.restore();
+        await reader.$disconnect().catch(() => {});
+        await deleter.$disconnect().catch(() => {});
+    }
+});
+
+test("an entry RE-CODED between the two reads refuses too — it is not only deletion", { skip }, async () => {
+    // The guard compares the foreign keys, not just the existence of the rows,
+    // so a re-code lands in the same refusal. Same seam, a different write.
+    const { loadGustoExport, isLabelRowMissingError } = await import("../src/lib/gusto-export-db");
+    const reader = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(reader, "recode");
+    const otherId = "label-costcode-recode-other";
+
+    try {
+        await reader.$executeRawUnsafe(
+            `INSERT INTO "CostCode" ("id","code","name","updatedAt") VALUES ($1,'02-OTHER','Other',now())`,
+            otherId
+        );
+
+        await assert.rejects(
+            () =>
+                reader.$transaction(
+                    async (tx) => {
+                        const client = clientWithInterleave(tx, async () => {
+                            await writer.$executeRawUnsafe(
+                                `UPDATE "TimeEntry" SET "costCodeId" = $1 WHERE "id" = $2`,
+                                otherId,
+                                `label-entry-recode`
+                            );
+                        });
+                        return loadGustoExport(PERIOD_START, PERIOD_END, {
+                            ...EXPORT_OPTIONS,
+                            client: client as never,
+                        });
+                    },
+                    { timeout: 30_000 }
+                ),
+            (error: Error) => isLabelRowMissingError(error)
+        );
+    } finally {
+        await reader.$executeRawUnsafe(`DELETE FROM "CostCode" WHERE "id" = $1`, otherId).catch(() => {});
+        await seeded.restore();
+        await reader.$disconnect().catch(() => {});
+        await writer.$disconnect().catch(() => {});
+    }
+});
+
+test("an UNDISTURBED export still succeeds — the guard is not a blanket refusal", { skip }, async () => {
+    // THE CONTROL for both refusals above: the same transaction shape, the same
+    // seam, no concurrent write.
+    const { loadGustoExport } = await import("../src/lib/gusto-export-db");
+    const reader = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(reader, "undisturbed");
+
+    try {
+        const result = await reader.$transaction(async (tx) => {
+            const client = clientWithInterleave(tx, async () => {});
+            return loadGustoExport(PERIOD_START, PERIOD_END, { ...EXPORT_OPTIONS, client: client as never });
+        });
+        assert.ok(result.detailCsv.includes("01-ORIG"));
+        assert.ok(result.detailCsv.includes("ORIGINAL PROJECT"));
+    } finally {
+        await seeded.restore();
+        await reader.$disconnect().catch(() => {});
+    }
+});
+
+test("the FK actions this reasoning rests on are what the database actually has", { skip }, async () => {
+    // The refusal above is needed because costCodeId is ON DELETE SET NULL. The
+    // project side is claimed safe because projectId is RESTRICT — a claim about
+    // a constraint three files away, which is exactly the kind that stops being
+    // true quietly. Asserted against the live catalog instead.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        const rows = (await db.$queryRawUnsafe(
+            `SELECT conname, confdeltype::text AS action FROM pg_constraint
+              WHERE conname IN ('TimeEntry_costCodeId_fkey','TimeEntry_projectId_fkey') ORDER BY conname`
+        )) as Array<{ conname: string; action: string }>;
+        assert.deepEqual(rows, [
+            // 'n' = SET NULL: a deleted cost code detaches the punch, which is
+            // the whole reason the verify step exists.
+            { conname: "TimeEntry_costCodeId_fkey", action: "n" },
+            // 'r' = RESTRICT: a project with hours cannot be deleted at all.
+            { conname: "TimeEntry_projectId_fkey", action: "r" },
+        ]);
+    } finally {
+        await db.$disconnect().catch(() => {});
+    }
+});
+
+test("a project with hours CANNOT be deleted — the RESTRICT this relies on is real", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db, "projrestrict");
+    try {
+        await assert.rejects(
+            () => db.$executeRawUnsafe(`DELETE FROM "Project" WHERE "id" = $1`, seeded.projectId),
+            /foreign key|violates/i,
+            "so the project half of the label check can never be tripped by a delete"
+        );
+    } finally {
+        await seeded.restore();
+        await db.$disconnect().catch(() => {});
+    }
+});

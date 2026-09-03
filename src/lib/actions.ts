@@ -15734,10 +15734,16 @@ export async function lockPayrollPeriod(
             timeZone,
         });
     } catch (error: any) {
-        const { isLockedSnapshotMissingError, isNonStaffOnPayrollError } = await import("./gusto-export-db");
-        // Both are "there is no correct export for this period" — surfaced as a
-        // message rather than a thrown action, for the same reason.
-        if (isLockedSnapshotMissingError(error) || isNonStaffOnPayrollError(error)) {
+        const { isLabelRowMissingError, isLockedSnapshotMissingError, isNonStaffOnPayrollError } = await import(
+            "./gusto-export-db"
+        );
+        // All three are "there is no correct export for this period" — surfaced
+        // as a message rather than a thrown action, for the same reason.
+        if (
+            isLockedSnapshotMissingError(error) ||
+            isNonStaffOnPayrollError(error) ||
+            isLabelRowMissingError(error)
+        ) {
             return { success: false as const, error: error.message };
         }
         throw error;

@@ -27,6 +27,7 @@ import {
     validatePayrollRange,
 } from "@/lib/payroll-config";
 import {
+    isLabelRowMissingError,
     isLockedSnapshotMissingError,
     isNonStaffOnPayrollError,
     loadGustoExport,
@@ -109,6 +110,19 @@ export default async function PayrollExportPage({ searchParams }: Props) {
         // safe to render: the numbers on this page are what a human approves,
         // and showing live ones next to a lock badge invites approving a file
         // that no longer exists. Refuse, and say how to fix it.
+        if (isLabelRowMissingError(error)) {
+            // A label row moved underneath this render. Nothing here is stable
+            // enough to approve, and the fix is to look again.
+            return (
+                <div className="max-w-3xl mx-auto py-16 px-6 text-center space-y-3">
+                    <h1 className="text-xl font-bold text-hui-textMain">This period changed while it was loading</h1>
+                    <p className="text-sm text-hui-textMuted">{error.message}</p>
+                    <Link href="/manager/payroll-export" className="hui-btn hui-btn-primary text-sm">
+                        Try again
+                    </Link>
+                </div>
+            );
+        }
         if (isNonStaffOnPayrollError(error)) {
             // Same treatment as a broken lock: nothing on this page is safe to
             // render, because the numbers a human would approve are the numbers

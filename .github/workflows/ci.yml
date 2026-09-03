@@ -228,7 +228,14 @@ jobs:
       # inputs to the frozen hash - and neither row was held by anything, so a
       # rename could land between the export read and the lock COMMIT. Two real
       # connections, both renames, each with a pre-fix control.
-      - name: Prove a rename cannot land while a pay period is being frozen
+      #
+      # FOR SHARE holds off a rename, but not a DELETE that committed before it,
+      # and TimeEntry.costCodeId is ON DELETE SET NULL - so the export re-reads
+      # the entries' foreign keys under those locks and refuses if anything
+      # moved or went missing. Staged on two connections at the exact instant
+      # between the entry read and the locks, with the FK actions the reasoning
+      # rests on asserted against the live catalog.
+      - name: Prove a rename or a deletion cannot land while a period is frozen
         run: npx tsx --test tests/payroll-label-lock-db.test.ts
         env:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations

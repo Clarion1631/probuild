@@ -17,6 +17,8 @@ import {
 } from "../src/app/api/time-entries/export/gusto/route";
 import type { LoadedGustoExport } from "../src/lib/gusto-export-db";
 import type { BlockingEntry } from "../src/lib/gusto-export-core";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-gusto-export-route-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -362,4 +364,160 @@ test("a range that OVERLAPS a locked period without being it is a 409", async ()
     const body = await res.json();
     assert.equal(body.code, "OVERLAPS_LOCKED_PERIOD");
     assert.deepEqual(body.lockedPeriods, [{ periodStart: "2026-08-17", periodEnd: "2026-08-31" }]);
+});
+
+// -- The frozen file depends on NOTHING live (round 11, finding 3) -----------
+//
+// Round 10 moved the snapshot read in front of the export read, but left it
+// BEHIND the company-time-zone resolution, and loadLockedSnapshot itself went
+// through the shared period select, which joins the live `lockedBy` User row.
+// So downloading a file frozen months ago still began with a live
+// CompanySettings query and still read a live user.
+//
+// The day keys identifying a period are stable text. Finding its frozen row
+// needs no zone, no settings, no users. These cases prove that by making every
+// live dependency throw.
+
+const EXPLODE = () => {
+    throw new Error("live dependency must not be reached for a locked period");
+};
+
+/** The source of a file in the repo, with comments stripped. */
+function codeOf(...parts: string[]): string {
+    return readFileSync(path.join(__dirname, "..", ...parts), "utf8")
+        .split("\r\n")
+        .join("\n")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^[ \t]*\/\/.*$/gm, "");
+}
+
+test("a complete snapshot is served while EVERY live dependency throws", async () => {
+    let resolvedZone = 0;
+    let loadedLive = 0;
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => {
+            resolvedZone += 1;
+            return EXPLODE();
+        },
+        load: async () => {
+            loadedLive += 1;
+            return EXPLODE();
+        },
+        loadSnapshot: async () => ({ summaryCsv: "FROZEN-S", detailCsv: "FROZEN-D", exportHash: "frozen" }),
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-export-source"), "snapshot");
+    assert.equal(res.headers.get("x-export-hash"), "frozen");
+    assert.equal(await res.text(), "FROZEN-S");
+
+    // Not "it survived them" - it never asked.
+    assert.equal(resolvedZone, 0, "the company time zone is not resolved for a frozen download");
+    assert.equal(loadedLive, 0, "and neither are the settings, the entries or the roster");
+});
+
+test("the detail format comes off the same frozen row, with the same live deps dead", async () => {
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: EXPLODE,
+        load: EXPLODE,
+        loadSnapshot: async () => ({ summaryCsv: "FROZEN-S", detailCsv: "FROZEN-D", exportHash: "frozen" }),
+    });
+    const res = await handler.GET(url("periodStart=2026-08-17&periodEnd=2026-08-31&format=detail"));
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), "FROZEN-D");
+    assert.match(res.headers.get("content-disposition") ?? "", /gusto-detail-2026-08-17_to_2026-08-30\.csv/);
+});
+
+test("an INCOMPLETE snapshot is still 409 - and still never reaches live state", async () => {
+    const { LockedSnapshotMissingError } = await import("../src/lib/gusto-export-db");
+    let resolvedZone = 0;
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => {
+            resolvedZone += 1;
+            return EXPLODE();
+        },
+        load: EXPLODE,
+        loadSnapshot: async () => {
+            throw new LockedSnapshotMissingError("2026-08-17", "2026-08-31");
+        },
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 409);
+    const parsed = (await res.json()) as { code: string };
+    assert.equal(parsed.code, "LOCKED_SNAPSHOT_MISSING");
+    assert.equal(resolvedZone, 0, "failing closed does not mean falling through to live data");
+});
+
+test("with NO frozen row the live path runs exactly as before - the control", async () => {
+    // Without this, "the live path was not reached" above would pass just as
+    // well on a handler that never reaches it at all.
+    let resolvedZone = 0;
+    let loadedLive = 0;
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => {
+            resolvedZone += 1;
+            return "America/Los_Angeles";
+        },
+        load: async () => {
+            loadedLive += 1;
+            return loaded();
+        },
+        loadSnapshot: async () => null,
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-export-source"), "live");
+    assert.equal(resolvedZone, 1, "the zone is resolved exactly once, for a live export");
+    assert.equal(loadedLive, 1);
+});
+
+test("the snapshot query is snapshot-only - its own findUnique, no relations", () => {
+    // The behavioural cases above stub loadSnapshot; this pins what the REAL one
+    // reads. It used to call findPayrollPeriod, whose shared select joins the
+    // live `lockedBy` User row.
+    const source = codeOf("src", "lib", "gusto-export-db.ts");
+    const start = source.indexOf("export async function loadLockedSnapshot");
+    assert.ok(start > 0, "loadLockedSnapshot must still exist");
+    const rest = source.slice(start);
+    const body = rest.slice(0, rest.indexOf("\nexport "));
+
+    assert.match(body, /client\.payrollPeriod\.findUnique/, "its own query, not the shared period select");
+    assert.ok(!/findPayrollPeriod\s*\(/.test(body), "the shared select joins a live User row");
+    assert.ok(!/lockedBy/.test(body), "no relation of any kind");
+    assert.ok(!/include\s*:/.test(body), "and nothing included either");
+    // Every column it does read, named. A select that grows is a select that
+    // can quietly grow a relation.
+    const columns = body
+        .slice(body.indexOf("select: {"))
+        .split("\n")
+        .map((line) => /^\s+(\w+): true,$/.exec(line)?.[1])
+        .filter((name): name is string => Boolean(name))
+        .sort();
+    assert.deepEqual(columns, [
+        "detailCsvSnapshot",
+        "discardedAt",
+        "exportHash",
+        "lockedAt",
+        "summaryCsvSnapshot",
+    ]);
+});
+
+test("the route reads the frozen row BEFORE it resolves the time zone", () => {
+    // Source order, because the behavioural proof above rests on it and an edit
+    // that moved the zone resolution back up would not fail any assertion that
+    // only looks at a snapshot response.
+    const source = codeOf("src", "app", "api", "time-entries", "export", "gusto", "route.ts");
+    const validate = source.indexOf("const range = validatePayrollRange");
+    const snapshot = source.indexOf("dependencies.loadSnapshot(");
+    const zone = source.indexOf("await dependencies.resolveTimeZone()");
+    assert.ok(validate > 0 && snapshot > 0 && zone > 0);
+    assert.ok(validate < snapshot, "the range is validated first - the keys have to be real");
+    assert.ok(snapshot < zone, "and the frozen row is read before any live state");
 });
