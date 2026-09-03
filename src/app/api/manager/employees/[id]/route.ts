@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
-import { withPayrollUserWrite } from "@/lib/payroll-period";
+import { touchesPayrollRateState, withPayrollUserWrite } from "@/lib/payroll-period";
 import {
     isUserMutationRefusedError,
     isUserMutationTargetNotFoundError,
@@ -41,8 +41,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const data: Record<string, unknown> = {};
     if (typeof body.role === "string") data.role = body.role;
     if (typeof body.status === "string") data.status = body.status;
-    const touchesRates =
-        body.hourlyRate !== undefined || body.burdenRate !== undefined || body.payType !== undefined;
+    // ONE rate payload, handed BOTH to the guard (which uses it to decide that
+    // the payroll advisory lock must be taken before the target row lock) and to
+    // the rate writer itself, and asked with the SAME predicate the writer uses.
+    const rateChange = { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType };
+    const touchesRates = touchesPayrollRateState(rateChange);
     if (Object.keys(data).length === 0 && !touchesRates) {
         return NextResponse.json({ error: "No mutable fields supplied" }, { status: 400 });
     }
@@ -71,14 +74,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     targetId: id,
                     changes: { role: body.role, status: body.status },
                     data,
+                    rateChange,
                 },
                 async () => {
-                    const rateResult = await applyRateChangeInTx(
-                        tx,
-                        rateActor,
-                        id,
-                        { hourlyRate: body.hourlyRate, burdenRate: body.burdenRate, payType: body.payType }
-                    );
+                    const rateResult = await applyRateChangeInTx(tx, rateActor, id, rateChange);
                     if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
 
                     if (Object.keys(data).length === 0) {

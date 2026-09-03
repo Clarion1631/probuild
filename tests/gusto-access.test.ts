@@ -86,7 +86,49 @@ test("Gusto employee ids are bounded and shape-checked", async () => {
 test("an empty map needs no database round trip and is accepted", async () => {
     // Clearing every mapping is legitimate, and must not require a user lookup.
     const result = await validateEmployeeMappings({});
-    assert.deepEqual(result, { ok: true, mappings: {} });
+    assert.equal(result.ok, true);
+    const mappings = (result as { mappings: Record<string, string> }).mappings;
+    assert.deepEqual(Object.keys(mappings), []);
+    // NULL prototype — see the __proto__ case below. deepEqual is
+    // prototype-aware, so this cannot be written as `{ ok: true, mappings: {} }`.
+    assert.equal(Object.getPrototypeOf(mappings), null);
+});
+
+test("a __proto__ key is REFUSED — it used to wipe every mapping", async () => {
+    // THE BUG (round 13, finding 3). `mappings[userId] = gustoId` on a `{}`
+    // literal with userId === "__proto__" hits the inherited SETTER instead of
+    // creating a property. Object.keys is then empty, the duplicate scan sees
+    // nothing, the "are these real user ids" lookup is skipped because there are
+    // no ids, and the route saves `employeeMappings: {}` — clearing the map that
+    // decides whose hours are filed under which Gusto employee, and answering
+    // `{ success: true }` while doing it.
+    //
+    // JSON.parse, not an object literal: a literal `{ __proto__: ... }` sets the
+    // prototype at parse time, which is a different thing entirely and would not
+    // reproduce the bug.
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+        const payload = JSON.parse(`{"${key}": "attacker-gusto-id"}`);
+        const result = await validateEmployeeMappings(payload);
+        assert.equal(result.ok, false, key);
+        assert.ok((result as { error: string }).error.includes(key), key);
+    }
+
+    // A payload that is an object but NOT a plain one is refused too, so a
+    // crafted prototype cannot ride in on the container itself.
+    const exotic = Object.create({ inherited: "x" });
+    exotic["u1"] = "GUSTO-1";
+    assert.equal((await validateEmployeeMappings(exotic)).ok, false);
+});
+
+test("a well-formed map gets PAST the shape check — the control", async () => {
+    // Without this the refusals above could be a validator that says no to
+    // everything. Two members mapped to the same Gusto id is caught by the
+    // DUPLICATE scan, which runs only after every key and value has been
+    // accepted — so reaching that message proves ordinary keys still pass. (It
+    // also needs no database, unlike the real-user-ids lookup after it.)
+    const result = await validateEmployeeMappings({ u1: "GUSTO-1", u2: "GUSTO-1" });
+    assert.equal(result.ok, false);
+    assert.match((result as { error: string }).error, /same Gusto employee/);
 });
 
 test("mapping keys are validated against real users", () => {

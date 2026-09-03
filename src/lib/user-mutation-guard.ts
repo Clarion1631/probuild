@@ -208,10 +208,20 @@ export function isUserMutationTargetNotFoundError(error: unknown): error is User
  * transaction never actually saw.
  *
  * Order, inside the caller's transaction:
- *   1. If `data` names an export-affecting column (see touchesExportUserState
- *      in payroll-period.ts), the tier-1 payroll advisory lock — same rule
+ *   1. If ANY PART of this request will take the payroll advisory lock, take it
+ *      HERE, first — the tier-1 lock, before any row lock, same rule
  *      withPayrollUserWrite already applies, kept here so a caller does not
  *      have to remember to call both.
+ *
+ *      "Any part" is the whole request, not just `data`: the rate fields travel
+ *      SEPARATELY to applyRateChangeInTx, which takes the same lock itself. This
+ *      used to ask only about `data`, so a rate-only edit (whose `data` names no
+ *      export column at all) fell through to the row lock below and THEN waited
+ *      for the payroll lock inside the rate writer — while lockPayrollPeriod
+ *      held that lock and waited FOR SHARE on the very row this transaction was
+ *      holding. A textbook inversion, and a real deadlock (round 13, finding 1).
+ *      `takesPayrollWriteLock` answers for both halves at once, so tier 1 is
+ *      always taken before tier 2.
  *   2. `SELECT "role" FROM "User" WHERE "id" = $1 FOR UPDATE` — unconditional.
  *      Even a permissions-only write re-checks under this lock: the race here
  *      is about AUTHORITY, not about payroll, so it applies regardless of
@@ -222,9 +232,15 @@ export function isUserMutationTargetNotFoundError(error: unknown): error is User
  *      so nothing after the check can commit outside the lock's protection.
  *
  * `data` is the raw payload about to be written to the row, or omitted for a
- * write with no column payload of its own (DELETE). It decides ONLY whether
- * the payroll lock is taken first — never whether the row lock or the
- * authority check run, both of which are unconditional.
+ * write with no column payload of its own (DELETE). `rateChange` is the payload
+ * the caller is about to hand applyRateChangeInTx, or omitted when it will not
+ * call it. Together they decide ONLY whether the payroll lock is taken first —
+ * never whether the row lock or the authority check run, both of which are
+ * unconditional.
+ *
+ * Pass the SAME rate object the closure hands to applyRateChangeInTx. Building
+ * a second one here would be a second answer to "does this request write
+ * rates", which is the shape of the bug this parameter exists to fix.
  */
 export async function withGuardedUserMutation<T>(
     tx: GuardedUserMutationClient,
@@ -233,11 +249,14 @@ export async function withGuardedUserMutation<T>(
         targetId: string;
         changes: UserMutationChanges;
         data?: unknown;
+        rateChange?: unknown;
     },
     write: (target: UserMutationTarget) => Promise<T>
 ): Promise<T> {
-    const { touchesExportUserState, acquirePayrollWriteLock } = await import("./payroll-period");
-    if (input.data !== undefined && touchesExportUserState(input.data)) {
+    const { takesPayrollWriteLock, acquirePayrollWriteLock } = await import("./payroll-period");
+    // TIER 1, unconditionally before the row lock below when it is needed at
+    // all — never after it, and never decided from half the request.
+    if (takesPayrollWriteLock({ data: input.data, rateChange: input.rateChange })) {
         await acquirePayrollWriteLock(tx);
     }
 

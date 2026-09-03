@@ -52,6 +52,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The payroll advisory-lock key, byte-for-byte the string
+ * PAYROLL_ADVISORY_LOCK_KEY holds in src/lib/payroll-period.ts.
+ *
+ * It cannot be imported (this is a plain .mjs run by node against production,
+ * with no TypeScript loader), so it is duplicated here and asserted equal by
+ * tests/payroll-apply-script-parity.test.ts. A DIFFERENT string is not a
+ * different lock that fails loudly — it is a lock that serialises against
+ * nothing, which is exactly the failure mode this key exists to prevent.
+ */
+const PAYROLL_ADVISORY_LOCK_KEY = "payroll-period";
 /** The schema every object below is expected to live in. Same-named objects elsewhere are NOT this object. */
 export const EXPECTED_SCHEMA = "public";
 
@@ -819,6 +831,23 @@ async function main() {
         // RAW span, deduct a meal it never owed, and reprice it at the member's
         // current rate. The readers were fixed instead.
 
+        // ----------------------------------------------------------------------
+        // Round-32 gate: lastRateSyncAt reverts to meaning "a rate was actually
+        // CONFIRMED" (a pay-type-only write must not move it), which reopens the
+        // replay hole it used to close for a concurrent pay-type-only change.
+        // payrollRevision is a plain monotonic counter, bumped on EVERY
+        // payroll-affecting write regardless of which fields it touches, and the
+        // rate-import signature is keyed on it instead.
+        //
+        // ADDED HERE, BEFORE THE SEED. It used to be added ~130 lines further
+        // down, which meant the payType seed below could not have bumped it even
+        // if it had wanted to — the column did not exist yet (round 13,
+        // finding 4).
+        // ----------------------------------------------------------------------
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0`
+        );
+
         // User.payType is left NULL for anyone nobody has confirmed.
         //
         // An earlier revision also stamped every ACTIVATED crew member and manager
@@ -839,16 +868,44 @@ async function main() {
         // aimed the other way: a migration script deciding, on nobody's authority,
         // that two specific humans are salaried. If either had actually been hourly
         // the export would have silently dropped their hours. No env var, no seed.
+
         const salaried = classifySalariedEmails(process.env.PAYROLL_SALARIED_EMAILS);
         if (!salaried.length) {
             console.log(
                 "PAYROLL_SALARIED_EMAILS is not set — no payType is being seeded. Everyone stays NULL until a human answers on Company -> Team Members."
             );
         } else {
-            const seededSalary = await prisma.$executeRawUnsafe(
-                `UPDATE "User" SET "payType" = 'SALARY' WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,
-                salaried
-            );
+            // THE SAME PROTOCOL EVERY OTHER payType WRITER FOLLOWS.
+            //
+            // This is a payType write, and payType is half the Gusto roster
+            // predicate — so it can move what a pay period contains. It used to
+            // run as a bare UPDATE on the pooled connection: no payroll advisory
+            // lock, so it could commit between lockPayrollPeriod's roster read
+            // and its COMMIT and freeze a period around a roster that had already
+            // changed; and no payrollRevision bump, so a rate-import approval
+            // signed before the seed still verified afterwards (round 13,
+            // finding 4).
+            //
+            // One transaction: the SHARED advisory lock on the same key
+            // acquirePayrollWriteLock uses (src/lib/payroll-period.ts) — shared
+            // because seeding does not conflict with another rate writer, only
+            // with a period being locked — then the update, which bumps
+            // payrollRevision for every row it actually changes.
+            //
+            // Still idempotent: `payType IS NULL` matches nothing on a second
+            // run, so no row is touched and no revision moves.
+            const seededSalary = await prisma.$transaction(async (tx) => {
+                await tx.$executeRawUnsafe(
+                    `SELECT pg_advisory_xact_lock_shared(hashtext($1))`,
+                    PAYROLL_ADVISORY_LOCK_KEY
+                );
+                return tx.$executeRawUnsafe(
+                    `UPDATE "User"
+                        SET "payType" = 'SALARY', "payrollRevision" = "payrollRevision" + 1
+                      WHERE "payType" IS NULL AND lower("email") = ANY($1::text[])`,
+                    salaried
+                );
+            });
             console.log(`seeded ${seededSalary} user(s) to payType = SALARY from PAYROLL_SALARIED_EMAILS`);
         }
         const unconfirmed = await prisma.$queryRawUnsafe(
@@ -964,18 +1021,6 @@ async function main() {
         );
         await prisma.$executeRawUnsafe(
             `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_locked_snapshot_complete"`
-        );
-
-        // ----------------------------------------------------------------------
-        // Round-32 gate: lastRateSyncAt reverts to meaning "a rate was actually
-        // CONFIRMED" (a pay-type-only write must not move it), which reopens the
-        // replay hole it used to close for a concurrent pay-type-only change.
-        // payrollRevision is a plain monotonic counter, bumped on EVERY
-        // payroll-affecting write regardless of which fields it touches, and the
-        // rate-import signature is keyed on it instead.
-        // ----------------------------------------------------------------------
-        await prisma.$executeRawUnsafe(
-            `ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0`
         );
 
         // ONE verification, against the SAME list the dry run reports on.

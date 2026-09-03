@@ -365,6 +365,50 @@ test("PUT: a manager may still disable a crew member — ordinary work is unaffe
     assert.equal(USERS["u-crew"].status, "DISABLED");
 });
 
+// ---------------------------------------------------------------------------
+// A RATE-ONLY save is a save (round 13, finding 2)
+// ---------------------------------------------------------------------------
+
+test("PUT: a rate-only body WRITES — it used to be a silent 200 that changed nothing", async () => {
+    // THE BUG. The condition guarding the whole transaction asked only about
+    // `data` (name/role/status/pinCode) and the permission patch. A body of
+    // `{ userInfo: { hourlyRate } }` produces an EMPTY `data` and no
+    // permissions, so the transaction never opened: the route fell straight
+    // through to "fetch updated user" and answered 200 with the OLD rate. The
+    // Team page showed a successful save and payroll kept paying the old
+    // number.
+    resetDb();
+    sessionEmail = "admin@example.test";
+    const res = await PUT(...request("u-crew", { userInfo: { hourlyRate: "31.50" } }));
+    assert.equal(res.status, 200);
+
+    const rateWrite = userWrites.find((write) => "hourlyRate" in write);
+    assert.ok(rateWrite, "the rate never reached a writer — this is the no-op bug");
+    assert.equal(String(rateWrite!.hourlyRate), "31.5");
+    // Through the ONE rate path, so its side effects come with it.
+    assert.ok("lastRateSyncAt" in rateWrite!, "the confirmation stamp is part of a rate write");
+    assert.deepEqual(rateWrite!.payrollRevision, { increment: 1 });
+});
+
+test("PUT: a payType-only body writes too, and an EMPTY body still writes nothing", async () => {
+    resetDb();
+    sessionEmail = "admin@example.test";
+    const payType = await PUT(...request("u-crew", { userInfo: { payType: "HOURLY" } }));
+    assert.equal(payType.status, 200);
+    assert.ok(
+        userWrites.some((write) => write.payType === "HOURLY"),
+        "payType is half the Gusto roster predicate — a save that drops it is not a save"
+    );
+
+    // THE CONTROL. Widening the condition must not turn every PUT into a write:
+    // a body with nothing mutable in it still opens no transaction.
+    resetDb();
+    const empty = await PUT(...request("u-crew", { userInfo: {} }));
+    assert.equal(empty.status, 200);
+    assert.deepEqual(userWrites, [], "an empty save is still a no-op");
+    assert.deepEqual(permissionWrites, []);
+});
+
 test("every user-mutating writer routes through the shared guard", () => {
     // The pure tests above prove the RULES; this proves they are the ones every
     // surface asks. A route that grows its own copy is how the four disagreed in
@@ -404,4 +448,39 @@ test("every user-mutating writer routes through the shared guard", () => {
     assert.ok(!/VALID_ROLES/.test(manager), "the local enum set was replaced by the shared one");
     const users = readFileSync(path.join(SRC, "app/api/users/[id]/route.ts"), "utf8");
     assert.ok(!/ALLOWED_PERMISSION_FIELDS/.test(users), "the local permission list was replaced by the shared one");
+});
+
+test("every guarded route hands the guard its RATE payload, and hands the SAME one to the writer", () => {
+    // The guard decides the LOCK ORDER — payroll advisory lock before the target
+    // row — and it can only decide it from what it is told. A route that passes
+    // `data` but not `rateChange` puts the rate writer's own
+    // acquirePayrollWriteLock AFTER a row lock this transaction is already
+    // holding, which is a deadlock against period creation (round 13,
+    // finding 1). tests/payroll-lock-order-db.test.ts proves that on real
+    // connections; this proves no route can quietly stop reporting.
+    const SRC = path.join(__dirname, "..", "src");
+    for (const file of [
+        "app/api/users/[id]/route.ts",
+        "app/api/users/route.ts",
+        "app/api/manager/employees/[id]/route.ts",
+    ] as const) {
+        const source = readFileSync(path.join(SRC, file), "utf8");
+        const call = source.slice(source.indexOf("withGuardedUserMutation("));
+        const input = call.slice(0, call.indexOf("async ("));
+        assert.match(input, /\brateChange,/, `${file} must tell the guard about the rate payload`);
+
+        // ONE object, built once and used twice. A route that built a second
+        // literal for applyRateChangeInTx could answer "does this write rates"
+        // differently in the two places, which is the same bug with an extra
+        // step.
+        assert.match(
+            source,
+            /applyRateChangeInTx\((\s|\/\/[^\n]*\n)*tx( as never)?,[\s\S]{0,120}?rateChange\s*\)/,
+            `${file} must hand the writer the SAME rateChange it handed the guard`
+        );
+        assert.ok(
+            !/applyRateChangeInTx\([\s\S]{0,200}?\{\s*(hourlyRate|burdenRate|payType)\s*:/.test(source),
+            `${file} must not build a second rate literal at the call site`
+        );
+    }
 });

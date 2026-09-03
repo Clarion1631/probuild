@@ -16,7 +16,7 @@
 // mapping write and the export can never disagree about who may act.
 
 import { NextResponse } from "next/server";
-import { canAccessIntegrations, requireIntegrationAccess } from "./integration-access";
+import { canAccessIntegrations, requireIntegrationAccess, validateStringMap } from "./integration-access";
 
 export type GustoViewer = { id: string; role: string };
 
@@ -64,6 +64,12 @@ export type MappingValidation =
     | { ok: true; mappings: Record<string, string> }
     | { ok: false; error: string };
 
+/** The Gusto id charset: word characters and dashes, or empty to CLEAR a mapping. */
+const GUSTO_ID = /^[\w-]*$/;
+
+/** Bounds for the map itself. Values are Gusto ids, which are short. */
+const GUSTO_MAPPING_LIMITS = { maxKeys: 500, maxKeyLength: 128, maxValueLength: 64 };
+
 /**
  * Validate an employeeMappings payload.
  *
@@ -72,19 +78,28 @@ export type MappingValidation =
  * either a typo that silently does nothing or an attempt to plant a mapping for
  * an id that does not exist yet. Values are opaque Gusto ids — bounded, but not
  * something this side can verify.
+ *
+ * THE PROTOTYPE HOLE (round 13, finding 3). This used to hand-roll its own
+ * object check and then copy every key straight into a `{}` literal. A body of
+ * `{"__proto__": "..."}` therefore hit the prototype SETTER instead of creating
+ * a property: `Object.keys` came back empty, the duplicate scan saw nothing, the
+ * "are these real users" lookup was skipped because there were no ids, and the
+ * route cheerfully saved `employeeMappings: {}` — WIPING every mapping in the
+ * integration record. Nothing errored and the caller got `{ success: true }`.
+ *
+ * The check is now the same hardened one the QuickBooks GL-mapping route uses
+ * (validateStringMap: plain-object prototype, forbidden keys, bounded key and
+ * value lengths, result built on a null prototype), with only the Gusto-specific
+ * id charset layered on top. One validator, so the two integration surfaces
+ * cannot drift apart on what a safe key is.
  */
 export async function validateEmployeeMappings(raw: unknown): Promise<MappingValidation> {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-        return { ok: false, error: "employeeMappings must be an object" };
-    }
-    const entries = Object.entries(raw as Record<string, unknown>);
-    if (entries.length > 500) {
-        return { ok: false, error: "Too many mappings." };
-    }
+    const base = validateStringMap(raw, "employeeMappings", GUSTO_MAPPING_LIMITS);
+    if (!base.ok) return { ok: false, error: base.error };
 
-    const mappings: Record<string, string> = {};
-    for (const [userId, gustoId] of entries) {
-        if (typeof gustoId !== "string" || gustoId.length > 64 || !/^[\w-]*$/.test(gustoId)) {
+    const mappings: Record<string, string> = Object.create(null);
+    for (const [userId, gustoId] of Object.entries(base.map)) {
+        if (!GUSTO_ID.test(gustoId)) {
             return { ok: false, error: `"${userId}" has an invalid Gusto employee id.` };
         }
         // An empty value is how the UI clears a mapping.

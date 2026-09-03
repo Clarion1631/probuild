@@ -206,6 +206,13 @@ export async function PATCH(req: Request) {
         if (status !== undefined) data.status = status;
         if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
 
+        // ONE rate payload, handed BOTH to the guard (which uses it to decide
+        // that the payroll advisory lock must be taken before the target row
+        // lock) and to the rate writer itself. Two copies would be two answers
+        // to "does this request write rates", which is exactly how the lock
+        // order came to be inverted for a rate-only edit (round 13, finding 1).
+        const rateChange = { hourlyRate, burdenRate, payType: body.payType };
+
         // Rates through the one validated path, in the same transaction as the
         // rest of the patch — this route used to write them as raw JS numbers
         // with no permission check and no lastRateSyncAt stamp.
@@ -227,14 +234,10 @@ export async function PATCH(req: Request) {
                         targetId: id,
                         changes: { role, status },
                         data,
+                        rateChange,
                     },
                     async () => {
-                        const rateResult = await applyRateChangeInTx(
-                            tx,
-                            currentUser,
-                            id,
-                            { hourlyRate, burdenRate, payType: body.payType }
-                        );
+                        const rateResult = await applyRateChangeInTx(tx, currentUser, id, rateChange);
                         if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                         // status and name are EXPORT INPUTS — activating somebody
                         // adds them to the Gusto roster, and their name is printed in

@@ -89,7 +89,10 @@ export function validateStringMap(
     if (entries.length > limits.maxKeys) {
         return { ok: false, error: `${label} has too many entries (max ${limits.maxKeys}).` };
     }
-    const map: Record<string, string> = {};
+    // NULL-PROTOTYPE. The forbidden-key check below is the actual guarantee;
+    // this is the belt to its braces, so a key nobody thought of cannot reach a
+    // setter that a `{}` literal inherits.
+    const map: Record<string, string> = Object.create(null);
     for (const [key, entry] of entries) {
         if (FORBIDDEN_KEYS.has(key)) {
             return { ok: false, error: `${label} may not contain the key ${key}.` };

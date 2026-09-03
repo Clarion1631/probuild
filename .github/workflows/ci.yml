@@ -256,6 +256,25 @@ jobs:
         env:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # THE GLOBAL LOCK ORDER: payroll advisory lock, then the User row. The
+      # guard decided whether to take the advisory lock from the Prisma `data`
+      # payload alone, but the rate fields travel separately to the rate writer,
+      # which takes the same lock itself — so a rate-only edit took the ROW
+      # first and asked for the lock second, and deadlocked against a period
+      # being locked. One predicate now answers for the whole request. Real
+      # connections, both orders, an interleave staged at the exact instant the
+      # old code deadlocked, and the inverted sequence written out beside it
+      # showing PostgreSQL really does report 40P01. The same step covers the
+      # apply script's payType seed, which now takes the shared lock and bumps
+      # payrollRevision only for rows it actually changes.
+      - name: Prove a rate edit and a period lock cannot invert the lock order
+        run: npx tsx --test tests/payroll-lock-order-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

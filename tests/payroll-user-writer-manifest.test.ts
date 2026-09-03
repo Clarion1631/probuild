@@ -80,15 +80,15 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: string }> = {
     // ---- activation and profile edits: the round-34 hole --------------------
-    "app/api/users/[id]/route.ts:170::update": {
+    "app/api/users/[id]/route.ts:189::update": {
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
-    "app/api/users/route.ts:245::update": {
+    "app/api/users/route.ts:248::update": {
         kind: "wrapped",
         why: "PATCH /api/users writes name/role/status — the same payload, for the same reason",
     },
-    "app/api/manager/employees/[id]/route.ts:97::update": {
+    "app/api/manager/employees/[id]/route.ts:96::update": {
         kind: "wrapped",
         why: "the mobile manager screen can activate or disable somebody, which moves them on and off the roster",
     },
@@ -106,19 +106,19 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
     },
 
     // ---- already-guarded payroll writers ------------------------------------
-    "lib/pay-rate-write.ts:192::update": {
+    "lib/pay-rate-write.ts:201::update": {
         kind: "guarded",
         why: "THE rate/payType writer — takes acquirePayrollWriteLock and then the owner row lock, in the global order",
     },
-    "lib/actions.ts:15536::updateMany": {
+    "lib/actions.ts:15560::updateMany": {
         kind: "guarded",
         why: "applyGustoRateImport, inside a transaction that takes acquirePayrollWriteLock before any row lock",
     },
-    "lib/actions.ts:15623::updateMany": {
+    "lib/actions.ts:15647::updateMany": {
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
-    "app/api/users/[id]/route.ts:318::delete": {
+    "app/api/users/[id]/route.ts:337::delete": {
         kind: "guarded",
         why: "runs through deleteParentWithTimeEntries, which takes acquirePayrollWriteLock and refuses while any of the member's hours sit in a locked period",
     },
@@ -132,7 +132,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "a CLIENT-role portal account: no payType, and User.status defaults to PENDING, so it cannot be on an hourly roster and it has no punches",
     },
-    "app/api/users/[id]/route.ts:236::update": {
+    "app/api/users/[id]/route.ts:255::update": {
         kind: "exempt",
         why: "connect/disconnect on assignedProjects only — dispatch crew assignment reaches no column the export reads",
     },
@@ -140,11 +140,11 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "connects In-Progress projects to a just-activated member; it touches assignedProjects and nothing else",
     },
-    "lib/actions.ts:7785::update": {
+    "lib/actions.ts:7809::update": {
         kind: "exempt",
         why: "markFieldUpdatesSeen writes fieldUpdatesSeenAt, a per-user UI timestamp that reaches no export",
     },
-    "lib/actions.ts:15204::update": {
+    "lib/actions.ts:15228::update": {
         kind: "exempt",
         why: "the WA meal-waiver signature stamp — it changes what settlement owes, which is a TimeEntry write, not a roster or CSV column",
     },

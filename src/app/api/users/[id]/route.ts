@@ -6,7 +6,12 @@ import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { deleteParentWithTimeEntries, isTimeEntriesExistError } from "@/lib/payroll-parent-delete";
-import { isPeriodLockedError, periodLockedResponse, withPayrollUserWrite } from "@/lib/payroll-period";
+import {
+    isPeriodLockedError,
+    periodLockedResponse,
+    touchesPayrollRateState,
+    withPayrollUserWrite,
+} from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
 import {
     ASSIGNABLE_PERMISSIONS,
@@ -117,7 +122,29 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         }
         if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
 
-        if (Object.keys(data).length > 0 || Object.keys(sanitizedPermissions).length > 0) {
+        // ONE rate payload, built here and used TWICE: to decide whether this
+        // request runs at all, and to decide (inside the guard) that the
+        // payroll advisory lock has to be taken before the target row. Building
+        // a second copy at either site would be a second answer to "does this
+        // request write rates".
+        const rateChange = userInfo
+            ? {
+                  hourlyRate: userInfo.hourlyRate,
+                  burdenRate: userInfo.burdenRate,
+                  payType: userInfo.payType,
+              }
+            : undefined;
+
+        // A RATE-ONLY body used to fall straight through this condition: `data`
+        // is empty for it and there are no permissions, so the transaction never
+        // opened and the route answered 200 with the values unchanged — the save
+        // silently did nothing (round 13, finding 2). The same predicate the
+        // rate writer itself uses now decides it.
+        if (
+            Object.keys(data).length > 0 ||
+            Object.keys(sanitizedPermissions).length > 0 ||
+            touchesPayrollRateState(rateChange)
+        ) {
             try {
                 await prisma.$transaction(async (tx) => {
                     await withGuardedUserMutation(
@@ -131,19 +158,11 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                                 permissions: requestedPermissions,
                             },
                             data,
+                            rateChange,
                         },
                         async (target) => {
-                            if (userInfo) {
-                                const rateResult = await applyRateChangeInTx(
-                                    tx,
-                                    currentUser,
-                                    id,
-                                    {
-                                        hourlyRate: userInfo.hourlyRate,
-                                        burdenRate: userInfo.burdenRate,
-                                        payType: userInfo.payType,
-                                    }
-                                );
+                            if (rateChange) {
+                                const rateResult = await applyRateChangeInTx(tx, currentUser, id, rateChange);
                                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                                 // Rates are NOT written here — applyRateChange
                                 // above owns them (payroll permission, exact

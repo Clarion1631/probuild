@@ -17,7 +17,7 @@ import { hasPermission } from "./access-rules";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
 import { isKnownPayType, lockOwnerRowForUpdate } from "./pay-rate-guard";
 import { isPayrollEligibleRole } from "./payroll-config";
-import { acquirePayrollWriteLock } from "./payroll-period";
+import { acquirePayrollWriteLock, touchesPayrollRateState } from "./payroll-period";
 
 export type RateActor = { role: string; permissions?: unknown } | null | undefined;
 
@@ -85,10 +85,16 @@ export type RateWriteTx = {
     $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
 };
 
-/** Does this payload touch payroll at all? Both entry points ask, so they cannot disagree. */
-function touchesPayroll(change: RateChange): boolean {
-    return change.hourlyRate !== undefined || change.burdenRate !== undefined || change.payType !== undefined;
-}
+/**
+ * Does this payload touch payroll at all?
+ *
+ * ONE definition, in payroll-period.ts beside the lock it decides. Both entry
+ * points below ask it, and so does withGuardedUserMutation when it decides
+ * whether the payroll advisory lock has to be taken BEFORE the target row lock
+ * — a question that used to be answered from the other half of the request and
+ * inverted the lock order for a rate-only edit (round 13, finding 1).
+ */
+const touchesPayroll = (change: RateChange): boolean => touchesPayrollRateState(change);
 
 export async function applyRateChangeInTx(
     tx: RateWriteTx,
@@ -98,7 +104,10 @@ export async function applyRateChangeInTx(
 ): Promise<RateWriteResult> {
     const touchesRates = change.hourlyRate !== undefined || change.burdenRate !== undefined;
     const touchesPayType = change.payType !== undefined;
-    if (!touchesRates && !touchesPayType) return { ok: true, changed: false };
+    // The same predicate the guard uses to decide the lock ORDER, so "this
+    // request writes rates" and "this request takes the payroll lock" can never
+    // be two different answers.
+    if (!touchesPayroll(change)) return { ok: true, changed: false };
 
     if (!canWriteRates(actor)) {
         return { ok: false, status: 403, error: "Payroll access is required to change pay rates." };

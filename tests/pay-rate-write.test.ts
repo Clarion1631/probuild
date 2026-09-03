@@ -238,7 +238,11 @@ test("no call site casts its tx away any more", () => {
         // `tx as never` is what let the wrong function be called for a whole
         // round without tsc noticing.
         assert.doesNotMatch(source, /tx as never/, file);
-        assert.match(source, /applyRateChangeInTx\(\s*\n\s*tx,/, file);
+        // The real `tx` is the first argument. Not anchored to a line break any
+        // more: the three call sites now pass one prebuilt `rateChange` object
+        // and fit on one line (round 13, finding 1), and formatting is not what
+        // this is guarding.
+        assert.match(source, /applyRateChangeInTx\(\s*tx,/, file);
         assert.doesNotMatch(source, /\bapplyRateChange\(/, `${file}: routes use the InTx variant`);
     }
 });

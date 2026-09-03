@@ -168,7 +168,70 @@ test("--dry-run is read-only for the WHOLE script, not just the seed", async () 
     const seed = main.slice(main.indexOf("const salaried = classifySalariedEmails"));
     const body = seed.slice(0, seed.indexOf("const unconfirmed"));
     assert.doesNotMatch(body, /dryRun/, "dead branches rot into false assurance");
-    assert.match(body, /UPDATE "User" SET "payType" = 'SALARY'/);
+    assert.match(body, /UPDATE "User"[\s\S]*?SET "payType" = 'SALARY'/);
+});
+
+test("the payType seed follows the payroll write protocol, like every other payType writer", async () => {
+    // THE HOLE (round 13, finding 4). This is a payType write, and payType is
+    // half the Gusto roster predicate — so it can change what a pay period
+    // contains. It ran as a bare UPDATE on the pooled connection: no payroll
+    // advisory lock, so it could commit between lockPayrollPeriod's roster read
+    // and its COMMIT; and no payrollRevision bump, so a rate-import approval
+    // signed before the seed still verified afterwards.
+    const script = read(SCRIPT);
+    const main = script.slice(script.indexOf("async function main()"));
+    const seed = main.slice(main.indexOf("const salaried = classifySalariedEmails"));
+    const body = seed.slice(0, seed.indexOf("const unconfirmed"));
+
+    // ONE transaction, and the lock is taken INSIDE it — pg_advisory_xact_lock*
+    // releases at COMMIT, so taking it outside one would release immediately and
+    // guarantee nothing.
+    assert.match(body, /\$transaction\(/, "the seed must run in a transaction");
+    assert.match(body, /pg_advisory_xact_lock_shared\(hashtext\(\$1\)\)/);
+    assert.ok(
+        body.indexOf("pg_advisory_xact_lock_shared") < body.indexOf(`UPDATE "User"`),
+        "the lock is taken BEFORE the write, not after it"
+    );
+    // SHARED, matching acquirePayrollWriteLock: seeding conflicts with a period
+    // being locked, not with another rate writer.
+    assert.doesNotMatch(body, /pg_advisory_xact_lock\(/, "an exclusive lock here would be the wrong tier");
+
+    // Every row it changes moves the counter.
+    assert.match(body, /"payrollRevision" = "payrollRevision" \+ 1/);
+    // And it stays idempotent: a second run matches no rows, so no revision
+    // moves either.
+    assert.match(body, /WHERE "payType" IS NULL/);
+});
+
+test("the script's advisory key is BYTE-FOR-BYTE the application's", async () => {
+    // The script is plain .mjs run by node against production; it cannot import
+    // the TypeScript constant, so the string is duplicated. A DIFFERENT string
+    // is not a lock that fails loudly — it is a lock that serialises against
+    // nothing, and the seed would be back to racing period creation while
+    // looking correct.
+    const appKey = /PAYROLL_ADVISORY_LOCK_KEY = "([^"]+)"/.exec(read("src/lib/payroll-period.ts"));
+    const scriptKey = /PAYROLL_ADVISORY_LOCK_KEY = "([^"]+)"/.exec(read(SCRIPT));
+    assert.ok(appKey, "src/lib/payroll-period.ts must declare PAYROLL_ADVISORY_LOCK_KEY");
+    assert.ok(scriptKey, "the apply script must declare PAYROLL_ADVISORY_LOCK_KEY");
+    assert.equal(scriptKey![1], appKey![1]);
+    // And the app really does hash the same constant into the same lock function.
+    assert.match(
+        read("src/lib/payroll-period.ts"),
+        /pg_advisory_xact_lock_shared\(hashtext\(\$1\)\)`,\s*PAYROLL_ADVISORY_LOCK_KEY/
+    );
+});
+
+test("the payrollRevision column exists BEFORE the seed that bumps it", () => {
+    // It used to be added ~130 lines further down the same function, so the seed
+    // could not have bumped the counter even if it had tried — the column was
+    // not there yet.
+    const script = read(SCRIPT);
+    const main = script.slice(script.indexOf("async function main()"));
+    const addColumn = main.indexOf(`ADD COLUMN IF NOT EXISTS "payrollRevision"`);
+    const seedUpdate = main.indexOf(`"payrollRevision" = "payrollRevision" + 1`);
+    assert.ok(addColumn > 0, "the script must still add the column");
+    assert.ok(seedUpdate > 0, "the seed must still bump it");
+    assert.ok(addColumn < seedUpdate, "the column has to exist before anything updates it");
 });
 
 test("the object list carries DEFINITIONS, not just names", async () => {

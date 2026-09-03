@@ -189,6 +189,54 @@ export function touchesExportUserState(data: unknown): boolean {
 }
 
 /**
+ * The RATE writer's own payload fields. They are not columns the export prints
+ * — they are the columns pay-rate-write.ts writes, and it takes the payroll
+ * advisory lock whenever one of them is present (an hourly rate is not on the
+ * roster predicate, but it IS a payroll write and it takes the same lock).
+ *
+ * `payType` appears in both lists on purpose: it decides who is on the Gusto
+ * roster AND it is written by the rate path.
+ */
+export const PAYROLL_RATE_FIELDS = ["hourlyRate", "burdenRate", "payType"] as const;
+
+/**
+ * Does this rate payload make pay-rate-write.ts take the payroll lock?
+ *
+ * VALUE-based, not key-based, and deliberately different from
+ * touchesExportUserState above. A Prisma `data` object is built key by key, so
+ * a key being present there means "write this column". A RateChange is built as
+ * one object literal carrying all three fields whether or not the request named
+ * them (`{ hourlyRate: body.hourlyRate, ... }`), so `in` would be true for
+ * every request that has a body at all — and applyRateChangeInTx itself asks
+ * `!== undefined`. This is that exact question, exported so the guard deciding
+ * the lock order and the writer taking the lock cannot disagree.
+ */
+export function touchesPayrollRateState(change: unknown): boolean {
+    if (!change || typeof change !== "object") return false;
+    const payload = change as Record<string, unknown>;
+    return PAYROLL_RATE_FIELDS.some((field) => payload[field] !== undefined);
+}
+
+/**
+ * THE predicate: will this request, taken as a WHOLE, end up taking the payroll
+ * advisory lock somewhere inside its transaction?
+ *
+ * It exists because asking it of only half the request produced a real
+ * lock-order inversion (round 13, finding 1). withGuardedUserMutation decided
+ * "export-affecting" from the Prisma `data` payload alone and then, for a
+ * payload that named none of those columns, took the User row FOR UPDATE
+ * first — while the rate fields, which travel SEPARATELY to
+ * applyRateChangeInTx, still made that writer ask for the payroll lock a moment
+ * later. So a rate-only edit held a User row and waited for the payroll lock,
+ * exactly while lockPayrollPeriod held the payroll lock and waited FOR SHARE on
+ * that same row. Both halves of the request now go through one predicate, so
+ * the advisory lock is always tier 1 and the row lock always tier 2.
+ */
+export function takesPayrollWriteLock(input: { data?: unknown; rateChange?: unknown }): boolean {
+    return touchesExportUserState(input.data) || touchesPayrollRateState(input.rateChange);
+}
+
+/**
  * THE entry point for a User write that can change what the payroll export
  * contains. Takes tier 1 of the global lock order FIRST, then runs the write.
  *

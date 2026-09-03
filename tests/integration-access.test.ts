@@ -82,17 +82,27 @@ test("keys and values are bounded, and non-string values are refused", async () 
     assert.equal(validateStringMap({ "": "4000" }, "glMappings").ok, false);
 });
 
-test("a real map is accepted, and comes back as a plain copy", async () => {
+test("a real map is accepted, and comes back on a NULL prototype", async () => {
     const { validateStringMap } = await guard();
     // THE CONTROL. Without it every refusal above could be a validator that
     // simply says no to everything.
     const result = validateStringMap({ "cc-1": "4000 Cost of Goods", "cc-2": "" }, "glMappings");
     assert.equal(result.ok, true);
-    assert.deepEqual((result as { map: Record<string, string> }).map, {
-        "cc-1": "4000 Cost of Goods",
-        "cc-2": "",
-    });
-    assert.deepEqual(validateStringMap({}, "glMappings"), { ok: true, map: {} });
+    const map = (result as { map: Record<string, string> }).map;
+    assert.deepEqual(Object.entries(map), [
+        ["cc-1", "4000 Cost of Goods"],
+        ["cc-2", ""],
+    ]);
+    // Not a `{}` literal: the forbidden-key list is the guarantee, but a result
+    // that inherits Object.prototype still carries the `__proto__` setter for
+    // whatever the next caller does with it (round 13, finding 3). deepEqual is
+    // prototype-aware, which is why the assertion above compares entries.
+    assert.equal(Object.getPrototypeOf(map), null);
+
+    const empty = validateStringMap({}, "glMappings");
+    assert.equal(empty.ok, true);
+    assert.deepEqual(Object.keys((empty as { map: Record<string, string> }).map), []);
+    assert.equal(Object.getPrototypeOf((empty as { map: Record<string, string> }).map), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -178,7 +188,13 @@ test("an ADMIN with a valid map is 200 and the map is saved", async () => {
     viewer = { id: "u-admin", role: "ADMIN", permissions: null };
     const res = await POST(request({ glMappings: { "cc-1": "4000 Cost of Goods" } }));
     assert.equal(res.status, 200);
-    assert.deepEqual(saved, [{ glMappings: { "cc-1": "4000 Cost of Goods" } }]);
+    assert.equal(saved.length, 1);
+    // Entries, not deepEqual: the saved map is null-prototyped and deepEqual
+    // compares prototypes.
+    const savedMap = (saved[0] as { glMappings: Record<string, string> }).glMappings;
+    assert.deepEqual(Object.entries(savedMap), [
+        ["cc-1", "4000 Cost of Goods"],
+    ]);
 });
 
 test("a FINANCE member with financialReports is allowed — the gate is the permission, not the role name", async () => {
