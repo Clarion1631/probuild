@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { updateScheduleTaskInTransaction } from "@/lib/schedule-task-core";
+import { ScheduleTaskValidationError } from "@/lib/schedule-task-result";
 
-// Regression: the Calendar quick-add creates one-day tasks with
-// startDate === endDate, and the update path used to reject any patch that
-// kept end === start ("must be after its start date"), so dragging or editing
-// a one-day task always failed with "Failed to save". Create and update must
-// agree: only end < start is rejected.
+// Convention (src/lib/schedule-dates.ts): ScheduleTask.endDate is EXCLUSIVE —
+// the day AFTER the last day of work. A one-day task on 9/3 is stored as
+// start 9/3, end 9/4. Non-milestones must have end STRICTLY after start;
+// milestones always store end == start.
 
 const PROJECT_ID = "proj-1";
 const TASK_ID = "task-1";
@@ -36,26 +36,109 @@ function fakeTx(persisted: { startDate: Date; endDate: Date; type?: string }) {
 
 const actor = { type: "TEAM" as const, name: "Richard" };
 
-test("moving a one-day task (end === start) is accepted", async () => {
-    const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-03T00:00:00Z") });
-    await updateScheduleTaskInTransaction(tx, TASK_ID, { startDate: "2026-09-04", endDate: "2026-09-04" }, actor, PROJECT_ID);
+test("moving a one-day task (9/3..9/4) to 9/4..9/5 is accepted", async () => {
+    const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-04T00:00:00Z") });
+    await updateScheduleTaskInTransaction(tx, TASK_ID, { startDate: "2026-09-04", endDate: "2026-09-05" }, actor, PROJECT_ID);
     assert.equal(updates.length, 1);
     assert.equal(updates[0].data.startDate.toISOString().slice(0, 10), "2026-09-04");
-    assert.equal(updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-04");
+    assert.equal(updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-05");
 });
 
-test("shrinking a multi-day task down to a single day is accepted", async () => {
+test("shrinking to end === start is rejected", async () => {
     const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-07T00:00:00Z") });
-    await updateScheduleTaskInTransaction(tx, TASK_ID, { endDate: "2026-09-03" }, actor, PROJECT_ID);
-    assert.equal(updates.length, 1);
-    assert.equal(updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-03");
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(tx, TASK_ID, { endDate: "2026-09-03" }, actor, PROJECT_ID),
+        (err: unknown) => {
+            assert.ok(err instanceof ScheduleTaskValidationError);
+            assert.match((err as Error).message, /must be after its start date/);
+            return true;
+        },
+    );
+    assert.equal(updates.length, 0);
 });
 
 test("an end date before the start date is still rejected", async () => {
     const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-07T00:00:00Z") });
     await assert.rejects(
         () => updateScheduleTaskInTransaction(tx, TASK_ID, { endDate: "2026-09-02" }, actor, PROJECT_ID),
-        /cannot be before its start date/,
+        (err: unknown) => {
+            assert.ok(err instanceof ScheduleTaskValidationError);
+            assert.match((err as Error).message, /must be after its start date/);
+            return true;
+        },
     );
     assert.equal(updates.length, 0);
+});
+
+test("a malformed date is a validation failure, not an unexpected error", async () => {
+    const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    for (const bad of ["2026-13-45", "09/03/2026", "2026-09-03T00:00:00Z"]) {
+        await assert.rejects(
+            () => updateScheduleTaskInTransaction(tx, TASK_ID, { endDate: bad }, actor, PROJECT_ID),
+            (err: unknown) => err instanceof ScheduleTaskValidationError && /Invalid date/.test((err as Error).message),
+        );
+    }
+    assert.equal(updates.length, 0);
+});
+
+test("changing type without dates keeps the stored dates valid", async () => {
+    // task -> milestone collapses end onto start
+    const a = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    await updateScheduleTaskInTransaction(a.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID);
+    assert.equal(a.updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-03");
+    // milestone -> task gets a one-day exclusive end
+    const b = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-03T00:00:00Z"), type: "milestone" });
+    await updateScheduleTaskInTransaction(b.tx, TASK_ID, { type: "task" }, actor, PROJECT_ID);
+    assert.equal(b.updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-04");
+});
+
+test("a milestone patch stores end === start regardless of the requested endDate", async () => {
+    const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-03T00:00:00Z"), type: "milestone" });
+    await updateScheduleTaskInTransaction(tx, TASK_ID, { startDate: "2026-09-10", endDate: "2026-09-20" }, actor, PROJECT_ID);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].data.startDate.toISOString().slice(0, 10), "2026-09-10");
+    assert.equal(updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-10");
+});
+
+test("linking an estimate item enforces project ownership and rejects sections", async () => {
+    function linkTx(item: any) {
+        const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+        tx.estimateItem = { findUnique: async () => item };
+        tx.scheduleTask.findFirst = async () => null;
+        return { tx, updates };
+    }
+    const foreign = linkTx({ type: "Labor", quantity: 8, budgetUnit: "hours", estimate: { projectId: "someone-elses-project" } });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(foreign.tx, TASK_ID, { estimateItemId: "item-1" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /not on this project/.test((err as Error).message),
+    );
+    const section = linkTx({ type: "Section", quantity: 0, budgetUnit: null, estimate: { projectId: PROJECT_ID } });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(section.tx, TASK_ID, { estimateItemId: "item-2" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /sections cannot/.test((err as Error).message),
+    );
+    const labor = linkTx({ type: "Labor", quantity: 8, budgetUnit: "hours", estimate: { projectId: PROJECT_ID } });
+    await updateScheduleTaskInTransaction(labor.tx, TASK_ID, { estimateItemId: "item-3" }, actor, PROJECT_ID);
+    assert.equal(labor.updates.length, 1);
+    assert.equal(labor.updates[0].data.estimatedHours, 8);
+});
+
+test("a type change is a date mutation: blocked on closed projects and audited", async () => {
+    const closed = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    closed.tx.scheduleTask.findUnique = async () => ({
+        id: TASK_ID, name: "Framing", projectId: PROJECT_ID, type: "task", status: "Not Started", blockedReason: null,
+        startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z"), project: { status: "Closed Complete" },
+    });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(closed.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /closed project/.test((err as Error).message),
+    );
+    assert.equal(closed.updates.length, 0);
+
+    const open = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    const audits: any[] = [];
+    open.tx.activityLog = { create: async (args: any) => { audits.push(args); return {}; } };
+    await updateScheduleTaskInTransaction(open.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID);
+    assert.equal(audits.length, 1);
+    assert.equal(audits[0].data.action, "updated_company_schedule_task_dates");
 });

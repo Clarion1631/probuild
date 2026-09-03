@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import type { DashboardTaskRow } from "@/lib/schedule-core";
 import { addTaskComment, deleteScheduleTask } from "@/lib/actions";
 import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { displayEndDate, storedEndDate } from "@/lib/schedule-dates";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
 import { FloatingPopover } from "./FloatingPopover";
 import { TaskCrewPicker } from "./CrewPickers";
@@ -248,7 +249,8 @@ export function TaskBlockSegment({
     const progress = Math.max(0, Math.min(100, task.progress));
     const crew = task.assignments.length > 0 ? task.assignments.map(assignment => assignment.name).join(", ") : "Unassigned";
     const assignmentInitials = task.assignments.slice(0, 2).map(assignment => initials(assignment.name)).join(" ");
-    const title = `${task.name} — ${task.status} — UTC ${formatDate(taskStart)} → ${formatDate(isMilestone ? taskStart : taskEnd)} — ${progress}% — Crew: ${crew}`;
+    const displayEnd = displayEndDate(task.startDate.slice(0, 10), task.endDate.slice(0, 10), task.type);
+    const title = `${task.name} — ${task.status} — UTC ${formatDate(taskStart)} → ${displayEnd} — ${progress}% — Crew: ${crew}`;
     const mutationDisabled = !canEdit || isPending;
 
     function beginPointerEdit(event: ReactPointerEvent<HTMLElement>, mode: TaskEditMode) {
@@ -363,7 +365,11 @@ export function TaskBlockSegment({
         if (!window.confirm(`Delete "${task.name}"? Deletes now — not part of unsaved changes. This can't be undone.`)) return;
         startDeleteTransition(async () => {
             try {
-                await deleteScheduleTask(task.id);
+                const res = await deleteScheduleTask(task.id);
+                if (!res.ok) {
+                    toast.error(res.error || "Failed to delete task");
+                    return;
+                }
                 router.refresh();
                 toast.success(`Deleted "${task.name}"`);
             } catch (err: any) {
@@ -489,7 +495,7 @@ export function TaskBlockSegment({
                                 id={`task-start-${task.id}-${fragmentId}`}
                                 type="date"
                                 value={menuStartDate}
-                                max={!isMilestone && menuEndDate ? formatDate(addDays(parseUTCDate(menuEndDate), -1)) : undefined}
+                                max={!isMilestone && menuEndDate ? displayEndDate(menuStartDate, menuEndDate, task.type) : undefined}
                                 onChange={event => {
                                     const nextStartDate = event.target.value;
                                     setMenuDraft({
@@ -504,12 +510,16 @@ export function TaskBlockSegment({
                             <input
                                 id={`task-end-${task.id}-${fragmentId}`}
                                 type="date"
-                                value={isMilestone ? menuStartDate : menuEndDate}
-                                min={!isMilestone && menuStartDate ? formatDate(addDays(parseUTCDate(menuStartDate), 1)) : undefined}
-                                onChange={event => setMenuDraft({
-                                    resetKey: actionResetKey,
-                                    dates: { startDate: menuStartDate, endDate: event.target.value },
-                                })}
+                                value={displayEndDate(menuStartDate, menuEndDate, task.type)}
+                                min={!isMilestone && menuStartDate ? menuStartDate : undefined}
+                                onChange={event => {
+                                    const v = event.target.value;
+                                    if (!v) return;
+                                    setMenuDraft({
+                                        resetKey: actionResetKey,
+                                        dates: { startDate: menuStartDate, endDate: storedEndDate(menuStartDate, v, task.type) },
+                                    });
+                                }}
                                 disabled={mutationDisabled || isMilestone}
                                 className="hui-input w-full px-2 py-1 text-xs"
                             />
@@ -552,7 +562,7 @@ export function TaskBlockSegment({
             <FloatingPopover open={hoverCardOpen} anchorRef={rootRef} onClose={closeHoverCard} width={220} pointerEventsNone>
                 <div className="space-y-1">
                     <p className="text-xs font-semibold text-hui-textMain">{isMilestone ? `◆ ${task.name}` : task.name}</p>
-                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)} · {task.status} · {progress}%</p>
+                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {displayEnd} · {task.status} · {progress}%</p>
                     <p className="text-[10px] text-hui-textMuted">Crew: {crew}</p>
                 </div>
             </FloatingPopover>

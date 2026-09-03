@@ -377,7 +377,7 @@ async function main() {
                 {
                     name: "Owner walkthrough",
                     startDate: dayKey(12),
-                    endDate: dayKey(12),
+                    endDate: dayKey(13),
                     type: "appointment",
                     scheduledTime: "14:30",
                     crewNames: ["Bob"],
