@@ -22,6 +22,7 @@ model User {
   invitedAt                 DateTime?                @default(now())
   timeEntries               TimeEntry[]
   assignedProjects          Project[]                @relation("CrewAssignments")
+  crewAutoLinks             ProjectCrewAutoLink[]
   taskAssignments           TaskAssignment[]
   taskComments              TaskComment[]
   uploadedFiles             ProjectFile[]
@@ -285,6 +286,7 @@ model Project {
   roomDesigns             RoomDesign[]
   contracts               Contract[]
   crew                    User[]                       @relation("CrewAssignments")
+  crewAutoLinks           ProjectCrewAutoLink[]
   scheduleTasks           ScheduleTask[]
   files                   ProjectFile[]
   folders                 FileFolder[]
@@ -1274,6 +1276,25 @@ model TaskAssignment {
   createdAt DateTime     @default(now())
 
   @@unique([taskId, userId])
+}
+
+// Provenance for automatic crew connections (crew-auto-assign-sync.ts). A row
+// here means "the auto-assign sync connected this user to this project's
+// crew" — as opposed to a manual connection made by hand on the Team Access
+// screen or a direct Prisma write. It lets the sync tell the two apart so it
+// can revoke ONLY what it added itself when the user becomes ineligible or
+// the project leaves the auto-assign statuses, without ever touching a
+// manually-curated crew connection. See crew-auto-assign.ts / -sync.ts for
+// the revoke rule (never revokes a user who still holds a TaskAssignment on
+// the project).
+model ProjectCrewAutoLink {
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([projectId, userId])
 }
 
 model McpConfirmation {

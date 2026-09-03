@@ -5,7 +5,9 @@ import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
+import { resolveChargeableItemsForProjects } from "./time-suggestion";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
+import { deriveCrewConflicts } from "./crew-conflicts";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
 // (.specs/PB-pipeline-001-company-dashboard.md), shared by the permission-gated
@@ -1672,148 +1674,48 @@ export interface CrewConflict {
 }
 
 /**
- * Crew double-bookings within [from, to), v2 (PB-pipeline-003):
- *  1. TaskAssignment windows — a user assigned to tasks on DIFFERENT projects
- *     whose [start, end) windows overlap within the range → pairs with task
- *     names + dates.
- *  2. Per-(userId, projectId) project-window fallback (R1 fix 6): only
- *     user–project pairs with NO task assignments in range use the P2
- *     project-window rule, so task coverage on project A never suppresses
- *     fallback coverage on project B. Windows: startDate → effectiveWorkEnd
- *     (startDate+1d remains only the duration fallback for empty projects).
- * Union of both, deduped per project pair (task-based entries win).
+ * Crew double-bookings within [from, to), v3 (R2 fix, PB-pipeline-003):
+ * derived ONLY from TaskAssignment windows — a user assigned to tasks on
+ * DIFFERENT projects whose [start, end) windows overlap within the range.
+ *
+ * Project-level crew membership (Project.crew) is NEVER a conflict source.
+ * With the auto-crew rule putting every dispatchable user on every In
+ * Progress project, treating membership as a full-project scheduling window
+ * would manufacture a conflict for the entire roster whenever two active
+ * projects' date ranges merely overlap. That signal is purely informational
+ * — the "soft" (on job crew, no task) dot in availability.ts — and must
+ * never feed this function. See deriveCrewConflicts in crew-conflicts.ts for
+ * the pure derivation.
  */
 export async function getCrewConflicts(from: Date, to: Date): Promise<CrewConflict[]> {
-    const [assignments, projects] = await Promise.all([
-        prisma.taskAssignment.findMany({
-            where: { task: { projectId: { not: null }, startDate: { lt: to }, endDate: { gt: from } } },
-            select: {
-                userId: true,
-                user: { select: { id: true, name: true, email: true } },
-                task: {
-                    select: {
-                        id: true, name: true, startDate: true, endDate: true, projectId: true,
-                        project: { select: { id: true, name: true } },
-                    },
+    const assignments = await prisma.taskAssignment.findMany({
+        where: { task: { projectId: { not: null }, startDate: { lt: to }, endDate: { gt: from } } },
+        select: {
+            userId: true,
+            user: { select: { id: true, name: true, email: true } },
+            task: {
+                select: {
+                    id: true, name: true, startDate: true, endDate: true, projectId: true,
+                    project: { select: { id: true, name: true } },
                 },
             },
-        }),
-        prisma.project.findMany({
-            where: { startDate: { not: null }, crew: { some: {} } },
-            select: {
-                id: true, name: true, startDate: true, endDate: true,
-                crew: { select: { id: true, name: true, email: true } },
-                scheduleTasks: { where: { type: { not: "milestone" } }, orderBy: { endDate: "desc" }, take: 1, select: { endDate: true } },
-            },
-        }),
-    ]);
-
-    // Half-open [start, end) overlap, intersected with the visible range.
-    const overlaps = (aS: Date, aE: Date, bS: Date, bE: Date): [Date, Date] | null => {
-        const s = aS > bS ? aS : bS;
-        const e = aE < bE ? aE : bE;
-        if (s >= e) return null;
-        if (e <= from || s >= to) return null;
-        return [s, e];
-    };
-
-    const byUser = new Map<string, CrewConflict>();
-    const pushPair = (userId: string, name: string, pair: CrewConflictPair, taskBased: boolean) => {
-        let entry = byUser.get(userId);
-        if (!entry) {
-            entry = { userId, name, pairs: [] };
-            byUser.set(userId, entry);
-        }
-        const key = [pair.projectA.id, pair.projectB.id].sort().join("|");
-        const existingIdx = entry.pairs.findIndex(p => [p.projectA.id, p.projectB.id].sort().join("|") === key);
-        if (existingIdx >= 0) {
-            // Task-based precision wins over the fallback for the same pair.
-            if (taskBased && !entry.pairs[existingIdx].taskA && !entry.pairs[existingIdx].taskB) entry.pairs[existingIdx] = pair;
-        } else {
-            entry.pairs.push(pair);
-        }
-    };
-
-    // (1) TaskAssignment windows.
-    type UserWindow = {
-        projectId: string;
-        projectName: string;
-        start: Date;
-        end: Date;
-        task?: { id: string; name: string; startDate: string; endDate: string };
-    };
-    const windowsByUser = new Map<string, { name: string; windows: UserWindow[] }>();
-    const addWindow = (userId: string, name: string, window: UserWindow) => {
-        let entry = windowsByUser.get(userId);
-        if (!entry) {
-            entry = { name, windows: [] };
-            windowsByUser.set(userId, entry);
-        }
-        entry.windows.push(window);
-    };
-    const assignedUserProjects = new Set<string>(); // "userId|projectId" with ≥1 assignment in range
-    for (const a of assignments) {
-        const projectId = a.task.projectId!;
-        assignedUserProjects.add(`${a.userId}|${projectId}`);
-        addWindow(a.userId, a.user.name || a.user.email, {
-            projectId,
-            projectName: a.task.project?.name ?? "",
-            start: a.task.startDate,
-            end: a.task.endDate,
-            task: {
-                id: a.task.id,
-                name: a.task.name,
-                startDate: a.task.startDate.toISOString(),
-                endDate: a.task.endDate.toISOString(),
-            },
-        });
-    }
-
-    // (2) Project-window fallback per (userId, projectId).
-    const fallbackWindows = projects.map(p => {
-        const start = utcDay(p.startDate!);
-        const rawEnd = effectiveWorkEnd(p, p.scheduleTasks[0]?.endDate ?? null);
-        return {
-            id: p.id,
-            name: p.name,
-            start,
-            end: rawEnd > start ? rawEnd : addDays(start, 1),
-            crew: p.crew,
-        };
+        },
     });
-    for (const w of fallbackWindows) {
-        for (const u of w.crew) {
-            if (assignedUserProjects.has(`${u.id}|${w.id}`)) continue; // task windows cover this pair
-            addWindow(u.id, u.name || u.email, {
-                projectId: w.id,
-                projectName: w.name,
-                start: w.start,
-                end: w.end,
-            });
-        }
-    }
-    // Compare the complete per-user union so task A is tested against fallback B.
-    for (const [userId, { name, windows: userWindows }] of windowsByUser) {
-        for (let i = 0; i < userWindows.length; i++) {
-            for (let j = i + 1; j < userWindows.length; j++) {
-                const a = userWindows[i];
-                const b = userWindows[j];
-                if (a.projectId === b.projectId) continue;
-                const o = overlaps(a.start, a.end, b.start, b.end);
-                if (!o) continue;
-                pushPair(userId, name, {
-                    projectA: { id: a.projectId, name: a.projectName },
-                    projectB: { id: b.projectId, name: b.projectName },
-                    overlapStart: o[0].toISOString(),
-                    overlapEnd: o[1].toISOString(),
-                    taskA: a.task,
-                    taskB: b.task,
-                }, !!a.task || !!b.task);
-            }
-        }
-    }
 
-    return [...byUser.values()];
+    return deriveCrewConflicts(
+        assignments.map(a => ({
+            userId: a.userId,
+            userName: a.user.name || a.user.email,
+            taskId: a.task.id,
+            taskName: a.task.name,
+            taskStart: a.task.startDate,
+            taskEnd: a.task.endDate,
+            projectId: a.task.projectId!,
+            projectName: a.task.project?.name ?? "",
+        })),
+        from,
+        to,
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2107,6 +2009,17 @@ export interface DashboardTaskRow {
     clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
+    // Dispatch Day mode: tasks clock in and job-cost against an estimate line.
+    // estimateItemId is the task's raw link; costCode/chargeableItemId are
+    // resolved through resolveChargeableItems (src/lib/time-suggestion.ts) —
+    // THE single authority for "what does this charge to" — so a leaf under a
+    // coded parent resolves to the parent's code, and an item on an
+    // ineligible estimate resolves to null ("not costed"), matching the
+    // clock-in picker exactly. Both costCode and chargeableItemId are null
+    // when the task isn't costed.
+    estimateItemId: string | null;
+    costCode: string | null;
+    chargeableItemId: string | null;
     pendingMaterials: number;
     stagedMaterials: number;
     missingMaterials: number;
@@ -2378,27 +2291,29 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches] = await Promise.all([
-        prisma.scheduleTask.findMany({
-            where: { projectId: { in: rowIds } },
-            orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
-            select: {
-                id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
-                doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
-                assignments: {
-                    orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
-                },
-                // Hover-card notes (item 3): capped at 2, newest first — same
-                // audience as the project schedule page's own comment thread
-                // (not money, no extra gate).
-                comments: {
-                    orderBy: { createdAt: "desc" },
-                    take: 2,
-                    select: { text: true, createdAt: true, subcontractorName: true, user: { select: { name: true, email: true } } },
-                },
+    const taskRowsPromise = prisma.scheduleTask.findMany({
+        where: { projectId: { in: rowIds } },
+        orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
+        select: {
+            id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
+            doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
+            estimateItemId: true,
+            assignments: {
+                orderBy: { createdAt: "asc" },
+                select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
             },
-        }),
+            // Hover-card notes (item 3): capped at 2, newest first — same
+            // audience as the project schedule page's own comment thread
+            // (not money, no extra gate).
+            comments: {
+                orderBy: { createdAt: "desc" },
+                take: 2,
+                select: { text: true, createdAt: true, subcontractorName: true, user: { select: { name: true, email: true } } },
+            },
+        },
+    });
+    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches, chargeableTargetsByProject] = await Promise.all([
+        taskRowsPromise,
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
         getUnappliedChangeOrders(rowIds),
         // All statuses, not just the three counted ones: `resolved` is the final
@@ -2438,6 +2353,21 @@ export async function getCompanyDashboardData(
             },
             _count: { id: true },
         }),
+        // Cost-code resolution — ONE query for every project's eligible
+        // estimates+items (resolveChargeableItemsForProjects), not one
+        // resolveChargeableItems call per project. Reuses the same
+        // per-estimate resolver the clock-in picker uses (via
+        // resolveEstimateChargeableItems) so Dispatch Day can never disagree
+        // with what a punch actually charges to. Restricted to projects that
+        // actually have a task with estimateItemId set — a project with zero
+        // costed tasks has no use for the resolution map, so it's skipped
+        // entirely rather than resolving estimates nothing will look up.
+        taskRowsPromise.then(taskRows => {
+            const costedProjectIds = [...new Set(
+                taskRows.filter(t => t.estimateItemId).map(t => t.projectId).filter((id): id is string => !!id),
+            )];
+            return resolveChargeableItemsForProjects(costedProjectIds);
+        }),
     ]);
     const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
     const materialStatusAtByTask = new Map<string, Date>();
@@ -2468,6 +2398,9 @@ export async function getCompanyDashboardData(
         if (!task.projectId) continue;
         const rows = tasksByProject.get(task.projectId) ?? [];
         const taskMaterialCounts = materialCountsByTask.get(task.id) ?? { pending: 0, staged: 0, missing: 0 };
+        const chargeableTarget = task.estimateItemId
+            ? chargeableTargetsByProject.get(task.projectId)?.targetByItemId.get(task.estimateItemId) ?? null
+            : null;
         rows.push({
             id: task.id,
             name: task.name,
@@ -2484,6 +2417,9 @@ export async function getCompanyDashboardData(
             clientStage: task.clientStage,
             scheduledTime: task.scheduledTime,
             confirmationStatus: task.confirmationStatus,
+            estimateItemId: task.estimateItemId,
+            costCode: chargeableTarget?.costCode?.code ?? null,
+            chargeableItemId: chargeableTarget?.id ?? null,
             pendingMaterials: taskMaterialCounts.pending,
             stagedMaterials: taskMaterialCounts.staged,
             missingMaterials: taskMaterialCounts.missing,

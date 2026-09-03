@@ -10,6 +10,7 @@ const BASE_URL = "http://localhost:3000";
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const COST_CODE_DEMO_ID = "e2e-mob-cc-demo";
+const COST_CODE_DRYW_ID = "e2e-mob-cc-dryw";
 const MOBILE_ITEM_DEMO_ID = "e2e-mob-item-demo";
 const MOBILE_TASK_DRYW_ID = "e2e-mob-task-dryw";
 const FIELD_CREW_EMAIL = "field-crew@test.local";
@@ -156,6 +157,194 @@ test.describe.serial("Mobile API contract", () => {
 
         await prisma.timeEntry.delete({ where: { id: created.id } });
         createdEntryIds.delete(created.id);
+    });
+
+    // Gate P2: server-side provenance of the suggestion audit fields.
+    // MOBILE_TASK_DRYW_ID is upserted in data.setup.ts as active "today" and
+    // assigned to the field-crew fixture user, resolving to COST_CODE_DRYW_ID
+    // via MOBILE_ITEM_DRYW_ID — real ground truth to check the server's
+    // confirm/downgrade behaviour against.
+    test("POST /api/time-entries — accepted dispatch suggestion is persisted as-is", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                suggestedCostCodeId: COST_CODE_DRYW_ID,
+                suggestionSource: "dispatch",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestionSource).toBe("dispatch");
+        expect(created.suggestedCostCodeId).toBe(COST_CODE_DRYW_ID);
+        expect(created.suggestedScheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
+    });
+
+    test("POST /api/time-entries — forged dispatch source (caller not assigned to the named task) is downgraded to null", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                // A schedule task id the field-crew fixture user has no
+                // TaskAssignment on (and that may not even resolve) — the
+                // server must never persist a "planned by office" claim it
+                // cannot itself confirm.
+                suggestedScheduleTaskId: "e2e-mob-task-not-assigned-to-crew",
+                suggestionSource: "dispatch",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestionSource).toBe(null);
+    });
+
+    test("POST /api/time-entries — forged suggestedCostCodeId (disagrees with the task's real cost code) is downgraded to null", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                // Real cost code for this task is COST_CODE_DRYW_ID — this claims a different one.
+                suggestedCostCodeId: COST_CODE_DEMO_ID,
+                suggestionSource: "today_schedule",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestedCostCodeId).toBe(null);
+        // Non-dispatch sources aren't subject to the assignment check.
+        expect(created.suggestionSource).toBe("today_schedule");
+    });
+
+    // Gate P1: whether a binding hint actually reaches the punch binder
+    // (punch-task-binding.ts "acceptedSuggestion") end-to-end. Needs a real
+    // ambiguous tie — a SECOND active-today task assigned to the field-crew
+    // fixture user alongside MOBILE_TASK_DRYW_ID — so soleAssignedTask can't
+    // resolve it on its own and the binding outcome actually depends on
+    // whether the route decided to pass a hint. Self-contained: creates and
+    // tears down its own extra task so it can't perturb any other test's
+    // assumption that MOBILE_TASK_DRYW_ID is the caller's only active task.
+    test.describe("gate P1: punch binding hint end-to-end", () => {
+        const EXTRA_TASK_ID = `e2e-tsug-p1-task-${RUN}`;
+        const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+        const daysFromNow = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
+
+        test.beforeAll(async () => {
+            // Later startDate than MOBILE_TASK_DRYW_ID's (daysAgo(3)) and
+            // same "assigned" role, so dispatch's own tie-break (lead, then
+            // earliest startDate) deterministically makes MOBILE_TASK_DRYW_ID
+            // the real dispatch winner in every scenario below — the extra
+            // task exists only to make the punch-binder's candidate set
+            // ambiguous (>1), never to contend for the winner slot.
+            await prisma.scheduleTask.upsert({
+                where: { id: EXTRA_TASK_ID },
+                update: { startDate: daysAgo(1), endDate: daysFromNow(4), status: "In Progress" },
+                create: {
+                    id: EXTRA_TASK_ID,
+                    projectId: PROJECT_ID,
+                    name: "Extra ambiguous task (gate P1 fixture)",
+                    type: "task",
+                    status: "In Progress",
+                    startDate: daysAgo(1),
+                    endDate: daysFromNow(4),
+                },
+            });
+            await prisma.taskAssignment.upsert({
+                where: { taskId_userId: { taskId: EXTRA_TASK_ID, userId: fieldCrewId } },
+                update: {},
+                create: { taskId: EXTRA_TASK_ID, userId: fieldCrewId },
+            });
+        });
+
+        test.afterAll(async () => {
+            await prisma.taskAssignment.deleteMany({ where: { taskId: EXTRA_TASK_ID } });
+            await prisma.scheduleTask.delete({ where: { id: EXTRA_TASK_ID } });
+        });
+
+        test("confirmed dispatch winner, not overridden -> binds via the suggestion (acceptedSuggestion)", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
+                    suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID, // the real dispatch winner
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: false,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            expect(created.suggestionSource).toBe("dispatch");
+            expect(created.scheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
+        });
+
+        test("'Keep my choice' (suggestionOverridden: true) -> never rolls hours onto the rejected suggestion", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
+                    // Names the real dispatch winner, but the crew member
+                    // rejected it and picked their own task instead.
+                    suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: true,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            // The audit field still records what was suggested and confirmed...
+            expect(created.suggestionSource).toBe("dispatch");
+            // ...but the ambiguous candidate set (2 active assigned tasks) is
+            // never broken by it — no hint reached the binder.
+            expect(created.scheduleTaskId).toBe(null);
+        });
+
+        test("forged/lower-tier suggestion naming the NON-winning ambiguous candidate -> never binds", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
+                    // EXTRA_TASK_ID is a real candidate (assigned + active),
+                    // but it is NOT the dispatch winner (MOBILE_TASK_DRYW_ID's
+                    // earlier startDate wins the tie-break) — a caller cannot
+                    // pick among ambiguous tasks by simply naming one of them
+                    // and claiming "dispatch".
+                    suggestedScheduleTaskId: EXTRA_TASK_ID,
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: false,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            // Provenance check downgrades the forged "dispatch" claim...
+            expect(created.suggestionSource).toBe(null);
+            // ...and the binder is left with a genuine, unresolved ambiguity.
+            expect(created.scheduleTaskId).toBe(null);
+        });
     });
 
     test("PUT — FIELD_CREW cannot edit another user's entry -> 403", async () => {

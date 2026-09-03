@@ -156,9 +156,10 @@ export function summarizeCell(chips: AvailabilityChip[]): AvailabilityCellSummar
 }
 
 /**
- * Reads the canonical serialized conflict windows. `solidOnly` narrows the
- * result to pairs backed by two task assignments, excluding project-crew
- * fallback overlaps from Dispatch's red true-conflict treatment.
+ * Reads the canonical serialized conflict windows. `getCrewConflicts` now
+ * derives pairs from TaskAssignment windows only (no project-crew fallback),
+ * so every pair already carries taskA/taskB; `solidOnly` is kept for call-site
+ * compatibility but no longer changes the result.
  */
 export function isConflictedDay(
     conflicts: CrewConflict[] | null,

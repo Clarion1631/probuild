@@ -7203,8 +7203,7 @@ export interface TaskBankResult {
 }
 
 export async function getTaskBank(projectId: string): Promise<TaskBankResult> {
-    const session = await getSessionOrDev();
-    if (!session?.user) throw new Error("Unauthorized");
+    await assertScheduleProjectAccess(projectId);
 
     const estimate = await prisma.estimate.findFirst({
         ...canonicalContractEstimateQuery(projectId),

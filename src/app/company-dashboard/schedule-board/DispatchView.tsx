@@ -9,11 +9,12 @@ import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getFallbackProjectColor, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { isConflictedDay } from "./availability";
-import { getCrewlessJobs, getUnstaffedToday, isTaskActiveOnDay } from "./dispatch-exceptions";
+import { isTaskActiveOnDay } from "./dispatch-exceptions";
 import { isDispatchable } from "@/lib/dispatch-roster";
 import { DispatchExceptions } from "./DispatchExceptions";
 import { DispatchCrewTaskChooser, type DispatchCrewTaskChoice } from "./DispatchCrewTaskChooser";
-import { DispatchJobCard } from "./DispatchJobCard";
+import { DispatchDayView } from "./DispatchDayView";
+import { disambiguateMemberNames, dispatchableTaskChoicesForDay } from "./dispatch-day-rows";
 import { DispatchTaskBank, type DispatchTaskBankItem } from "./DispatchTaskBank";
 import { createDragVisualLayer, crewChipDragSourceSelector, type DragVisualLayer } from "./dragVisualLayer";
 
@@ -38,6 +39,14 @@ interface DispatchViewProps {
     crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
     onDraftCrewAdd: (taskId: string, userId: string) => boolean;
     onDraftCrewRemove: (taskId: string, userId: string) => void;
+    // Day-list note saves (DispatchDayView) write straight to the DB outside
+    // of drafts, which bumps the task's revision independently. These let
+    // ScheduleBoard track that: disable Review dispatch while a save is in
+    // flight, and record the settled revision immediately (rather than
+    // waiting on the refresh poll) so a Review opened right after a note
+    // save doesn't compare against a just-stale expectedUpdatedAt.
+    onNoteSaveStart: (taskId: string) => void;
+    onNoteSaveSettled: (taskId: string, result: { updatedAt: string } | null) => void;
     // Day|Week range — owned by ScheduleBoard so the header row (which shows
     // the day/week-nav controls in the same slot as Prev/Today/Next, and the
     // date label in the title) can read/drive them too.
@@ -86,10 +95,6 @@ interface CrewChooserState {
 const CREW_MOUSE_DRAG_THRESHOLD_PX = 5;
 const CREW_TOUCH_DRAG_THRESHOLD_PX = 8;
 
-function initials(name: string): string {
-    return name.split(/\s+/).filter(Boolean).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
-}
-
 function dayLabel(day: Date): string {
     return new Intl.DateTimeFormat("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }).format(day);
 }
@@ -136,16 +141,13 @@ export function visibleWeekChips(chips: WeekChip[]): VisibleWeekChips {
     };
 }
 
+// Wraps dispatch-day-rows.ts's pure builder so every crew-chooser choice
+// list (drag-drop onto a Week cell, keyboard Enter in either mode) excludes
+// milestones, appointments, and phase parents the same way the Day list's
+// "+ Assign" does (item 1's isDispatchableRow rule) — a task that can't
+// reach a time card is never offered as a chooser target either.
 function taskChoicesForDay(projects: DashboardProjectRow[], dayKey: string): DispatchCrewTaskChoice[] {
-    return projects.flatMap(project => project.tasks
-        .filter(task => isTaskActiveOnDay(task, dayKey))
-        .map(task => ({
-            projectId: project.id,
-            projectName: project.name,
-            taskId: task.id,
-            taskName: task.name,
-            dayLabel: dayKey,
-        })));
+    return dispatchableTaskChoicesForDay(projects, dayKey);
 }
 
 export function DispatchView({
@@ -160,6 +162,8 @@ export function DispatchView({
     onModeChange,
     weekStart,
     dayKey,
+    onNoteSaveStart,
+    onNoteSaveSettled,
 }: DispatchViewProps) {
     const [highlightedProjectId, setHighlightedProjectId] = useState<string | null>(null);
     const [taskBankProjectId, setTaskBankProjectId] = useState(
@@ -187,24 +191,27 @@ export function DispatchView({
     // Exceptions strip's "Unstaffed today" vs. "Unstaffed" label).
     const trueTodayKey = formatDate(todayUTC());
     const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
-    const roster = useMemo(() => (data.teamMembers ?? []).filter(isDispatchable), [data.teamMembers]);
-    const activeDayByProject = new Map(projects.map(project => [
-        project.id,
-        project.tasks.filter(task => isTaskActiveOnDay(task, dayKey)),
-    ]));
-    const dayTasks = projects.flatMap(project => activeDayByProject.get(project.id) ?? []);
-    const assignedDayIds = new Set(dayTasks.flatMap(task => task.assignments
-        .filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }))
-        .map(assignment => assignment.userId)));
-    const available = roster.filter(member => !assignedDayIds.has(member.id));
-    const managerSupport = [...new Map(dayTasks.flatMap(task => task.assignments)
-        .filter(assignment => assignment.status === "ACTIVATED" && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER"))
-        .map(assignment => [assignment.userId, assignment] as const)).values()];
-    const crewlessProjectIds = new Set(getCrewlessJobs(projects, dayKey).map(item => item.projectId));
-    const hasUnstaffedTaskToday = getUnstaffedToday(projects, dayKey).length > 0;
-    const dayProjects = projects
-        .filter(project => (activeDayByProject.get(project.id)?.length ?? 0) > 0 || crewlessProjectIds.has(project.id))
-        .sort((left, right) => left.name.localeCompare(right.name));
+    // Two accounts can share a display name (e.g. two "Justin Adkins") —
+    // disambiguate over the FULL team pool (not just today's dispatchable
+    // subset) so the label is stable regardless of who happens to be
+    // dispatchable today, then carry it onto the roster the Day list and
+    // popover read from.
+    const memberLabelsById = useMemo(() => disambiguateMemberNames(data.teamMembers ?? []), [data.teamMembers]);
+    const roster = useMemo(() => (data.teamMembers ?? [])
+        .filter(isDispatchable)
+        .map(member => ({ ...member, name: memberLabelsById.get(member.id) ?? member.name })),
+        [data.teamMembers, memberLabelsById]);
+    // Day mode's plain list needs names for people who show up as a drafted
+    // addition but aren't (yet) on the project's crew — union the full
+    // company roster (already-disambiguated names) with every name already
+    // carried on an assignment, roster winning so an assigned duplicate
+    // Justin Adkins reads disambiguated too (dispatch-day-rows.ts prefers
+    // this map over the raw assignment name).
+    const memberNamesById = useMemo(() => new Map<string, string>([
+        ...projects.flatMap(project => project.tasks.flatMap(task => task.assignments.map(a => [a.userId, a.name] as const))),
+        ...roster.map(member => [member.id, member.name] as const),
+    ]), [roster, projects]);
+    const memberEmailsById = useMemo(() => new Map<string, string>(roster.map(member => [member.id, member.email])), [roster]);
 
     // Memoized so the day arrays hold a stable reference across re-renders
     // (they only actually change when the week or the weekend-visibility
@@ -399,8 +406,13 @@ export function DispatchView({
     function handleCrewKeyboardActivate(event: ReactKeyboardEvent<HTMLElement>, crew: CrewIdentity) {
         if (!data.canEdit || (event.key !== "Enter" && event.key !== " ")) return;
         event.preventDefault();
+        // Day mode's own list only ever renders data.pipeline.inProgress
+        // (see DispatchDayView's dayProjects prop) — the keyboard chooser's
+        // choices must come from that same set, not the full
+        // Waiting/Scheduled/In-Progress/Substantial pipeline `projects`
+        // holds, or Enter could offer a task the Day list never shows.
         const choices = mode === "today"
-            ? taskChoicesForDay(projects, dayKey)
+            ? taskChoicesForDay(data.pipeline.inProgress, dayKey)
             : visibleWeekDays.flatMap(day => taskChoicesForDay(projects, formatDate(day)));
         openCrewChooser(crew, choices, event.currentTarget, null);
     }
@@ -418,20 +430,24 @@ export function DispatchView({
 
     return (
         <div className="min-w-0">
-            <DispatchExceptions
-                projects={projects}
-                crewConflicts={data.crewConflicts}
-                dayKey={dayKey}
-                isToday={dayKey === trueTodayKey}
-                onActivate={onActivate}
-                onProjectFocus={focusProject}
-            />
+            {mode === "week" && (
+                <DispatchExceptions
+                    projects={projects}
+                    crewConflicts={data.crewConflicts}
+                    dayKey={dayKey}
+                    isToday={dayKey === trueTodayKey}
+                    onActivate={onActivate}
+                    onProjectFocus={focusProject}
+                />
+            )}
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hui-border px-4 py-2.5">
-                <p className="text-xs text-hui-textMuted">
-                    {headerForecast ? `Vancouver: ${headerForecast.precipitationProbability}% rain \u00B7 ${headerForecast.high}\u00B0/${headerForecast.low}\u00B0` : "Vancouver forecast unavailable"}
-                    {"  \u00B7  Jobs first today, people across the week."}
-                </p>
+                {mode === "week" ? (
+                    <p className="text-xs text-hui-textMuted">
+                        {headerForecast ? `Vancouver: ${headerForecast.precipitationProbability}% rain · ${headerForecast.high}°/${headerForecast.low}°` : "Vancouver forecast unavailable"}
+                        {"  ·  Jobs first today, people across the week."}
+                    </p>
+                ) : <span />}
                 <div className="flex flex-wrap items-center gap-2">
                     <SegmentedControl
                         ariaLabel="Dispatch range"
@@ -452,75 +468,25 @@ export function DispatchView({
             <div className="min-w-0 xl:flex">
             <div className="min-w-0 flex-1">
             {mode === "today" ? (
-                <div className="space-y-4 p-4">
-                    <div className="rounded-lg border border-hui-border bg-slate-50 px-3 py-2.5">
-                        <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Available</span>
-                            {available.length === 0 ? (
-                                <span className="inline-flex items-center gap-1.5 rounded-full border border-green-300 bg-green-50 px-2 py-0.5 text-[10px] font-semibold text-green-700">
-                                    {"Everyone placed ✓"}
-                                </span>
-                            ) : (
-                                <span
-                                    className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold tabular-nums ${hasUnstaffedTaskToday ? "border-amber-300 bg-amber-50 text-amber-800" : "border-slate-300 bg-slate-100 text-slate-600"}`}
-                                >
-                                    {available.length} available
-                                </span>
-                            )}
-                            {available.length === 0 ? <span className="text-xs text-slate-400">No unassigned field crew</span> : available.map(member => (
-                                <button
-                                    key={member.id}
-                                    type="button"
-                                    data-dispatch-crew-chip="true"
-                                    data-dispatch-user-id={member.id}
-                                    onPointerDown={event => handleCrewPointerDragStart(event, member)}
-                                    onKeyDown={event => handleCrewKeyboardActivate(event, member)}
-                                    className="inline-flex touch-none items-center gap-1.5 rounded-full border border-green-200 bg-white px-2 py-1 text-xs font-semibold text-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
-                                    title={`${member.name} has no task assignment today. Drag onto a task or press Enter.`}
-                                >
-                                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-green-100 text-[9px] font-bold">{initials(member.name)}</span>
-                                    {member.name}
-                                </button>
-                            ))}
-                        </div>
-                        {managerSupport.length > 0 && (
-                            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-slate-200 pt-2 text-xs text-slate-500">
-                                <span className="text-[10px] font-semibold uppercase tracking-wider">Manager support</span>
-                                {managerSupport.map(assignment => <span key={assignment.userId}>{assignment.name}</span>)}
-                            </div>
-                        )}
-                    </div>
-
-                    {dayProjects.length === 0 ? (
-                        <div className="rounded-lg border border-dashed border-hui-border px-4 py-10 text-center">
-                            <p className="text-sm font-semibold text-hui-textMain">No jobs on dispatch today</p>
-                            <p className="mt-1 text-xs text-hui-textMuted">Add a task or move work onto today to build the run.</p>
-                        </div>
-                    ) : (
-                        <div className="grid gap-4 xl:grid-cols-2">
-                            {dayProjects.map(project => (
-                                <DispatchJobCard
-                                    key={project.id}
-                                    project={project}
-                                    tasks={activeDayByProject.get(project.id) ?? []}
-                                    dayKey={dayKey}
-                                    highlighted={highlightedProjectId === project.id}
-                                    canCreate={data.canEdit}
-                                    crewDrafts={crewDrafts}
-                                    onActivate={onActivate}
-                                    onCrewPointerDown={handleCrewPointerDragStart}
-                                    onCrewKeyboardActivate={handleCrewKeyboardActivate}
-                                    onDraftCrewRemove={onDraftCrewRemove}
-                                    onAddTask={() => onCreateTask({
-                                        defaultProjectId: project.id,
-                                        lockProject: true,
-                                        defaultStartDate: dayKey,
-                                    })}
-                                />
-                            ))}
-                        </div>
-                    )}
-                </div>
+                <DispatchDayView
+                    dayProjects={data.pipeline.inProgress}
+                    allProjects={projects}
+                    dayKey={dayKey}
+                    roster={roster}
+                    crewDrafts={crewDrafts}
+                    memberNamesById={memberNamesById}
+                    memberEmailsById={memberEmailsById}
+                    canEdit={data.canEdit}
+                    highlightedProjectId={highlightedProjectId}
+                    onActivate={onActivate}
+                    onCreateTask={onCreateTask}
+                    onDraftCrewAdd={onDraftCrewAdd}
+                    onDraftCrewRemove={onDraftCrewRemove}
+                    onCrewPointerDown={handleCrewPointerDragStart}
+                    onCrewKeyboardActivate={handleCrewKeyboardActivate}
+                    onNoteSaveStart={onNoteSaveStart}
+                    onNoteSaveSettled={onNoteSaveSettled}
+                />
             ) : (
                 <div className="p-4">
                     <div className="max-w-full overflow-x-auto rounded-lg border border-hui-border">
@@ -660,14 +626,16 @@ export function DispatchView({
                 </div>
             )}
             </div>
-            <DispatchTaskBank
-                projects={projects.map(project => ({ id: project.id, name: project.name, taskCount: project.taskCount }))}
-                selectedProjectId={selectedTaskBankProjectId}
-                refreshKey={taskBankRefreshKey}
-                canSchedule={data.canEdit}
-                onProjectChange={setTaskBankProjectId}
-                onSchedule={scheduleTaskBankItem}
-            />
+            {mode === "week" && (
+                <DispatchTaskBank
+                    projects={projects.map(project => ({ id: project.id, name: project.name, taskCount: project.taskCount }))}
+                    selectedProjectId={selectedTaskBankProjectId}
+                    refreshKey={taskBankRefreshKey}
+                    canSchedule={data.canEdit}
+                    onProjectChange={setTaskBankProjectId}
+                    onSchedule={scheduleTaskBankItem}
+                />
+            )}
             </div>
             <DispatchCrewTaskChooser
                 open={Boolean(crewChooser)}

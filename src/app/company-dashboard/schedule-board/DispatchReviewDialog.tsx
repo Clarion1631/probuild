@@ -4,6 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
 import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
+import { applyReviewChangesToTasks, collisionDelta, findReviewCollisions, formatCollisionLines, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
@@ -12,6 +13,13 @@ interface DispatchReviewDialogProps {
     conflictTargetIds: ReadonlySet<string>;
     taskNamesById: ReadonlyMap<string, string>;
     memberNamesById: ReadonlyMap<string, string>;
+    // Day-mode collision warning: computed from the review's FINAL
+    // assignment state (every canonical task's currently-saved crew, with
+    // this review's own TASK_CREW changes overlaid) via findReviewCollisions
+    // — catches two conflicting drafted adds in the same review and
+    // multi-day overlaps, not just a change that collides with an
+    // already-committed double-booking.
+    tasks: readonly DispatchReviewTaskInput[];
     onConfirm: () => void;
     onClose: () => void;
 }
@@ -78,6 +86,7 @@ export function DispatchReviewDialog({
     conflictTargetIds,
     taskNamesById,
     memberNamesById,
+    tasks,
     onConfirm,
     onClose,
 }: DispatchReviewDialogProps) {
@@ -88,6 +97,21 @@ export function DispatchReviewDialog({
     ) ?? [];
     const changeCount = reviewRows.length;
     const deliveryCount = result?.deliveryCount ?? 0;
+    // Compare the canonical, pre-review state against the review's FINAL
+    // state — every reviewed change kind (TASK_DATES, PROJECT_START,
+    // TASK_CREW) applied on top of the canonical snapshot via
+    // applyReviewChangesToTasks — and flag only collisions THIS review
+    // introduces or worsens. A pre-existing double-booking the review
+    // leaves untouched, or one a drafted removal resolves, isn't this
+    // review's problem to surface. See dispatch-day-rows.ts's
+    // collisionDelta for the identity semantics.
+    const finalTasks = applyReviewChangesToTasks(tasks, result?.changes ?? []);
+    const canonicalCollisions = findReviewCollisions(tasks);
+    const finalCollisions = findReviewCollisions(finalTasks);
+    const newCollisions = collisionDelta(canonicalCollisions, finalCollisions);
+    const hasCollision = newCollisions.length > 0;
+    const collisionLines = formatCollisionLines(newCollisions, memberNamesById);
+    const collisionTaskIds = new Set(collisionLines.flatMap(line => line.taskIds));
 
     return (
         <Dialog.Root open={Boolean(result)} onOpenChange={open => { if (!open && !isPending) onClose(); }}>
@@ -127,6 +151,14 @@ export function DispatchReviewDialog({
                             </div>
                         ) : (
                             <>
+                                {hasCollision && (
+                                    <div className="border-b border-amber-200 bg-amber-50 px-5 py-2.5 text-xs font-medium text-amber-800">
+                                        <p>This dispatch double-books a crew member:</p>
+                                        <ul className="mt-1 space-y-0.5">
+                                            {collisionLines.map(line => <li key={line.key}>{line.text}</li>)}
+                                        </ul>
+                                    </div>
+                                )}
                                 <div className="border-b border-hui-border bg-slate-50 px-5 py-4">
                                     <div className="flex items-start justify-between gap-4">
                                         <div>
@@ -154,11 +186,12 @@ export function DispatchReviewDialog({
                                     <div className="space-y-2" role="list" aria-label="Dispatch changes">
                                         {reviewRows.map(({ change, key, summary }, index) => {
                                             const conflicted = conflictTargetIds.has(change.targetId);
+                                            const collides = collisionTaskIds.has(change.targetId);
                                             return (
                                                 <div
                                                     key={`${change.kind}-${change.targetId}-${key}`}
                                                     role="listitem"
-                                                    className={`grid grid-cols-[auto_1fr] gap-3 rounded-lg border px-3 py-3 ${conflicted ? "border-amber-300 bg-amber-50" : "border-hui-border bg-white"}`}
+                                                    className={`grid grid-cols-[auto_1fr] gap-3 rounded-lg border px-3 py-3 ${conflicted ? "border-amber-300 bg-amber-50" : collides ? "border-hui-border border-l-4 border-l-amber-400 bg-white" : "border-hui-border bg-white"}`}
                                                 >
                                                     <span className="mt-0.5 inline-flex h-6 min-w-14 items-center justify-center rounded bg-slate-100 px-2 text-[10px] font-bold uppercase tracking-wide text-slate-600">
                                                         {changeLabel(change.kind)}

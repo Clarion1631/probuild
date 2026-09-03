@@ -24,6 +24,7 @@ import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { DispatchView, DISPATCH_MODE_STORAGE_KEY } from "./DispatchView";
 import type { DispatchMode, DispatchTaskCreationDefaults } from "./DispatchView";
 import { shiftDayKey, formatDayLabel, isTodayKey } from "./dispatch-day";
+import { assertDispatchableTarget, finalTaskUserIds, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 import { DispatchReviewDialog } from "./DispatchReviewDialog";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
@@ -338,6 +339,19 @@ export function ScheduleBoard({
     const [projectIncomeOverrides, setProjectIncomeOverrides] = useState<Record<string, OverlayIncomeItem[]>>({});
     const [projectRefreshExpectations, setProjectRefreshExpectations] = useState<Record<string, ProjectRefreshExpectation>>({});
     const [dispatchReconciliationExpectation, setDispatchReconciliationExpectation] = useState<DispatchReconciliationExpectation | null>(null);
+    // Day list's inline note editor (DispatchDayView) writes doneWhen straight
+    // to the DB, which bumps the task's updatedAt/revision outside of drafts
+    // entirely. Two things track that so a Review opened right after a note
+    // save doesn't compare against a not-yet-refreshed (stale) revision:
+    // - pendingNoteSaveTaskIds: a save currently in flight for a task — Review
+    //   dispatch is disabled while any are pending, so we never even build
+    //   intents from an unsettled revision.
+    // - taskRevisionOverrides: the true post-save updatedAt for a task whose
+    //   save has settled but whose canonical `data` prop (server-refreshed via
+    //   router.refresh() polling) hasn't caught up yet. collectDispatchIntents
+    //   reads this instead of the possibly-stale canonicalTaskById value.
+    const [pendingNoteSaveTaskIds, setPendingNoteSaveTaskIds] = useState<Set<string>>(new Set());
+    const [taskRevisionOverrides, setTaskRevisionOverrides] = useState<Record<string, string>>({});
     const [dispatchReview, setDispatchReview] = useState<DispatchReviewState | null>(null);
     const [dispatchConflictTargetIds, setDispatchConflictTargetIds] = useState<Set<string>>(() => new Set());
     const [isDispatchReviewing, setIsDispatchReviewing] = useState(false);
@@ -471,8 +485,31 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
+    // "Has at least one child" set, scoped per-project like dispatch-day-rows.ts's
+    // own private parentIdsOf — feeds assertDispatchableTarget below (a phase
+    // parent can never be a crew-draft add target).
+    const taskHasChildrenById = useMemo(() => new Set(
+        canonicalProjects.flatMap(project => project.tasks.map(task => task.parentId).filter((id): id is string => Boolean(id))),
+    ), [canonicalProjects]);
     const dispatchTaskNamesById = useMemo(
         () => new Map(canonicalProjects.flatMap(project => project.tasks.map(task => [task.id, task.name] as const))),
+        [canonicalProjects],
+    );
+    // Day-mode collision warning (DispatchReviewDialog): every canonical
+    // task's full window plus its currently-saved dispatchable crew, fed to
+    // findReviewCollisions (dispatch-day-rows.ts) with this review's own
+    // TASK_CREW changes overlaid — draft-aware, multi-day, not limited to
+    // what the server's already-committed crewConflicts can see.
+    const dispatchReviewTasks: DispatchReviewTaskInput[] = useMemo(
+        () => canonicalProjects.flatMap(project => project.tasks.map(task => ({
+            id: task.id,
+            projectId: project.id,
+            projectName: project.name,
+            name: task.name,
+            startDate: task.startDate,
+            endDate: task.endDate,
+            savedUserIds: finalTaskUserIds(task, undefined),
+        }))),
         [canonicalProjects],
     );
     const dispatchMemberNamesById = useMemo(() => new Map([
@@ -502,6 +539,58 @@ export function ScheduleBoard({
             !awaitingTaskRefreshIds.has(taskId) && !dispatchAwaitingTaskIds.has(taskId),
         )),
         [taskDateOverrides, awaitingTaskRefreshIds, dispatchAwaitingTaskIds],
+    );
+    // A note save's own local revision override must never regress: two
+    // overlapping saves on the same task (a second edit started before the
+    // first settled) can resolve out of order, and an older response must
+    // not clobber a newer one already recorded.
+    const handleNoteSaveStart = useCallback((taskId: string) => {
+        setPendingNoteSaveTaskIds(current => (current.has(taskId) ? current : new Set(current).add(taskId)));
+    }, []);
+    const handleNoteSaveSettled = useCallback((taskId: string, result: { updatedAt: string } | null) => {
+        setPendingNoteSaveTaskIds(current => {
+            if (!current.has(taskId)) return current;
+            const next = new Set(current);
+            next.delete(taskId);
+            return next;
+        });
+        if (!result) return;
+        setTaskRevisionOverrides(current => {
+            const existing = current[taskId];
+            if (existing && existing >= result.updatedAt) return current;
+            return { ...current, [taskId]: result.updatedAt };
+        });
+    }, []);
+    // Drop an override as soon as canonical data (server refresh) has caught
+    // up to it or moved past it — including past it via someone ELSE'S edit,
+    // which must win over our own stale-by-comparison override so a
+    // genuinely concurrent change is never masked.
+    useEffect(() => {
+        if (Object.keys(taskRevisionOverrides).length === 0) return;
+        setTaskRevisionOverrides(current => {
+            let changed = false;
+            const next = { ...current };
+            for (const [taskId, overrideUpdatedAt] of Object.entries(current)) {
+                const canonicalUpdatedAt = canonicalTaskById.get(taskId)?.updatedAt;
+                if (!canonicalUpdatedAt || canonicalUpdatedAt >= overrideUpdatedAt) {
+                    delete next[taskId];
+                    changed = true;
+                }
+            }
+            return changed ? next : current;
+        });
+    }, [canonicalTaskById, taskRevisionOverrides]);
+    // What collectDispatchIntents should actually treat as "this task's
+    // current revision" — the override when it's ahead of canonical, else
+    // canonical itself. Never used to relax the server's own check (still
+    // exact-match against the live DB row) — only to feed it the freshest
+    // value the client actually knows.
+    const taskExpectedUpdatedAt = useCallback(
+        (taskId: string, canonicalUpdatedAt: string) => {
+            const override = taskRevisionOverrides[taskId];
+            return override && override > canonicalUpdatedAt ? override : canonicalUpdatedAt;
+        },
+        [taskRevisionOverrides],
     );
     const crewDraftTaskIds = useMemo(() => new Set(Object.keys(crewDrafts)), [crewDrafts]);
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
@@ -936,6 +1025,11 @@ export function ScheduleBoard({
     function queueCrewAddition(taskId: string, userId: string): boolean {
         const task = canonicalTaskById.get(taskId);
         if (!data.canEdit || isTaskLocked(taskId) || !task) return false;
+        const notDispatchableReason = assertDispatchableTarget({ type: task.type, status: task.status, hasChildren: taskHasChildrenById.has(taskId) });
+        if (notDispatchableReason) {
+            toast.error(`That task can't be dispatched: ${notDispatchableReason}`);
+            return false;
+        }
         const existingDraft = crewDrafts[taskId];
         const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
         const addUserIds = new Set(existingDraft?.addUserIds ?? []);
@@ -1205,7 +1299,7 @@ export function ScheduleBoard({
                 expectedUpdatedAt: project.updatedAt,
                 expectedTasks: project.tasks.map(task => ({
                     taskId: task.id,
-                    expectedUpdatedAt: task.updatedAt,
+                    expectedUpdatedAt: taskExpectedUpdatedAt(task.id, task.updatedAt),
                     expectedAssignments: dashboardTaskAssignments(task),
                 })),
                 startDate: draft.targetStart,
@@ -1228,7 +1322,7 @@ export function ScheduleBoard({
                 kind: "TASK_DATES",
                 projectId,
                 taskId,
-                expectedUpdatedAt: task.updatedAt,
+                expectedUpdatedAt: taskExpectedUpdatedAt(taskId, task.updatedAt),
                 expectedAssignments: dashboardTaskAssignments(task),
                 startDate: dates.startDate,
                 endDate: dates.endDate,
@@ -1251,7 +1345,7 @@ export function ScheduleBoard({
                 kind: "TASK_CREW",
                 projectId,
                 taskId,
-                expectedUpdatedAt: task.updatedAt,
+                expectedUpdatedAt: taskExpectedUpdatedAt(taskId, task.updatedAt),
                 expectedAssignments: draft.expectedAssignments,
                 assignments,
             });
@@ -1260,7 +1354,7 @@ export function ScheduleBoard({
     }
 
     async function reviewDispatchDrafts() {
-        if (isDispatchReviewing || isDispatchPublishing || isSaving || draftCount === 0) return;
+        if (isDispatchReviewing || isDispatchPublishing || isSaving || draftCount === 0 || pendingNoteSaveTaskIds.size > 0) return;
         cancelActiveTaskEdit();
         cancelActiveProjectEdit();
         setIsDispatchReviewing(true);
@@ -2449,10 +2543,13 @@ export function ScheduleBoard({
                             <button
                                 type="button"
                                 onClick={() => void reviewDispatchDrafts()}
-                                disabled={draftCount === 0 || isDispatchReviewing || isDispatchPublishing}
+                                disabled={draftCount === 0 || isDispatchReviewing || isDispatchPublishing || pendingNoteSaveTaskIds.size > 0}
+                                title={pendingNoteSaveTaskIds.size > 0 ? "Waiting for a note to finish saving..." : undefined}
                                 className="hui-btn hui-btn-green h-8 text-sm disabled:cursor-not-allowed disabled:opacity-50"
                             >
-                                {isDispatchReviewing ? (
+                                {pendingNoteSaveTaskIds.size > 0 ? (
+                                    "Saving note..."
+                                ) : isDispatchReviewing ? (
                                     "Reviewing..."
                                 ) : draftCount > 0 ? (
                                     <>
@@ -2596,6 +2693,8 @@ export function ScheduleBoard({
                     onModeChange={selectDispatchMode}
                     weekStart={dispatchWeekStart}
                     dayKey={dispatchDayKey}
+                    onNoteSaveStart={handleNoteSaveStart}
+                    onNoteSaveSettled={handleNoteSaveSettled}
                 />
             ) : boardView === "month" ? (
                 <MonthBarsView
@@ -2687,6 +2786,7 @@ export function ScheduleBoard({
                 conflictTargetIds={dispatchConflictTargetIds}
                 taskNamesById={dispatchTaskNamesById}
                 memberNamesById={dispatchMemberNamesById}
+                tasks={dispatchReviewTasks}
                 onConfirm={() => void publishDispatchDrafts()}
                 onClose={() => setDispatchReview(null)}
             />

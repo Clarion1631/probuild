@@ -76,6 +76,26 @@ function assertScheduleTaskStatus(status: string): asserts status is ScheduleTas
     }
 }
 
+/**
+ * Invariant: a task linked to an estimate item must always be type "task".
+ * A milestone/appointment can't be picked on a time card (isDispatchableRow
+ * in dispatch-day-rows.ts requires type === "task"), so an estimate line
+ * linked to one would silently vanish from the "Add from estimate" bank
+ * (DispatchAddFromEstimatePopover) — the item reads as scheduled, but can
+ * never actually be assigned or suggested. Pure so it's unit-testable
+ * without a tx; both createScheduleTaskInTransaction and
+ * updateScheduleTaskInTransaction throw on a non-null return.
+ */
+export function scheduleTaskTypeEstimateInvariantError(
+    type: string,
+    estimateItemId: string | null,
+): string | null {
+    if (estimateItemId && type !== "task") {
+        return "An estimate-linked task must stay type \"Task\" — unlink it from the estimate item first if you need a milestone or appointment.";
+    }
+    return null;
+}
+
 function normalizeScheduledTime(value: string | null | undefined): string | null {
     const normalized = value?.trim() || null;
     if (normalized && !SCHEDULE_TIME_PATTERN.test(normalized)) {
@@ -134,6 +154,8 @@ export async function createScheduleTaskInTransaction(
     }
     const confirmationStatus = type === "appointment" ? (data.confirmationStatus ?? "planned") : null;
     const estimateItemId = data.estimateItemId?.trim() || null;
+    const typeEstimateInvariantError = scheduleTaskTypeEstimateInvariantError(type, estimateItemId);
+    if (typeEstimateInvariantError) throw new Error(typeEstimateInvariantError);
     const crewIds = [...new Set((data.crewIds ?? []).filter(Boolean))];
     const leadUserId = data.leadUserId ?? null;
     if (leadUserId && !crewIds.includes(leadUserId)) {
@@ -272,6 +294,7 @@ export async function updateScheduleTaskInTransaction(
             blockedReason: true,
             startDate: true,
             endDate: true,
+            estimateItemId: true,
             project: { select: { status: true } },
         },
     });
@@ -281,6 +304,9 @@ export async function updateScheduleTaskInTransaction(
     if (data.status !== undefined) assertScheduleTaskStatus(data.status);
     const nextType = data.type ?? persisted.type;
     const nextStatus = data.status ?? persisted.status;
+    const nextEstimateItemId = data.estimateItemId !== undefined ? (data.estimateItemId ?? null) : persisted.estimateItemId;
+    const typeEstimateInvariantError = scheduleTaskTypeEstimateInvariantError(nextType, nextEstimateItemId);
+    if (typeEstimateInvariantError) throw new Error(typeEstimateInvariantError);
     const updateData: Prisma.ScheduleTaskUncheckedUpdateInput = {};
 
     if (data.name !== undefined) {
