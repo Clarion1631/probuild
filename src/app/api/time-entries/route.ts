@@ -5,7 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { hasPermission } from "@/lib/access-rules";
+import { canActOnFinancials } from "@/lib/financial-access";
 import { serializeTimeEntryJson, timeEntrySelect } from "@/lib/time-entry-projection";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
@@ -63,8 +63,10 @@ export async function GET(req: Request) {
     // back to role DEFAULTS when it is absent, and FINANCE's default includes
     // financialReports — so an explicit revocation would have been ignored.
     const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
-    const canSeePay =
-        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
+    // STAFF, then the permission — the shared predicate. A portal CLIENT
+    // holding `financialReports` used to see labor and burden cost on every
+    // entry they could read (round 15, finding 1).
+    const canSeePay = canActOnFinancials({ role: user.role, permissions: viewerPermissions });
 
     const timeEntries = await prisma.timeEntry.findMany({
         where: whereClause,
@@ -98,8 +100,10 @@ export async function POST(req: Request) {
     // verbatim, so a crew member got laborCost and burdenCost with it (round 9,
     // finding 2). Same audience rule as GET — see time-entry-projection.ts.
     const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
-    const canSeePay =
-        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
+    // STAFF, then the permission — the shared predicate. A portal CLIENT
+    // holding `financialReports` used to see labor and burden cost on every
+    // entry they could read (round 15, finding 1).
+    const canSeePay = canActOnFinancials({ role: user.role, permissions: viewerPermissions });
 
     // ONE resolution per request. Every company-local day key below is derived
     // from it — the stale-DEFERRED check, the day settlement triggers, and the
@@ -961,9 +965,12 @@ const clockOutHandler = createClockOutHandler({
     // role defaults when it is absent and FINANCE's default includes
     // financialReports, so an explicit revocation would have been ignored.
     canReadPay: async (viewer) => {
-        if (viewer.role === "ADMIN") return true;
-        const permissions = await prisma.userPermission.findUnique({ where: { userId: viewer.id } });
-        return hasPermission({ role: viewer.role, permissions }, "financialReports");
+        const permissions =
+            viewer.role === "ADMIN"
+                ? null
+                : await prisma.userPermission.findUnique({ where: { userId: viewer.id } });
+        // The shared predicate, staff half included.
+        return canActOnFinancials({ role: viewer.role, permissions });
     },
     findDayEntries: loadDayEntries,
     settleDay,

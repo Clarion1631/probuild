@@ -15,7 +15,8 @@
 // different answers about who may act.
 
 import { NextResponse } from "next/server";
-import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { getCurrentUserWithPermissions } from "./permissions";
+import { canActOnFinancials } from "./financial-access";
 
 export type IntegrationViewer = { id: string; role: string };
 
@@ -32,7 +33,11 @@ export async function requireIntegrationAccess(): Promise<
     if (!user) {
         return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
     }
-    if (user.role !== "ADMIN" && !hasPermission(user, "financialReports")) {
+    // STAFF, then the permission — one predicate, shared with the payroll
+    // gates. It used to be the permission alone, so an admin who granted
+    // `financialReports` to a portal CLIENT handed that customer the Gusto and
+    // QuickBooks OAuth credentials (round 15, finding 1).
+    if (!canActOnFinancials(user)) {
         return { response: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
     }
     return { viewer: { id: user.id, role: user.role } };
@@ -40,9 +45,7 @@ export async function requireIntegrationAccess(): Promise<
 
 /** True when this viewer may see or change an integration. For server components. */
 export async function canAccessIntegrations(): Promise<boolean> {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) return false;
-    return user.role === "ADMIN" || hasPermission(user, "financialReports");
+    return canActOnFinancials(await getCurrentUserWithPermissions());
 }
 
 /**

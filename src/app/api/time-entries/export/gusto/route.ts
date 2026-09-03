@@ -4,6 +4,7 @@ import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions"
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 import { validatePayrollRange } from "@/lib/payroll-config";
+import { canActOnFinancialsResolved } from "@/lib/financial-access";
 import {
     isLabelRowMissingError,
     isLockedSnapshotMissingError,
@@ -81,7 +82,12 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
         async GET(req: Request) {
             const viewer = await dependencies.authenticate();
             if (!viewer) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-            if (viewer.role !== "ADMIN" && !viewer.canReadFinancialReports) {
+            // STAFF, then the permission. `authenticate` resolves the permission
+            // rather than handing back a row, so this calls the resolved form of
+            // the SAME predicate the other gates use. It used to be the
+            // permission alone, and `financialReports` is assignable to a portal
+            // CLIENT (round 15, finding 1).
+            if (!canActOnFinancialsResolved(viewer.role, viewer.canReadFinancialReports)) {
                 return NextResponse.json({ error: "Forbidden" }, { status: 403 });
             }
 

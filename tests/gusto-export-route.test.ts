@@ -84,6 +84,19 @@ test("a FIELD_CREW session is 403 — payroll is not a crew screen", async () =>
     assert.equal(loads, 0);
 });
 
+test("a CLIENT carrying financialReports is 403 — the permission does not make a customer staff", async () => {
+    // THE HOLE (round 15, finding 1). `financialReports` is assignable, so an
+    // admin could tick it on a portal CLIENT, and the gate was
+    // `role === "ADMIN" || canReadFinancialReports` — which said yes. That
+    // customer could download the whole company's payroll CSV.
+    let loads = 0;
+    const res = await createGustoExportHandler(
+        deps({ viewer: { role: "CLIENT", canReadFinancialReports: true }, onLoad: () => { loads += 1; } })
+    ).GET(url());
+    assert.equal(res.status, 403);
+    assert.equal(loads, 0, "a refused caller must not run the payroll query");
+});
+
 test("MANAGER without financialReports is also 403 — the gate is the permission, not seniority", async () => {
     const res = await createGustoExportHandler(
         deps({ viewer: { role: "MANAGER", canReadFinancialReports: false } })

@@ -1,7 +1,8 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
+import { getCurrentUserWithPermissions } from "@/lib/permissions";
+import { canActOnFinancials } from "@/lib/financial-access";
 import { isSalariedOwner } from "@/lib/pay-rate-guard";
 import { payrollEligibleUserWhere } from "@/lib/payroll-config";
 
@@ -24,7 +25,11 @@ import { payrollEligibleUserWhere } from "@/lib/payroll-config";
 export async function GET(_req: Request) {
     const viewer = await getCurrentUserWithPermissions();
     if (!viewer) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    if (viewer.role !== "ADMIN" && !hasPermission(viewer, "financialReports")) {
+    // STAFF, then the permission — one predicate, shared with the export
+    // endpoint, the payroll actions and the integration settings. It used to be
+    // the permission alone, which a portal CLIENT could be granted (round 15,
+    // finding 1).
+    if (!canActOnFinancials(viewer)) {
         return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 

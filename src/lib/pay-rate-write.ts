@@ -13,7 +13,7 @@
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
-import { hasPermission } from "./access-rules";
+import { canActOnFinancials } from "./financial-access";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
 import { isKnownPayType, lockOwnerRowForUpdate } from "./pay-rate-guard";
 import { isPayrollEligibleRole } from "./payroll-config";
@@ -55,8 +55,13 @@ export type RateWriteResult = { ok: true; changed: boolean } | { ok: false; stat
  * (or a dedicated permission key) so every payroll surface moves together.
  */
 export function canWriteRates(actor: RateActor): boolean {
-    if (!actor) return false;
-    return actor.role === "ADMIN" || hasPermission(actor as never, "financialReports");
+    // The shared predicate: STAFF, then the permission. It used to be the
+    // permission alone, and `financialReports` is assignable to a portal
+    // CLIENT (round 15, finding 1). Unreachable through the three routes today
+    // — the user-mutation guard admits only MANAGER and ADMIN — but this is the
+    // ONE place a rate is written, and "safe because of a check in another
+    // file" is the claim that stops being true without anyone noticing.
+    return canActOnFinancials(actor);
 }
 
 /**

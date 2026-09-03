@@ -231,3 +231,26 @@ test("an unknown user id is 400, and a FIELD_CREW caller never gets that far", a
     assert.deepEqual(saved, []);
     assert.deepEqual(lookedUp, [], "a refused caller does not even reach the roster lookup");
 });
+
+test("a CLIENT carrying financialReports is 403 — the permission is not a staff badge", async () => {
+    // THE HOLE (round 15, finding 1). `financialReports` is assignable, so an
+    // admin could tick it on a portal CLIENT — and the gate was the permission
+    // alone. That customer could rewrite the map deciding whose hours are filed
+    // under which Gusto employee, and reach the OAuth routes beside it.
+    viewer = { id: "u-client", role: "CLIENT", permissions: { financialReports: true } };
+    saved = [];
+    lookedUp = [];
+    const res = await POST(request(`{"employeeMappings": {"u-alice": "GUSTO-1"}}`));
+    assert.equal(res.status, 403);
+    assert.deepEqual(saved, []);
+    assert.deepEqual(lookedUp, [], "a refused caller does not even reach the roster lookup");
+
+    // The CONTROL, on the same harness: a FINANCE member with the same
+    // permission IS allowed, so the refusal is about the role and not about the
+    // permission having stopped working.
+    viewer = { id: "u-finance", role: "FINANCE", permissions: { financialReports: true } };
+    saved = [];
+    const ok = await POST(request(`{"employeeMappings": {"u-alice": "GUSTO-1"}}`));
+    assert.equal(ok.status, 200);
+    assert.equal(saved.length, 1);
+});

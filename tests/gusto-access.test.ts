@@ -45,9 +45,18 @@ test("the gate is EXACTLY the payroll gate used everywhere else in this phase", 
         "no second copy of the rule may survive here"
     );
 
-    // ...and the shared one is still that same expression.
+    // ...and the shared one composes the ONE financial predicate.
+    //
+    // It used to spell out `role !== "ADMIN" && !hasPermission(...)`, which
+    // authorized any role carrying the permission — including a portal CLIENT
+    // an admin had ticked it on (round 15, finding 1). The staff half now lives
+    // in src/lib/financial-access.ts with every other gate on this surface.
     const shared = readFileSync(path.join(__dirname, "..", "src", "lib", "integration-access.ts"), "utf8");
-    assert.match(shared, /user\.role !== "ADMIN" && !hasPermission\(user, "financialReports"\)/);
+    assert.match(shared, /canActOnFinancials\(user\)/);
+    assert.ok(
+        !/hasPermission\(user, "financialReports"\)/.test(shared),
+        "the permission-only expression must not survive here either"
+    );
     assert.match(shared, /status: 401/);
     assert.match(shared, /status: 403/);
 });

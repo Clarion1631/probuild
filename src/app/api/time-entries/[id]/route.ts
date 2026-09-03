@@ -6,7 +6,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
-import { hasPermission } from "@/lib/access-rules";
+import { canActOnFinancials } from "@/lib/financial-access";
 import { timeEntryScalarSelect } from "@/lib/time-entry-projection";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
@@ -79,8 +79,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // burdenCost with it (round 8, finding 1). The permissions row is loaded
     // rather than inferred — see the same note in GET /api/time-entries.
     const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
-    const canSeePay =
-        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
+    // STAFF, then the permission — the shared predicate. A portal CLIENT
+    // holding `financialReports` used to see labor and burden cost on every
+    // entry they could read (round 15, finding 1).
+    const canSeePay = canActOnFinancials({ role: user.role, permissions: viewerPermissions });
     const responseSelect = timeEntryScalarSelect(canSeePay);
 
     const { id } = await params;

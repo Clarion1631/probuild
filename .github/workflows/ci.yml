@@ -291,6 +291,29 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # THE SCRIPT ITSELF, run end to end — the one thing nothing else did.
+      #
+      # The parity test reads it as text, the drift tests import its pure
+      # helpers, and the idempotency test runs it only against a database
+      # `migrate deploy` has ALREADY brought to the final shape, which is the one
+      # state where its whole DDL body is a no-op. So every statement that
+      # actually CREATES something had never been executed by anything but
+      # production. This builds the two states production has really been in —
+      # pre-Phase-5, and the "accidentally applied on 2026-09-02" shape with
+      # `payrollRevision` and the snapshot CHECK removed — and over each one:
+      # apply, `--dry-run` must exit 0 with zero drift, apply again for
+      # idempotency. `--target ci` takes the ambient URL, skips the production
+      # baseline and project-ref checks, and REFUSES any Supabase host, so this
+      # cannot reach a hosted database even by accident.
+      #
+      # Runs on its OWN database (probuild_apply_payroll) and last in the job, so
+      # it cannot disturb the steps above.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-payroll-phase5-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_payroll
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

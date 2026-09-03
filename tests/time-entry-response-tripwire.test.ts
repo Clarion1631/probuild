@@ -170,42 +170,42 @@ function isProvablySafe(arg: string): boolean {
  *                must appear in the same file.
  */
 const MANIFEST: Record<string, { kind: "serializer" | "select" | "no-entry"; via: string; why: string }> = {
-    "app/api/time-entries/route.ts:865": {
+    "app/api/time-entries/route.ts:869": {
         kind: "no-entry",
         via: "error.message",
         why: "a ClockOutInputError body; the spread only folds in `code`, which is why it needs saying rather than being obvious to the scanner",
     },
-    "app/api/time-entries/route.ts:89": {
+    "app/api/time-entries/route.ts:91": {
         kind: "select",
         via: "timeEntrySelect(canSeePay)",
         why: "GET: the list query itself is projected per audience",
     },
-    "app/api/time-entries/route.ts:346": {
+    "app/api/time-entries/route.ts:350": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "POST: the created row, projected at the boundary",
     },
-    "app/api/time-entries/route.ts:569": {
+    "app/api/time-entries/route.ts:573": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the up-front ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:888": {
+    "app/api/time-entries/route.ts:892": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the raced ALREADY_CLOCKED_OUT body embeds the entry",
     },
-    "app/api/time-entries/route.ts:906": {
+    "app/api/time-entries/route.ts:910": {
         kind: "serializer",
         via: "serializeTimeEntryJson",
         why: "PUT: the settled row after a successful clock-out",
     },
-    "app/api/time-entries/[id]/route.ts:195": {
+    "app/api/time-entries/[id]/route.ts:197": {
         kind: "select",
         via: "responseSelect",
         why: "PATCH telemetry branch: re-read with the audience projection",
     },
-    "app/api/time-entries/[id]/route.ts:648": {
+    "app/api/time-entries/[id]/route.ts:650": {
         kind: "select",
         via: "responseSelect",
         why: "PATCH edit branch: re-read with the audience projection",
@@ -231,9 +231,18 @@ test("the scanner finds the responses — the control", () => {
     const all = findResponses();
     // Without this every assertion below is vacuously true.
     assert.ok(all.length >= 60, `expected the time-entry responses to be found, got ${all.length}`);
+    // Named by its CLASSIFICATION, not by a line number. Pinning the line here
+    // meant every unrelated edit above it broke this control and taught the
+    // next person that the number is noise — which is the opposite of what a
+    // line-keyed manifest needs. The manifest is still line-keyed on purpose
+    // (that is the tripwire); this control just does not need to duplicate it.
+    const clockOut = Object.entries(MANIFEST).find(
+        ([, entry]) => entry.why === "PUT: the settled row after a successful clock-out"
+    );
+    assert.ok(clockOut, "the clock-out success response must still be classified");
     assert.ok(
-        all.some((response) => response.key.endsWith("route.ts:906")),
-        "the clock-out success response must be among them"
+        all.some((response) => response.key === clockOut![0]),
+        "the clock-out success response must be among the ones the scanner finds"
     );
 });
 

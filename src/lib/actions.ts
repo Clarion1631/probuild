@@ -15306,14 +15306,21 @@ export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: s
 // ============ Payroll (Phase 5 — docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md) ============
 
 /**
- * ADMIN, or the `financialReports` permission. Pay rates and payroll exports
- * are money, not team administration — the same gate the export endpoint uses,
- * so the panel and the download can never disagree about who may see rates.
+ * STAFF, and then ADMIN or the `financialReports` permission. Pay rates and
+ * payroll exports are money, not team administration — the same gate the
+ * export endpoint, the roster endpoint and the integration settings use, from
+ * ONE predicate, so they can never disagree about who may see rates.
+ *
+ * The staff half is not decoration: `financialReports` is an assignable
+ * permission, so it could be granted to a portal CLIENT, and this gate used to
+ * let that customer read and mutate the whole company's payroll (round 15,
+ * finding 1).
  */
 async function requirePayrollAccess() {
+    const { canActOnFinancials } = await import("./financial-access");
     const user = await getCurrentUserWithPermissions();
     if (!user) throw new Error("Not authenticated");
-    if (user.role !== "ADMIN" && !hasPermission(user, "financialReports")) throw new Error("Forbidden");
+    if (!canActOnFinancials(user)) throw new Error("Forbidden");
     return user;
 }
 

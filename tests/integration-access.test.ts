@@ -174,6 +174,19 @@ test("a FIELD_CREW member is 403, and nothing is written", async () => {
     assert.deepEqual(saved, [], "a refusal is not a partial write");
 });
 
+test("a CLIENT carrying financialReports is 403 — QuickBooks is not a customer screen", async () => {
+    // THE HOLE (round 15, finding 1). The gate was
+    // `role === "ADMIN" || hasPermission(user, "financialReports")`, and
+    // `financialReports` is assignable — so an admin could tick it on a portal
+    // CLIENT and hand that customer the GL map and, through the sibling routes,
+    // the QuickBooks OAuth credentials.
+    saved = [];
+    viewer = { id: "u-client", role: "CLIENT", permissions: { financialReports: true } };
+    const res = await POST(request({ glMappings: { "cc-1": "4000" } }));
+    assert.equal(res.status, 403);
+    assert.deepEqual(saved, [], "a refusal is not a partial write");
+});
+
 test("no session at all is 401", async () => {
     saved = [];
     viewer = null;

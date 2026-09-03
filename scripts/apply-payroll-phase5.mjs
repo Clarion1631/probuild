@@ -90,10 +90,45 @@ export const PROD_BASELINE_MIGRATION = "20260814000000_baseline_production";
  */
 export function expectedProdIdentity(env = {}) {
     return {
-        hostSuffix: env.PAYROLL_APPLY_EXPECT_HOST_SUFFIX || ".pooler.supabase.com",
-        database: env.PAYROLL_APPLY_EXPECT_DATABASE || "postgres",
+        hostSuffix: env.APPLY_EXPECT_HOST_SUFFIX || ".pooler.supabase.com",
+        database: env.APPLY_EXPECT_DATABASE || "postgres",
+        // NO DEFAULT, deliberately. The project ref is the only part of the
+        // connection that actually identifies WHICH Supabase project this is,
+        // and a default would be a guess about production baked into the repo.
+        // Unset is a refusal, not a pass.
+        projectRef: env.APPLY_EXPECT_PROJECT_REF || null,
         baseline: PROD_BASELINE_MIGRATION,
     };
+}
+
+/**
+ * The Supabase project ref carried in the connection USERNAME.
+ *
+ * Pooler hosts are shared REGIONALLY: every project in us-west-2 connects
+ * through `aws-0-us-west-2.pooler.supabase.com`, and every one of them has a
+ * database called `postgres`. So host + database identifies a REGION, not a
+ * project — which means the round-14 verifier would have accepted any other
+ * Supabase project in the same region as production (round 15, finding 2).
+ *
+ * The project is in the username: `postgres.<project-ref>`. That is the part
+ * that differs between two projects on the same pooler.
+ * A DIRECT connection carries it in the host instead
+ * (`db.<ref>.supabase.co`), so both are read — a future change of connection
+ * style must not silently turn the check off. Same parser as the other apply
+ * scripts, so one `APPLY_EXPECT_PROJECT_REF` covers all of them.
+ */
+export function projectRefFromUrl(raw) {
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        return null;
+    }
+    const user = decodeURIComponent(parsed.username || "");
+    const dotted = /^postgres\.([a-z0-9]+)$/i.exec(user);
+    if (dotted) return dotted[1];
+    const host = /^db\.([a-z0-9]+)\.supabase\.co$/i.exec(parsed.hostname || "");
+    return host ? host[1] : null;
 }
 
 export const TARGET_USAGE =
@@ -126,7 +161,14 @@ export function redactUrl(raw) {
 
 /** One line, safe to paste into a PR comment. */
 export function identityLine({ target, url, database, hasBaseline }) {
-    return `target=${target} at=${redactUrl(url)} current_database=${database} baseline=${hasBaseline ? "present" : "ABSENT"}`;
+    // The project ref is an IDENTIFIER, not a credential — it is in every
+    // Supabase dashboard URL — and it is the one field that says which project
+    // this is, so it belongs in the line that goes into the deploy notes.
+    const ref = projectRefFromUrl(url);
+    return (
+        `target=${target} at=${redactUrl(url)} project_ref=${ref ?? "(none)"} ` +
+        `current_database=${database} baseline=${hasBaseline ? "present" : "ABSENT"}`
+    );
 }
 
 /**
@@ -144,7 +186,30 @@ export function verifyTarget({ target, url, database, hasBaseline, env = {} }) {
     }
     const looksProduction = host.endsWith(expect.hostSuffix);
 
+    const ref = projectRefFromUrl(url);
+
     if (target === "prod") {
+        // THE PROJECT, before anything else. Host and database only narrow this
+        // to a region; two Supabase projects in us-west-2 are indistinguishable
+        // by them, and both answer `postgres` to current_database().
+        if (!expect.projectRef) {
+            return {
+                ok: false,
+                error: "REFUSING: APPLY_EXPECT_PROJECT_REF is not set. It is the only part of the connection that identifies WHICH Supabase project this is (pooler hosts are shared across a whole region), so --target prod cannot be verified without it. Set it to the production project ref.",
+            };
+        }
+        if (!ref) {
+            return {
+                ok: false,
+                error: `REFUSING: ${redactUrl(url)} carries no project ref in its username. A Supabase pooler connection is \`postgres.<project-ref>\`; this URL is not one.`,
+            };
+        }
+        if (ref !== expect.projectRef) {
+            return {
+                ok: false,
+                error: `REFUSING: this connection is Supabase project "${ref}", and APPLY_EXPECT_PROJECT_REF says production is "${expect.projectRef}". Same pooler host and same database name mean nothing here — pooler hosts are shared across a region.`,
+            };
+        }
         if (!looksProduction) {
             return {
                 ok: false,
@@ -166,10 +231,14 @@ export function verifyTarget({ target, url, database, hasBaseline, env = {} }) {
         return { ok: true };
     }
 
-    if (looksProduction) {
+    // A NON-PROD target must not be pointed at Supabase AT ALL — not just at
+    // the production pooler. A staging project is still somebody's real data,
+    // and `--target ci` is what the CI end-to-end driver runs, so this is the
+    // guard that keeps that driver from ever reaching a hosted database.
+    if (/supabase\.(co|com)$/i.test(host)) {
         return {
             ok: false,
-            error: `REFUSING: --target ${target}, but ${redactUrl(url)} IS the production pooler. Run it with --target prod, deliberately, or point DATABASE_URL somewhere else.`,
+            error: `REFUSING: --target ${target}, but ${redactUrl(url)} is a Supabase host. Run it with --target prod, deliberately, or point DATABASE_URL at a throwaway database.`,
         };
     }
     return { ok: true };

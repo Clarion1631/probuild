@@ -12,6 +12,7 @@
 // once, and every writer calls this.
 
 import { ADMIN_ROLES } from "./access-rules";
+import { isPayrollEligibleRole } from "./payroll-config";
 
 /** The roles a User row may hold. Same set the schema documents and the manager endpoint validated. */
 export const USER_ROLES = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE", "CLIENT"] as const;
@@ -91,6 +92,30 @@ export function checkUserMutation(input: {
     for (const key of permissionKeys) {
         if (!(ASSIGNABLE_PERMISSIONS as readonly string[]).includes(key)) {
             return { ok: false, status: 400, error: `Unknown permission: ${key}` };
+        }
+    }
+
+    // ---- the TARGET has to be able to hold what is being granted ----------
+    //
+    // A privileged permission on a portal CLIENT is not a permission, it is a
+    // customer with the keys to payroll and the integration credentials. Round
+    // 15 made every gate on that surface require a staff role as well as the
+    // permission, which closes it at the READING end; this closes it at the
+    // GRANTING end, so the row cannot exist in the first place.
+    //
+    // Before authority, with the other shape checks: an ADMIN doing this is
+    // making a mistake, not exceeding their authority, and telling them so is
+    // more useful than a 403.
+    if (!isPayrollEligibleRole(target.role)) {
+        const privilegedForNonStaff = permissionKeys.filter((key) =>
+            (PRIVILEGED_PERMISSIONS as readonly string[]).includes(key)
+        );
+        if (privilegedForNonStaff.length > 0) {
+            return {
+                ok: false,
+                status: 400,
+                error: `A ${target.role.toLowerCase()} account cannot hold ${privilegedForNonStaff.join(", ")} — those grant access to payroll, company settings and the integration credentials.`,
+            };
         }
     }
 
