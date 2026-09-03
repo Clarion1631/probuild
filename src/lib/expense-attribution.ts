@@ -932,8 +932,19 @@ export type ReattributionOutcome =
          * lock-free peek and the re-read under lock, so the row this write
          * would derive from is one the lock set does not cover. A 409 for a
          * caller; the next attempt re-peeks against the truth.
+         *
+         * "source-moved": the job the expense is LEAVING changed under the
+         * same peek. For a fallback-attributed row the job lives on the
+         * estimate, so it can move without either of the expense's own columns
+         * changing — the CAS would happily succeed on behalf of a caller
+         * authorized against a job the row no longer belongs to.
          */
-        reason: "no-such-expense" | "already-there" | "lost-the-race" | "target-moved";
+        reason:
+            | "no-such-expense"
+            | "already-there"
+            | "lost-the-race"
+            | "source-moved"
+            | "target-moved";
     };
 
 /** The transaction-client subset `reattributeExpense` needs. */
@@ -1056,6 +1067,22 @@ export async function reattributeExpense(
     // created after the peek, or the chosen one archived or moved to another
     // job. Refusing is the only safe answer — proceeding would write an
     // attribution derived from an unlocked row.
+    // THE SOURCE IS RE-READ TOO (round 44, item 2).
+    //
+    // Only the target used to be re-checked, and the source peek is the one
+    // that decides WHO IS ALLOWED to do this. For a fallback-attributed row the
+    // job comes from the estimate, so if that estimate moves from job A to job
+    // C in the gap, the expense's own two columns do not change at all: the CAS
+    // below still matches, and a caller authorized against A silently moves an
+    // expense that now belongs to C. The row never looked wrong; the authority
+    // did.
+    const lockedFromProjectId =
+        before.projectId ??
+        (before.estimateId ? await peekEstimateProjectId(tx, before.estimateId) : null);
+    if (lockedFromProjectId !== fromProjectId) {
+        return { moved: false, reason: "source-moved" };
+    }
+
     const lockedTarget = await tx.estimate.findFirst({
         where: targetEstimateWhere,
         orderBy: { createdAt: "desc" },

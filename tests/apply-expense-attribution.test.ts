@@ -23,6 +23,8 @@ import {
     expectedConstraints,
     expectedIndexes,
     expectedReceiptIntakeColumns,
+    backfillStatements,
+    DDL_STATEMENTS,
     AMOUNT_TAX_GUARD_DROP_SQL,
     AMOUNT_TAX_GUARD_SQL,
     COMPATIBILITY_TRIGGERS,
@@ -380,15 +382,23 @@ test("every updatedAt statement is re-runnable, and matches the migration", () =
     }
 });
 
-test("the DDL runs inside ONE transaction", () => {
+test("the run is TWO transactions: shape, then data", () => {
+    // ROUND 44, ITEM 1, replacing "the DDL runs inside ONE transaction".
+    //
     // A blip between the backfill and SET NOT NULL used to leave production
-    // half-migrated. Postgres is transactional for DDL; there is no reason to
-    // allow a partial apply.
+    // half-migrated, which is why round 13 made the whole run atomic. What that
+    // missed is the LOCK it held while being atomic: the first
+    // `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE until COMMIT, so the
+    // backfill's Project and Estimate row locks were taken while the whole
+    // Expense table was held — the other half of a cycle with any concurrent
+    // estimate move. Atomicity is re-argued through idempotency instead: every
+    // statement in both phases is re-runnable and the verifier checks the END
+    // state.
     const script = readFileSync(
         path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
         "utf8",
     );
-    const loopAt = script.indexOf("for (const sql of toRun)");
+    const loopAt = script.indexOf("for (const sql of sqlList)");
     assert.ok(loopAt > 0, "the run loop is still there");
     const run = script.slice(loopAt);
     assert.match(script, /await prisma\.\$transaction\(async tx =>/);
@@ -397,11 +407,56 @@ test("the DDL runs inside ONE transaction", () => {
         script.indexOf("$transaction(async tx =>") < loopAt,
         "the loop is INSIDE the transaction",
     );
-    // ...and --post-deploy is the same loop, not a second one that could drift.
+    // ONE loop, called twice — not two loops that could drift.
     assert.equal(
-        script.split("for (const sql of toRun)").length - 1, 1,
+        script.split("for (const sql of sqlList)").length - 1, 1,
         "one loop, whichever set it is given",
     );
+    // ...and it IS called twice, phase A before phase B.
+    const aAt = script.indexOf('runPhase("phase A');
+    const bAt = script.indexOf('runPhase("phase B');
+    assert.ok(aAt > 0 && bAt > 0, "both phases are run");
+    assert.ok(aAt < bAt, "shape commits before data asks for a parent row");
+});
+
+test("phase A takes no Project or Estimate lock, and phase B is the backfills", () => {
+    // The property the split exists for, asserted on the DATA rather than on
+    // the prose: nothing in the DDL phase may name `Project` or `Estimate` as
+    // a locking target, and every statement that does must be in phase B.
+    for (const sql of DDL_STATEMENTS as string[]) {
+        // A `CREATE OR REPLACE FUNCTION` body is COMPILED, not executed: the
+        // split-job guard's body reads "Estimate", but only later, when the
+        // trigger fires on somebody else's transaction. The CREATE itself
+        // takes no lock on it. Everything else is judged on what it does NOW.
+        const executesNow = /^CREATE\s+OR\s+REPLACE\s+FUNCTION/i.test(sql.trimStart())
+            ? sql.slice(0, sql.search(/AS\s+\$/i))
+            : sql;
+        assert.ok(
+            !/FOR\s+(SHARE|UPDATE|KEY\s+SHARE)/i.test(executesNow),
+            `phase A must take no row locks:\n  ${sql.slice(0, 120)}`,
+        );
+        assert.ok(
+            !/FROM\s+"Project"|FROM\s+"Estimate"/i.test(executesNow),
+            `phase A must not read a parent table:\n  ${sql.slice(0, 120)}`,
+        );
+    }
+    // The FK DO-blocks read pg_constraint, not the parent tables, so they are
+    // allowed above; this pins that they really are the only survivors.
+    assert.ok((DDL_STATEMENTS as string[]).some(s => s.includes("Expense_estimateId_fkey")));
+
+    // Phase B is exactly the re-runnable set — one definition, so the two
+    // cannot drift.
+    assert.deepEqual(
+        backfillStatements("America/Los_Angeles"),
+        postDeployStatements("America/Los_Angeles"),
+    );
+    // ...and the combined list the migration is checked against is A then B.
+    const all = statements as string[];
+    assert.deepEqual(all.slice(0, (DDL_STATEMENTS as string[]).length), DDL_STATEMENTS);
+    for (const sql of [PROJECT_ID_BACKFILL_LOCK_PROJECTS, PROJECT_ID_BACKFILL, SOURCE_FILE_ID_BACKFILL]) {
+        assert.ok(all.includes(sql as string), "every backfill is still in the committed set");
+        assert.ok(!(DDL_STATEMENTS as string[]).includes(sql as string), "and none of them is in phase A");
+    }
 });
 
 test("taxSource is declared everywhere the other tax columns are", () => {

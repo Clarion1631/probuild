@@ -48,6 +48,8 @@ import {
 import { createParsedReceiptExpense } from "../src/lib/receipt-parse-expense";
 import { runBackfill } from "../scripts/backfill-expense-attribution";
 import {
+    backfillStatements,
+    DDL_STATEMENTS,
     PROJECT_ID_BACKFILL,
     PROJECT_ID_BACKFILL_LOCK_PROJECTS,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -1032,6 +1034,209 @@ test("an estimate created between the peek and the lock is REFUSED, not moved on
             select: { projectId: true, estimateId: true },
         });
         assert.deepEqual(untouched, { projectId: PROJECT, estimateId: ESTIMATE }, "nothing moved");
+    } finally {
+        await cleanupTwoJobs();
+    }
+});
+
+// ── the WHOLE production sequence, against a live writer (round 44, item 1) ─
+//
+// The tests above run the two backfill statements. They cannot see the lock the
+// migration actually holds: the first `ALTER TABLE "Expense"` takes ACCESS
+// EXCLUSIVE on the table and keeps it until COMMIT, so running the backfill in
+// that same transaction means holding the Expense TABLE while reaching for
+// Project and Estimate ROW locks. A concurrent estimate move — holding its
+// Estimate row and needing to read Expense — is the other half of a cycle.
+//
+// These execute the SHIPPED statement lists, imported from the apply script
+// (inert on import, asserted by tests/apply-scripts-inert-on-import.test.ts),
+// so what is measured is the sequence that will run against production.
+
+/** A bookkeeper's estimate move: hold the Estimate row, then read Expense. */
+function estimateMover(held: ReturnType<typeof gate>) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, ESTIMATE);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 900));
+                // Reading Expense needs the table, which phase A holds while it
+                // is inside the same transaction as the backfill.
+                await tx.$executeRawUnsafe(`SELECT count(*)::int FROM "Expense" WHERE "estimateId" = $1`, ESTIMATE);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+test("CONTROL: the whole sequence in ONE transaction deadlocks a live estimate move", { skip }, async () => {
+    // The pre-fix shape: DDL first, backfill after, all in one transaction.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const held = gate();
+        const mover = estimateMover(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+            for (const sql of [...(DDL_STATEMENTS as string[]), ...backfillStatements("UTC")]) {
+                await tx.$executeRawUnsafe(sql);
+            }
+        }, { timeout: 60_000 }).catch(caught => { writerError = caught; });
+
+        await mover.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(mover.error),
+            `expected 40P01 from holding the Expense table across the backfill; migration=${writerError} mover=${mover.error}`,
+        );
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the SHIPPED two-phase sequence waits instead, and lands the right state", { skip }, async () => {
+    // Phase A commits — releasing the Expense table — before phase B asks for
+    // its first Project row. The mover finishes; the migration then proceeds.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const held = gate();
+        const mover = estimateMover(held);
+        await held.reached;
+
+        let writerError: unknown = null;
+        try {
+            await writerDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                for (const sql of DDL_STATEMENTS as string[]) await tx.$executeRawUnsafe(sql);
+            }, { timeout: 60_000 });
+            await writerDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '20s'`);
+                for (const sql of backfillStatements("UTC")) await tx.$executeRawUnsafe(sql);
+            }, { timeout: 60_000 });
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await mover.done;
+
+        assert.equal(deadlocked(writerError), false, `the migration was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(mover.error), false, `the estimate move was killed by a deadlock: ${mover.error}`);
+        assert.equal(writerError, null, `the migration failed: ${writerError}`);
+        assert.equal(mover.error, null, `the estimate move failed: ${mover.error}`);
+
+        // Waiting is only the right answer if the work still happened: the
+        // fallback-attributed row is attributed, which is what phase B is for.
+        const filled = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true },
+        });
+        assert.deepEqual(filled, { projectId: PROJECT }, "phase B ran and attributed the row");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("a crash between the phases is safe to re-run", { skip }, async () => {
+    // Atomicity is re-argued through idempotency, so this is the claim that
+    // replaces "all or nothing": run phase A, stop, then run BOTH phases again
+    // from the top and land in the same state with no error.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        await writerDb!.$transaction(async tx => {
+            for (const sql of DDL_STATEMENTS as string[]) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 60_000 });
+
+        // ...the "crash" is simply not running phase B. Now re-run everything.
+        await writerDb!.$transaction(async tx => {
+            for (const sql of DDL_STATEMENTS as string[]) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 60_000 });
+        await writerDb!.$transaction(async tx => {
+            for (const sql of backfillStatements("UTC")) await tx.$executeRawUnsafe(sql);
+        }, { timeout: 60_000 });
+
+        const filled = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true },
+        });
+        assert.deepEqual(filled, { projectId: PROJECT }, "the end state is the same either way");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the SOURCE estimate moving between the peek and the lock is REFUSED", { skip }, async () => {
+    // ROUND 44, ITEM 2. Only the target used to be re-checked, and the source
+    // peek is the one that decides WHO IS ALLOWED to do this. For a
+    // fallback-attributed row the job comes from the estimate, so when that
+    // estimate moves from job A to job C in the gap, the expense's own two
+    // columns do not change at all: the CAS still matches, and a caller
+    // authorized against A moves an expense that now belongs to C. The row
+    // never looked wrong; the authority did.
+    await seedTwoJobs();
+    // FALLBACK-ATTRIBUTED: the job lives on the estimate, which is the only
+    // shape in which the source can move invisibly.
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        let peeks = 0;
+        const outcome = await writerDb!.$transaction(async tx => {
+            const real = tx as unknown as Record<string, unknown>;
+            const client = new Proxy(real, {
+                get(target, prop: string) {
+                    if (prop !== "$queryRawUnsafe") return target[prop];
+                    const raw = target.$queryRawUnsafe as (q: string, ...v: unknown[]) => Promise<unknown>;
+                    return async (query: string, ...values: unknown[]) => {
+                        const answer = await raw.call(target, query, ...values);
+                        // The SOURCE peek is the first unlocked read of the
+                        // estimate's project. Right after it, a second
+                        // connection moves that estimate to the target job.
+                        if (/SELECT "projectId" FROM "Estimate"/.test(query) && ++peeks === 1) {
+                            await editorDb!.estimate.update({
+                                where: { id: ESTIMATE },
+                                data: { projectId: TARGET_PROJECT },
+                            });
+                        }
+                        return answer;
+                    };
+                },
+            });
+            return reattributeExpense(client as never, { expenseId: EXPENSE, toProjectId: TARGET_PROJECT });
+        }, { timeout: 30_000 });
+
+        assert.deepEqual(outcome, { moved: false, reason: "source-moved" });
+        const untouched = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true, estimateId: true },
+        });
+        assert.deepEqual(
+            untouched,
+            { projectId: null, estimateId: ESTIMATE },
+            "nothing moved under a stale authority",
+        );
+    } finally {
+        await editorDb!.estimate.updateMany({ where: { id: ESTIMATE }, data: { projectId: PROJECT } });
+        await cleanupTwoJobs();
+    }
+});
+
+test("...and a source that stays put still moves", { skip }, async () => {
+    // The control: the source re-read must not refuse the ordinary case.
+    await seedTwoJobs();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        const outcome = await writerDb!.$transaction(
+            async tx => reattributeExpense(tx as never, { expenseId: EXPENSE, toProjectId: TARGET_PROJECT }),
+            { timeout: 30_000 },
+        );
+        assert.deepEqual(outcome, { moved: true, projectId: TARGET_PROJECT, estimateId: TARGET_ESTIMATE });
     } finally {
         await cleanupTwoJobs();
     }

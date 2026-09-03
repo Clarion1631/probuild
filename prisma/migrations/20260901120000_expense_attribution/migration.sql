@@ -31,20 +31,6 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,3
 -- category group and the file id alone is not a per-row identity.
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceFileId" TEXT;
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceGroupIndex" INTEGER;
--- BACKFILL FROM THE URL, BUT ONLY WHERE THE ID IS UNAMBIGUOUS. Both shapes the
--- app has ever produced carry it (`/d/<id>` and `id=<id>`); anything else is
--- left NULL rather than guessed, since a wrong id would dedupe two unrelated
--- documents together. Idempotent by the IS NULL predicate.
-UPDATE "Expense"
-   SET "sourceFileId" = COALESCE(
-         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
-         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
-       )
- WHERE "sourceFileId" IS NULL
-   AND COALESCE(
-         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
-         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
-       ) IS NOT NULL;
 -- Mixed receipts: the portion actually resold, when it is less than the whole
 -- pre-tax total. NULL means "all of it", and is only reached on a row a human
 -- has explicitly flagged installed-at-customer.
@@ -436,54 +422,6 @@ EXECUTE FUNCTION probuild_expense_amount_tax_guard();
 -- transaction. Kept byte-identical in meaning to PROJECT_ID_BACKFILL in
 -- scripts/apply-expense-attribution.mjs (asserted by
 -- tests/apply-expense-attribution.test.ts).
--- THE JOBS FIRST (round 41, item 1). The UPDATE below is not the
--- estimate-only statement it looks like: the foreign key added by this same
--- migration makes Postgres take FOR KEY SHARE on every referenced Project row
--- to enforce it, so its real order is Estimate -> Project. A job editor
--- holding its Project row FOR UPDATE while reaching for an estimate closes the
--- cycle, and Postgres breaks it with 40P01 -- which here means the whole
--- migration transaction, not one row.
---
--- A separate STATEMENT rather than another CTE, because CTE evaluation order
--- is not guaranteed and "lock the projects in an earlier CTE" would be a hope
--- rather than a rule. Two statements in one transaction have a defined order,
--- and the first one's locks are held for the second. Kept byte-identical in
--- meaning to PROJECT_ID_BACKFILL_LOCK_PROJECTS in
--- scripts/apply-expense-attribution.mjs (asserted by
--- tests/apply-expense-attribution.test.ts).
-SELECT p.id
-  FROM "Project" p
- WHERE p.id IN (
-       SELECT DISTINCT est."projectId"
-         FROM "Estimate" est
-        WHERE est."projectId" IS NOT NULL
-          AND EXISTS (
-                SELECT 1 FROM "Expense" e
-                 WHERE e."estimateId" = est.id AND e."projectId" IS NULL
-              )
-     )
- ORDER BY p.id
-   FOR SHARE;
-
-WITH locked AS (
-  SELECT est.id, est."projectId"
-    FROM "Estimate" est
-   WHERE est."projectId" IS NOT NULL
-     AND EXISTS (
-           SELECT 1 FROM "Expense" e
-            WHERE e."estimateId" = est.id AND e."projectId" IS NULL
-         )
-   ORDER BY est.id
-     FOR SHARE
-)
-UPDATE "Expense" e SET "projectId" = locked."projectId"
-  FROM locked
- WHERE e."estimateId" = locked.id AND e."projectId" IS NULL;
-
--- ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
--- merge order: if Phase 1 has not landed in the target database yet, these two
--- columns are skipped and Phase 1's own migration creates the table without
--- them, at which point re-running this script adds them.
 -- AN ESTIMATE MAY NOT DELETE SPEND (round 42, item 4b).
 --
 -- `Expense_estimateId_fkey` was NOT NULL + ON DELETE CASCADE, so deleting an
@@ -532,6 +470,85 @@ DO $$ BEGIN
     ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
   END IF;
 END $$;
+
+-- ================= PHASE B: THE DATA =================
+--
+-- Everything above is SHAPE. In production these two halves run as TWO
+-- SEPARATE TRANSACTIONS (scripts/apply-expense-attribution.mjs, round 44,
+-- item 1): the first ALTER TABLE takes ACCESS EXCLUSIVE on Expense and holds
+-- it to COMMIT, so taking Project and Estimate row locks in that same
+-- transaction is the other half of a cycle with any concurrent estimate move.
+-- Phase A commits and releases the table; phase B then takes the parents.
+--
+-- This FILE is replayed by Prisma inside ONE transaction and there is no
+-- supported way to split one. That costs nothing: a migration only ever runs
+-- against a fresh CI or dev database where nothing else is writing. What the
+-- file must get right is the ORDER, which is why the statements are grouped
+-- this way rather than interleaved.
+
+-- THE JOBS FIRST (round 41, item 1). The UPDATE below is not the
+-- estimate-only statement it looks like: the foreign key added by this same
+-- migration makes Postgres take FOR KEY SHARE on every referenced Project row
+-- to enforce it, so its real order is Estimate -> Project. A job editor
+-- holding its Project row FOR UPDATE while reaching for an estimate closes the
+-- cycle, and Postgres breaks it with 40P01 -- which here means the whole
+-- migration transaction, not one row.
+--
+-- A separate STATEMENT rather than another CTE, because CTE evaluation order
+-- is not guaranteed and "lock the projects in an earlier CTE" would be a hope
+-- rather than a rule. Two statements in one transaction have a defined order,
+-- and the first one's locks are held for the second. Kept byte-identical in
+-- meaning to PROJECT_ID_BACKFILL_LOCK_PROJECTS in
+-- scripts/apply-expense-attribution.mjs (asserted by
+-- tests/apply-expense-attribution.test.ts).
+SELECT p.id
+  FROM "Project" p
+ WHERE p.id IN (
+       SELECT DISTINCT est."projectId"
+         FROM "Estimate" est
+        WHERE est."projectId" IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM "Expense" e
+                 WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+              )
+     )
+ ORDER BY p.id
+   FOR SHARE;
+
+WITH locked AS (
+  SELECT est.id, est."projectId"
+    FROM "Estimate" est
+   WHERE est."projectId" IS NOT NULL
+     AND EXISTS (
+           SELECT 1 FROM "Expense" e
+            WHERE e."estimateId" = est.id AND e."projectId" IS NULL
+         )
+   ORDER BY est.id
+     FOR SHARE
+)
+UPDATE "Expense" e SET "projectId" = locked."projectId"
+  FROM locked
+ WHERE e."estimateId" = locked.id AND e."projectId" IS NULL;
+
+-- BACKFILL FROM THE URL, BUT ONLY WHERE THE ID IS UNAMBIGUOUS. Both shapes the
+-- app has ever produced carry it (`/d/<id>` and `id=<id>`); anything else is
+-- left NULL rather than guessed, since a wrong id would dedupe two unrelated
+-- documents together. Idempotent by the IS NULL predicate.
+UPDATE "Expense"
+   SET "sourceFileId" = COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       )
+ WHERE "sourceFileId" IS NULL
+   AND COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       ) IS NOT NULL;
+
+-- ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
+-- merge order: if Phase 1 has not landed in the target database yet, these two
+-- columns are skipped and Phase 1's own migration creates the table without
+-- them, at which point re-running this script adds them.
 
 -- ...and the guard comes back out. In production this half is the
 -- --post-deploy pass, run once the old instances have drained; here it runs

@@ -710,7 +710,29 @@ export const SPLIT_JOB_REPAIR =
         AND e."projectId" <> locked."projectId"`;
 
 
-export const statements = [
+/**
+ * PHASE A: SHAPE ONLY. NOTHING HERE TOUCHES `Project` OR `Estimate`
+ * (Codex round 44, item 1).
+ *
+ * The first `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE on the whole table
+ * and holds it until COMMIT. Running the backfill in that same transaction
+ * therefore meant: hold the Expense table, then reach for Project and Estimate
+ * ROW locks. A concurrent estimate move holding its Estimate row and needing to
+ * read Expense closes the cycle, and Postgres breaks it with 40P01 -- killing
+ * either the migration mid-run or the bookkeeper's save.
+ *
+ * So the run is TWO transactions now, and this is the first: every DDL
+ * statement, plus the three Expense-only normalisations that a CHECK or a
+ * `SET NOT NULL` in this same phase depends on. It takes no row lock outside
+ * `Expense`, so nothing it holds can participate in a cross-table cycle, and it
+ * commits -- releasing the table -- before phase B asks for a parent.
+ *
+ * Every statement is additive and idempotent (`IF NOT EXISTS`, `DROP`-then-`ADD`
+ * by name, guarded `DO` blocks), so a crash between the two phases is safe to
+ * re-run from the top. The verification pass checks the END state, not that a
+ * particular transaction committed.
+ */
+export const DDL_STATEMENTS = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAmount" DECIMAL(65,30)`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false`,
@@ -726,9 +748,8 @@ export const statements = [
     // Which group of that document this row is: one receipt becomes one
     // Expense per category group, so the file id alone is not a row identity.
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceGroupIndex" INTEGER`,
-    // ...and fill it for the rows that predate the column. See the POST-DEPLOY
-    // note above SOURCE_FILE_ID_BACKFILL.
-    SOURCE_FILE_ID_BACKFILL,
+    // (The fill for the rows that predate this column is PHASE B -- see
+    // SOURCE_FILE_ID_BACKFILL and the two-transaction note above.)
     // Mixed receipts: the portion actually resold, when it is less than the
     // whole pre-tax total. NULL means "all of it".
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30)`,
@@ -908,12 +929,9 @@ END $$`,
     // added above. See SPLIT_JOB_GUARD_SQL and AMOUNT_TAX_GUARD_SQL.
     ...SPLIT_JOB_GUARD_SQL,
     ...AMOUNT_TAX_GUARD_SQL,
-    // See PROJECT_ID_BACKFILL and the POST-DEPLOY note above it. The jobs are
-    // share-locked FIRST, in their own statement, because the UPDATE below
-    // takes FOR KEY SHARE on them through the new foreign key (round 41,
-    // item 1) -- Estimate -> Project otherwise, which deadlocks the whole run.
-    PROJECT_ID_BACKFILL_LOCK_PROJECTS,
-    PROJECT_ID_BACKFILL,
+    // (The projectId backfill is PHASE B: it is the statement that takes
+    // Project and Estimate row locks, and it must not run while this phase
+    // holds ACCESS EXCLUSIVE on Expense. See DDL_STATEMENTS.)
 
     // ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
     // merge order: if Phase 1 has not landed in the target database yet, these
@@ -964,6 +982,44 @@ END $$`,
          ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
        END IF;
      END $$`,
+];
+
+/**
+ * PHASE B: THE DATA, IN THE CANONICAL LOCK ORDER (round 44, item 1).
+ *
+ * Projects first, then Estimates, then the Expense rows the UPDATE touches —
+ * and in its OWN transaction, so the Expense table lock phase A took is long
+ * released by the time any parent is asked for.
+ *
+ * It is exactly `postDeployStatements`, which is not a coincidence and is the
+ * point: the post-deploy pass exists to re-run the backfills against rows the
+ * old build wrote during the drain window, so "the data phase" and "the
+ * re-runnable half" are the same set of statements by construction. One
+ * definition means the two can never drift.
+ */
+export function backfillStatements(timeZone) {
+    return postDeployStatements(timeZone);
+}
+
+/**
+ * EVERY statement the main run executes, in run order — phase A then phase B.
+ *
+ * Kept as one exported list because that is what the committed migration has to
+ * contain and what tests/apply-expense-attribution.test.ts checks it against. A
+ * migration file is replayed by Prisma inside a SINGLE transaction and there is
+ * no supported way to split one, which costs nothing: it only ever runs against
+ * a fresh CI or dev database where nothing else is writing. Production gets the
+ * two-transaction treatment through this script, which is the only place the
+ * concurrency exists.
+ *
+ * `reanchorSql` needs the company time zone, so this list holds the three
+ * zone-free backfills and `main()` splices the re-anchor in beside them.
+ */
+export const statements = [
+    ...DDL_STATEMENTS,
+    PROJECT_ID_BACKFILL_LOCK_PROJECTS,
+    PROJECT_ID_BACKFILL,
+    SOURCE_FILE_ID_BACKFILL,
 ];
 
 /**
@@ -1234,13 +1290,32 @@ async function main() {
         const { timeZone: companyTimeZone, from: zoneFrom } = pickCompanyTimeZone(settingsRows);
         console.log(`company time zone for the date re-anchor: ${companyTimeZone} (from ${zoneFrom})`);
 
-        // ONE TRANSACTION FOR THE WHOLE THING (Codex round 13, item 6).
+        // TWO TRANSACTIONS: SHAPE, THEN DATA (round 44, item 1 — this replaces
+        // the "one transaction for the whole thing" rule of round 13, item 6).
         //
-        // Postgres is transactional for DDL, so there is no reason for this to
-        // be able to stop half-way: a network blip between the backfill and
-        // `SET NOT NULL` used to leave production with a column the next run
-        // had to repair, and one wrong statement used to leave every statement
-        // before it applied. Either the whole shape lands or none of it does.
+        // Round 13 made the whole run atomic so a network blip could not leave
+        // production half-migrated, and that reasoning still holds WITHIN each
+        // phase. What it missed is the lock it was holding while it did so: the
+        // first `ALTER TABLE "Expense"` takes ACCESS EXCLUSIVE on the table and
+        // keeps it until COMMIT, so running the backfill in the same
+        // transaction meant holding the Expense table and THEN reaching for
+        // Project and Estimate row locks. A concurrent estimate move holding
+        // its Estimate row and needing to read Expense is the other half of a
+        // cycle, and Postgres breaks a cycle by killing somebody — here, the
+        // migration mid-run or the bookkeeper's save.
+        //
+        // Phase A is every DDL statement and the Expense-only normalisations a
+        // CHECK depends on: no row lock outside `Expense`, so nothing it holds
+        // can take part in a cross-table cycle. It commits, releasing the
+        // table. Phase B then takes Projects, Estimates and Expense rows in the
+        // canonical order with the table free.
+        //
+        // ATOMICITY IS NOT LOST, it is re-argued: every statement in both
+        // phases is additive and idempotent, so a crash between them is safe to
+        // re-run from the top, and the verification pass below checks the END
+        // STATE rather than that any particular transaction committed. That is
+        // a stronger guarantee than "all or nothing" for a script whose whole
+        // design is to be re-runnable.
         //
         // The timeout is generous because a backfill over the Expense table on
         // a cold connection is not a five-second operation, and the default
@@ -1259,9 +1334,13 @@ async function main() {
             console.error("--repair-split-jobs is only valid together with --post-deploy.");
             process.exit(1);
         }
-        const toRun = postDeployOnly
+        // Phase A is skipped entirely on --post-deploy: the shape has already
+        // landed, and the point of that mode is to be an obviously-narrow
+        // second pass over the rows the old build wrote while it drained.
+        const phaseA = postDeployOnly ? [] : DDL_STATEMENTS;
+        const phaseB = postDeployOnly
             ? [...postDeployStatements(companyTimeZone), ...postDeployTeardownStatements({ repairSplitJobs })]
-            : [...statements, reanchorSql(companyTimeZone)];
+            : backfillStatements(companyTimeZone);
         if (postDeployOnly) {
             console.log("--post-deploy: the three backfills, then BOTH compatibility guards come out (see PROJECT_ID_BACKFILL and AMOUNT_TAX_GUARD_SQL).");
             console.log(
@@ -1270,20 +1349,29 @@ async function main() {
                     : "split-job repair NOT running (pass --repair-split-jobs to enable it; the verifier below reports the count either way).",
             );
         }
-        await prisma.$transaction(async tx => {
-            for (const sql of toRun) {
-                const label = sql.replace(/\s+/g, " ").slice(0, 84);
-                process.stdout.write(`  ${label} ... `);
-                const affected = await tx.$executeRawUnsafe(sql);
-                // Print the row count for the backfill: a SECOND run reporting
-                // 0 is the whole idempotency proof, and a silent "ok" hides it.
-                // `WITH` as well as `UPDATE`: PROJECT_ID_BACKFILL is now a
-                // data-modifying CTE (it locks the estimates it reads), and
-                // matching only on "UPDATE" silently dropped the one row count
-                // this script's idempotency argument rests on.
-                console.log(/^(UPDATE|WITH)\b/i.test(sql.trimStart()) ? `ok (${affected} rows)` : "ok");
-            }
-        }, { timeout: 300_000, maxWait: 60_000 });
+        const runPhase = async (label, sqlList) => {
+            if (!sqlList.length) return;
+            console.log(`\n-- ${label} --`);
+            await prisma.$transaction(async tx => {
+                for (const sql of sqlList) {
+                    const head = sql.replace(/\s+/g, " ").slice(0, 84);
+                    process.stdout.write(`  ${head} ... `);
+                    const affected = await tx.$executeRawUnsafe(sql);
+                    // Print the row count for the backfill: a SECOND run
+                    // reporting 0 is the whole idempotency proof, and a silent
+                    // "ok" hides it. `WITH` as well as `UPDATE`:
+                    // PROJECT_ID_BACKFILL is a data-modifying CTE (it locks the
+                    // estimates it reads), and matching only on "UPDATE"
+                    // silently dropped the one row count this script's
+                    // idempotency argument rests on.
+                    console.log(/^(UPDATE|WITH)\b/i.test(sql.trimStart()) ? `ok (${affected} rows)` : "ok");
+                }
+            }, { timeout: 300_000, maxWait: 60_000 });
+        };
+        // ORDER IS THE POINT: A commits and releases the Expense table before B
+        // asks for its first Project row.
+        await runPhase("phase A: shape (no Project/Estimate locks)", phaseA);
+        await runPhase("phase B: data (Projects, then Estimates, then rows)", phaseB);
 
         // Verify shape rather than trusting the run.
         for (const [table, columns] of Object.entries(expectedColumns)) {

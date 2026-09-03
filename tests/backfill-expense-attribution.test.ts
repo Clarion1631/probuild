@@ -204,9 +204,31 @@ function createStub(
                 // inside the lock, so the stub has to honour that filter — and
                 // serve whatever `items` says NOW, not a snapshot.
                 async findMany(args?: { where?: Record<string, any> }) {
-                    const wantProject = args?.where?.estimate?.projectId ?? null;
-                    if (!wantProject) return items;
-                    return items.filter(item => (item.estimate?.projectId ?? null) === wantProject);
+                    // OWNERSHIP IS LOADED FOR EVERY LINKED ITEM (round 44,
+                    // item 3), so the real query now selects `costCode.isActive`
+                    // and normalises a retired code to null itself. The stub
+                    // defaults it to ACTIVE, and the retired-code tests below
+                    // set `costCode: { isActive: false }` explicitly — which is
+                    // what the production query would return for them.
+                    const withCode = (item: any) => ({
+                        costCode: { isActive: true },
+                        ...item,
+                    });
+                    // The stub HONOURS a code filter when one is asked for.
+                    // It did not, which meant a `where` narrowing the ownership
+                    // map back to coded/active items was invisible here — the
+                    // exact regression round 44 item 3 fixed would have passed
+                    // every test in this file.
+                    const where = args?.where ?? {};
+                    const wantProject = where.estimate?.projectId ?? null;
+                    return items
+                        .filter(item => !wantProject || (item.estimate?.projectId ?? null) === wantProject)
+                        .map(withCode)
+                        .filter((item: any) => {
+                            if (where.costCodeId?.not === null && item.costCodeId === null) return false;
+                            if (where.costCode?.isActive === true && !item.costCode?.isActive) return false;
+                            return true;
+                        });
                 },
                 async findUnique(args: { where: { id: string } }) {
                     const item = items.find(candidate => candidate.id === args.where.id);
@@ -1227,12 +1249,17 @@ test("a phase REMOVED from the job after the plan blocks the write", async () =>
     // Removed AFTER the plan has read the phase list, so the plan genuinely
     // decides cc-plumb and only the write-phase re-read can catch it. (Removing
     // it earlier would make this pass for the wrong reason: nothing planned.)
+    // Keyed on the QUERY SHAPE, not on a call ordinal: the ownership map now
+    // loads only the items expenses actually link to (round 44, item 3), so a
+    // fixture with no `itemId` skips that read entirely and every "the Nth
+    // read" counter shifts under it. The plan's phase-list build is the one
+    // scoped by `estimate.projectId`; clearing right after it leaves the
+    // write-phase re-read looking at the truth.
     const readItems = stub.db.estimateItem.findMany;
-    let itemReads = 0;
+    let phaseListReads = 0;
     stub.db.estimateItem.findMany = async (args?: any) => {
         const rows = (await readItems(args)).map((item: any) => ({ ...item }));
-        itemReads += 1;
-        if (itemReads === 2) stub.items.length = 0;
+        if (args?.where?.estimate && ++phaseListReads === 1) stub.items.length = 0;
         return rows;
     };
 
@@ -1365,5 +1392,84 @@ test("round 36 item 3: the backfill PLAN skips a cleared phase, not just its wri
         offered,
         ["machine", "untouched"],
         "a phase a person deliberately cleared must not be offered back to them",
+    );
+});
+
+// ── a cross-job link is reported whatever its code (round 44, item 3) ───────
+
+test("a cross-job item with a NULL code is reported, not silently guessed at", async () => {
+    // THE CASE FROM THE REVIEW. The ownership map was filtered to items with a
+    // non-null, ACTIVE cost code, so it answered two questions at once: "who
+    // owns this item" and "is its code usable". A cross-job item whose code is
+    // null looked MISSING rather than foreign, the writer read that as "no
+    // answer either way", and the row fell through to regex suggestion — the
+    // vendor rule then coded it and nobody ever saw the broken link.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i-other", vendor: "Summit Plumbing" })],
+        [{ id: "i-other", costCodeId: null, estimateId: "est-job-2", estimate: { projectId: "job-2" } }],
+    );
+    const { plan } = await runBackfill({ db: stub.db, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(plan.codeFills, [], "no guess is written over a link nobody has checked");
+    assert.deepEqual(
+        plan.remainder.map((row: any) => [row.id, row.reason]),
+        [["e1", "item-outside-estimate"]],
+        "it is reported for a human to fix",
+    );
+});
+
+test("...and so is one whose code is RETIRED", async () => {
+    // Same shape, the other half of the old filter: `costCode: { isActive:
+    // true }`. A retired code is not a usable code, but it says nothing about
+    // who owns the item.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i-other", vendor: "Summit Plumbing" })],
+        [{
+            id: "i-other", costCodeId: "cc-retired", estimateId: "est-job-2",
+            estimate: { projectId: "job-2" }, costCode: { isActive: false },
+        } as never],
+    );
+    const { plan } = await runBackfill({ db: stub.db, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(plan.codeFills, []);
+    assert.deepEqual(
+        plan.remainder.map((row: any) => [row.id, row.reason]),
+        [["e1", "item-outside-estimate"]],
+    );
+});
+
+test("a SAME-job item with a retired code still falls through to the rules", async () => {
+    // The control, and the reason ownership and eligibility are separate
+    // questions: this link is fine, so the only thing wrong with it is the
+    // code — which is exactly the case the vendor rules exist for.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i-own", vendor: "Summit Plumbing" })],
+        [
+            {
+                id: "i-own", costCodeId: "cc-retired", estimateId: "est-job-1",
+                estimate: { projectId: "job-1" }, costCode: { isActive: false },
+            } as never,
+            { id: "i-phase", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } },
+        ],
+    );
+    const { plan } = await runBackfill({ db: stub.db, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(
+        plan.codeFills.map((fill: any) => [fill.id, fill.costCodeId, fill.costCodeSource]),
+        [["e1", "cc-plumb", "ai"]],
+        "the link is sound, so the rules get their turn",
+    );
+    assert.deepEqual(plan.remainder, []);
+});
+
+test("a SAME-job item with a usable code is still copied, not suggested", async () => {
+    // The other control: reordering the checks must not stop the item fallback
+    // working when it should.
+    const stub = createStub(
+        [expense({ id: "e1", projectId: "job-1", itemId: "i-own", vendor: "Summit Plumbing" })],
+        [{ id: "i-own", costCodeId: "cc-plumb", estimateId: "est-job-1", estimate: { projectId: "job-1" } }],
+    );
+    const { plan } = await runBackfill({ db: stub.db, log: () => {}, overheadProjectId: OVERHEAD_ID });
+    assert.deepEqual(
+        plan.codeFills.map((fill: any) => [fill.id, fill.costCodeId, fill.costCodeSource]),
+        [["e1", "cc-plumb", "backfill"]],
+        "copied from the item, not guessed from the vendor",
     );
 });

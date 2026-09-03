@@ -244,10 +244,16 @@ export function planBackfill({
         // same-project whenever both are known, so dropping it loses nothing
         // real and removes the branch where the two disagree.
         const item = expense.itemId ? items.get(expense.itemId) : undefined;
-        if (expense.itemId && !item) {
-            // A link to an item that is gone, or to an item with no cost code:
-            // no answer either way, so fall through to the rules below.
-        } else if (item && item.costCodeId) {
+        // OWNERSHIP FIRST, ELIGIBILITY SECOND (round 44, item 3).
+        //
+        // These used to be one condition: a link only got checked for crossing
+        // jobs if its item ALSO had a usable code, because the map was filtered
+        // to those. So a cross-job link whose code was null or retired looked
+        // like a link to a missing item, fell through to regex suggestion, and
+        // was never reported for a human to fix. Whether the link crosses jobs
+        // has nothing to do with what code the item carries, and it is now
+        // asked first and on its own.
+        if (item) {
             const sameProject =
                 resolvedProjectId !== null &&
                 item.projectId !== null &&
@@ -256,6 +262,11 @@ export function planBackfill({
                 add(expense, "item-outside-estimate");
                 continue;
             }
+        }
+        if (expense.itemId && !item) {
+            // A link to an item that is GONE (deleted, or never existed): no
+            // answer either way, so fall through to the rules below.
+        } else if (item && item.costCodeId) {
             // The item link proves the job; it does NOT prove the code is a
             // live phase of that job. An item on a draft estimate can carry a
             // code the job never committed to, so the same phase gate the
@@ -531,18 +542,39 @@ export async function runBackfill({
         },
     });
 
-    // The item's OWN estimate and project come back with it: the fallback has
-    // to prove the link does not cross jobs before it copies a code.
-    const itemRowsRaw = await db.estimateItem.findMany({
-        where: { costCodeId: { not: null }, costCode: { isActive: true } },
-        select: {
-            id: true, costCodeId: true, estimateId: true,
-            estimate: { select: { projectId: true } },
-        },
-    });
+    // OWNERSHIP FOR EVERY LINKED ITEM, WHATEVER ITS CODE (round 44, item 3).
+    //
+    // This map used to be filtered to items with a non-null, ACTIVE cost code,
+    // which quietly made it two things at once: "who owns this item" and "is
+    // its code usable". A cross-job item whose code is null or retired then
+    // looked MISSING rather than foreign, the writer read that as "no answer
+    // either way", and the row fell through to regex suggestion — so a link
+    // that should have been reported `item-outside-estimate` for a human to
+    // fix was instead quietly guessed at, and never appeared in the remainder
+    // CSV at all.
+    //
+    // Ownership is now loaded unconditionally, and eligibility stays where it
+    // already lives (`allowedCodesByProject`, built from committed estimates).
+    // Scoped to the items expenses actually LINK to, so widening the filter
+    // does not turn this into a full-table read.
+    const linkedItemIds = [...new Set(expenses.map(e => e.itemId).filter(Boolean))];
+    const itemRowsRaw = linkedItemIds.length
+        ? await db.estimateItem.findMany({
+            where: { id: { in: linkedItemIds } },
+            select: {
+                id: true, costCodeId: true, estimateId: true,
+                costCode: { select: { isActive: true } },
+                estimate: { select: { projectId: true } },
+            },
+        })
+        : [];
     const itemRows = itemRowsRaw.map(row => ({
         id: row.id,
-        costCodeId: row.costCodeId,
+        // A RETIRED code is not a usable code. Normalising it to null here
+        // keeps the two questions separate: the row still says who OWNS the
+        // item, and every reader of `costCodeId` gets the same answer it got
+        // when the query itself did the filtering.
+        costCodeId: row.costCode?.isActive ? row.costCodeId : null,
         estimateId: row.estimateId,
         projectId: row.estimate?.projectId ?? null,
     }));
