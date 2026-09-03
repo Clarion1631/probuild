@@ -45,12 +45,85 @@ function clip(value: string | undefined): string | undefined {
  * function, which would leave holes in the audit trail. One awaited insert
  * costs ~10ms; a swallowed failure costs nothing but the audit row.
  */
-/** Bounded, always-valid JSON — naive string slicing would corrupt the document. */
-function serializeDetail(detail: Record<string, unknown> | undefined): string | undefined {
+/** The column budget for a serialized `detail`. */
+const DETAIL_LIMIT = 4000;
+/** How much of any ONE value survives once the document is over budget. */
+const DETAIL_VALUE_LIMIT = 500;
+
+/** One oversized value, clipped, with its real length still on the record. */
+function clipDetailValue(value: unknown): unknown {
+    const text = typeof value === "string" ? value : undefined;
+    if (text !== undefined) {
+        return text.length > DETAIL_VALUE_LIMIT
+            ? `${text.slice(0, DETAIL_VALUE_LIMIT)} [+${text.length - DETAIL_VALUE_LIMIT} chars]`
+            : text;
+    }
+    if (value === null || typeof value !== "object") return value;
+    // A nested object or array: keep it if it is small, otherwise record it as
+    // clipped JSON rather than dropping the key entirely.
+    let nested: string | undefined;
+    try {
+        nested = JSON.stringify(value);
+    } catch {
+        return "[unserializable]";
+    }
+    if (nested === undefined) return undefined;
+    return nested.length > DETAIL_VALUE_LIMIT
+        ? `${nested.slice(0, DETAIL_VALUE_LIMIT)} [+${nested.length - DETAIL_VALUE_LIMIT} chars]`
+        : value;
+}
+
+/**
+ * Bounded, always-valid JSON — naive string slicing would corrupt the document.
+ *
+ * Truncation is now VALUE BY VALUE. The old form replaced the whole payload
+ * with a list of key names, which threw the record away precisely when it
+ * mattered: an ambiguous-create resolution logs the actor, the decision and the
+ * operator note beside a long create marker, and one oversized field took all
+ * of them with it — leaving an audit row that recorded a money decision was
+ * made and nothing about who made it or why.
+ *
+ * Now the long field is the only thing that loses anything. If clipping every
+ * value is still not enough (many fields rather than one long one), keys are
+ * dropped LONGEST FIRST, so the short high-signal ones — ids, actor, decision,
+ * reason — are the last to go, and the ones dropped are named.
+ */
+export function serializeDetail(detail: Record<string, unknown> | undefined): string | undefined {
     if (!detail) return undefined;
-    const serialized = JSON.stringify(detail);
-    if (serialized.length <= 4000) return serialized;
-    return JSON.stringify({ truncated: true, keys: Object.keys(detail).slice(0, 20) });
+    let serialized: string | undefined;
+    try {
+        serialized = JSON.stringify(detail);
+    } catch {
+        // A cycle or a BigInt. Never fail the caller over an audit row.
+        return JSON.stringify({ truncated: true, keys: Object.keys(detail).slice(0, 20) });
+    }
+    if (serialized !== undefined && serialized.length <= DETAIL_LIMIT) return serialized;
+
+    const clipped: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(detail)) {
+        const kept = clipDetailValue(value);
+        if (kept !== undefined) clipped[key] = kept;
+    }
+    let out = JSON.stringify({ ...clipped, truncated: true });
+    if (out.length <= DETAIL_LIMIT) return out;
+
+    // Still over. Shed the most expensive keys until it fits.
+    const byCost = Object.keys(clipped).sort(
+        (a, b) => (JSON.stringify(clipped[b]) ?? "").length - (JSON.stringify(clipped[a]) ?? "").length,
+    );
+    const dropped: string[] = [];
+    while (out.length > DETAIL_LIMIT && byCost.length > 0) {
+        const key = byCost.shift() as string;
+        delete clipped[key];
+        dropped.push(key);
+        out = JSON.stringify({ ...clipped, truncated: true, droppedKeys: dropped });
+    }
+    // Everything was dropped and it STILL does not fit (a pathological key
+    // list). Fall back to the smallest honest statement rather than an insert
+    // that would fail and take the whole audit row with it.
+    return out.length <= DETAIL_LIMIT
+        ? out
+        : JSON.stringify({ truncated: true, droppedKeys: dropped.slice(0, 20) });
 }
 
 export async function logAutomationEvent(input: AutomationEventInput): Promise<void> {

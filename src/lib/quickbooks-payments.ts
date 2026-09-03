@@ -240,8 +240,12 @@ export async function resolveCustomerAndItem(
     });
     if (!client) throw new Error("Client not found");
 
+    // What the mapping said BEFORE the QuickBooks round trip. Everything below
+    // is decided against this value, not against a re-read of `client`, because
+    // that is the state `ensureQBCustomer` actually answered about.
+    const qbCustomerIdBeforeRemote = client.qbCustomerId;
     const customerId = await ensureQBCustomer(tokens, client, deadline);
-    if (customerId !== client.qbCustomerId) {
+    if (customerId !== qbCustomerIdBeforeRemote) {
         // Re-pointing a client at another QuickBooks customer is a money-path
         // write: the ambiguous-create recovery decides whether to link or
         // release a parked invoice against exactly this value. It therefore
@@ -251,11 +255,36 @@ export async function resolveCustomerAndItem(
         //
         // Only the lock-and-write is inside the transaction. `ensureQBCustomer`
         // above is a QuickBooks round trip and must never be held across a row
-        // lock; the re-read under the lock is what makes the write safe anyway.
-        await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // lock.
+        //
+        // The lock alone was NOT enough. It serialised this write against the
+        // resolver, but the write itself was unconditional: the row was read
+        // BEFORE the round trip, and whatever landed in that window — another
+        // push remapping the same client, an admin repointing it by hand — was
+        // silently overwritten with a decision made against state that no longer
+        // existed. So the mapping is RE-READ under the lock and the write only
+        // lands while it still says what it said before the round trip.
+        const verdict = await withTxRetry(() => prisma.$transaction(async (tx) => {
             await lockClientRow(tx, client.id, "update");
+            const fresh = await tx.client.findUnique({
+                where: { id: client.id },
+                select: { qbCustomerId: true },
+            });
+            // Gone entirely: there is no row to remap and no safe value to write.
+            if (!fresh) return "conflict" as const;
+            // Somebody already wrote the SAME answer we were about to write.
+            // That is not a conflict — it is this exact remap, done once.
+            if (fresh.qbCustomerId === customerId) return "already" as const;
+            if (fresh.qbCustomerId !== qbCustomerIdBeforeRemote) return "conflict" as const;
             await tx.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+            return "written" as const;
         }));
+        // Fail closed. A caller that went ahead here would build its invoice
+        // against a customer the database disagrees with, and the marker it
+        // writes would fingerprint a mapping nothing can reproduce — which is
+        // exactly the state the resolver has to refuse later, after a real
+        // invoice already exists in QuickBooks.
+        if (verdict === "conflict") throw new QBCustomerRemappedError(client.name || client.id);
     }
 
     const qb = await getQBSettings();
@@ -814,6 +843,32 @@ export async function sweepPendingPayLinks(
     return result;
 }
 
+/**
+ * The client's QuickBooks customer mapping moved while we were asking
+ * QuickBooks about it.
+ *
+ * Raised instead of overwriting: `resolveCustomerAndItem` decided which
+ * customer to bill from a read taken BEFORE its round trip, and by the time it
+ * held the lock the row said something else. Every invoice built from this
+ * resolution — and every marker fingerprinting it — would describe a mapping
+ * the database disagrees with, so the send stops here, before anything reaches
+ * QuickBooks.
+ */
+export class QBCustomerRemappedError extends Error {
+    name = "QBCustomerRemappedError";
+    constructor(clientLabel: string) {
+        super(
+            `${clientLabel}'s QuickBooks customer changed while this was being prepared, so nothing was sent. ` +
+            `Open the client, confirm which QuickBooks customer it should bill, and try again.`,
+        );
+    }
+}
+
+/** Name-based, for the same Node-20 module-identity reason as the guards below. */
+export function isQBCustomerRemappedError(error: unknown): boolean {
+    return error instanceof Error && error.name === "QBCustomerRemappedError";
+}
+
 /** Raised when a send is refused because a previous attempt's outcome is unknown. */
 export class QBAmbiguousCreateError extends Error {
     name = "QBAmbiguousCreateError";
@@ -873,12 +928,26 @@ export function isAmbiguousCreateFailure(error: unknown): boolean {
 /** Reserved for the compensating delete, independent of the push's own budget. */
 export const MILESTONE_CLEANUP_BUDGET_MS = 10_000;
 /**
- * Default budget when a caller passes none. Under a 60s route ceiling, and it
- * leaves MILESTONE_CLEANUP_BUDGET_MS of headroom for the compensating delete
- * that may follow. An unbudgeted push was the remaining way to run to the
- * platform's ceiling and be killed between the invoice create and the link.
+ * The WORK half: how long the QuickBooks round trips themselves may take.
+ * Never handed to `pushMilestoneToQuickBooks` — it is what that function
+ * arrives at after carving the cleanup reserve off the route budget below.
+ *
+ * The two used to be one constant, `MILESTONE_PUSH_BUDGET_MS`, and its name did
+ * not say which half it was. The doc called it the work budget, the function
+ * treated its argument as the whole-route budget and subtracted the reserve
+ * from it, and both action callers passed the constant — so the reserve came
+ * out twice and the work budget was really 35s, not 45s. One name per half now,
+ * and the function has ONE contract: whatever it is given is the WHOLE ROUTE,
+ * and it carves the reserve itself.
  */
-export const MILESTONE_PUSH_BUDGET_MS = 45_000;
+export const MILESTONE_PUSH_WORK_BUDGET_MS = 45_000;
+/**
+ * The WHOLE-ROUTE budget a caller hands in (or the default when it passes
+ * none): the work above plus the cleanup reserve, under a 60s route ceiling.
+ * An unbudgeted push was the remaining way to run to the platform's ceiling and
+ * be killed between the invoice create and the link.
+ */
+export const MILESTONE_PUSH_ROUTE_BUDGET_MS = MILESTONE_PUSH_WORK_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS;
 /** Never spend the last slice of the route: leave the platform room to respond. */
 export const PLATFORM_RESERVE_MS = 2_000;
 
@@ -967,11 +1036,21 @@ export interface MilestoneLinkOutcome {
      * `linked` — we wrote the link. `already-finalized` — somebody else already
      * finished THIS invoice on this row, so there is nothing to write and
      * nothing to compensate. `abandoned` — the row genuinely moved on and the
-     * QuickBooks invoice we created is now unreferenced.
+     * QuickBooks invoice we created is now unreferenced. `mismatch` — the money
+     * state this invoice was ISSUED from no longer describes the row: the
+     * client was repointed at another QuickBooks customer, or the parent
+     * invoice tax rate moved and with it the milestone pre-tax/tax split. The
+     * document bills the wrong thing and must not be adopted.
+     *
+     * `mismatch` and `abandoned` both compensate; they are kept apart so the
+     * operator is told WHICH it was — "the row moved on" and "this invoice is
+     * now wrong" need different follow-up.
      */
-    outcome: "linked" | "already-finalized" | "abandoned";
+    outcome: "linked" | "already-finalized" | "abandoned" | "mismatch";
     /** The pay link the row carries, when someone else finished it. */
     payLink: string | null;
+    /** For `mismatch`: what diverged, in words, for the error the caller raises. */
+    mismatchDetail?: string;
 }
 
 /**
@@ -1003,15 +1082,77 @@ export async function finalizeMilestoneLinkUnderLock(
         /** Did the pre-pay-link provisional write land? It decides what the CAS pins. */
         preLinked: boolean;
         inFlightMarker: string;
+        /** The client this invoice bills — locked here, in Estimate → Invoice → Client order. */
+        clientId: string;
+        /**
+         * The issuance hash the marker carries: a fingerprint of the money state
+         * this QuickBooks invoice was actually built from. Recomputed under the
+         * locks below and compared, because the CAS alone cannot see it — the
+         * pinned columns all live on PaymentSchedule, while the customer mapping
+         * lives on Client and the tax rate on Invoice.
+         */
+        issuanceHash: string;
     },
 ): Promise<MilestoneLinkOutcome> {
-    const { qbId, payLink, preLinked, inFlightMarker } = args;
+    const { qbId, payLink, preLinked, inFlightMarker, clientId, issuanceHash } = args;
     return withTxRetry(() => prisma.$transaction(async (tx): Promise<MilestoneLinkOutcome> => {
-        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        // Estimate → Invoice → Client, the documented order (tx-retry.ts). The
+        // Client lock is FOR SHARE because this decision only READS the mapping,
+        // but it must not straddle the FOR UPDATE remap in resolveCustomerAndItem:
+        // the two serialise, so the value read below is the value that stands.
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId, clientId }, { clientLock: "share" });
         const claimedNow = await tx.progressBillingLine.findFirst({
             where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
             select: { id: true },
         });
+        // ONE re-read, taken under the locks, serving BOTH decisions below: the
+        // issuance guard here, and the "did a concurrent writer already finalize
+        // this exact invoice" check after a lost CAS. Under the invoice lock
+        // nothing can commit between them, so a second read would return the
+        // same rows.
+        const current = await tx.paymentSchedule.findUnique({
+            where: { id: schedule.id },
+            select: {
+                qbInvoiceId: true, qbInvoiceLink: true, status: true, amount: true,
+                name: true, dueDate: true, qbPaymentId: true,
+                // The tax split derives from these two plus amount and the parent
+                // invoice rate — milestoneTaxSplit, the rule the create used.
+                pretaxAmount: true, taxAmount: true,
+                invoice: { select: { taxRate: true, client: { select: { qbCustomerId: true } } } },
+            },
+        });
+        // The invoice was issued against a specific QuickBooks customer and a
+        // specific tax split. Neither lives on this row, so neither is pinned by
+        // the CAS below: a client repointed at another customer, or a parent
+        // invoice tax rate edited mid-push, leaves every pinned column identical
+        // while the document already in QuickBooks bills the wrong party or the
+        // wrong liability. Recomputed from what was just read and compared to the
+        // marker hash. The pinned literals are the ones the CAS itself requires,
+        // so this asks only: did the PAYLOAD state move?
+        const currentIssuanceHash = current
+            ? milestoneIssuanceHash({
+                status: "Pending",
+                qbPaymentId: null,
+                amount: current.amount,
+                dueDate: current.dueDate,
+                tax: milestoneTaxSplit({
+                    pretaxAmount: current.pretaxAmount,
+                    taxAmount: current.taxAmount,
+                    amount: current.amount,
+                    invoiceTaxRate: current.invoice?.taxRate ?? null,
+                }),
+                customerId: current.invoice?.client?.qbCustomerId ?? null,
+            })
+            : null;
+        if (currentIssuanceHash !== issuanceHash) {
+            return {
+                outcome: "mismatch",
+                payLink: null,
+                mismatchDetail: current
+                    ? "the QuickBooks customer or the tax treatment behind it changed while it was being created"
+                    : "the milestone no longer exists",
+            };
+        }
         // Conditional link write: the milestone was read as unlinked and unpaid
         // at the top of the push, but several remote calls happen in between — a
         // manual "Record Payment", a QB settle, a cancellation, a concurrent
@@ -1061,10 +1202,9 @@ export async function finalizeMilestoneLinkUnderLock(
         // duplicate and must still be compensated away. Hence the `claimedNow`
         // guard here — the row can carry our id and still be a double bill.
         if (!claimedNow) {
-            const current = await tx.paymentSchedule.findUnique({
-                where: { id: schedule.id },
-                select: { qbInvoiceId: true, qbInvoiceLink: true, status: true, amount: true, name: true, dueDate: true },
-            });
+            // `current` is the read taken under the locks above: same transaction,
+            // same lock, so it is exactly what a fresh read here would return, and
+            // one read is one fewer thing to keep in step.
             if (isConcurrentlyFinalizedMilestoneLink(current, qbId, schedule)) {
                 return { outcome: "already-finalized", payLink: current?.qbInvoiceLink ?? null };
             }
@@ -1098,12 +1238,18 @@ export async function pushMilestoneToQuickBooks(
     paymentScheduleId: string,
     passedTokens?: QBTokens,
     /**
-     * Whole-push budget. This is six serial QBO calls on a bad day — refresh,
-     * customer, service item, invoice create, payment link, status — plus a
-     * compensating delete if the link write fails. Individually bounded is not
-     * enough; without a shared budget the SUM still runs past the caller's
-     * ceiling, and being killed between the invoice create and the DB write is
-     * exactly how an orphaned QBO invoice happens.
+     * The WHOLE-ROUTE budget — everything this call may spend, cleanup
+     * included. This is six serial QBO calls on a bad day (refresh, customer,
+     * service item, invoice create, payment link, status) plus a compensating
+     * delete if the link write fails. Individually bounded is not enough;
+     * without a shared budget the SUM still runs past the caller's ceiling, and
+     * being killed between the invoice create and the DB write is exactly how an
+     * orphaned QBO invoice happens.
+     *
+     * Pass the route's real ceiling (or MILESTONE_PUSH_ROUTE_BUDGET_MS, or
+     * nothing at all for that default). Do NOT pass the work budget: this
+     * function carves MILESTONE_CLEANUP_BUDGET_MS off the front itself, so a
+     * caller that subtracts it too leaves the QuickBooks calls 10s short.
      */
     deadline?: RouteDeadline,
 ): Promise<MilestonePushResult> {
@@ -1115,7 +1261,7 @@ export async function pushMilestoneToQuickBooks(
     // (the old form) handed cleanup whatever the work budget had left — which
     // by the time compensation is needed is close to nothing, so the delete's
     // own deadline was already-exhausted before it could even start.
-    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS);
+    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_ROUTE_BUDGET_MS);
     const pushDeadline = createRouteDeadline(
         Math.max(1_000, routeDeadline.budgetMs - MILESTONE_CLEANUP_BUDGET_MS),
         routeDeadline.startedAt,
@@ -1452,6 +1598,14 @@ export async function pushMilestoneToQuickBooks(
         payLink,
         preLinked: claimedLink.count === 1,
         inFlightMarker,
+        // The Client this invoice bills, so the decision can lock and re-read
+        // the mapping it was issued against — the CAS cannot see that column.
+        clientId: invoice.clientId,
+        // The SAME hash the marker carries. Recomputed under the locks and
+        // compared, so a customer remap or a tax-rate edit that landed while
+        // this create was in flight refuses the link instead of adopting an
+        // invoice that now bills the wrong party or the wrong liability.
+        issuanceHash,
     });
     if (linked.outcome === "already-finalized") {
         // Someone else finished this exact invoice. Nothing to write and
@@ -1468,6 +1622,13 @@ export async function pushMilestoneToQuickBooks(
         // that reserve was carved out of the route's front on entry, so it is
         // still really there.
         const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(routeDeadline)));
+        // Say WHICH failure this was. "Changed while staging" is true of a row
+        // that was paid or repriced mid-push; it is misleading for a milestone
+        // that never moved at all and whose CUSTOMER or TAX RATE did — the
+        // operator would go looking at the milestone and find nothing wrong.
+        const whatChanged = linked.outcome === "mismatch"
+            ? `This milestone could not be linked to its new QuickBooks invoice because ${linked.mismatchDetail ?? "the money state it was issued from changed"}`
+            : "This milestone changed while staging its QuickBooks invoice";
         // Deleting is only half of it: this row may already carry the
         // provisional link written before the pay-link fetch, and leaving it
         // pointing at a deleted invoice would block the next send behind an
@@ -1485,7 +1646,7 @@ export async function pushMilestoneToQuickBooks(
             // than reporting a tidy "changed while staging" — the next send
             // would otherwise refuse against a dead link.
             console.error(`[quickbooks-payments] milestone ${schedule.id}: deleted QBO invoice ${qbId} but could not clear the local link`);
-            throw new Error(`This milestone changed while staging its QuickBooks invoice. The abandoned QuickBooks invoice ${docNumber} was deleted, but the link in ProBuild could not be cleared — use "Break QB Link" before re-sending.`);
+            throw new Error(`${whatChanged}. The abandoned QuickBooks invoice ${docNumber} was deleted, but the link in ProBuild could not be cleared — use "Break QB Link" before re-sending.`);
         }
         if (!compensated) {
             // Even the reserved budget is gone (or the delete was refused).
@@ -1501,9 +1662,9 @@ export async function pushMilestoneToQuickBooks(
             });
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${docNumber}) failed — delete it in QuickBooks manually`);
 
-            throw new Error(`This milestone changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
+            throw new Error(`${whatChanged}, and the abandoned QuickBooks invoice ${docNumber} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
         }
-        throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
+        throw new Error(`${whatChanged} — refresh and try again.`);
     }
 
     return { qbInvoiceId: qbId, payLink, qbTotal: total };

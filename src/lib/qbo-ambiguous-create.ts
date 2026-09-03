@@ -21,6 +21,7 @@
  * in as arguments and the role rule is enforced HERE, not only at the action
  * wrapper, so a test of the refusal exercises the real decision.
  */
+import { createHash } from "node:crypto";
 import { prisma } from "./prisma";
 import { withTxRetry, lockMoneyParents, lockClientRow, clientCustomerStillMatches } from "./tx-retry";
 import { logAutomationEvent } from "./automation-events";
@@ -281,6 +282,21 @@ export async function resolveAmbiguousInvoiceCreateCore(
     const reason = (input.reason || "").trim();
     if (!reason) {
         return { ok: false, refusal: "invalid", message: "Say what you found in QuickBooks — it goes on the audit record." };
+    }
+    // Bounded at the DOOR, not at the log. The audit row is the whole point of
+    // asking, and an unbounded note used to take the rest of the record down
+    // with it: the event logger gave up on an oversized `detail` and replaced
+    // the entire payload with a list of key names, so the actor, the decision
+    // and the reason all vanished together. The logger no longer does that
+    // (automation-events.ts truncates value by value), and this is the other
+    // half: a note nobody can read is not evidence, so say no up front rather
+    // than storing something misleading.
+    if (reason.length > RESOLVE_REASON_MAX_LEN) {
+        return {
+            ok: false,
+            refusal: "invalid",
+            message: `Keep the note under ${RESOLVE_REASON_MAX_LEN} characters — it goes on the audit record. Put the detail in QuickBooks and summarise it here.`,
+        };
     }
 
     const parked = await loadParkedRow(db, input.kind, input.id);
@@ -875,7 +891,10 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         where: { id },
         select: {
             id: true, code: true, qbInvoiceId: true, qbSyncError: true, invoiceId: true,
-            status: true, subtotal: true, total: true, taxAmount: true,
+            // `description` is a payload field on this rail (it is the QuickBooks
+            // line Description, and the ONLY thing updateProgressBillingCore can
+            // edit), so the hash covers it and the guard has to read it.
+            status: true, subtotal: true, total: true, taxAmount: true, description: true,
             invoice: {
                 select: {
                     code: true, projectId: true, estimateId: true,
@@ -895,6 +914,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         subtotal: row.subtotal,
         total: row.total,
         taxAmount: row.taxAmount,
+        description: row.description ?? null,
         customerId: parent.customerId,
     });
     return {
@@ -912,6 +932,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
             subtotal: row.subtotal,
             total: row.total,
             taxAmount: row.taxAmount,
+            description: row.description,
         },
         fingerprint: ambiguousCreateFingerprint(row),
         projectId: row.invoice?.projectId ?? null,
@@ -939,6 +960,26 @@ function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string |
     return { marker: row.qbSyncError as string, identity: parsed.identity, kind: parsed.kind, atMs: parsed.atMs };
 }
 
+/**
+ * How long an operator note may be. Long enough for a real explanation, short
+ * enough that it can never be the reason an audit row loses its other fields.
+ */
+export const RESOLVE_REASON_MAX_LEN = 500;
+
+/** Enough marker to recognise, not enough to crowd out the rest of the row. */
+export const MARKER_PREVIEW_LEN = 200;
+
+/**
+ * A stable, short stand-in for the full marker.
+ *
+ * Not a security boundary — it exists so two audit rows can be compared, and
+ * so a row can be matched back to the marker it was decided against, without
+ * carrying hundreds of characters of it into every event.
+ */
+export function markerDigest(marker: string): string {
+    return createHash("sha256").update(marker).digest("hex").slice(0, 16);
+}
+
 async function audit(
     logEvent: typeof logAutomationEvent,
     input: ResolveAmbiguousCreateInput,
@@ -956,7 +997,15 @@ async function audit(
         detail: {
             kind: input.kind,
             rowId: parked.id,
-            marker: parked.marker,
+            // The marker is the biggest field here by a wide margin — a DocNumber,
+            // a PrivateNote, a hash, a realm and a customer id — and none of it is
+            // information this record needs in full: the identity it carries is
+            // already spelled out in `docNumber` above and in `extra`. What the
+            // audit actually needs is to be able to say "this decision was made
+            // against THAT marker", which a digest answers exactly, plus enough
+            // prefix for a human to recognise it at a glance.
+            markerHash: markerDigest(parked.marker),
+            markerPreview: parked.marker.slice(0, MARKER_PREVIEW_LEN),
             decision: input.decision,
             operatorReason: reason,
             actorId: input.actor.id ?? null,

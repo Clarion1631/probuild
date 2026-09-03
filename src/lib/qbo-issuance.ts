@@ -76,8 +76,17 @@ export interface MilestoneIssuanceState {
 }
 
 /**
- * The progress-billing equivalent. `description` is excluded for the same
- * reason `name` is above — it is the invoice's text, not its money.
+ * The progress-billing equivalent — and it DOES include `description`, which is
+ * the one place the two rails deliberately diverge.
+ *
+ * On the milestone rail `name` is excluded because nothing can edit it while a
+ * create is parked: the only way to change it is through the invoice editor,
+ * which refuses a row carrying a create marker. A progress billing has a
+ * dedicated edit path (`updateProgressBillingCore`) whose ONLY editable field
+ * is `description`, so it is the single payload field a human can move while an
+ * invoice for the old text may already exist in QuickBooks. It is also what the
+ * stage sends as the QBO line Description. Excluding it would leave exactly one
+ * unguarded way to adopt an invoice that no longer describes the row.
  *
  * `taxAmount` and `customerId` are here for the same reason they are on the
  * milestone state: the stage payload's tax line is `{ preTaxAmount: subtotal,
@@ -89,6 +98,7 @@ export interface ProgressBillingIssuanceState {
     subtotal: unknown;
     total: unknown;
     taxAmount: unknown;
+    description: string | null;
     customerId: string | null;
 }
 
@@ -180,6 +190,7 @@ export function progressBillingIssuanceHash(row: ProgressBillingIssuanceState): 
         money(row.subtotal),
         money(row.total),
         money(row.taxAmount),
+        row.description ?? "",
         row.customerId ?? "",
     ]);
 }

@@ -134,7 +134,8 @@ test("a parked progress billing cannot be edited", async () => {
                 if (args.select?.invoiceId) return { invoiceId: "inv-1" };
                 return { ...parked };
             },
-            async update() { updated = true; return parked; },
+            async update() { throw new Error("the edit must be a CAS (updateMany), not an update-by-id"); },
+            async updateMany() { updated = true; return { count: 1 }; },
         },
         invoice: { async findUnique() { return { id: "inv-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; } },
         $queryRaw: async () => [],
@@ -147,6 +148,90 @@ test("a parked progress billing cannot be edited", async () => {
         );
     });
     assert.equal(updated, false, "the parked row must survive unedited");
+});
+
+/**
+ * Round 38 gate, finding 2. The guard above runs against a READ. The stage
+ * path writes its `create-in-flight` claim with a bare `updateMany` from
+ * OUTSIDE this transaction, so `lockMoneyParents` does not serialise against
+ * it: a claim landing between the guard and the write used to get an
+ * unconditional `update({ where: { id } })` anyway, changing the description
+ * while a QuickBooks invoice for the OLD one may already have been created.
+ */
+test("round 38: a stage claim landing between the guard and the write loses the edit", async () => {
+    const { updateProgressBillingCore, isProgressBillingChangedError } =
+        await import("../src/lib/progress-billing");
+    // As the guards read it: a clean, genuinely editable Draft.
+    const row: Record<string, any> = {
+        id: "pb-1", invoiceId: "inv-1", code: "INV-1-P1", status: "Draft",
+        description: "Rough-in complete", taxExempt: false,
+        qbInvoiceId: null, qbSyncError: null,
+    };
+    const seen: any[] = [];
+    const tx = {
+        progressBilling: {
+            async findUnique(args: any) {
+                if (args.select?.invoiceId) return { invoiceId: "inv-1" };
+                return { ...row };
+            },
+            async update() { throw new Error("the edit must be a CAS, not an update-by-id"); },
+            async updateMany(args: any) {
+                seen.push(args);
+                // THE INTERLEAVING, at the only moment it can happen.
+                row.qbSyncError = CREATE_IN_FLIGHT_MARKER;
+                const matches = Object.entries(args.where).every(([k, v]) => row[k] === v);
+                if (!matches) return { count: 0 };
+                Object.assign(row, args.data);
+                return { count: 1 };
+            },
+        },
+        invoice: { async findUnique() { return { id: "inv-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; } },
+        $queryRaw: async () => [],
+    };
+
+    await withFakePrisma({ $transaction: async (fn: any) => fn(tx) }, async () => {
+        await assert.rejects(
+            () => updateProgressBillingCore("pb-1", { description: "Rough-in complete (revised)" }),
+            (e: unknown) => isProgressBillingChangedError(e) && (e as any).status === 409,
+        );
+    });
+    assert.equal(row.description, "Rough-in complete", "the edit must not land on a row a create already claimed");
+    assert.deepEqual(
+        seen[0].where,
+        { id: "pb-1", status: "Draft", qbInvoiceId: null, qbSyncError: null },
+        "all three predicates re-asserted in the write itself, not only in the guard",
+    );
+});
+
+test("round 38: an uncontested edit still lands (the CAS is not simply always-refusing)", async () => {
+    const { updateProgressBillingCore } = await import("../src/lib/progress-billing");
+    const row: Record<string, any> = {
+        id: "pb-1", invoiceId: "inv-1", code: "INV-1-P1", status: "Draft",
+        description: "Rough-in complete", taxExempt: false,
+        qbInvoiceId: null, qbSyncError: null,
+    };
+    const tx = {
+        progressBilling: {
+            async findUnique(args: any) {
+                if (args.select?.invoiceId) return { invoiceId: "inv-1" };
+                if (args.include?.lines) return { ...row, lines: [] };
+                return { ...row };
+            },
+            async updateMany(args: any) {
+                const matches = Object.entries(args.where).every(([k, v]) => row[k] === v);
+                if (!matches) return { count: 0 };
+                Object.assign(row, args.data);
+                return { count: 1 };
+            },
+        },
+        invoice: { async findUnique() { return { id: "inv-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; } },
+        $queryRaw: async () => [],
+    };
+
+    await withFakePrisma({ $transaction: async (fn: any) => fn(tx) }, async () => {
+        await updateProgressBillingCore("pb-1", { description: "Rough-in complete (revised)" });
+    });
+    assert.equal(row.description, "Rough-in complete (revised)");
 });
 
 // --- Source tripwire -------------------------------------------------------

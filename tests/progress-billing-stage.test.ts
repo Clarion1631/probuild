@@ -270,6 +270,10 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
             // so a tax-only edit re-issues a different invoice while leaving
             // subtotal and total alone — and the customer decides who is billed.
             taxAmount: 89,
+            // Round 38 gate: `description` is the QuickBooks line Description AND
+            // the only field updateProgressBillingCore can edit, so it is the one
+            // payload field a human can move while a create is in flight.
+            description: "Rough-in complete",
             customerId: "42",
         }),
         // Round 33 gate: the resolver's total-match check reads this off the

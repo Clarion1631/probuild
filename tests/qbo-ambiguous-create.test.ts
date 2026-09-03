@@ -30,6 +30,8 @@ import {
     CREATE_IN_FLIGHT_STALE_MS,
 } from "../src/lib/qbo-create-markers";
 import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "../src/lib/qbo-issuance";
+import { markerDigest, RESOLVE_REASON_MAX_LEN, MARKER_PREVIEW_LEN } from "../src/lib/qbo-ambiguous-create";
+import { serializeDetail } from "../src/lib/automation-events";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
@@ -324,6 +326,95 @@ test("exactly one matching invoice is adopted, and the marker becomes paylink-pe
     assert.equal(events.at(-1)?.detail.actorEmail, "admin@example.com");
     assert.equal(events.at(-1)?.detail.operatorReason, "Checked QuickBooks");
     assert.equal(events.at(-1)?.detail.decision, "link-existing");
+    // Round 38 gate: the marker itself no longer rides along in full. It was
+    // by far the largest field here and none of it is information this record
+    // needs twice — the identity is already spelled out in `docNumber`.
+    assert.equal(events.at(-1)?.detail.marker, undefined, "the full marker must not be stored");
+    assert.equal(
+        events.at(-1)?.detail.markerHash,
+        markerDigest(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, MILESTONE_IDENTITY, AMBIGUOUS_MARKER_AT)),
+        "a digest, so two rows can still be compared and matched back to a marker",
+    );
+    assert.ok(
+        String(events.at(-1)?.detail.markerPreview).length <= MARKER_PREVIEW_LEN,
+        "and a bounded prefix, so a human can recognise it at a glance",
+    );
+});
+
+/**
+ * Round 38 gate, finding 3: the audit trail was lossy at BOTH ends.
+ *
+ * The reason field was unbounded, and the logger dropped an oversized `detail`
+ * to a bare list of key names — so one long note took the actor, the decision
+ * and the reason with it, leaving a row that recorded a money decision was made
+ * and nothing whatsoever about who made it or why.
+ */
+test("round 38: an over-long reason is refused at the door, not silently stored", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        {
+            ...base,
+            reason: "x".repeat(RESOLVE_REASON_MAX_LEN + 1),
+            expectedState: ambiguousCreateFingerprint(row),
+        },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "invalid", "a 400, so the operator can shorten it and retry");
+    assert.equal(row.qbInvoiceId, null, "and nothing was linked on the way");
+});
+
+test("round 38: a reason AT the limit is accepted (the bound is not off by one)", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        {
+            ...base,
+            reason: "x".repeat(RESOLVE_REASON_MAX_LEN),
+            expectedState: ambiguousCreateFingerprint(row),
+        },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+    assert.equal(res.ok, true);
+});
+
+test("round 38: a max-size audit payload still keeps the actor, the decision and the reason", () => {
+    // The shape the resolver actually logs, with every bounded field at its
+    // maximum and one field deliberately far over.
+    const detail = {
+        kind: "milestone",
+        rowId: "ps-1",
+        markerHash: markerDigest("x"),
+        markerPreview: "m".repeat(MARKER_PREVIEW_LEN),
+        decision: "link-existing",
+        operatorReason: "r".repeat(RESOLVE_REASON_MAX_LEN),
+        actorId: "user-1",
+        actorEmail: "admin@example.com",
+        actorRole: "ADMIN",
+        // The pathological one: something a future caller drops in without
+        // thinking. It must not be able to take the fields above with it.
+        qboResponse: "z".repeat(50_000),
+    };
+    const parsed = JSON.parse(serializeDetail(detail) as string);
+
+    assert.equal(parsed.truncated, true, "the row says it lost something");
+    assert.equal(parsed.actorEmail, "admin@example.com");
+    assert.equal(parsed.actorId, "user-1");
+    assert.equal(parsed.actorRole, "ADMIN");
+    assert.equal(parsed.decision, "link-existing");
+    assert.equal(parsed.rowId, "ps-1");
+    assert.equal(parsed.operatorReason, detail.operatorReason, "a bounded reason survives whole");
+    assert.ok(String(parsed.qboResponse).startsWith("z"), "the oversized field is clipped, not dropped");
+    assert.ok(String(parsed.qboResponse).includes("chars]"), "and says how much it lost");
+    assert.ok((serializeDetail(detail) as string).length <= 4000, "and the whole thing fits the column");
+});
+
+test("round 38: an ordinary payload is untouched", () => {
+    // The mutation control. If truncation fired on everything, the tests above
+    // would pass while the log had quietly become useless.
+    const detail = { rowId: "ps-1", decision: "confirmed-none", operatorReason: "Nothing in QuickBooks" };
+    assert.deepEqual(JSON.parse(serializeDetail(detail) as string), detail);
 });
 
 test("round 33 gate: DocNumber and PrivateNote match but the total differs — refused, not linked", async () => {

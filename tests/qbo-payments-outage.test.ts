@@ -15,6 +15,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { probeQBInvoice, QBTimeoutError, type QBInvoiceProbe } from "../src/lib/quickbooks";
+import { milestoneIssuanceHash, milestoneTaxSplit } from "../src/lib/qbo-issuance";
 
 const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 
@@ -1417,16 +1418,16 @@ test("an unresolvable orphan is recorded durably, not just logged", async () => 
 // --- The compensation clock starts when compensation begins ---
 
 test("the cleanup budget is not already spent by the calls that preceded it", async () => {
-    const { MILESTONE_CLEANUP_BUDGET_MS, MILESTONE_PUSH_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
+    const { MILESTONE_CLEANUP_BUDGET_MS, MILESTONE_PUSH_WORK_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
     const { createRouteDeadline, isBudgetExhausted } = await import("../src/lib/quickbooks");
 
-    assert.equal(MILESTONE_PUSH_BUDGET_MS, 45_000);
+    assert.equal(MILESTONE_PUSH_WORK_BUDGET_MS, 45_000);
     assert.equal(MILESTONE_CLEANUP_BUDGET_MS, 10_000);
 
     // Codex gate: reserving the clock at ENTRY meant it ticked down through
     // every call that preceded compensation, so by the time it was needed it
     // could already be gone. Started at compensation time it is always fresh.
-    const pushDeadline = createRouteDeadline(MILESTONE_PUSH_BUDGET_MS, Date.now() - 44_000);
+    const pushDeadline = createRouteDeadline(MILESTONE_PUSH_WORK_BUDGET_MS, Date.now() - 44_000);
     await new Promise(resolve => setTimeout(resolve, 60));
     assert.ok(isBudgetExhausted(pushDeadline), "the push budget really is nearly gone");
 
@@ -2537,6 +2538,8 @@ function fakeFinalizeDb(opts: {
 }) {
     const seen = { locked: 0, claims: [] as any[], reads: 0 };
     const tx = {
+        // Three locks now, in Estimate -> Invoice -> Client order (the Estimate
+        // is absent here, so: Invoice FOR UPDATE, Client FOR SHARE).
         $queryRaw: async () => { seen.locked++; return []; },
         progressBillingLine: {
             async findFirst() { return opts.billingClaim ? { id: "pbl-1" } : null; },
@@ -2557,7 +2560,42 @@ const SCHEDULE = {
     name: "Rough-in",
 };
 
-async function runFinalize(fake: { prisma: unknown }, preLinked = true) {
+/**
+ * Round 38 gate: the link decision now re-reads the state the invoice was
+ * ISSUED from, not just the columns the CAS can pin. Two of those live on the
+ * PARENTS - the QuickBooks customer on Client, the tax rate on Invoice - so
+ * the fixtures below carry them and the fake serves them from one read.
+ */
+const ISSUED_CUSTOMER = "qbcust-42";
+const ISSUED_PARENTS = {
+    pretaxAmount: null,
+    taxAmount: null,
+    invoice: { taxRate: 0, client: { qbCustomerId: ISSUED_CUSTOMER } },
+};
+/** A row exactly as the finalizer re-reads it: link fields plus that state. */
+function currentRow(overrides: Record<string, unknown> = {}) {
+    return {
+        qbInvoiceId: "inv-77",
+        qbInvoiceLink: "https://pay/77",
+        status: "Pending",
+        amount: 1200.5,
+        name: "Rough-in",
+        dueDate: ISSUED_DUE,
+        qbPaymentId: null,
+        ...ISSUED_PARENTS,
+        ...overrides,
+    };
+}
+const ISSUED_HASH = milestoneIssuanceHash({
+    status: "Pending",
+    qbPaymentId: null,
+    amount: 1200.5,
+    dueDate: ISSUED_DUE,
+    tax: milestoneTaxSplit({ pretaxAmount: null, taxAmount: null, amount: 1200.5, invoiceTaxRate: 0 }),
+    customerId: ISSUED_CUSTOMER,
+});
+
+async function runFinalize(fake: { prisma: unknown }, preLinked = true, issuanceHash = ISSUED_HASH) {
     const { finalizeMilestoneLinkUnderLock } = await import("../src/lib/quickbooks-payments");
     const previous = (globalThis as any).prisma;
     (globalThis as any).prisma = fake.prisma;
@@ -2567,6 +2605,8 @@ async function runFinalize(fake: { prisma: unknown }, preLinked = true) {
             payLink: "https://pay/77",
             preLinked,
             inFlightMarker: "create-in-flight:@1|INV-1-2|note",
+            clientId: "client-1",
+            issuanceHash,
         });
     } finally {
         (globalThis as any).prisma = previous;
@@ -2577,36 +2617,22 @@ test("interleaving: provisional link persisted, sweep finishes it, our CAS loses
     // 1. this push wrote qbInvoiceId=inv-77 + `paylink-pending`
     // 2. the sweep fetched the pay link and cleared the marker
     // 3. this push's final CAS pins `paylink-pending` and therefore loses
-    const fake = fakeFinalizeDb({
-        claimCount: 0,
-        current: {
-            qbInvoiceId: "inv-77",
-            qbInvoiceLink: "https://pay/77",
-            status: "Pending",
-            amount: 1200.5,
-            name: "Rough-in",
-            dueDate: ISSUED_DUE,
-        },
-    });
+    const fake = fakeFinalizeDb({ claimCount: 0, current: currentRow() });
     const result = await runFinalize(fake);
 
     assert.equal(result.outcome, "already-finalized", "the invoice is live and referenced — never delete it");
     assert.equal(result.payLink, "https://pay/77", "report the link the winner wrote");
-    assert.equal(fake.seen.locked, 1, "the verdict is reached under the invoice lock");
-    assert.equal(fake.seen.reads, 1, "the verdict comes from a re-read, not from the lost CAS alone");
+    assert.equal(fake.seen.locked, 2, "Invoice FOR UPDATE, then Client FOR SHARE — the documented order");
+    assert.equal(fake.seen.reads, 1, "one re-read under the locks answers BOTH the issuance guard and this verdict");
 });
 
 test("interleaving: the row really did move on — still abandoned, so compensation runs", async () => {
+    // Canceled, not repriced: the money state the hash covers is untouched, so
+    // the issuance guard passes and the CAS is what refuses. That ordering
+    // matters — a guard that fired here would have hidden the real verdict.
     const fake = fakeFinalizeDb({
         claimCount: 0,
-        current: {
-            qbInvoiceId: null,
-            qbInvoiceLink: null,
-            status: "Canceled",
-            amount: 1200.5,
-            name: "Rough-in",
-            dueDate: ISSUED_DUE,
-        },
+        current: currentRow({ qbInvoiceId: null, qbInvoiceLink: null, status: "Canceled" }),
     });
     assert.equal((await runFinalize(fake)).outcome, "abandoned");
 });
@@ -2614,37 +2640,76 @@ test("interleaving: the row really did move on — still abandoned, so compensat
 test("a progress billing that claimed the milestone is abandoned even when the row carries OUR id", async () => {
     // The billing stages its own covering invoice, so ours is the duplicate:
     // the id matching is not enough to make this a success.
-    const fake = fakeFinalizeDb({
-        claimCount: 0,
-        billingClaim: true,
-        current: {
-            qbInvoiceId: "inv-77",
-            qbInvoiceLink: "https://pay/77",
-            status: "Pending",
-            amount: 1200.5,
-            name: "Rough-in",
-            dueDate: ISSUED_DUE,
-        },
-    });
+    const fake = fakeFinalizeDb({ claimCount: 0, billingClaim: true, current: currentRow() });
     const result = await runFinalize(fake);
     assert.equal(result.outcome, "abandoned");
     assert.equal(fake.seen.claims.length, 0, "the link write must never run once a progress billing owns this milestone");
 });
 
 test("the ordinary path still writes the link and reports `linked`", async () => {
-    const fake = fakeFinalizeDb({ claimCount: 1, current: null });
+    const fake = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
     const result = await runFinalize(fake);
     assert.equal(result.outcome, "linked");
     assert.equal(result.payLink, "https://pay/77");
-    assert.equal(fake.seen.reads, 0, "a winning CAS needs no re-read");
+    assert.equal(fake.seen.reads, 1, "the issuance guard reads once, before the CAS");
     const where = fake.seen.claims[0].where;
     assert.equal(where.qbInvoiceId, "inv-77", "pre-linked: pinned to the id we already wrote");
     assert.equal(where.qbSyncError, "paylink-pending");
     // The retry branch (the pre-link write lost) still proves ownership.
-    const retry = fakeFinalizeDb({ claimCount: 1, current: null });
+    const retry = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
     await runFinalize(retry, false);
     assert.equal(retry.seen.claims[0].where.qbInvoiceId, null);
     assert.equal(retry.seen.claims[0].where.qbSyncError, "create-in-flight:@1|INV-1-2|note");
+});
+
+/**
+ * Round 38 gate, finding 1. Every column the CAS pins lives on PaymentSchedule.
+ * The customer lives on Client and the tax rate on Invoice, so both of these
+ * used to leave the CAS matching perfectly while the invoice already sitting in
+ * QuickBooks billed the wrong party, or the wrong liability split.
+ *
+ * `claimCount: 1` in both: the CAS WOULD have succeeded. The guard is what
+ * refuses, and `claims.length === 0` is what proves the guard ran first rather
+ * than the write being undone afterwards.
+ */
+test("round 38: a client repointed at another QuickBooks customer mid-push refuses the link", async () => {
+    const fake = fakeFinalizeDb({
+        claimCount: 1,
+        current: currentRow({ invoice: { taxRate: 0, client: { qbCustomerId: "qbcust-99" } } }),
+    });
+    const result = await runFinalize(fake);
+    assert.equal(result.outcome, "mismatch", "this invoice bills somebody else now");
+    assert.match(String(result.mismatchDetail), /customer or the tax treatment/);
+    assert.equal(fake.seen.claims.length, 0, "refused BEFORE the link write, not rolled back after it");
+});
+
+test("round 38: a tax-rate change mid-push refuses the link", async () => {
+    // Same dollars, different liability: milestoneTaxSplit derives the pre-tax
+    // and tax halves from the parent invoice rate, and the QuickBooks invoice
+    // was built from the OLD one.
+    const fake = fakeFinalizeDb({
+        claimCount: 1,
+        current: currentRow({ invoice: { taxRate: 8.9, client: { qbCustomerId: ISSUED_CUSTOMER } } }),
+    });
+    assert.equal((await runFinalize(fake)).outcome, "mismatch");
+    assert.equal(fake.seen.claims.length, 0);
+});
+
+test("round 38: the guard is not simply always-on — an unchanged row still links", async () => {
+    // The mutation control for the two above. Identical harness, identical
+    // claimCount, only the parent state restored: if this failed too, those
+    // tests would be proving nothing.
+    const fake = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
+    assert.equal((await runFinalize(fake)).outcome, "linked");
+    assert.equal(fake.seen.claims.length, 1);
+});
+
+test("round 38: a milestone that vanished mid-push is a mismatch, never a link", async () => {
+    const fake = fakeFinalizeDb({ claimCount: 1, current: null });
+    const result = await runFinalize(fake);
+    assert.equal(result.outcome, "mismatch");
+    assert.match(String(result.mismatchDetail), /no longer exists/);
+    assert.equal(fake.seen.claims.length, 0);
 });
 
 test("the push returns the concurrent winner's id instead of compensating", async () => {
