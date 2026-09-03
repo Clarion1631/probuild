@@ -2818,7 +2818,7 @@ test("R2-F1: staging and the collision cancel are the same lock from opposite en
 
         // A second credit at the same amount makes this day a collision, which
         // is what puts the cancel in front of the staged row at all.
-        await post(bankBatch([
+        const { body } = await post(bankBatch([
             { ref, amount: 7373.73 },
             { ref: "REF-LOCK-OTHER", amount: 7373.73 },
         ]));
@@ -2826,6 +2826,27 @@ test("R2-F1: staging and the collision cancel are the same lock from opposite en
         const row = depositRow(ref)!;
         assert.notEqual(row.status, "unmatched", "the cancel must not land on a row that staged an invoice");
         assert.equal(row.paymentScheduleId, milestone, "…nor take its milestone away");
+        // …and the missed cancel must not just SHRUG. Reporting "past-boundary"
+        // and leaving the row `processing` was the P0: the worker that staged
+        // the invoice would go on to win applyQboLinked's CAS and pay out a
+        // credit this very batch had proven ambiguous.
+        assert.equal(row.status, "reconcile", "a staged row the cancel missed must still be STOPPED");
+        assert.match(String(row.lastError), /already created a QuickBooks invoice for milestone/);
+        assert.ok(row.officeTaskId, "and a human is asked");
+        assert.equal(creditResult(body, ref).status, "reconcile");
+        assert.equal(body.ok, false, "the runner must fail on it");
+
+        // The staging worker now CONTINUES from where it was. Its next step is
+        // applyQboLinked, whose processing→qbo_unknown CAS is the money
+        // boundary — and it must find nothing.
+        const claimed = await tables.depositIngest.updateMany({
+            where: { id: "lock-stage", status: "processing" },
+            data: { status: "qbo_unknown", qbRequestPayload: '{"TotalAmt":7373.73}' },
+        });
+        assert.equal(claimed.count, 0, "the worker's money-boundary CAS must find nothing");
+        assert.equal(calls.buildQBPaymentRequest.length, 0, "no payment request is built");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "and none is sent");
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
     });
 
     await t.test("cancel first: staging stops, and no invoice is created at all", async () => {

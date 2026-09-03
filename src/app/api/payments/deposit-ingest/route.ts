@@ -1035,6 +1035,50 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
     });
 }
 
+/** Past this, there is nothing left to call back: the payment request is out
+ *  (or the money has moved), so a colliding credit can only be escalated. */
+function isPaymentBoundary(row: DepositIngest): boolean {
+    return !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt)
+        || ["qbo_unknown", "qbo_created"].includes(row.status);
+}
+
+/**
+ * STOP a row whose only boundary is the invoice-staging marker.
+ *
+ * `reconcile`, not `unmatched`: a QuickBooks invoice may exist against that
+ * milestone, so the reservation is RETAINED. And it must be an actual state
+ * TRANSITION, not just a verdict returned to the batch — leaving the row
+ * `processing` lets the worker that staged it win applyQboLinked's
+ * `status: "processing"` CAS and submit a payment for a credit this batch has
+ * already proven ambiguous (gate P0). Once the row reads `reconcile`, that CAS
+ * finds nothing and the worker stops before QuickBooks is asked for anything.
+ *
+ * The CAS pins `extracted` for the same reason the cancel does: it is the one
+ * thing a concurrent staging write moves. At most ONE further pass — a row can
+ * only move forward, so after a missed CAS it is either a true payment boundary
+ * (escalate) or somewhere its own path owns.
+ */
+async function stopStagedRow(row: DepositIngest, reason: string): Promise<"recorded" | "past-boundary"> {
+    const staged = stagedScheduleIdOf(row.extracted);
+    const stagedReason = `${reason}; the sweep had already created a QuickBooks invoice for milestone ${staged}, ` +
+        `so this credit cannot simply be set aside — check QuickBooks before recording anything against it`;
+    const stopped = await prisma.depositIngest.updateMany({
+        where: { id: row.id, status: "processing", extracted: row.extracted },
+        data: { status: "reconcile", lastError: stagedReason.slice(0, 1000) },
+    });
+    if (stopped.count === 0) {
+        const moved = await prisma.depositIngest.findUnique({ where: { id: row.id } });
+        if (!moved) return "recorded";
+        // Forward-only: qbo_unknown means the payment request is already out.
+        return isPaymentBoundary(moved) ? "past-boundary" : "recorded";
+    }
+    const fresh = await prisma.depositIngest.findUnique({ where: { id: row.id } });
+    if (fresh && !fresh.officeTaskId) await ensureReviewTask(fresh, stagedReason, "reconcile");
+    // Reported past-boundary so the batch counts it unresolved: a real
+    // QuickBooks document is in play and a human has to look at it.
+    return "past-boundary";
+}
+
 /**
  * Write a colliding credit's verdict, atomically, before any matching runs.
  *
@@ -1107,32 +1151,9 @@ async function persistCollisionVerdict(
     // `processing` let the staging worker walk straight past applyQboLinked's
     // `status: "processing"` CAS and create a payment for a credit nobody can
     // attribute.
-    const paymentBoundary = !!(existing.qbPaymentId || existing.qbRequestPayload || existing.settleStartedAt)
-        || ["qbo_unknown", "qbo_created"].includes(existing.status);
-    if (paymentBoundary) return "past-boundary";
+    if (isPaymentBoundary(existing)) return "past-boundary";
 
-    const staged = stagedScheduleIdOf(existing.extracted);
-    if (staged) {
-        // `reconcile`, not `unmatched`: a QuickBooks invoice may exist against
-        // that milestone, so the reservation is RETAINED. The CAS pins
-        // `extracted` for the same reason the cancel below does — it is the one
-        // thing a concurrent staging write moves.
-        const stagedReason = `${reason}; the sweep had already created a QuickBooks invoice for milestone ${staged}, ` +
-            `so this credit cannot simply be set aside — check QuickBooks before recording anything against it`;
-        const stopped = await prisma.depositIngest.updateMany({
-            where: { id: existing.id, status: "processing", extracted: existing.extracted },
-            data: { status: "reconcile", lastError: stagedReason.slice(0, 1000) },
-        });
-        if (stopped.count === 0) {
-            const moved = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
-            return moved && crossedAnyBoundary(moved) ? "past-boundary" : "recorded";
-        }
-        const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
-        if (fresh && !fresh.officeTaskId) await ensureReviewTask(fresh, stagedReason, "reconcile");
-        // Reported past-boundary so the batch counts it unresolved: a real
-        // QuickBooks document is in play and a human has to look at it.
-        return "past-boundary";
-    }
+    if (stagedScheduleIdOf(existing.extracted)) return await stopStagedRow(existing, reason);
 
     const status = "unmatched";
     const claimed = await prisma.depositIngest.updateMany({
@@ -1154,11 +1175,16 @@ async function persistCollisionVerdict(
         },
     });
     if (claimed.count === 0) {
-        // Lost the arbitration. If what moved was a staging write, this credit is
-        // NOT merely "someone else's to decide": a QuickBooks invoice may now
-        // exist for it, which the batch must report as unresolved.
+        // Lost the arbitration. If what moved was a STAGING write, reporting
+        // "past-boundary" and walking away is not enough (gate P0): the row is
+        // still `processing`, so the worker that staged it would go on to win
+        // applyQboLinked's CAS and pay out a credit this batch has just proven
+        // ambiguous. Re-read and stop it properly.
         const moved = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
-        return moved && crossedAnyBoundary(moved) ? "past-boundary" : "recorded";
+        if (!moved) return "recorded";
+        if (isPaymentBoundary(moved)) return "past-boundary";
+        if (stagedScheduleIdOf(moved.extracted)) return await stopStagedRow(moved, reason);
+        return "recorded"; // another worker moved it somewhere else; its own path decides
     }
     const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
     if (fresh && !fresh.officeTaskId) {
