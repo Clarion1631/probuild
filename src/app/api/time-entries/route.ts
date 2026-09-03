@@ -6,7 +6,7 @@ import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-a
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { hasPermission } from "@/lib/access-rules";
-import { timeEntrySelect } from "@/lib/time-entry-projection";
+import { serializeTimeEntryJson, timeEntrySelect } from "@/lib/time-entry-projection";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
@@ -93,6 +93,13 @@ export async function POST(req: Request) {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
+
+    // WHAT THIS CALLER MAY READ BACK. The 201 below used to be the created row
+    // verbatim, so a crew member got laborCost and burdenCost with it (round 9,
+    // finding 2). Same audience rule as GET — see time-entry-projection.ts.
+    const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
+    const canSeePay =
+        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
 
     // ONE resolution per request. Every company-local day key below is derived
     // from it — the stale-DEFERRED check, the day settlement triggers, and the
@@ -336,7 +343,7 @@ export async function POST(req: Request) {
         throw error;
     }
 
-    return NextResponse.json(timeEntry);
+    return NextResponse.json(serializeTimeEntryJson(timeEntry as never, canSeePay));
 }
 
 // ── PUT (clock-out) — extracted into a DI-testable factory ──────────────────
@@ -409,6 +416,13 @@ const LOGISTICS_NOTES_REQUIRED_MESSAGE = "Notes are required to clock out of a l
 
 export interface ClockOutDependencies {
     authenticate(req: Request): Promise<ClockOutAuthResult>;
+    /**
+     * May this caller see money on a time entry — laborCost, burdenCost, the
+     * invoice linkage, the QuickBooks id? The same gate GET /api/time-entries
+     * uses. A dependency rather than a direct query so the close path stays
+     * testable without a database, like everything else here.
+     */
+    canReadPay(user: { id: string; role: string }): Promise<boolean>;
     /**
      * The company time zone, resolved ONCE per request. Every company-local day
      * key in the close path comes from it: the day this punch belongs to, the
@@ -516,6 +530,8 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
 
             // ONE resolution per request — see resolveTimeZone on the interface.
             const companyTimeZone = await dependencies.resolveTimeZone();
+            // ...and one audience decision, applied to EVERY exit below.
+            const canSeePay = await dependencies.canReadPay(user);
 
             const body = await req.json();
             const { id, endTime, latitude, longitude, notes, deferMeal } = body;
@@ -554,7 +570,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     {
                         error: "Time entry is already clocked out",
                         code: "ALREADY_CLOCKED_OUT",
-                        entry: JSON.parse(JSON.stringify(existing)),
+                        entry: serializeTimeEntryJson(existing as never, canSeePay),
                     },
                     { status: 409 }
                 );
@@ -873,7 +889,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     {
                         error: "Time entry is already clocked out",
                         code: "ALREADY_CLOCKED_OUT",
-                        entry: closeResult.current ? JSON.parse(JSON.stringify(closeResult.current)) : null,
+                        entry: serializeTimeEntryJson(closeResult.current as never, canSeePay),
                     },
                     { status: 409 }
                 );
@@ -887,7 +903,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // Return what is STORED after settlement — the phone's "last entry"
             // card must never disagree with payroll about paid hours.
             const settled = deferMeal !== true ? await dependencies.findTimeEntry(existing.id) : null;
-            return NextResponse.json(JSON.parse(JSON.stringify(settled ?? closeResult.entry)));
+            return NextResponse.json(serializeTimeEntryJson((settled ?? closeResult.entry) as never, canSeePay));
         },
     };
 }
@@ -941,6 +957,14 @@ const clockOutHandler = createClockOutHandler({
     // open punch on the phone with no way to close it.
     loadLockedPeriods,
     resolveTimeZone: resolveCompanyTimeZone,
+    // The permissions row is LOADED, not inferred: hasPermission falls back to
+    // role defaults when it is absent and FINANCE's default includes
+    // financialReports, so an explicit revocation would have been ignored.
+    canReadPay: async (viewer) => {
+        if (viewer.role === "ADMIN") return true;
+        const permissions = await prisma.userPermission.findUnique({ where: { userId: viewer.id } });
+        return hasPermission({ role: viewer.role, permissions }, "financialReports");
+    },
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,

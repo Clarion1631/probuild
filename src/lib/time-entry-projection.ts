@@ -135,3 +135,59 @@ export function timeEntrySelect(includePay: boolean) {
 export function timeEntryResponseKeys(includePay: boolean): string[] {
     return Object.keys(timeEntrySelect(includePay)).sort();
 }
+
+/**
+ * Project an entry-shaped object that is ALREADY IN HAND.
+ *
+ * The read cannot always be narrowed: the clock-out handler decides what to
+ * write from `startTime`, `endTime`, `mealSkipStatus` and the owner's rates, so
+ * its reads are deliberately whole rows. The leak was never the read — it was
+ * handing that row straight to `NextResponse.json`. POST returned the created
+ * row verbatim, the successful clock-out returned the settled row, and both
+ * ALREADY_CLOCKED_OUT conflict bodies embedded one, so crew received laborCost,
+ * burdenCost, the invoice linkage and the QuickBooks activity id every time they
+ * clocked out (round 9, finding 2).
+ *
+ * So the projection is applied at the RESPONSE boundary instead, over the same
+ * allowlist the `select` uses. One function for every exit, which is what makes
+ * the tripwire in tests/time-entry-response-tripwire.test.ts able to insist
+ * that no route hands a raw row to a client.
+ *
+ * Null-tolerant: several conflict bodies carry `entry: null` when the row has
+ * vanished, and that is a legitimate answer rather than something to project.
+ */
+export function serializeTimeEntry<T extends Record<string, unknown>>(
+    entry: T | null | undefined,
+    includePay: boolean
+): Record<string, unknown> | null {
+    if (!entry) return null;
+    const allowed = new Set(Object.keys(timeEntryScalarSelect(includePay)));
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(entry)) {
+        if (allowed.has(key)) out[key] = value;
+    }
+    // Relations a caller may have included. Projected the same way rather than
+    // passed through: `user` is where the owner's PIN hash and pay rates live.
+    if (entry.user && typeof entry.user === "object") {
+        const ownerAllowed = new Set(
+            Object.keys(includePay ? TIME_ENTRY_OWNER_PAY_SELECT : TIME_ENTRY_OWNER_CREW_SELECT)
+        );
+        const owner: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(entry.user as Record<string, unknown>)) {
+            if (ownerAllowed.has(key)) owner[key] = value;
+        }
+        out.user = owner;
+    }
+    for (const relation of ["project", "costCode"] as const) {
+        if (entry[relation] !== undefined) out[relation] = entry[relation];
+    }
+    return out;
+}
+
+/** The same, JSON-safe (Decimal and Date through the same round trip every response here uses). */
+export function serializeTimeEntryJson(
+    entry: Record<string, unknown> | null | undefined,
+    includePay: boolean
+): unknown {
+    return JSON.parse(JSON.stringify(serializeTimeEntry(entry, includePay)));
+}

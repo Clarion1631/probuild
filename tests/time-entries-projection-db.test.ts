@@ -226,3 +226,70 @@ test("the two audiences really differ — the crew test is not just describing a
     assert.deepEqual(extra.sort(), ["burdenCost", "invoiceId", "invoicedAt", "laborCost", "qbTimeActivityId"]);
     assert.ok(!crew.has("pinCode") && !pay.includes("pinCode"), "neither tier can name the hash");
 });
+
+test("a FIELD_CREW clock-IN response carries no money either", { skip }, async () => {
+    // POST returned the created row verbatim (round 9, finding 2). A brand-new
+    // punch has no laborCost yet, so the leak was smaller than the clock-out
+    // one — but the SHAPE was the same whole-model serialization, and the next
+    // column added to TimeEntry would have shipped through it. The allowlist
+    // assertion is what makes that impossible rather than merely unlikely.
+    const { POST } = await import("../src/app/api/time-entries/route");
+    const { TIME_ENTRY_CREW_SELECT } = await import("../src/lib/time-entry-projection");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db);
+
+    try {
+        // A logistics job: the deliberate exception to the phase requirement,
+        // so this test does not need a cost-code fixture to reach the response
+        // it is actually about.
+        await db.$executeRawUnsafe(`UPDATE "Project" SET "isLogistics" = true WHERE "id" = $1`, PROJECT_ID);
+
+        // The crew member has to be able to reach the job.
+        await db.$executeRawUnsafe(
+            `INSERT INTO "ProjectAccess" ("id","userId","projectId") VALUES ($1,$2,$3)`,
+            `te-proj-access-${SUFFIX}`,
+            seeded.crew.id,
+            PROJECT_ID
+        );
+
+        const { signMobileToken } = await import("../src/lib/mobile-auth");
+        const token = await signMobileToken(seeded.crew as never, "pin");
+        const res = await POST(
+            new Request("https://example.test/api/time-entries", {
+                method: "POST",
+                headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+                body: JSON.stringify({
+                    projectId: PROJECT_ID,
+                    startTime: "2026-08-25T15:00:00.000Z",
+                    rawNote: "Shop time, sorting stock",
+                }),
+            })
+        );
+        assert.equal(res.status, 200);
+        const entry = (await res.json()) as Record<string, unknown>;
+        assert.ok(entry.id, "a punch was created");
+
+        const allowed = new Set(Object.keys(TIME_ENTRY_CREW_SELECT));
+        assert.deepEqual(
+            Object.keys(entry).filter((key) => !allowed.has(key)),
+            [],
+            "no key outside the crew projection"
+        );
+        for (const key of ["laborCost", "burdenCost", "invoiceId", "invoicedAt", "qbTimeActivityId"]) {
+            assert.ok(!(key in entry), `${key} must not reach a crew clock-in response`);
+        }
+
+        // THE CONTROL: the stored row really does have those columns, so the
+        // assertion above is about the projection and not about the model.
+        const raw = await db.timeEntry.findUniqueOrThrow({ where: { id: entry.id as string } });
+        assert.ok("laborCost" in raw && "qbTimeActivityId" in raw);
+        await db.$executeRawUnsafe(`DELETE FROM "TimeEntry" WHERE "id" = $1`, entry.id as string);
+    } finally {
+        await db
+            .$executeRawUnsafe(`DELETE FROM "ProjectAccess" WHERE "id" = $1`, `te-proj-access-${SUFFIX}`)
+            .catch(() => {});
+        await db.$executeRawUnsafe(`DELETE FROM "TimeEntry" WHERE "projectId" = $1`, PROJECT_ID).catch(() => {});
+        await seeded.restore();
+        await db.$disconnect().catch(() => {});
+    }
+});

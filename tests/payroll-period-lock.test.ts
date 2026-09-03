@@ -210,6 +210,10 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[], startTime: Date = INSIDE
         // The close path resolves the company zone ONCE and derives every day
         // key from it (round 7, finding 1).
         resolveTimeZone: async () => "America/Los_Angeles",
+        // ...and ONE audience decision, applied to every response (round 9,
+        // finding 2). True here: these cases are about the lock, not the
+        // projection, and a manager is the audience they were written for.
+        canReadPay: async () => true,
         findOwnerRates: async () => ({ hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" }),
         findDayEntries: async () => [],
         settleDay: async () => 0,

@@ -83,19 +83,19 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // ---- the payroll write paths -------------------------------------------
-    "app/api/time-entries/route.ts:313::create": {
+    "app/api/time-entries/route.ts:320::create": {
         kind: "guarded",
         why: "clock-in create, wrapped in withPayrollWriteTx (startTime is client-supplied, so it can aim at a locked period)",
     },
-    "app/api/time-entries/route.ts:143::updateMany": {
+    "app/api/time-entries/route.ts:150::updateMany": {
         kind: "guarded",
         why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts:1028::updateMany": {
+    "app/api/time-entries/route.ts:1052::updateMany": {
         kind: "guarded",
         why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime AND on updatedAt, so any concurrent write to the row the close was decided from fails it closed",
     },
-    "app/api/time-entries/route.ts:1053::update": {
+    "app/api/time-entries/route.ts:1077::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },

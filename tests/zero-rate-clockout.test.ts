@@ -141,6 +141,9 @@ function deps(options: {
         // ONE resolution per request; every day key in the close path comes
         // from it (round 7, finding 1).
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The response audience (round 9, finding 2) — irrelevant to the $0
+        // guard, so the wider one.
+        canReadPay: async () => true,
         authenticate: async () => ({
             ok: true,
             user: {

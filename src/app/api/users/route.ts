@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
+import { checkUserCreate, checkUserMutation } from "@/lib/user-mutation-guard";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -67,6 +68,17 @@ export async function POST(req: Request) {
         const { name, email, role, hourlyRate, burdenRate, pinCode } = body;
 
         if (!email) return NextResponse.json({ error: "Email is required" }, { status: 400 });
+
+        // A create cannot demote anybody, but it CAN mint an admin - this route
+        // accepted an arbitrary `role` string from any manager (round 9,
+        // finding 1). Status is not a parameter: every create starts PENDING.
+        const createVerdict = checkUserCreate({
+            actor: { id: currentUser.id, role: currentUser.role },
+            role,
+        });
+        if (!createVerdict.ok) {
+            return NextResponse.json({ error: createVerdict.error }, { status: createVerdict.status });
+        }
 
         const exactEmailLower = email.toLowerCase().trim();
         const existingUser = await prisma.user.findUnique({ where: { email: exactEmailLower } });
@@ -182,6 +194,17 @@ export async function PATCH(req: Request) {
         const { id, name, role, status, hourlyRate, burdenRate, pinCode } = body;
 
         if (!id) return NextResponse.json({ error: "User id required" }, { status: 400 });
+
+        // Same rules as PUT /api/users/[id] - this route wrote `role` and
+        // `status` straight from the body for any manager (round 9, finding 1).
+        const target = await prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
+        if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
+        const verdict = checkUserMutation({
+            actor: { id: currentUser.id, role: currentUser.role },
+            target,
+            changes: { role, status },
+        });
+        if (!verdict.ok) return NextResponse.json({ error: verdict.error }, { status: verdict.status });
 
         const data: any = {};
         if (name !== undefined) data.name = name;

@@ -13,6 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { TIME_ENTRY_CREW_SELECT } from "../src/lib/time-entry-projection";
 import type { ClockOutDependencies, ClockOutStoredSnapshot, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-time-entries-route-tests";
@@ -75,6 +76,8 @@ function createDeps(overrides: {
     /** Simulate a concurrent PUT winning the atomic close guard first. */
     closeRaceLost?: boolean;
     dayEntries?: import("../src/lib/wa-breaks").DayEntry[];
+    /** The response audience: false is a FIELD_CREW viewer (round 9, finding 2). */
+    canReadPay?: boolean;
 } = {}) {
     const updateCalls: Array<{ id: string; userId: string; data: Record<string, unknown> }> = [];
     /** Times the close TRANSACTION was entered — a refusal inside it still counts. */
@@ -87,6 +90,9 @@ function createDeps(overrides: {
         // ONE resolution per request; every day key in the close path comes
         // from it (round 7, finding 1).
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The response audience (round 9, finding 2). Overridable, so the
+        // crew-projection cases below can ask for the other one.
+        canReadPay: async () => overrides.canReadPay ?? true,
         findTimeEntry: async () => (overrides.entry !== undefined ? overrides.entry : baseEntry()),
         findProjectIsLogistics: async (projectId) =>
             overrides.logisticsProjects
@@ -722,4 +728,94 @@ test("a clock-out that would make the punch longer than 24h is rejected with SHI
     assert.equal(res.status, 400);
     assert.equal((await res.json()).code, "SHIFT_TOO_LONG");
     assert.equal(updateCalls.length, 0);
+});
+
+// ── Every clock-out exit is projected for its audience (round 9, finding 2) ──
+//
+// The successful PUT returned the settled row verbatim, and both
+// ALREADY_CLOCKED_OUT conflict bodies embedded one, so a crew member received
+// laborCost, burdenCost, the invoice linkage and the QuickBooks activity id
+// every time they clocked out — or every time they retried a clock-out that had
+// already happened. The GET projection did not cover any of that: it is a
+// different handler, and these were whole Prisma rows handed straight to
+// NextResponse.json.
+
+/** An entry that CARRIES money, so "the crew body has none" is about the projection. */
+function pricedEntry(overrides: Partial<ClockOutTimeEntryRow> = {}) {
+    return {
+        ...baseEntry(overrides),
+        // Not on ClockOutTimeEntryRow: the DI type is the narrow shape the
+        // handler REASONS about, while the real dependency reads a whole row
+        // and it is the whole row that reaches the response.
+        laborCost: 240,
+        burdenCost: 40,
+        invoiceId: "inv-1",
+        invoicedAt: new Date("2026-08-11T00:00:00.000Z"),
+        qbTimeActivityId: "qb-1",
+    } as unknown as ClockOutTimeEntryRow;
+}
+
+const END = new Date("2026-08-10T23:00:00.000Z");
+
+const MONEY_KEYS = ["laborCost", "burdenCost", "invoiceId", "invoicedAt", "qbTimeActivityId"];
+
+test("a FIELD_CREW clock-out response carries no money", async () => {
+    const { dependencies } = createDeps({ entry: pricedEntry(), canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 200);
+    const entry = (await res.json()) as Record<string, unknown>;
+
+    for (const key of MONEY_KEYS) {
+        assert.ok(!(key in entry), `${key} must not reach a crew clock-out response`);
+    }
+    // ALLOWLIST, not a denylist: every key present has to be one the crew
+    // projection names, so the next column added to TimeEntry cannot ship by
+    // default the way these five did.
+    const allowed = new Set(Object.keys(TIME_ENTRY_CREW_SELECT));
+    assert.deepEqual(Object.keys(entry).filter((key) => !allowed.has(key)), []);
+    // ...and the row really did carry them — the control.
+    assert.equal((pricedEntry() as unknown as Record<string, unknown>).laborCost, 240);
+});
+
+test("an ADMIN clock-out response still carries the money — the audiences differ", async () => {
+    const { dependencies } = createDeps({ entry: pricedEntry(), role: "ADMIN", canReadPay: true });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 200);
+    const entry = (await res.json()) as Record<string, unknown>;
+    assert.equal(entry.laborCost, 240);
+    assert.equal(entry.qbTimeActivityId, "qb-1");
+});
+
+test("the up-front ALREADY_CLOCKED_OUT body is projected too", async () => {
+    // This body exists so a client that lost the response to a successful
+    // clock-out can reconcile against it — which means it is the SAME row, and
+    // it leaked the same five fields.
+    const closed = pricedEntry({ endTime: END });
+    const { dependencies } = createDeps({ entry: closed, canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 409);
+    const parsed = (await res.json()) as { code: string; entry: Record<string, unknown> };
+    assert.equal(parsed.code, "ALREADY_CLOCKED_OUT");
+    for (const key of MONEY_KEYS) assert.ok(!(key in parsed.entry), key);
+    assert.equal(parsed.entry.id, "te1", "the control: it is still the entry, just projected");
+});
+
+test("the RACED ALREADY_CLOCKED_OUT body is projected too", async () => {
+    // The other conflict path: a concurrent PUT won the atomic close, and the
+    // loser answers with the row as it now stands.
+    const { dependencies } = createDeps({ entry: pricedEntry(), closeRaceLost: true, canReadPay: false });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: END.toISOString() }));
+    assert.equal(res.status, 409);
+    const parsed = (await res.json()) as { code: string; entry: Record<string, unknown> | null };
+    assert.equal(parsed.code, "ALREADY_CLOCKED_OUT");
+    assert.ok(parsed.entry, "the loser is told what the row looks like now");
+    for (const key of MONEY_KEYS) assert.ok(!(key in (parsed.entry as Record<string, unknown>)), key);
 });

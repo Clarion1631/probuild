@@ -8,6 +8,7 @@ import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { deleteParentWithTimeEntries, isTimeEntriesExistError } from "@/lib/payroll-parent-delete";
 import { isPeriodLockedError, periodLockedResponse, withPayrollUserWrite } from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
+import { ASSIGNABLE_PERMISSIONS, checkUserMutation } from "@/lib/user-mutation-guard";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -69,6 +70,35 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const { id } = await params;
         const body = await req.json();
         const { permissions, projectIds, userInfo, pinCode } = body;
+
+        // WHO MAY CHANGE WHAT. This route used to write `role`, `status` and an
+        // arbitrary permission set for any MANAGER, so a manager could promote
+        // themselves to ADMIN, grant themselves every permission, or disable the
+        // real admins - nullifying every boundary above it (round 9, finding 1).
+        // The target is RE-READ here: the rules are about the row as it stands,
+        // never about the values the request is asking for.
+        const target = await prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
+        if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
+
+        // The permission patch is narrowed to its boolean entries BEFORE the
+        // check, so an unknown key is a 400 from the guard rather than a silent
+        // drop by the writer below.
+        const requestedPermissions: Record<string, unknown> | null = permissions
+            ? Object.fromEntries(
+                  Object.entries(permissions).filter(([, value]) => typeof value === "boolean")
+              )
+            : null;
+
+        const verdict = checkUserMutation({
+            actor: { id: currentUser.id, role: currentUser.role },
+            target,
+            changes: {
+                role: userInfo?.role,
+                status: userInfo?.status,
+                permissions: requestedPermissions,
+            },
+        });
+        if (!verdict.ok) return NextResponse.json({ error: verdict.error }, { status: verdict.status });
 
         // Profile fields and rates commit TOGETHER, in one transaction. They
         // were two sequential writes: a rate refusal left the profile half
@@ -133,16 +163,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
-        // Update permissions if provided (allowlisted fields only)
+        // Update permissions if provided (allowlisted fields only). WHICH of
+        // them this caller may write was decided by checkUserMutation above; the
+        // key list itself now lives with that decision so the two cannot drift.
         if (permissions) {
-            const ALLOWED_PERMISSION_FIELDS = [
-                "manageTeamMembers", "manageSubs", "manageVendors", "companySettings",
-                "costCodesCategories", "schedules", "estimates", "invoices", "contracts",
-                "roomDesigner", "changeOrders", "financialReports", "timeClock",
-                "dailyLogs", "files", "takeoffs", "autoGrantNewProjects",
-            ] as const;
             const sanitized: Record<string, boolean> = {};
-            for (const key of ALLOWED_PERMISSION_FIELDS) {
+            for (const key of ASSIGNABLE_PERMISSIONS) {
                 if (key in permissions && typeof permissions[key] === "boolean") {
                     sanitized[key] = permissions[key];
                 }

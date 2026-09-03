@@ -80,15 +80,15 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: string }> = {
     // ---- activation and profile edits: the round-34 hole --------------------
-    "app/api/users/[id]/route.ts:117::update": {
+    "app/api/users/[id]/route.ts:147::update": {
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
-    "app/api/users/route.ts:212::update": {
+    "app/api/users/route.ts:235::update": {
         kind: "wrapped",
         why: "PATCH /api/users writes name/role/status — the same payload, for the same reason",
     },
-    "app/api/manager/employees/[id]/route.ts:107::update": {
+    "app/api/manager/employees/[id]/route.ts:93::update": {
         kind: "wrapped",
         why: "the mobile manager screen can activate or disable somebody, which moves them on and off the roster",
     },
@@ -118,13 +118,13 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
-    "app/api/users/[id]/route.ts:254::delete": {
+    "app/api/users/[id]/route.ts:280::delete": {
         kind: "guarded",
         why: "runs through deleteParentWithTimeEntries, which takes acquirePayrollWriteLock and refuses while any of the member's hours sit in a locked period",
     },
 
     // ---- exempt --------------------------------------------------------------
-    "app/api/users/route.ts:82::create": {
+    "app/api/users/route.ts:94::create": {
         kind: "exempt",
         why: "creates the row with status PENDING hard-coded and with no punches, so the roster predicate ((ACTIVATED and HOURLY) or punched) cannot match it; the payType that follows is written by applyRateChangeInTx, which does take the lock",
     },
@@ -132,7 +132,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "a CLIENT-role portal account: no payType, and User.status defaults to PENDING, so it cannot be on an hourly roster and it has no punches",
     },
-    "app/api/users/[id]/route.ts:187::update": {
+    "app/api/users/[id]/route.ts:213::update": {
         kind: "exempt",
         why: "connect/disconnect on assignedProjects only — dispatch crew assignment reaches no column the export reads",
     },
