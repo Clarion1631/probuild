@@ -31,8 +31,15 @@ interface FakeIssueRow {
 }
 
 let issues: FakeIssueRow[];
+/** Memo bindings the cards cron reads per card (round-40 gate, finding 3). */
+let memoBindings: Array<{ targetKey: string; pdfId: string }> = [];
 
 const fakePrisma = {
+    // The memo bindings the cards cron loads per card (round-40 gate,
+    // finding 3). A memo resolution counts only where the artifact table binds
+    // it to that charge, so the fixtures that mean "already answered" carry
+    // their binding here.
+    receiptMemoArtifact: { findMany: async () => memoBindings },
     reviewIssue: {
         findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
             const ids = new Set(where.id.in);
@@ -149,8 +156,11 @@ test("a SECOND owner's card re-resolves the shared component — evidence can ar
 test("items that do not need revalidation (cleared/resolved/acknowledged) never touch the cache", async () => {
     issues = [
         { id: "ri-cleared", targetKey: "bl-cleared", clearedAt: new Date(), reasonCodes: "[]", acknowledgedCodes: "[]", displayDetails: null },
-        { id: "ri-resolved", targetKey: "bl-resolved", clearedAt: null, reasonCodes: "[]", acknowledgedCodes: "[]", displayDetails: JSON.stringify({ resolution: "memo-signed" }) },
+        { id: "ri-resolved", targetKey: "bl-resolved", clearedAt: null, reasonCodes: "[]", acknowledgedCodes: "[]", displayDetails: JSON.stringify({ resolution: "memo-signed", pdfId: "pdf-1" }) },
     ];
+    // BOUND, since round 40 finding 3: an unbacked memo is not an answer, and
+    // the whole point of that fix is that it gets recomputed instead.
+    memoBindings = [{ targetKey: "bl-resolved", pdfId: "pdf-1" }];
     let calls = 0;
     const recompute = async (): Promise<ReasonCode[]> => { calls++; return []; };
     const truth = await loadCardItemTruth(["ri-cleared", "ri-resolved"], { recompute });

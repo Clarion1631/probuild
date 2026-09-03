@@ -31,8 +31,13 @@ import type { Prisma } from "@prisma/client";
  * concurrent mark could add A→B between the check and the write.
  */
 
-/** Just enough of a client to run the lock — the transaction, or a test double. */
-export type DuplicateGuardClient = Pick<Prisma.TransactionClient, "$queryRaw">;
+/**
+ * Just enough of a client for the lock AND the write it protects — the
+ * transaction, or a test double. `receiptIntake` rides along because the whole
+ * point of `withDuplicateChainLock` is that the caller writes inside the same
+ * transaction that took the lock (round-40 gate, finding 1).
+ */
+export type DuplicateGuardClient = Pick<Prisma.TransactionClient, "$queryRaw" | "receiptIntake">;
 
 interface LockedRow { id: string; duplicateOfId: string | null }
 
@@ -92,6 +97,29 @@ export function duplicateChainRefusal(action: "duplicate" | "void", inbound: rea
         + `${inbound.length === 1 ? "is" : "are"} filed as duplicates of it (${inbound.join(", ")}). `
         + "Unmark those first, or point them at the right original.",
     );
+}
+
+/**
+ * ONE TRANSACTION: TAKE THE LOCK, ANSWER THE QUESTION, DO THE WRITE (Codex PR
+ * #443 gate round 40, finding 1).
+ *
+ * Round 39 gave the manual paths a locked check and left the worker with an
+ * unlocked one — a read, then a transition in a separate statement — so an
+ * admin committing A→B in between produced exactly the chain the guard exists
+ * to prevent, from the one caller that runs unattended every five minutes.
+ *
+ * The lock and the write have to be the same transaction, and the only way to
+ * be sure of that for every caller is to make the guard own it: `body` runs
+ * INSIDE the transaction that took the lock, and gets the inbound references
+ * as an argument rather than fetching them itself. A caller cannot skip the
+ * lock, take it late, or hold it for a shorter span than its own write.
+ */
+export async function withDuplicateChainLock<T>(
+    transaction: <R>(fn: (tx: DuplicateGuardClient) => Promise<R>) => Promise<R>,
+    ids: readonly string[],
+    body: (tx: DuplicateGuardClient, inbound: Map<string, string[]>) => Promise<T>,
+): Promise<T> {
+    return transaction(async tx => body(tx, await lockWithInboundDuplicates(tx, ids)));
 }
 
 /** The worker's own note when it refuses to reclassify an original. */

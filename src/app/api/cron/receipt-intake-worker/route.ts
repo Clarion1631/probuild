@@ -17,6 +17,7 @@ import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
+import { duplicateChainReason, withDuplicateChainLock } from "@/lib/receipt-intake/duplicate-guard";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
     driveFileIdOf,
@@ -629,19 +630,43 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         }),
 
         /**
-         * Rows already filed as duplicates OF this one (round-39 gate, finding
-         * 2). A plain read, not a lock: this is a background pass with no
-         * transaction around its routing write, and the honest thing it buys is
-         * "do not reclassify a row somebody is filed behind". The manual paths
-         * hold the real lock, and a race that slips past here leaves the same
-         * state a human can fix, not a booking.
+         * PARK A ROUTED DUPLICATE — OR REFUSE TO — UNDER THE SHARED LOCK
+         * (round-39 gate finding 2; made transactional by round-40 gate,
+         * finding 1).
+         *
+         * The first version read the inbound references and then transitioned
+         * in a separate statement, which left the whole window between them for
+         * an admin to commit A→B: the worker then wrote B→C over a row that had
+         * just become somebody's original. `withDuplicateChainLock` is the same
+         * function the admin actions take, so the two cannot diverge, and the
+         * CAS below runs inside the transaction that holds the lock.
+         *
+         * NEEDS_REVIEW rather than a throw: this is a background pass over a
+         * batch, and one row that needs a human is not a reason to abandon the
+         * rest. The reason names the rows to unmark; `duplicateOfId` is kept as
+         * the evidence for that decision.
          */
-        findInboundDuplicates: async rowId => (await prisma.receiptIntake.findMany({
-            where: { duplicateOfId: rowId },
-            select: { id: true },
-            orderBy: { id: "asc" },
-            take: 10,
-        })).map(row => row.id),
+        applyDuplicateTransition: async (rowId, decision, patch, ownership) => withDuplicateChainLock(
+            fn => prisma.$transaction(fn),
+            [rowId],
+            async (tx, inboundById) => {
+                const inbound = inboundById.get(rowId) ?? [];
+                const effective = inbound.length === 0
+                    ? decision
+                    : { ...decision, state: "NEEDS_REVIEW" as const, stateReason: duplicateChainReason(inbound) };
+                const { count } = await tx.receiptIntake.updateMany({
+                    where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                    data: {
+                        ...patch,
+                        state: effective.state,
+                        stateReason: effective.stateReason,
+                        nextRetryAt: null,
+                        ...RELEASE_CLAIM,
+                    },
+                });
+                return { owned: count > 0, state: effective.state };
+            },
+        ),
 
         applyState: async (rowId, state, stateReason, patch, ownership) => {
             const { count } = await prisma.receiptIntake.updateMany({

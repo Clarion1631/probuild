@@ -111,6 +111,27 @@ export function isPacificWeekday(now: Date = new Date()): boolean {
     return !["Sat", "Sun"].includes(weekday);
 }
 
+/**
+ * THE MARKER A RESENT CARD CARRIES (Codex PR #443 gate round 40, finding 2).
+ *
+ * "Resend" puts an UNCERTAIN row back to PENDING and releases its claim — and
+ * the cron only ever looked up TODAY'S `(owner, pacificDate)`, so a resend
+ * requested after the last retry slot (16:30 UTC) was never claimed again:
+ * tomorrow builds a card for a different date and yesterday's row sits PENDING
+ * for ever, with the items on it re-asked from scratch and the operator's
+ * decision silently dropped.
+ *
+ * Written into `lastError` because that is where this row already records why
+ * it is where it is, and because a marker no column has to be added for is a
+ * marker that cannot be half-deployed. The cron drains rows carrying it,
+ * oldest first, whatever date they are for; pipeline-health reports the ones
+ * that have been waiting too long.
+ */
+export const CARD_RESEND_QUEUED_REASON = "resend-requested";
+
+/** How long a queued resend may sit before the digest calls it out. */
+export const CARD_RESEND_STALE_HOURS = 6;
+
 export function requestIdFor(owner: string, date: string): string {
     return `receipt-req-${owner}-${date}`;
 }

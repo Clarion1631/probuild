@@ -345,6 +345,9 @@ const cardsPrisma: Record<string, unknown> = {
     $transaction: async (arg: unknown) =>
         (typeof arg === "function" ? await (arg as (tx: unknown) => Promise<unknown>)(cardsPrisma) : arg),
     automationSetting: settingStore,
+    // The memo bindings the cards cron loads per card (round-40 gate,
+    // finding 3). None here: these tests are about the scan and the send.
+    receiptMemoArtifact: { findMany: async () => [] },
     reviewIssue: {
         findMany: async (args: {
             where: { id?: { in: string[] } };

@@ -22,9 +22,9 @@ import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from 
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
-import { duplicateChainRefusal, lockWithInboundDuplicates } from "./receipt-intake/duplicate-guard";
+import { duplicateChainRefusal, withDuplicateChainLock } from "./receipt-intake/duplicate-guard";
 import { driveFileIdOf } from "./receipt-intake/book";
-import { parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
+import { CARD_RESEND_QUEUED_REASON, parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
 import { recordCardOnIssues } from "./receipt-card-history";
 import {
     ORPHAN_AUDIT_KIND,
@@ -15421,14 +15421,14 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
      * `FOR UPDATE` on a plain SELECT of both ids, ordered — one statement, so
      * there is no window between taking the first lock and the second.
      */
-    await prisma.$transaction(async tx => {
-        /**
-         * BOTH ROWS AND EVERY ROW THAT POINTS AT EITHER (round-39 gate,
-         * finding 2). One statement, ordered by id, so the lock order is the
-         * same for every transaction and this cannot deadlock — and so the
-         * inbound references cannot change between the read and the write.
-         */
-        const inbound = await lockWithInboundDuplicates(tx, [id, duplicateOfId]);
+    /**
+     * BOTH ROWS AND EVERY ROW THAT POINTS AT EITHER (round-39 gate, finding 2),
+     * through the shared guard so this path and the worker cannot diverge
+     * (round-40 gate, finding 1). One statement, ordered by id, so the lock
+     * order is the same for every transaction and this cannot deadlock — and so
+     * the inbound references cannot change between the read and the write.
+     */
+    await withDuplicateChainLock(fn => prisma.$transaction(fn), [id, duplicateOfId], async (tx, inbound) => {
 
         // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
         // the page; under the lock it is read again because that is the only
@@ -15512,8 +15512,8 @@ export async function voidReceiptIntake(id: string, expectedState: string, expec
      * different way. Locked and checked in ONE transaction with the write, or
      * a duplicate marked a moment later slips through the gap.
      */
-    await prisma.$transaction(async tx => {
-        const inbound = (await lockWithInboundDuplicates(tx, [id])).get(id) ?? [];
+    await withDuplicateChainLock(fn => prisma.$transaction(fn), [id], async (tx, inboundById) => {
+        const inbound = inboundById.get(id) ?? [];
         if (inbound.length > 0) throw duplicateChainRefusal("void", inbound);
         await runParkWrites(planParkWrites({
             id,
@@ -15892,7 +15892,11 @@ export async function resolveUncertainCard(
                 }
                 : {
                     status: "PENDING",
-                    lastError: "resend-requested",
+                    // THE QUEUE MARKER, not a note (round-40 gate, finding 2).
+                    // The cards cron drains rows carrying it regardless of their
+                    // Pacific date — without that, a resend requested after the
+                    // day's last retry slot was never claimed again.
+                    lastError: CARD_RESEND_QUEUED_REASON,
                     // Ownership released, so the retry pass can claim it.
                     claimedAt: null,
                     claimToken: null,

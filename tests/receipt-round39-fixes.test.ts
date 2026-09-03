@@ -254,25 +254,26 @@ test("the three write paths all take the guard, and the worker refuses in its ow
     const mark = actions.slice(actions.indexOf("export async function markReceiptIntakeDuplicate("));
     assert.match(
         mark.slice(0, mark.indexOf("\n}")),
-        /const inbound = await lockWithInboundDuplicates\(tx, \[id, duplicateOfId\]\)[\s\S]{0,3000}throw duplicateChainRefusal\("duplicate", inboundToSource\)/,
+        /await withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\), \[id, duplicateOfId\][\s\S]{0,3000}throw duplicateChainRefusal\("duplicate", inboundToSource\)/,
         "mark locks both rows plus their references, and refuses to become a link in a chain",
     );
     const voidFn = actions.slice(actions.indexOf("export async function voidReceiptIntake("));
     assert.match(
         voidFn.slice(0, voidFn.indexOf("\n}")),
-        /await prisma\.\$transaction\(async tx => \{[\s\S]{0,600}lockWithInboundDuplicates\(tx, \[id\]\)[\s\S]{0,300}throw duplicateChainRefusal\("void", inbound\)[\s\S]{0,600}await runParkWrites\(/,
+        /await withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\), \[id\], async \(tx, inboundById\) => \{[\s\S]{0,400}throw duplicateChainRefusal\("void", inbound\)[\s\S]{0,600}await runParkWrites\(/,
         "void locks, refuses and writes in ONE transaction — a duplicate marked in between would slip through",
     );
 
+    // SINCE ROUND 40 (finding 1) the worker asks for a TRANSITION, not for a
+    // fact it then acts on: the check and the write are one transaction, inside
+    // the shared guard. Presence only — the proof is the worker-vs-admin
+    // interleaving in tests/receipt-round40-fixes.test.ts.
     const worker = readFileSync(join(repoRoot, "src/lib/receipt-intake/worker.ts"), "utf8");
-    assert.match(worker, /async function guardDuplicateChain\(/);
-    assert.match(worker, /if \(decision\.state !== "DUPLICATE" \|\| !deps\.findInboundDuplicates\) return decision;/);
-    assert.match(worker, /return \{ state: "NEEDS_REVIEW", stateReason: duplicateChainReason\(inbound\)/);
-    // All three routing outcomes go through it, not just the first.
-    assert.equal((worker.match(/await guardDuplicateChain\(/g) ?? []).length, 3, "the gate, the strong-owner re-route and the weak-net re-route");
-
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
-    assert.match(cron, /findInboundDuplicates: async rowId => \(await prisma\.receiptIntake\.findMany\(\{\s*where: \{ duplicateOfId: rowId \}/);
+    assert.match(worker, /async function applyRoutedState\(/);
+    assert.match(worker, /return deps\.applyDuplicateTransition\(rowId, decision, patch, ownership\);/);
+    assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 3);
+    assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withDuplicateChainLock\(/);
 });
 
 // ── 3. The memo filename is parsed, not positioned ─────────────────────────

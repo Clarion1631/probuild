@@ -155,6 +155,6 @@ test("applyRead is the ONE lease-keeping write, and it can only say RECEIVED", (
     // `gated`, not `gate`, since round 39 (finding 2): a routed DUPLICATE for a
     // row other rows are filed behind becomes NEEDS_REVIEW first. Still ONE
     // applyState, and still the write that releases the claim.
-    assert.match(worker, /const gated = await guardDuplicateChain\(deps, row\.id, gate\);/);
-    assert.match(worker, /const owned = await deps\.applyState\(row\.id, gated\.state, note\(gated\.stateReason\)/);
+    assert.match(worker, /const gated = await applyRoutedState\(deps, row\.id, gate,/);
+    assert.match(worker, /return gated\.owned \? gated\.state : "STALE";/);
 });

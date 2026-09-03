@@ -256,7 +256,20 @@ test("a row OTHER rows are filed behind is never reclassified DUPLICATE", async 
      */
     const h = harness([workerRow()], {
         applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
-        findInboundDuplicates: async rowId => (rowId === "row-1" ? ["row-9"] : []),
+        // The cron's own shape (round-40 gate, finding 1): ONE call that takes
+        // the lock, decides, and writes — never a fact the worker acts on later.
+        applyDuplicateTransition: async (rowId, decision, patch) => {
+            const inbound = rowId === "row-1" ? ["row-9"] : [];
+            const state = inbound.length === 0 ? decision.state : "NEEDS_REVIEW";
+            h.states.push({
+                id: rowId,
+                state,
+                reason: inbound.length === 0 ? decision.stateReason : `duplicate-chain:${inbound.join(",")}`,
+                patch,
+                ownership: { state: "RECEIVED", claimToken: "claim-1" },
+            });
+            return { owned: true, state };
+        },
     });
     const summary = await runIntakeWorker(h.deps);
 
@@ -274,7 +287,7 @@ test("PRE-FIX CONTROL: with nothing filed behind it, the same row still routes t
     // inbound reference, and it is the behaviour the test above changed.
     const h = harness([workerRow()], {
         applyRead: async () => ({ owned: true, strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
-        findInboundDuplicates: async () => [],
+        applyDuplicateTransition: async (_rowId, decision) => ({ owned: true, state: decision.state }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { DUPLICATE: 1 });

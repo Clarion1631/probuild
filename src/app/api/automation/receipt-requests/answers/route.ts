@@ -144,6 +144,12 @@ async function pdfIdReusedElsewhere(
     });
     return candidates.some(row => {
         const details = parseMissingReceiptDetails(row.displayDetails);
+        // hasResolution-justified: this asks "has some OTHER issue recorded this
+        // pdf as its answer", which is a question about the blob, not about
+        // whether that answer is well-founded. An unbacked memo elsewhere is
+        // still a memo that was spent elsewhere — and it is a COARSE pre-filter:
+        // the artifact table, where pdfId is UNIQUE, is what actually decides
+        // reuse a few lines below (round-40 gate, finding 3).
         return hasResolution(details) && details.pdfId === pdfId;
     });
 }
@@ -519,6 +525,11 @@ export async function POST(request: Request) {
             // Already answered BEFORE this write — the forwarder retrying, or a
             // memo landing after the matcher auto-closed the line. Either way
             // recording it again is idempotent, and nothing is closed by it.
+            //
+            // hasResolution-justified: a REPORTING flag on the 200 this request
+            // is about to return, not a gate on anything. It answers "was there
+            // already an answer here", which is true of an unbacked memo too —
+            // and this route is what replaces one (round-40 gate, finding 3).
             const alreadyAnswered = hasResolution(details);
             const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
             // Checked BEFORE the already-resolved answer below, so a memo for a

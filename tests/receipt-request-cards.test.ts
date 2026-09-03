@@ -485,7 +485,10 @@ test("an uncertain card is surfaced, and resolving it is a CAS", () => {
     assert.match(actions, /where: \{ id: cardId, status: "UNCERTAIN", updatedAt: seenAt \}/);
     // "delivered" closes the day; "resend" hands it back to the retry pass.
     assert.match(actions, /status: "POSTED",[\s\S]{0,200}postedAt: new Date\(\)/);
-    assert.match(actions, /status: "PENDING",\s*\n\s*lastError: "resend-requested"/);
+    // The marker is a named constant since round 40 (finding 2): the cards
+    // cron drains rows carrying it whatever date they are for, so the two
+    // sides must read the same string.
+    assert.match(actions, /status: "PENDING",\s*\n[\s\S]{0,400}lastError: CARD_RESEND_QUEUED_REASON,/);
 
     // The queue loads them and the tab renders a group with both actions.
     const data = readFileSync(join(root, "src/app/automation/receipts-data.ts"), "utf8");

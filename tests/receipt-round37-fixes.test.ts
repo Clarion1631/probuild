@@ -187,6 +187,9 @@ let cardIssues: Array<{
 }> = [];
 
 const cardsPrisma = {
+    // The memo bindings the cards cron loads per card (round-40 gate,
+    // finding 3). None here: this test is about the per-card cache.
+    receiptMemoArtifact: { findMany: async () => [] },
     reviewIssue: {
         findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
             cardIssues.filter(row => where.id.in.includes(row.id)),

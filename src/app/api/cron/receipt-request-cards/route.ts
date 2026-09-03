@@ -4,11 +4,12 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
-import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasResolution, isComponentDeadlineExceeded } from "@/lib/receipt-requests";
+import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasBackedResolution, isComponentDeadlineExceeded } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
     CARD_POST_TIMEOUT_MS,
     CARD_RATE_CEILING,
+    CARD_RESEND_QUEUED_REASON,
     buildCardFromItems,
     isPacificWeekday,
     pacificDate,
@@ -104,6 +105,13 @@ const SCAN_MAX_PAGES = 200;
  * it, and only that run may mark the row posted. A claim older than this lease
  * belongs to a run that died, and is up for grabs again.
  */
+/**
+ * How many queued resends one run drains (round-40 gate, finding 2). Small on
+ * purpose: today's cards and the send budget come first, and a backlog this
+ * size means somebody should be looking at it anyway — pipeline-health says so.
+ */
+const QUEUED_RESEND_DRAIN_LIMIT = 3;
+
 const CLAIM_LEASE_MS = 10 * 60_000;
 
 /**
@@ -406,20 +414,40 @@ export async function loadCardItemTruth(
         where: { id: { in: issueIds } },
         select: { id: true, targetKey: true, clearedAt: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
     });
+    /**
+     * THE MEMO BINDINGS FOR THESE ITEMS, IN ONE READ (Codex PR #443 gate round
+     * 40, finding 3).
+     *
+     * The check below used to be `hasResolution`, which is true for a
+     * `memo-signed` blob with no `ReceiptMemoArtifact` of its own — the losing
+     * side of a duplicated pdfId, or a row an older build wrote. That skipped
+     * the artifact-backed recompute entirely, so the item was dropped from the
+     * card and the charge was never chased again: the same fail-open the
+     * matcher closed in round 36, one layer further out. One query per card,
+     * bounded by the items on it.
+     */
+    const boundPdfIds = new Map(
+        (await prisma.receiptMemoArtifact.findMany({
+            where: {
+                targetType: RECEIPT_REQUEST_TARGET_TYPE,
+                targetKey: { in: rows.map(row => row.targetKey) },
+            },
+            select: { targetKey: true, pdfId: true },
+        })).map(row => [row.targetKey, row.pdfId]),
+    );
     const truth = new Map<string, CardItemTruth>();
     for (const row of rows) {
         const details = parseMissingReceiptDetails(row.displayDetails);
         const currentCodes = decodeReasonCodes(row.reasonCodes);
         const acked = new Set(decodeReasonCodes(row.acknowledgedCodes));
         const clearedAt = row.clearedAt;
-        // THE CHEAP CHECK IS ENOUGH HERE, deliberately (round-36 gate, finding 3).
-        // The matcher needs `hasBackedResolution` because it decides whether a
-        // chase may CLOSE; this only decides whether an item is worth a
-        // recompute, and it errs the safe way in both directions: a quarantined
-        // memo reads as unresolved (so the item is re-verified and carded), and
-        // a memo whose binding is missing is caught by the recompute below,
-        // which is artifact-backed.
-        const resolved = hasResolution(details);
+        // ARTIFACT-BACKED, like the matcher (round-40 gate, finding 3). The
+        // cheap check was NOT enough: it suppressed the recompute below for a
+        // `memo-signed` blob nothing could vouch for, so the item silently left
+        // the card instead of being re-verified — the comment that used to sit
+        // here claimed the recompute would catch it, and the recompute is
+        // exactly what it skipped.
+        const resolved = hasBackedResolution(details, boundPdfIds.get(row.targetKey) ?? null);
         const acknowledged = currentCodes.length > 0 && currentCodes.every(code => acked.has(code));
         /**
          * RE-VERIFY AGAINST RECEIPT EVIDENCE, not just this issue's own
@@ -595,6 +623,65 @@ export async function GET(request: Request) {
     // pacificDate) key blocks any replacement, so every later run today
     // would re-claim the same dead row and fail the same way.
     const invalidRows: string[] = [];
+
+    /**
+     * QUEUED RESENDS FIRST, WHATEVER DATE THEY ARE FOR (Codex PR #443 gate
+     * round 40, finding 2).
+     *
+     * An operator who answers "resend" puts an UNCERTAIN row back to PENDING.
+     * Every claim below is keyed on TODAY'S (owner, pacificDate), so a resend
+     * requested after the day's last retry slot was never claimed again — the
+     * row sat PENDING for ever, and tomorrow's card, built for a different
+     * date, re-asked the same items from scratch as if nobody had decided
+     * anything.
+     *
+     * So a queued row is drained on its own terms: oldest first, its OWN date
+     * and items (the thread key is derived from owner + that date, so the card
+     * lands in the thread the operator was looking at), and bounded per run so
+     * a backlog cannot crowd out today's cards or the send budget.
+     */
+    const queuedDrained: string[] = [];
+    const queued = await prisma.receiptRequestCard.findMany({
+        where: {
+            status: "PENDING",
+            postedAt: null,
+            lastError: CARD_RESEND_QUEUED_REASON,
+            pacificDate: { lt: date },
+        },
+        orderBy: [{ pacificDate: "asc" }, { owner: "asc" }],
+        take: QUEUED_RESEND_DRAIN_LIMIT,
+        select: { id: true, owner: true, pacificDate: true, itemsJson: true, overflow: true, overflowExact: true },
+    });
+    for (const row of queued) {
+        const token = randomUUID();
+        const taken = await prisma.receiptRequestCard.updateMany({
+            where: {
+                id: row.id,
+                postedAt: null,
+                status: "PENDING",
+                OR: [{ claimedAt: null }, { claimedAt: { lt: new Date(now.getTime() - CLAIM_LEASE_MS) } }],
+            },
+            data: { claimedAt: now, claimToken: token },
+        });
+        if (taken.count === 0) continue;
+        const items = parseItems(row.itemsJson);
+        if (items.length === 0) {
+            // Same reasoning as today's unusable row: delete it rather than
+            // leave a dead claim that every future run re-takes.
+            await prisma.receiptRequestCard.deleteMany({ where: { id: row.id, claimToken: token, postedAt: null } });
+            invalidRows.push(row.owner);
+            continue;
+        }
+        // ITS OWN DATE, not today's: the request id — and therefore the Chat
+        // thread — belongs to the day the card was selected for.
+        toPost.push({
+            card: buildCardFromItems(row.owner, row.pacificDate, items, row.overflow, row.overflowExact),
+            rowId: row.id,
+            token,
+            resumed: true,
+        });
+        queuedDrained.push(`${row.owner}:${row.pacificDate}`);
+    }
 
     for (const owner of CARD_OWNERS_ASKED) {
         const existing = await prisma.receiptRequestCard.findUnique({
@@ -1005,6 +1092,10 @@ export async function GET(request: Request) {
         // Rows deleted this run because their stored itemsJson parsed to
         // nothing. Worth seeing, not worth failing the run over.
         invalidRows,
+        // Queued resends this run picked up, as "<owner>:<their date>" — the
+        // only place an operator can see that a decision made after the day's
+        // last slot was honoured (round-40 gate, finding 2).
+        queuedDrained,
         date,
         retryOnly,
         scanned: scan.candidates.length,

@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { CARD_RESEND_QUEUED_REASON, CARD_RESEND_STALE_HOURS } from "@/lib/receipt-request-cards";
 import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 
 /**
@@ -146,6 +147,12 @@ export interface PipelineHealth {
         /** Days whose clearance was never answered, as `<from>..<to>`. */
         uncertifiedWindow?: string | null;
     };
+    /**
+     * Cards an operator asked to RESEND that are still unsent hours later
+     * (round-40 gate, finding 2). Optional so a caller built before the probe
+     * existed still type-checks; the health route always populates it.
+     */
+    queuedCards?: CountProbe;
     /** The missing-receipt sweep's marker, including why it is holding back. */
     chaser?: {
         status: ProbeStatus;
@@ -336,6 +343,16 @@ export function evaluatePipelineHealth(input: {
     };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
+    /**
+     * Cards an operator asked to RESEND that are still sitting unsent
+     * (Codex PR #443 gate round 40, finding 2).
+     *
+     * The cron drains them oldest-first, a few per run — so a count that stays
+     * above zero for hours means either the cron is not running or the backlog
+     * is deeper than the per-run limit. Both are things a human has to know:
+     * the operator already decided, and the crew is still waiting.
+     */
+    queuedCards?: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
     driveCredentials: { status: ProbeStatus; reason?: string; configured: boolean; source: string };
     /**
@@ -369,6 +386,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
         ["uncertainCards", input.uncertainCards],
+        ...(input.queuedCards ? [["queuedCards", input.queuedCards] as [string, { status: ProbeStatus }]] : []),
         ["bankPull", input.bankPull],
         ["driveCredentials", input.driveCredentials],
         ["chaser", input.chaser],
@@ -531,6 +549,12 @@ export function evaluatePipelineHealth(input: {
     // one looks the crew has silently not been asked for those receipts.
     if (input.uncertainCards.status === "ok" && input.uncertainCards.count > 0) {
         reasons.push(`cards-uncertain:${input.uncertainCards.count}`);
+    }
+
+    // Only the STALE ones: a resend requested five minutes ago is waiting for
+    // the next cron slot, which is the system working.
+    if (input.queuedCards?.status === "ok" && input.queuedCards.count > 0) {
+        reasons.push(`cards-queued-stale:${input.queuedCards.count}`);
     }
 
     return { ok: reasons.length === 0, reasons };
@@ -806,7 +830,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, bankPull, chaser, driveCredentials,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, uncertainCards, queuedCards, bankPull, chaser, driveCredentials,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -974,6 +998,20 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             () => prisma.receiptRequestCard.count({ where: { status: "UNCERTAIN" } }),
             0,
         ),
+        // Resends an operator asked for that are still unsent, and have been
+        // for longer than a cron slot or two (round-40 gate, finding 2).
+        probe<number>(
+            "queuedCards",
+            () => prisma.receiptRequestCard.count({
+                where: {
+                    status: "PENDING",
+                    postedAt: null,
+                    lastError: CARD_RESEND_QUEUED_REASON,
+                    updatedAt: { lt: new Date(now - CARD_RESEND_STALE_HOURS * HOUR_MS) },
+                },
+            }),
+            0,
+        ),
         // IN the Promise.all, and probed: it used to be an unprobed `await`
         // after it, so a hung database held the whole health check open past
         // every other probe's deadline and then answered "switched off".
@@ -1061,6 +1099,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: uncertainCards.status,
             reason: uncertainCards.reason,
             count: uncertainCards.value,
+        },
+        queuedCards: {
+            status: queuedCards.status,
+            reason: queuedCards.reason,
+            count: queuedCards.value,
         },
         chaser: {
             status: chaser.status,
@@ -1165,6 +1208,9 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
                 : health.bank.at
                     ? health.bank.at.slice(0, 10)
                     : "no lines"
+        }`,
+        `Cards queued for resend >${CARD_RESEND_STALE_HOURS}h: ${
+            health.queuedCards?.status === "error" ? "unavailable (probe failed)" : health.queuedCards?.count ?? "unavailable"
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
         // Optional-chained on purpose: a digest that THROWS means no morning
