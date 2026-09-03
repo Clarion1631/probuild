@@ -442,6 +442,21 @@ const expectedUniqueIndexes = [{
     name: "ReceiptRequestCard_owner_pacificDate_key",
     mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "pacificDate"\)/],
 }, {
+    // THE DELIVERY-DAY CLAIM (Codex PR #443 gate round 43, finding 6). The
+    // sibling above claims the day a card was SELECTED for; this one claims the
+    // day it was SENT, which is the only thing that can stop a resend — which
+    // keeps its original pacificDate on purpose — becoming a second message to
+    // the same person on the same day.
+    //
+    // `mustNotMatch` is as load bearing as `mustMatch` here: a PARTIAL index
+    // would enforce the same rule and be invisible to Prisma's diff engine, so
+    // CI's migrations job would report it missing forever. It needs no WHERE
+    // clause anyway — Postgres treats two NULLs as unequal in a unique index,
+    // so undelivered cards never collide.
+    name: "ReceiptRequestCard_owner_deliveredOn_key",
+    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "deliveredOn"\)/],
+    mustNotMatch: [/ WHERE /],
+}, {
     name: "ReceiptMemoArtifact_pdfId_key",
     mustMatch: [/CREATE UNIQUE INDEX/, /\("pdfId"\)/],
 }, {
@@ -541,7 +556,7 @@ async function main() {
             console.log(`verified constraint ${name}`);
         }
 
-        for (const { name, mustMatch } of expectedUniqueIndexes) {
+        for (const { name, mustMatch, mustNotMatch = [] } of expectedUniqueIndexes) {
             const [row] = await prisma.$queryRawUnsafe(`SELECT indexdef FROM pg_indexes WHERE indexname = $1`, name);
             if (!row) {
                 console.error(`VERIFY FAILED: index ${name} missing`);
@@ -550,6 +565,13 @@ async function main() {
             for (const pattern of mustMatch) {
                 if (!pattern.test(row.indexdef)) {
                     console.error(`VERIFY FAILED: index ${name} does not match ${pattern}\n  got: ${row.indexdef}`);
+                    process.exit(1);
+                }
+            }
+            for (const pattern of mustNotMatch) {
+                if (pattern.test(row.indexdef)) {
+                    console.error(`VERIFY FAILED: index ${name} must NOT match ${pattern}
+  got: ${row.indexdef}`);
                     process.exit(1);
                 }
             }

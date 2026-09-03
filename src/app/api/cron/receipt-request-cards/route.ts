@@ -874,6 +874,13 @@ export async function GET(request: Request) {
      * marker.
      */
     const budgetDeferred: string[] = [];
+    /**
+     * Owners whose day was claimed by a concurrent invocation between this
+     * run's check and its reservation (round-43 gate, finding 1). Not a
+     * failure — it is the mechanism working — but worth seeing, because a run
+     * that reports these every day means two schedules are overlapping.
+     */
+    const dayTaken: string[] = [];
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
         /**
          * ONE CACHE PER CARD, NOT PER RUN (Codex PR #443 gate round 37,
@@ -1035,14 +1042,56 @@ export async function GET(request: Request) {
         // POSTING, BEFORE the call. This is the whole point of the state: a
         // crash after this write and before the response is distinguishable
         // from a crash before it, so the next run knows not to repost.
-        const marked = await prisma.receiptRequestCard.updateMany({
-            where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
-            // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The row is
-            // the record of the card that was posted; leaving the pre-rebuild
-            // list on it would make a resumed run re-post items this one
-            // deliberately dropped.
-            data: { status: "POSTING", itemsJson: JSON.stringify(card.items) },
-        });
+        let marked: { count: number };
+        try {
+            marked = await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
+                // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The row is
+                // the record of the card that was posted; leaving the pre-rebuild
+                // list on it would make a resumed run re-post items this one
+                // deliberately dropped.
+                /**
+                 * AND THE DELIVERY-DAY CLAIM, BEFORE THE SEND (Codex PR #443 gate
+                 * round 43, finding 1).
+                 *
+                 * `deliveredOn` used to be written with the POSTED result, AFTER
+                 * the webhook returned — which made the unique index a detector of
+                 * double-sends rather than a preventer of them: two concurrent
+                 * runs both passed the in-memory `deliveredToday` check, both
+                 * called Chat, and only then collided on a constraint, with two
+                 * messages already in the space. A Chat message cannot be recalled,
+                 * so the claim has to be taken while it is still cheap to lose.
+                 *
+                 * It rides on the POSTING write because that write is already the
+                 * commit point for "this run owns the send": one row, one CAS, one
+                 * transaction. A loser sees `count === 0` (lost the claim token) or
+                 * a unique violation (lost the day) and sends nothing.
+                 *
+                 * Released only on a DEFINITE rejection, below — an uncertain
+                 * delivery keeps it, because the card may be in the space and a
+                 * second one is the outcome this whole mechanism exists to avoid.
+                 */
+                data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date },
+                });
+        } catch (error) {
+            /**
+             * LOST THE DAY, NOT THE ROW (round-43 gate, finding 1). Another
+             * invocation claimed `(owner, date)` first — its message is going
+             * out, or already has. This one sends nothing and releases its
+             * claim token so the row is free for tomorrow's pass; the card
+             * itself is untouched, so a queued resend keeps its marker.
+             *
+             * P2002 only. Anything else is a real failure and is rethrown, so a
+             * broken write cannot be silently read as "someone beat me to it".
+             */
+            if ((error as { code?: string })?.code !== "P2002") throw error;
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, postedAt: null },
+                data: { claimedAt: null, claimToken: null },
+            });
+            dayTaken.push(card.owner);
+            continue;
+        }
         if (marked.count === 0) {
             // Someone else owns it now; do not send.
             continue;
@@ -1059,6 +1108,12 @@ export async function GET(request: Request) {
                     status: "PENDING",
                     attempts: { increment: 1 },
                     lastError: `rejected:${result.reason}`,
+                    // THE ONLY PLACE THE DAY IS GIVEN BACK (round-43 gate,
+                    // finding 1). Chat provably did not take it, so nothing is
+                    // in the space and this owner's day is genuinely still
+                    // free. Every other outcome — posted, or uncertain — keeps
+                    // the claim.
+                    deliveredOn: null,
                     claimedAt: null,
                     claimToken: null,
                 },
@@ -1105,12 +1160,12 @@ export async function GET(request: Request) {
                 data: {
                     status: "POSTED",
                     postedAt: new Date(),
-                    // THE DELIVERY-DAY CLAIM (round-42 gate, finding 4): unique
-                    // per owner and day, so a second card for the same owner on
-                    // the same day loses on the constraint rather than on a
-                    // check somebody has to remember. Written with the post, in
-                    // the same transaction, because "delivered" and "claimed the
-                    // day" are the same event.
+                    // The delivery-day claim, restated. It was already taken by
+                    // the POSTING write above (round-43 gate, finding 1) — this
+                    // run owns the day before Chat was ever called. Writing the
+                    // same value again costs nothing and keeps this row's final
+                    // state readable on its own, without tracing back to the
+                    // reservation.
                     deliveredOn: date,
                     threadName: result.threadName,
                     messageName: result.messageName,
@@ -1218,6 +1273,8 @@ export async function GET(request: Request) {
         // because "we ran out of clock before the send" and "we ran out of
         // clock inside the check" are different failures to chase.
         ...(budgetDeferred.length > 0 ? { budgetDeferredOwners: budgetDeferred } : {}),
+        // Lost the (owner, day) reservation to a concurrent run; sent nothing.
+        ...(dayTaken.length > 0 ? { dayAlreadyClaimedOwners: dayTaken } : {}),
         ...(budgetDeferred.length > 0
             ? { deferredReason: "deferred:budget" as const }
             : sendDeferred.length > 0 ? { deferredReason: "send-deferred" as const } : {}),

@@ -5,7 +5,7 @@
  * THE DECISION THIS IMPLEMENTS (Justin, decision 3): a QuickBooks POSTED
  * register row is good enough to chase against. Before this, a canonical
  * `BankLine` was minted ONLY from a STATEMENT observation, so nothing existed
- * to chase until the monthly statement import ran — a 3-day receipt chase was
+ * to chase until the statement import ran — a 3-day receipt chase was
  * in practice a 30-day one. QBO register rows now mint their own canonical line.
  *
  * AND WHAT THAT IS NOT (Codex PR #443 gate round 37, finding 1). The source is

@@ -48,7 +48,7 @@ export const maxDuration = 60;
  * the QuickBooks General Ledger report: transactions QuickBooks has POSTED to
  * the account. A charge sitting in the bank feed unposted — pending, excluded,
  * or never matched — is absent from that report, so this pull cannot ingest it
- * and the mint cannot create a line for it. The monthly statement import
+ * and the mint cannot create a line for it. The statement import (daily WTB CSV, decision 3 as amended 2026-09-02)
  * remains the source of record for those, and its freshness is reported
  * separately (`newestStatementPostedDate`) so a healthy run of THIS cron can
  * never read as a current statement import.
@@ -170,6 +170,7 @@ async function readWindowState(): Promise<PullWindowState> {
                 : null,
             stampPending: parsed.stampPending === true,
             continuationPending: parsed.continuationPending === true,
+            continuationReason: typeof parsed.continuationReason === "string" ? parsed.continuationReason : null,
         };
         if (dropped.length > 0) {
             console.warn("[cron/bank-register-pull] dropped unusable window-state fields", dropped.join(","));
@@ -765,7 +766,30 @@ async function runPull() {
      */
     const statePatch: Record<string, unknown> = {};
     if (stampFailed) statePatch.stampPending = true;
-    if (!summary.ok) statePatch.continuationPending = true;
+    if (!summary.ok) {
+        statePatch.continuationPending = true;
+        statePatch.continuationReason = "failed";
+    }
+    /**
+     * AMBIGUITY IS UNFINISHED WORK TOO (round-43 gate, finding 5).
+     *
+     * A same-identity group inside this run's window that reconcile refused to
+     * guess at blocks the stamp — `stampWarranted` requires
+     * `ambiguousCount === 0` — but it does NOT make `summary.complete` false:
+     * the register was read, the rows are stored, the links this run could make
+     * were made. So the state save wrote `continuationPending: false`, every
+     * later slot answered "nothing-in-progress", and the freshness clock stayed
+     * where it was. A human could resolve the duplicate and nothing would come
+     * back to notice.
+     *
+     * Written AFTER the state save on purpose — this merge is what widens that
+     * save's answer, and it is the last write of the run, so it cannot be
+     * overwritten by the thing it is correcting.
+     */
+    if (summary.ok && ambiguousCount > 0) {
+        statePatch.continuationPending = true;
+        statePatch.continuationReason = "ambiguity";
+    }
     if (Object.keys(statePatch).length > 0) await mergeWindowState(statePatch);
 
     const status = stampFailed ? 503 : summary.ok ? 200 : 500;

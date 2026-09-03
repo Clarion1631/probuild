@@ -38,7 +38,7 @@ import {
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
 import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
-import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -177,6 +177,11 @@ export interface BookPrismaClient {
      * this transaction changes what the sweep reads, so it queues behind it.
      */
     $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+    /**
+     * And the evidence EPOCH is bumped through here (round-43 gate, finding 4),
+     * so a sweep certifying a whole cycle can tell that evidence moved under it.
+     */
+    $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     project: {
         findUnique(args: any): Promise<{
             id: string;
@@ -672,6 +677,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             // is exactly what the sweep reads as "the receipt exists"
             // (round-42 gate, finding 1).
             await lockReceiptEvidence(tx);
+            // AND MOVE THE EVIDENCE EPOCH (round-43 gate, finding 4). This
+            // transaction owns the lock directly rather than going through
+            // `withReceiptEvidenceLock`, so the bump the wrapper would have
+            // done has to be done here — a sweep certifying a cycle needs to
+            // see that evidence moved under it.
+            await bumpReceiptEvidenceEpoch(tx);
             // THE FENCE COMES FIRST, and that ordering is the whole point.
             //
             // It used to run after the Expense was created, which meant a void

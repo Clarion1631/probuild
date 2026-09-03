@@ -1,4 +1,5 @@
 import type { Prisma } from "@prisma/client";
+import { bumpReceiptEvidenceEpoch, lockReceiptEvidence } from "../receipt-evidence-lock";
 
 /**
  * THE DUPLICATE POINTER IS A ONE-HOP RELATION, AND STAYS ONE (Codex PR #443
@@ -34,7 +35,7 @@ import type { Prisma } from "@prisma/client";
 /**
  * Just enough of a client for the lock AND the write it protects — the
  * transaction, or a test double. `receiptIntake` rides along because the whole
- * point of `withDuplicateChainLock` is that the caller writes inside the same
+ * point of `withEvidenceAndChainLocks` is that the caller writes inside the same
  * transaction that took the lock (round-40 gate, finding 1).
  */
 export type DuplicateGuardClient = Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw" | "receiptIntake">;
@@ -113,13 +114,39 @@ export function duplicateChainRefusal(action: "duplicate" | "void", inbound: rea
  * INSIDE the transaction that took the lock, and gets the inbound references
  * as an argument rather than fetching them itself. A caller cannot skip the
  * lock, take it late, or hold it for a shorter span than its own write.
+ *
+ * BOTH LOCKS, IN ONE ORDER, FOR EVERY CALLER (Codex PR #443 gate round 43,
+ * findings 2 and 3).
+ *
+ * Round 42 added the receipt-evidence advisory lock and declared it the
+ * OUTERMOST lock — and then left this function taking `FOR UPDATE` row locks
+ * first, with two of its three callers taking the evidence lock inside the
+ * body. That is an AB-BA inversion against the sweep, which takes the evidence
+ * lock and then row locks: two transactions, opposite orders, a real deadlock.
+ * The third caller, the intake worker, took no evidence lock at all, so it
+ * changed evidence-defining state (a row becoming DUPLICATE is a receipt
+ * ceasing to exist as far as the sweep is concerned) straight through the
+ * fence.
+ *
+ * Both problems are the same problem: the order was a convention each caller
+ * had to remember. So this wrapper is the ONLY exported way in, and it takes
+ * the evidence lock first, always, before any row lock. There is no
+ * chain-lock-without-evidence-lock entry point left to call by mistake.
  */
-export async function withDuplicateChainLock<T>(
+export async function withEvidenceAndChainLocks<T>(
     transaction: <R>(fn: (tx: DuplicateGuardClient) => Promise<R>) => Promise<R>,
     ids: readonly string[],
     body: (tx: DuplicateGuardClient, inbound: Map<string, string[]>) => Promise<T>,
 ): Promise<T> {
-    return transaction(async tx => body(tx, await lockWithInboundDuplicates(tx, ids)));
+    return transaction(async tx => {
+        // FIRST. Not "somewhere inside".
+        await lockReceiptEvidence(tx);
+        // Everything that comes through here changes what the sweep reads — a
+        // row becomes DUPLICATE, or VOID — so the evidence epoch moves with it
+        // (round-43 gate, finding 4).
+        await bumpReceiptEvidenceEpoch(tx);
+        return body(tx, await lockWithInboundDuplicates(tx, ids));
+    });
 }
 
 /** The worker's own note when it refuses to reclassify an original. */

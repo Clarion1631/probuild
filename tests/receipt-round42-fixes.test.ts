@@ -127,6 +127,12 @@ let postCalls: OwnerCard[];
  * rebuild itself (which `rebuildCardItems` covers directly).
  */
 let rebuildOverride: ((items: readonly CardItem[]) => RebuiltCard) | null;
+/** Parks every webhook call until resolved, so two runs can interleave. */
+let postBarrier: Promise<void> | null;
+/** How many times the (owner, deliveredOn) index actually refused a write. */
+let uniqueViolations: number;
+/** Fails the NEXT reservation write with this error, once. */
+let postingWriteError: (Error & { code?: string }) | null;
 
 const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
 const dayBefore = (days: number) =>
@@ -225,6 +231,25 @@ const cardsPrisma: Record<string, unknown> = {
             let count = 0;
             for (const row of cards.values()) {
                 if (!cardMatches(row, where)) continue;
+                /**
+                 * THE UNIQUE INDEX, ENFORCED (round-43 gate, finding 1). Without
+                 * this the fake would let both concurrent runs reserve the same
+                 * (owner, day) and the concurrency test would prove nothing —
+                 * the constraint IS the mechanism.
+                 */
+                if (typeof data.deliveredOn === "string" && postingWriteError) {
+                    const error = postingWriteError;
+                    postingWriteError = null;
+                    throw error;
+                }
+                if (typeof data.deliveredOn === "string") {
+                    const taken = [...cards.values()].some(other =>
+                        other !== row && other.owner === row.owner && other.deliveredOn === data.deliveredOn);
+                    if (taken) {
+                        uniqueViolations++;
+                        throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
+                    }
+                }
                 for (const [key, value] of Object.entries(data)) {
                     if (value && typeof value === "object" && "increment" in (value as object)) {
                         row[key] = ((row[key] as number) ?? 0) + (value as { increment: number }).increment;
@@ -279,6 +304,9 @@ function reset() {
     cards = new Map();
     postCalls = [];
     rebuildOverride = null;
+    postBarrier = null;
+    uniqueViolations = 0;
+    postingWriteError = null;
     settings.clear();
     settings.set("receiptRequestsPhase", JSON.stringify({
         phase: "done",
@@ -304,6 +332,8 @@ before(async () => {
                 rebuildCardItems: (items: readonly CardItem[], truth: ReadonlyMap<string, CardItemTruth>, owner: string) =>
                     (rebuildOverride ? rebuildOverride(items) : realCards.rebuildCardItems(items, truth, owner)),
                 postOwnerCard: async (_url: string, card: OwnerCard) => {
+                    // A test can park the send here to interleave two runs.
+                    if (postBarrier) await postBarrier;
                     postCalls.push(card);
                     return { kind: "delivered", owner: card.owner, threadName: "spaces/s/threads/t", messageName: "spaces/s/messages/m" };
                 },
@@ -489,6 +519,85 @@ test("PRE-FIX CONTROL: with the day free, that same resend posts immediately", a
     assert.equal(postCalls.length, 1, "nothing about the row changed — only whether today was taken");
     assert.deepEqual(body.queuedDrained, [`CJ:${yesterday}`]);
     assert.equal(queued.resendQueuedAt, null);
+});
+
+test("TWO CONCURRENT RUNS, ONE MESSAGE: the reservation beats the send", async () => {
+    /**
+     * Codex PR #443 gate round 43, finding 1. Lives here because this file owns
+     * the cron harness.
+     *
+     * Both invocations pass the in-memory `deliveredToday` check — it is a read,
+     * and neither has written anything yet. Under round 42 they both went on to
+     * call Chat and collided on the unique index AFTERWARDS, with two messages
+     * already in the space. The reservation moved to the POSTING write, so the
+     * loser now finds out before it sends.
+     */
+    reset();
+    // TWO ROWS, ONE OWNER: a queued resend from yesterday, and a chase still
+    // open today. Two different cards, so two different claim tokens — the
+    // claim CAS cannot separate them, and nothing but the day reservation can.
+    queue = [scanRow("ri-1", "CJ"), scanRow("ri-2", "CJ")];
+    queuedCard("CJ", yesterday, ["ri-1"]);
+
+    // The first run reaches the webhook and parks there. The second run starts
+    // while it is parked, so its reservation races a claim that is committed
+    // but whose send has not returned.
+    let openBarrier!: () => void;
+    postBarrier = new Promise<void>(resolve => { openBarrier = resolve; });
+
+    const first = run();
+    // Let the first run get as far as its POSTING write and into the webhook.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const second = run();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    openBarrier();
+
+    const [bodyA, bodyB] = await Promise.all([
+        first.then(response => response.json()) as Promise<Record<string, unknown>>,
+        second.then(response => response.json()) as Promise<Record<string, unknown>>,
+    ]);
+
+    assert.equal(postCalls.length, 1, "exactly one message reached Chat");
+    const claimed = [bodyA, bodyB].filter(body => Array.isArray(body.queuedDrained) && (body.queuedDrained as string[]).length > 0);
+    assert.equal(claimed.length, 1, "and exactly one run says it sent it");
+
+    // AND IT WAS THE INDEX THAT STOPPED IT, not the claim token. Without this
+    // the test would pass for the wrong reason: both runs draining the SAME row
+    // collide on its claim, which proves nothing about the day.
+    assert.ok(uniqueViolations >= 1, "the (owner, deliveredOn) index is what refused the second card");
+
+    const row = cards.get(`CJ|${yesterday}`)!;
+    assert.equal(row.status, "POSTED");
+    assert.equal(row.deliveredOn, today, "the day is claimed once");
+    assert.equal(
+        [...cards.values()].filter(other => other.owner === "CJ" && other.deliveredOn === today).length,
+        1,
+        "one delivery on the books for this owner today",
+    );
+});
+
+test("a POSTING write that fails for ANY OTHER reason is NOT read as 'someone beat me to it'", async () => {
+    /**
+     * The other half of round 43's finding 1. Losing the day is a P2002 and
+     * nothing else. A bare `catch` around the reservation would turn a dropped
+     * connection, a timeout, or a genuine bug into a silent skip: the card
+     * would never go out and the run would report a clean day.
+     *
+     * (Measured: mutating the `!== "P2002"` test to `false` left every other
+     * test in this file green. This is the one that fails.)
+     */
+    reset();
+    queue = [scanRow("ri-1", "CJ")];
+    queuedCard("CJ", yesterday, ["ri-1"]);
+    postingWriteError = Object.assign(new Error("connection terminated unexpectedly"), { code: "P1017" });
+
+    await assert.rejects(
+        () => run(),
+        /connection terminated unexpectedly/,
+        "the failure surfaces instead of being counted as a lost race",
+    );
+    assert.equal(postCalls.length, 0, "and nothing was sent");
+    assert.equal(uniqueViolations, 0, "this was never a constraint violation");
 });
 
 test("the claim is a database constraint, not a check somebody has to remember", () => {

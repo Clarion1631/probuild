@@ -393,10 +393,13 @@ function makeLedger() {
         /** The chaser's transaction: everything inside runs under the same lock. */
         transaction: <T>(fn: (ops: {
             lockEpoch: () => Promise<string>;
+            /** The evidence side of the fence (round-43 gate, finding 4). */
+            lockEvidenceEpoch: () => Promise<string>;
             countNewLines: () => Promise<number>;
             writePhase: (phase: string, completedAt: string | undefined, blockedReason: string | null) => Promise<void>;
         }) => Promise<T>): Promise<T> => withLock(() => fn({
             lockEpoch: async () => String(epoch),
+            lockEvidenceEpoch: async () => "e0",
             countNewLines: async () => lines.filter(line => line.createdAt >= snapshotAt).length,
             writePhase: async (phase, completedAt, blockedReason) => {
                 written.push({ phase, completedAt, blockedReason, linesAtCommit: lines.length });
@@ -419,7 +422,7 @@ test("a line inserted after the count cannot slip in before the marker: check an
     // The writer starts DURING the fence: it queues on the same lock the fence
     // holds, exactly as it would on the epoch row.
     const fenced = fenceAndWritePhase(
-        { snapshotEpoch, computedPhase: "done", bankPullStale: false, now: new Date("2026-09-03T14:00:00Z") },
+        { snapshotEpoch, snapshotEvidenceEpoch: "e0", computedPhase: "done", bankPullStale: false, now: new Date("2026-09-03T14:00:00Z") },
         ledger.transaction as never,
     );
     const writer = ledger.write(() => ledger.lines.push({ id: "bl-2", createdAt: 20, descriptor: "HD" }));
@@ -460,7 +463,7 @@ test("a DESCRIPTOR rewritten under the pass is movement too — a createdAt coun
     await ledger.write(() => { ledger.lines[0].descriptor = "LOWES #02516 POS DEB C#8516"; });
 
     const decision = await fenceAndWritePhase(
-        { snapshotEpoch, computedPhase: "done", bankPullStale: false, now: new Date("2026-09-03T14:00:00Z") },
+        { snapshotEpoch, snapshotEvidenceEpoch: "e0", computedPhase: "done", bankPullStale: false, now: new Date("2026-09-03T14:00:00Z") },
         ledger.transaction as never,
     );
 
@@ -480,7 +483,7 @@ test("a fence that cannot be taken refuses to certify, under its own reason", as
     const failing = <T>(_fn: (ops: unknown) => Promise<T>): Promise<T> => Promise.reject(new Error("lock timeout"));
     await assert.rejects(
         () => fenceAndWritePhase(
-            { snapshotEpoch: "3", computedPhase: "done", bankPullStale: false, now: new Date() },
+            { snapshotEvidenceEpoch: "e0", snapshotEpoch: "3", computedPhase: "done", bankPullStale: false, now: new Date() },
             failing as never,
         ),
         /lock timeout/,

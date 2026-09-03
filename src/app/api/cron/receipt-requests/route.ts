@@ -38,7 +38,7 @@ import {
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
 import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { withTxRetry } from "@/lib/tx-retry";
-import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
+import { lockReceiptEvidence, readReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     SWEEP_MARKER_KEY,
@@ -180,6 +180,13 @@ const FENCE_TX_TIMEOUT_MS = 15_000;
 export interface LedgerFenceOps {
     /** Take the ledger epoch row's lock and read it. */
     lockEpoch(): Promise<string>;
+    /**
+     * Read the receipt-EVIDENCE epoch, under the evidence lock (round-43 gate,
+     * finding 4). A separate counter from the ledger's because they answer
+     * different questions: "did new charges appear" and "did the receipts those
+     * charges were judged against change".
+     */
+    lockEvidenceEpoch(): Promise<string>;
     /** Canonical lines that appeared in the window since the snapshot instant. */
     countNewLines(): Promise<number>;
     /** Write the phase marker — in the SAME transaction as the two above. */
@@ -214,6 +221,8 @@ export interface LedgerFenceOps {
 export async function fenceAndWritePhase(
     input: {
         snapshotEpoch: string;
+        /** The receipt-evidence epoch as it stood when this cycle started. */
+        snapshotEvidenceEpoch: string;
         computedPhase: SweepPhase;
         bankPullStale: boolean;
         /** The completion instant, injected so a test does not race a clock. */
@@ -224,8 +233,24 @@ export async function fenceAndWritePhase(
     return transaction(async ops => {
         const epoch = await ops.lockEpoch();
         const epochMoved = epoch !== input.snapshotEpoch;
-        const appeared = epochMoved ? 0 : await ops.countNewLines();
-        const ledgerMoved = epochMoved || appeared > 0;
+        /**
+         * EVIDENCE MOVING IS AS DISQUALIFYING AS THE LEDGER MOVING (round-43
+         * gate, finding 4).
+         *
+         * The per-component evidence lock fences ONE component transaction. The
+         * cycle is many of them, across pages, and it releases the lock between
+         * each. An intake voided or unlinked after its component ran but before
+         * this stamp leaves an issue closed on evidence that no longer exists —
+         * and the old fence, which only asked about BankLines, certified it.
+         *
+         * Read under the evidence lock so it cannot interleave with a bump, and
+         * treated exactly like a ledger move: hold the cycle open, let the
+         * 15-minute continuation re-judge over the truth.
+         */
+        const evidenceEpoch = await ops.lockEvidenceEpoch();
+        const evidenceMoved = evidenceEpoch !== input.snapshotEvidenceEpoch;
+        const appeared = epochMoved || evidenceMoved ? 0 : await ops.countNewLines();
+        const ledgerMoved = epochMoved || evidenceMoved || appeared > 0;
         const decision = sweepCompletionDecision({
             computedPhase: input.computedPhase,
             bankPullStale: input.bankPullStale,
@@ -1876,6 +1901,8 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // writer, so a descriptor rewritten under this pass — which changes who owns
     // the charge, and therefore who is asked — moves it too.
     const snapshotEpoch = await readBankLedgerEpoch(prisma);
+    // The evidence side of the same snapshot (round-43 gate, finding 4).
+    const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);
     const windowLines = await prisma.bankLine.findMany({
         where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
@@ -2073,9 +2100,16 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     if (certifiable) {
         try {
             decision = await fenceAndWritePhase(
-                { snapshotEpoch, computedPhase, bankPullStale, now: new Date() },
+                { snapshotEpoch, snapshotEvidenceEpoch, computedPhase, bankPullStale, now: new Date() },
                 fn => prisma.$transaction(async tx => fn({
                     lockEpoch: () => lockBankLedgerEpoch(tx),
+                    // The evidence lock FIRST, then its counter — same order
+                    // every other transaction takes them in, so this fence
+                    // cannot deadlock against a writer.
+                    lockEvidenceEpoch: async () => {
+                        await lockReceiptEvidence(tx);
+                        return readReceiptEvidenceEpoch(tx);
+                    },
                     countNewLines: () => tx.bankLine.count({
                         where: {
                             postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) },

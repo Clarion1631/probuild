@@ -525,7 +525,10 @@ test("the lease release is a single fenced statement", () => {
 
 test("cards write POSTING before the webhook and never repost an uncertain row", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
+    // The POSTING write also takes the delivery-day claim now (round-43 gate,
+    // finding 1) — the reservation and the "this run owns the send" commit are
+    // deliberately the same write.
+    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date }');
     const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     assert.ok(markAt > 0 && postAt > markAt, "POSTING must be written BEFORE the call");
     // A post that succeeded but whose completion write lost is UNCERTAIN.
@@ -764,7 +767,10 @@ test("the card snapshot is re-verified under the claim, immediately before the s
     // Rebuild -> (cancel | POSTING) -> post. In that order, inside the loop
     // that already holds the claim token.
     const rebuildAt = source.indexOf("const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);");
-    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
+    // The POSTING write also takes the delivery-day claim now (round-43 gate,
+    // finding 1) — the reservation and the "this run owns the send" commit are
+    // deliberately the same write.
+    const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date }');
     const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     assert.ok(rebuildAt > 0 && markAt > rebuildAt && postAt > markAt);
     // The truth is read fresh, not carried from the selection scan. It is

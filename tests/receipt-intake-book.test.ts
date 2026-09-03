@@ -109,6 +109,7 @@ interface Recorder {
     expenses: any[];
     intakeUpdates: any[];
     lockCalls: string[];
+    epochBumps: string[];
     events: any[];
 }
 
@@ -123,6 +124,7 @@ function recorder(
     const intakeUpdates: any[] = [];
     const events: any[] = [];
     const lockCalls: string[] = [];
+    const epochBumps: string[] = [];
 
     const tx = {
         project: {
@@ -157,6 +159,13 @@ function recorder(
             lockCalls.push(`${query.join("?")}|${values.join(",")}`);
             return 1;
         },
+        // The receipt-evidence EPOCH bump (round-43 gate, finding 4). Booking a
+        // row is evidence movement, so the counter a sweep fences its whole
+        // cycle against has to move with it — recorded here, asserted below.
+        $queryRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+            epochBumps.push(`${query.join("?")}|${values.join(",")}`);
+            return [{ value: "1" }];
+        },
         $transaction: async (fn: any) => fn(tx),
     };
 
@@ -178,7 +187,7 @@ function recorder(
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, lockCalls };
+    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, lockCalls, epochBumps };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {

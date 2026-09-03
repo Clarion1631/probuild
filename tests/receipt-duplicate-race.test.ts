@@ -132,7 +132,7 @@ test("both rows are locked, in id order, before anything is read", () => {
     // One transaction, one locking statement, both ids AND every row pointing
     // at either — the lock widened in round 39 (finding 2) so a chain cannot be
     // built from the other end while this transaction is deciding.
-    assert.match(body, /await withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\), \[id, duplicateOfId\], async \(tx, inbound\) => \{/);
+    assert.match(body, /await withEvidenceAndChainLocks\(fn => prisma\.\$transaction\(fn\), \[id, duplicateOfId\], async \(tx, inbound\) => \{/);
     // ONE function for the worker and the admin alike since round 40
     // (finding 1): the guard owns the transaction, so no caller can hold
     // the lock for a shorter span than its own write.

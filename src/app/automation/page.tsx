@@ -566,7 +566,7 @@ export default async function AutomationPage(props: {
                             {formatRelativeTime(new Date(fetchedAt), nowMs)}
                         </span>
                         . This view cannot see bank transactions that are pending, excluded, or missing from QuickBooks.
-                        Bank-side completeness requires the monthly WTB CSV compare.
+                        Bank-side completeness requires the daily WTB CSV compare.
                     </p>
                     {stale && (
                         <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">

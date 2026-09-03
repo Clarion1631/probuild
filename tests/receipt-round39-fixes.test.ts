@@ -254,13 +254,13 @@ test("the three write paths all take the guard, and the worker refuses in its ow
     const mark = actions.slice(actions.indexOf("export async function markReceiptIntakeDuplicate("));
     assert.match(
         mark.slice(0, mark.indexOf("\n}")),
-        /await withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\), \[id, duplicateOfId\][\s\S]{0,3000}throw duplicateChainRefusal\("duplicate", inboundToSource\)/,
+        /await withEvidenceAndChainLocks\(fn => prisma\.\$transaction\(fn\), \[id, duplicateOfId\][\s\S]{0,3000}throw duplicateChainRefusal\("duplicate", inboundToSource\)/,
         "mark locks both rows plus their references, and refuses to become a link in a chain",
     );
     const voidFn = actions.slice(actions.indexOf("export async function voidReceiptIntake("));
     assert.match(
         voidFn.slice(0, voidFn.indexOf("\n}")),
-        /await withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\), \[id\], async \(tx, inboundById\) => \{[\s\S]{0,400}throw duplicateChainRefusal\("void", inbound\)[\s\S]{0,600}await runParkWrites\(/,
+        /await withEvidenceAndChainLocks\(fn => prisma\.\$transaction\(fn\), \[id\], async \(tx, inboundById\) => \{[\s\S]{0,400}throw duplicateChainRefusal\("void", inbound\)[\s\S]{0,600}await runParkWrites\(/,
         "void locks, refuses and writes in ONE transaction — a duplicate marked in between would slip through",
     );
 
@@ -273,7 +273,7 @@ test("the three write paths all take the guard, and the worker refuses in its ow
     assert.match(worker, /async function applyRoutedState\(/);
     assert.match(worker, /return deps\.applyDuplicateTransition\(rowId, decision, patch, ownership\);/);
     assert.equal((worker.match(/await applyRoutedState\(/g) ?? []).length, 3);
-    assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withDuplicateChainLock\(/);
+    assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withEvidenceAndChainLocks\(/);
 });
 
 // ── 3. The memo filename is parsed, not positioned ─────────────────────────

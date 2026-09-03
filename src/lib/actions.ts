@@ -22,7 +22,7 @@ import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from 
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { POSSIBLE_ORPHAN_REASON, UNKNOWN_ORPHAN_STATES, planParkWrites, type ParkPlan } from "./receipt-intake/park";
-import { duplicateChainRefusal, withDuplicateChainLock } from "./receipt-intake/duplicate-guard";
+import { duplicateChainRefusal, withEvidenceAndChainLocks } from "./receipt-intake/duplicate-guard";
 import { driveFileIdOf } from "./receipt-intake/book";
 import { CARD_RESEND_QUEUED_REASON, parseChatDelivery, requestIdFor, type CardItem } from "./receipt-request-cards";
 import { recordCardOnIssues } from "./receipt-card-history";
@@ -15462,11 +15462,11 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
      * order is the same for every transaction and this cannot deadlock — and so
      * the inbound references cannot change between the read and the write.
      */
-    await withDuplicateChainLock(fn => prisma.$transaction(fn), [id, duplicateOfId], async (tx, inbound) => {
-        // The evidence lock is the OUTERMOST lock (round-42 gate, finding 1):
-        // marking a row DUPLICATE changes what the sweep reads.
-        await lockReceiptEvidence(tx);
-
+    // The evidence lock is the OUTERMOST lock, and the wrapper is what makes
+    // that true rather than remembered (round-43 gate, finding 3): taking it
+    // inside this body meant the row locks came first, which is the opposite of
+    // the order the sweep uses.
+    await withEvidenceAndChainLocks(fn => prisma.$transaction(fn), [id, duplicateOfId], async (tx, inbound) => {
         // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
         // the page; under the lock it is read again because that is the only
         // version that can still be true when the write lands.
@@ -15549,9 +15549,9 @@ export async function voidReceiptIntake(id: string, expectedState: string, expec
      * different way. Locked and checked in ONE transaction with the write, or
      * a duplicate marked a moment later slips through the gap.
      */
-    await withDuplicateChainLock(fn => prisma.$transaction(fn), [id], async (tx, inboundById) => {
-        // Same rule for a void: the row stops being evidence.
-        await lockReceiptEvidence(tx);
+    // Same rule for a void: the row stops being evidence, so the wrapper takes
+    // the evidence lock before the chain's row locks (round-43 gate, finding 3).
+    await withEvidenceAndChainLocks(fn => prisma.$transaction(fn), [id], async (tx, inboundById) => {
         const inbound = inboundById.get(id) ?? [];
         if (inbound.length > 0) throw duplicateChainRefusal("void", inbound);
         await runParkWrites(planParkWrites({

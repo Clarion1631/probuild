@@ -789,7 +789,7 @@ export interface ProbeResult<T> {
  * The nightly QBO pull reads the POSTED general-ledger register. A charge the
  * bank has cleared but QuickBooks has not posted — a pending or unmatched
  * bank-feed line — is not in that source at all and can never be minted from
- * it, so the monthly statement import stays the only thing that sees it. That
+ * it, so the statement import — the daily WTB CSV — stays the only thing that sees it. That
  * makes "how current is the statement import" a question the pull must not be
  * able to answer, and an unfiltered `max(postedDate)` let it: one night of
  * QBO-minted lines carried the date forward over a statement import nobody had

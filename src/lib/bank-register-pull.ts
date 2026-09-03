@@ -383,6 +383,22 @@ export interface PullWindowState {
      */
     continuationPending?: boolean;
     /**
+     * WHY a continuation is owed (Codex PR #443 gate round 43, finding 5).
+     *
+     * `"ambiguity"` is the case that motivated it. Unresolved same-identity
+     * groups inside THIS run's window block the freshness stamp — correctly,
+     * because nobody can say the register is reconciled — but they do not make
+     * `summary.complete` false, so the state save wrote
+     * `continuationPending: false` and every later slot answered
+     * "nothing-in-progress". The stamp was blocked and nothing was ever coming
+     * back to unblock it: a human resolved the duplicate and the clock still
+     * did not move until the next day's full pull happened to run.
+     *
+     * Recorded rather than inferred, because "incomplete" and "complete but
+     * unstampable" need different continuations and used to be the same flag.
+     */
+    continuationReason?: string | null;
+    /**
      * THE FRESHNESS STAMP A RUN OWED AND COULD NOT WRITE (round-36 gate,
      * finding 4).
      *
@@ -1312,6 +1328,10 @@ export async function runBankRegisterPull(
                 // every save, so the flag can never outlive the state it
                 // describes; false the moment a run completes the picture.
                 continuationPending: !summary.complete && clearedProbeOk,
+                // Set alongside the flag, so the two can never disagree. The
+                // route widens both when this run was complete but could not
+                // stamp (round-43 gate, finding 5).
+                continuationReason: !summary.complete && clearedProbeOk ? "incomplete" : null,
                 // CARRIED, NEVER CLEARED HERE (round-37 gate, finding 2). An
                 // owed freshness stamp is discharged by the write that commits
                 // the marker, in that write's own transaction; a save that

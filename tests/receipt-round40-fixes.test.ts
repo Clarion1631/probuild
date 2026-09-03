@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import {
     duplicateChainReason,
     duplicateChainRefusal,
-    withDuplicateChainLock,
+    withEvidenceAndChainLocks,
 } from "../src/lib/receipt-intake/duplicate-guard";
 import {
     CARD_RESEND_QUEUED_REASON,
@@ -47,10 +47,30 @@ interface FakeRow { id: string; duplicateOfId: string | null; state: string }
  */
 function fakeIntake(rows: FakeRow[]) {
     let held: Promise<void> = Promise.resolve();
+    /** What each transaction locked, in the order it asked for it. */
+    let lockOrder: string[] = [];
     const client = {
+        // The evidence advisory lock (round-43 gate, finding 3). Recorded rather
+        // than ignored, because the ORDER is the whole fix: this lock has to be
+        // taken before any row lock, in every caller, or it deadlocks against
+        // the sweep, which takes it first and then locks rows.
+        $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+            const sql = strings.join("?");
+            assert.match(sql, /pg_advisory_xact_lock\(hashtext\(/, "the only raw command here is the evidence lock");
+            lockOrder.push(`advisory:${values.join(",")}`);
+            return 1;
+        },
         $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
             const sql = strings.join("?");
+            // The evidence-epoch bump also runs raw (round-43 gate, finding 4).
+            // It is a WRITE, not a lock, so it is recorded and returned before
+            // the FOR UPDATE assertion below, which is about the ROW lock.
+            if (/AutomationSetting/.test(sql)) {
+                lockOrder.push("evidence-epoch");
+                return [{ value: "1" }];
+            }
             assert.match(sql, /FOR UPDATE/, "the guard must LOCK");
+            lockOrder.push("rows");
             const ids = values.map(String);
             return rows
                 .filter(row => ids.includes(row.id) || (row.duplicateOfId !== null && ids.includes(row.duplicateOfId)))
@@ -69,6 +89,8 @@ function fakeIntake(rows: FakeRow[]) {
     };
     return {
         rows,
+        get lockOrder() { return lockOrder; },
+        resetLockOrder() { lockOrder = []; },
         /** One transaction at a time — what FOR UPDATE buys the caller. */
         transaction: async <T>(fn: (tx: typeof client) => Promise<T>): Promise<T> => {
             const previous = held;
@@ -86,7 +108,7 @@ function fakeIntake(rows: FakeRow[]) {
 
 /** The worker's transition, exactly as the cron implements it. */
 async function workerTransition(table: ReturnType<typeof fakeIntake>, rowId: string, duplicateOfId: string) {
-    return withDuplicateChainLock(
+    return withEvidenceAndChainLocks(
         fn => table.transaction(fn as never) as never,
         [rowId],
         async (tx, inboundById) => {
@@ -103,7 +125,7 @@ async function workerTransition(table: ReturnType<typeof fakeIntake>, rowId: str
 
 /** The admin action's mark, through the same shared lock. */
 async function adminMark(table: ReturnType<typeof fakeIntake>, id: string, duplicateOfId: string) {
-    return withDuplicateChainLock(
+    return withEvidenceAndChainLocks(
         fn => table.transaction(fn as never) as never,
         [id, duplicateOfId],
         async (tx, inbound) => {
@@ -178,18 +200,57 @@ test("PRE-FIX CONTROL: an unlocked read then a separate write builds the chain",
     assert.equal(table.rows.find(r => r.id === "a")!.duplicateOfId, "b", "A→B→C — exactly the bug");
 });
 
+test("EVERY caller takes the evidence lock BEFORE any row lock", async () => {
+    /**
+     * The order, measured rather than read (Codex PR #443 gate round 43,
+     * finding 3). Before the wrapper existed, two of the three callers took the
+     * evidence lock inside the body — so the FOR UPDATE came first, the exact
+     * inversion of the sweep, which takes the evidence lock and then locks
+     * rows. Two transactions, opposite orders, a real deadlock.
+     */
+    const table = fakeIntake([
+        { id: "a", duplicateOfId: null, state: "RECEIVED" },
+        { id: "b", duplicateOfId: null, state: "RECEIVED" },
+    ]);
+
+    table.resetLockOrder();
+    await workerTransition(table, "a", "b");
+    assert.deepEqual(table.lockOrder, ["advisory:receipt-evidence", "evidence-epoch", "rows"],
+        "the worker: evidence lock, then rows");
+
+    // A FRESH table: the transition above made "b" somebody's original, which
+    // the admin path would (correctly) refuse.
+    const other = fakeIntake([
+        { id: "c", duplicateOfId: null, state: "RECEIVED" },
+        { id: "d", duplicateOfId: null, state: "RECEIVED" },
+    ]);
+    await adminMark(other, "c", "d");
+    assert.deepEqual(other.lockOrder, ["advisory:receipt-evidence", "evidence-epoch", "rows"],
+        "and the admin action, in the same order — there is only one wrapper");
+});
+
 test("both callers take the SAME function, so they cannot diverge", () => {
     const guard = readFileSync(join(repoRoot, "src/lib/receipt-intake/duplicate-guard.ts"), "utf8");
-    assert.match(guard, /export async function withDuplicateChainLock<T>\(/);
-    assert.match(guard, /return transaction\(async tx => body\(tx, await lockWithInboundDuplicates\(tx, ids\)\)\);/);
+    assert.match(guard, /export async function withEvidenceAndChainLocks<T>\(/);
+    assert.match(
+        guard,
+        /await lockReceiptEvidence\(tx\);[\s\S]{0,400}?await bumpReceiptEvidenceEpoch\(tx\);\s+return body\(tx, await lockWithInboundDuplicates\(tx, ids\)\);/,
+        "evidence lock first, then the epoch bump, then the row locks — one order, owned by the wrapper",
+    );
+    // And there is no way in that skips it: the chain-lock-only entry point is
+    // gone, so a caller cannot take row locks without the evidence lock.
+    assert.doesNotMatch(guard, /export async function withDuplicateChainLock/);
 
     const actions = readFileSync(join(repoRoot, "src/lib/actions.ts"), "utf8");
-    assert.equal((actions.match(/withDuplicateChainLock\(fn => prisma\.\$transaction\(fn\)/g) ?? []).length, 2,
+    assert.equal((actions.match(/withEvidenceAndChainLocks\(fn => prisma\.\$transaction\(fn\)/g) ?? []).length, 2,
         "mark and void both go through it");
     assert.doesNotMatch(actions, /lockWithInboundDuplicates\(tx,/, "and neither hand-rolls the lock any more");
+    // Nor takes the evidence lock inside the body, which is what put the row
+    // locks first and inverted the order against the sweep.
+    assert.doesNotMatch(actions, /withEvidenceAndChainLocks\([\s\S]{0,400}?await lockReceiptEvidence\(tx\)/);
 
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
-    assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withDuplicateChainLock\(/);
+    assert.match(cron, /applyDuplicateTransition: async \(rowId, decision, patch, ownership\) => withEvidenceAndChainLocks\(/);
     assert.match(cron, /where: \{ id: rowId, state: ownership\.state, claimToken: ownership\.claimToken \}/,
         "the CAS runs inside the transaction that took the lock");
     assert.doesNotMatch(cron, /findInboundDuplicates/, "the unlocked read is gone");

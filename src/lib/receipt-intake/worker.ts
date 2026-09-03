@@ -261,7 +261,7 @@ export interface WorkerDependencies {
      * transaction: the version that read the references and then wrote in a
      * separate statement let an admin commit A→B in between, which is the exact
      * chain being guarded against. The implementation takes the shared
-     * `withDuplicateChainLock`, so this path and the admin actions cannot
+     * `withEvidenceAndChainLocks`, so this path and the admin actions cannot
      * diverge. Returns the state it actually wrote.
      *
      * Optional so a caller that predates it keeps the old behaviour rather than

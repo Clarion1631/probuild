@@ -53,7 +53,7 @@ export interface EvidenceLockClient {
  * writer touches. Narrow on purpose — a writer that needs something else is a
  * writer worth looking at.
  */
-export type EvidenceWriteClient = Pick<Prisma.TransactionClient, "$executeRaw" | "receiptIntake" | "expense" | "reviewIssue">;
+export type EvidenceWriteClient = Pick<Prisma.TransactionClient, "$executeRaw" | "$queryRaw" | "receiptIntake" | "expense" | "reviewIssue">;
 
 /**
  * Take the receipt-evidence lock. Call it as the FIRST statement of the
@@ -64,6 +64,72 @@ export type EvidenceWriteClient = Pick<Prisma.TransactionClient, "$executeRaw" |
  */
 export async function lockReceiptEvidence(tx: EvidenceLockClient): Promise<void> {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${RECEIPT_EVIDENCE_LOCK}))`;
+}
+
+
+/**
+ * THE RECEIPT-EVIDENCE EPOCH (Codex PR #443 gate round 43, finding 4).
+ *
+ * The lock above fences ONE component transaction. The sweep is not one
+ * transaction: it walks components across pages, taking and releasing the lock
+ * per component, and certifies the whole cycle complete at the end. Between a
+ * component committing and that certification, an intake can be voided or
+ * unlinked — and the completion fence only checked `bankLedgerEpoch`, which
+ * says nothing about evidence. The cycle then stamped itself done over an issue
+ * it had closed on evidence that no longer existed.
+ *
+ * So evidence gets a counter of its own, exactly the shape of the bank-ledger
+ * one: monotonic, never reset, nobody reads its magnitude — only whether it
+ * differs from what the sweep saw when it started. Bumped by every evidence
+ * writer INSIDE the evidence lock, which is what makes the bump ordered with
+ * respect to the sweep's own reads rather than racing them.
+ */
+export const RECEIPT_EVIDENCE_EPOCH_KEY = "receiptEvidenceEpoch";
+
+/**
+ * What an evidence store that has never been written reads as.
+ *
+ * The row is created lazily, so "no row" and "no change since" must be the same
+ * answer, or the first cycle on a fresh database would fence against its own
+ * row creation and never certify.
+ */
+export const RECEIPT_EVIDENCE_EPOCH_ZERO = "0";
+
+/**
+ * Anything that can run a raw query: a transaction, the client, or a double.
+ *
+ * Structural for the same reason `EvidenceLockClient` is — the receipt-intake
+ * transaction clients are hand-written interfaces, not Prisma types.
+ */
+export interface EvidenceEpochClient {
+    $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
+}
+
+interface EpochRow { value: string }
+
+/**
+ * Record that receipt evidence changed. Call it inside the transaction that
+ * holds the evidence lock, alongside the write.
+ *
+ * Held under the lock on purpose: a sweep reading the epoch at cycle start
+ * cannot interleave with a bump, so "the epoch I saw" and "the evidence I read"
+ * describe the same moment.
+ */
+export async function bumpReceiptEvidenceEpoch(tx: EvidenceEpochClient): Promise<void> {
+    await tx.$queryRaw<EpochRow[]>`
+        INSERT INTO "AutomationSetting" ("key", "value", "updatedAt")
+        VALUES (${RECEIPT_EVIDENCE_EPOCH_KEY}, '1', NOW())
+        ON CONFLICT ("key") DO UPDATE
+            SET "value" = (COALESCE(NULLIF("AutomationSetting"."value", ''), '0')::bigint + 1)::text,
+                "updatedAt" = NOW()
+        RETURNING "value"`;
+}
+
+/** Read the epoch. The snapshot side of the completion fence. */
+export async function readReceiptEvidenceEpoch(client: EvidenceEpochClient): Promise<string> {
+    const rows = await client.$queryRaw<EpochRow[]>`
+        SELECT "value" FROM "AutomationSetting" WHERE "key" = ${RECEIPT_EVIDENCE_EPOCH_KEY}`;
+    return rows[0]?.value ?? RECEIPT_EVIDENCE_EPOCH_ZERO;
 }
 
 /**
@@ -81,6 +147,12 @@ export async function withReceiptEvidenceLock<T>(
 ): Promise<T> {
     return await transaction(async tx => {
         await lockReceiptEvidence(tx);
-        return body(tx);
+        const result = await body(tx);
+        // EVERY write through this wrapper moves the epoch (round-43 gate,
+        // finding 4). Doing it here rather than at each call site is the point:
+        // the wrapper is already the thing that cannot be skipped, so the
+        // counter cannot fall behind the writes it describes.
+        await bumpReceiptEvidenceEpoch(tx as unknown as EvidenceEpochClient);
+        return result;
     }) as T;
 }

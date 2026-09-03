@@ -373,9 +373,16 @@ posted therefore produces no register row, no observation, and no mint: nothing 
 phase can chase it.
 
 **So the claim is narrowed, not dropped.** The nightly pull takes the chase gap from
-"every charge waits for the monthly statement import" down to "unposted feed lines wait
-for the monthly statement import". For those lines the **statement import remains the
-source of record**, and its own freshness is reported separately —
+"every charge waits for the statement import" down to "unposted feed lines wait for the
+statement import". For those lines the **statement import remains the source of
+record**, and its own freshness is reported separately —
+
+(Cadence, per the amendment to decision 3 on 2026-09-02: the WTB CSV export is **daily**,
+not monthly — it is the only human-free source that sees an unbooked customer deposit, so
+it is also the money-IN trigger for the deposit sweep. That makes the residual gap for an
+unposted feed line about a day rather than a month, which is better than this section
+originally assumed; it does not change what the pull can see, which is the point being
+made here.) —
 `newestStatementPostedDate` scopes the health probe to `sourceOfRecord: "STATEMENT"`,
 so a healthy pull can never carry the "statement ledger through" date forward over an
 import nobody has run. Anything that reads as "the pull closes the freshness gap" is
@@ -573,8 +580,9 @@ reason to suppress every owner's cards.
 ## 8. Risks / open questions (max 5)
 
 1. **Data freshness**: matcher truth is `BankLine`, which before the nightly pull filled
-   only from monthly statement imports; QBO register rows were observations without
-   canonical lines, so a 3-day chase was in practice a 30-day one. The nightly pull
+   only from statement imports; QBO register rows were observations without canonical
+   lines, so a 3-day chase was in practice as long as the import cadence. (That cadence
+   is daily, not monthly — decision 3 as amended 2026-09-02.) The nightly pull
    narrows that to the charges QuickBooks has POSTED. It does **not** close the gap:
    a cleared-but-unposted bank-feed line is invisible to the QBO API (see §4b-i), so the
    statement import stays the source of record for those and its staleness is reported on

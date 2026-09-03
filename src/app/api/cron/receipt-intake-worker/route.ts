@@ -17,7 +17,7 @@ import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
-import { duplicateChainReason, withDuplicateChainLock } from "@/lib/receipt-intake/duplicate-guard";
+import { duplicateChainReason, withEvidenceAndChainLocks } from "@/lib/receipt-intake/duplicate-guard";
 import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
@@ -654,7 +654,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
          * The first version read the inbound references and then transitioned
          * in a separate statement, which left the whole window between them for
          * an admin to commit A→B: the worker then wrote B→C over a row that had
-         * just become somebody's original. `withDuplicateChainLock` is the same
+         * just become somebody's original. `withEvidenceAndChainLocks` is the same
          * function the admin actions take, so the two cannot diverge, and the
          * CAS below runs inside the transaction that holds the lock.
          *
@@ -662,8 +662,15 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
          * batch, and one row that needs a human is not a reason to abandon the
          * rest. The reason names the rows to unmark; `duplicateOfId` is kept as
          * the evidence for that decision.
+         *
+         * AND UNDER THE EVIDENCE LOCK (round-43 gate, finding 2). A row
+         * becoming DUPLICATE is a receipt ceasing to exist as far as the sweep
+         * is concerned, so this is an evidence write like any other — it just
+         * did not look like one, because it goes through the chain guard rather
+         * than through this file's `evidenceUpdateMany`. The wrapper takes both
+         * locks, evidence first, so there is no order left to get wrong.
          */
-        applyDuplicateTransition: async (rowId, decision, patch, ownership) => withDuplicateChainLock(
+        applyDuplicateTransition: async (rowId, decision, patch, ownership) => withEvidenceAndChainLocks(
             fn => prisma.$transaction(fn),
             [rowId],
             async (tx, inboundById) => {

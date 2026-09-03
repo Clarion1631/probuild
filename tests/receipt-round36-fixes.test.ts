@@ -24,15 +24,25 @@ import {
  * these two stories are told through it — the failure they describe is the same
  * one, and a test that still called the deleted helper would be pinning nothing.
  */
-function fence(input: { epochNow: string; appeared: number }) {
+function fence(input: { epochNow: string; appeared: number; evidenceEpochNow?: string }) {
     const written: Array<{ phase: string; completedAt: string | undefined; blockedReason: string | null }> = [];
     return {
         written,
         run: (snapshotEpoch: string, computedPhase: "done" | "lines" | "open-issues", bankPullStale = false) =>
             fenceAndWritePhase(
-                { snapshotEpoch, computedPhase, bankPullStale, now: new Date("2026-09-03T14:00:00Z") },
+                {
+                    snapshotEpoch,
+                    // The evidence side of the fence (round-43 gate, finding
+                    // 4). Defaulted to "unchanged" so these ledger-only cases
+                    // still describe what they were written to describe.
+                    snapshotEvidenceEpoch: "e0",
+                    computedPhase,
+                    bankPullStale,
+                    now: new Date("2026-09-03T14:00:00Z"),
+                },
                 fn => fn({
                     lockEpoch: async () => input.epochNow,
+                    lockEvidenceEpoch: async () => input.evidenceEpochNow ?? "e0",
                     countNewLines: async () => input.appeared,
                     writePhase: async (phase, completedAt, blockedReason) => {
                         written.push({ phase, completedAt, blockedReason });
