@@ -341,7 +341,11 @@ test("the retry pass re-posts unposted rows, and selects only when it may", () =
     // when it may not (then it posts purely from the claimed snapshot). It is
     // handed the run's own clock (round-34 finding 3), so the skipped branch has
     // to supply the same shape — including `deadlineHit`.
-    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) => remainingRevalidationBudgetMs\(runStartedAt\) <= 0\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
+    assert.match(source, /const scan = selectionAllowed\s*\n\s*\? await scanCandidates\(\(\) => remainingRevalidationBudgetMs\(runStartedAt\) <= 0, scanResumedFrom\)\s*\n\s*: \{ candidates: \[\] as CardCandidateIssue\[\]/);
+    // And the position is READ before and WRITTEN after, so a run that
+    // spends its budget scanning still leaves the next one further along.
+    assert.match(source, /const scanResumedFrom = selectionAllowed \? await readScanCursor\(\) : null;/);
+    assert.match(source, /await writeScanCursor\(scan\.nextCursor\)/);
 });
 
 test("the retry pass is scheduled two hours after the morning card", () => {
@@ -430,7 +434,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -598,7 +602,7 @@ test("the bank pull plans its window from a persisted high-water mark", () => {
     assert.match(source, /const PULL_BUDGET_MS = 50_000;/);
     assert.match(source, /windowState,\s*\n\s*saveWindowState,\s*\n\s*budgetMs: PULL_BUDGET_MS,/);
     // A corrupt state plans the WIDEST safe window, never a narrow one.
-    assert.match(source, /return \{ highWater: null, lastFullSweep: null, continueAfter: null \};/);
+    assert.match(source, /return \{ highWater: null, lastFullSweep: null, continueAfter: null, uncertifiedBounds: null \};/);
 });
 
 test("a descriptor-only difference is NOT a restatement", () => {
@@ -842,7 +846,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
     // And the cursor is persisted, so a backlog that is not draining is visible.
     assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
 
