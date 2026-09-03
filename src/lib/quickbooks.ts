@@ -1533,11 +1533,17 @@ export type QBPaymentBuildFailure =
  * mid-request or the response is lost). Guards the QBO invoice's open balance
  * against `opts.amount` to the cent — a deposit must exactly retire the
  * milestone it matched, never partially settle it.
+ *
+ * `opts.depositToAccountId` is optional and OMITTED by default, which is what
+ * the photo path has always done: QBO then books the payment to its own
+ * default (Undeposited Funds — docs/DEPOSIT-PIPELINE.md M2). The deposit sweep
+ * passes the Washington Trust bank account instead, because its trigger IS the
+ * bank line and Vanessa matches the feed line to the payment.
  */
 export async function buildQBPaymentRequest(
     tokens: QBTokens,
     qbInvoiceId: string,
-    opts: { amount: number; txnDate: string; paymentRefNum: string },
+    opts: { amount: number; txnDate: string; paymentRefNum: string; depositToAccountId?: string },
     deadline?: RouteDeadline,
 ): Promise<{ ok: true; requestBody: string } | QBPaymentBuildFailure> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity, gated in quickbooks-mock.ts):
@@ -1556,6 +1562,7 @@ export async function buildQBPaymentRequest(
             TxnDate: opts.txnDate,
             PaymentRefNum: opts.paymentRefNum,
             CustomerRef: { value: inv.customerId },
+            ...(opts.depositToAccountId ? { DepositToAccountRef: { value: opts.depositToAccountId } } : {}),
             Line: [{ Amount: opts.amount, LinkedTxn: [{ TxnId: qbInvoiceId, TxnType: "Invoice" }] }],
         };
         return { ok: true, requestBody: JSON.stringify(mockPayload) };
@@ -1571,6 +1578,7 @@ export async function buildQBPaymentRequest(
         TxnDate: opts.txnDate,
         PaymentRefNum: opts.paymentRefNum,
         CustomerRef: { value: inv.customerId },
+        ...(opts.depositToAccountId ? { DepositToAccountRef: { value: opts.depositToAccountId } } : {}),
         Line: [{ Amount: opts.amount, LinkedTxn: [{ TxnId: qbInvoiceId, TxnType: "Invoice" }] }],
     };
     return { ok: true, requestBody: JSON.stringify(payload) };

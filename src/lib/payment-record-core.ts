@@ -24,12 +24,15 @@ export async function recordPaymentCore(
         method: string;
         referenceNumber: string | null;
         notes: string | null;
+        /** Deposit sweep only: skip the CLIENT receipt for this settlement (team
+         *  email + activity log still fire). See payment-outbox.enqueueMilestonePaid. */
+        suppressClientReceipt?: boolean;
     },
 ): Promise<
     | { success: true; projectId: string }
     | { success: false; error: string }
 > {
-    const { paymentDate, method, referenceNumber, notes } = input;
+    const { paymentDate, method, referenceNumber, notes, suppressClientReceipt } = input;
 
     const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
         // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
@@ -134,7 +137,7 @@ export async function recordPaymentCore(
 
         // Durable notification: enqueue INSIDE the tx so it commits atomically with the
         // settle — a crash before delivery can't drop the team alert / receipt / activity log.
-        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
+        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice", suppressClientReceipt });
         return { success: true as const, projectId: invoice.projectId };
     }));
 
