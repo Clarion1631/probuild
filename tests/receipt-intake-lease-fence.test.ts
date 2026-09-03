@@ -252,3 +252,84 @@ test("LEASE-STALE: the ordering, as a decision table", () => {
     assert.equal(stale("nonce-a", null), true, "a row that never had a signed URL");
     assert.equal(stale(null, null), true, "and neither is the null/null case");
 });
+
+// ── NO EXTERNAL I/O INSIDE A DATABASE TRANSACTION (round-17 item 3) ───────
+//
+// The advisory-lock scheme held an interactive transaction — a pooled
+// connection — across Supabase calls the round-16 deadline caps at fifteen
+// seconds. Four concurrent finalizations exhausted the five-connection pool.
+// The lock is gone; this is the tripwire that stops it coming back under
+// another name.
+
+test("the object-lock helpers are GONE, and nothing reaches for them", () => {
+    for (const rel of LEASE_WRITERS) {
+        const src = source(rel);
+        for (const banned of ["withReceiptObjectLock(", "withReceiptPublishLock("]) {
+            assert.ok(
+                !src.includes(banned),
+                `${rel} still calls ${banned}: external I/O must not run inside a transaction`,
+            );
+        }
+    }
+});
+
+test("the ONE surviving advisory lock holds no external I/O", () => {
+    // `pg_advisory_xact_lock` is not banned outright — it is the right tool
+    // for a critical section that is PURELY database work. Exactly one such
+    // section survives: the weak-key check inside promoteToBooking, which
+    // serializes two rows sharing a dedup key across a SELECT and an UPDATE
+    // and calls nothing external. The object locks were different in kind:
+    // they wrapped Supabase round trips.
+    const users = LEASE_WRITERS.filter(rel => source(rel).includes("pg_advisory_xact_lock"));
+    assert.deepEqual(
+        users,
+        ["src/app/api/cron/receipt-intake-worker/route.ts"],
+        "only the weak-key promotion still takes an advisory lock",
+    );
+    const cron = source("src/app/api/cron/receipt-intake-worker/route.ts");
+    const promote = cron.slice(cron.indexOf("promoteToBooking: async"));
+    const body = promote.slice(0, promote.indexOf("book: row =>"));
+    assert.match(body, /pg_advisory_xact_lock/, "it lives where the comment says");
+    for (const external of ["storage", "downloadReceiptObject", "removeReceiptObject", "uploadReceiptObject", "fetch("]) {
+        assert.ok(!body.includes(external), `the weak-key section calls nothing external (${external})`);
+    }
+});
+
+test("every transaction helper the intake uses is a SHORT one", () => {
+    // `inShortTx` is the only transaction wrapper in this feature, and its
+    // timeout says so: a body that needs longer than five seconds without
+    // external I/O is doing something its own doc comment forbids.
+    const cleanup = source("src/lib/receipt-intake/storage-cleanup.ts");
+    const fn = cleanup.slice(cleanup.indexOf("export async function inShortTx"));
+    const body = fn.slice(0, fn.search(/\n\}\n/));
+    assert.match(body, /prisma\.\$transaction\(body, \{ maxWait: 5_000, timeout: 5_000 \}\)/);
+    // The 30-second window the lock needed is gone with it.
+    assert.ok(!cleanup.includes("timeout: 30_000"), "no transaction is sized for a storage round trip");
+});
+
+test("the SEAL happens outside every transaction — asserted on the shipped order", () => {
+    // The publish protocol, read off the source: claim, then seal, THEN open a
+    // transaction. A future edit that moved the seal back inside would have to
+    // move it past the `inShortTx(` call to pass this.
+    const stored = source("src/lib/receipt-intake/stored-object.ts");
+    const fn = stored.slice(stored.indexOf("export async function sealAndPublish"));
+    const claimAt = fn.indexOf("deps.claimCanonicalPath(");
+    const sealAt = fn.indexOf("await deps.seal(");
+    const txAt = fn.indexOf("await deps.inShortTx(");
+    assert.ok(claimAt > 0 && sealAt > 0 && txAt > 0, "all three phases are present");
+    assert.ok(claimAt < sealAt, "the path is claimed before it is written");
+    assert.ok(sealAt < txAt, "and the seal precedes any open transaction");
+});
+
+test("the cleanup sweep does its DELETE outside a transaction too", () => {
+    // Same shape on the other side: claim in a short tx, delete with none
+    // open, settle in a second short tx.
+    const cleanup = source("src/lib/receipt-intake/storage-cleanup.ts");
+    const fn = cleanup.slice(cleanup.indexOf("export async function retryPendingCleanups"));
+    const claimAt = fn.indexOf("const claim = await deps.inShortTx(");
+    const removeAt = fn.indexOf("await deps.remove(storagePath)");
+    const settleAt = fn.indexOf("const settled = await deps.inShortTx(");
+    assert.ok(claimAt > 0 && removeAt > 0 && settleAt > 0);
+    assert.ok(claimAt < removeAt, "the claim comes first");
+    assert.ok(removeAt < settleAt, "the delete runs between the two transactions, not inside either");
+});

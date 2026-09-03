@@ -41,8 +41,42 @@ export function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
 }
 
+/**
+ * REDACT THE CREDENTIALS, WITHOUT PARSING THE URL BY HAND.
+ *
+ * The regex this replaces was `/:[^:@]*@/` -> `:****@`, and it leaked whenever
+ * the password contained a literal colon. For
+ * `postgresql://user:pa:ss@host/db` it matched only the LAST `:ss@` segment,
+ * printing `postgresql://user:pa:****@host/db` — the first half of the
+ * password, in a log line the operator is told to paste into tickets.
+ * Passwords with `:` are ordinary (Supabase generates them), so this was not a
+ * corner case.
+ *
+ * `new URL()` knows where the userinfo ends; a regex cannot, because `@` is
+ * legal inside a percent-encoded password and `:` is legal inside it verbatim.
+ * Both halves of the userinfo go, since a username is an account name too.
+ *
+ * A URL that will not parse is NOT echoed in any form. There is nothing useful
+ * to show — the string is malformed, so any substring of it could be anything
+ * — and printing "the part I could not parse" is how a redactor leaks the
+ * thing it exists to hide.
+ */
 export function maskUrl(url) {
-    return url.replace(/:[^:@]*@/, ":****@");
+    try {
+        const parsed = new URL(url);
+        // NO HOST MEANS WE COULD NOT LOCATE THE USERINFO. `postgres:/x@y`
+        // parses as an opaque path with empty username and password, so the
+        // redaction would be a no-op and the whole string echoed verbatim. A
+        // real DATABASE_URL always has a host; anything without one is
+        // malformed, and a malformed string is exactly what must not be
+        // printed on the guess that its `@` is not a credential boundary.
+        if (!parsed.host) return "<unparseable DATABASE_URL, redacted>";
+        if (parsed.password) parsed.password = "***";
+        if (parsed.username) parsed.username = "***";
+        return parsed.toString();
+    } catch {
+        return "<unparseable DATABASE_URL, redacted>";
+    }
 }
 
 function readFlagValue(flag) {

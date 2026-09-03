@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 import { PrismaClient, Prisma } from "@prisma/client";
 import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
+import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
+import { inShortTx } from "../src/lib/receipt-intake/storage-cleanup";
 import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
@@ -454,4 +456,113 @@ test("IMPORTER WINS: the retry reconciles a real imported Expense", { skip }, as
     } finally {
         await cleanupExpenses();
     }
+});
+
+// ── No storage call holds a connection (Codex round-17 item 3) ────────────
+//
+// The advisory-lock scheme held an interactive transaction — and therefore a
+// pooled connection — across the Supabase seal and the Supabase delete. The
+// round-16 deadline caps a storage call at fifteen seconds, so a handful of
+// concurrent finalizations exhausted the five-connection pool and later
+// requests could not reach the database at all, including to release what they
+// had claimed. The lock made the POOL the contended resource, not the object.
+//
+// Measured against a REAL Postgres, because "how many connections are open" is
+// exactly the fact a mocked transaction cannot answer.
+
+/** Connections this client currently holds open inside a transaction. */
+async function openTxConnections(): Promise<number> {
+    const rows = await db!.$queryRaw<{ n: bigint }[]>(
+        Prisma.sql`SELECT count(*)::bigint AS n
+                   FROM pg_stat_activity
+                   WHERE datname = current_database()
+                     AND state IN ('idle in transaction', 'active')
+                     AND pid <> pg_backend_pid()`,
+    );
+    return Number(rows[0].n);
+}
+
+test("a SLOW storage call holds ZERO transactions open", { skip }, async () => {
+    // The publish protocol, run against the real database with a deliberately
+    // slow "storage" call in phase B. Nothing may be open while it runs.
+    let openDuringSeal = -1;
+    let sealMs = 0;
+
+    const outcome = await sealAndPublish("receipts/intake/probe.png", "probe-row", 1, {
+        mimeType: "image/png",
+        fileSize: 4,
+        fileSha256: "c".repeat(64),
+        bytes: Buffer.from("abcd"),
+    }, {
+        // The REAL short-transaction helper, so this measures the shipped one.
+        inShortTx,
+        claimCanonicalPath: async () => "intent-probe",
+        seal: async (_upload: string, canonical: string) => {
+            const started = Date.now();
+            // Long enough that a held transaction would be unmissable in
+            // pg_stat_activity, short enough not to slow the suite.
+            await new Promise(resolve => setTimeout(resolve, 750));
+            openDuringSeal = await openTxConnections();
+            sealMs = Date.now() - started;
+            return canonical;
+        },
+        commit: async () => 1,
+        queueUploadCleanup: async () => "ev-probe",
+        resolveCanonicalIntent: async () => {},
+        settleUploadCleanup: async () => {},
+    });
+
+    assert.equal(outcome?.published, true);
+    assert.ok(sealMs >= 700, `the seal really was slow (${sealMs}ms)`);
+    assert.equal(
+        openDuringSeal,
+        0,
+        `no transaction was open while storage ran (saw ${openDuringSeal})`,
+    );
+});
+
+test("CONTROL: an advisory-lock transaction DOES hold one — the pre-fix shape", { skip }, async () => {
+    // The same measurement against the scheme this replaced. Without it, the
+    // assertion above could pass because the probe cannot see anything at all.
+    let openDuringBody = -1;
+    await db!.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('receipt-object:probe'))`;
+        await new Promise(resolve => setTimeout(resolve, 750));
+        openDuringBody = await openTxConnections();
+    }, { maxWait: 5_000, timeout: 20_000 });
+
+    assert.ok(
+        openDuringBody >= 1,
+        `the old scheme held a connection for the whole body (saw ${openDuringBody})`,
+    );
+});
+
+test("CONCURRENT publishes do not queue behind each other on the pool", { skip }, async () => {
+    // The consequence the finding names: with the lock, N concurrent
+    // finalizations serialized on N connections. With the lease they overlap,
+    // and the peak transaction count stays at one per short settle rather than
+    // one per in-flight publish.
+    let peak = 0;
+    const publishOne = (n: number) => sealAndPublish(`receipts/intake/p${n}.png`, `probe-${n}`, 1, {
+        mimeType: "image/png",
+        fileSize: 4,
+        fileSha256: String(n).repeat(64).slice(0, 64),
+        bytes: Buffer.from("abcd"),
+    }, {
+        inShortTx,
+        claimCanonicalPath: async () => `intent-${n}`,
+        seal: async (_u: string, canonical: string) => {
+            await new Promise(resolve => setTimeout(resolve, 400));
+            peak = Math.max(peak, await openTxConnections());
+            return canonical;
+        },
+        commit: async () => 1,
+        queueUploadCleanup: async () => `ev-${n}`,
+        resolveCanonicalIntent: async () => {},
+        settleUploadCleanup: async () => {},
+    });
+
+    const results = await Promise.all([1, 2, 3, 4, 5, 6].map(publishOne));
+    assert.ok(results.every(r => r?.published), "all six published");
+    assert.equal(peak, 0, `six concurrent seals held no transactions (peak ${peak})`);
 });

@@ -24,6 +24,7 @@ import {
     ensureReceiptBucket,
     expectedConstraints,
     foreignKeyDrift,
+    maskUrl,
     parseSizeLimit,
     expectedColumns,
     statements,
@@ -570,4 +571,72 @@ test("a storage read failure stops the run rather than assuming the bucket is fi
         })),
         /could not read bucket/,
     );
+});
+
+// ── The DATABASE_URL redactor (Codex round-17 item 2) ─────────────────────
+//
+// `maskUrl` is printed by the apply script's own preflight, so whatever it
+// returns ends up in terminal scrollback and in the tickets operators paste
+// it into. The regex it replaces — `/:[^:@]*@/` -> `:****@` — matched only the
+// LAST colon-delimited run before the `@`, so a password containing a literal
+// colon had its first half printed in clear.
+
+test("a password containing a colon is FULLY redacted", () => {
+    // The exact leak: `pa:ss` printed as `pa:****`, exposing `pa`.
+    const masked = maskUrl("postgresql://appuser:pa:ss@db.example.com:5432/probuild");
+    assert.ok(!masked.includes("pa:ss"), masked);
+    assert.ok(!masked.includes(":pa"), `no fragment of the password survives: ${masked}`);
+    assert.ok(!masked.includes("ss@"), masked);
+    // Still useful: the host, port and database are what the operator is
+    // checking against --expect-db / --expect-host.
+    assert.ok(masked.includes("db.example.com"), masked);
+    assert.ok(masked.includes("5432"), masked);
+    assert.ok(masked.includes("probuild"), masked);
+
+    // PRE-FIX CONTROL: the old regex leaks on this exact input, so this test
+    // cannot pass for the implementation it replaced.
+    const oldRegex = "postgresql://appuser:pa:ss@db.example.com:5432/probuild"
+        .replace(/:[^:@]*@/, ":****@");
+    assert.ok(oldRegex.includes(":pa"), "the old redactor printed the first half");
+});
+
+test("a percent-encoded @ in the password does not end the userinfo early", () => {
+    // `@` is legal inside a password when encoded, and a regex anchored on the
+    // first or last `@` gets the boundary wrong either way.
+    const masked = maskUrl("postgresql://appuser:p%40ss%3Aword@db.example.com:6543/probuild");
+    assert.ok(!masked.includes("p%40ss"), masked);
+    assert.ok(!masked.includes("word"), masked);
+    assert.ok(masked.includes("db.example.com"), masked);
+});
+
+test("the USERNAME goes too — an account name is a credential", () => {
+    const masked = maskUrl("postgresql://postgres.abcdefgh:secret@aws-0-us-west-2.pooler.supabase.com:6543/postgres");
+    assert.ok(!masked.includes("secret"), masked);
+    assert.ok(!masked.includes("postgres.abcdefgh"), masked);
+    assert.ok(masked.includes("pooler.supabase.com"), masked);
+});
+
+test("an UNPARSEABLE url is never echoed, not even in part", () => {
+    // There is nothing safe to show: any substring of a malformed string could
+    // be the password, so a redactor that prints "the bit I could not parse"
+    // leaks the thing it exists to hide.
+    for (const bad of ["not a url at all", "://user:pw@host", "", "postgres:/missing-slash@host"]) {
+        const masked = maskUrl(bad);
+        assert.equal(masked, "<unparseable DATABASE_URL, redacted>", bad);
+    }
+    // `postgresql://` and `postgres:/x@y` both PARSE — WHATWG accepts a bare
+    // scheme, and the second as an opaque path whose `@` is not a userinfo
+    // boundary at all. Neither has a host, which is how the redactor knows it
+    // could not locate the credentials, so both take the placeholder rather
+    // than being echoed on the guess that their `@` is harmless.
+    assert.equal(maskUrl("postgresql://"), "<unparseable DATABASE_URL, redacted>");
+});
+
+test("a url with no credentials is passed through readably", () => {
+    // The control: redaction must not mangle a URL that has nothing to hide,
+    // or the preflight line stops being useful for its actual purpose.
+    const masked = maskUrl("postgresql://db.example.com:5432/probuild?sslmode=require");
+    assert.ok(masked.includes("db.example.com"), masked);
+    assert.ok(masked.includes("sslmode=require"), masked);
+    assert.ok(!masked.includes("***"), masked);
 });

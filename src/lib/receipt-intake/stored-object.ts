@@ -36,7 +36,7 @@ import { MAX_STORED_BYTES } from "./intake-core";
  * attempt on the same row — including one that follows a rejection, and a
  * rejection is what QUEUES A DELETION of that exact path. A re-armed /start
  * bumps the lease, so this makes a re-seal target a path no outstanding cleanup
- * event can be naming. (Belt and braces: withReceiptPublishLock also cancels
+ * event can be naming. (Belt and braces: claimObjectPath also cancels
  * any pending cleanup for the path it is about to fill. Either alone closes the
  * reuse; both is cheap.)
  */
@@ -81,7 +81,7 @@ export type VerifiedBytes =
  * holds the canonical path's advisory lock across both, so the sweep either
  * runs entirely before the seal (and the seal writes the bytes again) or
  * entirely after the commit (and sees the reference). See
- * withReceiptPublishLock in storage-cleanup.ts.
+ * claimObjectPath in storage-cleanup.ts.
  *
  * Nothing slow goes inside that lock: no read, no QBO call, no attachment —
  * one storage copy and one fenced UPDATE.
@@ -100,83 +100,59 @@ export type PublishTx = Prisma.TransactionClient;
 
 export interface SealPublishDeps {
     /**
-     * Runs the seal-and-commit critical section inside ONE transaction holding
-     * the canonical path's advisory lock. See withReceiptPublishLock.
+     * ONE SHORT TRANSACTION, holding NO storage call.
+     *
+     * This replaces `withObjectLock` — a transaction-scoped advisory lock that
+     * stayed open across the Supabase seal. That made a pooled connection
+     * hostage to a storage round trip which the round-16 deadline caps at
+     * FIFTEEN SECONDS, so a handful of concurrent finalizations exhausted the
+     * five-connection pool and later requests could not reach the database at
+     * all — including to release anything. The lock made the POOL the
+     * contended resource instead of the object.
+     *
+     * Nothing external may be awaited inside the body.
      */
-    withObjectLock: <T>(canonicalPath: string, body: (tx: PublishTx) => Promise<T>) => Promise<T>;
+    inShortTx: <T>(body: (tx: PublishTx) => Promise<T>) => Promise<T>;
+    /**
+     * PHASE A. In its own short transaction, and BEFORE anything is written to
+     * storage: cancel any queued deletion of this path and record a
+     * provisional INTENT for it, carrying a lease. Returns the intent's id.
+     *
+     * THE LEASE IS WHAT REPLACES THE ADVISORY LOCK. While it is live the
+     * sweeper leaves the path alone, so the object phase B is about to write
+     * cannot be collected between that write and the pointer commit — the
+     * window the lock existed to close, now held open without a transaction
+     * and therefore without a connection.
+     *
+     * A throw means NOTHING is sealed: writing an object we could not first
+     * promise to clean up is the leak itself.
+     */
+    claimCanonicalPath: (canonicalPath: string) => Promise<string>;
+    /** PHASE B. The external write. Called with no transaction open. */
     seal: (uploadPath: string, canonicalPath: string, bytes: Buffer, contentType: string) => Promise<string | null>;
-    /** Fenced CAS, INSIDE the lock. Returns the number of rows actually moved. */
+    /** PHASE C. The fenced CAS. Returns the number of rows actually moved. */
     commit: (
         tx: PublishTx,
         canonicalPath: string,
         check: { mimeType: string; fileSize: number; fileSha256: string },
     ) => Promise<number>;
     /**
-     * ENQUEUE the upload object's cleanup INSIDE the commit transaction, and
-     * return the queued event's id.
-     *
-     * It used to be a best-effort delete after the lock closed, and that made
-     * the queue entry — the only thing that remembers an object once the row
-     * stops pointing at it — a write that could fail on its own while the
-     * pointer had already moved. One transient database error then left bytes
-     * nothing referenced and nothing would ever sweep.
-     *
-     * A THROW here rolls the pointer transition back with it, which is the
-     * point: the row keeps pointing at the upload path, so the object is still
-     * reachable and the retry re-runs the whole thing.
+     * Enqueue the upload object's cleanup INSIDE the settle transaction. The
+     * queue entry is the only thing that remembers that object once the row
+     * stops pointing at it, so it commits with the pointer or not at all.
      */
     queueUploadCleanup: (tx: PublishTx, uploadPath: string) => Promise<string>;
     /**
-     * TAKE OUT A DURABLE INTENT FOR THE CANONICAL PATH, in its OWN committed
-     * transaction, BEFORE the object is written to storage.
-     *
-     * The seal is an external write that happens before the database CAS, so
-     * everything after it can fail — the commit, the winner lookup, the
-     * transaction — and the sealed copy is then in the bucket with nothing
-     * referencing it, nothing remembering it, and no sweep looking for it (the
-     * stale-STAGING sweep reads ROWS). A later re-arm moves the row elsewhere
-     * and the object is undiscoverable.
-     *
-     * Recorded as `provisional`, which the publish-lock's reclaim deliberately
-     * ignores — otherwise taking the lock would cancel the intent taken out to
-     * survive losing it.
-     *
-     * A throw here means NOTHING is sealed: an object we cannot account for in
-     * advance must not be written at all.
-     */
-    queueCanonicalIntent: (canonicalPath: string) => Promise<string>;
-    /**
-     * Cancel that intent, in the SAME transaction as the pointer commit. The
-     * object is referenced from that instant, so the two facts commit together
-     * or neither does.
+     * Cancel the phase-A intent, in the SAME transaction as the pointer
+     * commit: the object is referenced from that instant.
      */
     resolveCanonicalIntent: (tx: PublishTx, eventId: string) => Promise<void>;
     /**
-     * Try the queued deletion now, AFTER the pointer is committed and outside
-     * the lock. Best-effort by design: the event is already durable, so a
-     * failure here is just work the sweep picks up.
+     * Try the queued upload deletion now, AFTER the pointer is committed and
+     * with no transaction open. Best-effort by design: the event is durable,
+     * so a failure here is just work the sweep picks up.
      */
     settleUploadCleanup: (eventId: string, uploadPath: string) => Promise<void>;
-    /**
-     * Consulted ONLY when the commit CAS is lost, to tell apart the two
-     * reasons that can happen. Returns wherever the row's storagePath points
-     * RIGHT NOW. Read through the lock's transaction, so the answer and the
-     * orphan drop it decides cannot be separated by another publish.
-     */
-    currentStoragePath: (tx: PublishTx, rowId: string) => Promise<string | null>;
-    /**
-     * AFTER a lost commit CAS, and ONLY when the winner is proven to be
-     * pointing somewhere else (see below). A separate dependency so each
-     * caller can record its own reason for the cleanup queue rather than
-     * reusing "sealed", which would describe the wrong event.
-     *
-     * Runs inside the lock's transaction, and is no longer swallowed: if it
-     * cannot delete AND cannot record, the transaction rolls back and
-     * sealAndPublish reports the retryable null. Nothing of ours was
-     * published on this path anyway (the CAS was lost), so there is nothing
-     * to lose by rolling back — and swallowing it dropped an orphan silently.
-     */
-    dropOrphanedCanonical: (canonicalPath: string) => Promise<void>;
 }
 
 export async function sealAndPublish(
@@ -189,39 +165,55 @@ export async function sealAndPublish(
 ): Promise<PublishOutcome | null> {
     const canonicalPath = canonicalStoragePath(rowId, leaseVersion, check.fileSha256, check.mimeType);
 
-    // EVERYTHING THAT TOUCHES THIS PATH HAPPENS UNDER ITS LOCK: the seal, the
-    // fenced commit, and — when the commit is lost — the question of what the
-    // winner is pointing at and the drop that answer decides. Asking that
-    // question outside the lock and deleting afterwards is the same two-step
-    // race one level down: the winner can commit THIS path in the gap, and the
-    // drop then deletes the object the winner just published.
-    // ACCOUNTED FOR BEFORE IT EXISTS. Outside and before the lock, in its own
-    // committed transaction, so it survives every way the critical section
-    // below can fail. If this throws we seal nothing: writing an object we
-    // could not first promise to clean up is the leak itself.
+    // ── THE THREE-PHASE PUBLISH ────────────────────────────────────────────
+    //
+    // No Supabase call happens with a database transaction open. The advisory
+    // lock this replaces held one across the seal, so a storage round trip
+    // (capped at fifteen seconds) held a pooled connection for its whole
+    // duration and a handful of concurrent finalizations exhausted the pool.
+    //
+    //   A. CLAIM   — one short tx: cancel any queued deletion of the canonical
+    //                path, and record a provisional INTENT for it carrying a
+    //                lease. The lease is what replaces the lock: while it is
+    //                live the sweeper leaves the path alone, so the object we
+    //                are about to write cannot be collected mid-publish.
+    //   B. SEAL    — the external write, with NO transaction open.
+    //   C. SETTLE  — one short tx: the fenced CAS, and on success the upload
+    //                cleanup and the intent's cancellation in the same commit.
+    //
+    // A publish that dies between B and C leaves a live intent that lapses;
+    // the sweeper then reclaims it, rechecks live references, and either
+    // resolves it (somebody published this path) or deletes the orphan.
+    //
+    // MUTUAL EXCLUSION IS NOT LOST BY DROPPING THE LOCK. The canonical path is
+    // content-addressed — rowId, lease version, sha and mime — so two
+    // publishers racing on it are, necessarily, writing IDENTICAL bytes to it.
+    // The seal is an upsert, so doing it twice is a no-op by construction. Only
+    // the pointer needs serializing, and the CAS in phase C already does that.
     let intentId: string;
     try {
-        intentId = await deps.queueCanonicalIntent(canonicalPath);
+        intentId = await deps.claimCanonicalPath(canonicalPath);
     } catch (error) {
+        // Writing an object we could not first promise to clean up IS the leak.
         console.error(
-            "[receipts/intake] could not record the canonical seal intent; nothing sealed",
+            "[receipts/intake] could not claim the canonical path; nothing sealed",
             rowId,
             error instanceof Error ? error.name : "error",
         );
         return null;
     }
 
-    const moved = await deps.withObjectLock(canonicalPath, async tx => {
-        const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
-        if (!sealed) return null;
+    // PHASE B: no transaction is open here. This is the whole point.
+    const sealed = await deps.seal(uploadPath, canonicalPath, check.bytes, check.mimeType);
+    if (!sealed) return null;
 
+    const moved = await deps.inShortTx(async tx => {
         const count = await deps.commit(tx, canonicalPath, check);
         if (count > 0) {
             // THE POINTER MOVED, so the upload object is orphaned from this
             // instant — and the record of that has to commit WITH the move,
-            // not after it. Enqueued here, inside the same transaction; a
-            // throw takes the pointer transition down with it and the row
-            // stays on the upload path, still reachable, for the retry.
+            // not after it. A throw takes the pointer transition down with it
+            // and the row stays on the upload path, still reachable.
             const eventId = uploadPath === canonicalPath
                 ? null
                 : await deps.queueUploadCleanup(tx, uploadPath);
@@ -232,40 +224,18 @@ export async function sealAndPublish(
             return { count, eventId };
         }
 
-        // LOST THE CAS. Some other publish already moved the row — but "moved
-        // it where" is the whole question, and it splits into two very
-        // different cases:
+        // LOST THE CAS — the lease was re-claimed, or another publisher moved
+        // the row first. DO NOT TOUCH THE DATABASE FURTHER and do not delete
+        // anything: the winner may be pointing at this very object, and the
+        // intent recorded in phase A already accounts for it either way. The
+        // sweeper resolves it by re-checking live references once the lease
+        // lapses, which is the one place that question can be asked safely.
         //
-        //   - the row's storagePath is THIS exact canonicalPath: another
-        //     publisher raced this one on the SAME content (same rowId, same
-        //     lease, same bytes -> the identical content-addressed path — a
-        //     double /finalize, or /finalize racing the sweep on one row). The
-        //     object this call just sealed IS the object the winner committed;
-        //     deleting it would destroy what the winner is now pointing at.
-        //   - anything else: the winner published a DIFFERENT object — a
-        //     re-armed upload landed different bytes in the gap between this
-        //     call's read and its commit — and the copy THIS call sealed is an
-        //     orphan nothing will ever find on its own. It is not a STAGING row
-        //     any more (the winner moved it), so the stale-STAGING sweep will
-        //     never look at it again, and it would sit in the bucket forever.
-        //
-        // A failed lookup used to be swallowed into "assume the winner is
-        // using it", which suppressed the cleanup entirely and leaked the
-        // object on every lookup fault. It no longer has to: the intent above
-        // already accounts for this path, so the honest answer is to let the
-        // throw roll this transaction back — the publish reports its retryable
-        // null, and the intent is swept on schedule with the sweeper's own
-        // live-reference recheck deciding whether the object may go.
-        const winnerPath = await deps.currentStoragePath(tx, rowId);
-        if (winnerPath !== canonicalPath) {
-            // NOT swallowed any more: a drop that can neither delete nor record
-            // is an orphan nobody will find, and this transaction has nothing
-            // of ours to protect — the CAS was already lost. Rolling back turns
-            // it into the retryable `null` below.
-            await deps.dropOrphanedCanonical(canonicalPath);
-        }
+        // This is the case the old code answered with a storage DELETE from
+        // inside the transaction.
         return { count, eventId: null };
     }).catch(error => {
+
         // A lock we could not take, or a transaction that could not commit.
         // NOTHING was published, and the same `null` the seal failure returns
         // is the honest answer: a retryable "come back", never a verdict.

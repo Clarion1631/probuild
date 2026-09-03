@@ -16,13 +16,13 @@ import {
 import {
     deleteObjectOrRecord,
     queueObjectCleanup,
-    queueCanonicalIntent,
+    claimObjectPath,
     resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
     retryPendingCleanups,
     sealObject,
     settleQueuedCleanup,
-    withReceiptPublishLock,
+    inShortTx,
 } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
@@ -495,7 +495,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // so a swept row's "verified" bytes would remain replaceable
                     // afterwards.
                     const outcome = await sealAndPublish(row.storagePath, row.id, row.uploadLeaseVersion, check, {
-                        withObjectLock: withReceiptPublishLock,
+                        inShortTx,
                         seal: sealObject,
                         commit: async (tx, canonicalPath, values) => {
                             const { count } = await tx.receiptIntake.updateMany({
@@ -534,27 +534,17 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // the two have to commit together.
                         queueUploadCleanup: (tx, uploadPath) =>
                             queueObjectCleanup(tx, uploadPath, "sealed", cleanupNotBefore(row)),
-                        // Same intent the /finalize publisher takes: the seal
-                        // is an external write ahead of the CAS either way.
-                        queueCanonicalIntent: canonicalPath =>
-                            queueCanonicalIntent(canonicalPath, cleanupNotBefore(row)),
+                        // PHASE A, same as the /finalize publisher: the seal is
+                        // an external write ahead of the CAS either way, so the
+                        // path is claimed with a lease before anything is
+                        // written and the lease is what keeps this sweep's own
+                        // cleanup pass off it in the meantime.
+                        claimCanonicalPath: canonicalPath =>
+                            claimObjectPath(canonicalPath, cleanupNotBefore(row)),
                         resolveCanonicalIntent,
                         settleUploadCleanup: (eventId, uploadPath) =>
                             settleQueuedCleanup(eventId, uploadPath, cleanupNotBefore(row))
                                 .then(() => undefined),
-                        currentStoragePath: async (tx, rowId) => {
-                            const r = await tx.receiptIntake.findUnique({
-                                where: { id: rowId },
-                                select: { storagePath: true },
-                            });
-                            return r?.storagePath ?? null;
-                        },
-                        // A lost CAS here means /finalize (or a resumed
-                        // /start's re-armed lease) already moved this row
-                        // while the sweep was mid-inspection — best-effort,
-                        // same retry queue as every other orphan.
-                        dropOrphanedCanonical: canonicalPath =>
-                            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
                     });
                     if (outcome?.published) published++;
                     continue;

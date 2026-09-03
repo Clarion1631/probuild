@@ -136,23 +136,83 @@ function pending(notBefore: Date | null | undefined, now: Date): Date | null {
  * `hashtext` collisions are harmless here — two unrelated paths sharing a hash
  * serialize against each other for a few milliseconds and nothing more.
  */
-export async function withReceiptObjectLock<T>(
-    storagePath: string,
-    body: (tx: Prisma.TransactionClient) => Promise<T>,
-): Promise<T> {
-    return prisma.$transaction(
-        async tx => {
-            // $executeRaw, NOT $queryRaw: pg_advisory_xact_lock returns void.
-            // The blocking form, not `try_`: the critical sections here are a
-            // storage round trip long, and a publish that gave up because a
-            // sweep held the lock would be a spurious 503.
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('receipt-object:' || ${storagePath}))`;
-            return body(tx);
-        },
-        // Generous: the section holds one Supabase round trip on an object
-        // capped at MAX_STORED_BYTES (8 MB), and the default 5s interactive
-        // timeout would abort a slow-but-healthy seal.
-        { maxWait: 10_000, timeout: 30_000 },
+/**
+ * A SHORT transaction. No storage call may be awaited inside it.
+ *
+ * This replaces `withReceiptObjectLock`, which took a transaction-scoped
+ * advisory lock on the path and then ran a Supabase round trip inside it. The
+ * lock was correct about mutual exclusion and wrong about what it cost: a
+ * pooled connection was held for the whole of an external call the round-16
+ * deadline caps at fifteen seconds, so a handful of concurrent finalizations
+ * exhausted the five-connection pool and later requests could not reach the
+ * database at all — including to release what they had claimed.
+ *
+ * The exclusion it provided is now a LEASE recorded in the cleanup queue (see
+ * claimObjectPath), which needs no open transaction to hold.
+ *
+ * The timeout is short on purpose: a body that cannot finish in five seconds
+ * without external I/O is doing something this comment says it must not.
+ */
+export async function inShortTx<T>(body: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return prisma.$transaction(body, { maxWait: 5_000, timeout: 5_000 });
+}
+
+/**
+ * How long a publish may hold a path before the sweeper presumes it dead.
+ *
+ * Comfortably longer than STORAGE_CALL_MAX_MS (15s), because the lease has to
+ * cover the seal plus the settle transaction that follows it; short enough
+ * that a killed invocation's paths are collectable within a couple of sweeps.
+ */
+export const OBJECT_CLAIM_LEASE_MS = 60_000;
+
+/**
+ * WHEN A CLAIMED PATH BECOMES COLLECTABLE — the lease, as a pure decision.
+ *
+ * The LATER of two deadlines, and both matter:
+ *   - this publish's own lease, which is what stops the sweeper collecting the
+ *     object between the seal and the pointer commit (the window the advisory
+ *     lock used to hold open with a connection);
+ *   - the caller's schedule, when a still-live signed upload URL protects the
+ *     path for longer than the publish will take.
+ *
+ * Taking the caller's alone would leave the seal window unguarded whenever the
+ * upload lease had already lapsed — which is the sweeper's own publish path,
+ * every time.
+ */
+export function objectClaimDueAt(notBefore: Date | null, now: Date = new Date()): Date {
+    const leaseUntil = new Date(now.getTime() + OBJECT_CLAIM_LEASE_MS);
+    return notBefore && notBefore > leaseUntil ? notBefore : leaseUntil;
+}
+
+/**
+ * PHASE A OF THE PUBLISH: claim a canonical path without holding a connection.
+ *
+ * One short transaction that does two things which must happen together:
+ *   - cancels any PENDING deletion of this path. The queue may hold an entry
+ *     from an earlier attempt, and it is wrong about the object this publish
+ *     is about to write.
+ *   - records a PROVISIONAL intent carrying a lease. While that lease is live
+ *     the sweeper skips the path (its schedule is in the future), so the
+ *     object cannot be collected between the seal and the pointer commit —
+ *     the window the advisory lock used to hold open with a connection.
+ *
+ * Returns the intent id, which phase C resolves in the same transaction as
+ * the pointer. An intent left behind by a publish that died simply lapses and
+ * the sweeper reclaims it, re-checking live references before it deletes.
+ */
+export async function claimObjectPath(
+    canonicalPath: string,
+    /** When the object may be deleted once the lease lapses. */
+    notBefore: Date | null = null,
+    now: Date = new Date(),
+): Promise<string> {
+    await inShortTx(tx => reclaimQueuedCleanups(tx, canonicalPath));
+    return recordPendingCleanup(
+        canonicalPath,
+        "canonical-seal-intent",
+        objectClaimDueAt(notBefore, now),
+        "provisional",
     );
 }
 
@@ -185,23 +245,6 @@ async function reclaimQueuedCleanups(tx: Prisma.TransactionClient, storagePath: 
     });
 }
 
-/**
- * The publish half of the mutual exclusion: hold the path's lock, cancel any
- * queued deletion of it, and run the seal-and-commit inside.
- *
- * Only the seal and the row pointer belong in here. No Gemini read, no QBO
- * round trip, nothing that can take seconds — this transaction blocks every
- * other writer of the same path for as long as it is open.
- */
-export async function withReceiptPublishLock<T>(
-    canonicalPath: string,
-    body: (tx: Prisma.TransactionClient) => Promise<T>,
-): Promise<T> {
-    return withReceiptObjectLock(canonicalPath, async tx => {
-        await reclaimQueuedCleanups(tx, canonicalPath);
-        return body(tx);
-    });
-}
 
 /**
  * Copy verified bytes to their canonical path and drop the upload path.
@@ -295,12 +338,6 @@ export async function recordPendingCleanup(
  * before it deletes — so an intent that outlived a publish which actually
  * worked resolves harmlessly instead of destroying a live receipt.
  */
-export async function queueCanonicalIntent(
-    canonicalPath: string,
-    notBefore: Date | null = null,
-): Promise<string> {
-    return recordPendingCleanup(canonicalPath, "canonical-seal-intent", notBefore, "provisional");
-}
 
 /** Cancel an intent because the object it covers is now referenced by a row. */
 export async function resolveCanonicalIntent(
@@ -607,7 +644,8 @@ export const CLEANUP_SCAN_FACTOR = 5;
 export interface CleanupSweepDeps {
     findPending: (take: number) => Promise<{ id: string; detail: string | null }[]>;
     abandon: (eventId: string) => Promise<void>;
-    withObjectLock: <T>(storagePath: string, body: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>;
+    /** A SHORT transaction. No storage call may be awaited inside it. */
+    inShortTx: <T>(body: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>;
     remove: (storagePath: string) => Promise<void>;
     now: () => Date;
 }
@@ -625,7 +663,7 @@ const liveSweepDeps: CleanupSweepDeps = {
     abandon: async eventId => {
         await prisma.automationEvent.update({ where: { id: eventId }, data: { status: "abandoned" } });
     },
-    withObjectLock: withReceiptObjectLock,
+    inShortTx,
     remove: removeReceiptObject,
     now: () => new Date(),
 };
@@ -684,27 +722,32 @@ export async function retryPendingCleanups(
         if (!cleanupDue(event.detail, now)) continue;
         attempted++;
 
-        // NEVER delete a path a LIVE row still points at — and never answer
-        // that question while a publish is mid-flight at the same path.
+        // ── CLAIM, DELETE, SETTLE — no storage call inside a transaction ──
         //
-        // The recovery sequence makes the first reachable: an ambiguous upload
-        // records a cleanup, the row is deleted, the caller retries, and the
-        // retry's row can end up pointing at the same path — or a seal can
-        // publish a canonical path that an older pending event names. Deleting
-        // then destroys a receipt that is in active use. The event is resolved
-        // rather than retried forever: the object is accounted for, just not by
-        // us.
+        // This used to be one transaction holding the path's advisory lock
+        // across the Supabase delete. Correct about exclusion, wrong about
+        // cost: a pooled connection was held for a call the round-16 deadline
+        // caps at fifteen seconds, so the sweep competed for the pool with
+        // every finalization running beside it.
         //
-        // The LOCK is what makes the check mean anything. Looking and then
-        // deleting, as two free-running operations, answers "was it referenced
-        // a moment ago" — and a publish that has sealed its bytes but not yet
-        // committed its row pointer is precisely the state that answers "no"
-        // while being seconds away from answering "yes". See
-        // withReceiptObjectLock. The whole check-and-delete now runs inside one
-        // transaction holding the path's lock, so a publish either finished
-        // before it (the row is visible, and this skips) or starts after it
-        // (the object is already gone, and the seal simply writes it again).
-        const verdict = await deps.withObjectLock(storagePath, async tx => {
+        // PHASE 1 (short tx): decide, and CLAIM.
+        //
+        // NEVER delete a path a LIVE row still points at. The recovery
+        // sequence makes that reachable: an ambiguous upload records a
+        // cleanup, the row is deleted, the caller retries, and the retry's row
+        // can end up pointing at the same path — or a seal can publish a
+        // canonical path an older pending event names. The event is RESOLVED
+        // rather than retried forever: the object is accounted for, just not
+        // by us.
+        //
+        // And the newest schedule for the path wins, never the one this
+        // particular event carries. An event records the expiry its author
+        // OBSERVED, and that author can have been overtaken — a /start refresh
+        // extends the lease and queues a second cleanup with a LATER deadline;
+        // a publish in flight holds a provisional lease on this very path.
+        // Acting on the older event would delete an object something still
+        // has a live claim on.
+        const claim = await deps.inShortTx(async tx => {
             const referenced = await tx.receiptIntake.findFirst({
                 where: { storagePath },
                 select: { id: true },
@@ -714,68 +757,79 @@ export async function retryPendingCleanups(
                     where: { id: event.id },
                     data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
                 });
-                return "referenced" as const;
+                return { verdict: "referenced" as const, siblingIds: [] as string[] };
             }
-            // THE NEWEST SCHEDULE FOR THIS PATH WINS, never the one this
-            // particular event happens to carry.
-            //
-            // An event records the expiry its author OBSERVED, and that author
-            // can have been overtaken: a /start refresh extends the lease, and
-            // a second cleanup for the same path is then queued with a LATER
-            // deadline. Acting on the older event would delete the object
-            // while the refreshed URL still works — precisely the orphan the
-            // schedule exists to prevent, arriving through the queue instead
-            // of through the fence. Taken inside the lock, with the row's own
-            // current expiry folded in, so "newest" is answered against the
-            // same snapshot the delete acts on.
             const siblings = await tx.automationEvent.findMany({
                 where: {
                     kind: STORAGE_CLEANUP_KIND,
                     // Provisional intents included: they name the same object,
-                    // so they carry a schedule this delete must respect and
-                    // they must be resolved with it rather than left to retry
-                    // forever against bytes that are already gone.
+                    // so they carry a schedule this delete must respect — a
+                    // publish's live lease among them — and they must be
+                    // resolved with it rather than left retrying forever
+                    // against bytes that are already gone.
                     status: { in: CLEANUP_SWEEPABLE_STATUSES },
                     detail: { contains: JSON.stringify(storagePath) },
                 },
                 select: { id: true, detail: true },
             });
             const newest = siblings
-                .map(s => cleanupDueAt(s.detail))
+                .map(sibling => cleanupDueAt(sibling.detail))
                 .reduce<Date | null>(
                     (latest, at) => (at && (!latest || at > latest) ? at : latest),
                     null,
                 );
-            if (pending(newest, now)) return "not-due" as const;
-            // A throw here rolls the whole transaction back, so the event stays
-            // pending for the next pass — the same outcome the old separate
-            // delete had, without the resolve ever landing on its own.
-            await deps.remove(storagePath);
-            // Resolved ONLY after a delete that did not throw —
-            // removeReceiptObject surfaces a missing storage client as an error
-            // rather than a success, so a misconfigured deployment cannot
-            // quietly mark the queue clean.
-            // EVERY pending event naming this path, not just the one we came
-            // in on. They all describe the same object and it is now gone; a
-            // sibling left pending would be retried every pass forever, its
-            // remove() throwing "not found" each time, because nothing else
-            // will ever resolve it. Two events for one path is the normal
-            // shape once a lease can be refreshed mid-flight.
-            for (const sibling of siblings.length ? siblings : [{ id: event.id }]) {
-                await tx.automationEvent.update({
-                    where: { id: sibling.id },
-                    data: { status: "resolved" },
-                });
-            }
-            return "deleted" as const;
+            if (pending(newest, now)) return { verdict: "not-due" as const, siblingIds: [] };
+            return { verdict: "claimed" as const, siblingIds: siblings.map(sibling => sibling.id) };
         }).catch(error => {
+            console.error(
+                "[receipts/intake] cleanup claim failed, left pending",
+                storagePath,
+                error instanceof Error ? error.name : "error",
+            );
+            return { verdict: "failed" as const, siblingIds: [] as string[] };
+        });
+
+        if (claim.verdict !== "claimed") continue;
+
+        // PHASE 2: the external delete, with NO transaction open.
+        //
+        // A failure leaves every sibling event exactly as it was — still
+        // pending, still due — so the next pass simply tries again. That is
+        // the same outcome the old rollback produced, without a connection
+        // held for the duration.
+        try {
+            await deps.remove(storagePath);
+        } catch (error) {
             console.error(
                 "[receipts/intake] queued cleanup left pending",
                 storagePath,
                 error instanceof Error ? error.name : "error",
             );
-            return "failed" as const;
+            continue;
+        }
+
+        // PHASE 3 (short tx): the object is gone, so every event naming it is
+        // settled. Resolved only AFTER a delete that did not throw —
+        // removeReceiptObject surfaces a missing storage client as an error
+        // rather than a success, so a misconfigured deployment cannot quietly
+        // mark the queue clean.
+        const settled = await deps.inShortTx(async tx => {
+            for (const id of claim.siblingIds.length ? claim.siblingIds : [event.id]) {
+                await tx.automationEvent.update({ where: { id }, data: { status: "resolved" } });
+            }
+            return true;
+        }).catch(error => {
+            // The bytes ARE gone; only the bookkeeping failed. The next pass
+            // finds the event still pending, removes nothing (the object is
+            // already absent) and resolves it then.
+            console.error(
+                "[receipts/intake] cleanup settle failed after a successful delete",
+                storagePath,
+                error instanceof Error ? error.name : "error",
+            );
+            return false;
         });
+        const verdict = settled ? "deleted" : "failed";
         if (verdict === "deleted") cleared++;
     }
     return cleared;

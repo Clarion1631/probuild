@@ -217,10 +217,13 @@ import {
     settleQueuedCleanup,
     CLEANUP_SCAN_FACTOR,
     CLEANUP_SWEEPABLE_STATUSES,
+    objectClaimDueAt,
+    OBJECT_CLAIM_LEASE_MS,
     type CleanupIo,
     type CleanupSweepDeps,
 } from "../src/lib/receipt-intake/storage-cleanup";
 import { CLEANUP_GRACE_MS, cleanupNotBefore } from "../src/lib/receipt-intake/worker";
+import { STORAGE_CALL_MAX_MS } from "../src/lib/receipt-intake/bucket";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
 
 /** The verified bytes a publish carries. Only the shape matters here. */
@@ -244,6 +247,9 @@ function world(now: Date = T0) {
     const objects = new Set<string>();
     const events: { id: string; status: string; detail: string }[] = [];
     let rows: { id: string; storagePath: string }[] = [];
+    let txOpen = 0;
+    let txOpenMs = 0;
+    let maxConcurrentTx = 0;
     let clock = now.getTime();
 
     const record = async (storagePath: string, _reason: string, notBefore: Date | null) => {
@@ -279,9 +285,15 @@ function world(now: Date = T0) {
             const event = events.find(e => e.id === eventId);
             if (event) event.status = "abandoned";
         },
-        // The advisory lock is a database fact; what matters here is that the
-        // reference check and the delete happen inside one body, which they do.
-        withObjectLock: async (_path, body) => body({
+        // A SHORT transaction, and the fake RECORDS how long it stays open so
+        // "no storage call happens inside one" is a measured property rather
+        // than a claim — see the connection-hold test.
+        inShortTx: async body => {
+            const openedAt = Date.now();
+            txOpen++;
+            maxConcurrentTx = Math.max(maxConcurrentTx, txOpen);
+            try {
+                return await body({
             receiptIntake: {
                 findFirst: async ({ where }: { where: { storagePath: string } }) =>
                     rows.find(r => r.storagePath === where.storagePath) ?? null,
@@ -298,7 +310,12 @@ function world(now: Date = T0) {
                     return event;
                 },
             },
-        } as never),
+                } as never);
+            } finally {
+                txOpen--;
+                txOpenMs += Date.now() - openedAt;
+            }
+        },
         remove,
         now: () => new Date(clock),
     };
@@ -307,6 +324,9 @@ function world(now: Date = T0) {
         setRows: (next: typeof rows) => { rows = next; },
         advance: (ms: number) => { clock += ms; },
         pending: () => events.filter(e => (CLEANUP_SWEEPABLE_STATUSES as string[]).includes(e.status)),
+        /** Total time any transaction was open, across the whole sweep. */
+        txOpenMs: () => txOpenMs,
+        maxConcurrentTx: () => maxConcurrentTx,
     };
 }
 
@@ -556,7 +576,7 @@ test("a cleanup-record failure ROLLS BACK the pointer transition it belongs to",
     // rollback rather than a mutation the assertions cannot see.
     let staged = { ...store };
     const attempt = (queueThrows: boolean) => sealAndPublish(UPLOAD, "row-1", 1, CHECK, {
-        withObjectLock: async (_p: string, body: (tx: never) => Promise<unknown>) => {
+        inShortTx: async (body: (tx: never) => Promise<unknown>) => {
             staged = { ...store };
             const out = await body({
                 receiptIntake: { findUnique: async () => ({ storagePath: staged.storagePath }) },
@@ -571,15 +591,13 @@ test("a cleanup-record failure ROLLS BACK the pointer transition it belongs to",
             staged.state = "RECEIVED";
             return 1;
         },
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => {
             if (queueThrows) throw new Error("cleanup insert failed");
             return "ev-1";
         },
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => staged.storagePath,
-        dropOrphanedCanonical: async () => {},
     } as never);
 
     const failed = await attempt(true);
@@ -746,4 +764,125 @@ test("the publish lock's reclaim must NOT cancel a provisional intent", () => {
     );
     assert.match(siblings, /status: \{ in: CLEANUP_SWEEPABLE_STATUSES \}/);
     assert.deepEqual(CLEANUP_SWEEPABLE_STATUSES, ["pending", "provisional"]);
+});
+
+// ── An ambiguous healing upload is accounted for (round-17 item 1) ─────────
+//
+// `uploadReceiptObject` returns false for a REFUSAL and for an AMBIGUOUS
+// outcome alike — a write storage may well have accepted before the response
+// was lost. The heal branch answered 503 and recorded nothing, so those bytes
+// sat in a private bucket with no row pointing at them (the row still points
+// at its OLD path), no event remembering them, and no sweep looking: the
+// stale-STAGING sweep reads ROWS, and this row is not STAGING.
+
+test("the heal CLAIMS its path before uploading, and settles the claim with the repoint", () => {
+    const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
+    const heal = intake.slice(intake.indexOf("const healable = finalizeDisposition(existing)"));
+    const body = heal.slice(0, heal.indexOf("// A booked/archived row with no object"));
+
+    const claimAt = body.indexOf("claimObjectPath(");
+    const uploadAt = body.indexOf("await storeObject(");
+    const repointAt = body.indexOf("await inShortTx(");
+    assert.ok(claimAt > 0, "the path is claimed");
+    assert.ok(claimAt < uploadAt, "BEFORE the upload — an object we cannot promise to clean up is not written");
+    assert.ok(uploadAt < repointAt, "and the upload is outside the transaction that repoints the row");
+
+    // A claim that cannot be recorded uploads NOTHING.
+    const claimFail = body.slice(claimAt, repointAt);
+    assert.match(claimFail, /reason: "storage-unavailable", retryable: true/);
+
+    // The ambiguous outcome leaves the intent standing rather than resolving it.
+    assert.match(body, /AMBIGUOUS: storage may hold the bytes/);
+    assert.match(body, /if \(moved\.count > 0\) await resolveCanonicalIntent\(tx, healIntentId\);/);
+});
+
+test("an ambiguous heal leaves an intent the sweeper can act on", async () => {
+    // End to end through the queue: the intent is recorded with a lease, the
+    // sweeper defers while that lease is live, and collects the orphan once it
+    // lapses — rechecking live references first.
+    const w = world();
+    const HEAL = "receipts/intake/heal-1.png";
+    // Phase A wrote this and then the upload came back ambiguous.
+    w.objects.add(HEAL); // storage DID accept the bytes
+    w.events.push({
+        id: "intent-heal",
+        status: "provisional",
+        detail: JSON.stringify({ storagePath: HEAL, notBefore: new Date(T0.getTime() + 60_000).toISOString() }),
+    });
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 0, "deferred while the lease is live");
+    assert.ok(w.objects.has(HEAL));
+
+    w.advance(2 * 60_000);
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1, "collected once it lapsed");
+    assert.equal(w.objects.has(HEAL), false);
+
+    // PRE-FIX CONTROL: with no intent recorded there is nothing for the sweep
+    // to find, and the bytes stay in the bucket forever.
+    const leaked = world();
+    leaked.objects.add(HEAL);
+    leaked.advance(24 * 60 * 60_000);
+    assert.equal(await retryPendingCleanups(10, () => false, leaked.sweep), 0);
+    assert.ok(leaked.objects.has(HEAL), "unrecorded bytes are unreachable, which was the bug");
+});
+
+test("a heal that WINS its CAS cancels the intent — the control", async () => {
+    // Otherwise every successful heal would leave a live intent that the
+    // sweeper later resolves against a referenced row: harmless, but it would
+    // mean the cancellation was never actually wired.
+    const w = world();
+    const HEAL = "receipts/intake/heal-2.png";
+    w.objects.add(HEAL);
+    w.setRows([{ id: "row-1", storagePath: HEAL }]);
+    w.events.push({
+        id: "intent-heal-2",
+        status: "provisional",
+        detail: JSON.stringify({ storagePath: HEAL }),
+    });
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 0);
+    assert.ok(w.objects.has(HEAL), "the healed row's bytes are never collected");
+    assert.equal(w.pending().length, 0, "and the intent is resolved by the reference check");
+});
+
+test("the CLAIM lease covers the seal window, and yields to a longer one", () => {
+    // The lease is what replaced the advisory lock: while it is live the
+    // sweeper skips the path, so the object cannot be collected between the
+    // seal and the pointer commit.
+    const now = new Date("2026-09-03T12:00:00.000Z");
+
+    // No caller schedule at all — the sweeper's own publish path, where the
+    // upload URL has long since lapsed. Taking the caller's null here would
+    // leave the seal window completely unguarded.
+    const bare = objectClaimDueAt(null, now);
+    assert.equal(bare.getTime(), now.getTime() + OBJECT_CLAIM_LEASE_MS);
+    assert.ok(OBJECT_CLAIM_LEASE_MS > STORAGE_CALL_MAX_MS, "longer than a storage call may take");
+
+    // A caller schedule that has ALREADY passed must not shorten the lease.
+    const stale = objectClaimDueAt(new Date(now.getTime() - 60_000), now);
+    assert.equal(stale.getTime(), now.getTime() + OBJECT_CLAIM_LEASE_MS, "the publish window still holds");
+
+    // A LIVE upload URL outlives this publish, so its schedule wins.
+    const liveUrl = new Date(now.getTime() + 2 * 60 * 60_000);
+    assert.equal(objectClaimDueAt(liveUrl, now).getTime(), liveUrl.getTime());
+});
+
+test("a claimed path is NOT swept while its lease is live — the whole point", async () => {
+    // End to end through the queue, which is where the lock's job now lives.
+    const w = world();
+    const CANON = "receipts/row-1/v1/sealed.png";
+    w.objects.add(CANON);
+    w.events.push({
+        id: "intent-live",
+        status: "provisional",
+        detail: JSON.stringify({ storagePath: CANON, notBefore: objectClaimDueAt(null, T0).toISOString() }),
+    });
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 0, "the lease holds the path");
+    assert.ok(w.objects.has(CANON), "the bytes a publish is about to point at survive");
+
+    // ...and once it lapses without being resolved, the publish is presumed
+    // dead and the orphan is collected.
+    w.advance(OBJECT_CLAIM_LEASE_MS + 1_000);
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1);
+    assert.equal(w.objects.has(CANON), false);
 });

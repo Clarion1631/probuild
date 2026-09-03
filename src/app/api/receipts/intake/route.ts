@@ -9,7 +9,14 @@ import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { uploadReceiptObject } from "@/lib/receipt-intake/bucket";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
-import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
+import {
+    claimObjectPath,
+    deleteObjectOrRecord,
+    inShortTx,
+    recordPendingCleanup,
+    resolveCanonicalIntent,
+} from "@/lib/receipt-intake/storage-cleanup";
+import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME, sniffMime } from "@/lib/receipt-intake/file-type";
 import {
     decideSource,
@@ -503,6 +510,9 @@ async function respondToSourceRefConflict(
             // The whole lease identity, because the heal's CAS pins it — see
             // leaseFence. A refresh moves only the nonce and the expiry.
             uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
+            // Only for cleanupNotBefore: an inline row has no expiry, so its
+            // capability window is measured from createdAt.
+            createdAt: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
@@ -597,20 +607,57 @@ async function respondToSourceRefConflict(
         // disagree about whether a human's decision can be overwritten.
         const healable = finalizeDisposition(existing) === "publish";
         if (healable) {
+            // CLAIMED BEFORE IT IS WRITTEN — the same phase-A rule the publish
+            // uses, for the same reason.
+            //
+            // `uploadReceiptObject` returns false for a refusal AND for an
+            // ambiguous outcome: a write storage may well have accepted before
+            // the response was lost. Returning 503 on that without recording
+            // anything left those bytes in a private bucket with no row
+            // pointing at them, no event remembering them and no sweep looking
+            // for them — the row still points at its OLD path, so the
+            // stale-STAGING sweep never sees this one.
+            //
+            // The intent is committed first, in its own short transaction, and
+            // carries a lease so the sweeper leaves the path alone while this
+            // request is still using it. A heal that succeeds cancels it in the
+            // transaction that repoints the row; a heal that fails, ambiguously
+            // or otherwise, simply leaves it for the sweeper.
+            let healIntentId: string;
+            try {
+                healIntentId = await claimObjectPath(payload.storagePath, cleanupNotBefore(existing));
+            } catch {
+                // Writing an object we could not first promise to clean up IS
+                // the leak. Nothing is uploaded.
+                return NextResponse.json(
+                    { ok: false, reason: "storage-unavailable", retryable: true },
+                    { status: 503 },
+                );
+            }
             const healed = await storeObject(payload.storagePath, payload.bytes, payload.mimeType);
             if (!healed) {
+                // AMBIGUOUS: storage may hold the bytes. The intent stands and
+                // the sweeper collects them once its lease lapses, rechecking
+                // live references first.
                 return NextResponse.json({ ok: false, error: "storage-failed" }, { status: 503 });
             }
             // The SAME fence /finalize publishes under: exact state, exact
             // reason, unclaimed. Losing this race means somebody moved the row
             // while we were uploading, so the object we just wrote is
             // unreferenced — clean it up rather than orphan it.
-            const { count } = await prisma.receiptIntake.updateMany({
-                // leaseFence: the heal REPOINTS the row at bytes this request
-                // uploaded, and a /start that reissued the client's URL in the
-                // meantime moves neither the state, the reason nor the version.
-                where: { id: existing.id, ...leaseFence(existing) },
-                data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
+            // ONE SHORT TRANSACTION, with the upload already done: the repoint
+            // and the cancellation of its intent land together or neither does.
+            const { count } = await inShortTx(async tx => {
+                const moved = await tx.receiptIntake.updateMany({
+                    // leaseFence: the heal REPOINTS the row at bytes this request
+                    // uploaded, and a /start that reissued the client's URL in the
+                    // meantime moves neither the state, the reason nor the version.
+                    where: { id: existing.id, ...leaseFence(existing) },
+                    data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
+                });
+                // Referenced from this instant, so the intent goes with it.
+                if (moved.count > 0) await resolveCanonicalIntent(tx, healIntentId);
+                return moved;
             });
             if (count === 0) {
                 // Same rule as the publish-race drop above: this branch has no

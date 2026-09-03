@@ -330,7 +330,8 @@ const CHECK = {
  * A pass-through object lock, for the tests whose subject is the fenced CAS
  * rather than the mutual exclusion. The real one is exercised above.
  */
-const noLock = (_p: string, body: (tx: never) => Promise<unknown>) => body(null as never);
+/** A short transaction that just runs its body. No lock: there is none any more. */
+const noLock = (body: (tx: never) => Promise<unknown>) => body(null as never);
 
 /** The path sealAndPublish("...", "row-1", 1, CHECK, ...) will compute. */
 const CANONICAL_ROW1 = `receipts/row-1/v1/${CHECK.fileSha256}.png`;
@@ -346,24 +347,22 @@ function publishHarness(
     opts: {
         sealOk?: boolean;
         committed?: number;
-        currentPath?: string | null;
-        currentPathThrows?: boolean;
-        lockThrows?: boolean;
+        txThrows?: boolean;
     } = {},
 ) {
     const calls: string[] = [];
     const deps = {
-        // `lock`/`unlock` bracket the critical section in the call log, so
-        // every ordering assertion below also states which steps are INSIDE
-        // it. The seal, the commit, the winner lookup and the orphan drop must
-        // be; the upload drop must not.
-        withObjectLock: async (_p: string, body: (tx: never) => Promise<unknown>) => {
-            calls.push("lock");
-            if (opts.lockThrows) throw new Error("could not take the lock");
+        // `tx-open`/`tx-close` bracket the SETTLE transaction in the call
+        // log, so every ordering assertion below also states which steps are
+        // inside it. The commit, the upload-cleanup enqueue and the intent's
+        // cancellation must be; THE SEAL MUST NOT — that is the whole finding.
+        inShortTx: async (body: (tx: never) => Promise<unknown>) => {
+            calls.push("tx-open");
+            if (opts.txThrows) throw new Error("could not open the transaction");
             try {
                 return await body(null as never);
             } finally {
-                calls.push("unlock");
+                calls.push("tx-close");
             }
         },
         seal: async (_u: string, canonical: string) => {
@@ -371,16 +370,10 @@ function publishHarness(
             return opts.sealOk === false ? null : canonical;
         },
         commit: async () => { calls.push("commit"); return opts.committed ?? 1; },
-        queueCanonicalIntent: async () => { calls.push("queue-intent"); return "intent-1"; },
+        claimCanonicalPath: async () => { calls.push("claim"); return "intent-1"; },
         resolveCanonicalIntent: async () => { calls.push("resolve-intent"); },
         queueUploadCleanup: async () => { calls.push("queue-cleanup"); return "ev-1"; },
         settleUploadCleanup: async () => { calls.push("drop"); },
-        currentStoragePath: async () => {
-            calls.push("current-path");
-            if (opts.currentPathThrows) throw new Error("db is down");
-            return opts.currentPath === undefined ? CANONICAL_ROW1 : opts.currentPath;
-        },
-        dropOrphanedCanonical: async () => { calls.push("drop-orphan"); },
     } as never;
     return { calls, deps };
 }
@@ -405,114 +398,57 @@ test("the upload object is deleted only AFTER the row pointer is committed", asy
     // pointer commit, so the two facts land together or neither does.
     assert.deepEqual(
         h.calls,
-        ["queue-intent", "lock", "seal", "commit", "queue-cleanup", "resolve-intent", "unlock", "drop"],
+        ["claim", "seal", "tx-open", "commit", "queue-cleanup", "resolve-intent", "tx-close", "drop"],
     );
+    // THE SEAL IS OUTSIDE THE TRANSACTION. That is the finding, stated as an
+    // ordering: `claim` and `seal` both precede `tx-open`, so the external
+    // write holds no connection, and the cancellation of the claim sits inside
+    // the same transaction as the pointer so the two land together.
+    assert.ok(h.calls.indexOf("seal") < h.calls.indexOf("tx-open"), "seal before any tx");
     assert.equal(outcome?.published, true);
     assert.equal(outcome?.canonicalPath, `receipts/row-1/v1/${CHECK.fileSha256}.png`);
 });
 
-test("a FAILED commit leaves the upload object alone, so the retry can recover", async () => {
-    // The winner is proven (by the default harness) to be pointing at this
-    // EXACT canonical path — a double-publish racing on identical content —
-    // so nothing is deleted, upload OR canonical.
+test("a LOST CAS touches neither the database nor storage", async () => {
+    // The lease was re-claimed, or another publisher moved the row first.
+    //
+    // The old code answered this by looking up what the winner was pointing at
+    // and DELETING from inside the transaction if it was pointing elsewhere.
+    // Both halves are gone: the lookup because it was a second round trip
+    // inside a held transaction, and the delete because a publisher that lost
+    // cannot safely decide anything about an object it no longer owns.
+    //
+    // The phase-A intent already accounts for the sealed copy. The sweeper
+    // resolves it once the lease lapses, re-checking live references first —
+    // the one place that question can be asked without racing a publish.
     const h = publishHarness({ committed: 0 });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-    assert.deepEqual(
-        h.calls,
-        ["queue-intent", "lock", "seal", "commit", "current-path", "unlock"],
-        "nothing was deleted",
-    );
-    // ...and the intent was NOT cancelled, so the sealed copy is still
-    // accounted for even though this call published nothing.
-    assert.ok(!h.calls.includes("resolve-intent"));
-    assert.equal(outcome?.published, false);
-});
 
-// ── A lost CAS orphans the sealed copy unless it's proven to be the winner's own (Codex round-17 item 4) ──
-
-test("a lost CAS whose winner points elsewhere cleans up the orphaned canonical copy", async () => {
-    // The winner published a DIFFERENT object (a re-armed upload landed new
-    // bytes in the gap), so the copy THIS call sealed is not the row's
-    // storagePath any more, and the STAGING sweep will never look at it
-    // again — it must be cleaned up here or it sits in the bucket forever.
-    const h = publishHarness({ committed: 0, currentPath: "receipts/row-1/some-other-sha.png" });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-    // The winner lookup AND the drop it decides are inside the lock: asking
-    // outside it and deleting afterwards is the same two-step race one level
-    // down — the winner can commit this path in the gap.
-    assert.deepEqual(
-        h.calls,
-        ["queue-intent", "lock", "seal", "commit", "current-path", "drop-orphan", "unlock"],
-    );
+    assert.deepEqual(h.calls, ["claim", "seal", "tx-open", "commit", "tx-close"]);
+    assert.ok(!h.calls.includes("resolve-intent"), "the intent survives to cover the sealed copy");
+    assert.ok(!h.calls.includes("drop"), "and nothing is deleted by the loser");
     assert.equal(outcome?.published, false);
     assert.equal(outcome?.canonicalPath, CANONICAL_ROW1);
-});
-
-test("a lost CAS never deletes the object the winner is actually using", async () => {
-    // The winner's storagePath IS this exact canonical path: a double
-    // /finalize (or /finalize racing the sweep) on the SAME content. That
-    // object is the winner's now.
-    const h = publishHarness({ committed: 0, currentPath: CANONICAL_ROW1 });
-    await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-    assert.deepEqual(
-        h.calls,
-        ["queue-intent", "lock", "seal", "commit", "current-path", "unlock"],
-        "no drop-orphan call",
-    );
-});
-
-test("a failed lookup leaves the sealed copy ACCOUNTED FOR, not silently leaked", async () => {
-    // This test used to enshrine the leak. `currentStoragePath(...)` was
-    // wrapped in `.catch(() => canonicalPath)`, which turned "I could not find
-    // out what the winner is using" into "assume the winner is using it" — so
-    // nothing was deleted, nothing was recorded, and the object this call had
-    // already sealed sat in the bucket with no row referencing it and no sweep
-    // looking for it. The assertion below said "the failure default is 'do not
-    // delete'", which was true and was exactly the bug.
-    //
-    // Not deleting on uncertainty is still right. What changed is that the
-    // object was promised to the cleanup queue BEFORE it was written, so
-    // uncertainty no longer costs anything: the lookup throw rolls the
-    // transaction back, the publish reports its retryable null, and the
-    // provisional intent survives for the sweeper — which rechecks live
-    // references inside the path lock before it deletes, so an intent that
-    // outlived a publish that actually worked resolves harmlessly.
-    const h = publishHarness({ committed: 0, currentPathThrows: true });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-
-    assert.equal(outcome, null, "a retryable answer, never a verdict");
-    assert.ok(h.calls.includes("queue-intent"), "the sealed copy was accounted for first");
-    assert.ok(!h.calls.includes("resolve-intent"), "and the intent was NOT cancelled");
-    assert.ok(!h.calls.includes("drop-orphan"), "nothing is deleted on uncertainty");
-});
-
-test("nothing is SEALED when the intent cannot be recorded — the pre-fix control", async () => {
-    // The other half of the rule: an object we cannot promise to clean up in
-    // advance must not be written at all, or the leak is back by another door.
-    const h = publishHarness();
-    (h.deps as { queueCanonicalIntent: () => Promise<string> }).queueCanonicalIntent =
-        async () => { throw new Error("db is down"); };
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-    assert.equal(outcome, null);
-    assert.ok(!h.calls.includes("seal"), "the external write never happened");
-    assert.ok(!h.calls.includes("lock"), "and the lock was never taken");
 });
 
 test("a failed SEAL never touches the row or the upload object", async () => {
     const h = publishHarness({ sealOk: false });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
     assert.equal(outcome, null);
-    assert.deepEqual(h.calls, ["queue-intent", "lock", "seal", "unlock"]);
+    assert.deepEqual(h.calls, ["claim", "seal"], "no transaction was ever opened");
 });
 
-test("a lock that cannot be taken is a RETRYABLE null, never a verdict", async () => {
-    // Nothing was sealed and nothing was committed, so the honest answer is
-    // the same "come back" a failed seal gives — not a published row, and not
-    // a park.
-    const h = publishHarness({ lockThrows: true });
+test("a settle transaction that cannot open is a RETRYABLE null, never a verdict", async () => {
+    // The bytes ARE sealed by this point — that is unavoidable, the external
+    // write comes first — but nothing was committed, so the honest answer is
+    // the same "come back" a failed seal gives. The phase-A intent is what
+    // makes it safe: the sealed copy is accounted for, and the sweeper
+    // collects it if no retry ever claims it.
+    const h = publishHarness({ txThrows: true });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
     assert.equal(outcome, null);
-    assert.deepEqual(h.calls, ["queue-intent", "lock"], "the seal never ran");
+    assert.deepEqual(h.calls, ["claim", "seal", "tx-open"]);
+    assert.ok(!h.calls.includes("resolve-intent"), "the intent survives to cover the sealed copy");
 });
 
 test("a retry that finds the canonical object already there still commits", async () => {
@@ -529,44 +465,38 @@ test("a retry that finds the canonical object already there still commits", asyn
 // ── Cleanup vs publication: the seal/commit gap (round-35 P0) ───────────────
 
 /**
- * A stand-in for `pg_advisory_xact_lock`: one holder per path, everybody else
- * queues. Deliberately not a mock of the transaction — the ONLY property under
- * test is mutual exclusion between two concurrent holders of the same path.
- */
-function pathLocks() {
-    const held = new Map<string, Promise<void>>();
-    return async function withLock<T>(path: string, body: () => Promise<T>): Promise<T> {
-        while (held.has(path)) await held.get(path);
-        let release!: () => void;
-        held.set(path, new Promise<void>(resolve => { release = resolve; }));
-        try {
-            return await body();
-        } finally {
-            held.delete(path);
-            release();
-        }
-    };
-}
-
-/**
- * The whole failure, run: a publish that has sealed its bytes but not yet
- * committed its row pointer, and a cleanup sweep that starts in that window.
+ * THE SAME FAILURE, AGAINST THE LEASE PROTOCOL THAT REPLACED THE LOCK.
  *
- * `lockPaths: false` is the CONTROL, and it is the point of the pair — a
+ * A publish that has sealed its bytes but not yet committed its row pointer is
+ * the window in which nothing references the canonical path — so a cleanup
+ * sweep arriving in it used to delete the object the publish was about to
+ * point at, and the intake reported success while the row pointed at nothing.
+ *
+ * The advisory lock closed that window by holding a transaction (and a pooled
+ * connection) across the seal. What closes it now is the PROVISIONAL LEASE the
+ * publish records in phase A: the sweep reads the newest schedule for the path
+ * and skips a path whose lease has not lapsed. Same exclusion, no connection.
+ *
+ * `leased: false` is the CONTROL, and it is the point of the pair — a
  * concurrency test whose "fixed" case passes proves nothing unless the
- * unlocked case actually reproduces the loss.
+ * unguarded case actually reproduces the loss.
  */
-async function raceSweepAgainstPublish(lockPaths: boolean) {
-    const withLock = pathLocks();
+async function raceSweepAgainstPublish(leased: boolean) {
     const UPLOAD = "receipts/intake/a.png";
     const objects = new Set<string>([UPLOAD]);
     let rowStoragePath = UPLOAD;
     let sealDone!: () => void;
     const sealed = new Promise<void>(resolve => { sealDone = resolve; });
+    // The queue, as the sweep sees it: phase A writes a provisional entry for
+    // the canonical path carrying a lease that has not yet lapsed.
+    const leaseUntil = new Map<string, number>();
 
     const publishing = sealAndPublish(UPLOAD, "row-1", 1, CHECK, {
-        withObjectLock: (path: string, body: (tx: never) => Promise<unknown>) =>
-            lockPaths ? withLock(path, () => body(null as never)) : body(null as never),
+        inShortTx: (body: (tx: never) => Promise<unknown>) => body(null as never),
+        claimCanonicalPath: async (canonicalPath: string) => {
+            if (leased) leaseUntil.set(canonicalPath, Date.now() + 60_000);
+            return "intent-1";
+        },
         seal: async (_u: string, canonical: string) => {
             objects.add(canonical);
             sealDone();
@@ -579,44 +509,78 @@ async function raceSweepAgainstPublish(lockPaths: boolean) {
             rowStoragePath = canonical;
             return 1;
         },
-        queueCanonicalIntent: async () => "intent-1",
-        resolveCanonicalIntent: async () => {},
+        resolveCanonicalIntent: async () => { leaseUntil.delete(CANONICAL_ROW1); },
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async (_id: string, uploadPath: string) => { objects.delete(uploadPath); },
-        currentStoragePath: async () => rowStoragePath,
-        dropOrphanedCanonical: async () => {},
     } as never);
 
-    // The sweep: exactly what retryPendingCleanups does for a pending event
-    // naming this path — look for a live row pointing at it, then delete.
+    // The sweep, exactly as retryPendingCleanups decides: is a live row
+    // pointing at this path, and is the NEWEST schedule for it still ahead of
+    // us? Both questions are asked in a short transaction; neither is a lock.
     await sealed;
     const sweep = async () => {
         if (rowStoragePath === CANONICAL_ROW1) return "referenced";
+        const until = leaseUntil.get(CANONICAL_ROW1);
+        if (until && until > Date.now()) return "not-due";
         objects.delete(CANONICAL_ROW1);
         return "deleted";
     };
-    const swept = lockPaths ? await withLock(CANONICAL_ROW1, sweep) : await sweep();
+    const swept = await sweep();
 
     const outcome = await publishing;
     return { outcome, swept, objects, rowStoragePath };
 }
 
-test("a cleanup that starts between the seal and the commit WAITS, and the published bytes survive", async () => {
+test("a cleanup that starts between the seal and the commit DEFERS, and the bytes survive", async () => {
     const race = await raceSweepAgainstPublish(true);
     assert.equal(race.outcome?.published, true);
-    assert.equal(race.swept, "referenced", "the sweep blocked on the lock, then saw the reference");
+    assert.equal(race.swept, "not-due", "the publish's live lease held the path");
     assert.equal(race.rowStoragePath, CANONICAL_ROW1);
     assert.ok(race.objects.has(CANONICAL_ROW1), "the row the sweep let through still has its bytes");
 });
 
-test("CONTROL: without the lock the same interleaving publishes a row pointing at nothing", async () => {
+test("CONTROL: without the lease the same interleaving publishes a row pointing at nothing", async () => {
     // If this ever stops failing the way it does, the test above has stopped
     // proving anything.
     const race = await raceSweepAgainstPublish(false);
     assert.equal(race.outcome?.published, true, "the intake reports success either way");
-    assert.equal(race.swept, "deleted", "the sweep saw an unreferenced path, because the commit had not landed");
+    assert.equal(race.swept, "deleted", "the sweep saw an unreferenced, unleased path");
     assert.equal(race.rowStoragePath, CANONICAL_ROW1);
     assert.ok(!race.objects.has(CANONICAL_ROW1), "...and the successful intake now points at missing bytes");
+});
+
+test("NO STORAGE CALL RUNS WITH A TRANSACTION OPEN", async () => {
+    // The finding, measured: the seal is the slow external call, and the
+    // publish must hold zero database transactions while it runs. The fake
+    // counts transactions open at the moment the seal is invoked.
+    let txOpen = 0;
+    let txOpenDuringSeal = -1;
+    let sealMs = 0;
+
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
+        inShortTx: async (body: (tx: never) => Promise<unknown>) => {
+            txOpen++;
+            try { return await body(null as never); } finally { txOpen--; }
+        },
+        claimCanonicalPath: async () => "intent-1",
+        seal: async (_u: string, canonical: string) => {
+            txOpenDuringSeal = txOpen;
+            const started = Date.now();
+            // A SLOW storage call — the fifteen-second class the round-16
+            // deadline permits, compressed so the suite stays quick.
+            await new Promise(resolve => setTimeout(resolve, 60));
+            sealMs = Date.now() - started;
+            return canonical;
+        },
+        commit: async () => 1,
+        resolveCanonicalIntent: async () => {},
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async () => {},
+    } as never);
+
+    assert.equal(outcome?.published, true);
+    assert.ok(sealMs >= 50, `the seal really was slow (${sealMs}ms)`);
+    assert.equal(txOpenDuringSeal, 0, "ZERO transactions were open while storage was called");
 });
 
 test("text/plain is no longer accepted at all", async () => {
@@ -765,8 +729,9 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
 
     let dropped = false;
     let droppedOrphan = false;
+    let resolvedIntent = false;
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => {
             // THE RACE, in the exact window it happens: the worker re-parks the
             // row while we are copying the bytes.
@@ -778,12 +743,10 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
                 { id: "row-1", ...fence },
                 { state: "RECEIVED", stateReason: null, storagePath: canonicalPath },
             ),
-        queueCanonicalIntent: async () => "intent-1",
-        resolveCanonicalIntent: async () => {},
+        claimCanonicalPath: async () => "intent-1",
+        resolveCanonicalIntent: async () => { resolvedIntent = true; },
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => { dropped = true; },
-        currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
-        dropOrphanedCanonical: async () => { droppedOrphan = true; },
     } as never);
 
     assert.equal(outcome?.published, false, "zero rows updated");
@@ -791,9 +754,14 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
     assert.equal(store.get().stateReason, "vendor-mismatch", "the newer decision survives");
     assert.equal(dropped, false, "and the upload object is kept for the retry");
     // Nobody's row points at the copy this call sealed — the row never
-    // advanced past NEEDS_REVIEW — so it IS an orphan, and cleaning it up
-    // here is correct, unlike the upload object.
-    assert.equal(droppedOrphan, true, "but the newly-sealed canonical copy is nobody's, and is cleaned up");
+    // advanced past NEEDS_REVIEW — so it IS an orphan. It is no longer
+    // deleted HERE, though: a publisher that lost its CAS cannot safely decide
+    // anything about an object it no longer owns, and the delete it used to do
+    // ran inside a held transaction. The phase-A intent covers it instead, and
+    // the sweeper collects it once the lease lapses, re-checking live
+    // references first.
+    assert.equal(droppedOrphan, false, "the loser deletes nothing; the intent accounts for it");
+    assert.ok(!resolvedIntent, "and the intent is left standing to do that");
 });
 
 test("RACE: a worker claim taken during sealing also loses the publish", async () => {
@@ -802,18 +770,16 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
     });
     const fence = leaseFence(observedRow());
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => {
             store.set({ claimToken: "sweeper-1" });
             return canonical;
         },
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED" }),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
-        dropOrphanedCanonical: async () => {},
     } as never);
     assert.equal(outcome?.published, false);
     assert.equal(store.get().state, "STAGING", "the sweeper's row is left alone");
@@ -825,10 +791,10 @@ test("an unchanged row still publishes — the control", async () => {
     });
     const fence = leaseFence(observedRow({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch" }));
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => canonical,
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null, uploadLeaseVersion: 1 }),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
@@ -1115,7 +1081,7 @@ test("PUBLISH vs REFRESH: a lease reissued mid-finalize invalidates the publish"
 
     let queued = 0;
     const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => {
             // ...and /start refreshes the lease while the bytes are being sealed.
             refreshLease(store);
@@ -1125,12 +1091,10 @@ test("PUBLISH vs REFRESH: a lease reissued mid-finalize invalidates the publish"
             { id: "row-1", ...leaseFence(observed) },
             { state: "RECEIVED", stateReason: null },
         ),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => { queued++; return "ev-1"; },
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => store.get().storagePath as string,
-        dropOrphanedCanonical: async () => {},
     } as never);
 
     assert.equal(outcome?.published, false, "the publish lost");
@@ -1158,18 +1122,16 @@ test("PUBLISH vs REFRESH control: an UNrefreshed lease still publishes", async (
     });
     let queued = 0;
     const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => canonical,
         commit: async () => store.updateMany(
             { id: "row-1", ...leaseFence(observed) },
             { state: "RECEIVED", stateReason: null },
         ),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => { queued++; return "ev-1"; },
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => store.get().storagePath as string,
-        dropOrphanedCanonical: async () => {},
     } as never);
     assert.equal(outcome?.published, true);
     assert.equal(store.get().state, "RECEIVED");
@@ -1256,7 +1218,7 @@ test("SWEEP vs REFRESH: the publish commit loses too", async () => {
 
     let queuedExpiry: Date | null = null;
     const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => {
             refreshedInto(store);
             return canonical;
@@ -1265,15 +1227,13 @@ test("SWEEP vs REFRESH: the publish commit loses too", async () => {
             { id: "row-1", ...leaseFence(observed) },
             { state: "RECEIVED", stateReason: null },
         ),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => {
             queuedExpiry = observed.uploadUrlExpiresAt;
             return "ev-1";
         },
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => store.get().storagePath as string,
-        dropOrphanedCanonical: async () => {},
     } as never);
 
     assert.equal(outcome?.published, false, "the sweep did not publish over the refreshed lease");
@@ -1297,18 +1257,16 @@ test("SWEEP CONTROL: an unrefreshed row still parks and still publishes", async 
     const pubStore = stagingRow();
     const observed = observedStaging(pubStore);
     const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
-        withObjectLock: noLock,
+        inShortTx: noLock,
         seal: async (_u: string, canonical: string) => canonical,
         commit: async () => pubStore.updateMany(
             { id: "row-1", ...leaseFence(observed) },
             { state: "RECEIVED", stateReason: null },
         ),
-        queueCanonicalIntent: async () => "intent-1",
+        claimCanonicalPath: async () => "intent-1",
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-        currentStoragePath: async () => pubStore.get().storagePath as string,
-        dropOrphanedCanonical: async () => {},
     } as never);
     assert.equal(outcome?.published, true);
     assert.equal(pubStore.get().state, "RECEIVED");

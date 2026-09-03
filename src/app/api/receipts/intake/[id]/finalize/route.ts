@@ -24,12 +24,12 @@ import {
 import {
     deleteObjectOrRecord,
     queueObjectCleanup,
-    queueCanonicalIntent,
+    claimObjectPath,
     resolveCanonicalIntent,
     rejectRowAndQueueCleanup,
     sealObject,
     settleQueuedCleanup,
-    withReceiptPublishLock,
+    inShortTx,
 } from "@/lib/receipt-intake/storage-cleanup";
 import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
 
@@ -567,7 +567,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
     const outcome = await sealAndPublish(row.storagePath, id, row.uploadLeaseVersion, check, {
-        withObjectLock: withReceiptPublishLock,
+        inShortTx,
         seal: sealObject,
         commit: async (tx, canonicalPath, values) => {
             const { count } = await tx.receiptIntake.updateMany({
@@ -606,20 +606,10 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // The canonical copy is written before the pointer commit, so it is
         // promised to the cleanup queue before it exists — same schedule, so a
         // client still holding a live URL is never racing a sweep.
-        queueCanonicalIntent: canonicalPath => queueCanonicalIntent(canonicalPath, cleanupAfter),
+        claimCanonicalPath: canonicalPath => claimObjectPath(canonicalPath, cleanupAfter),
         resolveCanonicalIntent,
         settleUploadCleanup: (eventId, uploadPath) =>
             settleQueuedCleanup(eventId, uploadPath, cleanupAfter).then(() => undefined),
-        currentStoragePath: async (tx, rowId) => {
-            const r = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
-            return r?.storagePath ?? null;
-        },
-        // A lost CAS here means another /finalize (or the worker's
-        // stale-STAGING sweep) already published this row while we were
-        // mid-request — best-effort so a slow deleteObjectOrRecord failure
-        // still lands on the same retry queue as every other orphan.
-        dropOrphanedCanonical: canonicalPath =>
-            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
     });
 
     if (!outcome) {
