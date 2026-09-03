@@ -32,7 +32,12 @@ const state: {
     posts: Array<{ kind: "estimate" | "invoice"; requestId?: string }>;
     /** What the next create should do. Reset between tests. */
     createThrows: unknown;
-} = { user: null, estimates: {}, invoices: {}, posts: [], createThrows: null };
+    /** What a DocNumber lookup finds, and what it costs. */
+    lookup: { estimates: any[]; invoices: any[]; throws: unknown; calls: string[] };
+} = {
+    user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
+    lookup: { estimates: [], invoices: [], throws: null, calls: [] },
+};
 
 function resetState() {
     state.user = null;
@@ -40,6 +45,7 @@ function resetState() {
     state.invoices = {};
     state.posts = [];
     state.createThrows = null;
+    state.lookup = { estimates: [], invoices: [], throws: null, calls: [] };
 }
 
 const fakePermissions = {
@@ -83,6 +89,16 @@ const PRISMA_SPECIFIER = "@/lib/prisma";
 const QB_PAYMENTS_SPECIFIER = "@/lib/quickbooks-payments";
 const INTEGRATION_STORE_SPECIFIER = "@/lib/integration-store";
 const QUICKBOOKS_SPECIFIER = "@/lib/quickbooks";
+/**
+ * The SAME module, imported under a different specifier.
+ *
+ * `qbo-document-sync.ts` (the recovery probe) sits beside quickbooks.ts and
+ * imports it relatively, so patching only the route alias let the REAL
+ * DocNumber lookups run and try to reach Intuit — which failed as an outage
+ * and made every recovery look ambiguous. Scoped by requiring FILENAME so this
+ * cannot quietly stub the module for anything else in the graph.
+ */
+const RELATIVE_QUICKBOOKS_SPECIFIER = "./quickbooks";
 
 let POST: (req: Request) => Promise<Response>;
 
@@ -104,7 +120,8 @@ before(async () => {
         }
         if (id === QB_PAYMENTS_SPECIFIER) return fakeQbPayments;
         if (id === INTEGRATION_STORE_SPECIFIER) return fakeIntegrationStore;
-        if (id === QUICKBOOKS_SPECIFIER) {
+        if (id === QUICKBOOKS_SPECIFIER
+            || (id === RELATIVE_QUICKBOOKS_SPECIFIER && /qbo-document-sync/.test(this.filename ?? ""))) {
             // SPREAD the real module: the route also imports the deadline helper
             // and the whole error-classifier family from here, and a stub that
             // dropped them would make these tests pass against a route that
@@ -122,6 +139,18 @@ before(async () => {
                     state.posts.push({ kind: "invoice", requestId });
                     if (state.createThrows) throw state.createThrows;
                     return { qbId: "qb-inv-1", qbUrl: "https://qbo/inv/1" };
+                },
+                // The recovery probe. A THROW here is "QuickBooks did not
+                // answer", which must never read as absence.
+                findQBEstimatesByDocNumber: async (_t: unknown, doc: string) => {
+                    state.lookup.calls.push(doc);
+                    if (state.lookup.throws) throw state.lookup.throws;
+                    return state.lookup.estimates;
+                },
+                findQBInvoicesByDocNumber: async (_t: unknown, doc: string) => {
+                    state.lookup.calls.push(doc);
+                    if (state.lookup.throws) throw state.lookup.throws;
+                    return state.lookup.invoices;
                 },
             };
         }
@@ -272,16 +301,33 @@ test("round 38: a successful sync persists the id, and the replay makes no secon
     assert.equal(state.posts.length, 1, "the replay is served from the stored link");
 });
 
-test("round 38: the create carries a requestid keyed off the record and its claim", async () => {
-    // Intuit dedupes server-side on this. A fresh random value per attempt
-    // would dedupe nothing, so it has to come from the marker — the only part
-    // of the attempt that survives a process death.
+test("round 39: the requestid is a bounded digest, and fits Intuit 36-char cap", async () => {
+    // Intuit dedupes server-side on this, and its documented maximum is 36.
+    // The first cut concatenated `${recordId}:${nonce}` — a CUID plus a UUID,
+    // about 62 characters — and the tests hid it by using "est-1" as the id.
+    // An oversized key is worse than none: the caller believes it is protected.
+    const { syncRequestId, QB_REQUEST_ID_MAX_LEN } = await import("../src/lib/qbo-document-sync");
+    const realCuid = "cmpkiymjc000292jntwa4ts9b";
+    const realNonce = "9f1c0b7e-4a2d-4f3b-8c1e-2d5a6b7c8d9e";
+    const marker = `create-in-flight:${realNonce}`;
+
+    const id = syncRequestId(realCuid, marker);
+    assert.ok(id.length <= QB_REQUEST_ID_MAX_LEN, `requestid is ${id.length} chars, cap is ${QB_REQUEST_ID_MAX_LEN}`);
+    assert.equal(id, syncRequestId(realCuid, marker), "same attempt, same key — a replay must dedupe");
+    assert.notEqual(id, syncRequestId(realCuid, `create-in-flight:${realNonce.replace("9f1c", "9f1d")}`),
+        "a different attempt is a different key");
+    assert.notEqual(id, syncRequestId(realCuid + "x", marker), "and so is a different record");
+    // The unconcatenated form would have been 62 characters; assert the naive
+    // shape really is over the cap, so this test fails if someone reverts it.
+    assert.ok(`${realCuid}:${realNonce}`.length > QB_REQUEST_ID_MAX_LEN);
+
+    // ...and the route actually sends that value.
     state.user = ADMIN;
     seedEstimate();
     await POST(postRequest({ type: "estimate", id: "est-1" }));
     const sent = state.posts[0].requestId as string;
-    assert.ok(sent?.startsWith("est-1:"), `requestid must identify the record, got ${sent}`);
-    assert.ok(sent.length > "est-1:".length, "and carry the claim nonce");
+    assert.ok(sent && sent.length <= QB_REQUEST_ID_MAX_LEN);
+    assert.match(sent, /^[0-9a-f]+$/, "a digest, not a joined pair of ids");
 });
 
 test("round 38: an unconfirmed create parks the record, and the replay refuses", async () => {
@@ -297,11 +343,18 @@ test("round 38: an unconfirmed create parks the record, and the replay refuses",
         `the claim is PROMOTED, not released, got ${row.qbSyncMarker}`);
     assert.equal(row.qbEstimateId, null, "and nothing is linked — we never learned an id");
 
-    // The replay is the whole point: `retry: false` was advice, this is a rule.
+    // Round 39 gate, finding 4: the replay does NOT create, and it does not
+    // refuse forever either. It asks QuickBooks. Here the document is there,
+    // so it is adopted.
     state.createThrows = null;
+    state.lookup.estimates = [{ id: "qb-est-real", docNumber: "EST-00001", privateNote: "Kitchen", total: 1000 }];
     const replay = await POST(postRequest({ type: "estimate", id: "est-1" }));
-    assert.equal(replay.status, 409);
-    assert.equal((await replay.json()).reason, "ambiguous-create");
+    const body = await replay.json();
+    assert.equal(replay.status, 200);
+    assert.equal(body.qbId, "qb-est-real");
+    assert.equal(body.recovered, true);
+    assert.equal(row.qbEstimateId, "qb-est-real", "the id the create never told us is now recorded");
+    assert.equal(row.qbSyncMarker, null, "and the claim is cleared by the SAME write");
     assert.equal(state.posts.length, 1, "no second document, however many times it is retried");
 });
 
@@ -325,6 +378,7 @@ test("round 38: a definitive refusal RELEASES the claim, so the record can be sy
 });
 
 test("round 38: the invoice rail behaves identically", async () => {
+    const { QB_REQUEST_ID_MAX_LEN } = await import("../src/lib/qbo-document-sync");
     const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
     state.user = ADMIN;
     const row = seedInvoice();
@@ -332,19 +386,99 @@ test("round 38: the invoice rail behaves identically", async () => {
     await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal(row.qbInvoiceId, "qb-inv-1");
     assert.equal(row.qbSyncMarker, null);
-    assert.ok(String(state.posts[0].requestId).startsWith("inv-1:"));
+    assert.ok(String(state.posts[0].requestId).length <= QB_REQUEST_ID_MAX_LEN);
 
     const replay = await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal((await replay.json()).alreadyLinked, true);
     assert.equal(state.posts.length, 1);
 
-    // ...and a parked invoice refuses too.
+    // ...and a parked invoice goes through the same recovery.
     resetState();
     state.user = ADMIN;
     const parked = seedInvoice();
     state.createThrows = new QBAmbiguousDocumentCreateError("QB invoice sync");
     assert.equal((await POST(postRequest({ type: "invoice", id: "inv-1" }))).status, 503);
     assert.ok(String(parked.qbSyncMarker).startsWith("ambiguous-create:"));
-    assert.equal((await POST(postRequest({ type: "invoice", id: "inv-1" }))).status, 409);
-    assert.equal(state.posts.length, 1);
+
+    state.createThrows = null;
+    state.lookup.invoices = [{ id: "qb-inv-real", docNumber: "INV-00001", privateNote: null, total: 1000 }];
+    const recovered = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal((await recovered.json()).qbId, "qb-inv-real");
+    assert.equal(parked.qbInvoiceId, "qb-inv-real");
+    assert.equal(parked.qbSyncMarker, null);
+    assert.equal(state.posts.length, 1, "recovered by lookup — nothing was created");
+});
+
+test("round 39: a claimed record whose document is ABSENT may create again, on the same requestid", async () => {
+    // The case that made the first cut unusable: a process death after the
+    // claim and BEFORE the POST bricked the record permanently, because the
+    // route refused any stored marker and nothing in the product could clear
+    // one. QuickBooks says there is no such document, so a create is exactly
+    // what should happen.
+    //
+    // And it reuses the ORIGINAL nonce: if the document did exist but the
+    // query index had not caught up, the identical requestid makes Intuit
+    // return that document instead of making a second one. Claiming a fresh
+    // nonce would have thrown that protection away exactly when it counts.
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB estimate sync");
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const firstRequestId = state.posts[0].requestId;
+    const parkedMarker = String(row.qbSyncMarker);
+    assert.ok(parkedMarker.startsWith("ambiguous-create:"));
+
+    state.createThrows = null;
+    state.lookup.estimates = [];          // authoritatively none
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+    assert.equal(row.qbSyncMarker, null);
+    assert.equal(state.posts.length, 2, "it really did create this time");
+    assert.equal(state.posts[1].requestId, firstRequestId,
+        "same nonce, same requestid — Intuit dedupes if the first one had landed");
+});
+
+test("round 39: an ambiguous probe keeps refusing and does NOT clear the claim", async () => {
+    // The mutation control for the test above. If "could not ask" were treated
+    // as "there is none", that test would pass while the route cheerfully
+    // created a duplicate every time QuickBooks was unreachable.
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB estimate sync");
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const parkedMarker = String(row.qbSyncMarker);
+
+    state.createThrows = null;
+    state.lookup.throws = new Error("QuickBooks is unavailable");
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 503);
+    assert.equal(body.retry, true, "retry LATER, not never — the sweep keeps trying too");
+    assert.equal(row.qbSyncMarker, parkedMarker, "the claim is untouched");
+    assert.equal(row.qbEstimateId, null);
+    assert.equal(state.posts.length, 1, "and nothing was created on a question QuickBooks did not answer");
+    // The operator text must not tell anyone to do something impossible.
+    assert.doesNotMatch(String(body.error), /record its id|clear the marker/i);
+});
+
+test("round 39: documents under our code that are NOT ours are never adopted", async () => {
+    // A hand-created QuickBooks estimate that happens to reuse the code is not
+    // this record. Adopting it would link ProBuild to somebody else document;
+    // creating alongside it is the duplicate this mechanism exists to stop.
+    // Neither: ask a human.
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB estimate sync");
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    state.createThrows = null;
+    state.lookup.estimates = [{ id: "qb-someone-else", docNumber: "EST-00001", privateNote: "Not ours", total: 1000 }];
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 503);
+    assert.equal(row.qbEstimateId, null, "not adopted");
+    assert.equal(state.posts.length, 1, "and not duplicated either");
 });

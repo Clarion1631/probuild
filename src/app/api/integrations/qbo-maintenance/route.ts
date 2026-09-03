@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, sweepPendingDeletions, automationSettingCursorStore } from "@/lib/quickbooks-payments";
+import { sweepPendingDocumentSyncs, syncMarkerKind } from "@/lib/qbo-document-sync";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -320,11 +321,84 @@ export async function POST(req: Request) {
     }
     const deletionsPending = deletions?.stillPending ?? 0;
 
+    // Same pass, fourth repair: estimates and invoices left claimed by a
+    // document create whose outcome was never learned. Until this existed they
+    // were invisible until somebody happened to press Sync again, which is not
+    // a work queue — and it is precisely where a duplicate would be hiding.
+    let docSyncs: Awaited<ReturnType<typeof sweepPendingDocumentSyncs>> | null = null;
+    let docSyncsFailed: string | null = null;
+    if (!abortedReason) {
+        // Guarded: this is the FOURTH repair in the pass, and the three before
+        // it have already done real work. A failure here must be REPORTED (it
+        // still makes the run ok:false via `docSyncsFailed`), never allowed to
+        // throw away the results of the repairs that succeeded.
+        try {
+            const markerWhere = { qbSyncMarker: { not: null } } as const;
+            docSyncs = await sweepPendingDocumentSyncs(tokens, deadline, {
+                isExhausted: isBudgetExhausted,
+                listParked: async () => {
+                    const [estimates, invoices] = await Promise.all([
+                        prisma.estimate.findMany({
+                            where: { ...markerWhere, qbEstimateId: null },
+                            select: { id: true, code: true, title: true, qbSyncMarker: true },
+                            orderBy: { id: "asc" }, take: 25,
+                        }),
+                        prisma.invoice.findMany({
+                            where: { ...markerWhere, qbInvoiceId: null },
+                            select: { id: true, code: true, qbSyncMarker: true },
+                            orderBy: { id: "asc" }, take: 25,
+                        }),
+                    ]);
+                    return [
+                        // Only rows carrying a marker this rail understands. A value
+                        // the vocabulary does not recognise is somebody else data,
+                        // and adopting a QuickBooks document on the strength of it
+                        // would be a guess.
+                        ...estimates.filter((e) => syncMarkerKind(e.qbSyncMarker)).map((e) => ({
+                            id: e.id, code: e.code, privateNote: e.title,
+                            marker: e.qbSyncMarker as string, kind: "estimate" as const,
+                        })),
+                        ...invoices.filter((i) => syncMarkerKind(i.qbSyncMarker)).map((i) => ({
+                            id: i.id, code: i.code, privateNote: null,
+                            marker: i.qbSyncMarker as string, kind: "invoice" as const,
+                        })),
+                    ];
+                },
+                // CAS-pinned to the exact marker the probe was run against, so a row
+                // that moved in between keeps whatever replaced it.
+                adopt: async (row, qbId) => {
+                    const written = row.kind === "estimate"
+                        ? await prisma.estimate.updateMany({
+                            where: { id: row.id, qbEstimateId: null, qbSyncMarker: row.marker },
+                            data: { qbEstimateId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                        })
+                        : await prisma.invoice.updateMany({
+                            where: { id: row.id, qbInvoiceId: null, qbSyncMarker: row.marker },
+                            data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                        });
+                    return written.count;
+                },
+                countParked: async () => {
+                    const [e, i] = await Promise.all([
+                        prisma.estimate.count({ where: { ...markerWhere, qbEstimateId: null } }),
+                        prisma.invoice.count({ where: { ...markerWhere, qbInvoiceId: null } }),
+                    ]);
+                    return e + i;
+                },
+            });
+            if (docSyncs.reason === "budget-exhausted") abortedReason = docSyncs.reason;
+        } catch (e) {
+            docSyncsFailed = e instanceof Error ? e.message.slice(0, 200) : "document-sync sweep failed";
+        }
+    }
+    const docSyncsParked = docSyncs?.stillParked ?? 0;
+
     // Work left undone, by any route: the options loop stopped early, the
     // pay-link sweep hit its per-rail cap, rows were skipped inside it, or it
     // never reached rows that were eligible when it started.
     const truncated = abortedReason !== null || !!payLinks?.truncated
-        || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0 || deletionsPending > 0;
+        || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0 || deletionsPending > 0
+        || docSyncsParked > 0 || docSyncsFailed !== null;
 
     // `ok` reflects the RUN, not the fact that the handler returned. A run that
     // stopped early, left rows unvisited, or failed on a row has work

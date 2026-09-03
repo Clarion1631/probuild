@@ -1293,6 +1293,49 @@ export function isQBResultSetTruncatedError(error: unknown): error is QBResultSe
  * (QBResultSetTruncatedError) for the same reason: a result set that might be
  * incomplete must never be read as "these are all of them".
  */
+/**
+ * The Estimate half of the DocNumber lookup.
+ *
+ * Deliberately thinner than QBInvoiceMatch: the document-sync recovery
+ * (qbo-document-sync.ts) only has to answer "did the create we may have
+ * dispatched actually land, and is this it?". The estimate rail writes
+ * DocNumber = the ProBuild estimate code, which is ProBuild own sequential
+ * identifier for exactly one record, so that plus the PrivateNote is the whole
+ * identity there is to check.
+ */
+export interface QBEstimateMatch {
+    id: string;
+    docNumber: string | null;
+    privateNote: string | null;
+    total: number;
+}
+
+export async function findQBEstimatesByDocNumber(
+    tokens: QBTokens,
+    docNumber: string,
+    deadline?: RouteDeadline,
+): Promise<QBEstimateMatch[]> {
+    const rows = await qbQuery<any>(
+        tokens,
+        `select * from Estimate where DocNumber = '${escapeQBString(docNumber)}' maxresults ${FIND_INVOICES_BY_DOC_NUMBER_LIMIT}`,
+        deadline,
+    );
+    // Same rule as the invoice lookup: a FULL page is not an answer, it is a
+    // truncated one. Treating it as "these are all of them" would let a
+    // recovery conclude "absent" from a result set that simply ran out of room.
+    if (rows.length === FIND_INVOICES_BY_DOC_NUMBER_LIMIT) {
+        throw new QBResultSetTruncatedError(docNumber, FIND_INVOICES_BY_DOC_NUMBER_LIMIT);
+    }
+    return rows
+        .filter((e) => e?.Id)
+        .map((e) => ({
+            id: String(e.Id),
+            docNumber: e.DocNumber != null ? String(e.DocNumber) : null,
+            privateNote: e.PrivateNote != null ? String(e.PrivateNote) : null,
+            total: Number(e.TotalAmt ?? 0),
+        }));
+}
+
 export async function findQBInvoicesByDocNumber(
     tokens: QBTokens,
     docNumber: string,
@@ -1676,6 +1719,25 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string, deadl
  * already throws for a non-404 read failure, so only the delete POST needed
  * the same treatment here. See its doc comment for why a shared failure must
  * be thrown rather than collapsed into `false`.
+ */
+/**
+ * Delete a QuickBooks invoice.
+ *
+ * THE RETURN VALUE IS NOT "did it work". Three call sites read it that way and
+ * were all wrong in the same direction:
+ *
+ *   • `true`  — QuickBooks deleted it just now;
+ *   • `false` — the invoice IS NOT THERE. Either the pre-read missed it or the
+ *             delete itself answered 404. Both are CONFIRMED ABSENCE, which is
+ *             the same end state as `true` for every caller: the remote
+ *             document is gone and the local link may be released;
+ *   • throws  — the outcome is unknown, or QuickBooks refused. A real refusal
+ *             is a non-2xx that is not 404 (an invoice with a payment attached,
+ *             say). Only this means "it may still exist".
+ *
+ * So the guard is `catch`, never `if (!deleted)`. Reading `false` as "still
+ * there" left manually-deleted invoices linked and parked forever — exactly
+ * the state those callers existed to clear.
  */
 export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<boolean> {
     const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);

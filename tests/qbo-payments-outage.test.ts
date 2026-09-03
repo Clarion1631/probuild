@@ -2460,7 +2460,8 @@ const ISSUED_DUE = new Date("2026-09-30T00:00:00.000Z");
 const ISSUED_FROM = { amount: 1200.5, name: "Rough-in", dueDate: ISSUED_DUE };
 
 test("the pay-link sweep clearing our marker is NOT divergence", async () => {
-    const { isConcurrentlyFinalizedMilestoneLink } = await import("../src/lib/quickbooks-payments");
+    const { isConcurrentlyFinalizedMilestoneLink, isSettledWithoutQbPayment } =
+        await import("../src/lib/quickbooks-payments");
 
     // Exactly what the row looks like after the sweep finished it: our id, the
     // link filled in, the marker gone, everything else untouched.
@@ -2475,11 +2476,42 @@ test("the pay-link sweep clearing our marker is NOT divergence", async () => {
     assert.equal(isConcurrentlyFinalizedMilestoneLink(afterSweep, "inv-77", ISSUED_FROM), true);
 
     // A settle that landed against THIS invoice while we were fetching its pay
-    // link must not be compensated either — deleting a paid QuickBooks document
-    // is strictly worse than leaving an abandoned one.
+    // link must not be compensated — deleting a paid QuickBooks document is
+    // strictly worse than leaving an abandoned one. `qbPaymentId` is what makes
+    // it "against this invoice": settleMilestoneFromQBPayment writes it in the
+    // same transaction as the status.
+    assert.equal(
+        isConcurrentlyFinalizedMilestoneLink(
+            { ...afterSweep, status: "Paid", qbPaymentId: "qbpay-9" }, "inv-77", ISSUED_FROM,
+        ),
+        true,
+    );
+    // Round 39 gate, finding 1: WITHOUT that evidence it is not finalized.
+    // recordPaymentCore settles a milestone from a MANUAL Record Payment and
+    // leaves qbPaymentId null, because no QuickBooks payment exists. The old
+    // rule read that as "settled against this invoice" and returned success,
+    // leaving the QuickBooks invoice open and collectible for money the client
+    // had already handed over.
     assert.equal(
         isConcurrentlyFinalizedMilestoneLink({ ...afterSweep, status: "Paid" }, "inv-77", ISSUED_FROM),
+        false,
+        "Paid with no QuickBooks payment is not proof THIS invoice was settled",
+    );
+    // ...and it is not ordinary divergence either: the caller must park it,
+    // never compensate, because the Paid row still references the invoice.
+    assert.equal(
+        isSettledWithoutQbPayment({ ...afterSweep, status: "Paid" }, "inv-77"),
         true,
+    );
+    assert.equal(
+        isSettledWithoutQbPayment({ ...afterSweep, status: "Paid", qbPaymentId: "qbpay-9" }, "inv-77"),
+        false,
+        "a QuickBooks-settled row is finalized, not parked",
+    );
+    assert.equal(
+        isSettledWithoutQbPayment({ ...afterSweep, status: "Pending" }, "inv-77"),
+        false,
+        "and an unpaid row is the ordinary case, not this one",
     );
     // A different Date OBJECT carrying the same instant is the same due date.
     assert.equal(
@@ -2702,6 +2734,31 @@ test("round 38: the guard is not simply always-on — an unchanged row still lin
     const fake = fakeFinalizeDb({ claimCount: 1, current: currentRow() });
     assert.equal((await runFinalize(fake)).outcome, "linked");
     assert.equal(fake.seen.claims.length, 1);
+});
+
+test("round 39: a manual Record Payment mid-push parks the row instead of reporting success", async () => {
+    // The P0. `recordPaymentCore` marks the milestone Paid and writes no
+    // qbPaymentId, so the row is Paid, still points at our invoice, and the
+    // QuickBooks invoice is still open. Reporting `already-finalized` left it
+    // collectible for money already collected.
+    const fake = fakeFinalizeDb({
+        claimCount: 0,
+        current: currentRow({ status: "Paid", qbPaymentId: null }),
+    });
+    const result = await runFinalize(fake);
+    assert.equal(result.outcome, "settled-without-qb-payment");
+    assert.notEqual(result.outcome, "abandoned", "and it must NOT be compensated — the Paid row references it");
+});
+
+test("round 39: a QuickBooks-settled row mid-push is still `already-finalized`", async () => {
+    // The mutation control. If the guard simply refused every Paid row, the
+    // test above would prove nothing about the MISSING PAYMENT in particular —
+    // and this path would start deleting genuinely paid QuickBooks documents.
+    const fake = fakeFinalizeDb({
+        claimCount: 0,
+        current: currentRow({ status: "Paid", qbPaymentId: "qbpay-9" }),
+    });
+    assert.equal((await runFinalize(fake)).outcome, "already-finalized");
 });
 
 test("round 38: a milestone that vanished mid-push is a mismatch, never a link", async () => {

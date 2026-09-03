@@ -4,14 +4,19 @@ import {
     syncEstimateToQB, syncInvoiceToQB,
     createRouteDeadline, isQBBudgetExhaustedError, isQBTimeoutError, isQboConnectionFailure,
     isQBAmbiguousDocumentCreateError,
+    type QBTokens,
+    type RouteDeadline,
 } from "@/lib/quickbooks";
 import { getFreshQBTokens, resolveCustomerAndItem } from "@/lib/quickbooks-payments";
 import { randomUUID } from "node:crypto";
+import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER } from "@/lib/qbo-create-markers";
 import {
-    AMBIGUOUS_CREATE_MARKER,
-    CREATE_IN_FLIGHT_MARKER,
-    markerKind,
-} from "@/lib/qbo-create-markers";
+    composeSyncMarker,
+    probeDocumentSync,
+    syncMarkerKind,
+    syncMarkerNonce,
+    syncRequestId,
+} from "@/lib/qbo-document-sync";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { currentStaffUserOrNull, hasPermission, canAccessProject, canAccessEstimate } from "@/lib/permissions";
@@ -61,7 +66,97 @@ export const maxDuration = 60;
  * `requestid`. Intuit dedupes on it server-side, so a replay carrying the same
  * marker nonce gets the ORIGINAL document back instead of a new one.
  */
-const MARKER_NONCE_SEP = ":";
+/**
+ * A claimed record, re-examined instead of refused forever.
+ *
+ * The first cut simply refused any stored marker and told the operator to
+ * "record its id" or "clear the marker" — neither of which is a thing anyone can
+ * do: nothing in the product reads or writes that column by hand. So a process
+ * death anywhere after the claim, INCLUDING BEFORE THE POST EVER WENT OUT,
+ * bricked sync for that record permanently.
+ *
+ * Now the claim is a question, not a verdict: ask QuickBooks whether the
+ * document is there.
+ *
+ *   • found   — adopt it. Persist the id and clear the marker, one CAS.
+ *   • absent  — KEEP the claim and go on to create, reusing this marker's
+ *              nonce so the create carries the SAME requestid. That matters: if
+ *              the document did exist but the query had not indexed it yet,
+ *              Intuit's dedupe returns the original rather than making a
+ *              second. Clearing the marker and claiming a fresh nonce would
+ *              have thrown that protection away at the exact moment it counts.
+ *   • unknown — still refuse, with a retry-later status, and leave the marker
+ *              for the maintenance sweep to try again.
+ */
+type RecoveryOutcome =
+    | { kind: "adopted"; response: NextResponse }
+    | { kind: "create"; marker: string }
+    | { kind: "refused"; response: NextResponse };
+
+function retryLater(code: string, reason: string) {
+    return NextResponse.json(
+        {
+            error:
+                `A previous QuickBooks sync for ${code} could not be confirmed (${reason}), so nothing was sent. ` +
+                `ProBuild will keep checking; try again shortly.`,
+            retry: true,
+            reason: "ambiguous-create",
+        },
+        { status: 503 },
+    );
+}
+
+async function recoverClaimedRecord(args: {
+    kind: "estimate" | "invoice";
+    id: string;
+    code: string;
+    privateNote: string | null;
+    marker: string;
+    tokens: QBTokens;
+    deadline: RouteDeadline;
+    /** Adopt: persist the id and clear the marker in ONE compare-and-set. */
+    adopt: (qbId: string) => Promise<{ count: number }>;
+    /** Re-claim: put the marker back to create-in-flight, same nonce. */
+    reclaim: (next: string) => Promise<{ count: number }>;
+    urlFor: (qbId: string) => string;
+}): Promise<RecoveryOutcome> {
+    const probe = await probeDocumentSync(
+        args.tokens,
+        { kind: args.kind, code: args.code, privateNote: args.privateNote },
+        args.deadline,
+    );
+
+    if (probe.state === "unknown") {
+        return { kind: "refused", response: retryLater(args.code, probe.reason) };
+    }
+
+    if (probe.state === "found") {
+        const adopted = await args.adopt(probe.qbId);
+        if (adopted.count !== 1) {
+            // Somebody else finished it between the probe and this write. Not an
+            // error, but not ours to report either — re-read rather than assert.
+            return { kind: "refused", response: retryLater(args.code, "it was being updated concurrently") };
+        }
+        return {
+            kind: "adopted",
+            response: NextResponse.json({
+                success: true,
+                qbId: probe.qbId,
+                qbUrl: args.urlFor(probe.qbId),
+                recovered: true,
+            }),
+        };
+    }
+
+    // Absent. Re-claim under the SAME nonce, so the create below replays the
+    // requestid the previous attempt would have sent.
+    const next = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, syncMarkerNonce(args.marker));
+    const reclaimed = await args.reclaim(next);
+    if (reclaimed.count !== 1) {
+        return { kind: "refused", response: retryLater(args.code, "it was being updated concurrently") };
+    }
+    return { kind: "create", marker: next };
+}
 
 /**
  * What the claim becomes when the create did not return a document.
@@ -73,9 +168,9 @@ const MARKER_NONCE_SEP = ":";
  *     released and the record is freely re-syncable;
  *   • the outcome is UNKNOWN (a timeout after dispatch, a 2xx we could not
  *     read, a 4xx with no readable Fault) — a real document may exist. The
- *     claim is promoted to `ambiguous-create`, KEEPING the same nonce so a
- *     later resolution can still reason about the requestid that was sent,
- *     and every further sync refuses until a human has looked.
+ *     claim is promoted to `ambiguous-create`, KEEPING the same nonce so the
+ *     recovery above can replay the same requestid, and every further sync goes
+ *     through that recovery instead of creating.
  *
  * Never throws: this runs while an error is already propagating, and losing
  * the original failure to a bookkeeping write would be strictly worse.
@@ -89,49 +184,14 @@ async function settleSyncMarker(
     try {
         await write({
             qbSyncMarker: ambiguous
-                ? composeSyncMarker(AMBIGUOUS_CREATE_MARKER, nonceOf(marker))
+                ? composeSyncMarker(AMBIGUOUS_CREATE_MARKER, syncMarkerNonce(marker))
                 : null,
         });
     } catch {
-        // Best effort. A lost RELEASE leaves the record refusing further syncs
-        // until a human clears it, which is the safe direction; a lost
-        // PROMOTION leaves the in-flight marker, which also refuses.
+        // Best effort. A lost RELEASE leaves the record going through recovery on
+        // the next sync, which is the safe direction; a lost PROMOTION leaves the
+        // in-flight marker, which recovers the same way.
     }
-}
-
-/** `create-in-flight:<nonce>` — the nonce is what makes the requestid stable. */
-function composeSyncMarker(kind: string, nonce: string): string {
-    return `${kind}${MARKER_NONCE_SEP}${nonce}`;
-}
-
-function nonceOf(marker: string): string {
-    const at = marker.indexOf(MARKER_NONCE_SEP);
-    return at === -1 ? "" : marker.slice(at + 1);
-}
-
-/**
- * The QuickBooks idempotency key for one create attempt.
- *
- * Keyed off the RECORD and the marker nonce, not off a fresh random value: a
- * replay has to send the identical key for Intuit to recognise it, and the
- * nonce is the only thing that survives a process death.
- */
-function syncRequestId(recordId: string, marker: string): string {
-    return `${recordId}:${nonceOf(marker)}`;
-}
-
-/** Already parked by an earlier attempt whose outcome nobody knows. */
-function parkedResponse(code: string) {
-    return NextResponse.json(
-        {
-            error:
-                `A previous QuickBooks sync for ${code} ended without a confirmed result, so it may already exist there. ` +
-                `Check QuickBooks: if the document was created, record its id; if not, clear the marker and sync again.`,
-            retry: false,
-            reason: "ambiguous-create",
-        },
-        { status: 409 },
-    );
 }
 
 export async function POST(req: NextRequest) {
@@ -192,9 +252,6 @@ export async function POST(req: NextRequest) {
                     alreadyLinked: true,
                 });
             }
-            // Parked by an attempt whose outcome is unknown. Fail closed: a
-            // human has to look in QuickBooks before anything else is sent.
-            if (markerKind(estimate.qbSyncMarker)) return parkedResponse(estimate.code);
 
             const client = estimate.project?.client;
             if (!client) return NextResponse.json({ error: "No client attached to estimate" }, { status: 400 });
@@ -207,16 +264,47 @@ export async function POST(req: NextRequest) {
 
             const { customerId, itemId } = await resolveCustomerAndItem(tokens, client.id, deadline);
 
-            // 2. CLAIM before the POST. Pinned to "still unlinked, still
+            // 2. RECOVER an existing claim, or CLAIM afresh.
+            //
+            //    A stored marker means an earlier attempt did not finish. That
+            //    is not proof a document exists, so it is answered by ASKING
+            //    QuickBooks rather than by refusing the record forever.
+            //
+            //    A fresh claim is CAS-pinned to "still unlinked, still
             //    unclaimed", so a concurrent sync loses instead of racing this
             //    one into two documents. Failing to WRITE it aborts — an
             //    unwritten marker is exactly the invisible-crash case it guards.
-            const estimateMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
-            const estimateClaim = await prisma.estimate.updateMany({
-                where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: null },
-                data: { qbSyncMarker: estimateMarker },
-            });
-            if (estimateClaim.count !== 1) return parkedResponse(estimate.code);
+            const estimateUrl = (qbId: string) => `https://app.qbo.intuit.com/app/estimate?txnId=${qbId}`;
+            let estimateMarker: string;
+            if (syncMarkerKind(estimate.qbSyncMarker)) {
+                const stored = estimate.qbSyncMarker as string;
+                const recovery = await recoverClaimedRecord({
+                    kind: "estimate", id: estimate.id, code: estimate.code,
+                    // The estimate create sends the title as its PrivateNote, so
+                    // that is the second half of "is this document ours".
+                    privateNote: estimate.title, marker: stored, tokens, deadline,
+                    adopt: (qbId) => prisma.estimate.updateMany({
+                        where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: stored },
+                        data: { qbEstimateId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                    }),
+                    reclaim: (next) => prisma.estimate.updateMany({
+                        where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: stored },
+                        data: { qbSyncMarker: next },
+                    }),
+                    urlFor: estimateUrl,
+                });
+                if (recovery.kind !== "create") return recovery.response;
+                estimateMarker = recovery.marker;
+            } else {
+                estimateMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
+                const estimateClaim = await prisma.estimate.updateMany({
+                    where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: null },
+                    data: { qbSyncMarker: estimateMarker },
+                });
+                if (estimateClaim.count !== 1) {
+                    return retryLater(estimate.code, "another sync claimed it first");
+                }
+            }
 
             const result = await syncEstimateToQB(tokens, {
                 id: estimate.id,
@@ -249,10 +337,26 @@ export async function POST(req: NextRequest) {
 
             // 3. PERSIST in the same write that clears the claim, pinned to it,
             //    so the id and the marker can never disagree.
-            await prisma.estimate.updateMany({
+            const estimatePersisted = await prisma.estimate.updateMany({
                 where: { id: estimate.id, qbSyncMarker: estimateMarker },
                 data: { qbEstimateId: result.qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
             });
+            if (estimatePersisted.count !== 1) {
+                // The document EXISTS in QuickBooks and this record no longer
+                // carries our claim, so it cannot be reported as a clean
+                // success. Say what was created and where; the next sync
+                // recovers it by DocNumber rather than making a second.
+                return NextResponse.json(
+                    {
+                        error:
+                            `QuickBooks created ${estimate.code} (id ${result.qbId}), but this estimate changed while ` +
+                            `that was in flight, so the link was not recorded. Refresh and sync again.`,
+                        retry: true,
+                        qbId: result.qbId,
+                    },
+                    { status: 409 },
+                );
+            }
 
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }
@@ -278,8 +382,6 @@ export async function POST(req: NextRequest) {
                 alreadyLinked: true,
             });
         }
-        if (markerKind(invoice.qbSyncMarker)) return parkedResponse(invoice.code);
-
         const qb = await getQBSettings();
         if (!qb.connected) {
             return NextResponse.json({ error: "QuickBooks not connected", notConnected: true }, { status: 400 });
@@ -288,12 +390,37 @@ export async function POST(req: NextRequest) {
 
         const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.client.id, deadline);
 
-        const invoiceMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
-        const invoiceClaim = await prisma.invoice.updateMany({
-            where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: null },
-            data: { qbSyncMarker: invoiceMarker },
-        });
-        if (invoiceClaim.count !== 1) return parkedResponse(invoice.code);
+        const invoiceUrl = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
+        let invoiceMarker: string;
+        if (syncMarkerKind(invoice.qbSyncMarker)) {
+            const stored = invoice.qbSyncMarker as string;
+            const recovery = await recoverClaimedRecord({
+                kind: "invoice", id: invoice.id, code: invoice.code,
+                // The invoice create sends no PrivateNote, so the DocNumber —
+                // this invoice own sequential code — is the whole identity.
+                privateNote: null, marker: stored, tokens, deadline,
+                adopt: (qbId) => prisma.invoice.updateMany({
+                    where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: stored },
+                    data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
+                }),
+                reclaim: (next) => prisma.invoice.updateMany({
+                    where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: stored },
+                    data: { qbSyncMarker: next },
+                }),
+                urlFor: invoiceUrl,
+            });
+            if (recovery.kind !== "create") return recovery.response;
+            invoiceMarker = recovery.marker;
+        } else {
+            invoiceMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
+            const invoiceClaim = await prisma.invoice.updateMany({
+                where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: null },
+                data: { qbSyncMarker: invoiceMarker },
+            });
+            if (invoiceClaim.count !== 1) {
+                return retryLater(invoice.code, "another sync claimed it first");
+            }
+        }
 
         const result = await syncInvoiceToQB(tokens, {
             code: invoice.code,
@@ -312,10 +439,22 @@ export async function POST(req: NextRequest) {
                 throw error;
             });
 
-        await prisma.invoice.updateMany({
+        const invoicePersisted = await prisma.invoice.updateMany({
             where: { id: invoice.id, qbSyncMarker: invoiceMarker },
             data: { qbInvoiceId: result.qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
         });
+        if (invoicePersisted.count !== 1) {
+            return NextResponse.json(
+                {
+                    error:
+                        `QuickBooks created ${invoice.code} (id ${result.qbId}), but this invoice changed while ` +
+                        `that was in flight, so the link was not recorded. Refresh and sync again.`,
+                    retry: true,
+                    qbId: result.qbId,
+                },
+                { status: 409 },
+            );
+        }
 
         return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
     } catch (err) {

@@ -2561,9 +2561,15 @@ export async function updatePendingMilestoneAmountsCore(
                         continue;
                     }
                     const alreadyGone = probe.state === "voided" || probe.state === "notFound";
-                    if (!alreadyGone && !(await deleteQBInvoice(tokens, row.oldQbInvoiceId, qbDeadline))) {
-                        warnings.push(`"${row.name}": couldn't delete the old QuickBooks invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
-                        continue;
+                    // A `false` return is CONFIRMED ABSENCE (see deleteQBInvoice),
+                    // which is the same end state as a successful delete and a
+                    // reason to go on to the unlink below. It used to be read as
+                    // "could not delete", so an invoice a human had already
+                    // removed in QuickBooks kept its stale link and warned about
+                    // details it no longer had. A REFUSAL throws, and the
+                    // surrounding catch turns that into this row's warning.
+                    if (!alreadyGone) {
+                        await deleteQBInvoice(tokens, row.oldQbInvoiceId, qbDeadline);
                     }
                     // Old QBO invoice is confirmed gone — now clear the link, atomically
                     // (a concurrent settle still wins the claim and we stop here).

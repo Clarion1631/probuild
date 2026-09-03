@@ -45,6 +45,10 @@ function makePrisma(
     opts: {
         onPage?: () => void;
         settings?: Map<string, string>;
+        /** Estimates carrying an unfinished document-sync claim. */
+        parkedEstimates?: Array<Record<string, any>>;
+        /** Ids this run adopted, for the assertion. */
+        adopted?: string[];
         /**
          * QuickBooks invoice ids of rows carrying `paylink-pending`, per rail.
          * Real rows, served by BOTH `findMany` and `count`, so the pay-link
@@ -108,6 +112,27 @@ function makePrisma(
                 },
             },
             automationEvent: { async create() { return {}; } },
+            // Round 39: the maintenance pass also walks estimates and invoices
+            // left claimed by an unfinished document sync. Empty by default, so
+            // the existing cases are unchanged — but PRESENT, because a fake
+            // that made that sweep throw would have turned it into a silent
+            // no-op in every test here.
+            estimate: {
+                async findMany() { return (opts.parkedEstimates ?? []).map((r) => ({ ...r })); },
+                async count() { return (opts.parkedEstimates ?? []).length; },
+                async updateMany(args: any) {
+                    const row = (opts.parkedEstimates ?? []).find((r) => r.id === args.where.id);
+                    if (!row || row.qbSyncMarker !== args.where.qbSyncMarker) return { count: 0 };
+                    Object.assign(row, args.data);
+                    opts.adopted?.push(row.id);
+                    return { count: 1 };
+                },
+            },
+            invoice: {
+                async findMany() { return []; },
+                async count() { return 0; },
+                async updateMany() { return { count: 0 }; },
+            },
             progressBilling: {
                 async findMany(args: any) {
                     return pendingPage(pending("progressBilling", "pb"), args).map((r) => ({ ...r }));
@@ -449,7 +474,45 @@ function pendingDeletionDb(rows: Array<{ id: string; qbInvoiceId: string }>) {
     };
 }
 
-test("round 38: a confirmed delete unlinks; a refused one leaves the row linked", async () => {
+test("round 39: `false` from the delete is CONFIRMED ABSENCE, so the row still unlinks", async () => {
+    // deleteQBInvoice returns false ONLY for a 404 / read-miss, and THROWS for
+    // a real refusal. Reading false as "still there" left an invoice somebody
+    // had already deleted by hand parked forever: the sweep asked QuickBooks to
+    // remove a document that was gone, got the honest answer, and concluded it
+    // had failed. Both values mean the remote document is gone.
+    const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const { db, live } = pendingDeletionDb([
+        { id: "ps-1", qbInvoiceId: "qb-1" },   // deleted just now
+        { id: "ps-2", qbInvoiceId: "qb-2" },   // already absent
+    ]);
+    const unlinked: string[] = [];
+
+    const res = await sweepPendingDeletions(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        createRouteDeadline(30_000),
+        {
+            db: db as any,
+            deleteInvoice: async (_t, qbId) => qbId === "qb-1",
+            unlink: async (id) => {
+                unlinked.push(id);
+                live.splice(live.findIndex((r) => r.id === id), 1);
+                return true;
+            },
+        },
+    );
+
+    assert.deepEqual(unlinked, ["ps-1", "ps-2"], "BOTH are gone remotely, so both unlink");
+    assert.equal(res.checked, 2);
+    assert.equal(res.finished, 2);
+    assert.equal(res.stillPending, 0);
+    assert.equal(res.reason, null);
+});
+
+test("round 39: a REFUSAL throws, and that row stays linked and parked", async () => {
+    // The mutation control for the test above. If every delete outcome unlinked,
+    // that test would pass while an invoice with a payment attached — the case
+    // QuickBooks genuinely refuses — silently lost its link.
     const { sweepPendingDeletions } = await import("../src/lib/quickbooks-payments");
     const { createRouteDeadline } = await import("../src/lib/quickbooks");
     const { db, live } = pendingDeletionDb([
@@ -463,9 +526,10 @@ test("round 38: a confirmed delete unlinks; a refused one leaves the row linked"
         createRouteDeadline(30_000),
         {
             db: db as any,
-            // QuickBooks refuses the second one — an invoice with a payment
-            // attached cannot be deleted, and that row genuinely needs a human.
-            deleteInvoice: async (_t, qbId) => qbId === "qb-1",
+            deleteInvoice: async (_t, qbId) => {
+                if (qbId === "qb-2") throw new Error("QuickBooks refused: payment attached");
+                return true;
+            },
             unlink: async (id) => {
                 unlinked.push(id);
                 live.splice(live.findIndex((r) => r.id === id), 1);
@@ -474,11 +538,9 @@ test("round 38: a confirmed delete unlinks; a refused one leaves the row linked"
         },
     );
 
-    assert.deepEqual(unlinked, ["ps-1"], "only the CONFIRMED delete may unlink");
-    assert.equal(res.checked, 2);
+    assert.deepEqual(unlinked, ["ps-1"], "the refused one must keep its link");
     assert.equal(res.finished, 1);
-    assert.equal(res.stillPending, 1, "the refused one is still linked, and is reported");
-    assert.equal(res.reason, null);
+    assert.equal(res.stillPending, 1, "and it is reported, so the run is not clean");
 });
 
 test("round 38: the deadline stops the sweep, and the rows it never reached stay linked", async () => {
@@ -551,4 +613,150 @@ test("round 38: a resumed run that aborts before finishing a row keeps the store
     assert.match(src, /automationSettingCursorStore\.set\(SWEEP_CURSOR_KEY, abortedReason \? \(checkpoint \?\? ""\) : ""\)/);
     assert.match(src, /where: checkpoint \? \{ \.\.\.scheduleWhere, id: \{ gt: checkpoint \} \} : scheduleWhere,/,
         "and `remaining` is measured from the retained checkpoint");
+});
+
+// ─── Round 39 gate, finding 4: parked document syncs are a work queue ───
+
+test("round 39: the maintenance pass recovers an estimate left claimed by an unfinished sync", async () => {
+    // Until this existed, a record claimed by a create whose outcome was never
+    // learned was invisible: nothing read the column, so it sat until somebody
+    // happened to press Sync again. That is precisely where a duplicate hides.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const parked = [
+        { id: "est-1", code: "EST-00001", privateNote: "Kitchen", marker: "ambiguous-create:n1", kind: "estimate" as const },
+        { id: "est-2", code: "EST-00002", privateNote: "Bath", marker: "ambiguous-create:n2", kind: "estimate" as const },
+    ];
+    const adopted: Array<[string, string]> = [];
+    let remaining = 2;
+
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            listParked: async () => parked,
+            // EST-00001 is in QuickBooks; EST-00002 is not, and the sweep must
+            // leave that one alone rather than creating it unattended.
+            probe: (async (_t: unknown, input: { code: string }) =>
+                input.code === "EST-00001"
+                    ? { state: "found", qbId: "qb-est-real" }
+                    : { state: "absent" }) as any,
+            adopt: async (row, qbId) => { adopted.push([row.id, qbId]); remaining--; return 1; },
+            countParked: async () => remaining,
+        },
+    );
+
+    assert.equal(res.checked, 2);
+    assert.equal(res.recovered, 1);
+    assert.deepEqual(adopted, [["est-1", "qb-est-real"]]);
+    assert.equal(res.stillParked, 1, "the absent one is still claimed, and is reported");
+});
+
+test("round 39: the sweep NEVER adopts on an unanswered question", async () => {
+    // The mutation control. "Could not ask" must not read as "there is none",
+    // and it must certainly not adopt: either would be a guess about a document
+    // that decides whether a client gets billed twice.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    let adopts = 0;
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            listParked: async () => [
+                { id: "inv-1", code: "INV-00001", privateNote: null, marker: "create-in-flight:n1", kind: "invoice" as const },
+            ],
+            probe: (async () => ({ state: "unknown", reason: "QuickBooks is unavailable" })) as any,
+            adopt: async () => { adopts++; return 1; },
+            countParked: async () => 1,
+        },
+    );
+    assert.equal(adopts, 0);
+    assert.equal(res.recovered, 0);
+    assert.equal(res.stillParked, 1);
+    assert.match(String(res.reason), /unavailable/);
+});
+
+// ─── Round 39 gate, finding 2: Break QB Link had no project scope ───
+
+/**
+ * `assertInvoicePermission` proves the caller may work with invoices SOMEWHERE.
+ * It says nothing about THIS milestone project, and nothing else in the action
+ * did either: a FINANCE user scoped to one job could unlink — and with
+ * deleteInQBO, destroy the QuickBooks invoice for — any milestone in the
+ * company by id alone. Same hole and same fix as the estimate IDOR (#333).
+ *
+ * A source tripwire rather than a request-level test: actions.ts pulls in most
+ * of the app, and what has to be true here is an ORDERING — the scope check
+ * precedes every mutation, including the ambiguous-create resolver branch,
+ * which writes too. An outcome assertion on the happy path cannot see that.
+ */
+test("round 39: breakQBInvoiceLink checks project scope before ANY mutation", async () => {
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/actions.ts", "utf8"));
+    const start = src.indexOf("export async function breakQBInvoiceLink");
+    assert.ok(start > -1);
+    const fn = src.slice(start, src.indexOf("\nexport ", start + 10));
+
+    const scope = fn.indexOf("canAccessProject(user, schedule.invoice.projectId)");
+    assert.ok(scope > -1, "the horizontal check must exist at all");
+
+    // Every write in this function, local or remote, must come after it.
+    for (const mutation of [
+        "resolveAmbiguousInvoiceCreateCore(",   // writes: adopts or releases the row
+        "PENDING_DELETION_MARKER",              // writes: claims the delete intent
+        "deleteQBInvoice(tokens",               // remote destructive write
+        "claimQBInvoiceUnlink(prisma",          // local unlink
+    ]) {
+        const at = fn.indexOf(mutation);
+        assert.ok(at > -1, `${mutation} not found — has the action been restructured?`);
+        assert.ok(at > scope, `${mutation} runs BEFORE the project-scope check`);
+    }
+
+    // FINANCE is not exempt: the check is the shared helper, not a role test.
+    assert.doesNotMatch(fn.slice(0, scope), /role === "FINANCE"|isAdminOrManager/,
+        "scope must not be short-circuited by a role before it is checked");
+});
+
+test("round 39: canAccessProject really does refuse a scoped user on another project", async () => {
+    // The tripwire above proves the ORDER; this proves the PREDICATE it calls
+    // actually says no. Without this, a check placed correctly but calling
+    // something permissive would pass both.
+    const { canAccessProject } = await import("../src/lib/access-rules");
+    const scoped = {
+        id: "u1", role: "FINANCE", permissions: null,
+        projectAccess: [], assignedProjects: [],
+    } as any;
+    assert.equal(canAccessProject(scoped, "proj-not-theirs"), false,
+        "holding the invoices permission is not access to THIS project");
+    assert.equal(canAccessProject({ ...scoped, role: "ADMIN" }, "proj-not-theirs"), true,
+        "and an ADMIN still passes, so the guard is not simply always-false");
+});
+
+// ─── Round 39 gate, finding 3: the delete result read backwards ───
+
+test("round 39: every deleteQBInvoice caller treats `false` as confirmed absence", async () => {
+    // The contract is stated once, at the source, and three call sites read it
+    // the other way round. A tripwire because the failure only shows when the
+    // invoice is ALREADY gone — the happy path looks identical either way.
+    const fs = await import("node:fs");
+    const contract = fs.readFileSync("src/lib/quickbooks.ts", "utf8");
+    assert.match(contract, /CONFIRMED ABSENCE/,
+        "deleteQBInvoice must say what its return value means");
+
+    for (const [file, marker] of [
+        ["src/lib/actions.ts", "await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);"],
+        ["src/lib/quickbooks-payments.ts", "await remove(tokens, row.qbInvoiceId as string, deadline);"],
+        ["src/lib/billing-core.ts", "await deleteQBInvoice(tokens, row.oldQbInvoiceId, qbDeadline);"],
+    ] as const) {
+        const src = fs.readFileSync(file, "utf8");
+        assert.ok(src.includes(marker), `${file}: the call must not branch on the boolean`);
+    }
+    // ...and none of them still tests it.
+    const payments = fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8");
+    assert.doesNotMatch(payments, /if \(!deleted\)/, "a `false` branch is the bug this closes");
+    // Scoped to breakQBInvoiceLink: an unrelated `deleted` flag elsewhere in
+    // actions.ts (a selections decision) is not this contract.
+    const actions = fs.readFileSync("src/lib/actions.ts", "utf8");
+    const breakStart = actions.indexOf("export async function breakQBInvoiceLink");
+    const breakFn = actions.slice(breakStart, actions.indexOf("\nexport ", breakStart + 10));
+    assert.doesNotMatch(breakFn, /if \(!deleted\)/, "a false-branch is the bug this closes");
+    assert.doesNotMatch(breakFn, /let deleted/, "and the boolean is not captured at all any more");
 });

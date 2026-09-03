@@ -3803,6 +3803,16 @@ export async function breakQBInvoiceLink(
         },
     });
     if (!schedule) return { success: false, error: "Milestone not found" };
+    // HORIZONTAL authorization. `assertInvoicePermission` proves this caller may
+    // work with invoices SOMEWHERE; it says nothing about THIS milestone project.
+    // Without this a FINANCE user scoped to one job could unlink — and, with
+    // deleteInQBO, destroy the QuickBooks invoice for — any milestone in the
+    // company by id alone. Same hole and same fix as the estimate IDOR (#333),
+    // and FINANCE is not exempt from it. Checked BEFORE any local or remote
+    // write, and before the ambiguous-create resolver below, which mutates too.
+    if (!canAccessProject(user, schedule.invoice.projectId)) {
+        return { success: false, error: "You do not have access to this project's invoices." };
+    }
     if (schedule.status === "Paid") {
         return { success: false, error: "This milestone is already paid — unlinking is blocked. Use Undo first if you need to reverse it." };
     }
@@ -3887,15 +3897,17 @@ export async function breakQBInvoiceLink(
             };
         };
 
-        let deleted = false;
         try {
             const tokens = await getFreshQBTokens(deadline);
-            deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);
+            // The return value is CONFIRMED-GONE vs CONFIRMED-ABSENT, not
+            // success vs failure — see deleteQBInvoice. Reading `false` as a
+            // refusal meant an invoice somebody had already deleted by hand in
+            // QuickBooks left this milestone parked `pending-deletion` forever,
+            // un-re-sendable, with nothing able to clear it. A real refusal (a
+            // payment attached, say) THROWS, which is what the catch is for.
+            await deleteQBInvoice(tokens, schedule.qbInvoiceId, deadline);
         } catch (e) {
-            return stillLinked(`QuickBooks could not be reached to delete the invoice (${e instanceof Error ? e.message.slice(0, 160) : "unknown error"}).`);
-        }
-        if (!deleted) {
-            return stillLinked("QuickBooks refused to delete the invoice (it may have a payment attached).");
+            return stillLinked(`QuickBooks did not confirm the invoice was deleted (${e instanceof Error ? e.message.slice(0, 160) : "unknown error"}).`);
         }
 
         // Confirmed gone. NOW the link may go — through the same shared claim

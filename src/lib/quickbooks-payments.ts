@@ -452,11 +452,44 @@ export async function compensateAndUnlink(
  * content that no longer matches what the QBO invoice was built from) is
  * genuine divergence and still compensates, unchanged.
  *
- * Note `status` is only refused for "Canceled". A row that went **Paid** while
- * we were fetching the pay link was settled AGAINST THIS INVOICE — deleting it
- * would destroy a paid QuickBooks document, which is strictly worse than the
- * abandoned-invoice case this compensation exists for.
+ * A **Paid** row needs EVIDENCE, not just a status. The old rule accepted any
+ * non-Canceled row on the reasoning that a row which went Paid "was settled
+ * against this invoice" — and that is only true of the QuickBooks rail.
+ * `recordPaymentCore` (payment-record-core.ts) settles a milestone from a
+ * MANUAL Record Payment: it writes status, paymentDate, method and reference,
+ * and leaves `qbPaymentId` null, because no QuickBooks payment exists. Land
+ * that between the provisional link and this finalization and the guard said
+ * "already finalized", the push returned success, and the QuickBooks invoice
+ * stayed open and collectible for money the client had already handed over.
+ *
+ * So a Paid row only counts as finalized when `qbPaymentId` is set — the
+ * column `settleMilestoneFromQBPayment` writes in the same transaction as the
+ * status, and the only thing that ties a settlement to THIS QuickBooks
+ * document. A Paid row WITHOUT it is neither finalized nor abandoned; the
+ * caller parks it (see the `settled-without-qb-payment` outcome) rather than
+ * deleting a document a human may still need to reconcile against.
  */
+/**
+ * The specific shape the guard above now refuses: our invoice, our content,
+ * settled — but by something that is not a QuickBooks payment.
+ *
+ * Its own predicate because the CALLER has to tell it apart from ordinary
+ * divergence. Ordinary divergence compensates (the invoice is unreferenced, so
+ * delete it). This does NOT: the row still points at the invoice and is Paid,
+ * so deleting would strand a Paid milestone pointing at nothing, and the money
+ * may yet need reconciling in QuickBooks. It is a human decision, and the
+ * caller records it as one.
+ */
+export function isSettledWithoutQbPayment(
+    current: { qbInvoiceId: string | null; status: string; qbPaymentId?: string | null } | null,
+    qbInvoiceId: string,
+): boolean {
+    return !!current
+        && current.qbInvoiceId === qbInvoiceId
+        && current.status === "Paid"
+        && !current.qbPaymentId;
+}
+
 export function isConcurrentlyFinalizedMilestoneLink(
     current: {
         qbInvoiceId: string | null;
@@ -464,6 +497,8 @@ export function isConcurrentlyFinalizedMilestoneLink(
         amount: unknown;
         name: string;
         dueDate: Date | null;
+        /** Proof a QuickBooks payment settled this row. Null = settled elsewhere, or not at all. */
+        qbPaymentId?: string | null;
     } | null,
     qbInvoiceId: string,
     issuedFrom: { amount: unknown; name: string; dueDate: Date | null },
@@ -471,6 +506,7 @@ export function isConcurrentlyFinalizedMilestoneLink(
     if (!current) return false;
     if (current.qbInvoiceId !== qbInvoiceId) return false;
     if (current.status === "Canceled") return false;
+    if (current.status === "Paid" && !current.qbPaymentId) return false;
     if (current.name !== issuedFrom.name) return false;
     // Decimal columns never compare with ===; go through the same numeric
     // conversion the create used to build the invoice amount.
@@ -656,13 +692,14 @@ export async function sweepPendingDeletions(
         }
         result.checked++;
         try {
-            const deleted = await remove(tokens, row.qbInvoiceId as string, deadline);
-            if (!deleted) {
-                // QuickBooks said no. The row keeps its marker and its link — the
-                // invoice is still there, so it must still be un-re-sendable.
-                result.stillPending++;
-                continue;
-            }
+            // `false` is CONFIRMED ABSENCE, not a refusal — see deleteQBInvoice.
+            // Reading it as "still there" was what left a manually-deleted
+            // invoice parked forever: the sweep asked QuickBooks to remove a
+            // document that was already gone, got the honest answer, and
+            // concluded it had failed. Either value means the remote document is
+            // gone and the local link may be released; a real refusal arrives as
+            // a THROW and is handled below.
+            await remove(tokens, row.qbInvoiceId as string, deadline);
             if (await unlink(row.id, row.qbInvoiceId as string)) result.finished++;
             else result.stillPending++;
         } catch (e) {
@@ -1055,6 +1092,18 @@ export const PLATFORM_RESERVE_MS = 2_000;
 export const BREAK_QB_LINK_BUDGET_MS = 50_000;
 
 /**
+ * Diagnostic flag for a milestone settled OUTSIDE QuickBooks while its
+ * QuickBooks invoice was being created.
+ *
+ * A plain flag, deliberately not a create marker: `markerKind` does not
+ * recognise it, so it blocks no send path and needs no resolver — it sits in
+ * the same slot, and reads the same way, as the existing `voided` / `notFound`
+ * diagnostics the sync poller writes. What it does is make the state findable
+ * instead of invisible.
+ */
+export const SETTLED_WITHOUT_QB_PAYMENT_FLAG = "settled-without-qb-payment";
+
+/**
  * How long compensation may take, measured when it BEGINS.
  *
  * Never additive: the old form added the cleanup window to whatever the route
@@ -1148,8 +1197,14 @@ export interface MilestoneLinkOutcome {
      * `mismatch` and `abandoned` both compensate; they are kept apart so the
      * operator is told WHICH it was — "the row moved on" and "this invoice is
      * now wrong" need different follow-up.
+     *
+     * `settled-without-qb-payment` — the row is Paid and still points at our
+     * invoice, but no QuickBooks payment settled it (a manual Record Payment).
+     * Neither finalized nor abandoned: the QuickBooks invoice is real and still
+     * open, so it must not be reported as done, and the row references it, so it
+     * must not be deleted either. Parked for a human.
      */
-    outcome: "linked" | "already-finalized" | "abandoned" | "mismatch";
+    outcome: "linked" | "already-finalized" | "abandoned" | "mismatch" | "settled-without-qb-payment";
     /** The pay link the row carries, when someone else finished it. */
     payLink: string | null;
     /** For `mismatch`: what diverged, in words, for the error the caller raises. */
@@ -1310,6 +1365,12 @@ export async function finalizeMilestoneLinkUnderLock(
             // one read is one fewer thing to keep in step.
             if (isConcurrentlyFinalizedMilestoneLink(current, qbId, schedule)) {
                 return { outcome: "already-finalized", payLink: current?.qbInvoiceLink ?? null };
+            }
+            // Checked BEFORE falling through to `abandoned`: this row is Paid and
+            // still points at our invoice, so compensation would delete a document
+            // a Paid milestone references. Neither success nor abandonment.
+            if (isSettledWithoutQbPayment(current, qbId)) {
+                return { outcome: "settled-without-qb-payment", payLink: current?.qbInvoiceLink ?? null };
             }
         }
         return { outcome: "abandoned", payLink: null };
@@ -1720,6 +1781,37 @@ export async function pushMilestoneToQuickBooks(
         // Someone else finished this exact invoice. Nothing to write and
         // nothing to delete — report the same success they did.
         return { qbInvoiceId: qbId, payLink: linked.payLink ?? payLink, qbTotal: total };
+    }
+    if (linked.outcome === "settled-without-qb-payment") {
+        // NOT compensated. The row is Paid and carries this invoice id, so
+        // deleting the invoice would leave a Paid milestone pointing at nothing;
+        // and the invoice is genuinely open in QuickBooks, so reporting success
+        // would leave a client able to pay the same milestone twice. Both wrong
+        // answers, so this takes neither: it records the state where an operator
+        // will see it and says exactly what happened.
+        //
+        // The diagnostic goes on `qbSyncError` as a plain flag, NOT a create
+        // marker: `markerKind` does not recognise it, so it blocks nothing and
+        // reads like the existing `voided`/`notFound` diagnostics. CAS-pinned to
+        // the marker this push owns, so a row that moved again keeps whatever
+        // replaced it.
+        await prisma.paymentSchedule.updateMany({
+            where: { id: schedule.id, qbInvoiceId: qbId, qbSyncError: { in: [inFlightMarker, PAYLINK_PENDING_MARKER] } },
+            data: { qbSyncError: SETTLED_WITHOUT_QB_PAYMENT_FLAG },
+        }).catch(() => ({ count: 0 }));
+        await logAutomationEvent({
+            kind: "qbo-payments-sync",
+            status: "error",
+            reason: SETTLED_WITHOUT_QB_PAYMENT_FLAG,
+            source: "milestone-push",
+            docNumber,
+            detail: { paymentScheduleId: schedule.id, qbInvoiceId: qbId, docNumber },
+        });
+        throw new Error(
+            `This milestone was recorded as paid in ProBuild while its QuickBooks invoice ${docNumber} was being created, ` +
+            `and no QuickBooks payment is attached to that invoice — so it is still open and collectible there. ` +
+            `Record the payment against ${docNumber} in QuickBooks, or void it, then refresh.`,
+        );
     }
     if (linked.outcome !== "linked") {
         // The compensation clock starts HERE, when compensation begins — not at
