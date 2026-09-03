@@ -18,6 +18,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { resolveTargetOrRefuse } from "../scripts/lib/apply-target.mjs";
 import {
     APPLY_TARGETS,
     PRODUCTION_BASELINE_MIGRATION,
@@ -1707,4 +1708,55 @@ test("--post-deploy drops the bridge AFTER it has stamped the stragglers", () =>
     assert.ok(backfillAt > -1, "the sourceFileId backfill runs in --post-deploy");
     assert.ok(dropAt > -1, "and the bridge is dropped in the same pass");
     assert.ok(backfillAt < dropAt, "the stamping happens while the bridge still stands");
+});
+
+// ── the guard must ACCEPT the real production URL (P0 on the sibling PR) ──
+
+/** Byte-for-byte the shape CLAUDE.md documents for production. */
+const PROD_URL =
+    "postgresql://postgres.ghzdbzdnwjxazvmcefbh:s3cr3t@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true";
+
+test("the prod guard ACCEPTS the real pooler URL, port and all", () => {
+    // The failure this pins was found on the sibling PR: `new URL(url).host`
+    // includes the PORT (`aws-0-us-west-2.pooler.supabase.com:6543`), so a
+    // `/pooler\.supabase\.com$/` test against `host` rejects every real
+    // transaction-pooler URL — and CI would never notice, because CI only
+    // ever exercises `--target ci`. This helper reads `hostname`; the test is
+    // here so it keeps doing that.
+    assert.equal(new URL(PROD_URL).host, "aws-0-us-west-2.pooler.supabase.com:6543");
+    assert.equal(new URL(PROD_URL).hostname, "aws-0-us-west-2.pooler.supabase.com");
+    assert.equal(targetHostVerdict("prod", PROD_URL), null, "the REAL prod URL must pass the host check");
+});
+
+test("...and the whole chain passes with the right ref, refuses with a wrong one", () => {
+    // The composite a caller actually uses — target, url source, host, ref —
+    // driven against the production URL with the env file faked, because the
+    // pieces can each be right while the wiring drops one.
+    const files = { ".env.production.local": `DATABASE_URL="${PROD_URL}"\n` };
+    const disk = {
+        exists: (file: unknown) => String(file) in files,
+        read: (file: unknown) => files[String(file) as keyof typeof files],
+    };
+    const argv = ["node", "apply.mjs", "--target", "prod", "--yes"];
+
+    const right = resolveTargetOrRefuse(
+        argv,
+        { APPLY_EXPECT_PROJECT_REF: "ghzdbzdnwjxazvmcefbh" } as unknown as NodeJS.ProcessEnv,
+        disk,
+    );
+    assert.equal(right.error, undefined, `the real production target must be accepted: ${right.error}`);
+    assert.equal(right.target, "prod");
+    assert.equal(right.url, PROD_URL);
+    assert.equal(right.from, ".env.production.local");
+
+    const wrong = resolveTargetOrRefuse(
+        argv,
+        { APPLY_EXPECT_PROJECT_REF: "stagingprojectref" } as unknown as NodeJS.ProcessEnv,
+        disk,
+    );
+    assert.match(wrong.error ?? "", /this URL is for project ghzdbzdnwjxazvmcefbh, not stagingprojectref/);
+    assert.equal(wrong.url, undefined, "and no URL is handed back to connect with");
+
+    // ...and the banner built from that URL still hides the password.
+    assert.doesNotMatch(targetBanner("prod", { url: PROD_URL, from: ".env.production.local", db: "postgres", host: "10.0.0.5" }), /s3cr3t/);
 });

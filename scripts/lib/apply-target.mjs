@@ -264,10 +264,14 @@ export async function verifyTargetIdentity(prisma, { target, url, from, expectDb
  * ref that are readable from the URL alone. Returns `{ error }` or
  * `{ target, url, from }`.
  */
-export function resolveTargetOrRefuse(argv, env = process.env) {
+export function resolveTargetOrRefuse(argv, env = process.env, io = {}) {
     const chosen = parseTarget(argv);
     if (chosen.error) return { error: chosen.error };
-    const resolved = resolveTargetDatabaseUrl(chosen.name, { env });
+    // `io` exists so a test can drive this WHOLE chain against the exact
+    // production URL shape without a .env.production.local on disk. The
+    // composite is what a caller uses, so the composite is what has to be
+    // tested: the pieces can each be right while the wiring drops one.
+    const resolved = resolveTargetDatabaseUrl(chosen.name, { env, ...io });
     if (resolved.error) return { error: resolved.error };
     const hostProblem = targetHostVerdict(chosen.name, resolved.url);
     if (hostProblem) return { error: hostProblem };
