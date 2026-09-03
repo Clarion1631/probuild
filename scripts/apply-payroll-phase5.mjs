@@ -48,7 +48,7 @@ export function classifySalariedEmails(raw) {
 export const isDryRun = (argv = process.argv) => argv.includes("--dry-run");
 
 import { config } from "dotenv";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -682,7 +682,7 @@ async function main() {
     }
 }
 
-const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
     await main();
 }

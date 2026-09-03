@@ -10,6 +10,7 @@
 //
 // Usage: node scripts/apply-estimate-items-revision.mjs
 import { PrismaClient } from "@prisma/client";
+import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 
 // Same resolution the sibling apply-*.mjs scripts use: env first, then the
@@ -24,8 +25,8 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in env or .env files");
 }
 
-const url = resolveDatabaseUrl();
-const prisma = new PrismaClient({ datasources: { db: { url } } });
+let url;
+let prisma;
 
 const STATEMENTS = [
     `ALTER TABLE "Estimate" ADD COLUMN IF NOT EXISTS "itemsRevision" INTEGER NOT NULL DEFAULT 0;`,
@@ -48,9 +49,14 @@ async function main() {
     console.log("Estimate.itemsRevision column verified.");
 }
 
-main()
-    .catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    })
-    .finally(() => prisma.$disconnect());
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma.$disconnect());
+}

@@ -222,7 +222,9 @@ test("IMPORTING the script must not load production env or run anything", () => 
     // The module called config({ path: ".env.production.local" }) at top level,
     // so the import loaded PRODUCTION credentials and executed the entire
     // migration against them. Everything with a side effect now lives in main().
-    assert.match(script, /const isMainModule = process\.argv\[1\] && fileURLToPath\(import\.meta\.url\) === process\.argv\[1\]/);
+    // Guard spelling matches the one #446 applied across every scripts/apply-*.mjs
+    // (and enforced repo-wide by tests/apply-scripts-inert-on-import.test.ts).
+    assert.match(script, /const isMainModule = process\.argv\[1\] && import\.meta\.url === pathToFileURL\(process\.argv\[1\]\)\.href/);
     assert.match(script, /if \(isMainModule\) \{\s*\n\s*await main\(\);/);
 
     // The dangerous calls must all be INSIDE main(), never at module scope.

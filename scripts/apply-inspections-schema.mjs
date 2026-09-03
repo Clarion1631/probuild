@@ -6,6 +6,7 @@
 // This deliberately does NOT use prisma migrate/db push. See CLAUDE.md.
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 
 function readFlag(flag) {
     const index = process.argv.indexOf(flag);
@@ -184,7 +185,10 @@ async function main() {
     }
 }
 
-main().catch(error => {
-    console.error(error instanceof Error ? error.message : error);
-    process.exitCode = 1;
-});
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+    main().catch(error => {
+        console.error(error instanceof Error ? error.message : error);
+        process.exitCode = 1;
+    });
+}
