@@ -891,7 +891,7 @@ function bankPayloadFor(credit: BankCredit, postDate: string): BankPayload {
 async function handleBankBatch(raw: Record<string, unknown>): Promise<NextResponse> {
     const parsed = parseBankBatch(raw);
     if (!parsed.ok) return NextResponse.json({ ok: false, reason: parsed.reason }, { status: 400 });
-    const { postDate, credits, dryRun } = parsed.batch;
+    const { postDate, credits, excluded, dryRun } = parsed.batch;
 
     const fileIds = credits.map(c => bankFileId(c.bankReference));
     const existing = await prisma.depositIngest.findMany({
@@ -968,9 +968,15 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
     // HTTP is still 200 — the batch WAS processed; 400 is reserved for a payload
     // that could not be trusted at all. `ok` is what tells the unattended runner
     // whether the day finished cleanly.
+    // `excludedCount` is echoed, not counted: nothing was recorded for those
+    // rows, and `counts` must go on partitioning the credits this request
+    // actually processed. It is here so the runner can prove the endpoint read
+    // the same day it sent.
     return NextResponse.json({
         ok: sweepBatchOk(counts),
-        source: BANK_DEPOSIT_SOURCE, postDate, dryRun, counts, credits: results,
+        source: BANK_DEPOSIT_SOURCE, postDate, dryRun, counts,
+        excludedCount: excluded.length,
+        credits: results,
     });
 }
 
