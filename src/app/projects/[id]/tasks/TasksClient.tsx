@@ -9,6 +9,7 @@ import {
     deletePunchItem,
 } from "@/lib/actions";
 import { toast } from "sonner";
+import { displayEndDate, storedEndDate, toDateKey, formatDateKey } from "@/lib/schedule-dates";
 
 const STATUS_OPTIONS = ["Not Started", "In Progress", "Complete", "Blocked"];
 const STATUS_COLORS: Record<string, string> = {
@@ -59,10 +60,21 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
             toast.error("Name, start date, and end date are required");
             return;
         }
+        if (newTask.endDate < newTask.startDate) {
+            toast.error("End date must be on or after the start date");
+            return;
+        }
         startTransition(async () => {
             try {
-                const created = await createScheduleTask(projectId, newTask);
-                setTasks(prev => [...prev, { ...created, assignments: [], punchItems: [] }]);
+                const res = await createScheduleTask(projectId, {
+                    ...newTask,
+                    endDate: storedEndDate(newTask.startDate, newTask.endDate, "task"),
+                });
+                if (!res.ok) {
+                    toast.error(res.error || "Failed to add task");
+                    return;
+                }
+                setTasks(prev => [...prev, { ...res.task, assignments: [], punchItems: [] }]);
                 setNewTask({ name: "", startDate: "", endDate: "", status: "Not Started" });
                 setShowAddTask(false);
                 toast.success("Task added");
@@ -75,7 +87,11 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
     const handleStatusChange = (taskId: string, status: string) => {
         startTransition(async () => {
             try {
-                await updateScheduleTask(taskId, { status });
+                const res = await updateScheduleTask(taskId, { status });
+                if (!res.ok) {
+                    toast.error(res.error || "Failed to update status");
+                    return;
+                }
                 setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status } : t));
             } catch {
                 toast.error("Failed to update status");
@@ -87,7 +103,11 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
         if (!confirm("Delete this task?")) return;
         startTransition(async () => {
             try {
-                await deleteScheduleTask(taskId);
+                const res = await deleteScheduleTask(taskId);
+                if (!res.ok) {
+                    toast.error(res.error || "Failed to delete task");
+                    return;
+                }
                 setTasks(prev => prev.filter(t => t.id !== taskId));
                 toast.success("Task deleted");
             } catch {
@@ -177,8 +197,8 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
                             onChange={e => setNewTask(prev => ({ ...prev, name: e.target.value }))}
                             autoFocus
                         />
-                        <input type="date" className="hui-input" value={newTask.startDate} onChange={e => setNewTask(prev => ({ ...prev, startDate: e.target.value }))} />
-                        <input type="date" className="hui-input" value={newTask.endDate} onChange={e => setNewTask(prev => ({ ...prev, endDate: e.target.value }))} />
+                        <input type="date" className="hui-input" value={newTask.startDate} onChange={e => setNewTask(prev => ({ ...prev, startDate: e.target.value, endDate: prev.endDate || e.target.value }))} />
+                        <input type="date" className="hui-input" value={newTask.endDate} min={newTask.startDate || undefined} onChange={e => setNewTask(prev => ({ ...prev, endDate: e.target.value }))} />
                     </div>
                     <div className="flex gap-2">
                         <button onClick={handleAddTask} disabled={isPending} className="hui-btn hui-btn-primary text-sm">
@@ -231,7 +251,7 @@ export default function TasksClient({ projectId, initialTasks, teamMembers }: Pr
                                                         )}
                                                         {task.startDate && (
                                                             <span className="text-xs text-hui-textMuted tabular-nums whitespace-nowrap">
-                                                                {new Date(task.startDate).toLocaleDateString()} – {task.endDate ? new Date(task.endDate).toLocaleDateString() : "?"}
+                                                                {formatDateKey(toDateKey(task.startDate))} – {task.endDate ? formatDateKey(displayEndDate(toDateKey(task.startDate), toDateKey(task.endDate), task.type)) : "?"}
                                                             </span>
                                                         )}
                                                         <select

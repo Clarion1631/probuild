@@ -2,6 +2,7 @@
 
 import { useState, useRef, type Dispatch, type SetStateAction } from "react";
 import { addTaskCommentAsSub, updateTaskStatusAsSub } from "@/lib/actions";
+import { displayEndDate } from "@/lib/schedule-dates";
 
 type Dependency = { id: string; predecessorId: string; dependentId: string };
 type Assignment = { id: string; userId: string; firstName: string };
@@ -410,7 +411,7 @@ export default function PortalGanttChart({
                         <div className="flex items-start justify-between mb-3">
                             <div>
                                 <h3 className="font-semibold text-slate-800 text-sm">{selectedTask.name}</h3>
-                                <p className="text-xs text-slate-500 mt-0.5">{selectedTask.startDate} → {selectedTask.endDate}</p>
+                                <p className="text-xs text-slate-500 mt-0.5">{selectedTask.startDate} → {displayEndDate(selectedTask.startDate, selectedTask.endDate, selectedTask.type)}</p>
                             </div>
                             <button onClick={() => setSelectedTask(null)} className="text-slate-400 hover:text-slate-600 text-lg leading-none">&times;</button>
                         </div>
