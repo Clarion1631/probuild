@@ -30,7 +30,7 @@ test("the backfill UPDATE only targets non-milestone rows with end <= start", ()
     assert.match(UPDATE_MILESTONE_ROWS, /"type"\s*=\s*'milestone'/);
     assert.match(UPDATE_MILESTONE_ROWS, /"projectId"\s+IS NOT NULL/);
     // Raw SQL bypasses Prisma @updatedAt; dispatch concurrency reads that revision.
-    for (const sql of [UPDATE_LEGACY_ROWS, UPDATE_MILESTONE_ROWS, EXTEND_ROW]) assert.match(sql, /"updatedAt"s*=s*NOW()/);
+    for (const sql of [UPDATE_LEGACY_ROWS, UPDATE_MILESTONE_ROWS, EXTEND_ROW]) assert.match(sql, /"updatedAt"\s*=\s*NOW\(\)/);
     // Compare-and-set: one row by id, only while it still shows the reviewed End.
     assert.match(EXTEND_ROW, /"id"\s*=\s*\$1/);
     assert.match(EXTEND_ROW, /"endDate"\s*=\s*\(\$2::date\s*\+\s*interval\s*'1 day'\)/);
