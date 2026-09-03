@@ -30,6 +30,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
     return {
         intuit: { status: "ok" as const, indicator: "none" },
         lastPurchaseSync: { status: "ok" as const, at: iso(2 * HOUR) },
+        purchaseSyncRun: { status: "ok" as const, at: iso(2 * HOUR), runStatus: "ok" as string | null },
         lastReceiptPush: { status: "ok" as const, at: iso(3 * HOUR) },
         lastPaymentsSync: { status: "ok" as const, at: iso(1 * HOUR) },
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
@@ -47,7 +48,7 @@ test("a healthy snapshot is ok with no reasons", () => {
 // ─── False green from a failed probe ────────────────────────────────────────
 
 test("ANY failed probe forces ok:false with probe-failed:<name>", () => {
-    const names = ["lastPurchaseSync", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck"] as const;
+    const names = ["lastPurchaseSync", "purchaseSyncRun", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck"] as const;
     for (const name of names) {
         const base = snapshot();
         const broken = {
@@ -173,6 +174,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         intuit: { status: "ok", indicator: "none", description: "All Systems Operational" },
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
         },
@@ -211,6 +213,7 @@ test("digest says how long the silence has been, so a human can judge it", () =>
             reasons: ["no-receipts-72h"],
             qbo: {
                 lastPurchaseSync: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
+                purchaseSyncRun: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
                 lastReceiptPush: { status: "ok", at: "2026-08-20T14:00:00.000Z" },
                 lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
             },
@@ -248,12 +251,14 @@ test("digest renders missing timestamps as 'never' rather than a bogus date", ()
         sampleHealth({
             qbo: {
                 lastPurchaseSync: { status: "ok", at: null },
+                purchaseSyncRun: { status: "ok", at: null },
                 lastReceiptPush: { status: "ok", at: null },
                 lastPaymentsSync: { status: "ok", at: null },
             },
         }),
     );
-    assert.match(text, /Last QBO purchase sync: never/);
+    assert.match(text, /Last QBO purchase booked: never/);
+    assert.match(text, /Last purchase sync run: never/);
     assert.match(text, /Last receipt booked: never/);
 });
 
@@ -434,6 +439,7 @@ test("the digest flags an incomplete payments run in the body", () => {
         reasons: ["payments-sync-partial"],
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "partial" },
         },
@@ -477,6 +483,7 @@ test("the digest marks a failed last payments run", () => {
         reasons: ["payments-sync-error"],
         qbo: {
             lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
             lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
             lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z", runStatus: "error" },
         },
@@ -565,4 +572,138 @@ test("a QuickBooks auth refusal reads as reconnect-needed, not a generic error",
     const failed = evaluatePipelineHealth(snapshot({ qboAuth: { status: "error", reason: "error", count: 0 } }));
     assert.equal(failed.ok, false);
     assert.ok(failed.reasons.includes("probe-failed:qboAuth"), failed.reasons.join(","));
+});
+
+// ─── The purchase sync's own heartbeat ─────────────────────────────────────
+//
+// Round 36 gate: `lastPurchaseSync` is a DATA timestamp — the newest Expense
+// row QBO imported — so it legitimately stands still on a quiet week and could
+// never be read as "the job is alive". Nothing else watched the scheduled
+// qbo-sync at all, so health went green while purchases had not been imported
+// for weeks, or ever.
+
+test("purchase sync that has NEVER completed a cron run is red, with its own reason", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: null, runStatus: null },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-never-ran"]);
+});
+
+test("purchase sync older than the staleness window is red", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-stale"]);
+});
+
+test("a purchase sync inside the window with an ok run is green", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(5 * HOUR), runStatus: "ok" },
+    }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("the LATEST purchase-sync cron run failing is red at any age", () => {
+    // Same rule as the payments heartbeat: freshness comes from the last run
+    // that actually ran, but the reported status is the latest event whatever
+    // it was — otherwise an error right after a success is invisible.
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(1 * HOUR), runStatus: "error" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-error"]);
+});
+
+test("a partial purchase-sync run counts for freshness and is still flagged", () => {
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(1 * HOUR), runStatus: "partial" },
+    }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["purchase-sync-partial"]);
+});
+
+test("staleness and a failed latest run are reported together, not one instead of the other", () => {
+    // They are separately actionable: "nothing has run in days" and "the last
+    // thing that did run failed" send a human to different places.
+    const v = evaluatePipelineHealth(snapshot({
+        purchaseSyncRun: { status: "ok", at: iso(40 * HOUR), runStatus: "error" },
+    }));
+    assert.deepEqual(v.reasons, ["purchase-sync-stale", "purchase-sync-error"]);
+});
+
+test("QBO_PURCHASE_SYNC_STALE_HOURS overrides the window, and a junk value falls back", async () => {
+    const { DEFAULT_PURCHASE_SYNC_STALE_HOURS, purchaseSyncStaleHours } = await import("../src/lib/pipeline-health");
+    const previous = process.env.QBO_PURCHASE_SYNC_STALE_HOURS;
+    try {
+        process.env.QBO_PURCHASE_SYNC_STALE_HOURS = "48";
+        assert.equal(purchaseSyncStaleHours(), 48);
+        // 20h ago is stale at the 9h default and fresh at 48h.
+        assert.deepEqual(
+            evaluatePipelineHealth(snapshot({
+                purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+            })),
+            { ok: true, reasons: [] },
+        );
+        // A value that parses to NaN must NOT make every comparison false —
+        // that is the fail-OPEN direction this heartbeat exists to close.
+        for (const junk of ["", "soon", "0", "-3"]) {
+            process.env.QBO_PURCHASE_SYNC_STALE_HOURS = junk;
+            assert.equal(purchaseSyncStaleHours(), DEFAULT_PURCHASE_SYNC_STALE_HOURS, `junk value ${JSON.stringify(junk)}`);
+        }
+        process.env.QBO_PURCHASE_SYNC_STALE_HOURS = "soon";
+        const v = evaluatePipelineHealth(snapshot({
+            purchaseSyncRun: { status: "ok", at: iso(20 * HOUR), runStatus: "ok" },
+        }));
+        assert.deepEqual(v.reasons, ["purchase-sync-stale"]);
+    } finally {
+        if (previous === undefined) delete process.env.QBO_PURCHASE_SYNC_STALE_HOURS;
+        else process.env.QBO_PURCHASE_SYNC_STALE_HOURS = previous;
+    }
+});
+
+test("the sync route logs the exact kind/source the heartbeat queries for", async () => {
+    // A heartbeat that watches a kind nothing writes is worse than none: it is
+    // permanently red, or (as here, before the fix) permanently absent.
+    const { PURCHASE_SYNC_EVENT_KIND, PURCHASE_SYNC_CRON_SOURCE } = await import("../src/lib/pipeline-health");
+    const logged: any[] = [];
+    const { createQboExpenseSyncHandlers } = await import("../src/app/api/integrations/qbo-expenses/sync/route");
+    const handlers = createQboExpenseSyncHandlers({
+        getIngestSecret: () => "ingest",
+        getCronSecret: () => "cron-secret",
+        isCronEnabled: () => true,
+        getFreshTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: "realm-1" }),
+        syncExpenses: async () => ({ imported: 1, updated: 0, removed: 0, skipped: [] }) as any,
+        now: () => new Date("2026-09-01T14:00:00.000Z"),
+        isSyncPaused: async () => false,
+        logEvent: (event) => { logged.push(event); },
+        incrementalLookbackDays: 7,
+    });
+    await handlers.GET(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        headers: { authorization: "Bearer cron-secret" },
+    }));
+
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0].kind, PURCHASE_SYNC_EVENT_KIND);
+    assert.equal(logged[0].source, PURCHASE_SYNC_CRON_SOURCE);
+    assert.equal(logged[0].status, "ok");
+});
+
+test("the digest prints the purchase-sync heartbeat on its own line", () => {
+    const { text } = formatPipelineDigest(sampleHealth({
+        ok: false,
+        reasons: ["purchase-sync-stale"],
+        qbo: {
+            lastPurchaseSync: { status: "ok", at: "2026-09-01T10:00:00.000Z" },
+            purchaseSyncRun: { status: "ok", at: "2026-08-20T14:00:00.000Z", runStatus: "partial" },
+            lastReceiptPush: { status: "ok", at: "2026-09-01T12:00:00.000Z" },
+            lastPaymentsSync: { status: "ok", at: "2026-09-01T13:00:00.000Z" },
+        },
+    }));
+    assert.match(text, /Last purchase sync run: .* \(12d ago\) \[incomplete run\]/);
+    assert.match(text, /Needs attention: purchase-sync-stale/);
+    // The data timestamp is still there, separately — the two answer different
+    // questions and neither can stand in for the other.
+    assert.match(text, /Last QBO purchase booked: /);
 });

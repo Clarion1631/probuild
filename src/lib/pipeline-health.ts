@@ -66,8 +66,26 @@ export interface PipelineHealth {
     checkedAt: string;
     intuit: IntuitProbe;
     qbo: {
-        /** Newest Expense row QBO has synced into ProBuild job costs. */
+        /**
+         * Newest Expense row QBO has synced into ProBuild job costs.
+         *
+         * A DATA timestamp, not a heartbeat: it only moves when there is a new
+         * purchase to import, so a quiet week legitimately leaves it old. It is
+         * reported for information and cannot decide whether the sync is alive
+         * — that is `purchaseSyncRun` below.
+         */
         lastPurchaseSync: TimestampProbe;
+        /**
+         * Newest SUCCESSFUL purchase-sync run triggered by the scheduled CRON —
+         * the job-cost rail's own pulse, and the thing this file was missing.
+         * Nothing here used to go red when that cron stopped: `lastPurchaseSync`
+         * counted only as a failed PROBE, so a null or month-old timestamp added
+         * no reason at all and the digest read "Pipeline OK" while no purchase
+         * had been imported since. Manual/backfill runs are excluded on purpose,
+         * exactly as they are for the payments heartbeat: they must not be able
+         * to disguise a dead cron.
+         */
+        purchaseSyncRun: TimestampProbe;
         /** Newest receipt the bot actually CREATED (re-pushes don't count). */
         lastReceiptPush: TimestampProbe;
         /**
@@ -194,6 +212,36 @@ export const ATTACHMENT_FAILED_STATUS = "attachment-failed";
 export const PAYMENTS_SYNC_STALE_HOURS = 26;
 
 /**
+ * The scheduled QBO purchase sync's own audit row.
+ *
+ * `qbo-sync` / source `cron` is what /api/integrations/qbo-expenses/sync logs
+ * on its cron entry point (the manual POST logs `manual`/`backfill`, which are
+ * excluded for the same reason the payments heartbeat excludes on-view runs).
+ */
+export const PURCHASE_SYNC_EVENT_KIND = "qbo-sync";
+export const PURCHASE_SYNC_CRON_SOURCE = "cron";
+/** A "partial" run did execute, so it counts for freshness — then is flagged. */
+export const PURCHASE_SYNC_HEARTBEAT_STATUSES = ["ok", "partial"];
+/**
+ * The cron is scheduled every 4 hours (`30 * /4 * * *` in vercel.json), so 9h
+ * covers two consecutive misses plus a DST shift before it reads as stopped.
+ */
+export const DEFAULT_PURCHASE_SYNC_STALE_HOURS = 9;
+
+/**
+ * The configured staleness window, `QBO_PURCHASE_SYNC_STALE_HOURS`.
+ *
+ * Validated rather than trusted: a blank, zero, negative or non-numeric value
+ * falls back to the default. An env var that silently parsed to `NaN` would
+ * make every comparison below false, which is the fail-OPEN direction — a dead
+ * cron reading green is exactly the defect this heartbeat exists to fix.
+ */
+export function purchaseSyncStaleHours(): number {
+    const raw = Number(process.env.QBO_PURCHASE_SYNC_STALE_HOURS);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PURCHASE_SYNC_STALE_HOURS;
+}
+
+/**
  * The verdict, split out from the database reads so the rules are testable
  * without a DB.
  *
@@ -212,6 +260,12 @@ export const PAYMENTS_SYNC_STALE_HOURS = 26;
 export function evaluatePipelineHealth(input: {
     intuit: IntuitProbe;
     lastPurchaseSync: TimestampProbe;
+    /**
+     * REQUIRED, unlike `qboAuth` below. An optional heartbeat is a heartbeat a
+     * caller can forget to take, and "absent" would then read as "fine" — the
+     * precise shape of the bug this field exists to fix.
+     */
+    purchaseSyncRun: TimestampProbe;
     lastReceiptPush: TimestampProbe;
     lastPaymentsSync: TimestampProbe;
     receipts24h: CountsProbe;
@@ -225,6 +279,7 @@ export function evaluatePipelineHealth(input: {
 
     const namedProbes: Array<[string, { status: ProbeStatus }]> = [
         ["lastPurchaseSync", input.lastPurchaseSync],
+        ["purchaseSyncRun", input.purchaseSyncRun],
         ["lastReceiptPush", input.lastReceiptPush],
         ["lastPaymentsSync", input.lastPaymentsSync],
         ["receipts24h", input.receipts24h],
@@ -276,6 +331,30 @@ export function evaluatePipelineHealth(input: {
         // It proves the cron is alive, so it counts for freshness — but it must
         // be reported the same day, not hidden inside the 26h staleness window.
         else if (input.lastPaymentsSync.runStatus === "partial") reasons.push("payments-sync-partial");
+    }
+
+    if (input.purchaseSyncRun.status === "ok") {
+        // The job-cost rail's heartbeat, read exactly like the payments one —
+        // except that "never" gets its own reason. A pipeline whose purchase
+        // sync has NEVER completed a cron run is a different conversation from
+        // one that stopped, and both used to produce nothing at all here.
+        const at = input.purchaseSyncRun.at ? Date.parse(input.purchaseSyncRun.at) : null;
+        if (at === null || Number.isNaN(at)) {
+            reasons.push("purchase-sync-never-ran");
+        } else if (input.now - at > purchaseSyncStaleHours() * HOUR_MS) {
+            reasons.push("purchase-sync-stale");
+        }
+        // Reported alongside the freshness verdict rather than instead of it:
+        // "the last run failed" and "nothing has run in days" are separately
+        // actionable, and a run that failed still says nothing about freshness.
+        if (input.purchaseSyncRun.runStatus === "error") {
+            reasons.push("purchase-sync-error");
+        } else if (input.purchaseSyncRun.runStatus === "partial") {
+            // Ran, but left work undone (attachments it gave up on). It counts
+            // for freshness and is flagged the same day rather than hiding
+            // inside the staleness window.
+            reasons.push("purchase-sync-partial");
+        }
     }
 
     if (input.lastReceiptPush.status === "ok") {
@@ -342,7 +421,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth] = await Promise.all([
+    const [intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -352,6 +431,34 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 (await prisma.expense.aggregate({ where: { qbPurchaseId: { not: null } }, _max: { qbSyncedAt: true } }))
                     ._max.qbSyncedAt ?? null,
             null,
+        ),
+        // The purchase-sync CRON's own pulse. Same two-read shape as the
+        // payments heartbeat below: freshness may only come from a run that
+        // actually ran (ok/partial), while the reported run status is the
+        // LATEST cron event whatever it was — otherwise a failure right after a
+        // success is invisible.
+        probe<{ createdAt: Date | null; latestStatus: string | null }>(
+            "purchaseSyncRun",
+            async () => {
+                const [fresh, latest] = await Promise.all([
+                    prisma.automationEvent.findFirst({
+                        where: {
+                            kind: PURCHASE_SYNC_EVENT_KIND,
+                            status: { in: PURCHASE_SYNC_HEARTBEAT_STATUSES },
+                            source: PURCHASE_SYNC_CRON_SOURCE,
+                        },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    }),
+                    prisma.automationEvent.findFirst({
+                        where: { kind: PURCHASE_SYNC_EVENT_KIND, source: PURCHASE_SYNC_CRON_SOURCE },
+                        orderBy: { createdAt: "desc" },
+                        select: { status: true },
+                    }),
+                ]);
+                return { createdAt: fresh?.createdAt ?? null, latestStatus: latest?.status ?? null };
+            },
+            { createdAt: null, latestStatus: null },
         ),
         probe<Date | null>(
             "lastReceiptPush",
@@ -434,12 +541,13 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                         { status: { in: ["error", ATTACHMENT_FAILED_STATUS] } },
                         // A "partial" run left work undone, which is a problem
                         // even though it is not a hard failure. The payments
-                        // sweep is excluded because it reports its own
-                        // payments-sync-partial reason from the latest run —
-                        // counting it here too would say the same thing twice.
+                        // sweep and the purchase sync are excluded because each
+                        // reports its own *-sync-partial reason from its latest
+                        // run — counting them here too would say the same thing
+                        // twice.
                         {
                             status: "partial",
-                            kind: { not: PAYMENTS_SYNC_EVENT_KIND },
+                            kind: { notIn: [PAYMENTS_SYNC_EVENT_KIND, PURCHASE_SYNC_EVENT_KIND] },
                         },
                     ],
                 },
@@ -465,6 +573,12 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             status: lastPurchase.status,
             reason: lastPurchase.reason,
             at: lastPurchase.value?.toISOString() ?? null,
+        },
+        purchaseSyncRun: {
+            status: purchaseSyncRun.status,
+            reason: purchaseSyncRun.reason,
+            at: purchaseSyncRun.value.createdAt?.toISOString() ?? null,
+            runStatus: purchaseSyncRun.value.latestStatus,
         },
         lastReceiptPush: {
             status: lastPush.status,
@@ -495,6 +609,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         intuit: snapshot.intuit,
         qbo: {
             lastPurchaseSync: snapshot.lastPurchaseSync,
+            purchaseSyncRun: snapshot.purchaseSyncRun,
             lastReceiptPush: snapshot.lastReceiptPush,
             lastPaymentsSync: snapshot.lastPaymentsSync,
         },
@@ -534,7 +649,17 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         subject,
         `Checked: ${health.checkedAt}`,
         `Intuit status: ${health.intuit.indicator}${health.intuit.description ? ` (${health.intuit.description})` : ""}${health.intuit.status === "error" ? " [status page unreachable]" : ""}`,
-        `Last QBO purchase sync: ${ago(health.qbo.lastPurchaseSync, now)}`,
+        `Last QBO purchase booked: ${ago(health.qbo.lastPurchaseSync, now)}`,
+        // Surfaced exactly like the payments heartbeat below, and separately
+        // from the data timestamp above: "nothing new to import" and "the job
+        // that imports it has stopped" look identical on that line alone.
+        `Last purchase sync run: ${ago(health.qbo.purchaseSyncRun, now)}${
+            health.qbo.purchaseSyncRun.runStatus === "partial"
+                ? " [incomplete run]"
+                : health.qbo.purchaseSyncRun.runStatus === "error"
+                    ? " [last run FAILED]"
+                    : ""
+        }`,
         `Last receipt booked: ${ago(health.qbo.lastReceiptPush, now)}`,
         `Last payments sync: ${ago(health.qbo.lastPaymentsSync, now)}${
             health.qbo.lastPaymentsSync.runStatus === "partial"

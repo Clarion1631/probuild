@@ -31,6 +31,7 @@ import {
     escapeQBString,
     isQboConnectionFailure,
     isRetryableQboError,
+    isQBAmbiguousDocumentCreateError,
     isQboMalformedResponseError,
     qboHttpStatus,
     isQboReconnectRequired,
@@ -690,12 +691,49 @@ export class QBAmbiguousCreateError extends Error {
     }
 }
 
+/**
+ * The milestone row moved out from under a repair that had already read it.
+ *
+ * Raised by the existing-invoice pay-link repair when its CAS finds the row is
+ * no longer the one it looked at — most importantly when a concurrent
+ * break-link cleared `qbInvoiceId`, or a fresh send claimed the row with a new
+ * create marker. Both are ordinary, legitimate concurrent operations; the only
+ * wrong answer is to write anyway, because a stale `paylink-pending` landing on
+ * an unlinked row (or over a live create claim) either invents work for the
+ * sweep against an invoice that is gone, or overwrites the claim that is the
+ * only record another sender's POST ever went out.
+ */
+export class QBMilestoneRowMovedError extends Error {
+    name = "QBMilestoneRowMovedError";
+    constructor(subject: string) {
+        super(
+            `${subject} changed while QuickBooks was being read (it was unlinked, or sent again, in the meantime), ` +
+            `so nothing was written. Refresh and try again.`,
+        );
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBMilestoneRowMovedError(error: unknown): boolean {
+    return (
+        error instanceof QBMilestoneRowMovedError ||
+        (error instanceof Error && error.name === "QBMilestoneRowMovedError")
+    );
+}
+
 /** Did this failure leave the create's outcome genuinely unknown? */
 export function isAmbiguousCreateFailure(error: unknown): boolean {
     // A timeout or a dead connection means the request may have landed. A
-    // business refusal (4xx) means QuickBooks answered "no" and created
-    // nothing, so that is NOT ambiguous and must not park the row.
-    return isQBTimeoutError(error) || isRetryableQboError(error);
+    // business refusal (4xx WITH a QuickBooks Fault) means QuickBooks answered
+    // "no" and created nothing, so that is NOT ambiguous and must not park the
+    // row.
+    //
+    // QBAmbiguousDocumentCreateError is what the create boundary itself raises
+    // once it has decided an outcome is unknowable — a 4xx carrying no readable
+    // Fault, a body it could not read, a 2xx with no Id. It is neither a
+    // timeout nor a QboRetryableError, so without it here the callers would
+    // release their in-flight claim on exactly the states that must keep it.
+    return isQBTimeoutError(error) || isRetryableQboError(error) || isQBAmbiguousDocumentCreateError(error);
 }
 
 /** Reserved for the compensating delete, independent of the push's own budget. */
@@ -902,16 +940,25 @@ export async function finalizeMilestoneLinkUnderLock(
 }
 
 /**
- * The per-issuance idempotency seed, minted before the first QBO call.
+ * Create (or repair) one milestone's QuickBooks invoice.
  *
- * Keying on the row id de-duplicated a retry but could not express a
- * RE-ISSUE: after an unlink, the next send reused the same key and Intuit
- * returned the ORIGINAL (now stale or deleted) invoice instead of creating a
- * new one. A stored key that is minted on send and cleared on unlink separates
- * "same attempt, don't duplicate" from "new issuance, please create".
+ * WHAT STOPS A DUPLICATE, precisely — because the comment that used to sit here
+ * described a mechanism this function does not have. There is no stored
+ * idempotency key and no QBO `requestid` on this create (the Purchase rail has
+ * one, keyed off the Drive fileId; nothing on a milestone plays that role).
+ * What actually protects the client from a second bill is the marker:
  *
- * The CAS write is what makes it safe under concurrency: two pushes racing the
- * same milestone cannot mint two keys, so they cannot create two invoices.
+ *   • `claimMilestonePreCreateUnderLock` writes `create-in-flight` BEFORE the
+ *     POST, under the invoice lock, so a crash between the POST and the link
+ *     write leaves a trace and every other send path refuses the row;
+ *   • an outcome we never learned promotes that marker to `ambiguous-create`,
+ *     carrying the identity a human (or `resolveAmbiguousInvoiceCreateCore`)
+ *     needs to find the invoice in QuickBooks;
+ *   • only a QuickBooks refusal we can actually read — a 4xx with a parsed
+ *     Fault, see `isAmbiguousCreateFailure` — releases the claim.
+ *
+ * That is fail-closed rather than idempotent: it never re-sends into an unknown
+ * outcome, at the cost of needing a human to resolve one.
  */
 export async function pushMilestoneToQuickBooks(
     paymentScheduleId: string,
@@ -973,6 +1020,24 @@ export async function pushMilestoneToQuickBooks(
     const tokens = passedTokens ?? await getFreshQBTokens(pushDeadline);
 
     if (schedule.qbInvoiceId) {
+        // CLAIM BEFORE THE REMOTE CALL, and CAS every write against the link we
+        // read.
+        //
+        // This repair used to read the row, spend two remote round trips, and
+        // then `update({ where: { id } })` — pinned to the row's identity and
+        // nothing else. A break-link landing during those round trips clears
+        // `qbInvoiceId`, and a fresh send replaces `qbSyncError` with its own
+        // create claim; either way the stale write went through, stamping
+        // `paylink-pending` onto a row that no longer has a QuickBooks invoice,
+        // or erasing the in-flight claim that is the only durable record that
+        // another sender's POST ever left the building.
+        //
+        // Both halves matter. The claim below is CAS-pinned to the exact
+        // `{ qbInvoiceId, qbSyncError }` pair that was read, so a row that has
+        // already moved is detected BEFORE any QuickBooks call is spent; and the
+        // finalising write is pinned again to the same link, so a row that moves
+        // DURING the remote calls is refused rather than overwritten.
+        const linkedQbInvoiceId = schedule.qbInvoiceId;
         // The pay-link read now reports its failures instead of answering null.
         // A transient one (408/429/5xx/our deadline) must not fail a milestone
         // that is already correctly linked — it leaves PAYLINK_PENDING_MARKER so
@@ -981,31 +1046,60 @@ export async function pushMilestoneToQuickBooks(
         // surfaces.
         let payLink = schedule.qbInvoiceLink;
         let linkReadFailed = false;
+        /** What `qbSyncError` holds after the claim — what the final CAS pins. */
+        let markerNow = schedule.qbSyncError;
+        /** Did THIS call write a `paylink-pending` claim it now owes a retraction for? */
+        let claimedPending = false;
         if (!payLink) {
+            // A row already flagged `voided`/`notFound` KEEPS that flag: the
+            // claim is then purely the CAS probe (it rewrites the same value),
+            // because replacing a real diagnosis with `paylink-pending` would
+            // lose it whenever the status read below cannot reach the invoice.
+            const claimMarker = schedule.qbSyncError ?? PAYLINK_PENDING_MARKER;
+            const claimed = await prisma.paymentSchedule.updateMany({
+                where: { id: schedule.id, qbInvoiceId: linkedQbInvoiceId, qbSyncError: schedule.qbSyncError },
+                data: { qbSyncError: claimMarker },
+            });
+            if (claimed.count !== 1) {
+                throw new QBMilestoneRowMovedError(`${schedule.invoice.code} / ${schedule.name}`);
+            }
+            markerNow = claimMarker;
+            claimedPending = claimMarker === PAYLINK_PENDING_MARKER;
             try {
-                payLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId, pushDeadline);
+                payLink = await getQBInvoicePaymentLink(tokens, linkedQbInvoiceId, pushDeadline);
             } catch (error) {
                 if (!isAmbiguousCreateFailure(error)) throw error;
                 linkReadFailed = true;
             }
         }
-        const status = await getQBInvoiceStatus(tokens, schedule.qbInvoiceId, pushDeadline);
+        const status = await getQBInvoiceStatus(tokens, linkedQbInvoiceId, pushDeadline);
         const linkChanged = !!payLink && payLink !== schedule.qbInvoiceLink;
-        // A reachable invoice (status read back) clears any stale voided/notFound
-        // flag — unless the link read just failed, in which case the row still
-        // has work outstanding and must keep a marker for the sweep.
-        const clearFlag = !!status && !!schedule.qbSyncError && !linkReadFailed;
-        if (linkChanged || clearFlag || linkReadFailed) {
-            await prisma.paymentSchedule.update({
-                where: { id: schedule.id },
+        // Two different reasons to clear the marker, kept apart on purpose:
+        //   • a `paylink-pending` claim THIS call wrote is RETRACTED as soon as
+        //     the pay-link read answered at all (a link, or a definite "none")
+        //     — otherwise a row that had no marker before this call would be
+        //     left carrying one it never earned;
+        //   • a pre-existing `voided`/`notFound` flag (or a `paylink-pending`
+        //     this call did not write) is cleared only on the original
+        //     evidence, a reachable invoice.
+        // A failed link read clears nothing: the marker stays for the sweep.
+        const clearFlag = !linkReadFailed && (claimedPending || (!!markerNow && !!status));
+        if (linkChanged || clearFlag) {
+            const written = await prisma.paymentSchedule.updateMany({
+                // Pinned to the link we read AND to the marker the claim left,
+                // so an unlink or a new create claim during the remote calls
+                // above loses this write instead of being overwritten by it.
+                where: { id: schedule.id, qbInvoiceId: linkedQbInvoiceId, qbSyncError: markerNow },
                 data: {
                     ...(linkChanged ? { qbInvoiceLink: payLink } : {}),
                     ...(clearFlag ? { qbSyncError: null } : {}),
-                    ...(linkReadFailed ? { qbSyncError: PAYLINK_PENDING_MARKER } : {}),
                 },
             });
+            if (written.count !== 1) {
+                throw new QBMilestoneRowMovedError(`${schedule.invoice.code} / ${schedule.name}`);
+            }
         }
-        return { qbInvoiceId: schedule.qbInvoiceId, payLink, qbTotal: status?.total };
+        return { qbInvoiceId: linkedQbInvoiceId, payLink, qbTotal: status?.total };
     }
 
     // Fail closed: a previous attempt may already have created the invoice, or

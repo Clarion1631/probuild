@@ -29,7 +29,7 @@ import {
     CREATE_IN_FLIGHT_MARKER,
     CREATE_IN_FLIGHT_STALE_MS,
 } from "../src/lib/qbo-create-markers";
-import { milestoneIssuanceHash, progressBillingIssuanceHash } from "../src/lib/qbo-issuance";
+import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "../src/lib/qbo-issuance";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
 const ADMIN = { id: "u1", email: "admin@example.com", role: "ADMIN" };
@@ -111,6 +111,7 @@ function milestoneRow(overrides: Record<string, any> = {}): any {
         invoice: {
             code: "INV-00171",
             projectId: "proj-1",
+            estimateId: "est-1",
             taxRate: 8.9,
             client: { qbCustomerId: CUSTOMER_ID },
             project: { name: "Mesplay Kitchen" },
@@ -128,12 +129,32 @@ function billingRow(overrides: Record<string, any> = {}): any {
         qbInvoiceId: null,
         qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, BILLING_IDENTITY, AMBIGUOUS_MARKER_AT),
         invoiceId: "inv-1",
-        invoice: { code: "INV-00171", projectId: "proj-1", client: { qbCustomerId: CUSTOMER_ID } },
+        invoice: { code: "INV-00171", projectId: "proj-1", estimateId: "est-1", client: { qbCustomerId: CUSTOMER_ID } },
         ...overrides,
     };
 }
 
-function makeDb(milestone: any | null, billing: any | null) {
+/**
+ * The fake database.
+ *
+ * `$transaction` is REQUIRED by the resolver's seam, not optional, and this
+ * fake supplies a real one: every write goes through `writeUnderParentLocks`,
+ * which takes the Estimate -> Invoice locks (via `$queryRaw`) and RE-READS the
+ * parent invoice + client inside them. An optional transaction would have let
+ * these tests skip that path entirely and prove nothing about what production
+ * runs.
+ *
+ * `onLocked` runs at the moment the locks are held and the parent has not yet
+ * been re-read — the interleaving seam the round-36 tests use to move the
+ * client mapping or the invoice tax rate underneath a resolve that already
+ * decided.
+ */
+function makeDb(
+    milestone: any | null,
+    billing: any | null,
+    parentInvoice: any = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } },
+    onLocked?: () => void,
+) {
     const delegate = (row: any) => ({
         async findUnique() {
             return row ? { ...row } : null;
@@ -146,7 +167,34 @@ function makeDb(milestone: any | null, billing: any | null) {
             return { count: 1 };
         },
     });
-    return { paymentSchedule: delegate(milestone), progressBilling: delegate(billing) };
+    const paymentSchedule = delegate(milestone);
+    const progressBilling = delegate(billing);
+    const locks: string[] = [];
+    const tx = {
+        paymentSchedule,
+        progressBilling,
+        invoice: {
+            async findUnique() {
+                return parentInvoice ? { ...parentInvoice } : null;
+            },
+        },
+        // lockMoneyParents issues one tagged-template SELECT ... FOR UPDATE per
+        // parent; recording them lets a test assert the canonical order.
+        async $queryRaw(strings: TemplateStringsArray, ...values: any[]) {
+            locks.push(`${strings.join("?")}|${values.join(",")}`);
+            return [];
+        },
+    };
+    return {
+        paymentSchedule,
+        progressBilling,
+        locks,
+        parent: parentInvoice,
+        async $transaction<T>(fn: (t: any) => Promise<T>): Promise<T> {
+            onLocked?.();
+            return fn(tx);
+        },
+    };
 }
 
 const events: any[] = [];
@@ -154,12 +202,27 @@ const logEvent = (async (e: any) => {
     events.push(e);
 }) as any;
 
-const invoice = (id: string, privateNote: string | null, total = 1089): QBInvoiceMatch => ({
+/**
+ * A candidate as `findQBInvoicesByDocNumber` returns it.
+ *
+ * `customerId` and `totalTax` default to what the fixture create actually sent,
+ * so the happy path matches and a test that wants a QuickBooks-side divergence
+ * overrides exactly one of them.
+ */
+const invoice = (
+    id: string,
+    privateNote: string | null,
+    total = 1089,
+    overrides: Partial<QBInvoiceMatch> = {},
+): QBInvoiceMatch => ({
     id,
     docNumber: MILESTONE_DOC,
     privateNote,
     total,
     balance: total,
+    customerId: CUSTOMER_ID,
+    totalTax: MILESTONE_TAX.taxAmount,
+    ...overrides,
 });
 
 function deps(found: QBInvoiceMatch[] | (() => Promise<QBInvoiceMatch[]>), db: any) {
@@ -503,7 +566,10 @@ test("a progress billing resolves the same way, and comes back Staged", async ()
             actor: ADMIN,
             expectedState: ambiguousCreateFingerprint(row),
         },
-        deps([{ id: "qb-7", docNumber: "INV-00171-P1", privateNote: BILLING_NOTE, total: 1089, balance: 1089 }], db),
+        deps([{
+            id: "qb-7", docNumber: "INV-00171-P1", privateNote: BILLING_NOTE, total: 1089, balance: 1089,
+            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount,
+        }], db),
     );
 
     assert.equal(res.ok, true);
@@ -832,4 +898,212 @@ test("round 35 gate: canonicalPrivateNote truncates LAST, so the >4000-char case
     // possibly re-whitespaced at the edges — it must still canonicalize equal.
     assert.equal(canonicalPrivateNote(` ${ours}\n`), ours);
     assert.equal(canonicalPrivateNote(null), "");
+});
+
+// ─── Round 36 gate: the CANDIDATE INVOICE itself is verified ───────────────
+//
+// Everything the resolver checked before this looked at ProBuild's own state:
+// the marker, the row's issuance hash, `Client.qbCustomerId`. All of that
+// proves LOCAL state has not moved. It says nothing about the QuickBooks
+// document about to be adopted — whose CustomerRef can be edited in QuickBooks
+// after our create, and whose tax QuickBooks can recompute on its own.
+
+test("round 36 gate: an invoice QuickBooks bills to a DIFFERENT customer is refused, not linked", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 1089, { customerId: "99" })], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written — this bill is addressed to someone else");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked for manual review");
+});
+
+test("round 36 gate: an invoice whose CustomerRef cannot be read is refused, not linked", async () => {
+    // Same rule as the unreadable total: "cannot confirm" is not "matches".
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 1089, { customerId: null })], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 36 gate: a matching total split into DIFFERENT tax is refused", async () => {
+    // QuickBooks Automated Sales Tax can re-split the same grand total, and the
+    // split is the number the sales-tax return reads. $1089 as 1089/0 is not
+    // the invoice we sent as 1000/89.
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 1089, { totalTax: 0 })], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 36 gate: a taxed invoice whose TotalTax is absent is refused, not read as $0", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 1089, { totalTax: null })], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 36 gate: customer AND tax matching links, under the canonical money locks", async () => {
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(res.ok, true);
+    assert.equal(row.qbInvoiceId, "qb-9");
+    // Estimate before Invoice — the one global order every money-path
+    // transaction takes, so this resolve cannot deadlock against a settle.
+    assert.equal(db.locks.length, 2);
+    assert.match(db.locks[0], /"Estimate".*est-1/);
+    assert.match(db.locks[1], /"Invoice".*inv-1/);
+});
+
+// ─── Round 36 gate: PARENT-row state is re-read under the locks ────────────
+//
+// The link CAS pins the parked row's own columns. It cannot pin
+// `Client.qbCustomerId` or `Invoice.taxRate` — those live on other tables — and
+// the marker does not cover them either: it records what they were AT CREATE
+// TIME and is never rewritten when they move. A comment used to claim
+// otherwise. These drive the interleaving that comment made look impossible.
+
+test("round 36 gate: a client re-pointed at another QuickBooks customer DURING the resolve is refused", async () => {
+    const row = milestoneRow();
+    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
+    // Fires once the locks are held, before the parent is re-read: exactly the
+    // window between the decision and the write.
+    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written — the row now bills a different customer");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
+});
+
+test("round 36 gate: an invoice tax-rate edit DURING the resolve is refused", async () => {
+    // The rate only reaches the issuance hash when the milestone carries no
+    // explicit split of its own, so this fixture leaves both columns null and
+    // derives the same 1000/89 from the invoice's 8.9%.
+    const derivedTax = milestoneTaxSplit({
+        pretaxAmount: null, taxAmount: null, amount: MILESTONE_STATE.amount, invoiceTaxRate: 8.9,
+    });
+    const derivedState = { ...MILESTONE_STATE, pretaxAmount: null, taxAmount: null };
+    const identity = {
+        ...MILESTONE_IDENTITY,
+        issuanceHash: milestoneIssuanceHash({ ...derivedState, tax: derivedTax, customerId: CUSTOMER_ID }),
+    };
+    const row = milestoneRow({
+        pretaxAmount: null,
+        taxAmount: null,
+        qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity, AMBIGUOUS_MARKER_AT),
+    });
+    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
+    const db = makeDb(row, null, parent, () => { parent.taxRate = 10; });
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 1089, { totalTax: derivedTax!.taxAmount })], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written — the tax allocation is no longer the one that was sent");
+});
+
+test("round 36 gate: the CLEAR is guarded the same way — a customer remap mid-resolve refuses", async () => {
+    // Clearing releases the row to be sent again. The "QuickBooks has nothing"
+    // answer was reached against one customer mapping; if that moved while we
+    // looked, the answer is meaningless and the marker must stay.
+    const row = milestoneRow();
+    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
+    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — not released");
+});
+
+test("round 36 gate: a parked row whose parent invoice has vanished is refused, not linked", async () => {
+    // The customer and the tax rate both hang off the invoice. Nothing to read
+    // is "cannot verify", never "nothing changed".
+    const row = milestoneRow();
+    const db = makeDb(row, null, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+});
+
+test("round 36 gate: the progress-billing rail is guarded too", async () => {
+    const row = billingRow();
+    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
+    const db = makeDb(null, row, parent, () => { parent.client.qbCustomerId = "99"; });
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        {
+            kind: "progressBilling",
+            id: "pb-1",
+            decision: "link-existing",
+            reason: "Found INV-00171-P1 in QuickBooks",
+            actor: ADMIN,
+            expectedState: ambiguousCreateFingerprint(row),
+        },
+        deps([{
+            id: "qb-7", docNumber: "INV-00171-P1", privateNote: BILLING_NOTE, total: 1089, balance: 1089,
+            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount,
+        }], db),
+    );
+
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+    assert.notEqual(row.status, "Staged");
+});
+
+test("round 36 gate: the under-lock CUSTOMER check stands alone when the marker carries no issuance hash", async () => {
+    // A marker written between releases can carry realm + customer but no
+    // issuance hash. The link path refuses those outright
+    // ("issuance-unverifiable"), but a `confirmed-none` CLEAR does not need a
+    // hash — so on that path the re-read customer is the ONLY thing standing
+    // between a mid-resolve client remap and a released row.
+    const { issuanceHash: _dropped, ...noHash } = MILESTONE_IDENTITY;
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, noHash, AMBIGUOUS_MARKER_AT) });
+    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
+    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — not released");
 });

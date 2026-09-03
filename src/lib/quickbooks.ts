@@ -203,6 +203,129 @@ export function isQBAmbiguousDocumentCreateError(error: unknown): boolean {
     );
 }
 
+/**
+ * The ONLY HTTP statuses that can PROVE a document create made nothing.
+ *
+ * QuickBooks rejected the request on its own terms: the credential (401/403),
+ * the target (404) or the payload (400/422). All of them are decided before the
+ * transaction is written, so nothing exists to find afterwards and a retry is
+ * safe. Every other status — 429, any 5xx, anything unexpected — is QuickBooks
+ * failing to ANSWER, which says nothing about whether it also failed to act.
+ */
+export const DEFINITIVE_CREATE_REJECTION_STATUSES: readonly number[] = [400, 401, 403, 404, 422];
+
+/**
+ * The QBO `Fault` envelope, or `null` when the body does not carry one.
+ *
+ * This is the evidence half of "QuickBooks said no": a status on its own is a
+ * property of the HTTP hop (a gateway, a WAF, a proxy in front of Intuit can
+ * all produce a 4xx that Intuit itself never saw), whereas a parsed Fault is
+ * QuickBooks' own verdict on the document. Only a status AND a Fault together
+ * prove nothing was created.
+ */
+export function parseQboFault(body: string | null | undefined): { type: string | null; codes: string[] } | null {
+    if (!body) return null;
+    let data: unknown;
+    try {
+        data = JSON.parse(body);
+    } catch {
+        return null;
+    }
+    if (!data || typeof data !== "object") return null;
+    const record = data as Record<string, unknown>;
+    const fault = (record.Fault ?? record.fault) as Record<string, unknown> | undefined;
+    if (!fault || typeof fault !== "object") return null;
+    const rawErrors = (fault.Error ?? fault.error) as unknown;
+    const errors = Array.isArray(rawErrors) ? rawErrors : [];
+    return {
+        type: typeof fault.type === "string" ? fault.type : null,
+        codes: errors
+            .map((entry) => {
+                const code = entry && typeof entry === "object" ? (entry as Record<string, unknown>).code : null;
+                return code != null ? String(code) : "";
+            })
+            .filter(Boolean),
+    };
+}
+
+/**
+ * What a document create actually came back with, in the only terms the
+ * classification below cares about.
+ */
+export interface DocumentCreateOutcome {
+    /** The status QuickBooks answered with, or `null` when it never answered. */
+    status?: number | null;
+    /** The response body, when it could be read. */
+    body?: string;
+    /** The body could not be read at all, so no Fault could be parsed. */
+    bodyUnreadable?: boolean;
+    /** A 2xx that carried no document Id. */
+    missingId?: boolean;
+}
+
+/**
+ * ONE rule for every failure of a document create POST, shared by the estimate
+ * and invoice paths so the two cannot drift apart again.
+ *
+ * The invariant: **once the POST has been dispatched, every non-definitive
+ * outcome is ambiguous.** The old code classified non-2xx responses through
+ * `qboResponseError`, which sits OUTSIDE that boundary and only knows about
+ * transport semantics — so a 500 or a 503 arriving after QuickBooks had already
+ * processed the POST came back as `QboRetryableError`, and
+ * `/api/quickbooks/sync` answered `retry: true` for a document that may well
+ * exist. Retrying then bills the client twice, which is the exact failure the
+ * ambiguous-create machinery exists to prevent.
+ *
+ * Terminal (nothing was created, safe to retry after fixing the cause): a
+ * status in `DEFINITIVE_CREATE_REJECTION_STATUSES` whose body carries a parsed
+ * QBO Fault. A 4xx with no readable Fault deliberately does NOT qualify — an
+ * edge device in front of Intuit can produce one without Intuit ever seeing the
+ * request, and "we could not read the refusal" is not a refusal.
+ *
+ * Ambiguous (check QuickBooks before retrying): everything else — 429, 5xx, an
+ * unexpected status, a body that could not be read, and a 2xx with no Id.
+ *
+ * NOT this function's business: failures BEFORE dispatch (a token refresh, a
+ * customer or item lookup) and a caller's own abort. Those never reach here;
+ * their callers keep reporting them as retryable/cancelled.
+ */
+export function classifyDocumentCreateFailure(outcome: DocumentCreateOutcome, label: string): Error {
+    const status = outcome.status ?? null;
+    if (
+        status !== null
+        && !outcome.missingId
+        && DEFINITIVE_CREATE_REJECTION_STATUSES.includes(status)
+        && !outcome.bodyUnreadable
+        && parseQboFault(outcome.body) !== null
+    ) {
+        // Status preserved, so the route still reports a 401/403 as the
+        // reconnect it is rather than a generic failure.
+        return qboErrorFromStatus(status, outcome.body ?? "", label);
+    }
+    return new QBAmbiguousDocumentCreateError(label);
+}
+
+/**
+ * `classifyDocumentCreateFailure` for a live non-2xx `Response`.
+ *
+ * Deliberately NOT `qboResponseError`: that helper rethrows a body-read timeout
+ * or transport failure as itself, which is right for a read but wrong here — on
+ * a create, failing to read the refusal means we never learned the outcome, so
+ * it is ambiguous. Only a CALLER's own abort still propagates unchanged, so a
+ * cancellation stays distinguishable from an outage.
+ */
+export async function documentCreateResponseError(res: Response, label: string): Promise<Error> {
+    let body = "";
+    let bodyUnreadable = false;
+    try {
+        body = await res.text();
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        bodyUnreadable = true;
+    }
+    return classifyDocumentCreateFailure({ status: res.status, body, bodyUnreadable }, label);
+}
+
 /** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
 export function isRetryableQboError(error: unknown): boolean {
     return (
@@ -1032,7 +1155,14 @@ export async function createQBMilestoneInvoice(
         body: JSON.stringify(payload),
         qbDeadline: deadline,
     });
-    if (!res.ok) throw await qboResponseError(res, "QB milestone invoice create");
+    // The SAME create-boundary rule the estimate/invoice pushes use: a 4xx only
+    // ends this create when QuickBooks itself refused it (a parsed Fault), and
+    // every other non-2xx is an outcome we never learned. Routed through
+    // `qboResponseError` this used to hand a Fault-less 4xx back as a plain
+    // QboHttpError, which `isAmbiguousCreateFailure` reads as "QuickBooks said
+    // no" — so the caller RELEASED its in-flight claim and the row became
+    // freely re-sendable while an invoice may have existed.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB milestone invoice create");
     const data = await parseJsonOrNull(res);
     const invoice = data?.Invoice;
     const qbId = invoice?.Id ? String(invoice.Id) : "";
@@ -1040,10 +1170,12 @@ export async function createQBMilestoneInvoice(
     // A 200 with no usable invoice is NOT a success. Returning an empty id and
     // a NaN-coerced 0 let the caller link a milestone to nothing, or "verify" a
     // total against a fabricated zero. We cannot tell whether QBO created
-    // something, so this is ambiguous and retryable — the requestid above makes
-    // that retry safe.
+    // something, so it is ambiguous — the row stays parked on its marker and a
+    // human resolves it against QuickBooks. (This create carries no `requestid`
+    // idempotency key; an earlier comment here claimed one, and none was ever
+    // sent on this path.)
     if (!qbId || !Number.isFinite(total)) {
-        throw new QboRetryableError("QB milestone invoice create returned no usable Invoice");
+        throw classifyDocumentCreateFailure({ status: res.status, missingId: true }, "QB milestone invoice create");
     }
     return { qbId, qbUrl: `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`, total };
 }
@@ -1096,6 +1228,31 @@ export interface QBInvoiceMatch {
     privateNote: string | null;
     total: number;
     balance: number;
+    /**
+     * `CustomerRef.value` — WHO QuickBooks is actually billing for this
+     * document.
+     *
+     * The resolver used to check the customer only against ProBuild's own
+     * `Client.qbCustomerId`, which proves that LOCAL state has not moved since
+     * the create and says nothing at all about the invoice it is about to
+     * adopt. A DocNumber is unique to neither the company nor the customer, and
+     * the CustomerRef of a real QuickBooks invoice can be edited in QuickBooks
+     * after we created it — either way the row would be linked to a bill
+     * addressed to somebody else. `null` when the payload carried no readable
+     * CustomerRef, which the resolver treats as unverifiable (refused), not as
+     * a match.
+     */
+    customerId: string | null;
+    /**
+     * `TxnTaxDetail.TotalTax` — the sales-tax liability QuickBooks is actually
+     * carrying on this document.
+     *
+     * The grand total alone cannot distinguish the invoice we sent from one
+     * QuickBooks re-computed under Automated Sales Tax into a different
+     * pre-tax/tax split, and the split is what Vanessa's sales-tax reporting
+     * reads. `null` when the payload carried no readable TotalTax.
+     */
+    totalTax: number | null;
 }
 
 /** The page size findQBInvoicesByDocNumber queries. Kept as a constant so the
@@ -1141,6 +1298,9 @@ export async function findQBInvoicesByDocNumber(
     docNumber: string,
     deadline?: RouteDeadline,
 ): Promise<QBInvoiceMatch[]> {
+    // `select *` already returns CustomerRef and TxnTaxDetail; both are mapped
+    // out below because the resolver has to verify WHO the invoice bills and
+    // WHAT TAX it carries, not just that its DocNumber and PrivateNote match.
     const rows = await qbQuery<any>(
         tokens,
         `select * from Invoice where DocNumber = '${escapeQBString(docNumber)}' maxresults ${FIND_INVOICES_BY_DOC_NUMBER_LIMIT}`,
@@ -1157,6 +1317,20 @@ export async function findQBInvoicesByDocNumber(
             privateNote: inv.PrivateNote != null ? String(inv.PrivateNote) : null,
             total: Number(inv.TotalAmt ?? 0),
             balance: Number(inv.Balance ?? 0),
+            // Absent/blank reads as `null` (unverifiable), never as a match:
+            // `String(undefined)` would have produced the literal "undefined"
+            // and compared unequal by luck rather than by rule.
+            customerId: inv.CustomerRef?.value != null && String(inv.CustomerRef.value) !== ""
+                ? String(inv.CustomerRef.value)
+                : null,
+            // A missing TxnTaxDetail is NOT a $0 tax answer — the resolver has
+            // to be able to tell "QuickBooks says no tax" from "QuickBooks did
+            // not tell us", so an absent or unreadable value stays null.
+            // `Number(null)` is 0, so the null check comes FIRST — otherwise an
+            // explicit `"TotalTax": null` would read as a confident $0.
+            totalTax: inv.TxnTaxDetail?.TotalTax != null && Number.isFinite(Number(inv.TxnTaxDetail.TotalTax))
+                ? Number(inv.TxnTaxDetail.TotalTax)
+                : null,
         }));
 }
 
@@ -1814,20 +1988,26 @@ export async function syncEstimateToQB(
             qbDeadline: deadline,
         });
     } catch (error) {
-        // The POST was dispatched — a timeout or transport failure now means
-        // the outcome is UNKNOWN, not that the create failed. QuickBooks may
-        // already hold the estimate; the caller must not retry as though this
-        // were an ordinary outage (see /api/quickbooks/sync's classification).
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) {
-            throw new QBAmbiguousDocumentCreateError("QB estimate sync");
-        }
-        throw error;
+        // Two failures here happened BEFORE the request went out, and only
+        // those two: the route budget was already gone (`qbTimedFetch` checks
+        // it before calling `fetch`), or the CALLER cancelled. Nothing was
+        // created in either case, so they propagate as themselves and stay
+        // retryable.
+        if (isQBBudgetExhaustedError(error) || isAbortError(error)) throw error;
+        // Everything else means the POST was dispatched and we never learned
+        // the outcome — a timeout, a dead socket, a transport error. QuickBooks
+        // may already hold the estimate; the caller must not retry as though
+        // this were an ordinary outage (see /api/quickbooks/sync).
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
     }
 
-    // Every non-2xx goes through the shared classifier: a 429 or 5xx here is
-    // QuickBooks being unavailable, not a verdict on this estimate, and a bare
-    // Error made the two indistinguishable to every caller upstream.
-    if (!res.ok) throw await qboResponseError(res, "QB estimate sync");
+    // Every non-2xx goes through the CREATE classifier, which is not the same
+    // thing as the general one. `qboResponseError` sits outside the ambiguity
+    // boundary: it turned a 429/5xx into QboRetryableError, and the route then
+    // advertised `retry: true` for an estimate QuickBooks may already hold. A
+    // status only ends this create when QuickBooks itself refused it — see
+    // classifyDocumentCreateFailure.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB estimate sync");
 
     // A 2xx header only proves QuickBooks accepted the request, not that we
     // ever learned what it did with it. The old boundary ended above this
@@ -1906,14 +2086,12 @@ export async function syncInvoiceToQB(
         });
     } catch (error) {
         // Same "dispatched, outcome unknown" handling as the estimate push above.
-        if (isQBTimeoutError(error) || isRetryableQboError(error)) {
-            throw new QBAmbiguousDocumentCreateError("QB invoice sync");
-        }
-        throw error;
+        if (isQBBudgetExhaustedError(error) || isAbortError(error)) throw error;
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
     }
 
-    // Same shared classification as the estimate push above.
-    if (!res.ok) throw await qboResponseError(res, "QB invoice sync");
+    // Same create-boundary classification as the estimate push above.
+    if (!res.ok) throw await documentCreateResponseError(res, "QB invoice sync");
 
     // See the matching comment on syncEstimateToQB above: a 2xx only proves
     // QuickBooks accepted the request, so a body-read/parse failure here is

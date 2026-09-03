@@ -22,6 +22,7 @@
  * wrapper, so a test of the refusal exercises the real decision.
  */
 import { prisma } from "./prisma";
+import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { logAutomationEvent } from "./automation-events";
 import { canResolveAmbiguousCreate, canAccessProject, type ProjectScopedUser } from "./access-rules";
 import {
@@ -45,6 +46,7 @@ import {
 } from "./quickbooks-payments";
 import type { CreateIdentity } from "./qbo-create-markers";
 import { milestoneIssuanceHash, progressBillingIssuanceHash, milestoneTaxSplit } from "./qbo-issuance";
+import { toNum } from "./prisma-helpers";
 
 /** Whole-operation budget: a token refresh plus one query, and room to answer. */
 export const RESOLVE_AMBIGUOUS_BUDGET_MS = 25_000;
@@ -124,16 +126,52 @@ export interface ResolveAmbiguousCreateInput {
     actor: AmbiguousCreateActor;
 }
 
+/**
+ * The transaction client the guarded write runs on.
+ *
+ * `$queryRaw` is here because `lockMoneyParents` uses it to take the
+ * Estimate → Invoice row locks; `invoice.findUnique` because the parent state
+ * this resolver's decision depends on (the client's QuickBooks customer, the
+ * invoice's tax rate) has to be RE-READ inside those locks.
+ */
+export interface AmbiguousCreateTx {
+    paymentSchedule: { updateMany(args: any): Promise<{ count: number }> };
+    progressBilling: { updateMany(args: any): Promise<{ count: number }> };
+    invoice: { findUnique(args: any): Promise<any> };
+    $queryRaw(...args: any[]): Promise<unknown>;
+}
+
 /** Test seam: the QBO lookup and the two table delegates. */
 export interface ResolveAmbiguousCreateDeps {
     db?: {
-        paymentSchedule: { findUnique(args: any): Promise<any>; updateMany(args: any): Promise<{ count: number }> };
-        progressBilling: { findUnique(args: any): Promise<any>; updateMany(args: any): Promise<{ count: number }> };
+        paymentSchedule: { findUnique(args: any): Promise<any> };
+        progressBilling: { findUnique(args: any): Promise<any> };
+        /**
+         * Required, not optional. Every write this resolver makes runs inside
+         * it — an optional transaction seam would let a fake database skip the
+         * parent-lock path entirely, so the tests would prove nothing about the
+         * code that actually runs in production.
+         */
+        $transaction<T>(fn: (tx: AmbiguousCreateTx) => Promise<T>): Promise<T>;
     };
     getTokens?: (deadline: RouteDeadline) => Promise<QBTokens>;
     findInvoices?: (tokens: QBTokens, docNumber: string, deadline: RouteDeadline) => Promise<QBInvoiceMatch[]>;
     logEvent?: typeof logAutomationEvent;
     deadline?: RouteDeadline;
+}
+
+/**
+ * The issuance inputs that live on PARENT rows, not on the parked row itself.
+ *
+ * Both feed the create payload — the customer it is billed to, and (milestone
+ * rail only) the rate its tax allocation is derived from — and neither can be
+ * pinned by a child-table CAS. They are re-read under the money locks instead.
+ */
+export interface ParentIssuanceState {
+    /** `Client.qbCustomerId` as it stands under the lock. */
+    customerId: string | null;
+    /** `Invoice.taxRate` as it stands under the lock. Unused on the billing rail. */
+    invoiceTaxRate: unknown;
 }
 
 /** What we expect QuickBooks to be holding, if the create did land. */
@@ -157,6 +195,28 @@ interface ParkedRow {
      */
     currentIssuanceHash: string;
     /**
+     * The same hash, recomputed against PARENT-row values supplied by the
+     * caller instead of the ones read at load time.
+     *
+     * The child columns are frozen by the link CAS (`issuanceWhere`), but the
+     * two inputs that live on OTHER tables — `Client.qbCustomerId` and
+     * `Invoice.taxRate` — cannot go in a `PaymentSchedule` `updateMany` where.
+     * A comment here used to claim the marker covered them; it does not. The
+     * marker records what those values were AT CREATE TIME and is never
+     * rewritten when they change, so re-pointing the client at another
+     * QuickBooks customer, or moving the invoice's tax rate, left the CAS
+     * matching and the link going through. This closure is what lets the write
+     * transaction re-read them under the money locks and recompute.
+     */
+    issuanceHashWith(parent: ParentIssuanceState): string;
+    /**
+     * The sales tax the create actually sent, in dollars — `0` when the payload
+     * carried no tax line. Compared against the CANDIDATE invoice's own
+     * `TxnTaxDetail.TotalTax`, so a QuickBooks-side re-split that leaves the
+     * grand total alone cannot be adopted.
+     */
+    expectedTaxAmount: number;
+    /**
      * Those same columns as a Prisma `where` fragment, folded into the link
      * CAS. The hash comparison is a read; this is what makes the decision
      * atomic with the write, so a settle landing between the two cannot slip a
@@ -172,6 +232,14 @@ interface ParkedRow {
     projectId: string | null;
     invoiceId: string | null;
     /**
+     * The parent invoice's estimate, read for LOCK ORDER only.
+     *
+     * Every money-path transaction takes Estimate before Invoice
+     * (`lockMoneyParents`), so this one must too or it can deadlock against a
+     * settle running the other way.
+     */
+    estimateId: string | null;
+    /**
      * The QuickBooks customer this row bills TODAY — the persisted
      * `Client.qbCustomerId` the create path wrote when it ran
      * `resolveCustomerAndItem`. Compared against the marker's own
@@ -186,7 +254,10 @@ export async function resolveAmbiguousInvoiceCreateCore(
     input: ResolveAmbiguousCreateInput,
     deps?: ResolveAmbiguousCreateDeps,
 ): Promise<ResolveAmbiguousCreateResult> {
-    const db = deps?.db ?? prisma;
+    // Cast rather than structurally checked: PrismaClient's `$transaction` is
+    // overloaded (array form, callback form, options form) and the narrow
+    // callback shape this module needs does not assign cleanly from it.
+    const db = deps?.db ?? (prisma as unknown as NonNullable<ResolveAmbiguousCreateDeps["db"]>);
     const logEvent = deps?.logEvent ?? logAutomationEvent;
     const findInvoices = deps?.findInvoices ?? findQBInvoicesByDocNumber;
     const getTokens = deps?.getTokens ?? getFreshQBTokens;
@@ -388,8 +459,6 @@ export async function resolveAmbiguousInvoiceCreateCore(
         };
     }
 
-    const delegate = input.kind === "milestone" ? db.paymentSchedule : db.progressBilling;
-
     if (matches.length === 1) {
         // An invoice exists — but "it is ours" and "it still describes this
         // row" are different questions, and only the first one has been
@@ -456,14 +525,63 @@ export async function resolveAmbiguousInvoiceCreateCore(
                     `in QuickBooks before doing anything else with this row. Nothing was changed here.`,
             };
         }
+        // WHO QUICKBOOKS IS ACTUALLY BILLING.
+        //
+        // The customer was checked once already, near the top — but that check
+        // compares the MARKER against ProBuild's OWN `Client.qbCustomerId`, so
+        // all it proves is that local state has not moved. It says nothing
+        // about the document in front of us. QuickBooks holds the CustomerRef,
+        // it can be edited there after our create, and a DocNumber is unique to
+        // neither the company nor the customer — so an invoice addressed to
+        // somebody else could still reach this line wearing a matching
+        // DocNumber, PrivateNote and total.
+        //
+        // An unreadable CustomerRef is refused for the same reason an
+        // unreadable total is: "cannot confirm" is not "matches".
+        if (matches[0].customerId !== parked.identity.customerId) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but QuickBooks bills it to customer ` +
+                    `${matches[0].customerId ?? "nobody we can read"} while ${parked.code} was sent to customer ${parked.identity.customerId}. ` +
+                    `Linking would attach a bill addressed to someone else — check invoice ${parked.identity.docNumber} in QuickBooks. Nothing was changed here.`,
+            };
+        }
+        // AND WHAT TAX IT CARRIES.
+        //
+        // The grand total matching does not mean the invoice matches: QuickBooks
+        // Automated Sales Tax can re-split the same total into a different
+        // pre-tax/tax pair, and the split is the number Vanessa's sales-tax
+        // reporting reads. `expectedTaxAmount` is what the create actually sent
+        // — trustworthy here precisely because the issuance hash above has
+        // already proved this row still holds the state it was issued from.
+        //
+        // An absent TotalTax is only accepted when we sent no tax either; on a
+        // taxed invoice it is another "cannot confirm".
+        const remoteTax = matches[0].totalTax;
+        const taxUnverifiable = remoteTax === null && parked.expectedTaxAmount > 0.005;
+        if (taxUnverifiable || (remoteTax !== null && Math.abs(remoteTax - parked.expectedTaxAmount) > 0.005)) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but its sales tax ` +
+                    `(${remoteTax === null ? "unreadable" : `$${remoteTax.toFixed(2)}`}) does not match what ${parked.code} was sent with ` +
+                    `($${parked.expectedTaxAmount.toFixed(2)}) — check invoice ${parked.identity.docNumber} in QuickBooks before doing anything else with this row. ` +
+                    `Nothing was changed here.`,
+            };
+        }
         // QuickBooks is the truth: an invoice exists, whatever the operator
         // asserted. Adopt it. PAYLINK_PENDING_MARKER rather than null, because
         // we have the id but not the pay link — the maintenance sweep fetches it.
         const qbInvoiceId = matches[0].id;
-        const linked = await delegate.updateMany({
+        const linked = await writeUnderParentLocks(db, input.kind, parked, (delegate) => delegate.updateMany({
             // The issuance columns are pinned here as well as hashed above: the
             // hash check is a read taken before this write, so without them a
-            // settle or a reprice landing in between would still be linked.
+            // settle or a reprice landing in between would still be linked. The
+            // parent-side inputs are covered by the surrounding transaction —
+            // see writeUnderParentLocks.
             where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker, ...parked.issuanceWhere },
             data: {
                 qbInvoiceId,
@@ -471,10 +589,8 @@ export async function resolveAmbiguousInvoiceCreateCore(
                 qbSyncError: PAYLINK_PENDING_MARKER,
                 ...(input.kind === "progressBilling" ? { status: "Staged" } : {}),
             },
-        });
-        if (linked.count !== 1) {
-            return { ok: false, refusal: "changed", message: "This changed while it was being resolved. Refresh and look again." };
-        }
+        }));
+        if (!linked.ok) return linked.refused;
         await audit(logEvent, input, parked, "linked", reason, { qbInvoiceId });
         return {
             ok: true,
@@ -497,15 +613,119 @@ export async function resolveAmbiguousInvoiceCreateCore(
     // front, before any QuickBooks call — see the comment there. By the time
     // we get here it has already refused a fresh create-in-flight/ambiguous
     // marker for every outcome, clearing included.
-    const cleared = await delegate.updateMany({
+    //
+    // The clear runs under the same parent locks as the link, and for the same
+    // reason: the "nothing exists in QuickBooks" answer was reached against a
+    // particular customer mapping, and clearing releases the row to be sent
+    // again. A client re-pointed at another QuickBooks customer while this ran
+    // makes that answer meaningless, so the guard refuses rather than freeing
+    // a row whose real invoice may be sitting in the other customer's ledger.
+    const cleared = await writeUnderParentLocks(db, input.kind, parked, (delegate) => delegate.updateMany({
         where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker },
         data: { qbSyncError: null },
-    });
-    if (cleared.count !== 1) {
-        return { ok: false, refusal: "changed", message: "This changed while it was being resolved. Refresh and look again." };
-    }
+    }));
+    if (!cleared.ok) return cleared.refused;
     await audit(logEvent, input, parked, "cleared", reason, {});
     return { ok: true, outcome: "cleared", message: "Cleared — QuickBooks has nothing for this, so it can be sent again." };
+}
+
+/**
+ * Run this resolver's ONE write inside the canonical money-path transaction.
+ *
+ * The child CAS (`issuanceWhere` + the marker + a null `qbInvoiceId`) pins
+ * every column that lives on the parked row itself. It cannot pin the two
+ * inputs that live on parent rows — `Client.qbCustomerId` and, on the milestone
+ * rail, `Invoice.taxRate` — and the marker does not cover them either: it
+ * records what they were when the create ran and is never rewritten when they
+ * move. So between the read that decided this resolve and the write that
+ * commits it, a client could be re-pointed at a different QuickBooks customer,
+ * or an invoice's tax rate edited, and the CAS would still match.
+ *
+ * This closes that window the same way every other money path does:
+ *
+ *   1. `withTxRetry` + `$transaction`, so a deadlock re-runs cleanly.
+ *   2. `lockMoneyParents` in the canonical Estimate → Invoice order, so this
+ *      cannot deadlock against a settle or a reprice running concurrently.
+ *   3. RE-READ the parent state under those locks and recompute the issuance
+ *      hash from it. Any divergence from what the marker was written against
+ *      aborts with `mismatch` and writes nothing.
+ *   4. Only then the child CAS.
+ *
+ * Both rails go through here — the milestone rail and the progress-billing
+ * rail — and so do both outcomes, the link and the clear.
+ */
+async function writeUnderParentLocks(
+    db: NonNullable<ResolveAmbiguousCreateDeps["db"]>,
+    kind: AmbiguousCreateKind,
+    parked: ParkedRow,
+    write: (delegate: { updateMany(args: any): Promise<{ count: number }> }) => Promise<{ count: number }>,
+): Promise<{ ok: true } | { ok: false; refused: ResolveAmbiguousCreateResult }> {
+    const changed: ResolveAmbiguousCreateResult = {
+        ok: false,
+        refusal: "changed",
+        message: "This changed while it was being resolved. Refresh and look again.",
+    };
+    return withTxRetry(() => db.$transaction(async (tx) => {
+        // Canonical order: Estimate → Invoice → child rows.
+        // `tx` is the narrow seam shape above; lockMoneyParents only uses its
+        // `$queryRaw`, which that shape declares.
+        await lockMoneyParents(tx as any, { estimateId: parked.estimateId, invoiceId: parked.invoiceId });
+
+        // A parked row with no parent invoice cannot be verified at all — the
+        // customer and the tax rate both hang off it. Fail closed rather than
+        // treating "nothing to read" as "nothing changed".
+        if (!parked.invoiceId) {
+            return { ok: false as const, refused: mismatchRefusal(parked, "its invoice is missing") };
+        }
+        const parent = await tx.invoice.findUnique({
+            where: { id: parked.invoiceId },
+            select: { taxRate: true, client: { select: { qbCustomerId: true } } },
+        });
+        if (!parent) {
+            return { ok: false as const, refused: mismatchRefusal(parked, "its invoice is missing") };
+        }
+        const parentState: ParentIssuanceState = {
+            customerId: parent.client?.qbCustomerId ?? null,
+            invoiceTaxRate: parent.taxRate,
+        };
+        // The customer the row bills RIGHT NOW, under the lock, must still be
+        // the one the create POST addressed.
+        if (parentState.customerId !== parked.identity?.customerId) {
+            return {
+                ok: false as const,
+                refused: mismatchRefusal(
+                    parked,
+                    `it now bills QuickBooks customer ${parentState.customerId ?? "nobody"} instead of ${parked.identity?.customerId ?? "the recorded customer"}`,
+                ),
+            };
+        }
+        // And the whole money state, recomputed from those locked parent
+        // values, must still hash to what the marker recorded. This is what
+        // catches an invoice tax-rate edit: it changes the milestone's tax
+        // allocation without touching a single column the child CAS pins.
+        if (parked.identity?.issuanceHash && parked.identity.issuanceHash !== parked.issuanceHashWith(parentState)) {
+            return {
+                ok: false as const,
+                refused: mismatchRefusal(parked, "the money it was issued for has changed on its parent invoice (its tax rate or billing customer)"),
+            };
+        }
+
+        const delegate = kind === "milestone" ? tx.paymentSchedule : tx.progressBilling;
+        const written = await write(delegate);
+        if (written.count !== 1) return { ok: false as const, refused: changed };
+        return { ok: true as const };
+    }));
+}
+
+/** One shape for every "the parent state moved under us" refusal. */
+function mismatchRefusal(parked: ParkedRow, what: string): ResolveAmbiguousCreateResult {
+    return {
+        ok: false,
+        refusal: "mismatch",
+        message:
+            `${parked.code} changed while it was being resolved — ${what}. Nothing was changed here; ` +
+            `check invoice ${parked.identity?.docNumber ?? parked.code} in QuickBooks and try again.`,
+    };
 }
 
 async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Promise<ParkedRow | null> {
@@ -529,7 +749,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
                 pretaxAmount: true, taxAmount: true,
                 invoice: {
                     select: {
-                        code: true, projectId: true, taxRate: true,
+                        code: true, projectId: true, taxRate: true, estimateId: true,
                         // Who this row bills in QuickBooks TODAY.
                         client: { select: { qbCustomerId: true } },
                     },
@@ -538,23 +758,37 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         });
         if (!row) return null;
         const customerId = row.invoice?.client?.qbCustomerId ?? null;
+        // ONE definition of "the hash of this row's money state", parameterised
+        // by the parent values — used both for the pre-flight comparison below
+        // and, with values re-read under the money locks, for the guard that
+        // actually gates the write.
+        const issuanceHashWith = (parent: ParentIssuanceState) => milestoneIssuanceHash({
+            status: row.status ?? null,
+            amount: row.amount,
+            dueDate: row.dueDate ?? null,
+            qbPaymentId: row.qbPaymentId ?? null,
+            tax: milestoneTaxSplit({
+                pretaxAmount: row.pretaxAmount,
+                taxAmount: row.taxAmount,
+                amount: row.amount,
+                invoiceTaxRate: parent.invoiceTaxRate,
+            }),
+            customerId: parent.customerId,
+        });
         return {
             id: row.id,
             code: row.name || row.invoice?.code || row.id,
             ...parkedIdentity(row),
-            currentIssuanceHash: milestoneIssuanceHash({
-                status: row.status ?? null,
+            issuanceHashWith,
+            currentIssuanceHash: issuanceHashWith({ customerId, invoiceTaxRate: row.invoice?.taxRate }),
+            // The tax line createQBMilestoneInvoice sent, or $0 when it sent
+            // none — the value the candidate invoice's own TotalTax must match.
+            expectedTaxAmount: milestoneTaxSplit({
+                pretaxAmount: row.pretaxAmount,
+                taxAmount: row.taxAmount,
                 amount: row.amount,
-                dueDate: row.dueDate ?? null,
-                qbPaymentId: row.qbPaymentId ?? null,
-                tax: milestoneTaxSplit({
-                    pretaxAmount: row.pretaxAmount,
-                    taxAmount: row.taxAmount,
-                    amount: row.amount,
-                    invoiceTaxRate: row.invoice?.taxRate,
-                }),
-                customerId,
-            }),
+                invoiceTaxRate: row.invoice?.taxRate,
+            })?.taxAmount ?? 0,
             issuanceWhere: {
                 status: row.status,
                 amount: row.amount,
@@ -563,17 +797,24 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
                 // The tax columns are pinned too, for the same reason the
                 // amount is: the hash comparison is a read taken before the
                 // link write, so a tax edit landing in between would otherwise
-                // still be linked. `invoice.taxRate` and the client's customer
-                // id live on OTHER tables and cannot go in this `updateMany`
-                // where — they are covered instead by the marker string itself,
-                // which the CAS pins and which now carries both the issuance
-                // hash and the realm/customer identity.
+                // still be linked.
+                //
+                // `invoice.taxRate` and the client's customer id live on OTHER
+                // tables and cannot go in this `updateMany` where. They are NOT
+                // covered by the marker string either — a previous version of
+                // this comment claimed they were, and that was simply false:
+                // the marker records what they were when the create ran and is
+                // never rewritten when they change, so pinning it proves
+                // nothing about them. They are covered by the write
+                // transaction, which locks Estimate → Invoice and re-reads both
+                // under those locks before this CAS runs.
                 pretaxAmount: row.pretaxAmount,
                 taxAmount: row.taxAmount,
             },
             fingerprint: ambiguousCreateFingerprint(row),
             projectId: row.invoice?.projectId ?? null,
             invoiceId: row.invoiceId ?? null,
+            estimateId: row.invoice?.estimateId ?? null,
             customerId,
         };
     }
@@ -584,7 +825,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
             status: true, subtotal: true, total: true, taxAmount: true,
             invoice: {
                 select: {
-                    code: true, projectId: true,
+                    code: true, projectId: true, estimateId: true,
                     client: { select: { qbCustomerId: true } },
                 },
             },
@@ -592,17 +833,27 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
     });
     if (!row) return null;
     const customerId = row.invoice?.client?.qbCustomerId ?? null;
+    // Same parameterisation as the milestone rail. The billing's tax lives in
+    // its own `taxAmount` column (pinned by the CAS), so only the customer
+    // moves with the parent — but the shape is shared so neither rail can grow
+    // a private copy of the rule.
+    const issuanceHashWith = (parent: ParentIssuanceState) => progressBillingIssuanceHash({
+        status: row.status ?? null,
+        subtotal: row.subtotal,
+        total: row.total,
+        taxAmount: row.taxAmount,
+        customerId: parent.customerId,
+    });
     return {
         id: row.id,
         code: row.code,
         ...parkedIdentity(row),
-        currentIssuanceHash: progressBillingIssuanceHash({
-            status: row.status ?? null,
-            subtotal: row.subtotal,
-            total: row.total,
-            taxAmount: row.taxAmount,
-            customerId,
-        }),
+        issuanceHashWith,
+        currentIssuanceHash: issuanceHashWith({ customerId, invoiceTaxRate: null }),
+        // stageProgressBilling sends `{ preTaxAmount: subtotal, taxAmount }`
+        // only when taxAmount > 0, so a non-positive column means the payload
+        // carried no tax line at all.
+        expectedTaxAmount: toNum(row.taxAmount) > 0 ? toNum(row.taxAmount) : 0,
         issuanceWhere: {
             status: row.status,
             subtotal: row.subtotal,
@@ -612,6 +863,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
         fingerprint: ambiguousCreateFingerprint(row),
         projectId: row.invoice?.projectId ?? null,
         invoiceId: row.invoiceId ?? null,
+        estimateId: row.invoice?.estimateId ?? null,
         customerId,
     };
 }

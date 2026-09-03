@@ -547,8 +547,9 @@ test("an ordinary error body is still read into the message", async () => {
 
 // --- An invoice create must actually return an invoice ---
 
-test("a 200 with no usable Invoice is ambiguous and retryable, never a silent link", async () => {
-    const { createQBMilestoneInvoice, isRetryableQboError } = await import("../src/lib/quickbooks");
+test("a 200 with no usable Invoice is ambiguous, never a silent link", async () => {
+    const { createQBMilestoneInvoice, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const { isAmbiguousCreateFailure } = await import("../src/lib/quickbooks-payments");
     const TOKENS = { accessToken: "a", refreshToken: "r", realmId: "test-realm" };
     const args = {
         docNumber: "INV-1", idempotencyKey: "sched-1", customerId: "c1", itemId: "i1",
@@ -565,7 +566,12 @@ test("a 200 with no usable Invoice is ambiguous and retryable, never a silent li
         try {
             const error = await createQBMilestoneInvoice(TOKENS, args).then(() => null, (e: unknown) => e as Error);
             assert.ok(error, `${JSON.stringify(body)} should not resolve`);
-            assert.equal(isRetryableQboError(error), true, `${JSON.stringify(body)} -> ${error?.name}`);
+            // Round 36 gate: this used to be a plain QboRetryableError. The
+            // create boundary now names it for what it is — an outcome we never
+            // learned — and the money rail's own predicate must agree, or the
+            // caller would RELEASE its in-flight claim and re-send.
+            assert.equal(isQBAmbiguousDocumentCreateError(error), true, `${JSON.stringify(body)} -> ${error?.name}`);
+            assert.equal(isAmbiguousCreateFailure(error), true, `${JSON.stringify(body)} must keep the row parked`);
         } finally {
             globalThis.fetch = original;
         }
