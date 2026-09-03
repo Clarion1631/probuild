@@ -43,9 +43,9 @@ const SMALL = sized(1);
 const inspect = (
     path: string,
     mime: string,
-    download: Parameters<typeof inspectStoredObject>[2],
-    size: Parameters<typeof inspectStoredObject>[3] = SMALL,
-) => inspectStoredObject(path, mime, download, size);
+    download: Parameters<typeof inspectStoredObject>[3],
+    size: Parameters<typeof inspectStoredObject>[4] = SMALL,
+) => inspectStoredObject(path, mime, undefined, download, size);
 
 test("a real image is accepted, and its metadata comes from the BYTES", async () => {
     const check = await inspect("p.jpg", "application/pdf", give({ ok: true, bytes: PNG }));
@@ -189,20 +189,20 @@ test("a download whose bytes do not match the recorded sha is REFUSED", async ()
     const realSha = createHash("sha256").update(PNG).digest("hex");
     const swapped = Buffer.from("totally different bytes");
 
-    const good = await downloadVerified("p.png", realSha, give({ ok: true, bytes: PNG }));
+    const good = await downloadVerified("p.png", realSha, undefined, give({ ok: true, bytes: PNG }));
     assert.deepEqual(good, { ok: true, bytes: PNG });
 
-    const attacked = await downloadVerified("p.png", realSha, give({ ok: true, bytes: swapped }));
+    const attacked = await downloadVerified("p.png", realSha, undefined, give({ ok: true, bytes: swapped }));
     assert.equal(attacked.ok, false);
     assert.equal((attacked as { kind: string }).kind, "sha-mismatch");
 });
 
 test("missing and transient stay distinguishable through verification", async () => {
     assert.deepEqual(
-        await downloadVerified("p.png", "x".repeat(64), give({ ok: false, kind: "not-found" })),
+        await downloadVerified("p.png", "x".repeat(64), undefined, give({ ok: false, kind: "not-found" })),
         { ok: false, kind: "missing" },
     );
-    const flaky = await downloadVerified("p.png", "x".repeat(64), give({
+    const flaky = await downloadVerified("p.png", "x".repeat(64), undefined, give({
         ok: false, kind: "transient", message: "ECONNRESET",
     }));
     assert.equal((flaky as { kind: string }).kind, "transient");
@@ -239,7 +239,7 @@ test("MUTATED OBJECT: a replaced object is content-mismatch, never 'we have it'"
     const mutated = Buffer.from(PNG);
     mutated[mutated.length - 1] ^= 0xff; // one flipped bit is enough
 
-    const held = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: mutated }));
+    const held = await verifyStoredCopy("p.png", realSha, undefined, SMALL, give({ ok: true, bytes: mutated }));
     assert.deepEqual(
         { ok: held.ok, kind: (held as { kind?: string }).kind },
         { ok: false, kind: "content-mismatch" },
@@ -248,7 +248,7 @@ test("MUTATED OBJECT: a replaced object is content-mismatch, never 'we have it'"
 
 test("the control: the ORIGINAL bytes still verify", async () => {
     const realSha = createHash("sha256").update(PNG).digest("hex");
-    const held = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: PNG }));
+    const held = await verifyStoredCopy("p.png", realSha, undefined, SMALL, give({ ok: true, bytes: PNG }));
     assert.deepEqual(held, { ok: true });
 });
 
@@ -258,12 +258,12 @@ test("a mismatch is decided WITHOUT healing, and absence still reads as absence"
     // and never reaches the hash comparison at all.
     let downloads = 0;
     const counted = async () => { downloads++; return { ok: true as const, bytes: PNG }; };
-    const gone = await verifyStoredCopy("p.png", realSha, async () => ({ ok: false, kind: "missing" }), counted);
+    const gone = await verifyStoredCopy("p.png", realSha, undefined, async () => ({ ok: false, kind: "missing" }), counted);
     assert.equal((gone as { kind: string }).kind, "missing");
     assert.equal(downloads, 0, "no body was read for an object that is not there");
 
     const flaky = await verifyStoredCopy(
-        "p.png", realSha,
+        "p.png", realSha, undefined,
         async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
         counted,
     );
@@ -273,7 +273,7 @@ test("a mismatch is decided WITHOUT healing, and absence still reads as absence"
 
 test("a race — present, then gone before the read — is transient-or-missing, never success", async () => {
     const realSha = createHash("sha256").update(PNG).digest("hex");
-    const raced = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: false, kind: "not-found" }));
+    const raced = await verifyStoredCopy("p.png", realSha, undefined, SMALL, give({ ok: false, kind: "not-found" }));
     assert.equal(raced.ok, false);
     assert.equal((raced as { kind: string }).kind, "missing");
 });
@@ -312,7 +312,7 @@ test("ALL THREE replay paths ask this one rule, and answer a mismatch with 409",
 test("a legacy row with no recorded sha is passed through, not refused", async () => {
     // Rows written before sealing existed have nothing to compare against.
     // Refusing them would park real receipts for a reason that is our fault.
-    const legacy = await downloadVerified("p.png", "", give({ ok: true, bytes: PNG }));
+    const legacy = await downloadVerified("p.png", "", undefined, give({ ok: true, bytes: PNG }));
     assert.deepEqual(legacy, { ok: true, bytes: PNG });
 });
 
@@ -341,7 +341,7 @@ const CHECK = {
 /** A short transaction that just runs its body. No lock: there is none any more. */
 const noLock = (body: (tx: never) => Promise<unknown>) => body(null as never);
 
-/** The path sealAndPublish("...", "row-1", 1, CHECK, ...) will compute. */
+/** The path sealAndPublish("...", "row-1", 1, CHECK, ..., undefined) will compute. */
 const CANONICAL_ROW1 = `receipts/row-1/v1/${CHECK.fileSha256}.png`;
 
 /**
@@ -391,7 +391,7 @@ test("the upload object is deleted only AFTER the row pointer is committed", asy
     // points at a path whose object we just removed, and the receipt is gone
     // with nothing left to retry from.
     const h = publishHarness();
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
     // And the seal and the commit are INSIDE one critical section: the gap
     // between them is exactly where the cleanup sweep used to fit.
     //
@@ -430,7 +430,7 @@ test("a LOST CAS touches neither the database nor storage", async () => {
     // resolves it once the lease lapses, re-checking live references first —
     // the one place that question can be asked without racing a publish.
     const h = publishHarness({ committed: 0 });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
 
     assert.deepEqual(h.calls, ["claim", "seal", "tx-open", "commit", "tx-close"]);
     assert.ok(!h.calls.includes("resolve-intent"), "the intent survives to cover the sealed copy");
@@ -441,7 +441,7 @@ test("a LOST CAS touches neither the database nor storage", async () => {
 
 test("a failed SEAL never touches the row or the upload object", async () => {
     const h = publishHarness({ sealOk: false });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
     assert.equal(outcome, null);
     assert.deepEqual(h.calls, ["claim", "seal"], "no transaction was ever opened");
 });
@@ -453,7 +453,7 @@ test("a settle transaction that cannot open is a RETRYABLE null, never a verdict
     // makes it safe: the sealed copy is accounted for, and the sweeper
     // collects it if no retry ever claims it.
     const h = publishHarness({ txThrows: true });
-    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
     assert.equal(outcome, null);
     assert.deepEqual(h.calls, ["claim", "seal", "tx-open"]);
     assert.ok(!h.calls.includes("resolve-intent"), "the intent survives to cover the sealed copy");
@@ -464,8 +464,8 @@ test("a retry that finds the canonical object already there still commits", asyn
     // content-addressed path, so re-sealing the same bytes is a no-op and the
     // retry simply commits.
     const h = publishHarness();
-    const first = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
-    const second = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
+    const first = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
+    const second = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps, undefined);
     assert.equal(first?.canonicalPath, second?.canonicalPath, "same content, same path");
     assert.equal(second?.published, true);
 });
@@ -520,7 +520,7 @@ async function raceSweepAgainstPublish(leased: boolean) {
         resolveCanonicalIntent: async () => { leaseUntil.delete(CANONICAL_ROW1); },
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async (_id: string, uploadPath: string) => { objects.delete(uploadPath); },
-    } as never);
+    } as never, undefined);
 
     // The sweep, exactly as retryPendingCleanups decides: is a live row
     // pointing at this path, and is the NEWEST schedule for it still ahead of
@@ -584,7 +584,7 @@ test("NO STORAGE CALL RUNS WITH A TRANSACTION OPEN", async () => {
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     assert.equal(outcome?.published, true);
     assert.ok(sealMs >= 50, `the seal really was slow (${sealMs}ms)`);
@@ -755,7 +755,7 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
         resolveCanonicalIntent: async () => { resolvedIntent = true; },
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => { dropped = true; },
-    } as never);
+    } as never, undefined);
 
     assert.equal(outcome?.published, false, "zero rows updated");
     assert.equal(store.get().state, "NEEDS_REVIEW", "the row is untouched");
@@ -788,7 +788,7 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
     assert.equal(outcome?.published, false);
     assert.equal(store.get().state, "STAGING", "the sweeper's row is left alone");
 });
@@ -806,7 +806,7 @@ test("an unchanged row still publishes — the control", async () => {
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
     assert.equal(outcome?.published, true);
     assert.equal(store.get().state, "RECEIVED");
 });
@@ -929,7 +929,10 @@ test("/start's settled branch verifies the BYTES, and no longer probes for a siz
     const branch = start.slice(start.indexOf(`if (existing.state !== "STAGING") {`));
     const body = branch.slice(0, branch.indexOf("alreadyReceived: true"));
 
-    assert.match(body, /verifyStoredCopy\(existing\.storagePath, existing\.fileSha256\)/);
+    // WITH THE REQUEST'S DEADLINE. This probe and the download behind it used
+    // to be issued with none at all -- a fresh fifteen seconds each, inside a
+    // handler the platform kills at thirty.
+    assert.match(body, /verifyStoredCopy\(existing\.storagePath, existing\.fileSha256, deadline\)/);
     assert.ok(
         !/receiptObjectSize/.test(start),
         "the presence-only probe is gone from the route entirely, not merely bypassed",
@@ -957,7 +960,7 @@ test("the three verdicts /start maps: mutated -> mismatch, fault -> transient, m
     const mutated = Buffer.concat([PNG, Buffer.from([0])]);
 
     // A replaced object: 409 content-mismatch, and the row is left alone.
-    const swapped = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: mutated }));
+    const swapped = await verifyStoredCopy("p.png", realSha, undefined, SMALL, give({ ok: true, bytes: mutated }));
     assert.equal(swapped.ok, false);
     assert.equal((swapped as { kind: string }).kind, "content-mismatch");
 
@@ -965,12 +968,12 @@ test("the three verdicts /start maps: mutated -> mismatch, fault -> transient, m
     // fault into exactly this): 503 verify-unavailable, retryable. Never a
     // verdict about the bytes, so never the file-missing answer.
     const faulted = await verifyStoredCopy(
-        "p.png", realSha, SMALL, give({ ok: false, kind: "transient", message: "TypeError: fetch failed" }),
+        "p.png", realSha, undefined, SMALL, give({ ok: false, kind: "transient", message: "TypeError: fetch failed" }),
     );
     assert.equal((faulted as { kind: string }).kind, "transient");
 
     // Only verified bytes reach alreadyReceived.
-    assert.deepEqual(await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: PNG })), { ok: true });
+    assert.deepEqual(await verifyStoredCopy("p.png", realSha, undefined, SMALL, give({ ok: true, bytes: PNG })), { ok: true });
 });
 
 // -- A DECLARED hash is answered on EVERY success path (round-34 item 3) -----
@@ -1106,7 +1109,7 @@ test("PUBLISH vs REFRESH: a lease reissued mid-finalize invalidates the publish"
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => { queued++; return "ev-1"; },
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     assert.equal(outcome?.published, false, "the publish lost");
     assert.equal(store.get().state, "STAGING", "the row is untouched, still awaiting its upload");
@@ -1143,7 +1146,7 @@ test("PUBLISH vs REFRESH control: an UNrefreshed lease still publishes", async (
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => { queued++; return "ev-1"; },
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
     assert.equal(outcome?.published, true);
     assert.equal(store.get().state, "RECEIVED");
     assert.equal(queued, 1, "and the upload object's cleanup is queued in the commit");
@@ -1245,7 +1248,7 @@ test("SWEEP vs REFRESH: the publish commit loses too", async () => {
             return "ev-1";
         },
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     assert.equal(outcome?.published, false, "the sweep did not publish over the refreshed lease");
     assert.equal(store.get().state, "STAGING");
@@ -1278,7 +1281,7 @@ test("SWEEP CONTROL: an unrefreshed row still parks and still publishes", async 
         resolveCanonicalIntent: async () => {},
         queueUploadCleanup: async () => "ev-1",
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
     assert.equal(outcome?.published, true);
     assert.equal(pubStore.get().state, "RECEIVED");
 });

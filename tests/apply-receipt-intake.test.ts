@@ -1022,3 +1022,49 @@ test("main() refuses BEFORE it builds a client, and prints the target BEFORE any
     assert.match(ciBranch, /const url = process\.env\.DATABASE_URL;/);
     assert.match(ciBranch, /looksLikeSupabase\(url\)/, "and it refuses a Supabase URL");
 });
+
+// -- THE REAL PRODUCTION URL SHAPE MUST PASS THE GUARD --------------------
+//
+// A guard that refuses the only URL it will ever be pointed at is not a
+// guard, it is an outage -- and nothing else in this suite would notice,
+// because every other case feeds it a hand-written host. `new URL(u).host`
+// INCLUDES the port (`aws-0-us-west-2.pooler.supabase.com:6543`), so a suffix
+// test against `host` rejects the transaction pooler every time; `hostname`
+// does not. This drives the whole identity check with the exact string
+// production carries.
+
+test("the REAL pooler URL passes the guard, and a wrong project ref does not", async () => {
+    const PROD_REF = "ghzdbzdnwjxazvmcefbh";
+    const PROD_URL =
+        `postgresql://postgres.${PROD_REF}:s3cr3t-p%40ss@aws-0-us-west-2.pooler.supabase.com:6543`
+        + "/postgres?pgbouncer=true&connection_limit=1";
+
+    // The port is not part of the hostname, which is what the pooler check reads.
+    assert.equal(hostOf(PROD_URL), "aws-0-us-west-2.pooler.supabase.com");
+    assert.ok(
+        !hostOf(PROD_URL).includes(":"),
+        "a host WITH the port would fail the .pooler.supabase.com suffix test",
+    );
+    assert.equal(projectRefOf(PROD_URL), PROD_REF);
+
+    const query = async (sql: string) => (/current_database/.test(sql)
+        ? [{ db: "postgres", host: "10.0.0.5" }]
+        : [{ migration_name: PROD_BASELINE_MIGRATION }]) as unknown[];
+
+    const ok = await verifyProdIdentity(query, hostOf(PROD_URL), projectRefOf(PROD_URL), PROD_REF);
+    assert.deepEqual(ok.problems, [], "the real production URL is admitted");
+    assert.match(ok.line, new RegExp(`project=${PROD_REF}`));
+    assert.match(ok.line, /baseline=present/);
+    // The redacted line carries no credential from that URL.
+    assert.ok(!ok.line.includes("s3cr3t"), "no password");
+    assert.ok(!ok.line.includes("p%40ss"), "not even percent-encoded");
+
+    // A DIFFERENT project on the SAME pooler host, with the same database name
+    // and the same baseline row -- the staging-clone case -- is refused.
+    const clone =
+        `postgresql://postgres.stagingclone000000:pw@aws-0-us-west-2.pooler.supabase.com:6543`
+        + "/postgres?pgbouncer=true";
+    const refused = await verifyProdIdentity(query, hostOf(clone), projectRefOf(clone), PROD_REF);
+    assert.equal(refused.problems.length, 1);
+    assert.match(refused.problems[0], /same pooler host, different project/);
+});

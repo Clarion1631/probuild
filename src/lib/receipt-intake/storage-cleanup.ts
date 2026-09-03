@@ -223,24 +223,24 @@ export async function claimObjectPath(
     // deleter could take the path between the read and the write — which is
     // the very interleaving this claim exists to stop.
     return run(async tx => {
-        const existing = await tx.automationEvent.findMany({
-            where: {
-                kind: STORAGE_CLEANUP_KIND,
-                status: { in: CLEANUP_SWEEPABLE_STATUSES },
-                detail: { contains: JSON.stringify(canonicalPath) },
-            },
-            select: { detail: true },
-        });
-        const blocked = claimsConflict(existing, "publishing", now);
-        if (blocked) throw new ObjectPathBusyError(canonicalPath, blocked);
+        // THE LOCK FIRST, then the claim -- see acquireObjectClaim. Reading
+        // 'is this path free' and writing 'it is mine' have to be one step
+        // against every other claimant, and they were not: this insert and
+        // the sweeper's update touched DIFFERENT rows, so both could read a
+        // free path and both commit.
+        const claim = await acquireObjectClaim(tx, canonicalPath, "publishing", until, now);
+        if (!claim.ok) throw new ObjectPathBusyError(canonicalPath, claim.heldBy);
         await reclaimQueuedCleanups(tx, canonicalPath);
+        // The CLEANUP INTENT, which is a different thing from the claim: it is
+        // what the sweeper acts on if this publish dies. The claim above is
+        // what stops anyone deleting the path while it is alive.
         return queueObjectCleanup(
             tx,
             canonicalPath,
             "canonical-seal-intent",
             until,
             "provisional",
-            { token: randomUUID(), kind: "publishing", until },
+            { token: claim.token, kind: "publishing", until },
         );
     });
 }
@@ -437,6 +437,100 @@ export async function queueObjectCleanup(
     return event.id;
 }
 
+/**
+ * THE PER-PATH MUTEX BOTH CLAIM TRANSACTIONS TAKE AS THEIR FIRST STATEMENT.
+ *
+ * Reading the claim state and writing a claim have to be one atomic step
+ * against every OTHER claimant of the same path. They were not: a sweeper
+ * converting an EXPIRED provisional intent into a deleting claim UPDATEs that
+ * event row, while a publisher taking the path INSERTs a new one -- different
+ * rows, so at READ COMMITTED neither transaction blocks the other, both read
+ * 'the path is free', and both commit. The sweeper then deleted the object the
+ * publisher had sealed but not yet pointed at, leaving a RECEIVED row with no
+ * bytes behind it.
+ *
+ * Transaction-scoped, so it is released by COMMIT or ROLLBACK and a crashed
+ * claimant cannot wedge a path. It is taken FIRST in both transactions, so the
+ * two can only ever run one after the other, and the second sees what the
+ * first wrote.
+ *
+ * This is a LOCK, not I/O: it reaches nothing outside Postgres, and the
+ * transactions that hold it do no external work (see the tripwire in
+ * tests/receipt-intake-lease-fence.test.ts).
+ */
+export const OBJECT_LOCK_PREFIX = "receipt-object:";
+
+export async function lockObjectPath(tx: Prisma.TransactionClient, storagePath: string): Promise<void> {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${OBJECT_LOCK_PREFIX + storagePath}))`;
+}
+
+/** What a claim attempt found. */
+export type ObjectClaimAttempt =
+    | { ok: true; token: string }
+    | { ok: false; heldBy: ObjectClaimKind };
+
+/**
+ * TAKE THE PATH, or find out who holds it -- under the lock, against a table
+ * whose PRIMARY KEY is the path itself.
+ *
+ * One row per path IS the invariant: a second live claim is impossible even if
+ * the lock above were somehow missed, because there is nowhere to put it. The
+ * claim used to live in an AutomationEvent's JSON `detail`, where no
+ * constraint could express that.
+ *
+ * The exclusion rule is unchanged: two PUBLISHERS may share a path (it is
+ * content-addressed, so they are writing identical bytes and the seal is an
+ * upsert -- only the pointer needs serializing, and the publish CAS does that),
+ * two deleters may not, and the two kinds may never cross.
+ */
+export async function acquireObjectClaim(
+    tx: Prisma.TransactionClient,
+    storagePath: string,
+    want: ObjectClaimKind,
+    until: Date,
+    now: Date,
+): Promise<ObjectClaimAttempt> {
+    await lockObjectPath(tx, storagePath);
+    const held = await tx.receiptObjectClaim.findUnique({ where: { storagePath } });
+    if (held && held.expiresAt.getTime() > now.getTime()) {
+        const heldBy = held.kind as ObjectClaimKind;
+        if (heldBy !== want || want === "deleting") return { ok: false, heldBy };
+    }
+    // A LAPSED claim is taken over rather than respected: a dead holder must
+    // not block a path forever. The token changes with it, which is what makes
+    // the holder's own pre-delete re-read able to tell that it lost the path.
+    const token = randomUUID();
+    await tx.receiptObjectClaim.upsert({
+        where: { storagePath },
+        create: { storagePath, token, kind: want, expiresAt: until },
+        update: { token, kind: want, expiresAt: until },
+    });
+    return { ok: true, token };
+}
+
+/** Is `token` still the live claim over `storagePath`, of the kind we took? */
+export async function claimIsStillOurs(
+    tx: Prisma.TransactionClient,
+    storagePath: string,
+    want: ObjectClaimKind,
+    token: string,
+    now: Date,
+): Promise<boolean> {
+    const held = await tx.receiptObjectClaim.findUnique({ where: { storagePath } });
+    return !!held
+        && held.token === token
+        && held.kind === want
+        && held.expiresAt.getTime() > now.getTime();
+}
+
+/** Give the path back. Best effort: a lapsed claim is collected by the next claimant. */
+export async function releaseObjectClaim(
+    tx: Prisma.TransactionClient,
+    storagePath: string,
+    token: string,
+): Promise<void> {
+    await tx.receiptObjectClaim.deleteMany({ where: { storagePath, token } });
+}
 /**
  * The path is held by the other kind of operation right now. Retryable: the
  * holder's lease is short and the caller comes back on its own schedule.
@@ -855,7 +949,21 @@ export async function retryPendingCleanups(
         // a publish in flight holds a provisional lease on this very path.
         // Acting on the older event would delete an object something still
         // has a live claim on.
+        // The sweep's own lease over the path: long enough to cover the
+        // external delete, short enough that a killed pass frees it soon.
+        const claimUntil = new Date(now.getTime() + OBJECT_CLAIM_LEASE_MS);
         const claim = await deps.inShortTx(async tx => {
+            // THE SAME PER-PATH LOCK THE PUBLISHER TAKES, and first, so the
+            // two claim transactions serialize and the second reads what the
+            // first wrote. Everything below -- the reference check, the
+            // schedule, the claim -- is decided under it.
+            const taken = await acquireObjectClaim(tx, storagePath, "deleting", claimUntil, now);
+            if (!taken.ok) {
+                // A publish holds this path. Its object may not exist yet and
+                // the pointer that will reference it has not committed, so
+                // 'nothing references this' is true and irrelevant.
+                return { verdict: "not-due" as const, siblingIds: [] as string[], token: "" };
+            }
             const referenced = await tx.receiptIntake.findFirst({
                 where: { storagePath },
                 select: { id: true },
@@ -865,6 +973,9 @@ export async function retryPendingCleanups(
                     where: { id: event.id },
                     data: { status: "resolved", reason: `still referenced by ${referenced.id}` },
                 });
+                // Hand the path straight back: nothing is going to be deleted,
+                // and holding it would stall a publisher for the lease's length.
+                await releaseObjectClaim(tx, storagePath, taken.token);
                 return { verdict: "referenced" as const, siblingIds: [] as string[], token: "" };
             }
             const siblings = await tx.automationEvent.findMany({
@@ -883,35 +994,28 @@ export async function retryPendingCleanups(
             // A PUBLISH HOLDS THIS PATH. Its object may not exist yet, and the
             // pointer that will reference it has not committed — so "nothing
             // references this" is true and irrelevant. Leave it entirely.
-            const blocked = claimsConflict(siblings, "deleting", now);
-            if (blocked) return { verdict: "not-due" as const, siblingIds: [], token: "" };
+            // Exclusion is the claim table's job now (acquireObjectClaim, at the
+            // top of this transaction). What the siblings still decide is the
+            // SCHEDULE: the latest notBefore among every event naming this path.
             const newest = siblings
                 .map(sibling => cleanupDueAt(sibling.detail))
                 .reduce<Date | null>(
                     (latest, at) => (at && (!latest || at > latest) ? at : latest),
                     null,
                 );
-            if (pending(newest, now)) return { verdict: "not-due" as const, siblingIds: [], token: "" };
+            if (pending(newest, now)) {
+                await releaseObjectClaim(tx, storagePath, taken.token);
+                return { verdict: "not-due" as const, siblingIds: [], token: "" };
+            }
 
-            // THE CLAIM IS WRITTEN, not merely decided. A verdict that
-            // persisted nothing let a publisher take the path immediately
-            // afterwards and seal a new object into it, which this sweep then
-            // deleted on the strength of a reading taken before any of that.
-            const token = randomUUID();
-            const until = new Date(now.getTime() + OBJECT_CLAIM_LEASE_MS);
-            await tx.automationEvent.update({
-                where: { id: event.id },
-                data: {
-                    detail: JSON.stringify({
-                        storagePath,
-                        notBefore: (cleanupDueAt(event.detail) ?? now).toISOString(),
-                        claimToken: token,
-                        claimKind: "deleting",
-                        claimUntil: until.toISOString(),
-                    }),
-                },
-            });
-            return { verdict: "claimed" as const, siblingIds: siblings.map(s => s.id), token };
+            // The claim itself was written at the top of this transaction, in
+            // the one place a claim can live. The event's detail keeps only its
+            // schedule -- what it is actually for.
+            return {
+                verdict: "claimed" as const,
+                siblingIds: siblings.map(s => s.id),
+                token: taken.token,
+            };
         }).catch(error => {
             console.error(
                 "[receipts/intake] cleanup claim failed, left pending",
@@ -935,8 +1039,8 @@ export async function retryPendingCleanups(
                 select: { detail: true, status: true },
             });
             if (!fresh || !CLEANUP_SWEEPABLE_STATUSES.includes(fresh.status as CleanupStatus)) return false;
-            const held = liveClaim(fresh.detail, deps.now());
-            return !!held && held.kind === "deleting" && held.token === claim.token;
+            // Against the CLAIM TABLE, which is the one place a claim lives.
+            return claimIsStillOurs(tx, storagePath, "deleting", claim.token, deps.now());
         }).catch(() => false);
         if (!stillOurs) continue;
 

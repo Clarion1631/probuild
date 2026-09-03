@@ -536,7 +536,7 @@ export async function POST(req: Request) {
                 // the three cannot come to disagree about what "we already have
                 // it" means. The cheap metadata probe still runs first inside
                 // it, so the common orphan case never pays for a download.
-                const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256);
+                const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256, deadline);
                 if (!held.ok && held.kind === "transient") {
                     // Storage could not answer. That is never evidence about the
                     // bytes, so it is never a verdict: the sender retries with

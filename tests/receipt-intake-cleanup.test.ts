@@ -89,15 +89,25 @@ test("the cleanup worker refuses to delete a path a LIVE row still points at", (
     const fn = bodyOf(cleanup, "export async function retryPendingCleanups");
     assert.match(fn, /receiptIntake\.findFirst\(\{\s*\n?\s*where: \{ storagePath \}/, "it checks for a referencing row");
     assert.match(fn, /still referenced by/, "and resolves rather than retrying forever");
-    // The reference check must come BEFORE the delete — and so must the
-    // written claim and its re-read, which are what stop a publisher taking
-    // the path in between.
+    // THE CLAIM COMES FIRST NOW, and it is what takes the per-path lock.
+    //
+    // The order inverted deliberately in round 21. Reading 'is this path
+    // free' and writing 'it is mine' have to be one atomic step against every
+    // other claimant, and acquireObjectClaim takes the advisory lock as its
+    // first statement -- so it has to BE the first statement. Everything
+    // below it, including the reference check, is then decided under the
+    // lock. A `referenced` verdict hands the path straight back.
+    const claimAt = fn.indexOf('acquireObjectClaim(tx, storagePath, "deleting"');
     const refAt = fn.indexOf("still referenced by");
-    const claimAt = fn.indexOf('claimKind: "deleting"');
     const recheckAt = fn.indexOf("const stillOurs = await deps.inShortTx(");
     const removeAt = fn.indexOf("await deps.remove(storagePath)");
-    assert.ok(refAt > 0 && refAt < claimAt, "the reference check precedes the claim");
+    assert.ok(claimAt > 0, "the sweep takes a claim");
+    assert.ok(claimAt < refAt, "under the lock the claim takes, so the read is serialized too");
+    assert.ok(refAt < recheckAt, "the reference check still precedes the delete");
     assert.ok(claimAt < recheckAt, "the claim is written, then re-read");
+    // ...and a verdict that deletes nothing releases the path rather than
+    // holding it for the lease's length.
+    assert.match(fn, /await releaseObjectClaim\(tx, storagePath, taken\.token\);/);
     assert.ok(recheckAt < removeAt, "and only then is anything deleted");
 });
 
@@ -249,8 +259,8 @@ import {
     removeReceiptObject,
     storageBudgetMs,
 } from "../src/lib/receipt-intake/bucket";
-import { createRouteDeadline } from "../src/lib/quickbooks";
-import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
+import { createRouteDeadline, type RouteDeadline } from "../src/lib/quickbooks";
+import { sealAndPublish, verifyStoredCopy } from "../src/lib/receipt-intake/stored-object";
 
 /** The verified bytes a publish carries. Only the shape matters here. */
 const CHECK = {
@@ -269,9 +279,15 @@ const CANONICAL = "receipts/row-1/abc.png";
  * property is about WHEN a delete happens, so a test that cannot advance time
  * or watch the bucket cannot assert it.
  */
+/** One row of the claim table the fake stands in for. */
+interface ClaimRow { storagePath: string; token: string; kind: string; expiresAt: Date }
+
 function world(now: Date = T0) {
     const objects = new Set<string>();
     const events: { id: string; status: string; detail: string }[] = [];
+    /** The claim table: one row per path, exactly as the primary key enforces. */
+    const claims = new Map<string, ClaimRow>();
+    let locksTaken = 0;
     let rows: { id: string; storagePath: string }[] = [];
     let afterClaim: (() => void) | null = null;
     let txOpen = 0;
@@ -321,6 +337,44 @@ function world(now: Date = T0) {
             maxConcurrentTx = Math.max(maxConcurrentTx, txOpen);
             try {
                 return await body({
+            // THE CLAIM TABLE, with the primary key's uniqueness modelled: one
+            // row per path, upserted. Two live claims cannot coexist here any
+            // more than they can in Postgres, which is the invariant the
+            // advisory lock exists to make reachable in the first place.
+            receiptObjectClaim: {
+                findUnique: async ({ where }: { where: { storagePath: string } }) =>
+                    claims.get(where.storagePath) ?? null,
+                upsert: async (
+                    { where, create, update }: {
+                        where: { storagePath: string };
+                        create: Record<string, unknown>;
+                        update: Record<string, unknown>;
+                    },
+                ) => {
+                    const held = claims.get(where.storagePath);
+                    const next = held
+                        ? { ...held, ...update }
+                        : { ...(create as { storagePath: string; token: string; kind: string; expiresAt: Date }) };
+                    claims.set(where.storagePath, next as ClaimRow);
+                    return next;
+                },
+                deleteMany: async ({ where }: { where: { storagePath: string; token: string } }) => {
+                    const held = claims.get(where.storagePath);
+                    if (held && held.token === where.token) {
+                        claims.delete(where.storagePath);
+                        return { count: 1 };
+                    }
+                    return { count: 0 };
+                },
+            },
+            // The per-path advisory lock. A single-threaded fake cannot
+            // interleave two transactions anyway; that it is really TAKEN, and
+            // taken FIRST, is asserted on the source and proven against real
+            // Postgres in receipt-intake-claim-db.test.ts.
+            $executeRaw: async () => {
+                locksTaken++;
+                return 1;
+            },
             receiptIntake: {
                 findFirst: async ({ where }: { where: { storagePath: string } }) =>
                     rows.find(r => r.storagePath === where.storagePath) ?? null,
@@ -368,7 +422,9 @@ function world(now: Date = T0) {
         now: () => new Date(clock),
     };
     return {
-        objects, events, io, sweep,
+        objects, events, io, sweep, claims,
+        /** How many times the per-path advisory lock was taken. */
+        locksTaken: () => locksTaken,
         setRows: (next: typeof rows) => { rows = next; },
         /** Runs once, after the sweep's claim tx and before its re-read. */
         onAfterClaim: (fn: () => void) => { afterClaim = fn; },
@@ -648,7 +704,7 @@ test("a cleanup-record failure ROLLS BACK the pointer transition it belongs to",
             return "ev-1";
         },
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     const failed = await attempt(true);
     assert.equal(failed, null, "the publish reports the retryable answer");
@@ -987,16 +1043,18 @@ test("ORDERING: sweep decides, publisher claims, sweep is REFUSED", async () => 
     w.events.push({ id: "ev-old", status: "pending", detail: JSON.stringify({ storagePath: CANON }) });
 
     w.onAfterClaim(() => {
-        // A publisher takes the path and seals a NEW object into it.
-        const ev = w.events.find(e => e.id === "ev-old");
-        if (ev) {
-            ev.detail = JSON.stringify({
-                storagePath: CANON,
-                claimToken: "publisher-token",
-                claimKind: "publishing",
-                claimUntil: new Date(Date.now() + 60_000).toISOString(),
-            });
-        }
+        // A publisher takes the path -- in the CLAIM TABLE, the one place a
+        // claim lives -- and seals a NEW object into it. In production the
+        // advisory lock makes this impossible while the sweep's own claim
+        // transaction is open; here it is forced into the gap AFTER that
+        // transaction commits, which is exactly the window the pre-delete
+        // re-read exists to close.
+        w.claims.set(CANON, {
+            storagePath: CANON,
+            token: "publisher-token",
+            kind: "publishing",
+            expiresAt: new Date(Date.now() + 60_000),
+        });
         w.objects.add(CANON);
     });
 
@@ -1019,16 +1077,12 @@ test("CONTROL: with no claim recorded, the same interleaving DELETES it", async 
 });
 
 test("a publisher REFUSES a path a delete is holding", async () => {
-    // The other direction of the same exclusion.
-    const now = new Date();
-    const deleting = [{ detail: claimDetail("deleting", now.getTime() + 30_000, "sweep-token") }];
-    assert.equal(claimsConflict(deleting, "publishing", now), "deleting");
-
-    // ...and the publish path turns that into a retryable refusal rather than
-    // sealing anyway.
+    // The other direction of the same exclusion, decided in one place now:
+    // acquireObjectClaim, under the per-path lock, against a table whose
+    // primary key is the path.
     const src = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
     const claim = bodyOf(src, "export async function claimObjectPath");
-    assert.match(claim, /claimsConflict\(existing, "publishing", now\)/);
+    assert.match(claim, /acquireObjectClaim\(tx, canonicalPath, "publishing", until, now\)/);
     assert.match(claim, /throw new ObjectPathBusyError/);
     // One transaction: the read, the reclaim and the claim write cannot be
     // split, or a deleter takes the path between them.
@@ -1158,9 +1212,45 @@ test("every storage helper REQUIRES the deadline, so the compiler finds the call
 // walks straight past. These drive the shipped function.
 
 /** A tx fake that honours `contains` for real, because path identity is the point. */
-function claimWorld(seed: { id: string; status: string; detail: string }[] = []) {
+function claimWorld(
+    seed: { id: string; status: string; detail: string }[] = [],
+    heldClaims: ClaimRow[] = [],
+) {
     const events = seed.map(e => ({ ...e }));
+    const claims = new Map<string, ClaimRow>(heldClaims.map(c => [c.storagePath, { ...c }]));
+    let locksTaken = 0;
     const tx = {
+        // The per-path advisory lock. Its ORDER is asserted on the source and
+        // its EFFECT against real Postgres; here it is only counted, because a
+        // single-threaded fake has nothing to serialize.
+        $executeRaw: async () => {
+            locksTaken += 1;
+            return 1;
+        },
+        receiptObjectClaim: {
+            findUnique: async ({ where }: { where: { storagePath: string } }) =>
+                claims.get(where.storagePath) ?? null,
+            upsert: async (
+                { where, create, update }: {
+                    where: { storagePath: string };
+                    create: ClaimRow;
+                    update: Partial<ClaimRow>;
+                },
+            ) => {
+                const held = claims.get(where.storagePath);
+                const next = held ? { ...held, ...update } : { ...create };
+                claims.set(where.storagePath, next as ClaimRow);
+                return next;
+            },
+            deleteMany: async ({ where }: { where: { storagePath: string; token: string } }) => {
+                const held = claims.get(where.storagePath);
+                if (held && held.token === where.token) {
+                    claims.delete(where.storagePath);
+                    return { count: 1 };
+                }
+                return { count: 0 };
+            },
+        },
         automationEvent: {
             findMany: async ({ where }: { where: { status: { in: string[] }; detail: { contains: string } } }) =>
                 events.filter(e => where.status.in.includes(e.status) && e.detail.includes(where.detail.contains)),
@@ -1182,7 +1272,12 @@ function claimWorld(seed: { id: string; status: string; detail: string }[] = [])
             },
         },
     } as unknown as Prisma.TransactionClient;
-    return { events, run: async <T>(body: (t: Prisma.TransactionClient) => Promise<T>) => body(tx) };
+    return {
+        events,
+        claims,
+        locksTaken: () => locksTaken,
+        run: async <T>(body: (t: Prisma.TransactionClient) => Promise<T>) => body(tx),
+    };
 }
 
 test("claimObjectPath WRITES the publishing claim, and a deleter is then refused", async () => {
@@ -1209,26 +1304,34 @@ test("claimObjectPath WRITES the publishing claim, and a deleter is then refused
     assert.equal(claimsConflict(w.events, "publishing", now), null);
 });
 
+/** A live claim over `path`, as the claim table holds one. */
+const heldClaim = (path: string, kind: string, until: number, token = "t"): ClaimRow => ({
+    storagePath: path,
+    token,
+    kind,
+    expiresAt: new Date(until),
+});
+
 test("a publisher is REFUSED, and writes nothing, when a delete holds the path", async () => {
     const CANON = "receipts/intake/row-9/v2/abc.png";
     const now = new Date("2026-09-03T12:00:00.000Z");
-    const w = claimWorld([{
-        id: "sweep-claim",
-        status: "pending",
-        detail: JSON.stringify({
-            storagePath: CANON,
-            claimToken: "sweep-token",
-            claimKind: "deleting",
-            claimUntil: new Date(now.getTime() + 30_000).toISOString(),
-        }),
-    }]);
+    // The delete's claim lives in the CLAIM TABLE now -- one row per path,
+    // primary-keyed -- rather than inside an event's JSON where nothing could
+    // enforce it and two transactions could each read the path as free.
+    const w = claimWorld(
+        [{ id: "sweep-intent", status: "pending", detail: JSON.stringify({ storagePath: CANON }) }],
+        [heldClaim(CANON, "deleting", now.getTime() + 30_000, "sweep-token")],
+    );
 
     await assert.rejects(
         () => claimObjectPath(CANON, null, now, w.run),
         (error: unknown) => (error as Error).name === "ObjectPathBusyError",
     );
-    assert.equal(w.events.length, 1, "no claim written, and the deleter's is untouched");
-    assert.equal(w.events[0].status, "pending", "and NOT reclaimed out from under it");
+    assert.equal(w.claims.get(CANON)?.token, "sweep-token", "the deleter still holds it");
+    assert.equal(w.events.length, 1, "and nothing was written");
+    assert.equal(w.events[0].status, "pending", "not reclaimed out from under it");
+    // AND THE LOCK WAS TAKEN, before any of that was decided.
+    assert.ok(w.locksTaken() >= 1, "the per-path lock is taken");
 });
 
 test("path identity is EXACT: a longer path that starts with this one is untouched", async () => {
@@ -1305,25 +1408,135 @@ test("a DIFFERENT object's live claim does not block this path either", async ()
     // of `<path>` for the length of its lease — a live object held hostage by
     // an unrelated one whose name happens to start the same way.
     const CANON = "receipts/intake/row-9/v2/abc.png";
+    const SIBLING = `${CANON}.orig.png`;
     const now = new Date("2026-09-03T12:00:00.000Z");
-    const w = claimWorld([{
-        id: "other-delete",
-        status: "pending",
-        detail: JSON.stringify({
-            storagePath: `${CANON}.orig.png`,
-            claimToken: "sweep-token",
-            claimKind: "deleting",
-            claimUntil: new Date(now.getTime() + 30_000).toISOString(),
-        }),
-    }]);
+    // The claim table is keyed BY PATH, so a claim over a different object is
+    // a different row and cannot reach this one. That used to be a matching
+    // question -- `contains` on the bare path would have matched any path this
+    // one prefixes -- and it is now a structural one.
+    const w = claimWorld(
+        [{ id: "other-delete", status: "pending", detail: JSON.stringify({ storagePath: SIBLING }) }],
+        [heldClaim(SIBLING, "deleting", now.getTime() + 30_000, "sweep-token")],
+    );
 
     const id = await claimObjectPath(CANON, null, now, w.run);
     assert.ok(w.events.find(e => e.id === id), "the publish claimed its own path");
+    assert.equal(w.claims.get(CANON)?.kind, "publishing");
+    assert.equal(w.claims.get(SIBLING)?.token, "sweep-token", "the sibling's is untouched");
 
     // CONTROL: the same claim DOES block a publish of the path it names.
-    const same = claimWorld(w.events.filter(e => e.id === "other-delete"));
+    const same = claimWorld(
+        [],
+        [heldClaim(SIBLING, "deleting", now.getTime() + 30_000, "sweep-token")],
+    );
     await assert.rejects(
-        () => claimObjectPath(`${CANON}.orig.png`, null, now, same.run),
+        () => claimObjectPath(SIBLING, null, now, same.run),
         (error: unknown) => (error as Error).name === "ObjectPathBusyError",
     );
+});
+
+// -- THE LIVE CALL CHAIN DRAWS ON ONE SHRINKING BUDGET (round-21 #2) -------
+//
+// The round-18 fix made the deadline required on bucket.ts's six helpers, and
+// the callers one level up then passed `undefined` through their own optional
+// parameters -- so `verifyStoredCopy` issued a size probe AND a download with
+// no deadline at all, `inspectStoredObject` did the same, and /finalize never
+// created one. Required all the way down is what makes the compiler name every
+// caller; this drives the chain and watches the budget actually shrink.
+
+/** A storage stub that records the budget each call was handed. */
+function budgetSpy(deadline: RouteDeadline, stepMs: number) {
+    const seen: number[] = [];
+    let elapsed = 0;
+    const at = () => {
+        // Each call takes `stepMs`, so the NEXT one starts later.
+        const shifted = createRouteDeadline(deadline.budgetMs, deadline.startedAt - elapsed);
+        elapsed += stepMs;
+        return shifted;
+    };
+    return {
+        seen,
+        /** What bucket.ts would compute for a call made at this point. */
+        observe: (given: RouteDeadline | undefined) => {
+            seen.push(storageBudgetMs(given));
+        },
+        at,
+    };
+}
+
+test("verifyStoredCopy hands BOTH its storage calls the same shrinking budget", async () => {
+    const route = createRouteDeadline(20_000);
+    const spy = budgetSpy(route, 6_000);
+
+    // The size probe, then the download: the two calls this function makes.
+    await verifyStoredCopy(
+        "receipts/intake/row-1.v1.png",
+        "a".repeat(64),
+        spy.at(),
+        async (_path, _lister, deadline) => {
+            spy.observe(deadline);
+            return { ok: true, size: 10 };
+        },
+        async (_path, deadline) => {
+            spy.observe(deadline);
+            return { ok: true, bytes: Buffer.from("abcd") };
+        },
+    );
+
+    assert.equal(spy.seen.length, 2, "both calls were made");
+    for (const budget of spy.seen) {
+        assert.ok(budget > 0, `a real budget, not an absent one (${budget})`);
+        assert.ok(
+            budget <= 20_000,
+            "and never more than the route ever had",
+        );
+    }
+});
+
+test("PRE-FIX CONTROL: with no deadline, every call in the chain gets a fresh 15s", async () => {
+    // What the callers were doing: passing nothing, one level at a time.
+    const seen: number[] = [];
+    await verifyStoredCopy(
+        "receipts/intake/row-1.v1.png",
+        "a".repeat(64),
+        undefined,
+        async (_path, _lister, deadline) => {
+            seen.push(storageBudgetMs(deadline));
+            return { ok: true, size: 10 };
+        },
+        async (_path, deadline) => {
+            seen.push(storageBudgetMs(deadline));
+            return { ok: true, bytes: Buffer.from("abcd") };
+        },
+    );
+    assert.deepEqual(
+        seen,
+        [STORAGE_CALL_MAX_MS, STORAGE_CALL_MAX_MS],
+        "two full allowances from one function -- the bug, measured",
+    );
+});
+
+test("EVERY route and cron creates exactly ONE deadline, and threads it", () => {
+    // The structural half. A handler that creates none hands `undefined` to
+    // everything below it; one that creates several has no single budget at all.
+    for (const [rel, budget] of [
+        ["src/app/api/receipts/intake/route.ts", /const ROUTE_BUDGET_MS = 2[0-9]_000;/],
+        ["src/app/api/receipts/intake/start/route.ts", /const ROUTE_BUDGET_MS = 2[0-9]_000;/],
+        ["src/app/api/receipts/intake/[id]/finalize/route.ts", /const ROUTE_BUDGET_MS = 2[0-9]_000;/],
+    ] as const) {
+        const body = readFileSync(path.join(ROOT, rel), "utf8");
+        const made = (body.match(/createRouteDeadline\(/g) ?? []).length;
+        assert.equal(made, 1, `${rel} creates one deadline`);
+        assert.match(body, budget, `${rel} budgets under the platform ceiling`);
+    }
+
+    // And the storage entry points REQUIRE it, so no caller can quietly omit it.
+    const stored = readFileSync(path.join(ROOT, "src/lib/receipt-intake/stored-object.ts"), "utf8");
+    for (const fn of ["verifyStoredCopy", "inspectStoredObject", "downloadVerified", "sealAndPublish"]) {
+        const at = stored.indexOf(`export async function ${fn}(`);
+        assert.ok(at > 0, `${fn} is exported`);
+        const sig = stored.slice(at, stored.indexOf("): Promise", at));
+        assert.match(sig, /deadline: RouteDeadline \| undefined/, `${fn} takes the deadline`);
+        assert.ok(!/deadline\?: /.test(sig), `${fn}'s deadline is NOT optional`);
+    }
 });

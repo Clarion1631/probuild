@@ -171,8 +171,13 @@ export async function sealAndPublish(
     /**
      * The route's ONE deadline, handed to the seal. Every storage call this
      * invocation makes draws on the same shrinking budget.
+     *
+     * REQUIRED, so the compiler enumerates the callers. An optional one is
+     * silently omittable, and every caller that omitted it handed its
+     * storage call a fresh fifteen seconds inside an invocation that had
+     * already spent most of its life.
      */
-    deadline?: RouteDeadline,
+    deadline: RouteDeadline | undefined,
 ): Promise<PublishOutcome | null> {
     const canonicalPath = canonicalStoragePath(rowId, leaseVersion, check.fileSha256, check.mimeType);
 
@@ -281,9 +286,9 @@ export async function sealAndPublish(
 export async function downloadVerified(
     storagePath: string,
     expectedSha256: string,
-    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
-    /** Bounds the storage read — see withStorageDeadline in bucket.ts. */
-    deadline?: RouteDeadline,
+    /** The invocation's ONE deadline. REQUIRED — see verifyStoredCopy. */
+    deadline: RouteDeadline | undefined,
+    download: (storagePath: string, deadline: RouteDeadline | undefined) => Promise<DocBytesResult> = downloadReceiptObject,
 ): Promise<VerifiedBytes> {
     const result = await download(storagePath, deadline);
     if (!result.ok) {
@@ -357,16 +362,22 @@ export async function verifyStoredCopy(
     storagePath: string,
     /** What the row was published with. Empty means a legacy row — see downloadVerified. */
     fileSha256: string,
-    sizeOf: (storagePath: string, lister?: BucketLister | null, deadline?: RouteDeadline) => Promise<SizeResult> = receiptObjectSize,
-    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
+    /**
+     * The invocation's ONE deadline. REQUIRED: this function makes up to two
+     * storage calls, and both used to be issued with none at all -- a fresh
+     * fifteen seconds each, inside a handler the platform kills at thirty.
+     */
+    deadline: RouteDeadline | undefined,
+    sizeOf: (storagePath: string, lister: BucketLister | null | undefined, deadline: RouteDeadline | undefined) => Promise<SizeResult> = receiptObjectSize,
+    download: (storagePath: string, deadline: RouteDeadline | undefined) => Promise<DocBytesResult> = downloadReceiptObject,
 ): Promise<StoredCopyCheck> {
-    const present = await sizeOf(storagePath);
+    const present = await sizeOf(storagePath, null, deadline);
     if (!present.ok) {
         return present.kind === "missing"
             ? { ok: false, kind: "missing" }
             : { ok: false, kind: "transient", message: present.message ?? "size-unavailable" };
     }
-    const verified = await downloadVerified(storagePath, fileSha256, download);
+    const verified = await downloadVerified(storagePath, fileSha256, deadline, download);
     if (verified.ok) return { ok: true };
     // It was there a moment ago, so a `missing` here is a race, not a verdict —
     // and either way it is never a 2xx.
@@ -397,9 +408,11 @@ export async function inspectStoredObject(
      * format that CAN be identified is identified from the bytes.
      */
     declaredMime: string,
-    download: (storagePath: string, deadline?: RouteDeadline) => Promise<DocBytesResult> = downloadReceiptObject,
+    /** The invocation's ONE deadline. REQUIRED -- see verifyStoredCopy. */
+    deadline: RouteDeadline | undefined,
+    download: (storagePath: string, deadline: RouteDeadline | undefined) => Promise<DocBytesResult> = downloadReceiptObject,
     /** Metadata-only size lookup; injected so the "no body read" test is provable. */
-    sizeOf: (storagePath: string, lister?: BucketLister | null, deadline?: RouteDeadline) => Promise<SizeResult> = receiptObjectSize,
+    sizeOf: (storagePath: string, lister: BucketLister | null | undefined, deadline: RouteDeadline | undefined) => Promise<SizeResult> = receiptObjectSize,
 ): Promise<StoredObjectCheck> {
     // SIZE FIRST, FROM METADATA — before a single byte is read.
     //
@@ -414,7 +427,7 @@ export async function inspectStoredObject(
     // about (a storage hiccup, a missing client, an API with no metadata). The
     // sweep and the client both retry a transient answer; neither can be hurt
     // by waiting, and both can be hurt by a 400 MB read.
-    const declared = await sizeOf(storagePath);
+    const declared = await sizeOf(storagePath, null, deadline);
     if (!declared.ok) {
         return declared.kind === "missing"
             ? { ok: false, kind: "missing" }
@@ -424,7 +437,7 @@ export async function inspectStoredObject(
         return { ok: false, kind: "rejected", reason: `file-too-large:${declared.size}` };
     }
 
-    const result = await download(storagePath);
+    const result = await download(storagePath, deadline);
     if (!result.ok) {
         return result.kind === "not-found"
             ? { ok: false, kind: "missing" }

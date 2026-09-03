@@ -448,7 +448,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // or a truncated upload that /finalize would have refused — and
                 // those rows then go to Gemini and, if they read at all, to
                 // QuickBooks. One implementation, so the two cannot diverge.
-                const check = await inspectStoredObject(row.storagePath, row.mimeType);
+                // The INVOCATION's deadline, not a fresh allowance per call: a
+                // pass that has already spent 50 of its 60 seconds must not
+                // hand the next storage call a full fifteen.
+                const check = await inspectStoredObject(
+                    row.storagePath,
+                    row.mimeType,
+                    invocationDeadline,
+                );
 
                 if (check.ok) {
                     // The bytes that landed must be the document /start was told
@@ -546,7 +553,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         settleUploadCleanup: (eventId, uploadPath) =>
                             settleQueuedCleanup(eventId, uploadPath, cleanupNotBefore(row))
                                 .then(() => undefined),
-                    });
+                    }, invocationDeadline);
                     if (outcome?.published) published++;
                     continue;
                 }
@@ -654,7 +661,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // THE INVOCATION deadline, threaded into storage exactly as it is
             // into QuickBooks: a hung download must return control in time for
             // the pass to release the rows it claimed.
-            downloadVerified(storagePath, expectedSha256, undefined, invocationDeadline),
+            downloadVerified(storagePath, expectedSha256, invocationDeadline),
 
         // The invocation's ONE deadline, not a fresh 25s per row (see
         // readBudgetFor). A row reached late in the batch gets whatever
@@ -889,7 +896,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // THE INVOCATION deadline, threaded into storage exactly as it is
             // into QuickBooks: a hung download must return control in time for
             // the pass to release the rows it claimed.
-            downloadVerified(storagePath, expectedSha256, undefined, invocationDeadline),
+            downloadVerified(storagePath, expectedSha256, invocationDeadline),
             logEvent: logAutomationEvent,
             now: () => new Date(),
         }),

@@ -88,6 +88,23 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxWarning" TEXT;
 -- the two-step upload exists to prevent. Idempotent.
 ALTER TABLE "ReceiptIntake" ALTER COLUMN "state" SET DEFAULT 'STAGING';
 
+-- ONE LIVE CLAIM PER OBJECT PATH. The primary key IS the invariant: two
+-- live claims over one path cannot exist, whatever the application does.
+-- Publishing and deleting the same object used to be separated only by
+-- claim data inside an AutomationEvent's JSON, which nothing enforced and
+-- which two concurrent transactions could each read as 'free'.
+CREATE TABLE IF NOT EXISTS "ReceiptObjectClaim" (
+    "storagePath" TEXT NOT NULL,
+    "token" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "expiresAt" TIMESTAMP(3) NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "ReceiptObjectClaim_pkey" PRIMARY KEY ("storagePath")
+);
+CREATE INDEX IF NOT EXISTS "ReceiptObjectClaim_expiresAt_idx" ON "ReceiptObjectClaim"("expiresAt");
+ALTER TABLE "ReceiptObjectClaim" ENABLE ROW LEVEL SECURITY;
+
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
 CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_dedupStrongKey_active_key"

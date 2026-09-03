@@ -32,6 +32,7 @@ import {
     inShortTx,
 } from "@/lib/receipt-intake/storage-cleanup";
 import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
+import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
 
@@ -60,8 +61,13 @@ export const dynamic = "force-dynamic";
  * as it is, for the worker and the sweeper to act on), and only verified bytes
  * are success.
  */
-async function confirmStoredCopy(storagePath: string, fileSha256: string): Promise<NextResponse | null> {
-    const held = await verifyStoredCopy(storagePath, fileSha256);
+async function confirmStoredCopy(
+    storagePath: string,
+    fileSha256: string,
+    /** The REQUEST's deadline, not a fresh allowance for this probe. */
+    deadline: RouteDeadline | undefined,
+): Promise<NextResponse | null> {
+    const held = await verifyStoredCopy(storagePath, fileSha256, deadline);
     if (held.ok) return null;
     if (held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable", retryable: true }, { status: 503 });
@@ -160,6 +166,16 @@ async function authorizeFinalization(
 export const maxDuration = 30;
 
 /**
+ * THE ROUTE'S ONE ABSOLUTE DEADLINE, created at entry.
+ *
+ * This handler makes up to four storage calls -- the size probe, the
+ * download, the seal upload and, on a reject, the delete -- and it made
+ * every one of them with no deadline at all, so each took a fresh fifteen
+ * seconds inside a request the platform kills at thirty.
+ */
+const ROUTE_BUDGET_MS = 27_000;
+
+/**
  * Step 2 of the two-step upload: verify what actually landed, then publish.
  *
  * Everything here is checked against the STORED OBJECT, never against what the
@@ -172,6 +188,8 @@ export const maxDuration = 30;
  * row visible to the worker.
  */
 export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
+    // ONE deadline for the whole request -- see ROUTE_BUDGET_MS.
+    const deadline = createRouteDeadline(ROUTE_BUDGET_MS);
     const auth = await authenticateIntake(req, "ingest");
     if (!auth.ok) return auth.response;
 
@@ -409,7 +427,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!recoverable) {
         // The object first: `alreadyFinalized` is what makes a forwarder drop
         // its copy, so it must not be said about a row whose bytes are gone.
-        const unusable = await confirmStoredCopy(row.storagePath, row.fileSha256);
+        const unusable = await confirmStoredCopy(row.storagePath, row.fileSha256, deadline);
         if (unusable) return unusable;
         const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
@@ -428,7 +446,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     // ONE validator, shared with the worker's stale-STAGING sweep — see
     // stored-object.ts. If the two disagreed, whichever ran first would decide
     // whether a 40 MB video became a receipt.
-    const check = await inspectStoredObject(row.storagePath, row.mimeType);
+    const check = await inspectStoredObject(row.storagePath, row.mimeType, deadline);
     if (!check.ok) {
         if (check.kind === "missing") {
             // The upload never landed. Retryable, and NEVER a 2xx: the
@@ -610,7 +628,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         resolveCanonicalIntent,
         settleUploadCleanup: (eventId, uploadPath) =>
             settleQueuedCleanup(eventId, uploadPath, cleanupAfter).then(() => undefined),
-    });
+    }, deadline);
 
     if (!outcome) {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
@@ -659,7 +677,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // Against `current.fileSha256`, not this call's `fileSha256`: the two
         // were just proven equal by `positivelyPublished`, and the row's own
         // value is what every later reader verifies against.
-        const unusable = await confirmStoredCopy(current.storagePath, current.fileSha256);
+        const unusable = await confirmStoredCopy(current.storagePath, current.fileSha256, deadline);
         if (unusable) return unusable;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;

@@ -28,6 +28,27 @@ import path from "node:path";
 const ROOT = path.resolve(__dirname, "..");
 
 /**
+ * The text of one top-level function, EOL-AGNOSTIC.
+ *
+ * `search(/\n\}\n/)` returns -1 on a CRLF file -- the bytes there are
+ * `\r\n}\r\n` -- and `slice(0, -1)` then quietly hands back the REST OF THE
+ * FILE. Every assertion scoped to one function silently becomes unscoped, so a
+ * NEGATIVE check (`this section calls nothing external`) starts reading every
+ * function after it and fails for a reason that has nothing to do with its
+ * subject; a positive one passes on text it was never meant to see. Git's
+ * autocrlf makes that a property of who cloned the repo, not of the code.
+ */
+function functionBody(source: string, declaration: string): string {
+    const from = source.indexOf(declaration);
+    assert.notEqual(from, -1, `not found: ${declaration}`);
+    const rest = source.slice(from);
+    const end = rest.search(/\r?\n\}\r?\n/);
+    assert.notEqual(end, -1, `no closing brace found for ${declaration}`);
+    return rest.slice(0, end);
+}
+
+
+/**
  * Every file that may move a lease-bearing row. Listed explicitly rather than
  * globbed: a new file that writes these rows should have to be added here on
  * purpose, and that addition is the moment somebody reads this rule.
@@ -157,8 +178,7 @@ test("publishFence has NO caller left: every lease writer takes the full fence",
         "publishFence is referenced only where it is defined",
     );
     const lease = source("src/lib/receipt-intake/upload-lease.ts");
-    const reuse = lease.slice(lease.indexOf("export async function reuseLiveLease"));
-    const body = reuse.slice(0, reuse.search(/\n\}\n/));
+    const body = functionBody(lease, "export async function reuseLiveLease");
     assert.match(body, /\.\.\.leaseFence\(observed\)/, "the adoption CAS carries the generation");
     assert.ok(!/publishFence\(/.test(body), "and nothing weaker");
 });
@@ -167,8 +187,7 @@ test("leaseFence is a SUPERSET of publishFence, and names the lease generation",
     // If the builder ever stopped carrying the nonce or the expiry, every call
     // site would keep compiling and every fence would silently weaken.
     const stored = source("src/lib/receipt-intake/stored-object.ts");
-    const fn = stored.slice(stored.indexOf("export function leaseFence"));
-    const body = fn.slice(0, fn.search(/\n\}\n/));
+    const body = functionBody(stored, "export function leaseFence");
     assert.match(body, /\.\.\.publishFence\(row\)/);
     assert.match(body, /uploadLeaseNonce: row\.uploadLeaseNonce/);
     assert.match(body, /uploadUrlExpiresAt: row\.uploadUrlExpiresAt/);
@@ -291,26 +310,58 @@ test("the object-lock helpers are GONE, and nothing reaches for them", () => {
     }
 });
 
-test("the ONE surviving advisory lock holds no external I/O", () => {
-    // `pg_advisory_xact_lock` is not banned outright — it is the right tool
-    // for a critical section that is PURELY database work. Exactly one such
-    // section survives: the weak-key check inside promoteToBooking, which
-    // serializes two rows sharing a dedup key across a SELECT and an UPDATE
-    // and calls nothing external. The object locks were different in kind:
-    // they wrapped Supabase round trips.
+test("every advisory lock is PURE database work, and short", () => {
+    // `pg_advisory_xact_lock` is not banned -- it is the right tool for a
+    // critical section that is purely database work. The locks this feature
+    // once had were different in kind: they wrapped Supabase round trips, so a
+    // storage stall held a pooled connection for its whole duration.
+    //
+    // TWO sections take one now, and neither reaches outside Postgres:
+    //   - promoteToBooking's weak-key check, which serializes two rows
+    //     sharing a dedup key across a SELECT and an UPDATE;
+    //   - acquireObjectClaim, which serializes the publisher's and the
+    //     sweeper's claim transactions over one object path. Those two used to
+    //     touch DIFFERENT rows, so at READ COMMITTED both could read the path
+    //     as free and both commit -- and the sweeper then deleted an object a
+    //     publisher had just sealed.
     const users = LEASE_WRITERS.filter(rel => source(rel).includes("pg_advisory_xact_lock"));
     assert.deepEqual(
-        users,
-        ["src/app/api/cron/receipt-intake-worker/route.ts"],
-        "only the weak-key promotion still takes an advisory lock",
+        [...users].sort(),
+        [
+            "src/app/api/cron/receipt-intake-worker/route.ts",
+            "src/lib/receipt-intake/storage-cleanup.ts",
+        ],
+        "the weak-key promotion and the object claim, and nothing else",
     );
+
     const cron = source("src/app/api/cron/receipt-intake-worker/route.ts");
     const promote = cron.slice(cron.indexOf("promoteToBooking: async"));
-    const body = promote.slice(0, promote.indexOf("book: row =>"));
-    assert.match(body, /pg_advisory_xact_lock/, "it lives where the comment says");
-    for (const external of ["storage", "downloadReceiptObject", "removeReceiptObject", "uploadReceiptObject", "fetch("]) {
-        assert.ok(!body.includes(external), `the weak-key section calls nothing external (${external})`);
+    const weakKey = promote.slice(0, promote.indexOf("book: row =>"));
+    assert.match(weakKey, /pg_advisory_xact_lock/, "it lives where the comment says");
+
+    const cleanup = source("src/lib/receipt-intake/storage-cleanup.ts");
+    const lockBody = functionBody(cleanup, "export async function lockObjectPath");
+    assert.match(lockBody, /pg_advisory_xact_lock\(hashtext\(/, "keyed by the path");
+
+    // THE CLAIM TRANSACTIONS THEMSELVES touch nothing outside the database.
+    const acquireBody = functionBody(cleanup, "export async function acquireObjectClaim");
+    for (const body of [weakKey, lockBody, acquireBody]) {
+        // `.storage.` rather than a bare "storage": `storagePath` is a parameter
+        // name in every one of these sections, and a substring check that trips
+        // on it is a check that can only be satisfied by renaming variables.
+        for (const external of [".storage.", "downloadReceiptObject", "removeReceiptObject", "uploadReceiptObject", "fetch("]) {
+            assert.ok(!body.includes(external), `an advisory-lock section calls nothing external (${external})`);
+        }
     }
+
+    // AND IT IS THE FIRST STATEMENT of both claim transactions. A read taken
+    // before the lock is a read the other claimant can invalidate.
+    assert.match(acquireBody, /^\s*await lockObjectPath\(tx, storagePath\);/m);
+    const publisherBody = functionBody(cleanup, "export async function claimObjectPath");
+    assert.ok(
+        publisherBody.indexOf("acquireObjectClaim(") < publisherBody.indexOf("reclaimQueuedCleanups("),
+        "the publisher claims before it touches anything else",
+    );
 });
 
 test("every transaction helper the intake uses is a SHORT one", () => {
@@ -318,8 +369,7 @@ test("every transaction helper the intake uses is a SHORT one", () => {
     // timeout says so: a body that needs longer than five seconds without
     // external I/O is doing something its own doc comment forbids.
     const cleanup = source("src/lib/receipt-intake/storage-cleanup.ts");
-    const fn = cleanup.slice(cleanup.indexOf("export async function inShortTx"));
-    const body = fn.slice(0, fn.search(/\n\}\n/));
+    const body = functionBody(cleanup, "export async function inShortTx");
     assert.match(body, /prisma\.\$transaction\(body, \{ maxWait: 5_000, timeout: 5_000 \}\)/);
     // The 30-second window the lock needed is gone with it.
     assert.ok(!cleanup.includes("timeout: 30_000"), "no transaction is sized for a storage round trip");

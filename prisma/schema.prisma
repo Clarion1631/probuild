@@ -3048,6 +3048,35 @@ model BankImageMatch {
 ///
 /// `state` is a String with a SQL CHECK, not a Prisma enum — matching
 /// BankLine.state and Expense.status.
+/// ONE LIVE CLAIM PER OBJECT PATH, enforced by the primary key.
+///
+/// Publishing and deleting the same object are mutually exclusive, and until
+/// now that exclusion lived entirely in the JSON `detail` of an AutomationEvent
+/// -- which no constraint could enforce and no two transactions serialized on.
+/// A sweeper converting an EXPIRED provisional intent into a deleting claim and
+/// a publisher inserting a fresh publishing claim touched DIFFERENT rows, so at
+/// READ COMMITTED both read "the path is free", both committed, and the sweeper
+/// deleted the object the publisher had just sealed but not yet pointed at: a
+/// RECEIVED row with no bytes behind it.
+///
+/// The path being the PRIMARY KEY makes a second live claim impossible even if
+/// the advisory lock both claim transactions take were somehow missed.
+model ReceiptObjectClaim {
+  /// The object this claim is over. One row per path -- that IS the invariant.
+  storagePath String   @id
+  /// Random per acquisition. The holder re-reads it before acting, so an
+  /// expired claim taken over by somebody else cannot be mistaken for its own.
+  token       String
+  /// publishing | deleting
+  kind        String
+  /// When the claim lapses. A dead holder must not block a path forever.
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
 model ReceiptIntake {
   id          String  @id @default(cuid())
   source      String // mobile | email | drive | chat | web

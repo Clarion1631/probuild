@@ -17,6 +17,7 @@ import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/wo
 import { lockQboExpense } from "../src/lib/qbo-expense-sync";
 import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
 import { statements, verifyColumnDefaults } from "../scripts/apply-receipt-intake.mjs";
+import { acquireObjectClaim } from "../src/lib/receipt-intake/storage-cleanup";
 import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
@@ -28,6 +29,13 @@ const skip = !url
         : false;
 
 const db = url && !looksLikeProd ? new PrismaClient({ datasources: { db: { url } } }) : null;
+/**
+ * TWO MORE CONNECTIONS. The claim race is between two transactions on two
+ * different backends, and a single client cannot hold two open at once --
+ * which is exactly why a mocked transaction can say nothing about it.
+ */
+const dbA = url && !looksLikeProd ? new PrismaClient({ datasources: { db: { url } } }) : null;
+const dbB = url && !looksLikeProd ? new PrismaClient({ datasources: { db: { url } } }) : null;
 
 const PREFIX = "drive:claimdb-";
 
@@ -526,7 +534,7 @@ test("a SLOW storage call holds ZERO transactions open", { skip }, async () => {
         queueUploadCleanup: async () => "ev-probe",
         resolveCanonicalIntent: async () => {},
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     assert.equal(outcome?.published, true, "the publish completed");
     assert.ok(sealMs >= 700, `the seal really was slow (${sealMs}ms)`);
@@ -597,7 +605,7 @@ async function runBatch(
         queueUploadCleanup: async () => `ev-${n}`,
         resolveCanonicalIntent: async () => {},
         settleUploadCleanup: async () => {},
-    } as never);
+    } as never, undefined);
 
     const startedAt = Date.now();
     const results = await Promise.all(PUBLISHERS.map(publishOne));
@@ -897,4 +905,187 @@ test("CONTROL: the drifted table WITHOUT the upgrade keeps the old default", { s
     } finally {
         await db!.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${UPGRADE_SCHEMA}_ctl" CASCADE`);
     }
+});
+
+// ── PUBLISHER vs SWEEPER: exactly one takes the path (round-21 finding 1) ──
+//
+// The write skew, precisely: an EXPIRED provisional intent exists. The sweeper
+// reads it, finds the claim lapsed, and UPDATES that event into a deleting
+// claim. The publisher reads the same events, also finds nothing live, and
+// INSERTS a fresh publishing claim -- and its reclamation only touches
+// `pending` rows, so it does not even see the provisional one. Two
+// transactions, two different rows, no conflict at READ COMMITTED: both
+// commit, and the sweeper then deletes the object the publisher has sealed but
+// not yet pointed at.
+//
+// Both claim transactions now take the same per-path advisory lock as their
+// FIRST statement, and the claim itself lives in a table whose primary key is
+// the path. This is the only place either can be shown to work: a mock cannot
+// block, and a single connection cannot interleave.
+
+const RACE_PATH = `receipts/intake/${PREFIX}race/v1/abc.png`;
+
+async function clearClaims() {
+    await db!.receiptObjectClaim.deleteMany({ where: { storagePath: { contains: PREFIX } } });
+}
+
+/**
+ * Take a claim on `client`, then HOLD the transaction open until `release`
+ * resolves. The hold is what lets the other side try while this one still has
+ * the lock.
+ */
+function claimHolding(
+    client: PrismaClient,
+    kind: "publishing" | "deleting",
+    release: Promise<void>,
+    now: Date,
+) {
+    return client.$transaction(async tx => {
+        const got = await acquireObjectClaim(
+            tx as unknown as Prisma.TransactionClient,
+            RACE_PATH,
+            kind,
+            new Date(now.getTime() + 60_000),
+            now,
+        );
+        await release;
+        return got;
+    }, { maxWait: 20_000, timeout: 20_000 });
+}
+
+const settle = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+for (const [firstKind, secondKind] of [
+    ["deleting", "publishing"],
+    ["publishing", "deleting"],
+] as const) {
+    test(
+        `CLAIM RACE (${firstKind} first): exactly one wins, and the loser sees it`,
+        { skip },
+        async () => {
+            await clearClaims();
+            const now = new Date();
+
+            let release!: () => void;
+            const held = new Promise<void>(resolve => { release = resolve; });
+
+            // The first claimant takes the lock and keeps its transaction open.
+            const first = claimHolding(dbA!, firstKind, held, now);
+            await settle(300);
+
+            // The second starts while that lock is held. It BLOCKS -- which is the
+            // whole point; before the lock it would have read the same state and
+            // written its own claim into a different row.
+            const second = claimHolding(dbB!, secondKind, Promise.resolve(), now);
+            await settle(300);
+
+            let secondSettled = false;
+            void second.then(() => { secondSettled = true; }, () => { secondSettled = true; });
+            await settle(100);
+            assert.equal(secondSettled, false, `the ${secondKind} claim waits for the lock`);
+
+            release();
+            const [a, b] = await Promise.all([first, second]);
+
+            assert.equal(a.ok, true, `the ${firstKind} claim won`);
+            assert.equal(b.ok, false, `and the ${secondKind} claim was refused`);
+            assert.equal((b as { heldBy: string }).heldBy, firstKind, "by name");
+
+            // ONE row, one live claim -- the primary key says so.
+            const rows = await db!.receiptObjectClaim.findMany({
+                where: { storagePath: RACE_PATH },
+            });
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].kind, firstKind);
+            assert.equal(rows[0].token, (a as { token: string }).token);
+        },
+    );
+}
+
+test("CONTROL: two publishers may share a path, because the bytes are identical", { skip }, async () => {
+    // Without this, a claim that refused everything would pass the two tests
+    // above while breaking every concurrent publish -- which the whole
+    // content-addressed design depends on being allowed.
+    await clearClaims();
+    const now = new Date();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+
+    const first = claimHolding(dbA!, "publishing", held, now);
+    await settle(300);
+    const second = claimHolding(dbB!, "publishing", Promise.resolve(), now);
+    await settle(200);
+    release();
+    const [a, b] = await Promise.all([first, second]);
+
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true, "a second publisher is not a conflict");
+    const rows = await db!.receiptObjectClaim.findMany({ where: { storagePath: RACE_PATH } });
+    assert.equal(rows.length, 1, "still one row: the path is the primary key");
+});
+
+test("PRE-FIX CONTROL: without the lock, both claimants commit", { skip }, async () => {
+    // The shipped shape, reproduced against the same real Postgres: two
+    // transactions that read the claim state and then write DIFFERENT rows. No
+    // conflict is possible at READ COMMITTED, so both succeed -- and that is
+    // precisely how a sweeper came to delete an object a publisher had sealed.
+    await clearClaims();
+    const eventPrefix = `${PREFIX}skew`;
+    await db!.automationEvent.deleteMany({ where: { detail: { contains: eventPrefix } } });
+    const expired = await db!.automationEvent.create({
+        data: {
+            kind: "receipt-intake-storage-cleanup",
+            status: "provisional",
+            reason: "canonical-seal-intent",
+            source: "receipt-intake",
+            detail: JSON.stringify({
+                storagePath: `${eventPrefix}/object.png`,
+                claimToken: "long-dead",
+                claimKind: "publishing",
+                claimUntil: new Date(Date.now() - 60_000).toISOString(),
+            }),
+        },
+    });
+
+    // The sweeper's shape: UPDATE the expired event into a deleting claim.
+    const sweeper = dbA!.$transaction(async tx => {
+        const seen = await tx.automationEvent.findMany({
+            where: { detail: { contains: eventPrefix } },
+            select: { id: true, detail: true },
+        });
+        await settle(300);
+        await tx.automationEvent.update({
+            where: { id: expired.id },
+            data: { reason: "swept-claim" },
+        });
+        return seen.length;
+    }, { maxWait: 20_000, timeout: 20_000 });
+
+    // The publisher's shape: INSERT a fresh provisional claim.
+    const publisher = dbB!.$transaction(async tx => {
+        const seen = await tx.automationEvent.findMany({
+            where: { detail: { contains: eventPrefix } },
+            select: { id: true, detail: true },
+        });
+        await settle(300);
+        const made = await tx.automationEvent.create({
+            data: {
+                kind: "receipt-intake-storage-cleanup",
+                status: "provisional",
+                reason: "publisher-claim",
+                source: "receipt-intake",
+                detail: JSON.stringify({ storagePath: `${eventPrefix}/object.png` }),
+            },
+            select: { id: true },
+        });
+        return { seen: seen.length, made: made.id };
+    }, { maxWait: 20_000, timeout: 20_000 });
+
+    const [swept, published] = await Promise.all([sweeper, publisher]);
+
+    assert.equal(swept, 1, "the sweeper saw only the expired intent");
+    assert.equal(published.seen, 1, "and so did the publisher: neither saw the other");
+    assert.ok(published.made, "BOTH committed -- different rows, no conflict, no lock");
+
+    await db!.automationEvent.deleteMany({ where: { detail: { contains: eventPrefix } } });
 });

@@ -592,7 +592,7 @@ async function respondToSourceRefConflict(
     // download. A TRANSIENT answer is not evidence of absence — healing on it
     // would overwrite a document that is really there — so it is answered 503
     // and the forwarder retries with its copy intact.
-    const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256);
+    const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256, deadline);
     if (!held.ok && held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }

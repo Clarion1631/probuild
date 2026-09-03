@@ -412,6 +412,30 @@ export const statements = [
     // Idempotent — setting a default that already matches is a no-op.
     `ALTER TABLE "ReceiptIntake" ALTER COLUMN "state" SET DEFAULT 'STAGING'`,
 
+    // ONE LIVE CLAIM PER OBJECT PATH. The primary key IS the invariant.
+    //
+    // Publishing and deleting the same object are mutually exclusive, and
+    // that exclusion used to live entirely in an AutomationEvent's JSON
+    // `detail` -- which no constraint enforced and which two concurrent
+    // transactions could each read as 'free', because they touched different
+    // rows. Both claim transactions now take a per-path advisory lock AND
+    // write here, so a second live claim is impossible even if the lock were
+    // somehow missed.
+    `CREATE TABLE IF NOT EXISTS "ReceiptObjectClaim" (
+       "storagePath" TEXT NOT NULL,
+       "token"       TEXT NOT NULL,
+       "kind"        TEXT NOT NULL,
+       "expiresAt"   TIMESTAMP(3) NOT NULL,
+       "createdAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       "updatedAt"   TIMESTAMP(3) NOT NULL,
+       CONSTRAINT "ReceiptObjectClaim_pkey" PRIMARY KEY ("storagePath")
+     )`,
+
+    `CREATE INDEX IF NOT EXISTS "ReceiptObjectClaim_expiresAt_idx"
+       ON "ReceiptObjectClaim"("expiresAt")`,
+
+    `ALTER TABLE "ReceiptObjectClaim" ENABLE ROW LEVEL SECURITY`,
+
     // Intake idempotency: one row per caller-supplied sourceRef. A forwarder
     // replaying the same Drive file / Gmail message is a no-op.
     `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key"
@@ -540,6 +564,9 @@ export const statements = [
 ];
 
 export const expectedColumns = {
+    ReceiptObjectClaim: [
+        "storagePath", "token", "kind", "expiresAt", "createdAt", "updatedAt",
+    ],
     ReceiptIntake: [
         "id", "source", "sourceRef", "state", "dryRun", "stateReason", "taxWarning",
         "projectId", "costCodeId", "suggestedCostCodeId", "suggestedConfidence",

@@ -2124,17 +2124,29 @@ test("CONTROL: an ordinary transient storage fault still gets all 20 attempts", 
     assert.match(h.retried[0].reason, /^storage:/);
 });
 
-test("the deadline reaches storage, not just QuickBooks", () => {
-    // The wiring: buildDeps threads the invocation deadline into the download
-    // exactly as it does into the QBO client.
+test("the deadline reaches EVERY storage call, not just QuickBooks", () => {
+    // The wiring: buildDeps threads the INVOCATION's deadline into every
+    // storage call the pass makes, exactly as it does into the QBO client.
+    // They are the same deadline, so a pass that has spent fifty of its sixty
+    // seconds cannot hand the next call a fresh fifteen.
     const cron = readFileSync(
         path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
         "utf8",
     );
     assert.equal(
-        (cron.match(/downloadVerified\(storagePath, expectedSha256, undefined, invocationDeadline\)/g) ?? []).length,
+        (cron.match(/downloadVerified\(storagePath, expectedSha256, invocationDeadline\)/g) ?? []).length,
         2,
         "both the worker's read and the booking's read",
+    );
+    // The stale-STAGING sweep's inspection and the publish's seal, too. Both
+    // used to be issued with no deadline at all.
+    assert.match(cron, /inspectStoredObject\(\s*\n\s*row\.storagePath,\s*\n\s*row\.mimeType,\s*\n\s*invocationDeadline,\s*\n\s*\)/);
+    assert.match(cron, /\}, invocationDeadline\);/, "and sealAndPublish takes it as well");
+    // ONE deadline per invocation, created once.
+    assert.equal(
+        (cron.match(/createRouteDeadline\(/g) ?? []).length,
+        1,
+        "one deadline for the pass, not one per row",
     );
 });
 
