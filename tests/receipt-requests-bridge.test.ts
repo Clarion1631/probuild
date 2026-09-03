@@ -342,7 +342,7 @@ test("the retry pass re-posts unposted rows, and selects only when it may", () =
     // select when the chase finished after the morning run bailed, which is
     // the only way that day gets a card at all.
     assert.match(source, /if \(!selectionAllowed\) continue;/);
-    assert.match(source, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
+    assert.match(source, /const selectionAllowed = chaserCompletedFor\(marker, date, "America\/Los_Angeles", currentCycleId\);/);
     // The scan follows the same verdict: needed when it may select, skipped
     // when it may not (then it posts purely from the claimed snapshot). It is
     // handed the run's own clock (round-34 finding 3), so the skipped branch has
@@ -443,7 +443,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0[\s]*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);
@@ -627,7 +627,7 @@ test("the bank pull plans its window from a persisted high-water mark", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
     assert.match(source, /const WINDOW_STATE_KEY = "bankRegisterPullWindow";/);
     assert.match(source, /const PULL_BUDGET_MS = 50_000;/);
-    assert.match(source, /windowState,\s*\n\s*saveWindowState,\s*\n\s*budgetMs: PULL_BUDGET_MS,/);
+    assert.match(source, /windowState,\s*\n\s*saveWindowState,[\s\S]{0,2200}?budgetMs: PULL_BUDGET_MS,/);
     // A corrupt state plans the WIDEST safe window, never a narrow one.
     assert.match(source, /return \{ highWater: null, lastFullSweep: null, continueAfter: null, uncertifiedBounds: null \};/);
 });
@@ -678,13 +678,13 @@ test("?continue=1 and moreToProcess consult BOTH cursors", () => {
     // Widened in round 45 (finding 2): an OWED FULL RUN is work in progress
     // too, even with no cursor parked — otherwise a 13:00 run that lost the
     // lease to a continuation would never be picked up.
-    assert.match(source, /const \[phase, lineCursor, openCursor, fullRunOwed\] = await Promise\.all\(\[/);
-    assert.match(source, /readPhase\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\),/);
+    assert.match(source, /const \[phase, lineCursor, openCursor, fullRunOwed, persistedCycle\] = await Promise\.all\(\[/);
+    assert.match(source, /readPhase\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\), readCycle\(\),/);
     // ...and the PHASE, because each cursor is cleared the moment its pass
     // finishes, so a cycle can be unfinished with neither one parked.
     // An OWED FULL RUN keeps this pass alive even with no cursor parked
     // (round-45 gate, finding 2).
-    assert.match(source, /if \(!fullRunOwed && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
+    assert.match(source, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
     assert.match(source, /moreToProcess: !exhausted \|\| !openExhausted/);
 });
 
@@ -882,7 +882,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified;/);
+    assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s\S]{0,140}?quarantineHeld\.length === 0[\s]*&& !summary\.uncertified;/);
     // The write itself, and the release of an owed stamp, are ONE transaction
     // (round-37 gate, finding 2) — the ONLY place stampPending is ever cleared.
     assert.match(route, /if \(stampWarranted\) \{[\s\S]{0,300}await commitFreshnessStamp\(/);

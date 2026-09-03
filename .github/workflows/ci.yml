@@ -89,6 +89,22 @@ jobs:
         env:
           MIGRATION_HISTORY_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # THE APPLY SCRIPT, RUN THE WAY PRODUCTION RUNS IT.
+      #
+      # main() is the one part of that script nothing else executes — the unit
+      # tests read its statement list and its guards as text — so a statement a
+      # real Postgres rejects, or one in the wrong order, would ship green. The
+      # driver builds a pre-Phase-2 database, seeds the rows the data-dependent
+      # statements need (a legacy memo-signed issue, cards carrying a
+      # deliveredOn claim), runs the script twice for idempotency, and asserts
+      # the resulting shape — columns, indexes, RLS and policies — matches a
+      # database built from the committed migration.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-phase2-receipt-queue-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_phase2
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest

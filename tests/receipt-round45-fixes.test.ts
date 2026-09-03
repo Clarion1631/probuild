@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { cycleStillValid, parseSweepCycle } from "../src/app/api/cron/receipt-requests/route";
+import { cycleStillValid, parseSweepCycle } from "../src/lib/receipt-sweep-marker";
 import { MAX_SPLITS_PER_TXN, convertRegisterRows, splitSuffix } from "../src/lib/bank-register-pull";
 
 /**
@@ -30,7 +30,10 @@ test("the cycle's epochs live in a record of their own, not on the cursors", () 
     assert.match(sweep, /if \(exhausted && totals\.errors === 0\) await writeCursor\(null\);/);
 
     // The fix: a record written once per cycle and read on every continuation.
-    assert.match(sweep, /const CYCLE_KEY = "receiptRequestsCycle";/);
+    // The record lives in the shared marker module, not the sweep route: the
+    // cards cron needs it too, and a route importing another route pulls the
+    // whole sweep into its bundle.
+    assert.match(read("src/lib/receipt-sweep-marker.ts"), /export const CYCLE_KEY = "receiptRequestsCycle";/);
     assert.match(sweep, /cycle = \{ id: randomUUID\(\), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \};/);
     assert.match(sweep, /await writeCycle\(cycle\);/);
     // A fresh full run clears it with the cursors, so the next cycle cannot
@@ -83,7 +86,7 @@ test("the full run records its intent BEFORE reaching for the lease", () => {
     // And whoever runs next honours it.
     assert.match(sweep, /const fullRunOwed = continueOnly && await readFullRunRequested\(\);/);
     assert.match(sweep, /await writeFullRunRequested\(null\);/);
-    assert.match(sweep, /if \(!fullRunOwed && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/,
+    assert.match(sweep, /if \(!fullRunOwed && !cycleOpen && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/,
         "an owed full run is work in progress even with no cursor parked");
 });
 
@@ -197,7 +200,7 @@ test("a quarantine is reported, and does not fail the run", () => {
     // mark and the freshness stamp could never advance — every owner's cards
     // stopped for one transaction, on every retry, indefinitely.
     assert.doesNotMatch(lib, /summary\.error = "qbo-duplicate-conflict";/);
-    assert.match(lib, /summary\.quarantinedQbTxnIds = \[\.\.\.quarantined\];/);
+    assert.match(lib, /summary\.quarantinedQbTxnIds = quarantined\.map\(entry => entry\.qbTxnId\);/);
     // Minting stays blocked while rows are missing, which is a narrow and real
     // reason — blocking the MINT is not blocking the run.
     assert.match(lib, /clearedProbeOk && quarantined\.length === 0;/);

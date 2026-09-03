@@ -385,10 +385,20 @@ function reset() {
     uniqueViolations = 0;
     postingWriteError = null;
     settings.clear();
+    /**
+     * THE COMPLETION IS A TUPLE since round 46 (finding 4): the cards cron
+     * requires the CURRENT cycle to be the one that finished, not merely that
+     * something finished today. A stale stamp carried forward by a later phase
+     * write used to release cards over a partially reconciled set.
+     */
+    settings.set("receiptRequestsCycle", JSON.stringify({
+        id: "cycle-under-test", epoch: "1", evidenceEpoch: "1",
+    }));
     settings.set("receiptRequestsPhase", JSON.stringify({
         phase: "done",
         chaserCompletedAt: new Date().toISOString(),
         blockedReason: null,
+        completedCycleId: "cycle-under-test",
     }));
 }
 

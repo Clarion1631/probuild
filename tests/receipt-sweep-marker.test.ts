@@ -50,22 +50,41 @@ test("the marker row still reads correctly when an older build wrote it", () => 
     // being taken as done.
     // A bare phase carries no block either — absent must read as "nothing is
     // holding this back", never as an unknown that alarms.
-    assert.deepEqual(parseSweepMarker("lines"), { phase: "lines", chaserCompletedAt: null, blockedReason: null });
-    assert.deepEqual(parseSweepMarker("done"), { phase: "done", chaserCompletedAt: null, blockedReason: null });
-    // And a JSON marker from the build BEFORE blockedReason existed.
+    assert.deepEqual(parseSweepMarker("lines"),
+        { phase: "lines", chaserCompletedAt: null, blockedReason: null, completedCycleId: null });
+    assert.deepEqual(parseSweepMarker("done"),
+        { phase: "done", chaserCompletedAt: null, blockedReason: null, completedCycleId: null });
+    // And a JSON marker from the build BEFORE blockedReason or the cycle id
+    // existed. A missing cycle id reads as null, which FAILS the identity check
+    // and therefore blocks the cards — the safe direction on the deploy that
+    // introduces it, and self-correcting on the next clean cycle.
     assert.deepEqual(
         parseSweepMarker(JSON.stringify({ phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z" })),
-        { phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z", blockedReason: null },
+        { phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z", blockedReason: null, completedCycleId: null },
+    );
+    assert.equal(
+        chaserCompletedFor(
+            parseSweepMarker(JSON.stringify({ phase: "done", chaserCompletedAt: "2026-09-02T13:20:00Z" })),
+            "2026-09-02", "America/Los_Angeles", "cycle-1",
+        ),
+        false,
+        "a stamp with no cycle id cannot be THIS cycle's completion",
     );
     assert.equal(chaserCompletedFor(parseSweepMarker("done"), "2026-09-02"), false);
     // Junk is not a licence to assume anything either.
     for (const junk of ["", "  ", "{not json", "[]", "null", undefined, null]) {
         assert.equal(chaserCompletedFor(parseSweepMarker(junk as string), "2026-09-02"), false, String(junk));
     }
-    // Round-trips, block and all.
-    const marker = { phase: "lines" as const, chaserCompletedAt: "2026-09-02T13:20:00Z", blockedReason: null };
+    // Round-trips, block and cycle id and all.
+    const marker = {
+        phase: "lines" as const, chaserCompletedAt: "2026-09-02T13:20:00Z",
+        blockedReason: null, completedCycleId: "cycle-1",
+    };
     assert.deepEqual(parseSweepMarker(formatSweepMarker(marker)), marker);
-    const blocked = { phase: "lines" as const, chaserCompletedAt: null, blockedReason: "bank-pull-stale" };
+    const blocked = {
+        phase: "lines" as const, chaserCompletedAt: null,
+        blockedReason: "bank-pull-stale", completedCycleId: null,
+    };
     assert.deepEqual(parseSweepMarker(formatSweepMarker(blocked)), blocked);
     // An empty string is not a reason.
     assert.equal(parseSweepMarker(JSON.stringify({ phase: "done", blockedReason: "" })).blockedReason, null);
@@ -79,7 +98,7 @@ test("the sweep stamps only a clean cycle, and the cards cron refuses without on
     // and the ledger check are one transaction, so no BankLine can commit
     // between "the ledger has not moved" and "this cycle is done".
     assert.match(sweep, /await ops\.writePhase\(\s*decision\.phase,\s*decision\.complete \? input\.now\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
-    assert.match(sweep, /chaserCompletedAt: completedAt \?\? previous\.chaserCompletedAt,/);
+    assert.match(sweep, /chaserCompletedAt: startingNewCycle \? null : \(completedAt \?\? previous\.chaserCompletedAt\),/);
     // A STALE BANK PULL CANNOT REACH "done". The phase is forced back to
     // "lines" so `shouldResumeSweep` keeps saying yes and the every-15-minutes
     // resume stamps as soon as the pull recovers — leaving it "done" would make
@@ -99,7 +118,7 @@ test("the sweep stamps only a clean cycle, and the cards cron refuses without on
     const cards = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     // The gate is now a named verdict, because the RETRY pass consults it too:
     // it may select when the chase finished after the morning run bailed.
-    assert.match(cards, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
+    assert.match(cards, /const selectionAllowed = chaserCompletedFor\(marker, date, "America\/Los_Angeles", currentCycleId\);/);
     assert.match(cards, /if \(!selectionAllowed\) \{/);
     assert.match(cards, /skipped: "chaser-incomplete"/);
     // ok:false so it is visible, 200 because retrying THIS invocation would not

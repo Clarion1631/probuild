@@ -7,6 +7,12 @@ import { releaseLease, takeLease } from "@/lib/cron-lease";
 import {
     BANK_PULL_LAST_SUCCESS_KEY,
     BANK_PULL_AMBIGUOUS_KEY,
+    BANK_PULL_QUARANTINE_ACCEPTED_KEY,
+    BANK_PULL_QUARANTINE_KEY,
+    BANK_PULL_SPLIT_MANIFEST_KEY,
+    outstandingQuarantine,
+    parseAcceptedQuarantine,
+    parseQuarantine,
     BANK_PULL_AMBIGUOUS_STALE_KEY,
     BANK_PULL_BLOCKED_REASON_KEY,
     BANK_PULL_UNCERTIFIED_KEY,
@@ -239,6 +245,49 @@ async function mergeWindowState(fields: Record<string, unknown>): Promise<void> 
  * for a write that has just succeeded. Losing the reminder costs a continuation
  * that finds nothing to do; losing the stamp costs the day's cards.
  */
+/**
+ * Merge this run's quarantined ids into the durable record and report what is
+ * still outstanding.
+ *
+ * MERGED, not replaced: a transaction quarantined last night is still missing
+ * from the ledger tonight even if tonight's fetch did not reach it, and
+ * `firstSeenAt` is kept so the age is visible. Accepted ids are dropped from
+ * the outstanding list but stay in the record, so the history of what was
+ * waved through survives.
+ */
+async function persistQuarantine(found: readonly string[]): Promise<Array<{ qbTxnId: string }>> {
+    try {
+        const [existingRow, acceptedRow] = await Promise.all([
+            prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_KEY } }),
+            prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_ACCEPTED_KEY } }),
+        ]);
+        const existing = parseQuarantine(existingRow?.value);
+        const accepted = parseAcceptedQuarantine(acceptedRow?.value);
+        const byId = new Map(existing.map(entry => [entry.qbTxnId, entry]));
+        const now = new Date().toISOString();
+        for (const qbTxnId of found) {
+            if (byId.has(qbTxnId)) continue;
+            byId.set(qbTxnId, { qbTxnId, reason: "implausible-split-count", count: 0, firstSeenAt: now });
+        }
+        const merged = [...byId.values()];
+        const value = JSON.stringify(merged);
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_QUARANTINE_KEY },
+            update: { value },
+            create: { key: BANK_PULL_QUARANTINE_KEY, value },
+        });
+        return outstandingQuarantine(merged, accepted);
+    } catch (error) {
+        console.error("[cron/bank-register-pull] quarantine write failed", error instanceof Error ? error.message : "UnknownError");
+        /**
+         * A quarantine we could not RECORD is still a quarantine. Reporting the
+         * ids this run found holds the stamp, which is the safe direction: the
+         * alternative is stamping over rows nobody can see.
+         */
+        return found.map(qbTxnId => ({ qbTxnId }));
+    }
+}
+
 async function commitFreshnessStamp(at: string): Promise<void> {
     await prisma.$transaction(async tx => {
         await tx.automationSetting.upsert({
@@ -520,6 +569,39 @@ async function runPull() {
         days: BANK_REGISTER_PULL_DAYS,
         windowState,
         saveWindowState,
+        /**
+         * The split manifest (round-46 gate, finding 1). One row, read before
+         * the fetch and written after it, so the next run can tell a
+         * QuickBooks restatement from a new observation and a 1↔N split
+         * transition from either.
+         */
+        loadSplitManifest: async () => {
+            try {
+                const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_SPLIT_MANIFEST_KEY } });
+                if (!row?.value) return {};
+                const parsed: unknown = JSON.parse(row.value);
+                if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+                const out: Record<string, string[]> = {};
+                for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+                    if (Array.isArray(value) && value.every(entry => typeof entry === "string")) out[key] = value as string[];
+                }
+                return out;
+            } catch {
+                // An unreadable manifest reads as EMPTY, which makes every
+                // transaction look new — so nothing is restated and nothing is
+                // quarantined on a cardinality change this run cannot see. The
+                // write below then rebuilds it from what was actually fetched.
+                return {};
+            }
+        },
+        saveSplitManifest: async manifest => {
+            const value = JSON.stringify(manifest);
+            await prisma.automationSetting.upsert({
+                where: { key: BANK_PULL_SPLIT_MANIFEST_KEY },
+                update: { value },
+                create: { key: BANK_PULL_SPLIT_MANIFEST_KEY, value },
+            });
+        },
         budgetMs: PULL_BUDGET_MS,
         elapsedMs: () => Date.now() - startedAt,
 
@@ -725,7 +807,23 @@ async function runPull() {
     // That was the fourth shape of the lie: a narrow, healthy, complete overlap
     // window stamped the clock over observations that had never been certified
     // and were never offered to the mint (round-35 gate, finding 1).
+    /**
+     * A QUARANTINE IS MISSING ROWS, AND MISSING ROWS BLOCK THE STAMP (round-46
+     * gate, finding 2).
+     *
+     * Round 45 excluded the transaction and left `ok`/`complete` true, so the
+     * state advanced, the freshness clock stamped, and the chaser released
+     * cards over a register that was short by exactly those rows. The
+     * quarantine was only a log line.
+     *
+     * It is persisted here and it holds the stamp — the same treatment as
+     * ambiguity, and for the same reason — until a person accepts it. Accepting
+     * does not un-miss the rows; it records that somebody looked and decided
+     * the pipeline should move anyway, which is a judgement no rule can make.
+     */
+    const quarantineHeld = await persistQuarantine(summary.quarantinedQbTxnIds ?? []);
     const stampWarranted = summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
+        && quarantineHeld.length === 0
         && !summary.uncertified;
     /**
      * A FAILED STAMP IS A FAILED RUN (round-36 gate, finding 4).

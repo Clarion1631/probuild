@@ -188,13 +188,23 @@ const FIVE_ROW_FIXTURE: BankRegisterRowLike[] = [
     { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: "1sEISJBJaGRYpivooQJBR", name: "Lowes", memo: "LOWES #02516 POS DEB C#8516", amountCents: -12_345, clearedStatus: "Reconciled" },
 ];
 
-test("convertRegisterRows maps the fixture, skips identity-less rows, collapses split repeats", () => {
+test("convertRegisterRows maps the fixture, skips identity-less rows, splits repeats by ordinal", () => {
     const result = convertRegisterRows(FIVE_ROW_FIXTURE);
     assert.equal(result.skipped, 1, "the balance/summary row carries no txn identity");
-    assert.equal(result.collapsed, 1, "the repeated 6625 split is ONE observation");
+    /**
+     * TWO IDENTICAL ROWS ARE TWO SPLITS, NOT ONE (round-46 gate, finding 1).
+     *
+     * They used to collapse by content, which quietly threw away a real
+     * posting: a transaction with two equal splits to the same account is
+     * exactly the shape that collapse destroyed. Ordinal identity keeps both,
+     * and keeps them distinguishable.
+     */
+    assert.equal(result.collapsed, 0, "nothing collapses by content any more");
+    assert.equal(result.split, 2, "the repeated 6625 is two splits");
     assert.deepEqual(result.lines, [
         // The memo wins over the name, and the type is never appended.
-        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625", clearedStatus: "Reconciled" },
+        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625#0", clearedStatus: "Reconciled" },
+        { postedDate: "2026-08-12", amountCents: -12_345, rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null, qbTxnId: "6625#1", clearedStatus: "Reconciled" },
         // The UNCLEARED check survives conversion unchanged. It is not dropped
         // here — it becomes an observation like any other; what it may not do
         // is mint a canonical line (see planQboMint).
@@ -262,15 +272,20 @@ test("runBankRegisterPull: a second run over the same window inserts ZERO new ro
 
     const first = await runBankRegisterPull(pullDeps(store, FIVE_ROW_FIXTURE, reconcileCalls));
     assert.equal(first.ok, true);
-    assert.equal(first.observations, 3);
-    assert.equal(first.inserted, 3);
+    // 4 since round 46 (finding 1): the repeated 6625 is two splits at two
+    // ordinals, not one row collapsed by content.
+    assert.equal(first.observations, 4);
+    assert.equal(first.inserted, 4);
     assert.equal(first.existing, 0);
 
     const second = await runBankRegisterPull(pullDeps(store, FIVE_ROW_FIXTURE, reconcileCalls));
     assert.equal(second.ok, true);
+    // THE ORDINAL IDENTITY IS WHAT MAKES THIS ZERO. A content-derived id would
+    // have produced the same ids here too — but only because nothing changed;
+    // the restatement test above is where the two differ.
     assert.equal(second.inserted, 0, "re-running an overlapping window must create nothing");
-    assert.equal(second.existing, 3);
-    assert.equal(store.stored.size, 3);
+    assert.equal(second.existing, 4);
+    assert.equal(store.stored.size, 4);
     assert.deepEqual(reconcileCalls, ["WTB-0723", "WTB-0723"], "reconcile runs after every pull");
 });
 
@@ -292,8 +307,12 @@ test("runBankRegisterPull: a QBO restatement stops the run and is reported, neve
     const summary = await runBankRegisterPull(pullDeps(store, restated, []));
     assert.equal(summary.ok, false);
     assert.equal(summary.error, "qbo-txn-conflict");
-    assert.deepEqual(summary.conflictQbTxnIds, ["6625"]);
-    assert.equal(store.stored.get("6625"), JSON.stringify(["2026-08-12", -12_345, "LOWES #02516 POS DEB C#8516", null]),
+    // The identity is now ordinal-based (round-46 gate, finding 1), so the
+    // restated split keeps the id it already had — which is the whole point:
+    // the ingest updates the row it has rather than minting a second one, and
+    // the route's own 409 is what surfaces a restatement of a stored identity.
+    assert.deepEqual(summary.conflictQbTxnIds, ["6625#0"]);
+    assert.equal(store.stored.get("6625#0"), JSON.stringify(["2026-08-12", -12_345, "LOWES #02516 POS DEB C#8516", null]),
         "the stored observation is never silently overwritten");
 });
 
@@ -310,7 +329,7 @@ test("runBankRegisterPull: a reconcile failure FAILS the pull — unlinked obser
     // incomplete truth. The observations DID land; the run still failed.
     assert.equal(summary.ok, false);
     assert.equal(summary.error, "reconcile-failed");
-    assert.equal(summary.inserted, 3, "whatever committed stays committed");
+    assert.equal(summary.inserted, 4, "whatever committed stays committed");
     assert.equal(summary.reconciled, null);
 });
 
@@ -367,11 +386,18 @@ test("divergent repeats under one qbTxnId are SPLITS, and they post", async t =>
         );
     });
 
-    await t.test("identical repeats still collapse, and are not splits", () => {
+    await t.test("identical repeats are DISTINCT splits, not one collapsed row", () => {
+        /**
+         * Round 45 collapsed these by content, which threw away a real posting:
+         * a transaction with two equal splits to the same account is exactly
+         * the shape that destroyed. Ordinal identity keeps both.
+         */
         const result = convertRegisterRows(FIVE_ROW_FIXTURE);
         assert.deepEqual(result.quarantined, []);
-        assert.equal(result.split, 0);
-        assert.equal(result.collapsed, 1);
+        assert.equal(result.split, 2);
+        assert.equal(result.collapsed, 0);
+        assert.deepEqual(result.lines.filter(l => l.qbTxnId.startsWith("6625")).map(l => l.qbTxnId),
+            ["6625#0", "6625#1"]);
     });
 
     await t.test("the run SUCCEEDS and every row lands", async () => {
@@ -411,7 +437,9 @@ test("divergent repeats under one qbTxnId are SPLITS, and they post", async t =>
         runaway.push({ date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", memo: null, amountCents: -500 });
 
         const result = convertRegisterRows(runaway);
-        assert.deepEqual(result.quarantined, ["9999"]);
+        assert.deepEqual(result.quarantined, [
+            { qbTxnId: "9999", reason: "implausible-split-count", count: MAX_SPLITS_PER_TXN + 1 },
+        ]);
         assert.deepEqual(result.lines.map(l => l.qbTxnId), ["6610"],
             "the unrelated row still posts — that is the difference between one bad transaction and a stopped pipeline");
     });
@@ -447,6 +475,6 @@ test("a mint failure FAILS the pull too, though the observations are already sto
     });
     assert.equal(summary.ok, false);
     assert.equal(summary.error, "mint-failed");
-    assert.equal(summary.inserted, 3, "whatever committed stays committed");
+    assert.equal(summary.inserted, 4, "whatever committed stays committed");
     assert.equal(summary.minted, null);
 });

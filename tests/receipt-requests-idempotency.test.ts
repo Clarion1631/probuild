@@ -399,5 +399,5 @@ test("a resume already past the open pass does not redo it", () => {
     // Widened in round 45 (finding 2): a continuation that finds an owed full
     // run performs it, rather than resuming into a cycle the full run was
     // about to restart.
-    assert.match(source, /runSweep\(now, \(!continueOnly \|\| fullRunOwed\) \? "open-issues" : resumePhase\)/);
+    assert.match(source, /runSweep\(now, startingFullRun \? "open-issues" : resumePhase, startingFullRun\)/);
 });

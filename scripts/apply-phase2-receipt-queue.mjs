@@ -114,6 +114,38 @@ export function isProductionPoolerHost(host) {
     return /(^|\.)pooler\.supabase\.com$/i.test(String(host ?? ""));
 }
 
+/**
+ * THE HOST DOES NOT IDENTIFY THE PROJECT (Codex cross-PR addendum).
+ *
+ * Supabase pooler hosts are shared regionally, so `aws-0-us-west-2.pooler.
+ * supabase.com` plus `current_database() = "postgres"` plus a baseline
+ * migration row describes production AND every migrated staging clone in the
+ * same region equally well. The thing that actually names the project is the
+ * URL USERNAME: `postgres.<project-ref>`.
+ *
+ * Returns null when the username is not in that form, which refuses rather than
+ * guessing.
+ */
+export function projectRefFromUrl(url) {
+    try {
+        const username = decodeURIComponent(new URL(url).username || "");
+        const match = /^postgres\.([a-z0-9]{16,})$/i.exec(username);
+        return match ? match[1] : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * The project ref this run is allowed to touch.
+ *
+ * Env, not a flag: it is a property of the operator's machine rather than of
+ * one invocation, and all five apply scripts read the SAME name so a machine is
+ * configured once. Unset is a refusal — defaulting to "whatever we connected
+ * to" is the failure this check exists to prevent.
+ */
+export const PROJECT_REF_ENV = "APPLY_EXPECT_PROJECT_REF";
+
 export function maskUrl(url) {
     return url.replace(/:[^:@]*@/, ":****@");
 }
@@ -577,14 +609,28 @@ async function main() {
      * (CLAUDE.md: importing an apply script once executed it against prod).
      */
     const target = readFlagValue("--target");
-    if (target !== "prod") {
+    if (target !== "prod" && target !== "ci") {
         console.error(
-            "Refusing to run without `--target prod`. This script has exactly one legitimate target, "
-            + "and naming it is how you prove you meant it — an ambient DATABASE_URL pointing at a local "
-            + "database used to be accepted silently, so every statement reported ok while production was untouched.",
+            "Refusing to run without `--target prod` (or `--target ci`). This script has exactly one "
+            + "legitimate production target, and naming it is how you prove you meant it — an ambient "
+            + "DATABASE_URL pointing at a local database used to be accepted silently, so every statement "
+            + "reported ok while production was untouched.",
         );
         process.exit(1);
     }
+    /**
+     * `--target ci` EXISTS SO THIS FUNCTION IS ACTUALLY EXERCISED.
+     *
+     * `main()` is the one part of this script no unit test runs, and it is
+     * where a Postgres-version rendering difference or a mis-ordered statement
+     * would hide. CI drives it end-to-end against a throwaway database.
+     *
+     * It takes the ambient URL and skips the production identity checks — which
+     * is safe only because it REFUSES a Supabase host outright. The production
+     * guard therefore cannot be satisfied by this path even by accident, and
+     * this path cannot reach production.
+     */
+    const ciMode = target === "ci";
     if (!process.argv.includes("--yes")) {
         console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
         process.exit(1);
@@ -596,14 +642,47 @@ async function main() {
         process.exit(1);
     }
 
-    // The production file, never the environment.
-    const { url, from } = resolveProdDatabaseUrl();
+    // The production file, never the environment — except in CI, which has no
+    // such file and is fenced off from Supabase entirely.
+    const { url, from } = ciMode
+        ? { url: process.env.DATABASE_URL ?? "", from: "process.env.DATABASE_URL (--target ci)" }
+        : resolveProdDatabaseUrl();
+    if (ciMode) {
+        if (!url) {
+            console.error("REFUSING: --target ci needs DATABASE_URL set to the throwaway database.");
+            process.exit(1);
+        }
+        if (/supabase\.(co|com)/i.test(url)) {
+            console.error("REFUSING: --target ci must never point at Supabase.");
+            process.exit(1);
+        }
+    }
     console.log(`TARGET (${from}): ${redactTarget(url)}`);
     if (process.env.DATABASE_URL) {
         console.log("note: an ambient DATABASE_URL is set and is being IGNORED — the target above is the one that will be written.");
     }
-    if (!isProductionPoolerHost(new URL(url).hostname)) {
+    const projectRef = projectRefFromUrl(url);
+    if (!ciMode) console.log(`TARGET project ref: ${projectRef ?? "(unparseable)"}`);
+    if (!ciMode && !isProductionPoolerHost(new URL(url).hostname)) {
         console.error(`REFUSING: ${from} points at ${redactTarget(url)}, which is not the production pooler host.`);
+        process.exit(1);
+    }
+    /**
+     * AND IT MUST BE THE RIGHT PROJECT. The pooler host is shared regionally,
+     * so host + database name + baseline row cannot tell production from a
+     * migrated staging clone. The project ref can.
+     */
+    const expectedRef = ciMode ? null : process.env[PROJECT_REF_ENV];
+    if (!ciMode && !expectedRef) {
+        console.error(
+            `REFUSING: ${PROJECT_REF_ENV} is not set. Set it to production's Supabase project ref — the `
+            + "pooler host is shared across every project in the region, so nothing else in this connection "
+            + "distinguishes production from a staging clone.",
+        );
+        process.exit(1);
+    }
+    if (!ciMode && projectRef !== expectedRef) {
+        console.error(`REFUSING: ${from} is project "${projectRef ?? "(unparseable)"}", not "${expectedRef}".`);
         process.exit(1);
     }
     const prisma = new PrismaClient({ datasources: { db: { url } } });
@@ -633,7 +712,7 @@ async function main() {
             `SELECT 1 FROM "_prisma_migrations" WHERE "migration_name" = $1 LIMIT 1`,
             PROD_BASELINE_MIGRATION,
         );
-        if (baseline.length === 0) {
+        if (!ciMode && baseline.length === 0) {
             console.error(
                 `REFUSING: this database has no "${PROD_BASELINE_MIGRATION}" row in _prisma_migrations, `
                 + "so it is not production and not a database built from this repo's migrations.",

@@ -150,18 +150,25 @@ export interface ConvertedRegisterRows {
     /** Repeat qbTxnIds with IDENTICAL content, collapsed to one observation. */
     collapsed: number;
     /**
-     * Rows emitted under a `<qbTxnId>#<suffix>` identity because their
-     * transaction had several distinct account-affecting splits (round-45 gate,
-     * finding 6). Reported so a sudden jump is visible; not an error.
+     * Rows emitted under a `<qbTxnId>#<ordinal>` identity because their
+     * transaction has several account-affecting splits. Reported so a sudden
+     * jump is visible; not an error.
      */
     split: number;
     /**
-     * Transactions with more distinct splits than `MAX_SPLITS_PER_TXN`.
-     * Excluded from the payload and reported for a human — every other row in
-     * the fetch still posts, which is the difference between one bad
-     * transaction and a stopped pipeline.
+     * Splits QuickBooks RESTATED since the last run: same identity, different
+     * content. The ingest updates the row it already has — it never mints a
+     * second one (round-46 gate, finding 1).
      */
-    quarantined: string[];
+    restated: string[];
+    /**
+     * Transactions excluded because they could not be represented: an
+     * implausible split count, or a cardinality change that makes every
+     * ordinal's meaning uncertain. Every other row in the fetch still posts.
+     */
+    quarantined: QuarantinedTxn[];
+    /** What to persist for the next run to compare against. */
+    manifest: SplitManifest;
 }
 
 /**
@@ -181,17 +188,21 @@ function lineContent(line: BankRegisterIngestLine): string {
  * A real multi-split purchase has a handful. A transaction claiming hundreds is
  * not a purchase, it is a symptom — a malformed report, a runaway journal — and
  * ingesting it would flood the ledger with observations nobody can reconcile.
- * That, and only that, is quarantined.
  */
 export const MAX_SPLITS_PER_TXN = 25;
 
 /**
- * A short, STABLE suffix for one split's content.
+ * A short content fingerprint for one split.
  *
  * FNV-1a, written out rather than imported: this module is pure and runs in
- * both runtimes, and the hash only has to be deterministic across runs, not
- * cryptographic. Same content, same suffix, every night — which is what makes
- * re-ingesting idempotent.
+ * both runtimes, and the hash only has to be deterministic, not cryptographic.
+ *
+ * NOT AN IDENTITY (Codex PR #443 gate round 46, finding 1). Round 45 built the
+ * durable id from this, which made identity a function of MUTABLE content: a
+ * QuickBooks restatement looked like a brand new observation and minted a
+ * second BankLine while the stale one stayed, a 1↔N split transition replaced
+ * every id at once, and two legitimately identical splits collapsed into one.
+ * The hash is now only ever used to DETECT that a known split changed.
  */
 export function splitSuffix(content: string): string {
     let hash = 0x811c9dc5;
@@ -203,69 +214,131 @@ export function splitSuffix(content: string): string {
 }
 
 /**
+ * What the last run saw for each transaction: one content hash per split, in
+ * ordinal order.
+ *
+ * Persisted between runs so a restatement can be told from a new observation,
+ * and a cardinality change from either. Without it every run would treat the
+ * register as if it had never seen it before, which is precisely how round 45
+ * came to mint duplicates.
+ */
+export type SplitManifest = Record<string, string[]>;
+
+/** Why a transaction was quarantined. Reported, and durable. */
+export type QuarantineReason = "implausible-split-count" | "split-cardinality-changed";
+
+export interface QuarantinedTxn {
+    qbTxnId: string;
+    reason: QuarantineReason;
+    count: number;
+}
+
+/**
+ * The durable identity of one split.
+ *
+ * `qbTxnId` for a single-row transaction — unchanged, so nothing already stored
+ * is orphaned — and `<qbTxnId>#<ordinal>` for a split one. The ordinal is the
+ * split's POSITION within the transaction as QuickBooks returns it, which does
+ * not move when an amount is corrected.
+ */
+export function splitIdentity(qbTxnId: string, ordinal: number, splitCount: number): string {
+    return splitCount === 1 ? qbTxnId : `${qbTxnId}#${ordinal}`;
+}
+
+/**
  * Convert a whole register fetch into ingest lines. PURE.
  *
- * QBO can emit the same `qbTxnId` several times in one GL when the transaction
- * has multiple account-affecting splits. Identical repeats are the same
- * observation twice and collapse to one.
+ * QBO emits the same `qbTxnId` several times in one GL when the transaction has
+ * multiple account-affecting splits. Each is a real posting and each gets its
+ * own durable identity, derived from its ORDINAL rather than its content.
  *
- * DIVERGENT REPEATS ARE SPLITS, NOT A CONTRADICTION (Codex PR #443 gate round
- * 45, finding 6).
+ * Three outcomes, and the manifest is what tells them apart:
  *
- * They used to be treated as a fatal conflict: both rows dropped, the run
- * marked `ok: false` and `complete: false`, and — because the same transaction
- * comes back on every pull — the high-water mark and the freshness stamp could
- * never advance again. One legitimate two-split purchase stopped every owner's
- * chase cards indefinitely. The doc comment above this function even said QBO
- * does this "when it has multiple account-affecting splits", and then treated
- * it as an error anyway.
+ *   * SAME cardinality, SAME hashes — nothing changed. Ordinary re-ingest,
+ *     idempotent on identity.
+ *   * SAME cardinality, a hash MOVED — QuickBooks restated that split. The
+ *     identity is unchanged, so the ingest UPDATES the row it already has
+ *     rather than minting a second one. Reported in `restated`.
+ *   * DIFFERENT cardinality — a 1↔N transition, or N↔M. Every ordinal's meaning
+ *     may have shifted, so no id can be trusted to still name the same posting.
+ *     Quarantined as unsupported rather than guessed at.
  *
- * So each distinct content gets its own durable identity, `<qbTxnId>#<suffix>`,
- * derived from the content itself and therefore stable across runs. A
- * single-row transaction keeps its bare `qbTxnId`, so nothing that already
- * exists is orphaned or re-minted.
- *
- * Only a transaction with more distinct splits than `MAX_SPLITS_PER_TXN` is
- * QUARANTINED: excluded from the payload and reported, while every other row in
- * the fetch posts normally. A quarantine is not a failed run — that was the
- * whole bug — it is one transaction a human should look at.
+ * A transaction with more splits than `MAX_SPLITS_PER_TXN` is quarantined too.
+ * Quarantining excludes that transaction and nothing else: the rest of the
+ * fetch posts, which is the difference between one bad transaction and a
+ * stopped pipeline.
  */
-export function convertRegisterRows(rows: readonly BankRegisterRowLike[]): ConvertedRegisterRows {
-    const byTxnId = new Map<string, Map<string, BankRegisterIngestLine>>();
+export function convertRegisterRows(
+    rows: readonly BankRegisterRowLike[],
+    manifest: SplitManifest = {},
+): ConvertedRegisterRows {
+    // Grouped in ARRIVAL ORDER — the ordinal is a position, so the order QBO
+    // returns rows in is the thing being recorded.
+    const byTxnId = new Map<string, BankRegisterIngestLine[]>();
     let skipped = 0;
-    let collapsed = 0;
     for (const row of rows) {
         const line = registerRowToIngestLine(row);
         if (!line) { skipped++; continue; }
-        const content = lineContent(line);
-        let splits = byTxnId.get(line.qbTxnId);
-        if (!splits) { splits = new Map(); byTxnId.set(line.qbTxnId, splits); }
-        // An identical repeat is the same observation twice.
-        if (splits.has(content)) { collapsed++; continue; }
-        splits.set(content, line);
+        const group = byTxnId.get(line.qbTxnId);
+        if (group) group.push(line);
+        else byTxnId.set(line.qbTxnId, [line]);
     }
 
     const lines: BankRegisterIngestLine[] = [];
-    const quarantined: string[] = [];
+    const quarantined: QuarantinedTxn[] = [];
+    const restated: string[] = [];
+    const nextManifest: SplitManifest = {};
     let split = 0;
-    for (const [qbTxnId, splits] of byTxnId) {
-        if (splits.size > MAX_SPLITS_PER_TXN) { quarantined.push(qbTxnId); continue; }
-        if (splits.size === 1) {
-            lines.push([...splits.values()][0]);
+
+    for (const [qbTxnId, group] of byTxnId) {
+        const hashes = group.map(line => splitSuffix(lineContent(line)));
+
+        if (group.length > MAX_SPLITS_PER_TXN) {
+            quarantined.push({ qbTxnId, reason: "implausible-split-count", count: group.length });
+            // The previous manifest entry is carried forward: this run learned
+            // nothing about the transaction, so it must not forget what the
+            // last one knew.
+            if (manifest[qbTxnId]) nextManifest[qbTxnId] = manifest[qbTxnId];
             continue;
         }
-        // Sorted by content. NOT for identity — the suffix is derived from the
-        // content itself, so it is stable whatever order QBO returns the rows
-        // in. This makes the EMITTED ORDER stable too, so the batches this
-        // fetch is chunked into are the same on a re-run, which is what makes a
-        // partial ingest resumable at the same boundary.
-        for (const content of [...splits.keys()].sort()) {
-            const line = splits.get(content)!;
-            lines.push({ ...line, qbTxnId: `${qbTxnId}#${splitSuffix(content)}` });
-            split++;
+
+        const previous = manifest[qbTxnId];
+        if (previous && previous.length !== group.length) {
+            quarantined.push({ qbTxnId, reason: "split-cardinality-changed", count: group.length });
+            nextManifest[qbTxnId] = previous;
+            continue;
         }
+
+        if (previous) {
+            for (let i = 0; i < hashes.length; i++) {
+                if (previous[i] !== hashes[i]) restated.push(splitIdentity(qbTxnId, i, group.length));
+            }
+        }
+
+        group.forEach((line, ordinal) => {
+            lines.push({ ...line, qbTxnId: splitIdentity(qbTxnId, ordinal, group.length) });
+            if (group.length > 1) split++;
+        });
+        nextManifest[qbTxnId] = hashes;
     }
-    return { lines, skipped, collapsed, split, quarantined: quarantined.sort() };
+
+    // Transactions this fetch did not reach keep whatever the manifest knew:
+    // a narrow window must not erase the record of a wide one.
+    for (const [qbTxnId, hashes] of Object.entries(manifest)) {
+        if (!(qbTxnId in nextManifest)) nextManifest[qbTxnId] = hashes;
+    }
+
+    return {
+        lines,
+        skipped,
+        // Identical splits are DISTINCT postings at distinct ordinals now, so
+        // nothing collapses by content any more (round-46 gate, finding 1).
+        collapsed: 0,
+        split,
+        restated: restated.sort(),
+        quarantined: quarantined.sort((a, b) => a.qbTxnId.localeCompare(b.qbTxnId)),
+        manifest: nextManifest,
+    };
 }
 
 export function chunkLines<T>(items: readonly T[], size: number): T[][] {
@@ -834,6 +907,14 @@ export interface BankRegisterPullDependencies {
     windowState?: PullWindowState;
     /** Persists the advanced high-water mark and sweep date. Errors fail the run. */
     saveWindowState?(next: PullWindowState): Promise<void>;
+    /**
+     * The split manifest from the previous run, and where to put this run's
+     * (round-46 gate, finding 1). Optional so the pure tests can run without a
+     * database; when absent every transaction looks new, which loses the
+     * restatement and cardinality checks — so the route always supplies them.
+     */
+    loadSplitManifest?(): Promise<SplitManifest>;
+    saveSplitManifest?(manifest: SplitManifest): Promise<void>;
     /** Outer wall-clock budget for the whole pull. */
     budgetMs?: number;
     /** Monotonic clock, injectable so the budget is testable. */
@@ -910,8 +991,12 @@ export interface BankRegisterPullSummary {
      * identities, and they post.
      */
     conflictQbTxnIds?: string[];
-    /** Rows posted under a `<qbTxnId>#<suffix>` split identity this run. */
+    /** Rows posted under a `<qbTxnId>#<ordinal>` split identity this run. */
     splitObservations?: number;
+    /** Splits QuickBooks restated: same identity, updated in place. */
+    restatedSplits?: string[];
+    /** The quarantine records this run produced, with their reasons. */
+    quarantined?: QuarantinedTxn[];
     /**
      * Transactions excluded for claiming an implausible number of splits.
      * Reported, never fatal: quarantining one transaction must not stop the
@@ -1038,7 +1123,11 @@ export async function runBankRegisterPull(
     // shape of unknown, and inventing the second from the first would hold the
     // stamp down for every caller that predates the field.
     const clearedProbeOk = fetched.clearedProbeOk !== false;
-    const { lines, skipped, collapsed, split, quarantined } = convertRegisterRows(fetched.rows);
+    // The manifest from the last run is what tells a restatement from a new
+    // observation, and a 1↔N transition from either (round-46 gate, finding 1).
+    const priorManifest = dependencies.loadSplitManifest ? await dependencies.loadSplitManifest() : {};
+    const { lines, skipped, collapsed, split, restated, quarantined, manifest } =
+        convertRegisterRows(fetched.rows, priorManifest);
 
     // A STALE fetch is QuickBooks not answering: the rows are a cached copy from
     // an earlier run, so "we pulled the register" is not true of this one. It
@@ -1074,25 +1163,46 @@ export async function runBankRegisterPull(
         summary.reason = "cleared-probe-failed";
     }
     /**
-     * A QUARANTINED TRANSACTION DOES NOT FAIL THE RUN (round-45 gate, finding
-     * 6).
+     * A QUARANTINE EXCLUDES ONE TRANSACTION AND HOLDS THE STAMP (round-45
+     * finding 6, corrected by round-46 finding 2).
      *
-     * Divergent repeats used to land here as a fatal conflict, which set
-     * `ok: false` and `complete: false` — and because the same transaction
-     * comes back on every pull, the high-water mark and the freshness stamp
-     * could never advance again. One legitimate multi-split purchase stopped
-     * every owner's chase cards indefinitely. Splits now get their own durable
-     * identities and post like anything else.
+     * Divergent repeats used to be a fatal conflict, which set `ok: false` and
+     * `complete: false` — and because the same transaction comes back on every
+     * pull, the high-water mark and the freshness stamp could never advance
+     * again. One legitimate multi-split purchase stopped every owner's chase
+     * cards indefinitely. Splits now get ordinal identities and post normally.
      *
-     * What is left to quarantine is a transaction claiming more splits than any
-     * purchase has, which is a symptom rather than a purchase. It is excluded
-     * and REPORTED — the rest of the fetch posts, the cycle proceeds, and a
-     * human has something specific to look at.
+     * What is left to quarantine — an implausible split count, or a cardinality
+     * change that makes every ordinal's meaning uncertain — leaves rows MISSING
+     * from the register. That does not fail the run, but it must not certify
+     * one either: the route persists these and withholds the freshness stamp
+     * until a person accepts them (round-46, finding 2). Round 45 stopped at
+     * the log line, and the chaser released cards over a short register.
      */
     summary.splitObservations = split;
+    if (restated.length > 0) {
+        summary.restatedSplits = [...restated];
+        console.log("[bank-register-pull] QuickBooks restated known splits; updating in place", restated);
+    }
     if (quarantined.length > 0) {
-        summary.quarantinedQbTxnIds = [...quarantined];
-        console.warn("[bank-register-pull] quarantined transactions with implausible split counts", quarantined);
+        summary.quarantinedQbTxnIds = quarantined.map(entry => entry.qbTxnId);
+        summary.quarantined = quarantined.map(entry => ({ ...entry }));
+        console.warn("[bank-register-pull] quarantined transactions", quarantined);
+    }
+    if (dependencies.saveSplitManifest) {
+        try {
+            await dependencies.saveSplitManifest(manifest);
+        } catch (error) {
+            /**
+             * A manifest we could not save means the NEXT run cannot tell a
+             * restatement from a new observation or a cardinality change. That
+             * is exactly the blindness round 46 found, so the run says so and
+             * does not certify.
+             */
+            console.error("[bank-register-pull] split manifest write failed", error instanceof Error ? error.message : "UnknownError");
+            summary.complete = false;
+            summary.reason = "split-manifest-write-failed";
+        }
     }
     summary.fullSweep = planned.fullSweep;
     // A CAPPED window is not an incomplete RUN, but it is an incomplete

@@ -19,8 +19,10 @@ import {
     BANK_LINE_SOURCES_OF_RECORD,
     PROD_BASELINE_MIGRATION,
     PROD_ENV_FILE,
+    PROJECT_REF_ENV,
     expectedColumns,
     isProductionPoolerHost,
+    projectRefFromUrl,
     redactTarget,
     resolveDatabaseUrl,
     resolveProdDatabaseUrl,
@@ -421,7 +423,7 @@ test("the script refuses before any DDL when the target is not named", () => {
     // `--target prod` is checked FIRST, before --yes and before anything opens
     // a connection — a refusal that happens after the first statement is not a
     // refusal.
-    const targetAt = source.indexOf('if (target !== "prod") {');
+    const targetAt = source.indexOf('if (target !== "prod" && target !== "ci") {');
     const clientAt = source.indexOf("new PrismaClient(");
     const firstStatementAt = source.indexOf("for (const sql of statements) {");
     assert.ok(targetAt > 0 && clientAt > targetAt && firstStatementAt > clientAt,
@@ -435,7 +437,8 @@ test("the script refuses before any DDL when the target is not named", () => {
     // The ambient variable is ignored, and the run says so rather than
     // silently preferring one or the other.
     assert.match(source, /an ambient DATABASE_URL is set and is being IGNORED/);
-    assert.match(source, /const \{ url, from \} = resolveProdDatabaseUrl\(\);/);
+    assert.match(source, /: resolveProdDatabaseUrl\(\);/,
+        "the production path takes the file, and only CI takes the ambient URL");
     assert.doesNotMatch(source, /const \{ url, from \} = resolveDatabaseUrl\(\);/);
 
     // And the database must itself agree it is production.
@@ -444,4 +447,56 @@ test("the script refuses before any DDL when the target is not named", () => {
     const baselineAt = source.indexOf('FROM "_prisma_migrations" WHERE "migration_name" = $1');
     assert.ok(baselineAt > clientAt && baselineAt < firstStatementAt,
         "the baseline check runs after connecting and before the first write");
+});
+
+test("the project ref, not the host, is what identifies production", () => {
+    /**
+     * Codex cross-PR addendum. Supabase pooler hosts are shared regionally, so
+     * `aws-0-us-west-2.pooler.supabase.com` + `current_database() = "postgres"`
+     * + a baseline migration row describes production AND every migrated
+     * staging clone in the same region equally well. The project ref lives in
+     * the URL username.
+     */
+    const prod = "postgresql://postgres.ghzdbzdnwjxazvmcefbh:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
+    const staging = "postgresql://postgres.abcdefghijklmnop:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
+
+    assert.equal(projectRefFromUrl(prod), "ghzdbzdnwjxazvmcefbh");
+    assert.equal(projectRefFromUrl(staging), "abcdefghijklmnop");
+    assert.notEqual(projectRefFromUrl(prod), projectRefFromUrl(staging),
+        "same host, same database name, same baseline — different project");
+
+    // A username that is not `postgres.<ref>` refuses rather than guessing.
+    assert.equal(projectRefFromUrl("postgresql://postgres:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres"), null);
+    assert.equal(projectRefFromUrl("postgresql://someoneelse:pw@host:5432/postgres"), null);
+    assert.equal(projectRefFromUrl("not a url"), null);
+});
+
+test("an unset expected project ref is a refusal, not a default", () => {
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+
+    // Exactly this env name, so all five apply scripts share one setting.
+    assert.equal(PROJECT_REF_ENV, "APPLY_EXPECT_PROJECT_REF");
+    assert.match(source, /const expectedRef = ciMode \? null : process\.env\[PROJECT_REF_ENV\];/);
+    assert.match(source, /if \(!ciMode && !expectedRef\) \{[\s\S]{0,400}?process\.exit\(1\);/,
+        "unset must refuse — defaulting to whatever we connected to is the bug");
+    assert.match(source, /if \(!ciMode && projectRef !== expectedRef\) \{/);
+
+    // `--target ci` exists so main() is actually exercised, and it is fenced
+    // off from production rather than trusted: it refuses a Supabase host
+    // outright, so the production guard cannot be satisfied by that path.
+    assert.match(source, /const ciMode = target === "ci";/);
+    // The CONDITION, not just the message: a message string survives having
+    // its `if` neutered, and that mutation is how CI mode would silently
+    // become a second unguarded route to production.
+    assert.match(source, /if \(\/supabase\\.\(co\|com\)\/i\.test\(url\)\) \{/);
+    assert.match(source, /REFUSING: --target ci must never point at Supabase\./);
+    assert.match(source, /REFUSING: --target ci needs DATABASE_URL set to the throwaway database\./);
+
+    // The ref is printed, so a human reading the log can see which project.
+    assert.match(source, /console\.log\(`TARGET project ref: \$\{projectRef \?\? "\(unparseable\)"\}`\);/);
+
+    // And it is checked BEFORE the first statement, like every other refusal.
+    const refCheckAt = source.indexOf("if (!ciMode && projectRef !== expectedRef) {");
+    const firstStatementAt = source.indexOf("for (const sql of statements) {");
+    assert.ok(refCheckAt > 0 && firstStatementAt > refCheckAt);
 });

@@ -41,9 +41,13 @@ import { withTxRetry } from "@/lib/tx-retry";
 import { lockReceiptEvidence, readReceiptEvidenceEpoch } from "@/lib/receipt-evidence-lock";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
+    CYCLE_KEY,
     SWEEP_MARKER_KEY,
+    cycleStillValid,
     formatSweepMarker,
+    parseSweepCycle,
     parseSweepMarker,
+    type SweepCycle,
     type SweepMarker,
     type SweepPhase,
 } from "@/lib/receipt-sweep-marker";
@@ -472,18 +476,32 @@ async function writePhase(
     completedAt?: string,
     blockedReason: string | null = null,
     client: MarkerClient = prisma,
+    /**
+     * The cycle this write is about (round-46 gate, finding 4). Supplied when
+     * the write STAMPS a completion, so the stamp says which cycle finished;
+     * `null` when a cycle is STARTING, which clears the previous stamp because
+     * from that moment it is no longer a statement about the work in progress.
+     */
+    cycleId?: string | null,
 ): Promise<void> {
     try {
         const previous = await readMarker(client);
+        const startingNewCycle = cycleId === null;
         const value = formatSweepMarker({
             phase,
-            chaserCompletedAt: completedAt ?? previous.chaserCompletedAt,
+            chaserCompletedAt: startingNewCycle ? null : (completedAt ?? previous.chaserCompletedAt),
             // NOT carried forward. Unlike the completion stamp — which is a true
             // statement about a cycle that really happened — a block is a
             // statement about the run that is ending right now, so every write
             // restates it or clears it. Carrying a stale one forward would keep
             // `chaser-blocked` firing after the pull recovered.
             blockedReason,
+            // Carried with the stamp it describes: a phase write that is not a
+            // completion keeps whichever cycle last completed, a completion
+            // names its own cycle, and a starting cycle clears both.
+            completedCycleId: startingNewCycle
+                ? null
+                : (completedAt ? (cycleId ?? null) : previous.completedCycleId ?? null),
         });
         await client.automationSetting.upsert({
             where: { key: PHASE_KEY },
@@ -596,59 +614,6 @@ class CursorWriteError extends Error {
         super(`cursor write failed: ${cause}`);
         this.name = "CursorWriteError";
     }
-}
-
-/**
- * THE CYCLE RECORD (Codex PR #443 gate round 45, finding 1).
- *
- * Round 44 put both epochs on the cursors. That is still not enough, because a
- * cursor is CLEARED the moment its pass completes: an invocation that finishes
- * the open-issue pass writes `null` there, and a line pass that exhausts writes
- * `null` too. A continuation then finds no cursor to validate, captures a FRESH
- * pair of epochs, skips the open-issue pass because the phase says "lines", and
- * certifies a cycle whose earlier passes were measured against a world that has
- * since moved. The epochs were attached to the wrong thing: they describe the
- * CYCLE, not a position within it.
- *
- * So they live in a record of their own, written when a cycle starts and
- * untouched until the next one starts. It outlives every cursor.
- *
- * Stored as JSON in one AutomationSetting row: `{ id, epoch, evidenceEpoch }`.
- * A row that is missing, empty, or unparseable reads as "no cycle", which
- * starts one — the safe direction, and what every database looks like the first
- * time this ships.
- */
-const CYCLE_KEY = "receiptRequestsCycle";
-
-export interface SweepCycle {
-    /** Identifies the cycle in logs; never compared for correctness. */
-    id: string;
-    epoch: string;
-    evidenceEpoch: string;
-}
-
-export function parseSweepCycle(value: string | null): SweepCycle | null {
-    if (!value) return null;
-    try {
-        const parsed = JSON.parse(value) as Partial<SweepCycle>;
-        if (typeof parsed?.id !== "string" || !parsed.id) return null;
-        if (typeof parsed.epoch !== "string" || !parsed.epoch) return null;
-        if (typeof parsed.evidenceEpoch !== "string" || !parsed.evidenceEpoch) return null;
-        return { id: parsed.id, epoch: parsed.epoch, evidenceEpoch: parsed.evidenceEpoch };
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Is the world still the one this cycle started against?
- *
- * A null cycle is NOT usable: it means nothing recorded what this cycle was
- * measured against, and a continuation cannot certify on a guarantee nobody
- * wrote down.
- */
-export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenceEpoch: string): boolean {
-    return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch;
 }
 
 async function readCycle(): Promise<SweepCycle | null> {
@@ -1822,12 +1787,23 @@ export async function GET(request: Request) {
         // Even both cursors are not enough: each is cleared the instant its pass
         // completes, so a run that finished the open-issue pass and then ran out
         // of budget parked NEITHER, and the line pass never resumed.
-        const [phase, lineCursor, openCursor, fullRunOwed] = await Promise.all([
-            readPhase(), readCursor(), readOpenCursor(), readFullRunRequested(),
+        const [phase, lineCursor, openCursor, fullRunOwed, persistedCycle] = await Promise.all([
+            readPhase(), readCursor(), readOpenCursor(), readFullRunRequested(), readCycle(),
         ]);
-        // An owed full run is work in progress even when no cursor is parked —
-        // it is the reason this pass must not exit early (round-45, finding 2).
-        if (!fullRunOwed && !shouldResumeSweep(phase, lineCursor, openCursor)) {
+        /**
+         * A PERSISTED CYCLE IS WORK IN PROGRESS (round-46 gate, finding 3).
+         *
+         * The handoff between clearing the old cycle and `runSweep` writing the
+         * new one is several writes long, and a crash inside it used to leave
+         * phase `"done"`, no completion, no cursor and no request — which every
+         * later continuation read as `nothing-in-progress`, losing the day. The
+         * cycle record is written first now and is the durable evidence that a
+         * cycle is open, so this pass honours it whatever the cursors say.
+         *
+         * An owed full run counts for the same reason (round-45, finding 2).
+         */
+        const cycleOpen = persistedCycle !== null;
+        if (!fullRunOwed && !cycleOpen && !shouldResumeSweep(phase, lineCursor, openCursor)) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
         resumePhase = phase === "done" ? "open-issues" : phase;
@@ -1854,13 +1830,30 @@ export async function GET(request: Request) {
          * instead of the whole day's cycle.
          */
         const fullRunOwed = continueOnly && await readFullRunRequested();
-        if (!continueOnly || fullRunOwed) {
+        const startingFullRun = !continueOnly || fullRunOwed;
+        if (startingFullRun) {
+            /**
+             * THE REQUEST OUTLIVES THE RESET (round-46 gate, finding 3).
+             *
+             * This used to clear the cursors, the cycle AND the request, and
+             * only then call `runSweep` — which is where the new cycle and
+             * phase are written. A crash in that gap left phase `"done"`, no
+             * completion, no cursor and nothing asking for a full run: every
+             * later continuation answered `nothing-in-progress` and the day was
+             * lost.
+             *
+             * So the request is NOT cleared here. `runSweep` clears it once the
+             * new cycle record is durably written, which is the first moment
+             * anything else could pick the work up. Re-doing the reset is free
+             * — it is idempotent and the cycle has not started.
+             */
             await Promise.all([writeCursor(null), writeOpenCursor(null), writeCycle(null)]);
-            // Cleared by the invocation that ACTS on it, never by the one that
-            // merely saw it.
-            await writeFullRunRequested(null);
+            // And the marker says a cycle is starting, which clears the previous
+            // completion stamp (round-46 gate, finding 4) — from here on it is
+            // not a statement about the work in progress.
+            await writePhase("open-issues", undefined, null, prisma, null);
         }
-        return await runSweep(now, (!continueOnly || fullRunOwed) ? "open-issues" : resumePhase);
+        return await runSweep(now, startingFullRun ? "open-issues" : resumePhase, startingFullRun);
     } catch (error) {
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
         // note in the log. Whatever this run committed stays committed, but the
@@ -1877,7 +1870,16 @@ export async function GET(request: Request) {
     }
 }
 
-async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
+async function runSweep(
+    now: Date,
+    startPhase: SweepPhase = "open-issues",
+    /**
+     * True when the caller reset the world for a fresh cycle and is still
+     * holding an unfulfilled full-run request (round-46 gate, finding 3). The
+     * request is discharged here, once the new cycle record is durable.
+     */
+    clearFullRunRequestOnStart = false,
+) {
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
 
@@ -1951,6 +1953,13 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch };
         await writeCycle(cycle);
     }
+    /**
+     * ONLY NOW is the full-run request discharged (round-46 gate, finding 3).
+     * The cycle record above is durable, so any later invocation can see that a
+     * cycle is open and resume it. Clearing the request before this point left
+     * a window where a crash meant nothing at all was asking for the work.
+     */
+    if (clearFullRunRequestOnStart) await writeFullRunRequested(null);
 
     // The cycle is unfinished from here until the line pass exhausts.
     if (startPhase !== "lines") await writePhase("open-issues");
@@ -2345,8 +2354,11 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
                             createdAt: { gte: linePassFrom },
                         },
                     }),
+                    // The completion names the cycle it is about (round-46
+                    // gate, finding 4), so the cards cron can tell "a cycle
+                    // completed today" from "THIS cycle completed".
                     writePhase: (phase, completedAt, blockedReason) =>
-                        writePhase(phase, completedAt, blockedReason, tx),
+                        writePhase(phase, completedAt, blockedReason, tx, cycle.id),
                 }), { timeout: FENCE_TX_TIMEOUT_MS }),
             );
         } catch (error) {

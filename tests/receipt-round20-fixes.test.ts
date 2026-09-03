@@ -149,7 +149,7 @@ test("the retry pass selects when the chase finished after the morning run", () 
     // chase unfinished and claims nothing, the chase completes at 15:00, and
     // the 16:30 retry — the last run of the day — refused to select because
     // there was no row to re-post.
-    assert.match(cardsSource, /const selectionAllowed = chaserCompletedFor\(marker, date\);/);
+    assert.match(cardsSource, /const selectionAllowed = chaserCompletedFor\(marker, date, "America\/Los_Angeles", currentCycleId\);/);
     assert.match(cardsSource, /if \(!selectionAllowed\) continue;/);
     assert.doesNotMatch(cardsSource, /if \(retryOnly\) continue; \/\/ nothing claimed today/);
     // It also has to SCAN, or selection finds an empty list — the same lost day

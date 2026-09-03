@@ -22,7 +22,7 @@ import {
     type CardItemTruth,
     type OwnerCard,
 } from "@/lib/receipt-request-cards";
-import { SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepMarker } from "@/lib/receipt-sweep-marker";
+import { CYCLE_KEY, SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepCycle, parseSweepMarker } from "@/lib/receipt-sweep-marker";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
 // Reused rather than re-implemented (Codex PR #443 gate, finding 1) — see its
@@ -576,7 +576,26 @@ export async function GET(request: Request) {
      * already-claimed card does not — that snapshot was chosen when the chase
      * WAS complete, and re-posting it is the retry pass's whole job.
      */
-    const selectionAllowed = chaserCompletedFor(marker, date);
+    /**
+     * THE COMPLETION MUST BE THIS CYCLE'S (Codex PR #443 gate round 46,
+     * finding 4).
+     *
+     * `chaserCompletedFor` used to ask only whether the stamp's DATE was today.
+     * A completion is deliberately carried forward by every later phase write —
+     * it is a true statement about a cycle that really happened — so a NEW
+     * cycle that started at 13:00 and is still mid-flight, or blocked by a
+     * stale bank pull, still looked "completed today" and released the cards
+     * over a partially reconciled set.
+     *
+     * The cycle record is read here and passed in, so the question becomes
+     * "did the cycle that is running RIGHT NOW finish, unblocked". A cycle that
+     * starts clears the stamp, so there is no window where the old answer
+     * applies to the new cycle.
+     */
+    const currentCycleId = parseSweepCycle(
+        (await prisma.automationSetting.findUnique({ where: { key: CYCLE_KEY } }))?.value ?? null,
+    )?.id ?? null;
+    const selectionAllowed = chaserCompletedFor(marker, date, "America/Los_Angeles", currentCycleId);
     if (!retryOnly) {
         if (!selectionAllowed) {
             const summary = {

@@ -139,6 +139,8 @@ export interface PipelineHealth {
         enabled: boolean;
         lastSuccessAt: string | null;
         ambiguousCount: number;
+        /** Transactions the pull could not represent and nobody has accepted. */
+        quarantinedCount?: number;
         unclearedCount?: number;
         /** Ambiguity from before the last pulled window: reported, never a stamp blocker. */
         staleAmbiguous?: { count: number; keys: string[] };
@@ -338,6 +340,8 @@ export function evaluatePipelineHealth(input: {
         enabled: boolean;
         lastSuccessAt: string | null;
         ambiguousCount: number;
+        /** Transactions the pull could not represent and nobody has accepted. */
+        quarantinedCount?: number;
         unclearedCount?: number;
         staleAmbiguous?: { count: number; keys: string[] };
         blockedReason?: string | null;
@@ -482,6 +486,18 @@ export function evaluatePipelineHealth(input: {
         reasons.push(`bank-pull-ambiguous:${input.bankPull.ambiguousCount}`);
     }
 
+    /**
+     * TRANSACTIONS THE PULL COULD NOT REPRESENT (round-46 gate, finding 2).
+     *
+     * These are rows MISSING from the register the chaser is about to certify,
+     * so this is not a note — it is a reason, and it holds the pull's freshness
+     * stamp until somebody accepts them. Reported whatever the pull's own
+     * status, because a quarantine outlives the run that found it.
+     */
+    if ((input.bankPull.quarantinedCount ?? 0) > 0) {
+        reasons.push(`bank-quarantine:${input.bankPull.quarantinedCount}`);
+    }
+
     // AMBIGUITY OLDER THAN THE LAST PULLED WINDOW. Reported, and deliberately
     // separate from the line above: it is a real backlog somebody owes an
     // answer on, but it is NOT evidence that tonight's register is unsettled,
@@ -619,6 +635,98 @@ export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
 export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
 
 /**
+ * Transactions the pull could not represent, and which are therefore MISSING
+ * from the register it just read (Codex PR #443 gate round 46, finding 2).
+ *
+ * Round 45 quarantined them and let the run certify anyway — `ok` and
+ * `complete` stayed true, the state advanced, the freshness stamp landed, and
+ * the chaser released cards over a register with rows missing. A quarantine
+ * that only writes a log line is not a quarantine.
+ *
+ * So it is durable, and it BLOCKS the stamp until a human accepts it. The value
+ * is a JSON array of `{ qbTxnId, reason, count, firstSeenAt }`; an empty array
+ * means nothing is held.
+ */
+export const BANK_PULL_QUARANTINE_KEY = "bankRegisterPullQuarantine";
+
+/**
+ * What the last pull saw for each transaction: one content hash per split, in
+ * ordinal order (round-46 gate, finding 1).
+ *
+ * It is what lets the next run tell a QuickBooks RESTATEMENT (same identity,
+ * new content — update in place) from a NEW observation, and a 1↔N split
+ * transition from either. Without it every run treats the register as if it
+ * had never seen it, which is how content-derived identities came to mint
+ * duplicates.
+ */
+export const BANK_PULL_SPLIT_MANIFEST_KEY = "bankRegisterPullSplitManifest";
+
+/**
+ * The qbTxnIds an operator has explicitly accepted as unrepresentable.
+ *
+ * A JSON array of ids. A quarantine whose id appears here stops blocking the
+ * stamp — the rows are still missing and the health probe still reports them,
+ * but the pipeline moves again on a person's say-so rather than stalling every
+ * owner's cards indefinitely. "These rows are genuinely not chaseable" is a
+ * judgement only a human can make.
+ */
+export const BANK_PULL_QUARANTINE_ACCEPTED_KEY = "bankRegisterPullQuarantineAccepted";
+
+export interface BankPullQuarantineEntry {
+    qbTxnId: string;
+    reason: string;
+    count: number;
+    firstSeenAt: string;
+}
+
+/** Parse the durable quarantine list. Anything unreadable reads as empty. */
+export function parseQuarantine(value: string | null | undefined): BankPullQuarantineEntry[] {
+    if (!value) return [];
+    try {
+        const parsed: unknown = JSON.parse(value);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.flatMap(row => {
+            if (!row || typeof row !== "object") return [];
+            const entry = row as Partial<BankPullQuarantineEntry>;
+            if (typeof entry.qbTxnId !== "string" || !entry.qbTxnId) return [];
+            return [{
+                qbTxnId: entry.qbTxnId,
+                reason: typeof entry.reason === "string" ? entry.reason : "unknown",
+                count: typeof entry.count === "number" ? entry.count : 0,
+                firstSeenAt: typeof entry.firstSeenAt === "string" ? entry.firstSeenAt : "",
+            }];
+        });
+    } catch {
+        return [];
+    }
+}
+
+/** Parse the accepted-id list. Anything unreadable reads as "nothing accepted". */
+export function parseAcceptedQuarantine(value: string | null | undefined): string[] {
+    if (!value) return [];
+    try {
+        const parsed: unknown = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && !!id) : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * The quarantined transactions still holding the pipeline back.
+ *
+ * Accepted ids drop out; everything else blocks. Exported so the pull and the
+ * health probe cannot disagree about what "outstanding" means.
+ */
+export function outstandingQuarantine(
+    entries: readonly BankPullQuarantineEntry[],
+    accepted: readonly string[],
+): BankPullQuarantineEntry[] {
+    const ok = new Set(accepted);
+    return entries.filter(entry => !ok.has(entry.qbTxnId));
+}
+
+/**
  * Where the pull records how many QBO_REGISTER observations QuickBooks has NOT
  * cleared, inside the mint lookback window and not yet linked to a canonical
  * line.
@@ -731,6 +839,7 @@ async function readBankPullState(): Promise<{
     enabled: boolean;
     lastSuccessAt: string | null;
     ambiguousCount: number;
+    quarantinedCount: number;
     unclearedCount: number;
     staleAmbiguous: { count: number; keys: string[] };
     blockedReason: string | null;
@@ -741,9 +850,11 @@ async function readBankPullState(): Promise<{
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    const [successRow, ambiguousRow, unclearedRow, staleAmbiguousRow, blockedRow, uncertifiedRow] = await Promise.all([
+    const [successRow, ambiguousRow, quarantineRow, quarantineAcceptedRow, unclearedRow, staleAmbiguousRow, blockedRow, uncertifiedRow] = await Promise.all([
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_QUARANTINE_ACCEPTED_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_UNCLEARED_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_STALE_KEY } }),
         prisma.automationSetting.findUnique({ where: { key: BANK_PULL_BLOCKED_REASON_KEY } }),
@@ -755,6 +866,12 @@ async function readBankPullState(): Promise<{
         enabled: true,
         lastSuccessAt: successRow?.value || null,
         ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
+        // Only the OUTSTANDING ones: accepted quarantines stay in the record
+        // for history but no longer hold the pipeline (round-46, finding 2).
+        quarantinedCount: outstandingQuarantine(
+            parseQuarantine(quarantineRow?.value),
+            parseAcceptedQuarantine(quarantineAcceptedRow?.value),
+        ).length,
         unclearedCount: Number.isFinite(parsedUncleared) ? parsedUncleared : 0,
         staleAmbiguous: parseStaleAmbiguous(staleAmbiguousRow?.value),
         blockedReason: blockedRow?.value || null,
@@ -1053,6 +1170,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             enabled: boolean;
             lastSuccessAt: string | null;
             ambiguousCount: number;
+            quarantinedCount: number;
             unclearedCount: number;
             staleAmbiguous: { count: number; keys: string[] };
             blockedReason: string | null;
@@ -1060,7 +1178,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         }>(
             "bankPull",
             readBankPullState,
-            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null, uncertifiedWindow: null },
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0, quarantinedCount: 0, unclearedCount: 0, staleAmbiguous: { count: 0, keys: [] }, blockedReason: null, uncertifiedWindow: null },
         ),
         // Can we authenticate to Drive? Asked here rather than at the moment a
         // memo arrives, because the answer "no" produces no symptom anywhere
