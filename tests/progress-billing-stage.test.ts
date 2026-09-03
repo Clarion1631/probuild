@@ -336,13 +336,17 @@ test("an AUTH failure on the pay link surfaces; it is not filed as pending", asy
 
 // --- Compensation releases the provisional link ---------------------------
 
-test("a compensated invoice takes the provisional link with it", async () => {
-    // The race: the link write COMMITS (the row now points at the new QBO
-    // invoice) and then the response is lost, so the stage compensates.
-    // Deleting without clearing would leave the row pointing at a document that
-    // no longer exists — the poller would keep probing it, the portal would
-    // offer a dead pay link, and the next stage would refuse because the
-    // billing "already has" an invoice.
+test("a link write that COMMITS and then loses its response is a success, not a compensation", async () => {
+    // Round 34 gate: the link-write `catch` used to compensate unconditionally,
+    // on the assumption that a thrown write means nothing points at the new
+    // invoice. It can equally mean the write landed and the response was lost —
+    // or that a concurrent stage linked the SAME invoice first (both share one
+    // issuance key, so Intuit hands them the same invoice). The row points at a
+    // live, correct QuickBooks invoice either way, and deleting it destroys the
+    // very document another caller may already have reported as a success.
+    // What the compensation itself does once it IS warranted (clearing the
+    // provisional link, keeping it on a failed delete) is covered directly
+    // against compensateAndUnlink below.
     const { row, db } = makeDb(draftRow());
     const { qbo, calls } = makeQbo();
 
@@ -359,41 +363,31 @@ test("a compensated invoice takes the provisional link with it", async () => {
         },
     };
 
-    await assert.rejects(
-        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db: lossyDb, qbo, logEvent }),
-        /connection lost after linking/,
-    );
+    const res = await stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db: lossyDb, qbo, logEvent });
 
-    assert.deepEqual(calls.deleted, ["qb-1"], "the invoice we could not keep is deleted");
-    assert.equal(row.qbInvoiceId, null, "and the row does not point at it any more");
-    assert.equal(row.qbInvoiceLink, null);
-    assert.equal(row.qbSyncError, null, "including the paylink-pending marker");
-    assert.equal(row.status, "Draft", "re-stageable");
+    assert.deepEqual(res, { success: true, qbInvoiceId: "qb-1", qbInvoiceLink: null });
+    assert.equal(calls.deleted.length, 0, "the row points at this invoice — never compensate it away");
+    assert.equal(row.qbInvoiceId, "qb-1");
+    assert.equal(row.status, "Staged");
+    assert.equal(row.qbSyncError, "paylink-pending", "the sweep finishes the link");
 });
 
-test("a FAILED compensation keeps the link, so a human can find the invoice", async () => {
-    // The opposite rule, deliberately: the invoice is still out there and
-    // collectible, and a row pointing at it is how anyone finds it. A THROWN
-    // delete is the genuine-failure case — a bare `false` return now means
-    // "already gone" (an authoritative 404) and is a compensation SUCCESS.
-    const { row, db } = makeDb(draftRow());
+test("a FAILED compensation leaves the billing parked, so a human can find the invoice", async () => {
+    // The link write never landed (the row is untouched), so the invoice really
+    // is unreferenced — but the delete THREW, so its outcome is unknown and it
+    // may still be sitting in QuickBooks, collectible. Nothing may be released:
+    // the in-flight claim stays, which is what keeps the next stage from
+    // creating a second invoice for the same money. A bare `false` return is a
+    // different animal — an authoritative 404 is a compensation SUCCESS.
+    const { row, db } = makeDb(draftRow(), { failUpdateNo: 2 });
     const { qbo } = makeQbo({ deleteThrows: new Error("qbo delete failed") });
-    let updates = 0;
-    const lossyDb = {
-        findUnique: db.findUnique,
-        async updateMany(args: any) {
-            updates++;
-            const result = await db.updateMany(args);
-            if (updates === 2) throw new Error("connection lost after linking");
-            return result;
-        },
-    };
 
     await assert.rejects(
-        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db: lossyDb, qbo, logEvent }),
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
         /could not be deleted/,
     );
-    assert.equal(row.qbInvoiceId, "qb-1", "the link survives a failed delete");
+    assert.equal(markerKind(row.qbSyncError), "create-in-flight", "the claim survives a failed delete");
+    assert.equal(row.status, "Draft");
 });
 
 test("compensateAndUnlink clears only a row still pointing at the deleted invoice", async () => {
@@ -499,4 +493,18 @@ test("round 29 gate: compensateAndUnlink falls back to the owned marker when the
     const withoutFallback = await compensateAndUnlink(delegate2, "r5", "qb-9", async () => true, { status: "Draft" });
     assert.deepEqual(withoutFallback, { deleted: true, unlinked: false, alreadyAbsent: false });
     assert.equal(stillNeverLinked.qbSyncError, marker, "no marker supplied — nothing was cleared");
+});
+
+test("a link write that genuinely failed still compensates", async () => {
+    // The control: the write threw and left the row untouched, so the invoice
+    // really is unreferenced and must be deleted.
+    const { row, db } = makeDb(draftRow(), { failUpdateNo: 2 });
+    const { qbo, calls } = makeQbo();
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /database unavailable/,
+    );
+    assert.deepEqual(calls.deleted, ["qb-1"], "an unreferenced invoice is still cleaned up");
+    assert.equal(row.qbInvoiceId, null);
 });

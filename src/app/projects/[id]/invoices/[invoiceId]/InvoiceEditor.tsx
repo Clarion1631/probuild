@@ -48,7 +48,21 @@ function formatPaymentMethod(method: string | null | undefined, ref: string | nu
     return label;
 }
 
-export default function InvoiceEditor({ project, initialInvoice, checkEvidence = {} }: { project: any, initialInvoice: any, checkEvidence?: Record<string, CheckEvidence> }) {
+export default function InvoiceEditor({
+    project,
+    initialInvoice,
+    checkEvidence = {},
+    // Computed on the server from the SAME predicate the resolver core
+    // enforces (canResolveAmbiguousCreate) - see page.tsx. Defaults to false so
+    // a caller that forgets to pass it hides the control rather than offering a
+    // button the server can only ever refuse.
+    canResolveQbCreate = false,
+}: {
+    project: any,
+    initialInvoice: any,
+    checkEvidence?: Record<string, CheckEvidence>,
+    canResolveQbCreate?: boolean,
+}) {
     const router = useRouter();
     const [isIssuing, setIsIssuing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -959,7 +973,10 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                                                             className="text-[10px] font-bold uppercase text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded"
                                                             title={
                                                                 isParkedOnQb(payment.qbSyncError)
-                                                                    ? "A QuickBooks send ended without a confirmed result — an invoice may already exist there. Use Resolve in QuickBooks before sending again."
+                                                                    ? canResolveQbCreate
+                                                                        ? "A QuickBooks send ended without a confirmed result — an invoice may already exist there. Use Resolve in QuickBooks before sending again."
+                                                                        // Same rule as the button: pointing a MANAGER at a control they do not have is a dead end.
+                                                                        : "A QuickBooks send ended without a confirmed result — an invoice may already exist there. An admin or the finance role has to resolve it before this can be sent again."
                                                                     : payment.qbSyncError === PAYLINK_PENDING
                                                                         ? "The QuickBooks invoice exists; only its pay link is still to be fetched. The maintenance sweep finishes this automatically."
                                                                         : "The linked QuickBooks invoice appears voided or deleted. Use Break QB Link to clear it, then re-create the invoice."
@@ -1035,7 +1052,7 @@ export default function InvoiceEditor({ project, initialInvoice, checkEvidence =
                                                                 {qbBusy === payment.id ? "Working…" : "Break QB Link"}
                                                             </button>
                                                         )}
-                                                        {!payment.qbInvoiceId && isParkedOnQb(payment.qbSyncError) && (
+                                                        {canResolveQbCreate && !payment.qbInvoiceId && isParkedOnQb(payment.qbSyncError) && (
                                                             <button
                                                                 onClick={() => handleResolveAmbiguous(payment)}
                                                                 disabled={qbBusy === payment.id}

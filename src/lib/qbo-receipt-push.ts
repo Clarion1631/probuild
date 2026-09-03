@@ -271,7 +271,16 @@ export interface QboReceiptPushDependencies {
      * retries are real behaviour that needs covering without a live Intuit.
      */
     refreshTokensFn: () => Promise<QBTokens>;
+    /**
+     * Mutual exclusion for one Drive file across concurrent deliveries — see
+     * `defaultWithReceiptFileLock`. Injectable so the interleaving can be
+     * driven deterministically in a test with no database.
+     */
+    withFileLock: ReceiptFileLock;
 }
+
+/** Run `run` with nobody else pushing the same Drive file at the same time. */
+export type ReceiptFileLock = <T>(fileId: string, run: () => Promise<T>) => Promise<T>;
 
 const BANK_ACCOUNT_ID_DEFAULT = "154"; // Washington Trust Bank
 const EXPENSE_ACCOUNT_ID_DEFAULT = "98"; // COGS Supplies & materials
@@ -824,6 +833,75 @@ async function verifyReceiptAccounts(
 }
 
 /**
+ * How long one file's push may hold its lock, including the wait for it.
+ *
+ * The push is already bounded by its route deadline; this is the ceiling for
+ * the case where no deadline was passed at all, and it stays under the route's
+ * own 60s `maxDuration`.
+ */
+export const RECEIPT_FILE_LOCK_MAX_MS = 55_000;
+
+/**
+ * Serialize every push of the SAME Drive file, so two concurrent deliveries
+ * cannot both take the fresh-create path.
+ *
+ * The failure this closes: two requests for one receipt both miss the opening
+ * DocNumber lookup (neither has committed yet), both call create — which QBO
+ * de-duplicates via `requestid`, handing BOTH the same Purchase — and both then
+ * upload the receipt image unconditionally, because the deterministic-FileName
+ * existence check only runs on the `alreadyExists` path. Result: one Purchase
+ * carrying the same receipt twice. DocNumber/`requestid` idempotency is
+ * QBO-side and per-call; it says nothing about what the two callers do NEXT.
+ *
+ * Implemented as `pg_advisory_xact_lock` inside one interactive transaction
+ * wrapping the whole lookup→create→attach. Deliberately NOT a session-level
+ * `pg_advisory_lock`: `DATABASE_URL` points at pgbouncer in transaction-pooling
+ * mode, which hands out a different backend connection per statement, so a
+ * session lock would be taken and released on unrelated connections (the same
+ * reasoning recorded in review-alert-rollout.ts). A transaction-scoped lock is
+ * held for exactly as long as its transaction and auto-releases on commit,
+ * rollback, or a dead connection — no lease, no stale-claim reclaim, and
+ * nothing durable left behind if the function is killed mid-push. That is also
+ * why this is a lock rather than a claim marker: there is no receipt row to
+ * CAS against, and a durable claim would need a schema change plus a
+ * stale-lease reclaim, with a stuck claim able to block the receipt forever.
+ *
+ * The cost is one pooled connection held for the length of the push.
+ * Contention is per-file, so ordinary traffic — different receipts — never
+ * waits.
+ *
+ * The loser of the race does NOT skip: it runs once the winner is done, its
+ * DocNumber lookup now finds the committed Purchase, and it takes the
+ * `alreadyExists` path, which re-checks the attachment by deterministic
+ * FileName and returns the SAME purchase id. Fail-closed: if the lock cannot be
+ * taken the error propagates and the route answers a retryable 500, rather than
+ * pushing unprotected.
+ */
+async function defaultWithReceiptFileLock<T>(
+    fileId: string,
+    run: () => Promise<T>,
+    deadline?: RouteDeadline,
+): Promise<T> {
+    const remaining = remainingBudgetMs(deadline);
+    const windowMs = Number.isFinite(remaining)
+        ? Math.max(1_000, Math.min(Math.floor(remaining), RECEIPT_FILE_LOCK_MAX_MS))
+        : RECEIPT_FILE_LOCK_MAX_MS;
+    return prisma.$transaction(
+        async (tx) => {
+            // A bound parameter, not interpolation. $executeRawUnsafe because
+            // pg_advisory_xact_lock returns void; hashtext() maps the
+            // namespaced key onto the integer the lock function takes.
+            await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtext($1))", `receipt-push:${fileId}`);
+            return run();
+        },
+        // `timeout` covers the wait for the lock AND the work under it; every
+        // QBO call inside is separately bounded by `deadline`, so the
+        // transaction can never outlive the route.
+        { timeout: windowMs, maxWait: windowMs },
+    );
+}
+
+/**
  * Create (or reuse) the finalized QBO Purchase for one receipt/check document,
  * job-coded per category group at the line level.
  *
@@ -832,7 +910,25 @@ async function verifyReceiptAccounts(
  * account-identity check fires, so a bad payload never creates or looks up
  * anything in QuickBooks beyond the initial DocNumber query.
  */
+/**
+ * Public entry point: take the per-file lock, then run the push under it.
+ *
+ * A thin wrapper rather than something folded into the body, so the lock cannot
+ * be bypassed by calling the push directly — the implementation below is not
+ * exported.
+ */
 export async function createQBReceiptPurchase(
+    tokens: QBTokens,
+    input: CreateQBReceiptPurchaseInput,
+    deps: Partial<QboReceiptPushDependencies> = {},
+    deadline?: RouteDeadline,
+): Promise<CreateQBReceiptPurchaseResult> {
+    const withFileLock: ReceiptFileLock =
+        deps.withFileLock ?? ((fileId, run) => defaultWithReceiptFileLock(fileId, run, deadline));
+    return withFileLock(input.fileId, () => createQBReceiptPurchaseUnderLock(tokens, input, deps, deadline));
+}
+
+async function createQBReceiptPurchaseUnderLock(
     tokens: QBTokens,
     input: CreateQBReceiptPurchaseInput,
     deps: Partial<QboReceiptPushDependencies> = {},

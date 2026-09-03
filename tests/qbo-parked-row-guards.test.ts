@@ -209,3 +209,46 @@ test("no money guard reads qbInvoiceId without accounting for the pending marker
         `these read qbInvoiceId with no pending-create marker in sight — a parked row would slip through:\n${offenders.join("\n")}`,
     );
 });
+
+// --- The recovery control is only offered to whoever can actually use it ---
+
+/**
+ * Round 34 gate: "Resolve in QuickBooks" was rendered for anyone with invoice
+ * access, but `resolveAmbiguousInvoiceCreateCore` refuses anyone who is not
+ * ADMIN or FINANCE. A MANAGER with full invoice access was being handed a
+ * button whose only possible answer was "forbidden" — on the one screen where
+ * the row is stuck and someone is looking for a way out.
+ */
+test("the resolve capability is ADMIN/FINANCE only", async () => {
+    const { canResolveAmbiguousCreate } = await import("../src/lib/access-rules");
+
+    assert.equal(canResolveAmbiguousCreate({ role: "ADMIN" }), true);
+    assert.equal(canResolveAmbiguousCreate({ role: "FINANCE" }), true);
+    // Deliberately narrower than the `invoices` permission.
+    assert.equal(canResolveAmbiguousCreate({ role: "MANAGER" }), false);
+    assert.equal(canResolveAmbiguousCreate({ role: "EMPLOYEE" }), false);
+    assert.equal(canResolveAmbiguousCreate({ role: "FIELD_CREW" }), false);
+});
+
+test("the invoice editor hides the resolve control unless the server said yes", () => {
+    const editor = readFileSync("src/app/projects/[id]/invoices/[invoiceId]/InvoiceEditor.tsx", "utf8");
+
+    // The button lives behind the capability flag, not behind invoice access.
+    const guard = editor.indexOf("{canResolveQbCreate && !payment.qbInvoiceId && isParkedOnQb(payment.qbSyncError) && (");
+    // The label, not the tooltip that mentions it earlier in the file.
+    const button = editor.indexOf('"Checking…" : "Resolve in QuickBooks"');
+    assert.ok(guard > -1, "the resolve control must be gated on the server-computed capability");
+    assert.ok(button > guard, "the button must sit INSIDE that gate");
+    // Missing prop = hidden, never shown-and-refused.
+    assert.match(editor, /canResolveQbCreate = false,/);
+});
+
+test("the capability is computed from the resolver's own predicate, not a copy of the role list", () => {
+    const page = readFileSync("src/app/projects/[id]/invoices/[invoiceId]/page.tsx", "utf8");
+
+    assert.match(page, /canResolveAmbiguousCreate/, "reuse the predicate the resolver core enforces");
+    assert.match(page, /canResolveQbCreate=\{canResolveQbCreate\}/, "and hand the answer to the editor");
+    // A second copy of "ADMIN" / "FINANCE" here is exactly how the UI and the
+    // server rule drift apart.
+    assert.doesNotMatch(page, /"(ADMIN|FINANCE|MANAGER)"/);
+});

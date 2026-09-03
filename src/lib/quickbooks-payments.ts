@@ -382,6 +382,59 @@ export async function compensateAndUnlink(
     return { deleted: true, unlinked: clearedByMarker.count === 1, alreadyAbsent };
 }
 
+/**
+ * Did somebody ELSE already finish the link for the very invoice we just
+ * created?
+ *
+ * The final link CAS in `pushMilestoneToQuickBooks` pins `qbSyncError` to the
+ * `paylink-pending` marker the pre-pay-link write left behind. That marker is
+ * deliberately transient: `sweepPendingPayLinks` fills the pay link and clears
+ * it, and so does a CONCURRENT resend taking the already-linked early-return
+ * branch at the top of the push (it fetches the link and clears the flag). Both
+ * of those finish the row correctly and, in the resend's case, have already
+ * returned success for this exact `qbInvoiceId` to their own caller.
+ *
+ * Before this guard the losing CAS was read as "the milestone was abandoned",
+ * and compensation DELETED a live, correct QuickBooks invoice out from under
+ * the caller that had just been told it existed. A marker that moved is not
+ * divergence; the invoice id is what identifies the outcome.
+ *
+ * Pure so the interleaving can be tested exactly. `true` means "this row is
+ * still the row we issued for, and it points at OUR invoice" — never
+ * compensate. Everything else (a different or absent id, a Canceled row, or
+ * content that no longer matches what the QBO invoice was built from) is
+ * genuine divergence and still compensates, unchanged.
+ *
+ * Note `status` is only refused for "Canceled". A row that went **Paid** while
+ * we were fetching the pay link was settled AGAINST THIS INVOICE — deleting it
+ * would destroy a paid QuickBooks document, which is strictly worse than the
+ * abandoned-invoice case this compensation exists for.
+ */
+export function isConcurrentlyFinalizedMilestoneLink(
+    current: {
+        qbInvoiceId: string | null;
+        status: string;
+        amount: unknown;
+        name: string;
+        dueDate: Date | null;
+    } | null,
+    qbInvoiceId: string,
+    issuedFrom: { amount: unknown; name: string; dueDate: Date | null },
+): boolean {
+    if (!current) return false;
+    if (current.qbInvoiceId !== qbInvoiceId) return false;
+    if (current.status === "Canceled") return false;
+    if (current.name !== issuedFrom.name) return false;
+    // Decimal columns never compare with ===; go through the same numeric
+    // conversion the create used to build the invoice amount.
+    const a = toNum(current.amount as any);
+    const b = toNum(issuedFrom.amount as any);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 0.0001) return false;
+    const currentDue = current.dueDate ? new Date(current.dueDate).getTime() : null;
+    const issuedDue = issuedFrom.dueDate ? new Date(issuedFrom.dueDate).getTime() : null;
+    return currentDue === issuedDue;
+}
+
 /** One row waiting for its pay link, from either rail. */
 export interface PayLinkPendingRow {
     id: string;
@@ -736,6 +789,118 @@ export async function claimMilestonePreCreateUnderLock(
     }));
 }
 
+/** What the final link write settled on. */
+export interface MilestoneLinkOutcome {
+    /**
+     * `linked` — we wrote the link. `already-finalized` — somebody else already
+     * finished THIS invoice on this row, so there is nothing to write and
+     * nothing to compensate. `abandoned` — the row genuinely moved on and the
+     * QuickBooks invoice we created is now unreferenced.
+     */
+    outcome: "linked" | "already-finalized" | "abandoned";
+    /** The pay link the row carries, when someone else finished it. */
+    payLink: string | null;
+}
+
+/**
+ * The final link write for a milestone push, and the verdict when it loses.
+ *
+ * Taken under the invoice lock and paired with a progress-billing re-check:
+ * createProgressBillingCore locks the same invoice row, so the two paths
+ * serialize instead of interleaving. Without this a progress billing could
+ * claim this milestone in the window between the guard at the top of
+ * `pushMilestoneToQuickBooks` and the write here (a full-milestone billing
+ * leaves the row Pending and unlinked, so every pinned column would still
+ * match) and the client would end up with two collectible QuickBooks invoices.
+ *
+ * All three outcomes are decided INSIDE the transaction, while the lock is
+ * still held — the progress-billing re-check and the re-read below have to
+ * agree with each other, and only the lock makes that true.
+ */
+export async function finalizeMilestoneLinkUnderLock(
+    schedule: {
+        id: string;
+        invoiceId: string;
+        amount: Prisma.Decimal | number;
+        dueDate: Date | null;
+        name: string;
+    },
+    args: {
+        qbId: string;
+        payLink: string | null;
+        /** Did the pre-pay-link provisional write land? It decides what the CAS pins. */
+        preLinked: boolean;
+        inFlightMarker: string;
+    },
+): Promise<MilestoneLinkOutcome> {
+    const { qbId, payLink, preLinked, inFlightMarker } = args;
+    return withTxRetry(() => prisma.$transaction(async (tx): Promise<MilestoneLinkOutcome> => {
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { id: true },
+        });
+        // Conditional link write: the milestone was read as unlinked and unpaid
+        // at the top of the push, but several remote calls happen in between — a
+        // manual "Record Payment", a QB settle, a cancellation, a concurrent
+        // push, or a rebalance changing the row's content can all land in that
+        // window. The guards go in the WHERE — status pinned to Pending (a
+        // Canceled row must never get a fresh collectible invoice: the payment
+        // poller only watches Pending) and the content snapshot
+        // (amount/name/dueDate) pinned to what the QBO invoice was actually
+        // created from, so a mid-push edit can't leave QBO silently out of sync.
+        const claimed = claimedNow ? { count: 0 } : await tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                status: "Pending",
+                qbPaymentId: null,
+                // Pinned to the id WE just wrote, not to null: the pre-pay-link
+                // write already linked this row, and demanding null here would
+                // miss every time and compensate away a real invoice.
+                qbInvoiceId: preLinked ? qbId : null,
+                // Prove we still own the claim before writing. When the pre-link
+                // write already landed, this is the marker IT wrote; when that
+                // write lost the race, this is the SAME in-flight marker it
+                // required — never retry against a bare qbInvoiceId: null with no
+                // ownership check, or a row whose marker moved on for an
+                // unrelated reason (compensated, resolved, reclaimed) could get
+                // OUR invoice attached to it.
+                qbSyncError: preLinked ? PAYLINK_PENDING_MARKER : inFlightMarker,
+                amount: schedule.amount,
+                name: schedule.name,
+                dueDate: schedule.dueDate,
+            },
+            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
+            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
+        });
+        if (claimed.count === 1) return { outcome: "linked", payLink };
+        // The claim lost. Before treating this invoice as abandoned, ask what
+        // the row actually says NOW. The CAS pins `qbSyncError`, and the
+        // `paylink-pending` marker it requires is cleared as a matter of course
+        // by `sweepPendingPayLinks` and by a concurrent resend (which takes the
+        // already-linked branch at the top of the push, fetches the pay link and
+        // clears the flag) — both of which leave this row correctly linked to
+        // THIS invoice, and the resend has already returned success for it.
+        // Compensating on that deleted a live, correct QuickBooks invoice out
+        // from under the caller that had just been told it existed.
+        //
+        // A progress billing that claimed the milestone is NOT that case: its
+        // billing stages its own covering invoice, so ours really is the
+        // duplicate and must still be compensated away. Hence the `claimedNow`
+        // guard here — the row can carry our id and still be a double bill.
+        if (!claimedNow) {
+            const current = await tx.paymentSchedule.findUnique({
+                where: { id: schedule.id },
+                select: { qbInvoiceId: true, qbInvoiceLink: true, status: true, amount: true, name: true, dueDate: true },
+            });
+            if (isConcurrentlyFinalizedMilestoneLink(current, qbId, schedule)) {
+                return { outcome: "already-finalized", payLink: current?.qbInvoiceLink ?? null };
+            }
+        }
+        return { outcome: "abandoned", payLink: null };
+    }));
+}
+
 /**
  * The per-issuance idempotency seed, minted before the first QBO call.
  *
@@ -1033,57 +1198,22 @@ export async function pushMilestoneToQuickBooks(
         payLink = await getQBInvoicePaymentLink(tokens, qbId, pushDeadline).catch(() => null);
     }
 
-    // Conditional link write: the milestone was read as unlinked and unpaid at
-    // the top, but this function does several remote calls in between — a manual
-    // "Record Payment", a QB settle, a cancellation, a concurrent push, or a
-    // rebalance changing the row's content can all land in that window. The
-    // guards go in the WHERE — status pinned to Pending (a Canceled row must
-    // never get a fresh collectible invoice: the payment poller only watches
-    // Pending) and the content snapshot (amount/name/dueDate) pinned to what the
-    // QBO invoice was actually created from, so a mid-push edit can't leave QBO
-    // silently out of sync. If the claim misses, the just-created QBO invoice is
-    // deleted (compensation) instead of being attached to a row it no longer
-    // describes.
-    // Taken under the invoice lock and paired with a progress-billing re-check:
-    // createProgressBillingCore locks the same invoice row, so the two paths
-    // serialize instead of interleaving. Without this a progress billing could
-    // claim this milestone in the window between the guard at the top of this
-    // function and the write below (a full-milestone billing leaves the row
-    // Pending and unlinked, so every pinned column here would still match) and
-    // the client would end up with two collectible QuickBooks invoices.
-    const linked = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
-        const claimedNow = await tx.progressBillingLine.findFirst({
-            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
-            select: { id: true },
-        });
-        if (claimedNow) return { count: 0 };
-        return tx.paymentSchedule.updateMany({
-            where: {
-                id: schedule.id,
-                status: "Pending",
-                qbPaymentId: null,
-                // Pinned to the id WE just wrote, not to null: the pre-pay-link
-                // write above already linked this row, and demanding null here
-                // would miss every time and compensate away a real invoice.
-                qbInvoiceId: claimedLink.count === 1 ? qbId : null,
-                // Prove we still own the claim before writing. When the pre-link
-                // write already landed, this is the marker IT wrote; when that
-                // write lost the race, this is the SAME in-flight marker it
-                // required — never retry against a bare qbInvoiceId: null with no
-                // ownership check, or a row whose marker moved on for an
-                // unrelated reason (compensated, resolved, reclaimed) could get
-                // OUR invoice attached to it.
-                qbSyncError: claimedLink.count === 1 ? PAYLINK_PENDING_MARKER : inFlightMarker,
-                amount: schedule.amount,
-                name: schedule.name,
-                dueDate: schedule.dueDate,
-            },
-            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
-        });
-    }));
-    if (linked.count !== 1) {
+    // Finish the link. The rules the write enforces (the content/status pins,
+    // the progress-billing re-check under the invoice lock) and the verdict
+    // when it loses live in `finalizeMilestoneLinkUnderLock` above; an
+    // `abandoned` verdict — and only that — compensates the QBO invoice away.
+    const linked = await finalizeMilestoneLinkUnderLock(schedule, {
+        qbId,
+        payLink,
+        preLinked: claimedLink.count === 1,
+        inFlightMarker,
+    });
+    if (linked.outcome === "already-finalized") {
+        // Someone else finished this exact invoice. Nothing to write and
+        // nothing to delete — report the same success they did.
+        return { qbInvoiceId: qbId, payLink: linked.payLink ?? payLink, qbTotal: total };
+    }
+    if (linked.outcome !== "linked") {
         // The compensation clock starts HERE, when compensation begins — not at
         // entry, where it would have been ticking down through every call that
         // preceded it and could already be spent by the time it is needed. It

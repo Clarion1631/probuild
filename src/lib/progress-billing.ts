@@ -982,8 +982,21 @@ export async function stageProgressBillingToQuickBooksCore(
             data: { status: "Staged", qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncError: PAYLINK_PENDING_MARKER },
         });
     } catch (err) {
-        // The link write itself failed, so nothing points at the new invoice.
         const message = err instanceof Error ? err.message : String(err);
+        // "The write failed" is NOT the same as "nothing points at the new
+        // invoice". A commit whose response died, or a concurrent stage that
+        // linked this same invoice first (both share one issuance key, so
+        // Intuit hands them the same invoice), both land here with the row
+        // ALREADY pointing at `qbId`. Compensating on that deletes a live,
+        // correct QuickBooks invoice — the same failure the lost-CAS branch
+        // below already guards against, which this path was missing.
+        const current = await db.findUnique({
+            where: { id: billing.id },
+            select: { qbInvoiceId: true, qbInvoiceLink: true },
+        }).catch(() => null);
+        if (current?.qbInvoiceId === qbId) {
+            return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: current.qbInvoiceLink ?? null };
+        }
         if (!(await compensate())) throw orphanError(message);
         // Deleted, but check whether the local unlink ALSO landed —
         // `compensate()` sets `compensationUnlinkFailed` from

@@ -1938,10 +1938,16 @@ test("round 29 gate: the final link write proves ownership of the in-flight mark
     // could get THIS invoice silently attached to it.
     const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
     const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
+    // The write itself moved into finalizeMilestoneLinkUnderLock when the
+    // concurrent-finalize verdict was added (round 34); the invariant did not.
+    const finalize = src.slice(
+        src.indexOf("export async function finalizeMilestoneLinkUnderLock"),
+        src.indexOf("export async function pushMilestoneToQuickBooks"),
+    );
 
     assert.match(
-        push,
-        /qbSyncError: claimedLink\.count === 1 \? PAYLINK_PENDING_MARKER : inFlightMarker,/,
+        finalize,
+        /qbSyncError: preLinked \? PAYLINK_PENDING_MARKER : inFlightMarker,/,
         "the final link write must require the marker whichever branch it takes",
     );
     // Compensation must also be able to release the claim by marker, not only
@@ -2241,4 +2247,218 @@ test("the /api/quickbooks/sync route classifies an ambiguous create distinctly, 
     const ambiguousBlock = source.slice(ambiguousIdx, genericIdx);
     assert.ok(ambiguousBlock.includes('retry: false'), "an ambiguous create must never advertise retry:true");
     assert.ok(ambiguousBlock.includes('"ambiguous-create"'), "must surface the ambiguous-create reason");
+});
+
+// --- Round 34 gate: a lost final CAS is not proof the invoice was abandoned ---
+
+/**
+ * The failure: after the provisional link (`qbInvoiceId` + `paylink-pending`)
+ * is persisted, `sweepPendingPayLinks` — or a concurrent resend taking the
+ * already-linked branch at the top of the push — fills the pay link and clears
+ * the marker. The original request's final CAS pins that marker, so it fails
+ * for that reason ALONE, was read as "the milestone was abandoned", and
+ * compensation deleted a live, correct QuickBooks invoice that the concurrent
+ * caller had already reported as a success.
+ */
+
+const ISSUED_DUE = new Date("2026-09-30T00:00:00.000Z");
+const ISSUED_FROM = { amount: 1200.5, name: "Rough-in", dueDate: ISSUED_DUE };
+
+test("the pay-link sweep clearing our marker is NOT divergence", async () => {
+    const { isConcurrentlyFinalizedMilestoneLink } = await import("../src/lib/quickbooks-payments");
+
+    // Exactly what the row looks like after the sweep finished it: our id, the
+    // link filled in, the marker gone, everything else untouched.
+    const afterSweep = {
+        qbInvoiceId: "inv-77",
+        qbInvoiceLink: "https://pay/77",
+        status: "Pending",
+        amount: 1200.5,
+        name: "Rough-in",
+        dueDate: ISSUED_DUE,
+    };
+    assert.equal(isConcurrentlyFinalizedMilestoneLink(afterSweep, "inv-77", ISSUED_FROM), true);
+
+    // A settle that landed against THIS invoice while we were fetching its pay
+    // link must not be compensated either — deleting a paid QuickBooks document
+    // is strictly worse than leaving an abandoned one.
+    assert.equal(
+        isConcurrentlyFinalizedMilestoneLink({ ...afterSweep, status: "Paid" }, "inv-77", ISSUED_FROM),
+        true,
+    );
+    // A different Date OBJECT carrying the same instant is the same due date.
+    assert.equal(
+        isConcurrentlyFinalizedMilestoneLink(
+            { ...afterSweep, dueDate: new Date(ISSUED_DUE.getTime()) },
+            "inv-77",
+            ISSUED_FROM,
+        ),
+        true,
+    );
+});
+
+test("genuine divergence still compensates", async () => {
+    const { isConcurrentlyFinalizedMilestoneLink } = await import("../src/lib/quickbooks-payments");
+    const base = {
+        qbInvoiceId: "inv-77",
+        qbInvoiceLink: null,
+        status: "Pending",
+        amount: 1200.5,
+        name: "Rough-in",
+        dueDate: ISSUED_DUE,
+    };
+    const cases: Array<[string, any]> = [
+        ["the row vanished", null],
+        ["a different invoice", { ...base, qbInvoiceId: "inv-99" }],
+        ["no invoice at all", { ...base, qbInvoiceId: null }],
+        ["cancelled mid-push", { ...base, status: "Canceled" }],
+        ["repriced mid-push", { ...base, amount: 1500 }],
+        ["renamed mid-push", { ...base, name: "Rough-in (revised)" }],
+        ["rescheduled mid-push", { ...base, dueDate: new Date("2026-10-31T00:00:00.000Z") }],
+        ["due date cleared", { ...base, dueDate: null }],
+    ];
+    for (const [label, row] of cases) {
+        assert.equal(
+            isConcurrentlyFinalizedMilestoneLink(row, "inv-77", ISSUED_FROM),
+            false,
+            `${label} must still compensate`,
+        );
+    }
+    // ...and a row that never had a due date matches one issued without one.
+    assert.equal(
+        isConcurrentlyFinalizedMilestoneLink({ ...base, dueDate: null }, "inv-77", { ...ISSUED_FROM, dueDate: null }),
+        true,
+    );
+});
+
+/**
+ * Drives the REAL transaction (src/lib/prisma.ts reads globalThis.prisma before
+ * it builds a client), so the interleaving is exercised end to end rather than
+ * simulated.
+ */
+function fakeFinalizeDb(opts: {
+    claimCount: number;
+    current: Record<string, unknown> | null;
+    billingClaim?: boolean;
+}) {
+    const seen = { locked: 0, claims: [] as any[], reads: 0 };
+    const tx = {
+        $queryRaw: async () => { seen.locked++; return []; },
+        progressBillingLine: {
+            async findFirst() { return opts.billingClaim ? { id: "pbl-1" } : null; },
+        },
+        paymentSchedule: {
+            async updateMany(args: any) { seen.claims.push(args); return { count: opts.claimCount }; },
+            async findUnique() { seen.reads++; return opts.current; },
+        },
+    };
+    return { seen, prisma: { $transaction: async (fn: any) => fn(tx) } };
+}
+
+const SCHEDULE = {
+    id: "ps-1",
+    invoiceId: "inv-1",
+    amount: 1200.5,
+    dueDate: ISSUED_DUE,
+    name: "Rough-in",
+};
+
+async function runFinalize(fake: { prisma: unknown }, preLinked = true) {
+    const { finalizeMilestoneLinkUnderLock } = await import("../src/lib/quickbooks-payments");
+    const previous = (globalThis as any).prisma;
+    (globalThis as any).prisma = fake.prisma;
+    try {
+        return await finalizeMilestoneLinkUnderLock(SCHEDULE, {
+            qbId: "inv-77",
+            payLink: "https://pay/77",
+            preLinked,
+            inFlightMarker: "create-in-flight:@1|INV-1-2|note",
+        });
+    } finally {
+        (globalThis as any).prisma = previous;
+    }
+}
+
+test("interleaving: provisional link persisted, sweep finishes it, our CAS loses — no compensation", async () => {
+    // 1. this push wrote qbInvoiceId=inv-77 + `paylink-pending`
+    // 2. the sweep fetched the pay link and cleared the marker
+    // 3. this push's final CAS pins `paylink-pending` and therefore loses
+    const fake = fakeFinalizeDb({
+        claimCount: 0,
+        current: {
+            qbInvoiceId: "inv-77",
+            qbInvoiceLink: "https://pay/77",
+            status: "Pending",
+            amount: 1200.5,
+            name: "Rough-in",
+            dueDate: ISSUED_DUE,
+        },
+    });
+    const result = await runFinalize(fake);
+
+    assert.equal(result.outcome, "already-finalized", "the invoice is live and referenced — never delete it");
+    assert.equal(result.payLink, "https://pay/77", "report the link the winner wrote");
+    assert.equal(fake.seen.locked, 1, "the verdict is reached under the invoice lock");
+    assert.equal(fake.seen.reads, 1, "the verdict comes from a re-read, not from the lost CAS alone");
+});
+
+test("interleaving: the row really did move on — still abandoned, so compensation runs", async () => {
+    const fake = fakeFinalizeDb({
+        claimCount: 0,
+        current: {
+            qbInvoiceId: null,
+            qbInvoiceLink: null,
+            status: "Canceled",
+            amount: 1200.5,
+            name: "Rough-in",
+            dueDate: ISSUED_DUE,
+        },
+    });
+    assert.equal((await runFinalize(fake)).outcome, "abandoned");
+});
+
+test("a progress billing that claimed the milestone is abandoned even when the row carries OUR id", async () => {
+    // The billing stages its own covering invoice, so ours is the duplicate:
+    // the id matching is not enough to make this a success.
+    const fake = fakeFinalizeDb({
+        claimCount: 0,
+        billingClaim: true,
+        current: {
+            qbInvoiceId: "inv-77",
+            qbInvoiceLink: "https://pay/77",
+            status: "Pending",
+            amount: 1200.5,
+            name: "Rough-in",
+            dueDate: ISSUED_DUE,
+        },
+    });
+    const result = await runFinalize(fake);
+    assert.equal(result.outcome, "abandoned");
+    assert.equal(fake.seen.claims.length, 0, "the link write must never run once a progress billing owns this milestone");
+});
+
+test("the ordinary path still writes the link and reports `linked`", async () => {
+    const fake = fakeFinalizeDb({ claimCount: 1, current: null });
+    const result = await runFinalize(fake);
+    assert.equal(result.outcome, "linked");
+    assert.equal(result.payLink, "https://pay/77");
+    assert.equal(fake.seen.reads, 0, "a winning CAS needs no re-read");
+    const where = fake.seen.claims[0].where;
+    assert.equal(where.qbInvoiceId, "inv-77", "pre-linked: pinned to the id we already wrote");
+    assert.equal(where.qbSyncError, "paylink-pending");
+    // The retry branch (the pre-link write lost) still proves ownership.
+    const retry = fakeFinalizeDb({ claimCount: 1, current: null });
+    await runFinalize(retry, false);
+    assert.equal(retry.seen.claims[0].where.qbInvoiceId, null);
+    assert.equal(retry.seen.claims[0].where.qbSyncError, "create-in-flight:@1|INV-1-2|note");
+});
+
+test("the push returns the concurrent winner's id instead of compensating", async () => {
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
+    const finalized = push.indexOf('linked.outcome === "already-finalized"');
+    const compensate = push.indexOf("compensateAndUnlink(");
+    assert.ok(finalized > -1, "the push must act on the already-finalized verdict");
+    assert.ok(compensate > -1, "compensation is still there for the genuinely abandoned case");
+    assert.ok(finalized < compensate, "the success return must come BEFORE any compensating delete");
 });

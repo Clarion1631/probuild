@@ -11,6 +11,7 @@ import {
     type QboReceiptProjectCandidate,
     type QboReceiptPushDependencies,
     type ReceiptAttachmentStatus,
+    type ReceiptFileLock,
 } from "../src/lib/qbo-receipt-push";
 import {
     createQboReceiptCreateHandlers,
@@ -29,6 +30,14 @@ const EXPENSE_ACCOUNT_ID = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || "98";
 const TAX_ACCOUNT_ID = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || "1150040032";
 
 const PROJECT: QboReceiptProjectCandidate = { id: "project-1", name: "Mueller Remodel" };
+
+/**
+ * The per-file lock, stubbed out for the single-caller tests. The default
+ * implementation is a Postgres advisory lock inside a transaction, and these
+ * tests run without a database; contention itself is covered by the concurrency
+ * test at the end of this file.
+ */
+const INLINE_LOCK: ReceiptFileLock = (_fileId, run) => run();
 
 function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): CreateQBReceiptPurchaseInput {
     return {
@@ -71,6 +80,35 @@ interface DepsOverrides {
     attachableRows?: Array<Record<string, unknown>>;
     /** Lets a test make the attachable lookup itself fail. */
     attachableQueryImpl?: () => Promise<Array<Record<string, unknown>>>;
+    /** Stand-in for the per-file advisory lock; defaults to running inline. */
+    withFileLock?: ReceiptFileLock;
+    /** Full control of the Purchase lookup, for the concurrency test's shared QBO state. */
+    existingRowsImpl?: () => Array<Record<string, unknown>>;
+    /** Full control of the create, so two callers can share one idempotent QBO. */
+    qbCreateImpl?: QboReceiptPushDependencies["qbCreateFn"];
+}
+
+/**
+ * A faithful stand-in for `pg_advisory_xact_lock(hashtext('receipt-push:' || fileId))`:
+ * mutual exclusion keyed by fileId, shared by every caller that is handed it.
+ * The real lock lives in the database so it also spans processes; what matters
+ * to the code under test is that the second caller does not start until the
+ * first has finished.
+ */
+function createFileLock() {
+    const chains = new Map<string, Promise<unknown>>();
+    const order: string[] = [];
+    const lock = (<T,>(fileId: string, run: () => Promise<T>): Promise<T> => {
+        const previous = chains.get(fileId) ?? Promise.resolve();
+        const next = previous.then(() => {
+            order.push(fileId);
+            return run();
+        });
+        // Never let one caller's failure poison the queue for the next.
+        chains.set(fileId, next.then(() => undefined, () => undefined));
+        return next;
+    }) as ReceiptFileLock;
+    return { lock, order };
 }
 
 function createDeps(overrides: DepsOverrides = {}) {
@@ -81,6 +119,8 @@ function createDeps(overrides: DepsOverrides = {}) {
         customerCalls: [] as string[],
     };
     const deps: Partial<QboReceiptPushDependencies> = {
+        // Runs the push inline unless a test supplies the serializing lock.
+        withFileLock: overrides.withFileLock ?? ((_fileId, run) => run()),
         qbQueryFn: async (_tokens: unknown, query: string) => {
             calls.queries.push(query);
             if (/FROM Account/i.test(query)) {
@@ -90,12 +130,13 @@ function createDeps(overrides: DepsOverrides = {}) {
                 if (overrides.attachableQueryImpl) return (await overrides.attachableQueryImpl()) as never[];
                 return (overrides.attachableRows ?? []) as never[];
             }
+            if (overrides.existingRowsImpl) return overrides.existingRowsImpl() as never[];
             return (overrides.existingRows ?? []) as never[];
         },
-        qbCreateFn: async (_tokens, payload, requestId) => {
+        qbCreateFn: overrides.qbCreateImpl ?? (async (_tokens, payload, requestId) => {
             calls.creates.push({ payload, requestId });
             return { id: overrides.createdId ?? "purchase-1" };
-        },
+        }),
         ensureVendorFn:
             overrides.vendorImpl ??
             (async (_tokens, name: string) => {
@@ -1289,6 +1330,7 @@ test("the whole push, end to end, stops before the route ceiling", async () => {
             },
             ensureCustomerFn: async () => slow("cust-1"),
             listProjects: async () => [PROJECT],
+            withFileLock: INLINE_LOCK,
             qbCreateFn: async () => {
                 createCalls++;
                 return slow({ id: "purchase-1" });
@@ -1416,7 +1458,7 @@ test("the real vendor/customer ensures are bounded by the route budget", async (
             TOKENS,
             baseInput({ ...FILE_INPUT }),
             // Only the database read is stubbed; every QBO call is real.
-            { listProjects: async () => [PROJECT] },
+            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
             deadline,
         ),
     ).then(() => null, (e: unknown) => e as Error);
@@ -1465,7 +1507,7 @@ test("an already-spent budget stops the real ensures before any QBO call", async
         createQBReceiptPurchase(
             TOKENS,
             baseInput({ ...FILE_INPUT }),
-            { listProjects: async () => [PROJECT] },
+            { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK },
             spent,
         ),
     ).then(() => null, (e: unknown) => e as Error);
@@ -1501,6 +1543,7 @@ test("two concurrent pushes each honour THEIR OWN remaining budget", async () =>
         ensureVendorFn: (async () => "vendor-1") as never,
         ensureCustomerFn: (async () => "cust-1") as never,
         listProjects: async () => [PROJECT],
+        withFileLock: INLINE_LOCK,
         qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
         uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
     });
@@ -1725,6 +1768,7 @@ test("a SHORT-budget push starting the verification does not poison it for other
         ensureVendorFn: (async () => "vendor-1") as never,
         ensureCustomerFn: (async () => "cust-1") as never,
         listProjects: async () => [PROJECT],
+        withFileLock: INLINE_LOCK,
         qbCreateFn: (async () => ({ id: "purchase-1" })) as never,
         uploadAttachment: (async () => "attached" as ReceiptAttachmentStatus) as never,
     });
@@ -1784,7 +1828,7 @@ test("a 503 on the REAL vendor/customer/purchase create reaches the route as a 5
                 const mod = await import("../src/lib/qbo-receipt-push");
                 // Real ensures, real queries, real create — nothing stubbed but
                 // the project list, which is a database read.
-                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT] }, deadline);
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
             }),
         logEvent: event => { events.push(event); },
     });
@@ -1852,7 +1896,7 @@ test("a 400 on the REAL customer create is a terminal qbo-fault at the route", a
         createPurchase: (tokens, input, deadline) =>
             withFetch(badRequest, async () => {
                 const mod = await import("../src/lib/qbo-receipt-push");
-                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT] }, deadline);
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT], withFileLock: INLINE_LOCK }, deadline);
             }),
         logEvent: event => { events.push(event); },
     });
@@ -2137,4 +2181,89 @@ test("route: a genuine business 4xx is still terminal", async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: false, reason: "qbo-fault", detail: "400" });
     assert.equal(events[0].status, "fallback");
+});
+
+// ─── Concurrent deliveries of the same receipt ──────────────────────────────
+
+test("two simultaneous pushes of one file upload the attachment ONCE and agree on the purchase id", async () => {
+    // Round 34 gate: without mutual exclusion both requests miss the opening
+    // DocNumber lookup (neither has committed), both call create — QBO
+    // de-duplicates on `requestid` and hands BOTH the same Purchase — and both
+    // then upload the receipt unconditionally, because the
+    // deterministic-FileName check only runs on the `alreadyExists` path. The
+    // Purchase ends up carrying the same image twice.
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+
+    // One shared QuickBooks: a Purchase store that is idempotent on requestid,
+    // and an Attachable store the deterministic-FileName check reads back.
+    let purchase: { Id: string; PrivateNote: string } | null = null;
+    const seenRequestIds = new Set<string>();
+    const attachables: Array<Record<string, unknown>> = [];
+    const uploads: Array<{ purchaseId: string; fileName: string }> = [];
+
+    const qbCreateImpl: QboReceiptPushDependencies["qbCreateFn"] = async (_t, payload, requestId) => {
+        seenRequestIds.add(requestId);
+        // QBO's own idempotency: a repeat requestid returns the SAME Purchase.
+        if (!purchase) purchase = { Id: "77", PrivateNote: String(payload.PrivateNote) };
+        return { id: purchase.Id };
+    };
+    const shared = {
+        existingRowsImpl: () => (purchase ? [purchase] : []),
+        attachableQueryImpl: async () => attachables,
+        qbCreateImpl,
+        uploadAttachment: (async (_t: unknown, purchaseId: string, file: { fileName: string }) => {
+            uploads.push({ purchaseId, fileName: file.fileName });
+            attachables.push(attachableRow(purchaseId, file.fileName));
+            return "attached" as ReceiptAttachmentStatus;
+        }) as QboReceiptPushDependencies["uploadAttachment"],
+    };
+
+    const { lock, order } = createFileLock();
+    const a = createDeps({ ...shared, withFileLock: lock });
+    const b = createDeps({ ...shared, withFileLock: lock });
+
+    const [first, second] = await Promise.all([
+        createQBReceiptPurchase(TOKENS, input, a.deps),
+        createQBReceiptPurchase(TOKENS, input, b.deps),
+    ]);
+
+    assert.equal(order.length, 2, "both deliveries went through the per-file lock");
+    assert.equal(uploads.length, 1, "the receipt image is uploaded exactly once");
+    assert.deepEqual(uploads[0], { purchaseId: "77", fileName: "receipt.jpg" });
+    assert.equal(first.ok && first.qbPurchaseId, "77");
+    assert.equal(second.ok && second.qbPurchaseId, "77");
+    // One of the two ran first and created; the other found the committed
+    // Purchase and took the already-exists path, which re-checked by filename.
+    const flags = [first.ok && first.alreadyExists, second.ok && second.alreadyExists].sort();
+    assert.deepEqual(flags, [false, true]);
+    const attachmentResults = [
+        first.ok ? first.attachment : null,
+        second.ok ? second.attachment : null,
+    ].sort();
+    assert.deepEqual(attachmentResults, ["already-attached", "attached"]);
+    assert.equal(seenRequestIds.size, 1, "both callers use the same QBO idempotency key");
+    // The marker is what proves the found Purchase is ours, not a DocNumber collision.
+    assert.ok(purchase && String((purchase as any).PrivateNote).includes(marker));
+});
+
+test("the push cannot run outside the per-file lock", async () => {
+    // The lock is only an invariant if there is no way round it: the
+    // implementation must not be exported, and the exported entry point must
+    // take the lock before doing anything else.
+    const mod: Record<string, unknown> = await import("../src/lib/qbo-receipt-push");
+    assert.equal(mod.createQBReceiptPurchaseUnderLock, undefined, "the unlocked implementation must stay private");
+
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/qbo-receipt-push.ts", "utf8"));
+    const entry = src.slice(
+        src.indexOf("export async function createQBReceiptPurchase("),
+        src.indexOf("async function createQBReceiptPurchaseUnderLock("),
+    );
+    assert.match(entry, /withFileLock\(input\.fileId, \(\) => createQBReceiptPurchaseUnderLock\(/);
+    assert.match(
+        src,
+        /pg_advisory_xact_lock\(hashtext\(\$1\)\)/,
+        "the default lock is the transaction-scoped advisory lock, not a session one",
+    );
+    assert.doesNotMatch(src, /pg_advisory_lock\(/, "a session-level lock does not survive pgbouncer transaction pooling");
 });
