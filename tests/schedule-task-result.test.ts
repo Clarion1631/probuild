@@ -5,7 +5,7 @@ import {
     UNEXPECTED_SCHEDULE_TASK_ERROR,
     toScheduleTaskFailure,
 } from "@/lib/schedule-task-result";
-import { UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROW, UPDATE_MILESTONE_ROWS } from "../scripts/apply-schedule-task-exclusive-end.mjs";
+import { UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROW, UPDATE_MILESTONE_ROWS, targetMatches } from "../scripts/apply-schedule-task-exclusive-end.mjs";
 
 test("ScheduleTaskValidationError carries the VALIDATION code and its own name", () => {
     const err = new ScheduleTaskValidationError("Task end date must be after its start date");
@@ -80,4 +80,11 @@ test("an expired session is FORBIDDEN with a sign-in hint, not UNEXPECTED", () =
     const failure = toScheduleTaskFailure(new Error("Unauthorized"));
     assert.equal(failure.code, "FORBIDDEN");
     assert.match(failure.error, /sign in/i);
+});
+
+test("the backfill refuses a database or host that does not match the expected target", () => {
+    assert.equal(targetMatches({ db: "postgres", host: "10.0.0.1" }, "postgres", "10.0.0.1"), true);
+    assert.equal(targetMatches({ db: "postgres", host: "10.0.0.2" }, "postgres", "10.0.0.1"), false);
+    assert.equal(targetMatches({ db: "staging", host: "10.0.0.1" }, "postgres", "10.0.0.1"), false);
+    assert.equal(targetMatches(undefined, "postgres", "10.0.0.1"), false);
 });

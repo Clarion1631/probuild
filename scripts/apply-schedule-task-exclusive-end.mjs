@@ -7,9 +7,10 @@
 // Default is DRY RUN: prints the rows that would change. Pass --yes to apply
 // the UPDATE for real, inside a transaction.
 //
-//   node scripts/apply-schedule-task-exclusive-end.mjs           (dry run)
-//   node scripts/apply-schedule-task-exclusive-end.mjs --yes     (apply the legacy repair)
-//   node scripts/apply-schedule-task-exclusive-end.mjs --yes --extend <id>:<shownEnd>,<id>:<shownEnd>
+//   node scripts/apply-schedule-task-exclusive-end.mjs           (dry run; prints the connected db/host)
+//   node scripts/apply-schedule-task-exclusive-end.mjs --yes --expect-db <name> --expect-host <host>
+//                                                              (apply the legacy repair; both flags must match the connection)
+//   node scripts/apply-schedule-task-exclusive-end.mjs --yes --expect-db <name> --expect-host <host> --extend <id>:<shownEnd>,...
 //                                                              (also extend reviewed rows; tokens come from the dry-run review list)
 //
 // Idempotent: re-running after a successful apply finds zero matching rows.
@@ -80,6 +81,25 @@ export const SELECT_REVIEW_ROWS = `
 
 export const SELECT_TASK_END = `SELECT "endDate" FROM "ScheduleTask" WHERE "id" = $1`;
 
+// Target-identity guard, same convention as apply-check-payer-extraction.mjs:
+// --yes alone proves intent, not which database; both --expect-db and
+// --expect-host must match what the connection reports before any write.
+export function maskUrl(url) {
+    return url.replace(/:[^:@]*@/, ":****@");
+}
+
+/** Pure comparison, exported for unit testing. */
+export function targetMatches(actual, expectDb, expectHost) {
+    if (!actual || typeof actual !== "object") return false;
+    if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
+    return String(actual.host ?? "") === String(expectHost ?? "");
+}
+
+function readFlagValue(flag) {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 ? process.argv[idx + 1] : undefined;
+}
+
 function addDaysKey(key, days) {
     const [y, m, d] = key.split("-").map(Number);
     return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
@@ -99,6 +119,22 @@ async function main() {
 
     const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
     try {
+        console.log(`target: ${maskUrl(process.env.DATABASE_URL)}`);
+        const [actual] = await prisma.$queryRawUnsafe(
+            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
+        );
+        console.log(`connected to db="${actual?.db ?? "<unknown>"}" host="${actual?.host ?? "<unknown>"}"`);
+        if (APPLY) {
+            const expectDb = readFlagValue("--expect-db");
+            const expectHost = readFlagValue("--expect-host");
+            if (!expectDb || !expectHost) {
+                throw new Error("Refusing: --yes requires both --expect-db <name> and --expect-host <host> (copy them from the dry-run 'connected to' line).");
+            }
+            if (!targetMatches(actual, expectDb, expectHost)) {
+                throw new Error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual?.db ?? "<unknown>"}" host="${actual?.host ?? "<unknown>"}". Nothing was applied.`);
+            }
+        }
+
         const rows = await prisma.$queryRawUnsafe(SELECT_LEGACY_ROWS);
         console.log(`found ${rows.length} row(s) with type <> 'milestone' AND "endDate" <= "startDate"`);
         for (const row of rows) {
@@ -131,7 +167,7 @@ async function main() {
 
         if (!APPLY) {
             if (extendPairs.length) console.log(`would extend ${extendPairs.length} task(s) by one day: ${extendPairs.map((p) => p.id).join(", ")}`);
-            console.log("dry run — pass --yes to apply");
+            console.log(`dry run — to apply: --yes --expect-db ${actual?.db ?? "<db>"} --expect-host ${actual?.host || "<host>"}`);
             return;
         }
 
