@@ -544,6 +544,82 @@ export default function EntityContractsClient({
         }
     };
 
+    // ─── PRINT / SAVE AS PDF ───
+    // Opens the contract as the customer reads it (merge fields resolved, signing
+    // placeholders drawn as signature lines) in a print-ready tab and triggers the
+    // browser print dialog, which also offers "Save as PDF". Works in every status —
+    // before signing there is no executed PDF yet, so this is the only way to print,
+    // proof, or email a copy of a draft.
+    const [printing, setPrinting] = useState(false);
+    const handlePrint = async () => {
+        if (!editingContract) return;
+        // Open synchronously inside the click so popup blockers allow it; fill it after the await.
+        const win = window.open("", "_blank");
+        if (!win) { toast.error("Your browser blocked the print window. Allow pop-ups for this site and try again."); return; }
+        win.document.write("<!doctype html><title>Preparing contract…</title><p style=\"font-family:sans-serif;color:#64748b;padding:24px\">Preparing contract…</p>");
+        setPrinting(true);
+        try {
+            const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            const isReadOnly = ["Signed", "Finalized"].includes(editingContract.status);
+            let html: string;
+            if (isReadOnly) {
+                // Signed contracts already carry their signature images via the read-only parser.
+                html = parsedReadOnlyBody;
+            } else {
+                const projectId = entity.type === "project" ? entity.id : null;
+                const leadId = entity.type === "lead" ? entity.id : null;
+                const mergeData = await getResolvedMergePreview(projectId, leadId);
+                const fill = (key: string): string | null => (key in mergeData ? escapeHtml(mergeData[key] || "") : null);
+                html = editBody;
+                html = html.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g, (m, key) => fill(key) ?? m);
+                html = html.replace(/\{\{(\w+)\}\}/g, (m, key) => fill(key) ?? m);
+                const line = (label: string, width: number) =>
+                    `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
+                const SIGN_LINES: Record<string, string> = {
+                    SIGNATURE_BLOCK: line("Client signature", 240),
+                    INITIAL_BLOCK: line("Initials", 70),
+                    DATE_BLOCK: line("Date", 120),
+                    CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl
+                        ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
+                        : line("Contractor signature", 240),
+                };
+                html = html.replace(/\{\{(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)\}\}/g, (_m, key) => SIGN_LINES[key]);
+                html = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+            }
+            const title = escapeHtml(editTitle || editingContract.title || "Contract");
+            const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+  @page { size: letter; margin: 0.75in; }
+  body { font-family: Georgia, "Times New Roman", serif; color: #1e293b; font-size: 12pt; line-height: 1.55; margin: 0; }
+  .page { max-width: 7in; margin: 0 auto; padding: 24px 0; }
+  h1.doc-title { font-family: Arial, Helvetica, sans-serif; font-size: 18pt; margin: 0 0 4px; color: #0f172a; }
+  .doc-sub { font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #64748b; margin: 0 0 20px; padding-bottom: 12px; border-bottom: 1px solid #cbd5e1; }
+  h1, h2, h3, h4 { font-family: Arial, Helvetica, sans-serif; color: #0f172a; page-break-after: avoid; }
+  h2 { font-size: 14pt; margin: 20px 0 8px; } h3 { font-size: 12pt; margin: 16px 0 6px; }
+  p { margin: 0 0 10px; } ul, ol { margin: 0 0 10px 22px; padding: 0; } li { margin: 2px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; page-break-inside: auto; }
+  td, th { border: 1px solid #cbd5e1; padding: 6px 8px; vertical-align: top; text-align: left; font-size: 11pt; }
+  th { background: #f1f5f9; } tr { page-break-inside: avoid; }
+  img { max-width: 100%; }
+  .toolbar { font-family: Arial, Helvetica, sans-serif; background: #0f172a; color: #fff; padding: 10px 16px; display: flex; gap: 12px; align-items: center; font-size: 13px; }
+  .toolbar button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  @media print { .toolbar { display: none; } .page { padding: 0; max-width: none; } }
+</style></head><body>
+<div class="toolbar"><button onclick="window.print()">Print / Save as PDF</button><span>Choose “Save as PDF” as the printer to get a PDF you can email.</span></div>
+<div class="page"><h1 class="doc-title">${title}</h1><p class="doc-sub">${escapeHtml(entity.name)} · ${escapeHtml(entity.clientName || "")}</p>${html}</div>
+<script>window.addEventListener("load", function () { setTimeout(function () { window.print(); }, 300); });</script>
+</body></html>`;
+            win.document.open();
+            win.document.write(doc);
+            win.document.close();
+        } catch (e: any) {
+            win.close();
+            toast.error(e?.message || "Failed to prepare the contract for printing");
+        } finally {
+            setPrinting(false);
+        }
+    };
+
     const handleDelete = async (contractId: string) => {
         if (!confirm("Delete this contract?")) return;
         try { await deleteContract(contractId); toast.success("Deleted"); router.refresh(); }
@@ -752,6 +828,11 @@ export default function EntityContractsClient({
                         {!isReadOnly && !editingContract.originalPdfPath && (
                             <button onClick={handlePreviewToggle} disabled={loadingPreview} className={`px-3 py-1.5 text-sm font-medium rounded-lg transition border ${isPreview ? "bg-amber-50 text-amber-700 border-amber-300" : "text-slate-600 border-slate-200 hover:bg-slate-50"}`}>
                                 {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
+                            </button>
+                        )}
+                        {!editingContract.originalPdfPath && (
+                            <button onClick={handlePrint} disabled={printing} title="Open a print-ready copy of this contract. Use “Save as PDF” in the print dialog to get a PDF you can email." className="px-3 py-1.5 text-sm font-medium rounded-lg transition border text-slate-600 border-slate-200 hover:bg-slate-50 disabled:opacity-50">
+                                {printing ? "Preparing..." : "🖨 Print / PDF"}
                             </button>
                         )}
                         {isReadOnly && editingContract.status === "Signed" && editingContract.requiresCountersign && !editingContract.companySignedBy && (
