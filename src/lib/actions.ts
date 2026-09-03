@@ -5163,7 +5163,13 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
     // Delete related items, schedules, expenses, and the estimate itself
     await prisma.estimateItem.deleteMany({ where: { estimateId } });
     await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
-    await prisma.expense.deleteMany({ where: { estimateId } });
+    // EVIDENCE (round-45 gate, finding 3). Deleting an estimate cascades to its
+    // Expenses, and every one of those is a row the missing-receipt sweep may
+    // have read as "this charge has its receipt". Unfenced, a sweep mid-cycle
+    // could close a chase on evidence this statement was in the middle of
+    // destroying — and certify it, because nothing moved the epoch.
+    await withReceiptEvidenceLock(fn => prisma.$transaction(fn),
+        tx => tx.expense.deleteMany({ where: { estimateId } }));
     await prisma.estimate.delete({ where: { id: estimateId } });
 
     if (estimate.projectId) {

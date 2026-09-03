@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import {
@@ -20,7 +21,15 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
             select: { qbPurchaseId: true },
         });
         assertExpenseMutableOutsideQbo(expense);
-        await prisma.expense.deleteMany({ where: { id, qbPurchaseId: null } });
+        // EVIDENCE (round-45 gate, finding 3). Any Expense write can change what
+        // the missing-receipt sweep reads, so it goes through the shared fence:
+        // the advisory lock, and the epoch bump that stops a cycle certifying
+        // over it. Uniform on purpose — a per-field rule would need every
+        // future edit to re-derive which columns the matcher happens to read.
+        // A DELETE is the sharpest case of it: the sweep read this row as
+        // "the receipt exists" and it is about to stop existing.
+        await withReceiptEvidenceLock(fn => prisma.$transaction(fn),
+            tx => tx.expense.deleteMany({ where: { id, qbPurchaseId: null } }));
 
         return NextResponse.json({ success: true });
     } catch (error) {
@@ -54,7 +63,14 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
-        const updatedExpense = await prisma.expense.update({
+        // EVIDENCE (round-45 gate, finding 3). Any Expense write can change what
+        // the missing-receipt sweep reads, so it goes through the shared fence:
+        // the advisory lock, and the epoch bump that stops a cycle certifying
+        // over it. Uniform on purpose — a per-field rule would need every
+        // future edit to re-derive which columns the matcher happens to read.
+        // `amount`, `vendor` and `date` are literally three of the fields the
+        // matcher pairs a charge on.
+        const updatedExpense = await withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.expense.update({
             where: { id },
             data: {
                 amount: body.amount ? parseFloat(body.amount) : undefined,
@@ -63,7 +79,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 description: body.description || null,
                 itemId: body.itemId || null,
             },
-        });
+        }));
 
         return NextResponse.json(updatedExpense);
     } catch (error) {

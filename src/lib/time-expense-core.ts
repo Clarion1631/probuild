@@ -245,7 +245,9 @@ export async function tagExpensesToChangeOrderCore(
     if (rows.some((row) => row.estimate.projectId !== changeOrder.projectId)) throw new Error("All expenses must belong to the change order project");
     for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
-    const result = await prisma.expense.updateMany({
+    // EVIDENCE (round-45 gate, finding 3): fenced like every other Expense
+    // write, so the epoch moves and no cycle certifies over it.
+    const result = await withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.expense.updateMany({
         where: {
             id: { in: input.ids },
             qbPurchaseId: null,
@@ -253,6 +255,6 @@ export async function tagExpensesToChangeOrderCore(
             invoicedAt: null,
         },
         data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
-    });
+    }));
     return { updated: result.count };
 }

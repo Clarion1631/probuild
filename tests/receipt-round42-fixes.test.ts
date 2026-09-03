@@ -829,7 +829,12 @@ test("the claim is a database constraint, not a check somebody has to remember",
     // NOT partial: Postgres already treats NULLs as distinct, so an undelivered
     // card holds no claim without one — and a partial index is invisible to
     // Prisma's diff engine, which is a permanent phantom for no semantics.
-    assert.doesNotMatch(migration, /WHERE "deliveredOn" IS NOT NULL/);
+    // Scoped to the CREATE statement: the round-45 backfill legitimately
+    // selects `WHERE "deliveredOn" IS NOT NULL`, and a file-wide assertion
+    // would read that as a partial index.
+    const createIndex = /CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"[^;]*/.exec(migration);
+    assert.ok(createIndex, "the migration creates the index");
+    assert.doesNotMatch(createIndex[0], /WHERE/);
 
     // The apply script has to say the same thing, or prod and CI drift.
     const apply = readFileSync(join(repoRoot, "scripts/apply-phase2-receipt-queue.mjs"), "utf8");

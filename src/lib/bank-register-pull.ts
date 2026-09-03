@@ -150,11 +150,18 @@ export interface ConvertedRegisterRows {
     /** Repeat qbTxnIds with IDENTICAL content, collapsed to one observation. */
     collapsed: number;
     /**
-     * Repeat qbTxnIds with DIFFERENT content. Two rows claiming the same
-     * durable identity with different dates/amounts/descriptors cannot both be
-     * right, and neither is posted.
+     * Rows emitted under a `<qbTxnId>#<suffix>` identity because their
+     * transaction had several distinct account-affecting splits (round-45 gate,
+     * finding 6). Reported so a sudden jump is visible; not an error.
      */
-    conflicts: string[];
+    split: number;
+    /**
+     * Transactions with more distinct splits than `MAX_SPLITS_PER_TXN`.
+     * Excluded from the payload and reported for a human — every other row in
+     * the fetch still posts, which is the difference between one bad
+     * transaction and a stopped pipeline.
+     */
+    quarantined: string[];
 }
 
 /**
@@ -169,43 +176,96 @@ function lineContent(line: BankRegisterIngestLine): string {
 }
 
 /**
+ * The most account-affecting splits one transaction may legitimately have.
+ *
+ * A real multi-split purchase has a handful. A transaction claiming hundreds is
+ * not a purchase, it is a symptom — a malformed report, a runaway journal — and
+ * ingesting it would flood the ledger with observations nobody can reconcile.
+ * That, and only that, is quarantined.
+ */
+export const MAX_SPLITS_PER_TXN = 25;
+
+/**
+ * A short, STABLE suffix for one split's content.
+ *
+ * FNV-1a, written out rather than imported: this module is pure and runs in
+ * both runtimes, and the hash only has to be deterministic across runs, not
+ * cryptographic. Same content, same suffix, every night — which is what makes
+ * re-ingesting idempotent.
+ */
+export function splitSuffix(content: string): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < content.length; i++) {
+        hash ^= content.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+}
+
+/**
  * Convert a whole register fetch into ingest lines. PURE.
  *
- * A qbTxnId must appear at most once per request — the ingest route's own
- * duplicate check 409s the whole batch otherwise. QBO can emit the same txn
- * twice in a GL when it has multiple account-affecting splits.
+ * QBO can emit the same `qbTxnId` several times in one GL when the transaction
+ * has multiple account-affecting splits. Identical repeats are the same
+ * observation twice and collapse to one.
  *
- * CONTENT-COMPARED, not first-wins. Identical repeats really are the same
- * observation and collapse to one. DIVERGENT repeats are a different animal:
- * picking the first is a guess, and it is the guess that hides a QuickBooks
- * restatement — exactly the thing the ingest route's 409 contract exists to
- * surface. Those ids are dropped from the payload (they cannot be represented
- * as one observation) and reported in `conflicts`, which the cron turns into a
- * 500 so the platform flags it for a human.
+ * DIVERGENT REPEATS ARE SPLITS, NOT A CONTRADICTION (Codex PR #443 gate round
+ * 45, finding 6).
+ *
+ * They used to be treated as a fatal conflict: both rows dropped, the run
+ * marked `ok: false` and `complete: false`, and — because the same transaction
+ * comes back on every pull — the high-water mark and the freshness stamp could
+ * never advance again. One legitimate two-split purchase stopped every owner's
+ * chase cards indefinitely. The doc comment above this function even said QBO
+ * does this "when it has multiple account-affecting splits", and then treated
+ * it as an error anyway.
+ *
+ * So each distinct content gets its own durable identity, `<qbTxnId>#<suffix>`,
+ * derived from the content itself and therefore stable across runs. A
+ * single-row transaction keeps its bare `qbTxnId`, so nothing that already
+ * exists is orphaned or re-minted.
+ *
+ * Only a transaction with more distinct splits than `MAX_SPLITS_PER_TXN` is
+ * QUARANTINED: excluded from the payload and reported, while every other row in
+ * the fetch posts normally. A quarantine is not a failed run — that was the
+ * whole bug — it is one transaction a human should look at.
  */
 export function convertRegisterRows(rows: readonly BankRegisterRowLike[]): ConvertedRegisterRows {
-    const byTxnId = new Map<string, { line: BankRegisterIngestLine; content: string }>();
-    const conflicts = new Set<string>();
+    const byTxnId = new Map<string, Map<string, BankRegisterIngestLine>>();
     let skipped = 0;
     let collapsed = 0;
     for (const row of rows) {
         const line = registerRowToIngestLine(row);
         if (!line) { skipped++; continue; }
         const content = lineContent(line);
-        const prior = byTxnId.get(line.qbTxnId);
-        if (!prior) { byTxnId.set(line.qbTxnId, { line, content }); continue; }
-        if (prior.content === content) { collapsed++; continue; }
-        conflicts.add(line.qbTxnId);
+        let splits = byTxnId.get(line.qbTxnId);
+        if (!splits) { splits = new Map(); byTxnId.set(line.qbTxnId, splits); }
+        // An identical repeat is the same observation twice.
+        if (splits.has(content)) { collapsed++; continue; }
+        splits.set(content, line);
     }
-    // A conflicting id is posted by nobody: not the first sighting, not the
-    // second. Half of a contradiction is still a guess.
-    for (const qbTxnId of conflicts) byTxnId.delete(qbTxnId);
-    return {
-        lines: [...byTxnId.values()].map(entry => entry.line),
-        skipped,
-        collapsed,
-        conflicts: [...conflicts].sort(),
-    };
+
+    const lines: BankRegisterIngestLine[] = [];
+    const quarantined: string[] = [];
+    let split = 0;
+    for (const [qbTxnId, splits] of byTxnId) {
+        if (splits.size > MAX_SPLITS_PER_TXN) { quarantined.push(qbTxnId); continue; }
+        if (splits.size === 1) {
+            lines.push([...splits.values()][0]);
+            continue;
+        }
+        // Sorted by content. NOT for identity — the suffix is derived from the
+        // content itself, so it is stable whatever order QBO returns the rows
+        // in. This makes the EMITTED ORDER stable too, so the batches this
+        // fetch is chunked into are the same on a re-run, which is what makes a
+        // partial ingest resumable at the same boundary.
+        for (const content of [...splits.keys()].sort()) {
+            const line = splits.get(content)!;
+            lines.push({ ...line, qbTxnId: `${qbTxnId}#${splitSuffix(content)}` });
+            split++;
+        }
+    }
+    return { lines, skipped, collapsed, split, quarantined: quarantined.sort() };
 }
 
 export function chunkLines<T>(items: readonly T[], size: number): T[][] {
@@ -840,13 +900,24 @@ export interface BankRegisterPullSummary {
     /** Set when a batch came back non-OK; later batches are not attempted. */
     error?: string;
     /**
-     * Every qbTxnId this run refused to post: divergent repeats inside the
-     * fetch, plus the id the ingest route 409'd on, if any. A non-empty list
-     * makes the cron answer 500 — it is a QuickBooks restatement, and a human
-     * has to look. Batches that already committed stay committed; re-running is
-     * a no-op for them.
+     * Every qbTxnId the INGEST ROUTE 409'd on. A non-empty list makes the cron
+     * answer 500 — it is a QuickBooks restatement of an identity already
+     * stored, and a human has to look. Batches that already committed stay
+     * committed; re-running is a no-op for them.
+     *
+     * Divergent repeats WITHIN a fetch no longer land here (round-45 gate,
+     * finding 6): they are multi-split transactions, they get their own durable
+     * identities, and they post.
      */
     conflictQbTxnIds?: string[];
+    /** Rows posted under a `<qbTxnId>#<suffix>` split identity this run. */
+    splitObservations?: number;
+    /**
+     * Transactions excluded for claiming an implausible number of splits.
+     * Reported, never fatal: quarantining one transaction must not stop the
+     * other rows, the freshness stamp, or every owner's chase cards.
+     */
+    quarantinedQbTxnIds?: string[];
     reconciled?: {
         linked: number;
         proposed: number;
@@ -868,7 +939,7 @@ export interface BankRegisterPullSummary {
     fullSweep?: boolean;
     highWater?: string | null;
     /** Why minting was held back this run, when it was. */
-    mintSkipped?: "stale-fetch" | "conflicts" | "ingest-failed" | "incomplete-window" | "cleared-probe-failed";
+    mintSkipped?: "stale-fetch" | "quarantined" | "ingest-failed" | "incomplete-window" | "cleared-probe-failed";
     /**
      * The window this run parked for a continuation to re-run, or null when it
      * parked none (and cleared any it inherited). Reported so a failed probe is
@@ -967,7 +1038,7 @@ export async function runBankRegisterPull(
     // shape of unknown, and inventing the second from the first would hold the
     // stamp down for every caller that predates the field.
     const clearedProbeOk = fetched.clearedProbeOk !== false;
-    const { lines, skipped, collapsed, conflicts } = convertRegisterRows(fetched.rows);
+    const { lines, skipped, collapsed, split, quarantined } = convertRegisterRows(fetched.rows);
 
     // A STALE fetch is QuickBooks not answering: the rows are a cached copy from
     // an earlier run, so "we pulled the register" is not true of this one. It
@@ -1002,16 +1073,26 @@ export async function runBankRegisterPull(
         summary.complete = false;
         summary.reason = "cleared-probe-failed";
     }
-    // Divergent repeats inside the fetch are already a conflict, and the run is
-    // already failed — but the NON-conflicting lines still post. They are good
-    // evidence, the ingest is idempotent, and holding a whole night's register
-    // hostage to one restated transaction would starve the matcher for a reason
-    // that has nothing to do with the other rows.
-    if (conflicts.length > 0) {
-        summary.ok = false;
-        summary.complete = false;
-        summary.error = "qbo-duplicate-conflict";
-        summary.conflictQbTxnIds = [...conflicts];
+    /**
+     * A QUARANTINED TRANSACTION DOES NOT FAIL THE RUN (round-45 gate, finding
+     * 6).
+     *
+     * Divergent repeats used to land here as a fatal conflict, which set
+     * `ok: false` and `complete: false` — and because the same transaction
+     * comes back on every pull, the high-water mark and the freshness stamp
+     * could never advance again. One legitimate multi-split purchase stopped
+     * every owner's chase cards indefinitely. Splits now get their own durable
+     * identities and post like anything else.
+     *
+     * What is left to quarantine is a transaction claiming more splits than any
+     * purchase has, which is a symptom rather than a purchase. It is excluded
+     * and REPORTED — the rest of the fetch posts, the cycle proceeds, and a
+     * human has something specific to look at.
+     */
+    summary.splitObservations = split;
+    if (quarantined.length > 0) {
+        summary.quarantinedQbTxnIds = [...quarantined];
+        console.warn("[bank-register-pull] quarantined transactions with implausible split counts", quarantined);
     }
     summary.fullSweep = planned.fullSweep;
     // A CAPPED window is not an incomplete RUN, but it is an incomplete
@@ -1177,13 +1258,17 @@ export async function runBankRegisterPull(
     // said a row cleared; with the probe down every row reads "Unknown", so a
     // mint pass could only ever skip everything — and reporting that as a
     // finished mint is how the run came to look complete (round-33 gate).
-    const mintIsSafe = summary.ok && summary.complete && !fetched.stale && clearedProbeOk && conflicts.length === 0;
+    // Minting stays blocked while anything is quarantined: those rows are
+    // missing from the ledger this pass read, so a canonical line minted now
+    // could be minted against an incomplete picture. Blocking the MINT is not
+    // blocking the run (round-45 gate, finding 6).
+    const mintIsSafe = summary.ok && summary.complete && !fetched.stale && clearedProbeOk && quarantined.length === 0;
     if (dependencies.mintFromQbo && !mintIsSafe) {
         summary.minted = null;
         summary.mintSkipped = fetched.stale
             ? "stale-fetch"
-            : conflicts.length > 0
-                ? "conflicts"
+            : quarantined.length > 0
+                ? "quarantined"
                 : !clearedProbeOk
                     ? "cleared-probe-failed"
                     : summary.ok
@@ -1313,6 +1398,14 @@ export async function runBankRegisterPull(
             ? advanceScanBoundary(dependencies.windowState.highWater, endDate, lines)
             : dependencies.windowState.highWater;
         summary.highWater = highWater;
+        /**
+         * Unresolved same-identity groups inside THIS run's window block the
+         * freshness stamp without making the run incomplete — which is exactly
+         * why they need recording (round-45 gate, finding 4). Stale ones, from
+         * before the window, are deliberately not a blocker and so not an
+         * obligation either.
+         */
+        const windowAmbiguous = (summary.reconciled?.ambiguous?.length ?? 0) > 0;
         try {
             await dependencies.saveWindowState({
                 mintRemainingCursor: summary.minted?.remainingCursor ?? null,
@@ -1327,11 +1420,29 @@ export async function runBankRegisterPull(
                 // AND THE PLAIN FACT THAT THIS RUN DID NOT FINISH. Written on
                 // every save, so the flag can never outlive the state it
                 // describes; false the moment a run completes the picture.
-                continuationPending: !summary.complete && clearedProbeOk,
+                /**
+                 * ONE WRITE, INCLUDING THE AMBIGUITY DECISION (round-45 gate,
+                 * finding 4).
+                 *
+                 * Round 43 recorded the ambiguity obligation in a SECOND write,
+                 * from the route, after this save had already stored
+                 * `continuationPending: false`. A crash in between left the
+                 * freshness stamp withheld — correctly, ambiguity blocks it —
+                 * and no obligation to come back for it, so every later slot
+                 * answered "nothing-in-progress" and the clock stayed put until
+                 * the next day's full pull happened to run.
+                 *
+                 * The decision is made HERE, where the reconcile result already
+                 * is, so the obligation and the state that implies it commit
+                 * together or not at all.
+                 */
+                continuationPending: (!summary.complete && clearedProbeOk) || windowAmbiguous,
                 // Set alongside the flag, so the two can never disagree. The
-                // route widens both when this run was complete but could not
-                // stamp (round-43 gate, finding 5).
-                continuationReason: !summary.complete && clearedProbeOk ? "incomplete" : null,
+                // specific reason wins: "we could not finish" and "we finished
+                // but nobody can certify it" need different continuations.
+                continuationReason: windowAmbiguous
+                    ? "ambiguity"
+                    : (!summary.complete && clearedProbeOk ? "incomplete" : null),
                 // CARRIED, NEVER CLEARED HERE (round-37 gate, finding 2). An
                 // owed freshness stamp is discharged by the write that commits
                 // the marker, in that write's own transaction; a save that

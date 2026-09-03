@@ -262,6 +262,10 @@
       "forced": false
     },
     {
+      "name": "ReceiptRequestCardDelivery",
+      "forced": false
+    },
+    {
       "name": "RefundEvent",
       "forced": false
     },

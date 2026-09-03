@@ -1172,33 +1172,42 @@ export async function GET(request: Request) {
         const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });
 
         if (result.kind === "rejected") {
-            // Chat provably did NOT take it: nothing is in the space. Back to
-            // PENDING with the claim released, so the retry pass can send it.
-            await prisma.receiptRequestCard.updateMany({
-                where: { id: rowId, claimToken: token },
-                data: {
-                    status: "PENDING",
-                    attempts: { increment: 1 },
-                    lastError: `rejected:${result.reason}`,
-                    // THE ONLY PLACE THE DAY IS GIVEN BACK (round-43 gate,
-                    // finding 1). Chat provably did not take it, so nothing is
-                    // in the space and this owner's day is genuinely still
-                    // free. Every other outcome — posted, or uncertain — keeps
-                    // the claim. The immutable delivery row is retracted in the
-                    // same breath, below: this is the one path allowed to
-                    // delete one, because it is the one path that can prove
-                    // nothing was sent.
-                    deliveredOn: null,
-                    claimedAt: null,
-                    claimToken: null,
-                },
-            });
-            // AND RETRACT THE RESERVATION. Chat provably did not take this
-            // message, so the day is genuinely free and holding it would burn
-            // the owner's only slot on a message nobody received. Deleting a
-            // delivery row is legal here and nowhere else.
-            await prisma.receiptRequestCardDelivery.deleteMany({
-                where: { owner: card.owner, deliveryDay: date },
+            /**
+             * ONE TRANSACTION FOR BOTH WRITES (round-45 gate, finding 7).
+             *
+             * Chat provably did NOT take it: nothing is in the space. The card
+             * goes back to PENDING and the reservation is retracted — and those
+             * two facts have to land together. Separately, a failure in between
+             * left the card sendable while its delivery row still held the
+             * owner's only slot for the day, so the retry pass would take the
+             * card, lose the reservation, and defer: the owner's day burnt on a
+             * message nobody received.
+             *
+             * Fenced on the claim token, like every other write in this loop,
+             * so a run that lost ownership mid-flight changes nothing.
+             */
+            await prisma.$transaction(async tx => {
+                const released = await tx.receiptRequestCard.updateMany({
+                    where: { id: rowId, claimToken: token },
+                    data: {
+                        status: "PENDING",
+                        attempts: { increment: 1 },
+                        lastError: `rejected:${result.reason}`,
+                        // THE ONLY PLACE THE DAY IS GIVEN BACK (round-43 gate,
+                        // finding 1). Every other outcome — posted, or
+                        // uncertain — keeps the claim.
+                        deliveredOn: null,
+                        claimedAt: null,
+                        claimToken: null,
+                    },
+                });
+                // Only if this run still owned the card. Deleting a delivery
+                // row on the strength of a CAS that matched nothing would
+                // retract somebody else's reservation.
+                if (released.count === 0) return;
+                await tx.receiptRequestCardDelivery.deleteMany({
+                    where: { owner: card.owner, deliveryDay: date },
+                });
             });
             failures.push(card.owner);
             continue;

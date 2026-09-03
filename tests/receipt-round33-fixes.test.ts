@@ -447,13 +447,22 @@ test("the continuation is scheduled, bounded, and stops before the chaser", () =
     assert.equal(at("/api/cron/bank-register-pull"), "0 2 * * *");
     const resume = at("/api/cron/bank-register-pull?continue=1");
     assert.ok(resume, "the pull needs a continuation slot, exactly as the chaser has one");
-    assert.equal(resume, "*/15 2-12 * * *");
+    // OFFSET off the hour (round-45 gate, finding 2): `*/15` fired at 02:00,
+    // the same minute as the full pull it was meant to continue.
+    assert.equal(resume, "5-59/15 2-12 * * *");
 
     // The ordering the whole design rests on, asserted rather than assumed: the
     // last continuation lands before the 13:00 sweep, and there are enough of
     // them for a real backlog to drain.
     const [minutes, hours] = (resume as string).split(" ");
-    assert.equal(minutes, "*/15");
+    assert.equal(minutes, "5-59/15");
+    // Still four slots an hour — :05, :20, :35, :50 — just none of them on the
+    // hour, where the full pull runs.
+    assert.deepEqual(
+        [5, 20, 35, 50].filter(m => m >= 5 && (m - 5) % 15 === 0),
+        [5, 20, 35, 50],
+        "four offset slots per hour",
+    );
     const [firstHour, lastHour] = hours.split("-").map(Number);
     assert.equal(firstHour, 2, "it starts with the nightly pull");
     assert.ok(lastHour < 13, "and every slot lands before the 13:00 chaser");

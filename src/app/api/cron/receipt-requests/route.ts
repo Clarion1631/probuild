@@ -598,6 +598,123 @@ class CursorWriteError extends Error {
     }
 }
 
+/**
+ * THE CYCLE RECORD (Codex PR #443 gate round 45, finding 1).
+ *
+ * Round 44 put both epochs on the cursors. That is still not enough, because a
+ * cursor is CLEARED the moment its pass completes: an invocation that finishes
+ * the open-issue pass writes `null` there, and a line pass that exhausts writes
+ * `null` too. A continuation then finds no cursor to validate, captures a FRESH
+ * pair of epochs, skips the open-issue pass because the phase says "lines", and
+ * certifies a cycle whose earlier passes were measured against a world that has
+ * since moved. The epochs were attached to the wrong thing: they describe the
+ * CYCLE, not a position within it.
+ *
+ * So they live in a record of their own, written when a cycle starts and
+ * untouched until the next one starts. It outlives every cursor.
+ *
+ * Stored as JSON in one AutomationSetting row: `{ id, epoch, evidenceEpoch }`.
+ * A row that is missing, empty, or unparseable reads as "no cycle", which
+ * starts one — the safe direction, and what every database looks like the first
+ * time this ships.
+ */
+const CYCLE_KEY = "receiptRequestsCycle";
+
+export interface SweepCycle {
+    /** Identifies the cycle in logs; never compared for correctness. */
+    id: string;
+    epoch: string;
+    evidenceEpoch: string;
+}
+
+export function parseSweepCycle(value: string | null): SweepCycle | null {
+    if (!value) return null;
+    try {
+        const parsed = JSON.parse(value) as Partial<SweepCycle>;
+        if (typeof parsed?.id !== "string" || !parsed.id) return null;
+        if (typeof parsed.epoch !== "string" || !parsed.epoch) return null;
+        if (typeof parsed.evidenceEpoch !== "string" || !parsed.evidenceEpoch) return null;
+        return { id: parsed.id, epoch: parsed.epoch, evidenceEpoch: parsed.evidenceEpoch };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Is the world still the one this cycle started against?
+ *
+ * A null cycle is NOT usable: it means nothing recorded what this cycle was
+ * measured against, and a continuation cannot certify on a guarantee nobody
+ * wrote down.
+ */
+export function cycleStillValid(cycle: SweepCycle | null, epoch: string, evidenceEpoch: string): boolean {
+    return cycle !== null && cycle.epoch === epoch && cycle.evidenceEpoch === evidenceEpoch;
+}
+
+async function readCycle(): Promise<SweepCycle | null> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: CYCLE_KEY } });
+        return parseSweepCycle(row?.value ?? null);
+    } catch {
+        return null;
+    }
+}
+
+async function writeCycle(cycle: SweepCycle | null): Promise<void> {
+    const value = cycle ? JSON.stringify(cycle) : "";
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: CYCLE_KEY },
+            update: { value },
+            create: { key: CYCLE_KEY, value },
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "UnknownError";
+        console.error("[cron/receipt-requests] cycle write failed", message);
+        throw new CursorWriteError(message);
+    }
+}
+
+/**
+ * THE FULL RUN'S DURABLE INTENT (round-45 gate, finding 2).
+ *
+ * The 13:00 full run and a continuation could fire in the same minute, and the
+ * continuation could win the lease — so the full run returned
+ * `already-running`, having cleared nothing, and the day's cycle never
+ * restarted. Offsetting the schedule to :05/:20/:35/:50 removes the collision;
+ * this removes the RACE, which a schedule cannot.
+ *
+ * The full run records the intent BEFORE it tries for the lease. Whoever runs
+ * next honours it: a continuation that finds the flag does the full run's work
+ * — clear the cursors, start a new cycle from the open-issue pass — instead of
+ * resuming. The flag is cleared only by the invocation that acts on it, so
+ * losing the lease costs a few minutes rather than a day.
+ */
+const FULL_RUN_REQUESTED_KEY = "receiptRequestsFullRunRequested";
+
+async function readFullRunRequested(): Promise<boolean> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: FULL_RUN_REQUESTED_KEY } });
+        return !!row?.value;
+    } catch {
+        return false;
+    }
+}
+
+async function writeFullRunRequested(value: string | null): Promise<void> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: FULL_RUN_REQUESTED_KEY },
+            update: { value: value ?? "" },
+            create: { key: FULL_RUN_REQUESTED_KEY, value: value ?? "" },
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "UnknownError";
+        console.error("[cron/receipt-requests] full-run flag write failed", message);
+        throw new CursorWriteError(message);
+    }
+}
+
 async function readOpenCursor(): Promise<string | null> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: OPEN_CURSOR_KEY } });
@@ -1691,6 +1808,11 @@ export async function GET(request: Request) {
     // day. Checked BEFORE the lease so a resume pass with nothing to do cannot
     // even briefly block the real run.
     const continueOnly = new URL(request.url).searchParams.get("continue") === "1";
+    // THE INTENT IS RECORDED BEFORE THE LEASE IS SOUGHT (round-45 gate, finding
+    // 2). A full run that loses the lease to a continuation used to return
+    // `already-running` having cleared nothing; now the next invocation picks
+    // the work up.
+    if (!continueOnly) await writeFullRunRequested(now.toISOString());
     let resumePhase: SweepPhase = "open-issues";
     if (continueOnly) {
         // THE PHASE, plus both cursors. The sweep has two independent passes
@@ -1700,8 +1822,12 @@ export async function GET(request: Request) {
         // Even both cursors are not enough: each is cleared the instant its pass
         // completes, so a run that finished the open-issue pass and then ran out
         // of budget parked NEITHER, and the line pass never resumed.
-        const [phase, lineCursor, openCursor] = await Promise.all([readPhase(), readCursor(), readOpenCursor()]);
-        if (!shouldResumeSweep(phase, lineCursor, openCursor)) {
+        const [phase, lineCursor, openCursor, fullRunOwed] = await Promise.all([
+            readPhase(), readCursor(), readOpenCursor(), readFullRunRequested(),
+        ]);
+        // An owed full run is work in progress even when no cursor is parked —
+        // it is the reason this pass must not exit early (round-45, finding 2).
+        if (!fullRunOwed && !shouldResumeSweep(phase, lineCursor, openCursor)) {
             return NextResponse.json({ ok: true, skipped: "nothing-in-progress" });
         }
         resumePhase = phase === "done" ? "open-issues" : phase;
@@ -1721,10 +1847,20 @@ export async function GET(request: Request) {
          * out components the fresh run was supposed to judge. A fresh cycle
          * means fresh everywhere: the cursors are cleared before the read.
          */
-        if (!continueOnly) {
-            await Promise.all([writeCursor(null), writeOpenCursor(null)]);
+        /**
+         * A CONTINUATION THAT FINDS A PENDING FULL RUN BECOMES ONE (round-45
+         * gate, finding 2). The 13:00 run records its intent before reaching
+         * for the lease, so losing that race costs one continuation slot
+         * instead of the whole day's cycle.
+         */
+        const fullRunOwed = continueOnly && await readFullRunRequested();
+        if (!continueOnly || fullRunOwed) {
+            await Promise.all([writeCursor(null), writeOpenCursor(null), writeCycle(null)]);
+            // Cleared by the invocation that ACTS on it, never by the one that
+            // merely saw it.
+            await writeFullRunRequested(null);
         }
-        return await runSweep(now, continueOnly ? resumePhase : "open-issues");
+        return await runSweep(now, (!continueOnly || fullRunOwed) ? "open-issues" : resumePhase);
     } catch (error) {
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
         // note in the log. Whatever this run committed stays committed, but the
@@ -1776,21 +1912,45 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
      * cannot reach.
      */
     let effectiveStartPhase = startPhase;
-    if (startPhase === "lines" || (await readOpenCursor()) !== null) {
-        const stored = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
+    let cycle = await readCycle();
+    if (startPhase === "lines" || cycle !== null) {
+        /**
+         * THE CYCLE RECORD IS WHAT IS CHECKED, NOT THE CURSORS (round-45 gate,
+         * finding 1). A cursor is cleared the moment its pass completes, so a
+         * continuation could find nothing to validate, take a fresh snapshot,
+         * skip the open-issue pass and certify a cycle whose earlier passes
+         * were measured against a world that had moved. The record outlives
+         * every cursor, which is the whole point of it.
+         *
+         * The cursors are still checked too: they are a second, narrower
+         * statement about the same thing, and a disagreement either way
+         * restarts.
+         */
+        const storedCursors = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
             .filter(cursor => cursor.key !== null);
-        const stale = stored.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
+        const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch)
+            || storedCursors.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
         if (stale) {
-            console.log("[cron/receipt-requests] ledger or evidence moved between invocations; restarting the cycle", {
+            console.log("[cron/receipt-requests] ledger or evidence moved under the cycle; restarting it", {
                 snapshotEpoch,
                 snapshotEvidenceEpoch,
-                stored: stored.map(cursor => ({ epoch: cursor.epoch, evidenceEpoch: cursor.evidenceEpoch })),
+                cycle,
+                cursors: storedCursors.map(cursor => ({ epoch: cursor.epoch, evidenceEpoch: cursor.evidenceEpoch })),
             });
             await Promise.all([writeCursor(null), writeOpenCursor(null)]);
             effectiveStartPhase = "open-issues";
+            cycle = null;
         }
     }
     startPhase = effectiveStartPhase;
+
+    // A cycle starting — fresh run, or a restart above — records what it is
+    // being measured against, once, and nothing touches it again until the
+    // next one starts.
+    if (cycle === null) {
+        cycle = { id: randomUUID(), epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch };
+        await writeCycle(cycle);
+    }
 
     // The cycle is unfinished from here until the line pass exhausts.
     if (startPhase !== "lines") await writePhase("open-issues");

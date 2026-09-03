@@ -31,7 +31,10 @@
 // EXISTS plus a guarded constraint add. Safe to re-run; a second run reports
 // every statement "ok" and changes nothing. No existing row is modified.
 //
-//   node scripts/apply-phase2-receipt-queue.mjs --yes --expect-db <name> --expect-host <host>
+//   node scripts/apply-phase2-receipt-queue.mjs --target prod --yes --expect-db <name> --expect-host <host>
+//
+// --target prod is MANDATORY and is the only accepted value: the URL then
+// comes from .env.production.local and an ambient DATABASE_URL is ignored.
 //
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
@@ -48,6 +51,67 @@ export function resolveDatabaseUrl() {
         if (match) return { url: match[1], from: file };
     }
     throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
+}
+
+/**
+ * WHICH DATABASE IS THIS? PROVE IT (Codex cross-PR finding, found on P5).
+ *
+ * The old resolution read `process.env.DATABASE_URL` first. A developer with a
+ * local database exported in their shell — or a `.env` loaded by something
+ * else — could run this script, watch every statement report "ok", and merge
+ * believing production had been migrated. It had not. The failure is silent by
+ * construction: the script's own output looked identical either way.
+ *
+ * So the target is not inferred at all. `--target prod` is mandatory, the URL
+ * comes from `.env.production.local` and NOWHERE else, and an ambient
+ * `DATABASE_URL` is deliberately ignored rather than preferred.
+ */
+export const PROD_ENV_FILE = ".env.production.local";
+
+/** The migration every production database carries, and no other database does. */
+export const PROD_BASELINE_MIGRATION = "20260814000000_baseline_production";
+
+/**
+ * The production URL, from the production env file only.
+ *
+ * Exported for tests. Takes the filesystem as an argument so a test can prove
+ * the ambient environment is ignored without writing to disk.
+ */
+export function resolveProdDatabaseUrl(readFile = path => fs.readFileSync(path, "utf8"),
+                                       exists = path => fs.existsSync(path)) {
+    if (!exists(PROD_ENV_FILE)) {
+        throw new Error(
+            `${PROD_ENV_FILE} not found. Run \`vercel env pull ${PROD_ENV_FILE} --environment=production\` first. `
+            + "The production URL is never taken from the environment: an ambient DATABASE_URL is exactly how "
+            + "a local database gets migrated instead of production.",
+        );
+    }
+    const match = readFile(PROD_ENV_FILE).match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+    if (!match) throw new Error(`DATABASE_URL not found in ${PROD_ENV_FILE}`);
+    return { url: match[1], from: PROD_ENV_FILE };
+}
+
+/**
+ * A target line with NO credentials in it at all.
+ *
+ * `maskUrl` only replaces the password, which still prints the username and
+ * leaves the whole query string — including any credential-bearing parameter —
+ * in the terminal and in whatever transcript is recording it. This prints the
+ * three things a human needs to confirm the target and nothing else.
+ */
+export function redactTarget(url) {
+    try {
+        const parsed = new URL(url);
+        const db = parsed.pathname.replace(/^\//, "") || "(none)";
+        return `host=${parsed.hostname} port=${parsed.port || "(default)"} db=${db}`;
+    } catch {
+        return "host=(unparseable) port=(unparseable) db=(unparseable)";
+    }
+}
+
+/** Does this host look like the Supabase pooler production runs on? */
+export function isProductionPoolerHost(host) {
+    return /(^|\.)pooler\.supabase\.com$/i.test(String(host ?? ""));
 }
 
 export function maskUrl(url) {
@@ -284,6 +348,17 @@ export const statements = [
        ON "ReceiptRequestCardDelivery"("owner", "deliveryDay")`,
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_cardId_idx"
        ON "ReceiptRequestCardDelivery"("cardId")`,
+    // BACKFILL THE EXISTING CLAIMS (round-45 gate, finding 5). Rows already
+    // carrying `deliveredOn` were delivered before this table existed; without
+    // them a legacy same-day UNCERTAIN -> PENDING resend finds the table empty
+    // and posts a second message. Idempotent BY DERIVED KEY: the id is computed
+    // from (owner, deliveredOn), so a re-run computes the same ids and writes
+    // nothing. A fresh uuid would duplicate on every run while reporting "ok".
+    `INSERT INTO "ReceiptRequestCardDelivery" ("id", "owner", "deliveryDay", "cardId", "createdAt")
+     SELECT md5('rrcd:' || "owner" || ':' || "deliveredOn"), "owner", "deliveredOn", "id", COALESCE("postedAt", CURRENT_TIMESTAMP)
+       FROM "ReceiptRequestCard"
+      WHERE "deliveredOn" IS NOT NULL
+     ON CONFLICT ("owner", "deliveryDay") DO NOTHING`,
     `CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
        "id"         TEXT NOT NULL,
        "pdfId"      TEXT NOT NULL,
@@ -497,6 +572,19 @@ const expectedUniqueIndexes = [{
 }];
 
 async function main() {
+    /**
+     * FLAGS ARE READ HERE, INSIDE main(), so the module stays inert on import
+     * (CLAUDE.md: importing an apply script once executed it against prod).
+     */
+    const target = readFlagValue("--target");
+    if (target !== "prod") {
+        console.error(
+            "Refusing to run without `--target prod`. This script has exactly one legitimate target, "
+            + "and naming it is how you prove you meant it — an ambient DATABASE_URL pointing at a local "
+            + "database used to be accepted silently, so every statement reported ok while production was untouched.",
+        );
+        process.exit(1);
+    }
     if (!process.argv.includes("--yes")) {
         console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
         process.exit(1);
@@ -508,8 +596,16 @@ async function main() {
         process.exit(1);
     }
 
-    const { url, from } = resolveDatabaseUrl();
-    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
+    // The production file, never the environment.
+    const { url, from } = resolveProdDatabaseUrl();
+    console.log(`TARGET (${from}): ${redactTarget(url)}`);
+    if (process.env.DATABASE_URL) {
+        console.log("note: an ambient DATABASE_URL is set and is being IGNORED — the target above is the one that will be written.");
+    }
+    if (!isProductionPoolerHost(new URL(url).hostname)) {
+        console.error(`REFUSING: ${from} points at ${redactTarget(url)}, which is not the production pooler host.`);
+        process.exit(1);
+    }
     const prisma = new PrismaClient({ datasources: { db: { url } } });
 
     try {
@@ -521,6 +617,30 @@ async function main() {
             console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
             process.exit(1);
         }
+
+        /**
+         * AND THE DATABASE ITSELF HAS TO AGREE IT IS PRODUCTION.
+         *
+         * `current_database()` is "postgres" on a local Postgres too, and the
+         * expect-host check compares whatever the operator typed. The baseline
+         * migration row is the one thing only production carries: it was marked
+         * applied there by a deliberate one-off step (#382) and no other
+         * database has it. A throwaway CI database built from
+         * prisma/migrations has the row too — which is correct, since that is
+         * the database CI is entitled to write.
+         */
+        const baseline = await prisma.$queryRawUnsafe(
+            `SELECT 1 FROM "_prisma_migrations" WHERE "migration_name" = $1 LIMIT 1`,
+            PROD_BASELINE_MIGRATION,
+        );
+        if (baseline.length === 0) {
+            console.error(
+                `REFUSING: this database has no "${PROD_BASELINE_MIGRATION}" row in _prisma_migrations, `
+                + "so it is not production and not a database built from this repo's migrations.",
+            );
+            process.exit(1);
+        }
+        console.log(`verified baseline migration "${PROD_BASELINE_MIGRATION}" is present`);
 
         for (const sql of statements) {
             const label = sql.replace(/\s+/g, " ").slice(0, 84);
@@ -609,6 +729,31 @@ async function main() {
             }
             console.log(`verified unique index ${name}`);
         }
+
+        /**
+         * THE BACKFILL ACTUALLY LANDED (round-45 gate, finding 5). A statement
+         * reporting "ok" says it ran, not that it copied anything — and a
+         * missing reservation is invisible until the day somebody gets asked
+         * twice. Every card carrying a `deliveredOn` must have a matching
+         * delivery row; more rows than that is fine and expected, because the
+         * cron writes new ones.
+         */
+        const [claims] = await prisma.$queryRawUnsafe(
+            `SELECT COUNT(*)::int AS n FROM "ReceiptRequestCard" WHERE "deliveredOn" IS NOT NULL`,
+        );
+        const [missing] = await prisma.$queryRawUnsafe(
+            `SELECT COUNT(*)::int AS n
+               FROM "ReceiptRequestCard" c
+              WHERE c."deliveredOn" IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM "ReceiptRequestCardDelivery" d
+                     WHERE d."owner" = c."owner" AND d."deliveryDay" = c."deliveredOn")`,
+        );
+        if (missing.n > 0) {
+            console.error(`VERIFY FAILED: ${missing.n} of ${claims.n} existing delivery claims have no ReceiptRequestCardDelivery row`);
+            process.exit(1);
+        }
+        console.log(`verified delivery backfill: ${claims.n} existing claim(s), 0 missing`);
 
         console.log("done.");
     } finally {

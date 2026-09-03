@@ -62,7 +62,7 @@
     },
     {
       "path": "/api/cron/bank-register-pull?continue=1",
-      "schedule": "*/15 2-12 * * *"
+      "schedule": "5-59/15 2-12 * * *"
     },
     {
       "path": "/api/cron/receipt-requests",
@@ -70,7 +70,7 @@
     },
     {
       "path": "/api/cron/receipt-requests?continue=1",
-      "schedule": "*/15 * * * *"
+      "schedule": "5-59/15 * * * *"
     },
     {
       "path": "/api/cron/receipt-request-cards",

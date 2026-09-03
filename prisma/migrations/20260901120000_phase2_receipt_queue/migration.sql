@@ -205,6 +205,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_owner_deliveryDay_
 CREATE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_cardId_idx"
   ON "ReceiptRequestCardDelivery"("cardId");
 
+-- BACKFILL THE EXISTING CLAIMS (round-45 gate, finding 5). Rows already
+-- carrying `deliveredOn` were delivered before this table existed; without
+-- them a legacy same-day UNCERTAIN -> PENDING resend finds the table empty and
+-- posts a second message. Idempotent BY DERIVED KEY: the id is computed from
+-- (owner, deliveredOn), so a re-run computes the same ids and ON CONFLICT
+-- writes nothing. A fresh uuid would insert a duplicate on every run while
+-- reporting "ok" — the silent drift the apply-script guard exists to catch.
+INSERT INTO "ReceiptRequestCardDelivery" ("id", "owner", "deliveryDay", "cardId", "createdAt")
+SELECT md5('rrcd:' || "owner" || ':' || "deliveredOn"), "owner", "deliveredOn", "id", COALESCE("postedAt", CURRENT_TIMESTAMP)
+  FROM "ReceiptRequestCard"
+ WHERE "deliveredOn" IS NOT NULL
+ON CONFLICT ("owner", "deliveryDay") DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
     "id" TEXT NOT NULL,
     "pdfId" TEXT NOT NULL,

@@ -7,6 +7,7 @@ import {
     ymdDaysAgo,
     type BankRegisterIngestLine,
     type BankRegisterRowLike,
+    MAX_SPLITS_PER_TXN,
 } from "../src/lib/bank-register-pull";
 
 // Fixture note: synthetic QBO General Ledger rows shaped like the ones
@@ -313,34 +314,106 @@ test("runBankRegisterPull: a reconcile failure FAILS the pull — unlinked obser
     assert.equal(summary.reconciled, null);
 });
 
-test("divergent repeats under one qbTxnId are a CONFLICT, never first-wins", async t => {
+test("divergent repeats under one qbTxnId are SPLITS, and they post", async t => {
+    /**
+     * Codex PR #443 gate round 45, finding 6. These used to be a fatal
+     * conflict: both rows dropped, `ok: false`, `complete: false` — and because
+     * the same transaction comes back on every pull, the high-water mark and
+     * the freshness stamp could never advance again. One legitimate two-split
+     * purchase stopped every owner's chase cards indefinitely.
+     */
     const divergent: BankRegisterRowLike[] = [
         { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", memo: null, amountCents: -12_345 },
         { date: "2026-08-12", qbType: "Expense", qbTxnId: "6625", docNum: null, name: "LOWES", memo: null, amountCents: -99_999 },
         { date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", memo: null, amountCents: -500 },
     ];
 
-    await t.test("neither sighting is posted — half a contradiction is still a guess", () => {
+    await t.test("each split gets its own durable identity, and nothing is dropped", () => {
         const result = convertRegisterRows(divergent);
-        assert.deepEqual(result.conflicts, ["6625"]);
-        assert.deepEqual(result.lines.map(l => l.qbTxnId), ["6610"]);
+        assert.deepEqual(result.quarantined, [], "a two-split purchase is not a quarantine");
+        assert.equal(result.split, 2, "both splits are observations");
+        assert.equal(result.lines.length, 3, "two splits plus the unrelated row");
+        assert.equal(result.lines.filter(l => l.qbTxnId.startsWith("6625#")).length, 2);
+        assert.deepEqual(result.lines.filter(l => l.qbTxnId === "6610").length, 1,
+            "a single-row transaction keeps its bare id — nothing already stored is orphaned");
         assert.equal(result.collapsed, 0, "a divergent repeat is not a collapse");
+        // Both amounts survive; neither is a guess between them.
+        assert.deepEqual(
+            result.lines.filter(l => l.qbTxnId.startsWith("6625#")).map(l => l.amountCents).sort((a, b) => a - b),
+            [-99_999, -12_345],
+        );
     });
 
-    await t.test("identical repeats still collapse and are NOT conflicts", () => {
+    await t.test("the identity is STABLE across runs, so re-ingesting is a no-op", () => {
+        const first = convertRegisterRows(divergent).lines.map(l => l.qbTxnId).sort();
+        // Same rows, different order from QBO.
+        const shuffled = [divergent[1], divergent[2], divergent[0]];
+        const second = convertRegisterRows(shuffled).lines.map(l => l.qbTxnId).sort();
+        assert.deepEqual(second, first, "the suffix comes from the content, not the arrival order");
+
+        /**
+         * AND SO IS THE EMITTED ORDER, which is a separate guarantee the
+         * content sort provides: the batches this fetch is chunked into are the
+         * same on a re-run, so a partial ingest resumes at the same boundary.
+         *
+         * (Measured: dropping the sort left the identity assertion above green,
+         * because identity never depended on it. This is the assertion that
+         * fails.)
+         */
+        assert.deepEqual(
+            convertRegisterRows(shuffled).lines.map(l => l.qbTxnId),
+            convertRegisterRows(divergent).lines.map(l => l.qbTxnId),
+            "the same rows produce the same sequence, whatever order they arrive in",
+        );
+    });
+
+    await t.test("identical repeats still collapse, and are not splits", () => {
         const result = convertRegisterRows(FIVE_ROW_FIXTURE);
-        assert.deepEqual(result.conflicts, []);
+        assert.deepEqual(result.quarantined, []);
+        assert.equal(result.split, 0);
         assert.equal(result.collapsed, 1);
     });
 
-    await t.test("the good rows still post, and the run fails with the ids", async () => {
+    await t.test("the run SUCCEEDS and every row lands", async () => {
         const store = fakeIngestStore();
         const summary = await runBankRegisterPull(pullDeps(store, divergent, []));
-        assert.equal(summary.ok, false);
-        assert.equal(summary.error, "qbo-duplicate-conflict");
-        assert.deepEqual(summary.conflictQbTxnIds, ["6625"]);
-        assert.equal(summary.inserted, 1, "the non-conflicting row is good evidence and still lands");
-        assert.equal(store.stored.has("6625"), false, "the contradicted id is stored by nobody");
+        assert.equal(summary.ok, true, "a multi-split purchase is not a failed run");
+        assert.equal(summary.error, undefined);
+        assert.equal(summary.quarantinedQbTxnIds, undefined);
+        assert.equal(summary.splitObservations, 2);
+        assert.equal(summary.inserted, 3, "both splits and the unrelated row");
+    });
+
+    await t.test("PRE-FIX CONTROL: treating divergence as a conflict blocks everything", async () => {
+        /**
+         * The old rule, applied to the same rows: drop every divergent id, fail
+         * the run. The pre-fix outcome is not just "two rows missing" — it is
+         * `complete: false` on every subsequent pull, which is what froze the
+         * freshness stamp and the cards.
+         */
+        const conflicted = new Set<string>();
+        const seen = new Map<string, number>();
+        for (const row of divergent) {
+            const id = row.qbTxnId ?? "";
+            const prior = seen.get(id);
+            if (prior !== undefined && prior !== row.amountCents) conflicted.add(id);
+            else seen.set(id, row.amountCents);
+        }
+        assert.deepEqual([...conflicted], ["6625"], "the old rule called this a contradiction");
+        assert.equal(convertRegisterRows(divergent).quarantined.length, 0, "the new rule calls it a purchase");
+    });
+
+    await t.test("a transaction claiming implausible splits IS quarantined, alone", () => {
+        const runaway: BankRegisterRowLike[] = [];
+        for (let i = 0; i <= MAX_SPLITS_PER_TXN; i++) {
+            runaway.push({ date: "2026-08-12", qbType: "Expense", qbTxnId: "9999", docNum: null, name: "X", memo: null, amountCents: -(i + 1) });
+        }
+        runaway.push({ date: "2026-08-11", qbType: "Expense", qbTxnId: "6610", docNum: null, name: "NAPA", memo: null, amountCents: -500 });
+
+        const result = convertRegisterRows(runaway);
+        assert.deepEqual(result.quarantined, ["9999"]);
+        assert.deepEqual(result.lines.map(l => l.qbTxnId), ["6610"],
+            "the unrelated row still posts — that is the difference between one bad transaction and a stopped pipeline");
     });
 });
 

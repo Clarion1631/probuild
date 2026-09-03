@@ -168,3 +168,45 @@ test("every local `evidence*` helper actually wraps its write in the lock", () =
     assert.deepEqual(unwrapped, [],
         `these helpers are named for the fence but do not take it: ${unwrapped.join(", ")}`);
 });
+
+test("no evidence write is issued on the prisma CLIENT — only inside a transaction", () => {
+    /**
+     * THE PER-FILE MARKER IS NOT ENOUGH, AGAIN (Codex PR #443 gate round 45,
+     * finding 3).
+     *
+     * `actions.ts` carries lock markers all over it, so the file counted as
+     * covered while `prisma.expense.deleteMany({ where: { estimateId } })` —
+     * the cascade from deleting an estimate — ran with no lock and no epoch
+     * bump at all. Four more writes were in the same shape across the expense
+     * routes, including one that edits `amount`, `vendor` and `date`: three of
+     * the exact fields the matcher pairs a charge on.
+     *
+     * The rule that catches all of them is structural rather than
+     * field-by-field: an evidence write issued on the `prisma` CLIENT can never
+     * be fenced, because `pg_advisory_xact_lock` is transaction-scoped and a
+     * bare client call is its own implicit transaction. So the receiver is the
+     * test. A `tx.` receiver is fine — it only exists inside a transaction the
+     * shared helpers opened and locked.
+     *
+     * Uniform across every field on purpose. A per-field rule would oblige
+     * every future edit to re-derive which columns the sweep happens to read,
+     * and the cost here is an advisory lock on a handful of rare admin actions.
+     */
+    const WRITE_VERBS = "create|createMany|update|updateMany|upsert|delete|deleteMany";
+    const offenders: string[] = [];
+    for (const file of walk(srcRoot)) {
+        if (file.endsWith("receipt-evidence-lock.ts")) continue;
+        const rel = relative(repoRoot, file);
+        const lines = readFileSync(file, "utf8").split("\n");
+        lines.forEach((line, index) => {
+            const trimmed = line.trim();
+            // Comments and doc prose quote these shapes deliberately.
+            if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return;
+            if (new RegExp(String.raw`\bprisma\.(receiptIntake|expense)\.(${WRITE_VERBS})\(`).test(line)) {
+                offenders.push(`${rel}:${index + 1}`);
+            }
+        });
+    }
+    assert.deepEqual(offenders, [],
+        `these evidence writes run on the client, so they cannot hold the xact lock: ${offenders.join(", ")}`);
+});

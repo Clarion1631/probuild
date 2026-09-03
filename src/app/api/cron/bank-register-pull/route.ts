@@ -771,25 +771,17 @@ async function runPull() {
         statePatch.continuationReason = "failed";
     }
     /**
-     * AMBIGUITY IS UNFINISHED WORK TOO (round-43 gate, finding 5).
+     * AMBIGUITY IS UNFINISHED WORK TOO (round-43 gate, finding 5) — and it is
+     * recorded by the state save inside `runBankRegisterPull`, not here
+     * (round-45 gate, finding 4).
      *
-     * A same-identity group inside this run's window that reconcile refused to
-     * guess at blocks the stamp — `stampWarranted` requires
-     * `ambiguousCount === 0` — but it does NOT make `summary.complete` false:
-     * the register was read, the rows are stored, the links this run could make
-     * were made. So the state save wrote `continuationPending: false`, every
-     * later slot answered "nothing-in-progress", and the freshness clock stayed
-     * where it was. A human could resolve the duplicate and nothing would come
-     * back to notice.
-     *
-     * Written AFTER the state save on purpose — this merge is what widens that
-     * save's answer, and it is the last write of the run, so it cannot be
-     * overwritten by the thing it is correcting.
+     * It used to be a SECOND write, applied after that save had already stored
+     * `continuationPending: false`. A crash in between left the freshness stamp
+     * withheld and nothing scheduled to come back for it, which is the exact
+     * state this obligation exists to prevent. The decision now commits with
+     * the state it describes; the only thing left here is the case that save
+     * never runs at all, below.
      */
-    if (summary.ok && ambiguousCount > 0) {
-        statePatch.continuationPending = true;
-        statePatch.continuationReason = "ambiguity";
-    }
     if (Object.keys(statePatch).length > 0) await mergeWindowState(statePatch);
 
     const status = stampFailed ? 503 : summary.ok ? 200 : 500;

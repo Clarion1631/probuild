@@ -15,7 +15,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { BANK_LINE_SOURCES_OF_RECORD, expectedColumns, statements, targetMatches } from "../scripts/apply-phase2-receipt-queue.mjs";
+import {
+    BANK_LINE_SOURCES_OF_RECORD,
+    PROD_BASELINE_MIGRATION,
+    PROD_ENV_FILE,
+    expectedColumns,
+    isProductionPoolerHost,
+    redactTarget,
+    resolveDatabaseUrl,
+    resolveProdDatabaseUrl,
+    statements,
+    targetMatches,
+} from "../scripts/apply-phase2-receipt-queue.mjs";
 
 const migrationSql = readFileSync(
     path.join(__dirname, "..", "prisma", "migrations", "20260901120000_phase2_receipt_queue", "migration.sql"),
@@ -87,7 +98,7 @@ test("both are additive and idempotent — a re-run must change nothing", () => 
             // fresh cuid would insert a duplicate on every run while reporting
             // "ok", which is the same silent-drift failure the constraint
             // convergence above exists to avoid.
-            || (/^INSERT INTO /i.test(s) && /ON CONFLICT DO NOTHING$/i.test(s) && /md5\(/i.test(s))
+            || (/^INSERT INTO /i.test(s) && /ON CONFLICT (?:\([^)]*\) )?DO NOTHING$/i.test(s) && /md5\(/i.test(s))
             // A REPAIR UPDATE is idempotent when its WHERE clause is the very
             // thing the update removes. The memo quarantine (round-36 gate,
             // finding 3) selects `memo-signed` issues with no artifact of their
@@ -340,4 +351,97 @@ test("the artifact table is verified by shape and carries RLS, like every other 
     const rls = `ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY`;
     assert.ok(statements.some(s => normalize(s) === normalize(rls)));
     assert.ok(normalizedMigration.includes(normalize(rls)));
+});
+
+// ── The script must PROVE which database it targets ────────────────────────
+
+test("the production URL comes from the production file, never the environment", () => {
+    /**
+     * Codex cross-PR finding (found on P5). Reading `process.env.DATABASE_URL`
+     * first let a developer with a local database exported in their shell run
+     * this script, watch every statement report "ok", and merge believing
+     * production had been migrated. The output was identical either way, which
+     * is what made it silent.
+     */
+    const files: Record<string, string> = {
+        [PROD_ENV_FILE]: 'DATABASE_URL="postgresql://u:p@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true"\n',
+    };
+    const resolved = resolveProdDatabaseUrl(
+        (path: string) => files[path],
+        (path: string) => path in files,
+    );
+    assert.equal(resolved.from, PROD_ENV_FILE);
+    assert.match(resolved.url, /pooler\.supabase\.com/);
+
+    // PRE-FIX CONTROL: the old resolver prefers whatever is in the environment,
+    // which is exactly the local database the finding is about.
+    const previous = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = "postgresql://u:p@localhost:5432/probuild_dev";
+    try {
+        assert.equal(resolveDatabaseUrl().from, "process.env.DATABASE_URL",
+            "the old path would have connected to localhost and reported success");
+    } finally {
+        if (previous === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = previous;
+    }
+});
+
+test("a missing production env file refuses, and says how to get one", () => {
+    assert.throws(
+        () => resolveProdDatabaseUrl(() => "", () => false),
+        /vercel env pull .*--environment=production/,
+    );
+});
+
+test("the target line carries NO credentials", () => {
+    const line = redactTarget("postgresql://someuser:sup3rsecret@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true");
+    assert.equal(line, "host=aws-0-us-west-2.pooler.supabase.com port=6543 db=postgres");
+    // Not "masked" — absent. `maskUrl` still prints the username and the whole
+    // query string, either of which can carry a credential.
+    for (const secret of ["someuser", "sup3rsecret", "pgbouncer"]) {
+        assert.equal(line.includes(secret), false, `${secret} must not reach the terminal`);
+    }
+    assert.doesNotThrow(() => redactTarget("not a url"));
+    assert.match(redactTarget("not a url"), /unparseable/);
+});
+
+test("only the production pooler host is accepted", () => {
+    assert.equal(isProductionPoolerHost("aws-0-us-west-2.pooler.supabase.com"), true);
+    assert.equal(isProductionPoolerHost("localhost"), false);
+    assert.equal(isProductionPoolerHost("db.ghzdbzdnwjxazvmcefbh.supabase.co"), false, "the direct host is not the pooler");
+    // A host that merely CONTAINS the pooler name must not pass.
+    assert.equal(isProductionPoolerHost("pooler.supabase.com.evil.test"), false);
+    assert.equal(isProductionPoolerHost(""), false);
+    assert.equal(isProductionPoolerHost(undefined), false);
+});
+
+test("the script refuses before any DDL when the target is not named", () => {
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+
+    // `--target prod` is checked FIRST, before --yes and before anything opens
+    // a connection — a refusal that happens after the first statement is not a
+    // refusal.
+    const targetAt = source.indexOf('if (target !== "prod") {');
+    const clientAt = source.indexOf("new PrismaClient(");
+    const firstStatementAt = source.indexOf("for (const sql of statements) {");
+    assert.ok(targetAt > 0 && clientAt > targetAt && firstStatementAt > clientAt,
+        "target check, then connect, then write");
+
+    // Flags are read inside main(), so importing the module still does nothing
+    // (CLAUDE.md: importing an apply script once executed it against prod).
+    const mainAt = source.indexOf("async function main() {");
+    assert.ok(mainAt > 0 && source.indexOf('readFlagValue("--target")') > mainAt);
+
+    // The ambient variable is ignored, and the run says so rather than
+    // silently preferring one or the other.
+    assert.match(source, /an ambient DATABASE_URL is set and is being IGNORED/);
+    assert.match(source, /const \{ url, from \} = resolveProdDatabaseUrl\(\);/);
+    assert.doesNotMatch(source, /const \{ url, from \} = resolveDatabaseUrl\(\);/);
+
+    // And the database must itself agree it is production.
+    assert.match(source, /PROD_BASELINE_MIGRATION/);
+    assert.equal(PROD_BASELINE_MIGRATION, "20260814000000_baseline_production");
+    const baselineAt = source.indexOf('FROM "_prisma_migrations" WHERE "migration_name" = $1');
+    assert.ok(baselineAt > clientAt && baselineAt < firstStatementAt,
+        "the baseline check runs after connecting and before the first write");
 });

@@ -503,14 +503,23 @@ test("?continue=1 only resumes; with no cursor it exits immediately", () => {
         crons: Array<{ path: string; schedule: string }>;
     };
     assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests")?.schedule, "0 13 * * *");
-    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "*/15 * * * *");
+    // OFFSET off the hour (round-45 gate, finding 2): `*/15` fired at :00,
+    // which is the same minute as the 13:00 full run — and the continuation
+    // could win the lease, so the full run returned `already-running` having
+    // cleared nothing and the day's cycle never restarted.
+    assert.equal(vercel.crons.find(c => c.path === "/api/cron/receipt-requests?continue=1")?.schedule, "5-59/15 * * * *");
+    const fullRun = vercel.crons.find((c: { path: string }) => c.path === "/api/cron/receipt-requests")?.schedule as string;
+    const fullRunMinute = Number(fullRun.split(" ")[0]);
+    assert.equal(fullRunMinute, 0);
+    assert.equal([5, 20, 35, 50].includes(fullRunMinute), false,
+        "the continuation never fires in the same minute as the full run");
 });
 
 test("reconciliation always runs; minting needs a fresh, conflict-free pull", () => {
     const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
     // No early return that would skip the backlog on an empty fetch.
     assert.doesNotMatch(lib, /if \(lines\.length === 0\) return summary;/);
-    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && clearedProbeOk && conflicts\.length === 0;/);
+    assert.match(lib, /const mintIsSafe = summary\.ok && summary\.complete && !fetched\.stale && clearedProbeOk && quarantined\.length === 0;/);
     assert.match(lib, /summary\.mintSkipped = fetched\.stale\s*\n\s*\? "stale-fetch"/);
     // A truncated window has its own reason, distinct from a failed ingest.
     assert.match(lib, /\? "incomplete-window"/);
@@ -568,7 +577,7 @@ test("an ACTIVE claim on a POSTING row is honoured; only an EXPIRED one goes UNC
 
 test("only a REJECTED send returns to PENDING; UNKNOWN is never auto-retried", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    assert.match(source, /if \(result\.kind === "rejected"\) \{[\s\S]{0,600}status: "PENDING"/);
+    assert.match(source, /if \(result\.kind === "rejected"\) \{[\s\S]{0,1400}status: "PENDING"/);
     assert.match(source, /if \(result\.kind === "unknown"\) \{[\s\S]{0,700}status: "UNCERTAIN"/);
     // An unknown outcome must never be handed back to the retry pass.
     const unknownAt = source.indexOf('if (result.kind === "unknown")');
@@ -609,7 +618,9 @@ test("a cursor write failure is a 500, never ok:true", () => {
     assert.match(source, /error: "cursor-write-failed"/);
     // Every checkpoint fails the same way.
     const throws = source.match(/throw new CursorWriteError\(message\);/g) ?? [];
-    assert.equal(throws.length, 3, "the line cursor, the open-issue cursor, and the phase");
+    assert.equal(throws.length, 5,
+        "the line cursor, the open-issue cursor, the phase, the cycle record and the full-run flag — "
+        + "a checkpoint that cannot persist must never report ok:true, whichever one it is");
 });
 
 test("the bank pull plans its window from a persisted high-water mark", () => {
@@ -664,10 +675,16 @@ test("?continue=1 and moreToProcess consult BOTH cursors", () => {
     // about the line cursor made a half-finished OPEN-ISSUE pass look like
     // nothing in progress.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(source, /const \[phase, lineCursor, openCursor\] = await Promise\.all\(\[readPhase\(\), readCursor\(\), readOpenCursor\(\)\]\);/);
+    // Widened in round 45 (finding 2): an OWED FULL RUN is work in progress
+    // too, even with no cursor parked — otherwise a 13:00 run that lost the
+    // lease to a continuation would never be picked up.
+    assert.match(source, /const \[phase, lineCursor, openCursor, fullRunOwed\] = await Promise\.all\(\[/);
+    assert.match(source, /readPhase\(\), readCursor\(\), readOpenCursor\(\), readFullRunRequested\(\),/);
     // ...and the PHASE, because each cursor is cleared the moment its pass
     // finishes, so a cycle can be unfinished with neither one parked.
-    assert.match(source, /if \(!shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
+    // An OWED FULL RUN keeps this pass alive even with no cursor parked
+    // (round-45 gate, finding 2).
+    assert.match(source, /if \(!fullRunOwed && !shouldResumeSweep\(phase, lineCursor, openCursor\)\)/);
     assert.match(source, /moreToProcess: !exhausted \|\| !openExhausted/);
 });
 

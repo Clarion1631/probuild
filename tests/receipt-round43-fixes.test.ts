@@ -65,11 +65,16 @@ test("only a DEFINITE rejection gives the day back", () => {
         /lastError: `rejected:\$\{result\.reason\}`,[\s\S]{0,900}?deliveredOn: null,/,
         "Chat provably did not take it, so the owner's day is genuinely free",
     );
+    // Retracted in the SAME TRANSACTION as the return to PENDING (round-45
+    // gate, finding 7) — separately, a failure between them left the card
+    // sendable while its reservation still held the owner's only slot.
     assert.match(
         cards,
-        /await prisma\.receiptRequestCardDelivery\.deleteMany\([\s\S]{0,200}?deliveryDay: date/,
-        "and the reservation is retracted with it",
+        /await prisma\.\$transaction\(async tx => \{\s*\n\s*const released = await tx\.receiptRequestCard\.updateMany\([\s\S]{0,1400}?tx\.receiptRequestCardDelivery\.deleteMany\([\s\S]{0,200}?deliveryDay: date/,
+        "and the reservation is retracted with it, atomically",
     );
+    assert.match(cards, /if \(released\.count === 0\) return;/,
+        "and only when this run still owned the card");
     assert.equal((cards.match(/receiptRequestCardDelivery\.deleteMany/g) ?? []).length, 1,
         "exactly one path may delete a delivery record");
 
@@ -231,8 +236,11 @@ test("a continuation whose stored epochs disagree restarts from the open-issue p
     // Both cursors are read, both are checked against BOTH epochs, and a
     // mismatch discards both and forces the open-issue pass — the only pass
     // that re-checks an issue the 60-day line window cannot even see.
-    assert.match(sweep, /const stale = stored\.some\(cursor => !cursorUsableAt\(cursor, snapshotEpoch, snapshotEvidenceEpoch\)\);/);
-    const staleAt = sweep.indexOf("const stale = stored.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));");
+    // Widened in round 45 (finding 1): the CYCLE RECORD is checked as well as
+    // the cursors, because a cursor is cleared the moment its pass completes.
+    assert.match(sweep, /const stale = !cycleStillValid\(cycle, snapshotEpoch, snapshotEvidenceEpoch\)/);
+    assert.match(sweep, /\|\| storedCursors\.some\(cursor => !cursorUsableAt\(cursor, snapshotEpoch, snapshotEvidenceEpoch\)\)/);
+    const staleAt = sweep.indexOf("const stale = !cycleStillValid(cycle, snapshotEpoch, snapshotEvidenceEpoch)");
     const clearAt = sweep.indexOf("await Promise.all([writeCursor(null), writeOpenCursor(null)]);", staleAt);
     const restartAt = sweep.indexOf('effectiveStartPhase = "open-issues";', clearAt);
     assert.ok(staleAt > 0 && clearAt > staleAt && restartAt > clearAt,
@@ -307,21 +315,28 @@ test("an unresolved ambiguity is unfinished work the resume pass can see", () =>
 
 test("a complete run blocked ONLY by ambiguity still schedules its continuation", () => {
     const route = read("src/app/api/cron/bank-register-pull/route.ts");
+    const lib = read("src/lib/bank-register-pull.ts");
 
     // The stamp is blocked...
     assert.match(route, /const stampWarranted = summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0/);
     // ...and the obligation is written down, which is what was missing: this
     // run IS complete, so the state save wrote continuationPending: false.
-    assert.match(
-        route,
-        /if \(summary\.ok && ambiguousCount > 0\) \{\s*\n\s*statePatch\.continuationPending = true;\s*\n\s*statePatch\.continuationReason = "ambiguity";/,
-    );
+    // ONE WRITE since round 45 (finding 4): the decision is made where the
+    // reconcile result already is, so the obligation and the state that implies
+    // it commit together. A crash between two writes used to leave the stamp
+    // withheld with nothing scheduled to come back for it.
+    assert.match(lib, /const windowAmbiguous = \(summary\.reconciled\?\.ambiguous\?\.length \?\? 0\) > 0;/);
+    assert.match(lib, /continuationPending: \(!summary\.complete && clearedProbeOk\) \|\| windowAmbiguous,/);
+    assert.doesNotMatch(route, /statePatch\.continuationReason = "ambiguity"/,
+        "the second write is gone");
 
     // PRE-FIX CONTROL: the save inside the pull keys the flag on `complete`
     // alone, which an ambiguity-blocked run satisfies. That is why the widening
     // has to happen in the route, AFTER that save.
-    const lib = read("src/lib/bank-register-pull.ts");
-    assert.match(lib, /continuationPending: !summary\.complete && clearedProbeOk,/);
+    // PRE-FIX CONTROL: the round-43 shape keyed the flag on `complete` alone,
+    // which an ambiguity-blocked run satisfies — that is why the obligation was
+    // added by a second write, and why a crash between the two lost it.
+    assert.doesNotMatch(lib, /continuationPending: !summary\.complete && clearedProbeOk,/);
     const saveAt = route.indexOf("const statePatch: Record<string, unknown> = {};");
     const pullAt = route.indexOf("const summary = await runBankRegisterPull(");
     assert.ok(pullAt > 0 && saveAt > pullAt, "the merge is the run's LAST write, so it cannot be overwritten");
@@ -356,7 +371,11 @@ test("migration, apply script and schema describe the SAME index", () => {
 
     assert.match(schema, /@@unique\(\[owner, deliveredOn\]\)/);
     for (const [name, source] of [["migration", migration], ["apply script", apply]] as const) {
-        assert.match(source, /CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"/, name);
-        assert.doesNotMatch(source, /WHERE "deliveredOn" IS NOT NULL/, `${name} must not be partial`);
+        const create = /CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"[^;`]*/.exec(source);
+        assert.ok(create, `${name} creates the index`);
+        // Scoped to the CREATE INDEX statement, not the whole file: the
+        // round-45 backfill legitimately selects `WHERE "deliveredOn" IS NOT
+        // NULL`, and a file-wide assertion would read that as a partial index.
+        assert.doesNotMatch(create[0], /WHERE/, `${name}'s index must not be partial`);
     }
 });

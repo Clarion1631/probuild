@@ -396,5 +396,8 @@ test("a resume already past the open pass does not redo it", () => {
     // between "the ledger has not moved" and "this cycle is done".
     assert.match(source, /await ops\.writePhase\(\s*decision\.phase,\s*decision\.complete \? input\.now\.toISOString\(\) : undefined,\s*decision\.blockedReason,\s*\);/);
     // A scheduled (non-resume) run always starts a fresh cycle.
-    assert.match(source, /runSweep\(now, continueOnly \? resumePhase : "open-issues"\)/);
+    // Widened in round 45 (finding 2): a continuation that finds an owed full
+    // run performs it, rather than resuming into a cycle the full run was
+    // about to restart.
+    assert.match(source, /runSweep\(now, \(!continueOnly \|\| fullRunOwed\) \? "open-issues" : resumePhase\)/);
 });
