@@ -553,12 +553,29 @@ test("CONTROL: an advisory-lock transaction DOES hold one — the pre-fix shape"
     );
 });
 
-test("CONCURRENT publishes do not queue behind each other on the pool", { skip }, async () => {
-    // The consequence the finding names: with the lock, N concurrent
-    // finalizations serialized on N connections. With the lease they overlap,
-    // and no connection is held across any of their seals.
-    const baseline = await heldTxConnections();
-    let peak = 0;
+const SEAL_MS = 400;
+const PUBLISHERS = [1, 2, 3, 4, 5, 6];
+
+/**
+ * Run the six publishes, reporting how many seals were in flight at once and
+ * how long the whole batch took.
+ *
+ * MEASURED BY OVERLAP, not by counting connections. An earlier version sampled
+ * `pg_stat_activity` from inside each seal and demanded zero transactions open
+ * anywhere. That is not the property: six INDEPENDENT publishers each run their
+ * own short phase-A and phase-C transactions, and one of those legitimately sits
+ * `idle in transaction` for the instant between its two statements while another
+ * publisher happens to be sampling. It failed CI on a peak of one. Whether a
+ * transaction spans a storage call is proven, for a single publisher with nobody
+ * else to confuse the count, by the test above; what THIS test is for is the
+ * consequence the finding named — that concurrent finalizations no longer
+ * serialize on each other.
+ */
+async function runBatch(
+    wrap: (n: number, body: () => Promise<void>) => Promise<void> = (_n, body) => body(),
+) {
+    let inFlight = 0;
+    let peakInFlight = 0;
     const publishOne = (n: number) => sealAndPublish(`receipts/intake/p${n}.png`, `probe-${n}`, 1, {
         mimeType: "image/png",
         fileSize: 4,
@@ -568,8 +585,12 @@ test("CONCURRENT publishes do not queue behind each other on the pool", { skip }
         inShortTx: shortTx,
         claimCanonicalPath: async () => `intent-${n}`,
         seal: async (_u: string, canonical: string) => {
-            await new Promise(resolve => setTimeout(resolve, 400));
-            peak = Math.max(peak, await heldTxConnections());
+            await wrap(n, async () => {
+                inFlight += 1;
+                peakInFlight = Math.max(peakInFlight, inFlight);
+                await new Promise(resolve => setTimeout(resolve, SEAL_MS));
+                inFlight -= 1;
+            });
             return canonical;
         },
         commit: async () => 1,
@@ -578,9 +599,45 @@ test("CONCURRENT publishes do not queue behind each other on the pool", { skip }
         settleUploadCleanup: async () => {},
     } as never);
 
-    const results = await Promise.all([1, 2, 3, 4, 5, 6].map(publishOne));
+    const startedAt = Date.now();
+    const results = await Promise.all(PUBLISHERS.map(publishOne));
+    return { results, peakInFlight, elapsed: Date.now() - startedAt };
+}
+
+test("CONCURRENT publishes do not queue behind each other on the pool", { skip }, async () => {
+    const { results, peakInFlight, elapsed } = await runBatch();
+
     assert.ok(results.every(r => r?.published), "all six published");
-    assert.ok(peak <= baseline, `six concurrent seals held no transactions (baseline ${baseline}, peak ${peak})`);
+    assert.equal(peakInFlight, PUBLISHERS.length, `all six seals overlapped (peak ${peakInFlight})`);
+    // Serialized, this batch could not finish in less than six seals. The bound
+    // is loose on purpose — the claim is "they overlap", not a latency budget.
+    assert.ok(
+        elapsed < SEAL_MS * PUBLISHERS.length,
+        `finished in ${elapsed}ms, less than ${SEAL_MS * PUBLISHERS.length}ms of queued seals`,
+    );
+    assert.ok(elapsed >= SEAL_MS, `the seals really ran (${elapsed}ms)`);
+});
+
+test("CONTROL: serialize the same six and both measurements move", { skip }, async () => {
+    // The pre-fix shape, without asserting anything about how it was
+    // serialized: one at a time is one at a time. Without this, a batch that
+    // silently did no work at all would satisfy the test above.
+    let chain: Promise<void> = Promise.resolve();
+    const oneAtATime = (_n: number, body: () => Promise<void>) => {
+        const next = chain.then(body);
+        chain = next.catch(() => {});
+        return next;
+    };
+
+    const { results, peakInFlight, elapsed } = await runBatch(oneAtATime);
+
+    assert.ok(results.every(r => r?.published), "they all still publish, just not together");
+    assert.equal(peakInFlight, 1, "one seal at a time — what the advisory lock produced");
+    assert.ok(
+        // A timer may fire a millisecond early; the claim is the shape, not the ms.
+        elapsed >= SEAL_MS * PUBLISHERS.length - 50,
+        `and the batch takes the full queue (${elapsed}ms)`,
+    );
 });
 
 // ── The old state default is REPAIRED, against real Postgres (round-18 #4) ──
