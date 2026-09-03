@@ -369,25 +369,35 @@ test("a rejected queued card is reported, not silently dropped", () => {
 
 // ── 4. The sweep's component transaction is serializable ───────────────────
 
-test("the component transaction runs SERIALIZABLE, retried, with the reads and writes inside it", () => {
+test("the component transaction is fenced by its own re-read, at the isolation that makes that work", () => {
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
-    assert.match(
-        sweep,
-        /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{/,
-        "the whole component transaction is the retry unit — a 40001 rolls it all back",
-    );
-    assert.match(sweep, /\{ timeout: COMPONENT_TX_TIMEOUT_MS, isolationLevel: "Serializable" \}/);
-    // The evidence reads and the ReviewIssue writes are both inside it: the
-    // predicate locks only cover what THIS transaction read.
-    const txAt = sweep.indexOf("await withTxRetry(() => prisma.$transaction(async tx => {");
-    const readsAt = sweep.indexOf("tx.receiptIntake.findMany(", txAt);
-    const writeAt = sweep.indexOf("const applied = await applyReceiptRequestPlan(", txAt);
-    const closeAt = sweep.indexOf("isolationLevel: \"Serializable\"", txAt);
-    assert.ok(readsAt > txAt && writeAt > readsAt && closeAt > writeAt,
-        "reads, then writes, then the transaction closes — nothing decided outside it");
 
-    // And the retry is the shared, documented one.
+    // THE FENCE: the fingerprint re-read INSIDE the transaction, immediately
+    // before the writes. Under READ COMMITTED each statement takes a fresh
+    // snapshot, so it sees a ReceiptIntake or Expense committed since planning.
+    assert.match(sweep, /const current = componentVersionOf\(\{/);
+    assert.match(sweep, /if \(!componentVersionsMatch\(planned, current\)\) throw new ComponentMovedError\(\);/);
+
+    // NOT SERIALIZABLE, deliberately and with evidence: snapshot isolation
+    // hides the very row the re-read exists to catch, and SSI raises nothing
+    // for this access pattern (one rw edge, no cycle). Both facts are measured
+    // against a real Postgres in tests/receipt-sweep-serializable-db.test.ts.
+    assert.doesNotMatch(sweep, /isolationLevel: "Serializable"/);
+
+    // The re-read comes after the locks and BEFORE the writes — a check that
+    // runs earlier fences a smaller window than the one it claims to.
+    const txAt = sweep.indexOf("await withTxRetry(() => prisma.$transaction(async tx => {");
+    const lockAt = sweep.indexOf("pg_advisory_xact_lock", txAt);
+    const refetchAt = sweep.indexOf("if (!componentVersionsMatch(planned, current))", txAt);
+    const writeAt = sweep.indexOf("const applied = await applyReceiptRequestPlan(", txAt);
+    assert.ok(txAt > 0 && lockAt > txAt && refetchAt > lockAt && writeAt > refetchAt,
+        "lock, re-read, then write — in that order, inside one transaction");
+
+    // The retry stays: a deadlock or a genuine serialization failure rolls the
+    // whole component back, and re-running it is always safe.
+    assert.match(sweep, /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{/);
     assert.match(sweep, /import \{ withTxRetry \} from "@\/lib\/tx-retry";/);
     const retry = readFileSync(join(repoRoot, "src/lib/tx-retry.ts"), "utf8");
-    assert.match(retry, /pg === "40P01" \|\| pg === "40001"/, "40001 is what SSI raises, and it must be retryable");
+    assert.match(retry, /pg === "40P01" \|\| pg === "40001"/, "both Postgres codes are retryable");
+    assert.match(retry, /e\?\.code === "P2034"/, "and so is Prisma's own write-conflict wrapper");
 });

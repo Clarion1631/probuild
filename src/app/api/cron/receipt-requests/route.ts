@@ -1291,26 +1291,40 @@ async function processBatch(
 
         try {
             /**
-             * SERIALIZABLE, AND RETRIED (Codex PR #443 gate round 41, finding 4).
+             * THE ISOLATION LEVEL IS DELIBERATELY THE DEFAULT — READ COMMITTED
+             * (Codex PR #443 gate round 41, finding 4; corrected by what CI
+             * measured).
              *
-             * The advisory lock below serializes this sweep against ITSELF, and
-             * the row locks cover rows that already exist. Neither covers the
-             * evidence this transaction actually decides on: a ReceiptIntake
-             * INSERTED after the fingerprint reads, or an Expense whose
-             * `receiptUrl` is filled in by the QBO sync a moment later. Those
-             * writers are not ours to fence — they span Phase 3's files, and the
-             * ledger epoch only tracks BankLine writers — so the fence has to
-             * come from the database: under SERIALIZABLE, Postgres's SSI takes
-             * predicate locks on what this transaction READ, and a concurrent
-             * insert or update inside those predicates aborts one of the two
-             * with 40001 rather than letting a stale plan commit.
+             * The hole is real: the advisory lock serializes this sweep against
+             * ITSELF and the row locks cover rows that already exist, so neither
+             * sees a ReceiptIntake INSERTED, or an `Expense.receiptUrl` filled
+             * in by the QBO sync, while this component is being decided. Those
+             * writers span Phase 3's files and the ledger epoch only tracks
+             * BankLine writers, so the fence has to be here.
              *
-             * The cost is a retry, not a failure: a 40001 rolls the whole
-             * component back — nothing of it happened — and `withTxRetry` runs
-             * it again against fresh state, bounded, with jittered backoff. A
-             * component that keeps losing ends up counted as an error and its
-             * cursor does not advance, which is the same safe end state every
-             * other failure here has.
+             * IT IS THE FINGERPRINT RE-READ BELOW (step 2), not the isolation
+             * level. Under READ COMMITTED every statement takes a fresh
+             * snapshot, so that re-read SEES a concurrently committed insert or
+             * update and `componentVersionsMatch` fails — the component throws
+             * ComponentMovedError, nothing is written, and the batch replans.
+             *
+             * SERIALIZABLE WAS TRIED AND IS WRONG HERE, twice over
+             * (tests/receipt-sweep-serializable-db.test.ts measures both against
+             * a real Postgres):
+             *   * SSI aborts a transaction only to break a rw-antidependency
+             *     CYCLE. This transaction reads the evidence and writes
+             *     ReviewIssue rows nobody else reads, so a concurrent insert
+             *     leaves a single rw edge — a schedule equivalent to "sweep,
+             *     then insert" — and no 40001 is due. CI proved it: the
+             *     transaction committed.
+             *   * Worse, snapshot isolation would BLIND the re-read that does
+             *     work: a row committed after this transaction started is
+             *     invisible to it, so raising the isolation level would have
+             *     removed the only fence there is.
+             *
+             * `withTxRetry` stays: a deadlock or a genuine serialization
+             * failure rolls the whole component back — nothing half-applied —
+             * and re-running it against fresh state is always safe.
              */
             await withTxRetry(() => prisma.$transaction(async tx => {
                 /**
@@ -1477,7 +1491,7 @@ async function processBatch(
                 summary.skipped += applied.skipped;
                 summary.errors += applied.errors;
                 summary.failedTargets.push(...applied.failedTargets);
-            }, { timeout: COMPONENT_TX_TIMEOUT_MS, isolationLevel: "Serializable" }));
+            }, { timeout: COMPONENT_TX_TIMEOUT_MS }));
         } catch (error) {
             if (error instanceof ComponentMovedError) {
                 // NOTHING COMMITTED for this component. The caller replans the
