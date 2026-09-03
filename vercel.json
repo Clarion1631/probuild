@@ -51,6 +51,10 @@
     {
       "path": "/api/cron/pipeline-digest",
       "schedule": "0 14 * * *"
+    },
+    {
+      "path": "/api/cron/qbo-maintenance",
+      "schedule": "45 * * * *"
     }
   ]
 }

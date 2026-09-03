@@ -1,6 +1,13 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
+import {
+    PAID_DELETION_UNRESOLVABLE,
+    PAYLINK_PENDING_MARKER,
+    PENDING_DELETION_MARKER,
+    PENDING_DELETION_SETTLED_MARKER,
+    SETTLED_WITHOUT_QB_PAYMENT,
+    pendingCreateMarkerWhere,
+} from "@/lib/qbo-create-markers";
 
 /**
  * One summary of the receipt/QBO pipeline's health, shared by the on-demand
@@ -120,6 +127,19 @@ export interface PipelineHealth {
      * having run.
      */
     payLinksPending: CountProbe;
+    /**
+     * Standing money-path queues only a human can clear.
+     *
+     * Optional so a caller that predates them (an older cached snapshot, a
+     * fixture) still typechecks; the verdict treats an absent probe as
+     * unmeasured rather than as zero, which is the honest reading.
+     */
+    parkedCreates?: CountProbe;
+    parkedDocumentSyncs?: CountProbe;
+    pendingDeletions?: CountProbe;
+    unreconciledMoney?: CountProbe;
+    /** Last successful maintenance cron; stale means nothing is working those queues. */
+    maintenanceRun?: { status: ProbeStatus; reason?: ProbeFailure; at: string | null };
 }
 
 /**
@@ -210,6 +230,17 @@ export const QBO_RECONNECT_EVENT_REASONS: readonly string[] = [
  * hourly job that has stopped running.
  */
 export const PAYMENTS_SYNC_CRON_SOURCE = "cron";
+
+/** The `source` the QBO maintenance cron stamps on its own run events. */
+export const QBO_MAINTENANCE_SOURCE = "qbo-maintenance-cron";
+
+/**
+ * Twice the cron cadence (hourly at :45, see vercel.json). One missed run is
+ * a blip; two in a row means the thing that works the repair queues is not
+ * running, and an empty queue because nothing sweeps it looks exactly like an
+ * empty queue because the work is done.
+ */
+export const MAINTENANCE_STALE_MS = 2 * 60 * 60_000;
 /**
  * Run statuses that prove the cron is alive. A "partial" run did execute, so
  * it counts for freshness — and is then flagged separately, immediately.
@@ -293,6 +324,19 @@ export function evaluatePipelineHealth(input: {
      * unpaid-link rows" — the false green this probe exists to remove.
      */
     payLinksPending: CountProbe;
+    /**
+     * Standing money-path queues only a human can clear.
+     *
+     * Optional so a caller that predates them (an older cached snapshot, a
+     * fixture) still typechecks; the verdict treats an absent probe as
+     * unmeasured rather than as zero, which is the honest reading.
+     */
+    parkedCreates?: CountProbe;
+    parkedDocumentSyncs?: CountProbe;
+    pendingDeletions?: CountProbe;
+    unreconciledMoney?: CountProbe;
+    /** Last successful maintenance cron; stale means nothing is working those queues. */
+    maintenanceRun?: { status: ProbeStatus; reason?: ProbeFailure; at: string | null };
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -334,6 +378,34 @@ export function evaluatePipelineHealth(input: {
         // while one of these sat in front of its cursor is exactly why this is
         // measured here rather than taken on that sweep's word.
         reasons.push(`pay-links-pending:${input.payLinksPending.count}`);
+    }
+
+    // Each standing queue, named and counted separately. Folding them into
+    // one number would tell an operator that something is parked without
+    // saying which thing, and they need different actions.
+    const queues: Array<[string, CountProbe | undefined]> = [
+        ["parked-creates", input.parkedCreates],
+        ["parked-document-syncs", input.parkedDocumentSyncs],
+        ["pending-deletions", input.pendingDeletions],
+        ["unreconciled-money", input.unreconciledMoney],
+    ];
+    for (const [name, q] of queues) {
+        if (!q) continue;
+        if (q.status === "error") reasons.push(`probe-failed:${name}`);
+        else if (q.count > 0) reasons.push(`${name}:${q.count}`);
+    }
+
+    // The heartbeat for the thing that WORKS those queues. An empty queue
+    // because the sweep is dead looks exactly like an empty queue because
+    // the work is done, and only this tells them apart.
+    if (input.maintenanceRun) {
+        if (input.maintenanceRun.status === "error") reasons.push("probe-failed:maintenanceRun");
+        else {
+            const at = input.maintenanceRun.at ? Date.parse(input.maintenanceRun.at) : null;
+            if (at === null || Number.isNaN(at) || input.now - at > MAINTENANCE_STALE_MS) {
+                reasons.push("qbo-maintenance-stale");
+            }
+        }
     }
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
@@ -441,36 +513,66 @@ export function createLimiter(limit: number): Limiter {
     let inFlight = 0;
     const waiting: Array<() => void> = [];
     const release = () => {
-        inFlight--;
+        // TRANSFER, do not decrement-then-wake.
+        //
+        // Decrementing first opened a window: the woken waiter increments in a
+        // later microtask, so a concurrent acquire() running in between saw
+        // inFlight below the limit, took the slot synchronously, and then BOTH
+        // incremented — the gate ran over its cap. Handing the slot straight to
+        // the next waiter keeps inFlight unchanged, so there is no window at all.
         const next = waiting.shift();
-        if (next) next();
+        if (next) {
+            next();
+            return;
+        }
+        inFlight--;
     };
     return {
         async acquire(timeoutMs?: number) {
             if (inFlight >= limit) {
-                let ticket: () => void = () => {};
-                const queued = new Promise<boolean>((resolve) => {
-                    ticket = () => resolve(true);
-                    waiting.push(ticket);
+                // EVERY promise this creates is settled before returning, and the
+                // timer is cleared rather than unref'd.
+                //
+                // The first cut left both halves of the race dangling: the queue
+                // ticket was spliced out but never resolved, and the timeout promise
+                // stayed pending whenever the slot arrived first. Node 20 fails a
+                // test that exits with a promise still pending — and an unref'd
+                // timer means it may simply never fire, so the promise it would have
+                // resolved is unreachable rather than merely late.
+                let settleQueued: (granted: boolean) => void = () => {};
+                const queued = new Promise<boolean>((resolve) => { settleQueued = resolve; });
+                // `handed` records that release() actually TRANSFERRED a slot to us.
+                // The race below can pick the timeout even when the handoff already
+                // happened in the same tick; without this we would walk away from a
+                // slot we own and the gate would leak it permanently.
+                let handed = false;
+                const ticket = () => { handed = true; settleQueued(true); };
+                waiting.push(ticket);
+
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                let settleTimeout: (granted: boolean) => void = () => {};
+                const expiry = new Promise<boolean>((resolve) => {
+                    settleTimeout = resolve;
+                    if (timeoutMs !== undefined) timer = setTimeout(() => resolve(false), timeoutMs);
                 });
-                const got = timeoutMs === undefined
-                    ? await queued
-                    : await Promise.race([
-                        queued,
-                        new Promise<boolean>((resolve) => {
-                            const t = setTimeout(() => resolve(false), timeoutMs);
-                            if (typeof t === "object" && t && "unref" in t) (t as { unref(): void }).unref();
-                        }),
-                    ]);
-                if (!got) {
+
+                const got = timeoutMs === undefined ? await queued : await Promise.race([queued, expiry]);
+
+                clearTimeout(timer);
+                settleTimeout(got);
+                if (!got && !handed) {
                     // Drop the ticket, or the next release hands a slot to a waiter
                     // that has already given up and the gate leaks one permanently.
                     const at = waiting.indexOf(ticket);
                     if (at > -1) waiting.splice(at, 1);
+                    settleQueued(false);
                     return null;
                 }
+                // Reaching here means a slot was TRANSFERRED to us: `inFlight`
+                // already counts it, so incrementing again would double-count.
+            } else {
+                inFlight++;
             }
-            inFlight++;
             let released = false;
             // Idempotent: a double release would let the gate drift open.
             return () => {
@@ -560,8 +662,13 @@ export async function runProbe<T>(
     // still occupies its slot until the database actually lets go.
     const work = withDb(timeoutMs, run);
     void work.then(() => releaseSlot(), () => releaseSlot());
+    // Held so the timer promise can be SETTLED on the way out. Clearing the
+    // timeout alone left it pending forever on every successful probe, which is
+    // exactly the shape Node flags as an unresolved promise at exit.
+    let settleDeadline: (v: typeof TIMED_OUT) => void = () => {};
     try {
         const deadline = new Promise<typeof TIMED_OUT>(resolve => {
+            settleDeadline = resolve;
             timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
         });
         const result = await Promise.race([work, deadline]);
@@ -574,9 +681,11 @@ export async function runProbe<T>(
         console.error(`[pipeline-health] probe failed: ${name}`, error instanceof Error ? error.name : "UnknownError");
         return { status: "error", reason: "error", value: onError };
     } finally {
-        // Never leave a pending timer holding the event loop open. The slot is
-        // deliberately NOT released here: `work` owns it now.
+        // Never leave a pending timer holding the event loop open, nor a promise
+        // that can never settle. The SLOT is deliberately not released here:
+        // `work` owns it now.
         clearTimeout(timer);
+        settleDeadline(TIMED_OUT);
     }
 }
 
@@ -587,7 +696,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth, payLinksPending] = await Promise.all([
+    const [
+        intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows,
+        lastBankLine, stuck, qboAuth, payLinksPending,
+        parkedCreates, parkedDocumentSyncs, pendingDeletions, unreconciledMoney, maintenanceRun,
+    ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -743,6 +856,71 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             },
             0,
         ),
+        // THE STANDING QUEUES. Everything above measures whether something
+        // RAN; none of it measures what is sitting parked. Health could report
+        // green with a client mid-billed on both rails: an unknown-outcome
+        // create, a deletion queued and never confirmed, a milestone paid
+        // outside QuickBooks with its invoice still open. Each is money-path
+        // work that only a human can finish, so each is its own count and each
+        // one alone turns the check non-green.
+        probe<number>(
+            "parkedCreates",
+            async (db) => {
+                const where = { OR: pendingCreateMarkerWhere() };
+                const [milestones, billings] = await Promise.all([
+                    db.paymentSchedule.count({ where }),
+                    db.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
+        probe<number>(
+            "parkedDocumentSyncs",
+            async (db) => {
+                // EVERY non-null marker, readable or not: an unreadable value is
+                // outstanding work too, and counting only the recognised ones is
+                // exactly the blind spot the maintenance sweep just lost.
+                const [estimates, invoices] = await Promise.all([
+                    db.estimate.count({ where: { qbSyncMarker: { not: null }, qbEstimateId: null } }),
+                    db.invoice.count({ where: { qbSyncMarker: { not: null }, qbInvoiceId: null } }),
+                ]);
+                return estimates + invoices;
+            },
+            0,
+        ),
+        probe<number>(
+            "pendingDeletions",
+            async (db) => db.paymentSchedule.count({
+                where: {
+                    qbSyncError: { in: [PENDING_DELETION_MARKER, PENDING_DELETION_SETTLED_MARKER] },
+                    qbInvoiceId: { not: null },
+                },
+            }),
+            0,
+        ),
+        probe<number>(
+            "unreconciledMoney",
+            async (db) => db.paymentSchedule.count({
+                where: { qbSyncError: { in: [PAID_DELETION_UNRESOLVABLE, SETTLED_WITHOUT_QB_PAYMENT] } },
+            }),
+            0,
+        ),
+        // ...and whether the thing that WORKS those queues is still running.
+        // A queue that is empty because nothing is sweeping it looks identical
+        // to one that is empty because the work is done.
+        probe<Date | null>(
+            "maintenanceRun",
+            async (db) =>
+                (
+                    await db.automationEvent.findFirst({
+                        where: { kind: PAYMENTS_SYNC_EVENT_KIND, source: QBO_MAINTENANCE_SOURCE, status: "ok" },
+                        orderBy: { createdAt: "desc" },
+                        select: { createdAt: true },
+                    })
+                )?.createdAt ?? null,
+            null,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -781,6 +959,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
         qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
         payLinksPending: { status: payLinksPending.status, reason: payLinksPending.reason, count: payLinksPending.value },
+        parkedCreates: { status: parkedCreates.status, reason: parkedCreates.reason, count: parkedCreates.value },
+        parkedDocumentSyncs: { status: parkedDocumentSyncs.status, reason: parkedDocumentSyncs.reason, count: parkedDocumentSyncs.value },
+        pendingDeletions: { status: pendingDeletions.status, reason: pendingDeletions.reason, count: pendingDeletions.value },
+        unreconciledMoney: { status: unreconciledMoney.status, reason: unreconciledMoney.reason, count: unreconciledMoney.value },
+        maintenanceRun: { status: maintenanceRun.status, reason: maintenanceRun.reason, at: maintenanceRun.value?.toISOString() ?? null },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -800,6 +983,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         stuck: snapshot.stuck,
         qboAuth: snapshot.qboAuth,
         payLinksPending: snapshot.payLinksPending,
+        parkedCreates: snapshot.parkedCreates,
+        parkedDocumentSyncs: snapshot.parkedDocumentSyncs,
+        pendingDeletions: snapshot.pendingDeletions,
+        unreconciledMoney: snapshot.unreconciledMoney,
+        maintenanceRun: snapshot.maintenanceRun,
     };
 }
 

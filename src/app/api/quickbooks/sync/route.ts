@@ -20,6 +20,7 @@ import {
 } from "@/lib/qbo-document-sync";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { prisma } from "@/lib/prisma";
+import { logAutomationEvent } from "@/lib/automation-events";
 import type { Prisma } from "@prisma/client";
 import { toNum } from "@/lib/prisma-helpers";
 import { currentStaffUserOrNull, hasPermission, canAccessProject, canAccessEstimate } from "@/lib/permissions";
@@ -454,6 +455,18 @@ export async function POST(req: NextRequest) {
                     return retryLater(estimate.code, "another sync claimed it first");
                 }
                 estimateMarker = claimed.value.marker;
+                // A parked marker is money-path work only a human can finish, so it
+                // has to be VISIBLE. Nothing recorded a document claim anywhere, so
+                // pipeline-health had no event to read and the row sat unmentioned
+                // until somebody opened the record.
+                await logAutomationEvent({
+                    kind: "qbo-payments-sync",
+                    status: "ok",
+                    reason: "document-sync-claimed",
+                    source: "document-sync",
+                    docNumber: estimate.code,
+                    detail: { kind: "estimate", id: estimate.id },
+                });
                 estimateFacts = claimed.facts;
             }
 
@@ -604,6 +617,14 @@ export async function POST(req: NextRequest) {
                 return retryLater(invoice.code, "another sync claimed it first");
             }
             invoiceMarker = claimed.value.marker;
+            await logAutomationEvent({
+                kind: "qbo-payments-sync",
+                status: "ok",
+                reason: "document-sync-claimed",
+                source: "document-sync",
+                docNumber: invoice.code,
+                detail: { kind: "invoice", id: invoice.id },
+            });
             invoiceFacts = claimed.facts;
         }
 

@@ -5,7 +5,7 @@ import { recordPayment, issueInvoice, deleteInvoice, updateInvoiceNotes, addInvo
 // Pure module (no Prisma) so the marker vocabulary is shared with the server
 // rather than restated here — a second copy of these strings is how a UI stops
 // recognising the state the money guards act on.
-import { ambiguousCreateFingerprint, isBlockedByAmbiguousCreate, PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
+import { ambiguousCreateFingerprint, isBlockedByAmbiguousCreate, milestoneSendBlockedReason, PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
 import { useRouter } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import SendInvoiceModal from "@/components/SendInvoiceModal";
@@ -116,7 +116,15 @@ export default function InvoiceEditor({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [initialInvoice.id]);
 
-    async function handleQBLink(payment: { id: string; qbInvoiceLink?: string | null }) {
+    async function handleQBLink(payment: { id: string; qbInvoiceLink?: string | null; qbSyncError?: string | null }) {
+        // The SAME predicate the server uses, so the button and the action can
+        // never disagree. Copying a pay link IS a send: it puts a URL that
+        // collects money in front of a client just as an email does.
+        const blocked = milestoneSendBlockedReason(payment);
+        if (blocked) {
+            toast.error(`Can not use this link: ${blocked}`);
+            return;
+        }
         // Already pushed → just copy the live link.
         if (payment.qbInvoiceLink) {
             await navigator.clipboard.writeText(payment.qbInvoiceLink).catch(() => {});
@@ -878,7 +886,13 @@ export default function InvoiceEditor({
                                     const receiptSentLabel = payment.receiptSentAt
                                         ? `Last sent ${new Date(payment.receiptSentAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
                                         : undefined;
-                                    const isSendable = payment.status !== "Paid" && payment.status !== "Canceled";
+                                    // Status alone was never the whole answer: the SAME predicate
+                                    // the server uses decides whether this row may be sent, copied
+                                    // or re-sent, so a disabled button and a refused action always
+                                    // agree, and the button can say WHY.
+                                    const sendBlockedReason = milestoneSendBlockedReason(payment);
+                                    const isSendable = payment.status !== "Paid" && payment.status !== "Canceled"
+                                        && !sendBlockedReason;
                                     const sentLabel = payment.qbInvoiceSentAt
                                         ? `Sent · ${new Date(payment.qbInvoiceSentAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
                                         : null;
@@ -1018,12 +1032,22 @@ export default function InvoiceEditor({
                                                         <>
                                                         <button
                                                             onClick={() => handleQBLink(payment)}
-                                                            disabled={qbBusy === payment.id}
-                                                            title={payment.qbInvoiceLink ? "Copy the QuickBooks pay link" : "Create a QuickBooks invoice with a hosted pay link (card/ACH)"}
+                                                            disabled={qbBusy === payment.id || !!sendBlockedReason}
+                                                            title={sendBlockedReason
+                                                                ? `Blocked: ${sendBlockedReason}`
+                                                                : payment.qbInvoiceLink ? "Copy the QuickBooks pay link" : "Create a QuickBooks invoice with a hosted pay link (card/ACH)"}
                                                             className="hui-btn hui-btn-secondary py-1 px-3 text-xs w-auto h-8 flex items-center justify-center whitespace-nowrap disabled:opacity-50"
                                                         >
                                                             {qbBusy === payment.id ? "Pushing…" : payment.qbInvoiceLink ? "Copy QB Link" : "QuickBooks Link"}
                                                         </button>
+                                                        {sendBlockedReason && (
+                                                            <span
+                                                                className="text-xs text-amber-700 italic max-w-[18rem] text-right"
+                                                                title={sendBlockedReason}
+                                                            >
+                                                                Cannot send: {sendBlockedReason}
+                                                            </span>
+                                                        )}
                                                         {isSendable && (
                                                             <button
                                                                 onClick={() => {

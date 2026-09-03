@@ -18,7 +18,7 @@ import {
     isBlockedByAmbiguousCreate,
     isQboInvoiceLinkedOrPending,
     pendingCreateMarkerWhere,
-    QBResolveRequiredError,
+    QBResolveRequiredError, milestoneSendBlockedReason,
 } from "./qbo-create-markers";
 import {
     createRouteDeadline,
@@ -922,6 +922,18 @@ export async function sendMilestoneInvoicesCore(
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
                 skippedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Milestone is already paid or canceled" });
+                continue;
+            }
+            // The ONE send predicate (qbo-create-markers.ts). Status alone was not
+            // enough: an ALREADY-LINKED row never reaches pushMilestoneToQuickBooks,
+            // where the marker guards live, so a milestone whose QuickBooks invoice
+            // was queued for deletion — or parked by an unknown-outcome create, or
+            // settled outside QuickBooks — could still be emailed to the client
+            // with a pay link for a document about to vanish, or already paid.
+            const blocked = milestoneSendBlockedReason(schedule);
+            if (blocked) {
+                skippedCount++;
+                results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: `Not sent: ${blocked}` });
                 continue;
             }
 

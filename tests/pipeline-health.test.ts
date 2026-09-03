@@ -831,8 +831,15 @@ test("round 43: a timed-out probe KEEPS its slot until the query settles", async
     // pool that was already full: the cap was counting callers, not work.
     const limiter = createLimiter(1);
     let finishFirst: (v: unknown) => void = () => {};
-    const held: ProbeRunner = <T,>() =>
-        new Promise<T>((resolve) => { finishFirst = resolve as (v: unknown) => void; });
+    // Tracked so the test can settle it before returning. Node 20 fails a test
+    // that leaves a promise pending at exit, and "still running after the caller
+    // gave up" is precisely the state being asserted here.
+    let wedgedWork: Promise<unknown> = Promise.resolve();
+    const held: ProbeRunner = <T,>() => {
+        const p = new Promise<T>((resolve) => { finishFirst = resolve as (v: unknown) => void; });
+        wedgedWork = p;
+        return p;
+    };
 
     const wedged = await runProbe("wedged", async () => 1, -1, 20, { withDb: held, limiter });
     assert.equal(wedged.reason, "timeout", "the caller is answered immediately");
@@ -846,6 +853,7 @@ test("round 43: a timed-out probe KEEPS its slot until the query settles", async
 
     // Once the database actually lets go, the gate reopens.
     finishFirst(1);
+    await wedgedWork;
     await new Promise((r) => setTimeout(r, 10));
     const after = await runProbe("after", async () => 1, -1, 500,
         { withDb: passThrough, limiter, acquireTimeoutMs: 200 });
@@ -859,12 +867,16 @@ test("round 43: concurrency never exceeds the cap, even when callers have timed 
     let inFlight = 0;
     let peak = 0;
     const finishers: Array<() => void> = [];
+    // Every query this test starts, so it can be settled before returning.
+    const started: Array<Promise<unknown>> = [];
     const held: ProbeRunner = <T,>() => {
         inFlight++;
         peak = Math.max(peak, inFlight);
-        return new Promise<T>((resolve) => {
+        const p = new Promise<T>((resolve) => {
             finishers.push(() => { inFlight--; resolve(undefined as T); });
         });
+        started.push(p);
+        return p;
     };
 
     // Nine probes, each timing out well before its query settles.
@@ -877,5 +889,88 @@ test("round 43: concurrency never exceeds the cap, even when callers have timed 
         results.some((r) => r.reason === "skipped"),
         "the ones behind are reported as skipped rather than started anyway",
     );
+    // Let the abandoned queries finish. Node 20 fails a test that exits with a
+    // promise still pending, and every one of these is deliberately still
+    // running after its caller gave up.
     for (const f of finishers) f();
+    await Promise.all(started);
+    await new Promise((r) => setTimeout(r, 0));
+});
+
+// ─── Round 44: standing queues, the heartbeat, and the slot handoff ───
+
+/**
+ * Everything the health check measured was whether something RAN. None of it
+ * measured what was sitting PARKED, so it could report green with a client
+ * mid-billed: an unknown-outcome create, a deletion queued and never
+ * confirmed, a milestone paid outside QuickBooks with its invoice still open.
+ */
+test("round 44: each parked money-path queue alone turns health non-green", () => {
+    const green = snapshot();
+    assert.equal(evaluatePipelineHealth(green).ok, true, "the control really is green");
+
+    const queues: Array<[string, string]> = [
+        ["parkedCreates", "parked-creates:1"],
+        ["parkedDocumentSyncs", "parked-document-syncs:1"],
+        ["pendingDeletions", "pending-deletions:1"],
+        ["unreconciledMoney", "unreconciled-money:1"],
+    ];
+    for (const [field, reason] of queues) {
+        const v = evaluatePipelineHealth(snapshot({ [field]: { status: "ok", count: 1 } } as any));
+        assert.equal(v.ok, false, `${field} > 0 must not read as healthy`);
+        assert.ok(v.reasons.includes(reason), `${field} must report ${reason}, got ${v.reasons.join(",")}`);
+    }
+});
+
+test("round 44: a queue we could not READ is reported, never assumed empty", () => {
+    const v = evaluatePipelineHealth(snapshot({ pendingDeletions: { status: "error", reason: "timeout", count: 0 } } as any));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("probe-failed:pending-deletions"));
+});
+
+test("round 44: a stale maintenance heartbeat turns health non-green", () => {
+    // An empty queue because nothing sweeps it looks exactly like an empty
+    // queue because the work is done. Only this tells them apart.
+    const fresh = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: iso(30 * 60_000) },
+    } as any));
+    assert.equal(fresh.ok, true, "a recent run is fine");
+
+    const stale = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: iso(3 * HOUR) },
+    } as any));
+    assert.equal(stale.ok, false);
+    assert.ok(stale.reasons.includes("qbo-maintenance-stale"));
+
+    const never = evaluatePipelineHealth(snapshot({
+        maintenanceRun: { status: "ok", at: null },
+    } as any));
+    assert.equal(never.ok, false, "never having run is not healthy either");
+});
+
+test("round 44: the limiter never exceeds its cap when a slot is handed over", async () => {
+    // release() used to decrement inFlight and THEN wake a waiter, which
+    // increments in a LATER microtask. The window between those two is the bug:
+    // a caller arriving in it sees a free slot and takes it, and then the woken
+    // waiter increments too — two holders against a cap of one.
+    //
+    // So the intruder has to arrive in that exact window: synchronously after
+    // the release, before any await lets the waiter resume. A test that only
+    // used already-queued waiters passes against the racy version.
+    const limiter = createLimiter(1);
+    const held = await limiter.acquire();
+    assert.ok(held, "the first caller holds the only slot");
+
+    const queued = limiter.acquire(60);   // waiting behind it
+    await new Promise((r) => setTimeout(r, 5));
+
+    held!();                              // hands the slot over...
+    const intruder = limiter.acquire(60); // ...and this arrives in the window
+
+    const [a, b] = await Promise.all([queued, intruder]);
+    const granted = [a, b].filter(Boolean);
+    assert.equal(granted.length, 1, "exactly ONE holder at a cap of one, never two");
+    assert.ok(a, "and it is the caller that was already waiting, not the one that jumped in");
+
+    for (const release of granted) release!();
 });

@@ -552,3 +552,54 @@ export class QBResolveRequiredError extends Error {
         );
     }
 }
+
+/**
+ * Diagnostic flags this module does not own but must still recognise.
+ *
+ * Both are written by the milestone rail (quickbooks-payments.ts) and neither
+ * is a create marker, so `markerKind` ignores them — but both describe a row a
+ * client must not be asked to pay, so the send predicate below has to know
+ * them. Declared here rather than imported to keep this module free of the
+ * server-only rail (it is bundled into a client component).
+ */
+export const PAID_DELETION_UNRESOLVABLE = "paid-deletion-unresolvable";
+export const SETTLED_WITHOUT_QB_PAYMENT = "settled-without-qb-payment";
+
+/**
+ * THE one reason a milestone may not be sent, copied or re-sent to a client.
+ *
+ * Every send path used to make its own decision, and each of them checked a
+ * different, smaller thing: `sendMilestoneInvoicesCore` rejected only
+ * Paid/Canceled, and an ALREADY-LINKED row never reaches
+ * `pushMilestoneToQuickBooks` (which is where the marker guards live), so a
+ * milestone whose QuickBooks invoice was queued for deletion — or was parked
+ * by an unknown-outcome create, or settled outside QuickBooks — could still be
+ * emailed to the client with a pay link for a document that is about to
+ * vanish, or has already been paid.
+ *
+ * `null` means sendable. A string is the reason, written for the operator: it
+ * goes in the skip result AND on the disabled button in the editor, so the UI
+ * and the server agree by construction rather than by review.
+ */
+export function milestoneSendBlockedReason(row: {
+    qbSyncError?: string | null;
+}): string | null {
+    const marker = row.qbSyncError;
+    if (!marker) return null;
+    if (isPendingDeletion(marker)) {
+        return "its QuickBooks invoice is queued for deletion " + "— resolve that first, or the client gets a link to a document that is about to vanish";
+    }
+    if (marker === PAID_DELETION_UNRESOLVABLE) {
+        return "it was paid while its QuickBooks invoice was being deleted " + "— reconcile it in QuickBooks before sending anything";
+    }
+    if (marker === SETTLED_WITHOUT_QB_PAYMENT) {
+        return "it is already paid in ProBuild while its QuickBooks invoice is still open " + "— reconcile it in QuickBooks before sending anything";
+    }
+    if (markerKind(marker)) {
+        return "a previous QuickBooks send for it ended without a confirmed result " + "— check QuickBooks and resolve it before sending again";
+    }
+    // `voided` / `notFound` and anything else the poller wrote: the row is
+    // flagged but the invoice is not in an ambiguous or disappearing state, so
+    // sending is the operator's call, exactly as it was before.
+    return null;
+}
