@@ -238,21 +238,27 @@ export function useScheduleActions(
     }
 
     async function handleDelete(taskId: string) {
-        const previousTasks = tasksRef.current;
+        const removed = tasksRef.current.find(t => t.id === taskId);
+        // Roll back only this task, never a whole snapshot: other edits may
+        // land while the delete is in flight.
+        const restore = () => {
+            if (!removed) return;
+            setTasks(prev => prev.some(t => t.id === taskId) ? prev : [...prev, removed].sort((a, b) => a.order - b.order));
+        };
         const wasSelected = selectedTaskId === taskId;
         setTasks(prev => prev.filter(t => t.id !== taskId));
         if (wasSelected) setSelectedTaskId(null);
         try {
             const res = await deleteScheduleTask(taskId);
             if (!res.ok) {
-                setTasks(previousTasks);
+                restore();
                 if (wasSelected) setSelectedTaskId(taskId);
                 toast.error(res.error);
                 return;
             }
             toast.success("Task deleted");
         } catch (error) {
-            setTasks(previousTasks);
+            restore();
             if (wasSelected) setSelectedTaskId(taskId);
             toast.error(error instanceof Error ? error.message : "Failed to delete task");
         }

@@ -240,20 +240,26 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
     }
 
     async function removeTask(taskId: string) {
-        const before = tasks;
+        const removed = tasks.find(t => t.id === taskId);
+        // Roll back only this task, never a whole snapshot: other edits may
+        // land while the delete is in flight.
+        const restore = () => {
+            if (!removed) return;
+            setTasks(prev => prev.some(t => t.id === taskId) ? prev : [...prev, removed].sort((a, b) => a.order - b.order));
+        };
         setTasks(prev => prev.filter(t => t.id !== taskId));
         setEditing(null);
         try {
             const res = await deleteScheduleTask(taskId);
             if (!res.ok) {
-                setTasks(before);
+                restore();
                 toast.error(res.error);
                 return;
             }
             toast.success("Task deleted");
             startTransition(() => router.refresh());
         } catch {
-            setTasks(before);
+            restore();
             toast.error("Failed to delete");
         }
     }

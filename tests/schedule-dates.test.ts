@@ -36,9 +36,11 @@ test("legacy zero-length rows (end == start) display and count as one day", () =
     assert.equal(isTaskOnDay("2026-09-03", "2026-09-03", "2026-09-04"), false);
 });
 
-test("a display end on or before the start becomes a one-day task", () => {
-    assert.equal(storedEndDate("2026-09-03", "2026-09-01"), "2026-09-04");
+test("a display end on the start day is a one-day task; before the start is left invalid for the server", () => {
     assert.equal(storedEndDate("2026-09-03", "2026-09-03"), "2026-09-04");
+    // 9/1 shown -> stored 9/2, which is <= start 9/3 and fails validation
+    // instead of being silently turned into a one-day task.
+    assert.equal(storedEndDate("2026-09-03", "2026-09-01"), "2026-09-02");
 });
 
 test("milestones keep end == start in both directions", () => {

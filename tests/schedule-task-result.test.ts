@@ -5,7 +5,7 @@ import {
     UNEXPECTED_SCHEDULE_TASK_ERROR,
     toScheduleTaskFailure,
 } from "@/lib/schedule-task-result";
-import { UPDATE_LEGACY_ROWS } from "../scripts/apply-schedule-task-exclusive-end.mjs";
+import { UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROWS } from "../scripts/apply-schedule-task-exclusive-end.mjs";
 
 test("ScheduleTaskValidationError carries the VALIDATION code and its own name", () => {
     const err = new ScheduleTaskValidationError("Task end date must be after its start date");
@@ -19,6 +19,13 @@ test("the backfill UPDATE only targets non-milestone rows with end <= start", ()
     assert.match(UPDATE_LEGACY_ROWS, /type"\s*<>\s*'milestone'/);
     assert.match(UPDATE_LEGACY_ROWS, /UPDATE\s+"ScheduleTask"/);
     assert.match(UPDATE_LEGACY_ROWS, /"startDate"\s*\+\s*interval\s*'1 day'/);
+    // Lead schedule tasks share the table with projectId = NULL and keep
+    // inclusive dates: every statement must be scoped to project tasks.
+    for (const sql of [UPDATE_LEGACY_ROWS, SELECT_LEGACY_ROWS, SELECT_REVIEW_ROWS, EXTEND_ROWS]) {
+        assert.match(sql, /"projectId"\s+IS NOT NULL/);
+        assert.match(sql, /<>\s*'milestone'/);
+    }
+    assert.match(EXTEND_ROWS, /"id"\s*=\s*ANY\(\$1::text\[\]\)/);
 });
 
 test("toScheduleTaskFailure classifies each branch in order", () => {

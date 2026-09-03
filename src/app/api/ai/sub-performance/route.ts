@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
-import { displayEndDate, toDateKey, durationDays } from "@/lib/schedule-dates";
+import { displayEndDate, toDateKey, durationDays, isTaskOverdue } from "@/lib/schedule-dates";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
@@ -37,7 +37,7 @@ export async function POST(req: NextRequest) {
     const taskSummary = sub.taskAssignments.map(ta => {
         const t = ta.task;
         const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
-        const isPastDue = today >= toDateKey(t.endDate) && t.progress < 100;
+        const isPastDue = isTaskOverdue(t.startDate, t.endDate, today, t.type) && t.progress < 100;
         const isComplete = t.progress === 100;
         const totalHoursLogged = t.timeEntries.reduce((sum, te) => sum + (te.durationHours || 0), 0);
         const hoursInfo = t.estimatedHours

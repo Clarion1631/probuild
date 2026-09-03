@@ -68,14 +68,13 @@ export function displayEndDate(startDate: string, endDate: string, type?: Schedu
 
 /**
  * User-entered "End" (last day of work) -> the value to STORE (exclusive).
- * Milestones store end == start. Anything on or before the start becomes a
- * one-day task ending the next morning.
+ * Milestones store end == start. An End before the Start is NOT repaired
+ * here: it converts to a stored end on or before the start, which the
+ * server rejects with a validation message the user can act on.
  */
 export function storedEndDate(startDate: string, displayEnd: string, type?: ScheduleTaskKind): string {
-    const start = toDateKey(startDate);
-    if (type === "milestone") return start;
-    const end = toDateKey(displayEnd);
-    return end < start ? addDaysKey(start, 1) : addDaysKey(end, 1);
+    if (type === "milestone") return toDateKey(startDate);
+    return addDaysKey(toDateKey(displayEnd), 1);
 }
 
 /** Working days a stored task covers. A milestone or legacy zero-length row counts as one. */
@@ -99,7 +98,7 @@ export function isTaskOverdue(startDate: string | Date, endDate: string | Date, 
 }
 
 /** True when `day` (YYYY-MM-DD) is a working day of the stored task: start <= day < end, milestones on their day. */
-export function isTaskOnDay(startDate: string, endDate: string, day: string, type?: ScheduleTaskKind): boolean {
+export function isTaskOnDay(startDate: string | Date, endDate: string | Date, day: string | Date, type?: ScheduleTaskKind): boolean {
     const start = toDateKey(startDate);
     const d = toDateKey(day);
     if (type === "milestone") return d === start;

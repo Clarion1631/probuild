@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
-import { displayEndDate, toDateKey, durationDays, isTaskOverdue } from "@/lib/schedule-dates";
+import { displayEndDate, toDateKey, durationDays, isTaskOverdue, isTaskOnDay } from "@/lib/schedule-dates";
 
 interface ScheduleTask {
     id: string;
@@ -31,11 +31,9 @@ export async function POST(req: NextRequest) {
     const today = new Date().toISOString().split("T")[0];
 
     const taskSummary = tasks.map(t => {
-        const start = new Date(t.startDate);
-        const end = new Date(t.endDate);
         const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
         const isPast = isTaskOverdue(t.startDate, t.endDate, today, t.type);
-        const isActive = start <= new Date() && end >= new Date();
+        const isActive = isTaskOnDay(t.startDate, t.endDate, today, t.type);
         const hoursVariance = t.estimatedHours && t.actualHours > 0
             ? `${t.actualHours.toFixed(0)}/${t.estimatedHours}h actual/est`
             : "";

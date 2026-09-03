@@ -18,16 +18,27 @@ import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Lead schedule tasks live in the same table with projectId = NULL and keep
+// INCLUSIVE dates (createLeadScheduleTask / updateLeadScheduleTask). Every
+// statement here is scoped to project tasks only.
 export const SELECT_LEGACY_ROWS = `
     SELECT "id", "name", "projectId", "startDate", "endDate"
     FROM "ScheduleTask"
-    WHERE "type" <> 'milestone' AND "endDate" <= "startDate"
+    WHERE "projectId" IS NOT NULL AND "type" <> 'milestone' AND "endDate" <= "startDate"
     ORDER BY "startDate" ASC`;
 
 export const UPDATE_LEGACY_ROWS = `
     UPDATE "ScheduleTask"
     SET "endDate" = "startDate" + interval '1 day'
-    WHERE "type" <> 'milestone' AND "endDate" <= "startDate"`;
+    WHERE "projectId" IS NOT NULL AND "type" <> 'milestone' AND "endDate" <= "startDate"`;
+
+// Human-curated correction for multi-day tasks whose End was typed into the
+// old inclusive Calendar view: `--extend <id,id,...>` adds one day to exactly
+// those rows. Milestones and lead tasks are never touched.
+export const EXTEND_ROWS = `
+    UPDATE "ScheduleTask"
+    SET "endDate" = "endDate" + interval '1 day'
+    WHERE "id" = ANY($1::text[]) AND "projectId" IS NOT NULL AND "type" <> 'milestone'`;
 
 // Review list, printed in dry run: multi-day tasks that are current or upcoming.
 // A task whose dates were last typed into the old Calendar view (inclusive)
@@ -38,7 +49,8 @@ export const SELECT_REVIEW_ROWS = `
     SELECT t."id", t."name", p."name" AS "projectName", t."startDate", t."endDate"
     FROM "ScheduleTask" t
     JOIN "Project" p ON p."id" = t."projectId"
-    WHERE t."type" <> 'milestone'
+    WHERE t."projectId" IS NOT NULL
+      AND t."type" <> 'milestone'
       AND t."endDate" > t."startDate" + interval '1 day'
       AND t."endDate" >= now() - interval '7 days'
     ORDER BY p."name" ASC, t."startDate" ASC`;
@@ -65,21 +77,31 @@ async function main() {
             );
         }
 
+        const review = await prisma.$queryRawUnsafe(SELECT_REVIEW_ROWS);
+        console.log(`\nreview: ${review.length} current/upcoming multi-day task(s). If a task's End was last set in the Calendar view before 2026-09-03, its shown End is now one day earlier than intended. Re-run with --extend <id,id,...> for the ones a human confirms:`);
+        for (const row of review) {
+            const shownEnd = new Date(row.endDate.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            console.log(`  ${row.id}  ${row.projectName}  |  ${row.name}  |  ${row.startDate.toISOString().slice(0, 10)} to ${shownEnd} (shown)`);
+        }
+
+        const extendIdx = process.argv.indexOf("--extend");
+        const extendIds = extendIdx >= 0 && process.argv[extendIdx + 1]
+            ? process.argv[extendIdx + 1].split(",").map((s) => s.trim()).filter(Boolean)
+            : [];
+
         if (!APPLY) {
-            const review = await prisma.$queryRawUnsafe(SELECT_REVIEW_ROWS);
-            console.log(`\nreview: ${review.length} current/upcoming multi-day task(s). If a task's End was last set in the Calendar view before 2026-09-03, its shown End is now one day earlier than intended — check these by project:`);
-            for (const row of review) {
-                const shownEnd = new Date(row.endDate.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-                console.log(`  ${row.projectName}  |  ${row.name}  |  ${row.startDate.toISOString().slice(0, 10)} to ${shownEnd} (shown)`);
-            }
+            if (extendIds.length) console.log(`would extend ${extendIds.length} task(s) by one day: ${extendIds.join(", ")}`);
             console.log("dry run — pass --yes to apply");
             return;
         }
 
-        const applied = await prisma.$transaction(async (tx) => {
-            return tx.$executeRawUnsafe(UPDATE_LEGACY_ROWS);
+        const { applied, extended } = await prisma.$transaction(async (tx) => {
+            const applied = await tx.$executeRawUnsafe(UPDATE_LEGACY_ROWS);
+            const extended = extendIds.length ? await tx.$executeRawUnsafe(EXTEND_ROWS, extendIds) : 0;
+            return { applied, extended };
         });
         console.log(`applied: ${applied} rows`);
+        if (extendIds.length) console.log(`extended: ${extended} of ${extendIds.length} requested task(s) by one day`);
     } finally {
         await prisma.$disconnect();
     }

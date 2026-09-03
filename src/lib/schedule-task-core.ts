@@ -346,16 +346,21 @@ export async function updateScheduleTaskInTransaction(
     if (data.estimateItemId !== undefined) {
         updateData.estimateItemId = data.estimateItemId;
         if (data.estimateItemId) {
+            // The item must belong to this task's own project: a foreign id must
+            // neither link across projects nor reveal another project's task name.
+            const item = await tx.estimateItem.findUnique({
+                where: { id: data.estimateItemId },
+                select: { type: true, quantity: true, budgetUnit: true, estimate: { select: { projectId: true } } },
+            });
+            if (!item || item.estimate.projectId !== locked.projectId) {
+                throw new ScheduleTaskValidationError("That estimate item is not on this project");
+            }
             const existing = await tx.scheduleTask.findFirst({
-                where: { estimateItemId: data.estimateItemId, id: { not: taskId } },
+                where: { estimateItemId: data.estimateItemId, id: { not: taskId }, projectId: locked.projectId },
                 select: { id: true, name: true },
             });
             if (existing) throw new ScheduleTaskValidationError(`Already linked to "${existing.name}"`);
-            const item = await tx.estimateItem.findUnique({
-                where: { id: data.estimateItemId },
-                select: { type: true, quantity: true, budgetUnit: true },
-            });
-            if (item && (item.type === "Labor" || item.budgetUnit === "hours")) {
+            if (item.type === "Labor" || item.budgetUnit === "hours") {
                 updateData.estimatedHours = item.quantity || null;
             }
         }
