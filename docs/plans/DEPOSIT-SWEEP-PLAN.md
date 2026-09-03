@@ -1,0 +1,151 @@
+# Deposit Sweep Plan (daily bank-credit auto-apply)
+
+Status: PLANNED, revised after Codex plan review rounds 1 and 2 (see the last two sections). One PR. Schema via apply script before merge, plus a matching migration.
+
+## Problem
+
+A customer check ($13,447.68, Hoppe "Rough In complete", ProBuild INV-00173, QBO INV-00173-3 / Id 6648) hit Washington Trust Bank on 2026-08-24 (bank ref 26236015002406). Nobody photographed it, so the photo path (`src/app/api/payments/deposit-ingest/route.ts`) never fired. QBO showed the invoice unpaid and the ProBuild milestone sat Pending for 9 days until a human booked QBO Payment 6705 and ran `/api/cron/quickbooks-payments`. A 2026-08-19 audit found $119,947.68 of deposits in this state. The hole: a deposit that reaches the bank without a photo sits unbooked indefinitely.
+
+## Goal
+
+A daily, no-human, no-browser sweep. Every bank credit that exactly and unambiguously matches ONE billed, still-pending milestone gets booked in QBO and ProBuild through the SAME code the photo path uses. Everything else files an OfficeTask. Zero new money-write code paths.
+
+## Key finding 1: the data source (amends v2 plan decision 3)
+
+`docs/plans/RECEIPT-PIPELINE-V2-PLAN.md:17` (decision 3) says "QuickBooks bank feed by API is bank truth, nightly" and demotes the WTB CSV to monthly (line 139). That is right for money OUT and BLIND for money IN. The QBO API exposes only BOOKED transactions (Deposit/Payment entities), never the "For Review" bank feed. An unbooked customer check, the exact thing this sweep must see, is invisible in QBO until a human books it. The one daily, human-free source that saw the Hoppe deposit is the Hermes job "WTB Daily Bank CSV -> GTR Drive" (id 812546ea9b36, cron `0 18 * * *`, skill `wtb-daily-bank-export`, runner `wtb_browser_export.py`). Its CSV carries `Bank Reference`, the stable per-deposit id (`docs/WTB-CHECK-IMAGES.md:76`), plus the bank's own per-day OPENING/CLOSING LEDGER and TOTAL CREDITS/DEBITS control rows (`docs/BANK-DATA-SOURCES.md:52-54`). A credit row looks like `08/24/2026,...,OTHER DEPOSITS,174,13447.68,Cleared,Credit,26236015002406,,DEPOSIT - DDA/MMKT ,OTHER DEPOSITS,`.
+
+Recommendation: amend decision 3 to "QBO API for money out; WTB daily CSV credits for money in". Keep the daily CSV job. Do NOT retire it to monthly. This is Decision 1 for Justin below.
+
+The weekly job "WTB weekly check + deposit images -> ProBuild" (b1335f646864, Sundays 10:00) stays weekly. It needs a live human bank session, both runs so far are BLOCKED, and it only adds payer names for mobile-deposited checks; a branch-deposited check yields only a teller receipt, never the payer (`docs/WTB-CHECK-IMAGES.md:50-58`). The sweep treats images as optional corroboration and must never depend on that job. Making it daily would add a daily human dependency to a pipeline whose whole point is running without one.
+
+## Key finding 2: the disambiguator is "requested", and the field is `qbInvoiceSentAt`
+
+`src/lib/deposit-attribution.ts:457-473` treats the Hoppe deposit as a conflict: three Pending milestones (Rough In, Drywall, Tile) at exactly $13,447.68. But only ONE was actually requested from the client. The invariant "due means requested" (#289/#290) already exists in this repo, and the request marker is `PaymentSchedule.qbInvoiceSentAt` (`prisma/schema.prisma:703`): billing-core stamps it only after the client email actually goes out, and calls it "the rail-neutral request marker" outright (`src/lib/billing-core.ts:546-556` whole-invoice path, `:1006` milestone path). `qbInvoiceId` (schema:699) alone is NOT a request: a QBO invoice can be created and never emailed, or survive a failed email.
+
+So, correcting the first draft: candidates require `qbInvoiceSentAt != null`. A `qbInvoiceId`-only milestone is excluded from candidates. Auto-apply additionally requires `qbInvoiceId != null` (the QBO write path needs the linked invoice). There is NO `lastEmailedAt` column on PaymentSchedule; that name is only a UI projection of `qbInvoiceSentAt` in `src/lib/billing-core.ts:117,166`. With this predicate the Hoppe deposit resolves to the one requested milestone; the shadow week (Phase A) confirms the prod row actually carries the stamp before anything goes live.
+
+## Design
+
+### Ingress: extend deposit-ingest, one POST per day
+
+Extend `POST /api/payments/deposit-ingest` with a `source: "bank"` payload variant rather than adding a parallel endpoint. Justification: the route already owns the crash-safe state machine (route.ts:17-57), the milestone reservation (partial unique index, `scripts/apply-deposit-ingest-schema.mjs:70`), the QBO idempotent create (`depositRequestId`, route.ts:698; `sendQBPaymentCreateRequest`, `src/lib/quickbooks.ts:505`), the settle (`recordPaymentCore` call at route.ts:454, `settleMilestoneFromQBPayment` at `src/lib/quickbooks-payments.ts:462`), and the one-task-per-row OfficeTask filing (`ensureReviewTask`, route.ts:624). Same auth (`DEPOSIT_INGEST_SECRET` bearer, route.ts:331-346); `/api/payments/*` is in the proxy bypass (`src/proxy.ts:228`), so the in-handler check is the sole gate and stays fail-closed.
+
+The bank variant is ONE POST per day carrying the COMPLETE day's Credit rows plus the CSV's own control totals: `{ source: "bank", postDate, credits: [{ bankReference, amount, transactionDetail, customerReference }...], creditCount, creditSum, dryRun? }`, where creditCount/creditSum come from the CSV's ledger/total rows (`docs/BANK-DATA-SOURCES.md:52-54`). The endpoint rejects the whole batch (400, nothing written) if the credit count or sum does not match what the rows add up to. It then preflights the batch BEFORE any money write, in two steps:
+
+1. Replay resolution first. A credit whose `bankReference` already has a DepositIngest row is a replay of that row, not a new deposit: a terminal row returns its outcome (e.g. alreadyApplied), a `proposed` row is re-evaluated now (it may have aged past the wait rule below), and a non-terminal stale row is reclaimed per the existing lease rules (route.ts:237-270). Replays are EXCLUDED from collision classification.
+2. Collision detection on what remains. A collision is a DIFFERENT bankReference, in the batch or already stored, with the same `postDate` and `amountCents`. Both credits go to a human.
+
+Per-credit idempotency: `fileId = "bank:<bankReference>"`, fitting the existing `@unique` (schema:745) and the 200-char cap (route.ts:127). ONE bank credit = ONE DepositIngest row = ONE payment ever; `depositRequestId` hashes the full fileId, so QBO requestids can never collide with a Drive-file deposit. `postDate` and `amountCents` are persisted as real columns for rows of BOTH sources (see Schema change) so the preflight and the cross-source claim check are queries, not JSON scans.
+
+### Matching for bank rows
+
+Bank rows carry no project name and no check number, so two photo-path rules change, for bank rows ONLY:
+
+1. Project-first matching (route.ts:377-407) is skipped. There is nothing to fuzzy-match. The candidate query (photo version at route.ts:409-412) runs across ALL projects: `status: "Pending"`, `qbInvoiceSentAt != null`, invoice in `OPEN_INVOICE_STATUSES` (route.ts:61), amount equal to the cent.
+2. Missing `checkNumber` is not `unmatched` (photo rule at route.ts:370-371). A bank row has no check number by construction. `referenceNumber` / `PaymentRefNum` becomes the bank reference; that is the instrument-traceability the field exists for, and it is what Vanessa sees in the feed. `checkDate` = the CSV `Post Date`, validated by `isValidCheckDate` (route.ts:703).
+
+Uniqueness is taken over a UNION, not just Pending rows. The candidate count = requested Pending milestones at the amount PLUS any milestone at that amount settled recently by ANY source (`status: "Paid"` with `paymentDate >= postDate - 14 days`). Auto-apply only when that union is exactly one milestone, it is Pending, and it has `qbInvoiceId != null`. Anything else files for a human. This NARROWS the cross-path race with the photo path; it does not close it (Codex round 2), because the union only sees already-Paid milestones, and the photo path's candidates do not require `qbInvoiceSentAt` (route.ts:409-412), so a photo naming project X could reserve an unrequested Pending milestone while the sweep reserves the sole requested one elsewhere. Two more guards attack exactly that window:
+
+- Cross-source claim check, BOTH paths, inside the same transaction as the milestone reservation. Before reserving, query DepositIngest for any OTHER row (either source, different fileId) with the same `amountCents` and a `postDate` within 14 days whose status is in processing, qbo_unknown, qbo_created, applied, or proposed. If one exists, `finalizeUnmatched` with a message naming that row (its fileId or bankReference, its reserved milestone, its date). Photo rows populate `amountCents` (from `payload.amount`) and `postDate` (from `checkDate`) so both directions of the query work.
+- Bank rows wait. A bank credit is eligible for LIVE auto-apply only when `postDate <= today - 2 days`. Younger credits are held in the `proposed` state and re-evaluated by the next daily POST (identical-reference replay resolves proposed rows, see the preflight). Rationale: the photo path carries a project name, so it gets first dibs on a fresh check. Hoppe would still have auto-applied on 2026-08-26 instead of never. Dry-run ignores the wait.
+
+Residual race after the union rule plus both guards: two sources claiming the same amount inside 14 days with no row yet written by either. That residual is escalated, not hidden: see Decision 2.
+
+Further guards, all routed to `finalizeUnmatched` (route.ts:603) with every candidate listed in the OfficeTask notes:
+
+- Payer corroboration: reuse `attributeDeposit()` (`src/lib/deposit-attribution.ts:244`) as a pure pre-check with the candidates mapped to `MilestoneCandidate`. Image evidence is selected by identity, not by window, and the key carries a side suffix: `scripts/post-bank-images.mjs:105` stores `sourceExternalId` as `` `${ref}:${side}` `` (e.g. `26236015002406:front`) under `source = "WTB_ONLINE"` (`post-bank-images.mjs:29`), so the lookup is `source = "WTB_ONLINE"` AND `sourceExternalId` starts with `bankReference + ":"` (`BankImage` at `prisma/schema.prisma:2939`, `@@unique([source, sourceExternalId])` at :2976). Amount and date are then verified against the credit. Zero payer-bearing images = no evidence, proceed on the union rule. Two or more payer-bearing images for one reference = conflict -> human. Any `conflict` confidence from `attributeDeposit` -> unmatched with its `reason` verbatim; `namesAgree` (deposit-attribution.ts:217-242) already encodes the wrong-family guards.
+- Already-booked-in-QBO protection needs no new code: `buildQBPaymentRequest` (quickbooks.ts:455) rejects on `balance-mismatch` (line 483) when the QBO invoice balance no longer equals the amount, i.e. when Marge already booked a payment. A guard failure, not a duplicate.
+
+### Money write: unchanged path plus one option
+
+Exactly the existing chain: `buildQBPaymentRequest`, persist the exact bytes, `sendQBPaymentCreateRequest` with the row's requestid, then `settleMilestoneFromQBPayment` (settles both mirror sides via `sourceScheduleId`, schema:708), with the notification going through the outbox. One extension: `buildQBPaymentRequest` today sets no `DepositToAccountRef` (quickbooks.ts:486-492), so payments land in the QBO default (Undeposited Funds, per `docs/DEPOSIT-PIPELINE.md:48` M2). Add an optional `depositToAccountId` to its `opts`, passed only by the bank branch, set to the Washington Trust Bank account (QBO Account Id 154, matching the two prior Hoppe payments and the 2026-09-02 manual one). Photo-path behavior unchanged. This is Decision 3 for Justin.
+
+### Notifications: explicit receipt suppression, not the back-date rule
+
+Correcting the first draft: `isBackdatedPayment` suppresses only when the payment date is MORE than `BACKDATED_RECEIPT_CUTOFF_DAYS = 3` days old (`src/lib/payment-date.ts:26`, doc at :46-49), so a sweep payment 1 day after the deposit WOULD email the client a receipt for a bank credit no human has looked at. Grep confirms no existing suppress option anywhere in the chain: `enqueueMilestonePaid` takes only `{ scheduleId, scheduleType }` (`src/lib/payment-outbox.ts:39-51`), the callers pass nothing else (`src/lib/payment-record-core.ts:137`, `src/lib/quickbooks-payments.ts:481`), and `PaymentNotification` (schema:2544) has no such column. So add ONE optional flag end to end: `suppressClientReceipt?: boolean` on `recordPaymentCore`'s input (payment-record-core.ts:19) and `settleMilestoneFromQBPayment`'s input (quickbooks-payments.ts:462), passed only by the bank branch; carried into `enqueueMilestonePaid` and persisted as a nullable Boolean on the PaymentNotification row (delivery is async, so it must survive on the row); `deliver()` (payment-outbox.ts:53-61) hands it to `notifyMilestonePaid`'s opts, consulted next to `isBackdatedPayment` at `src/lib/payment-notifications.ts:175` and `:294`. The team email and activity log still fire. The single-writer rule holds: no new notifier, one new field read by the existing one.
+
+### Dedup with the photo path
+
+Three mechanisms, because the paths can collide before, during, or after a reservation:
+
+- Before: the cross-source claim check above stops the second path from reserving a DIFFERENT milestone for the same money while the first is in flight or applied.
+- During (concurrent, same milestone): the partial unique index still arbitrates. The P2002 loser (route.ts:426-428) writes an order-specific reason using the winning row's `source` and `bankReference`.
+- After (sequential, the common case): once one path settles, the milestone is Paid, so the other path's `status: "Pending"` query finds nothing and would file a generic scary task. So BEFORE the generic zero-match message, both branches look up `DepositIngest` rows with `status: "applied"`, the same `amountCents`, and `postDate` within 14 days, either source. Photo-first order: the bank row's task says "likely the same check already applied from a deposit photo (file <fileId>) on <date>. Verify, then archive this task." Bank-first order: the photo row's task says "already applied by the deposit sweep from bank ref <bankReference> on <date>. Verify, then archive this task." The photo path gains one pre-reserve query and one message lookup; its matching rules are untouched.
+
+### Ops
+
+- The Hermes daily job (812546ea9b36) POSTs the day's credit batch after filing the CSV; the runner change is a real deliverable (Goal 7). The daily-job watchdog (90e8ef10c81d) already covers the job itself.
+- The job appends one line to its Bot Health report: `deposit sweep: N credits, A applied, H need-human, S already-applied`, built from the endpoint response.
+- No new Vercel cron. The sweep is push-driven, matching the photo path's push model. `vercel.json` unchanged.
+
+## Rollout gate
+
+- Phase A (shadow, 1 week): Hermes POSTs with `dryRun: true`. The endpoint runs the full preflight and match but stops before any money boundary, writing bank rows in a new bank-only status `proposed` (terminal to the bot, never enters the retry loop) with the would-apply milestone recorded. Bot Health shows would-apply vs needs-human counts. Justin compares against QBO for the week.
+- Phase A exit gate: shadow POSTs observed as `DepositIngest` rows with `source = "bank"` for 5 consecutive days, control totals passing, before Phase B.
+- Phase B (live): flip `dryRun` off in the Hermes job as its own step (Goal 7). `proposed` rows are re-evaluated by the next daily POST's replay resolution, subject to the 2-day wait rule.
+- Phase C (later, optional): surface `proposed` and bank-sourced `unmatched` rows in the existing `/automation` deposit review panel (`src/app/automation/components/deposit-review.tsx`, `src/lib/deposit-review.ts`). Not in this PR.
+
+## Schema change (small, additive)
+
+`DepositIngest` (schema:743): add nullable `source String?` (null means photo), `bankReference String?`, `postDate DateTime? @db.Date`, `amountCents Int?`, an index on `(postDate, amountCents)` for the preflight and the claim check, and an index on `bankReference`. `postDate` and `amountCents` are written for BOTH sources (photo rows: amount from the payload, date from `checkDate`) so the cross-source claim check works in both directions. `PaymentNotification` (schema:2544): add nullable `suppressClientReceipt Boolean?`. No change to `fileId` semantics beyond the `bank:` prefix convention. Ship as BOTH a new `scripts/apply-deposit-sweep-schema.mjs` (IF NOT EXISTS, run against prod before merge) AND a matching `prisma/migrations/` entry, per CLAUDE.md "Schema migrations" and the apply-script/migration parity lesson. Never edit the baseline or the spent DDL in `apply-deposit-ingest-schema.mjs`. Never import an apply script to inspect it; read it as text.
+
+## Work breakdown (executor-sized goals, one PR)
+
+1. Schema: `scripts/apply-deposit-sweep-schema.mjs` + matching migration + `prisma/schema.prisma` changes (DepositIngest `source`, `bankReference`, `postDate`, `amountCents`, both indexes; PaymentNotification `suppressClientReceipt`). Update the DepositIngest doc comment (schema:727-742). Run the apply script against prod before merge.
+2. Batch ingress: in `src/app/api/payments/deposit-ingest/route.ts`, accept the `source: "bank"` daily-batch payload (postDate, credits[], creditCount, creditSum, dryRun); verify control totals (400 on mismatch, nothing written); replay resolution first, then collision detection on non-replays (different bankReference, same postDate + amountCents); then per-credit rows with `fileId = "bank:" + bankReference` and persisted `postDate`/`amountCents`. Photo validation untouched.
+3. Bank matching: a new match function beside `matchAndApply` (route.ts:350) implementing the requested-only candidate query, the 14-day Paid union rule, the cross-source claim check inside the reservation transaction, the 2-day wait rule (skipped under dryRun), the `attributeDeposit` corroboration pre-check with `WTB_ONLINE` prefix-keyed images, the qbInvoiceId-required auto-apply gate, and the `proposed` state. Reuse `finalizeUnmatched`, `finalizeReconcile`, and the reservation write verbatim.
+4. Photo path cross-source claim check: one pre-reserve query added inside the same transaction as the reservation (route.ts:421-430), plus writing `amountCents`/`postDate` on photo rows; matching rules untouched.
+5. Money write + receipt suppression: optional `depositToAccountId` on `buildQBPaymentRequest` (`src/lib/quickbooks.ts:455`, mock branch at :471 too); `PaymentRefNum`/`referenceNumber` carry the bank reference; `suppressClientReceipt` plumbed through `recordPaymentCore` (payment-record-core.ts:19), `settleMilestoneFromQBPayment` (quickbooks-payments.ts:462), `enqueueMilestonePaid` (payment-outbox.ts:39), the PaymentNotification row, and `notifyMilestonePaid` (payment-notifications.ts:175). Extend `quickbooks-mock.ts` so tests can assert `DepositToAccountRef` round-trips.
+6. Dedup messaging: the applied-row lookup before the generic zero-match message in BOTH branches, plus the enriched P2002 loser reason (route.ts:426-428) and `createDepositReviewTask` notes (route.ts:649).
+7. Hermes runner change (real deliverable, lives outside this repo): edit the `wtb-daily-bank-export` skill/runner on job 812546ea9b36 (profile gtr-books) in a separate Claude session; owner: Justin's Hermes profile. After filing the CSV it POSTs the full-day credit batch with the bearer secret and appends the Bot Health line. Retry behavior: a failed POST is a job failure, so watchdog 90e8ef10c81d fires; never a partial-day POST. The `dryRun` flip for Phase B is its own step, gated on the Phase A exit gate.
+8. Tests (below), then Codex code review (money path, mandatory), max two rounds.
+9. Docs: update `docs/DEPOSIT-PIPELINE.md` with the bank source and state machine additions; add the decision-3 amendment to `docs/plans/RECEIPT-PIPELINE-V2-PLAN.md` once Justin confirms.
+
+## Acceptance criteria
+
+Technical (all must pass):
+
+- Unit tests (pattern: `tests/deposit-attribution.test.ts`): the requested filter makes the Hoppe equal-thirds case unique (only one of three has `qbInvoiceSentAt`); a `qbInvoiceId`-only milestone is NOT a candidate; three requested same-amount milestones -> human; the union rule: one Pending requested milestone plus one same-amount milestone Paid 3 days ago -> human, Paid 20 days ago -> auto-apply eligible; cross-source claim check: a photo row claimed yesterday at the amount -> the bank row goes to a human, and the reverse; the wait rule: a credit with postDate yesterday -> `proposed`, not applied; two same-day same-amount credits in one batch -> both human; an image stored with the `:front` suffix is found by the prefix lookup; control-total mismatch -> 400, nothing written; a credit missing bankReference -> rejected.
+- E2E (extend `e2e/deposit-ingest.spec.ts`, QBO mock): the same bank reference POSTed twice yields one QBO payment, the replay returns alreadyApplied and is NOT classified as a collision; two different references, same day, same amount -> both human; photo-then-bank produces the "already applied from a deposit photo" task text and bank-then-photo produces the "already applied by the deposit sweep from bank ref X" text (sequential orders, via the applied-row lookup); `dryRun` writes `proposed` and creates no QBO payment; a pre-booked QBO invoice (balance mismatch) creates no duplicate payment.
+- Auth: missing or wrong bearer -> 401; `DEPOSIT_INGEST_SECRET` unset -> 401 (fail closed), for the bank variant too.
+- Receipt suppression: a bank settle with postDate 2 days ago sends NO client receipt; the team email still goes (assert via the outbox row's `suppressClientReceipt` and the notifier, payment-notifications.ts:175).
+- `e2e/money-pipeline.spec.ts` unchanged and green. `npm run build` passes with 0 errors. CI `migrations` job green (apply script and migration produce identical DDL).
+
+VISUAL (deployed preview, screenshot-verifiable):
+
+- The /tasks board shows an OfficeTask titled "Deposit needs review (unmatched): ..." for an ambiguous bank credit, and its notes list every candidate milestone with project name and invoice code.
+- After a live sweep apply, the project invoices page shows that milestone as Paid with the bank reference as its reference number.
+- The /automation deposit review panel still renders photo-path rows unchanged (no regression from the new columns).
+
+## Risks
+
+- Irreversible money write: a wrong auto-apply creates a real QBO Payment. Mitigations: requested + union + claim-check + wait-rule + collision guards, qbInvoiceId-required, the balance-mismatch guard, and the shadow week with its 5-day exit gate. Reversal is a manual QBO delete plus milestone unsettle, same as the photo path today.
+- The cross-path race is narrowed, not closed. The residual: two sources claiming the same amount inside 14 days with no row yet written by either. The wait rule makes that window require a photo arriving 2+ days late AND losing the timestamp race; the shadow week measures how often same-amount claims actually occur. Escalated in Decision 2.
+- Amount-only matching stays the weakest tier (`src/lib/deposit-attribution.ts:5-9` documents the $60k near-miss). Second residual: two customers whose only same-amount milestones sit outside the 14-day window; the window length is a tunable the shadow week can inform.
+- The Hermes CSV is browser automation against WTB. A layout change makes the sweep silently see no credits. The watchdog covers job failure; the control totals and the Bot Health count line cover "ran but wrong".
+
+## Decisions for Justin (max 3)
+
+1. Amend RECEIPT-PIPELINE-V2 decision 3: QBO API for money out; WTB daily CSV credits stay daily as the money-in trigger. Recommended: yes. The QBO API cannot see unbooked deposits.
+2. Live auto-apply vs suggest-only. Codex's stance: "amount-only, no payer evidence should never live auto-apply", and after round 2 Codex still recommends suggest-only for payer-less credits. But branch deposits never carry a payer (`docs/WTB-CHECK-IMAGES.md:50-58`), so that rule means suggest-only forever for nearly every check. The plan's position: the union rule, the cross-source claim check, and the 2-day wait NARROW the race to one residual (two sources claiming the same amount inside 14 days with no row yet written by either); they do not close it. The plan recommends live auto-apply after the shadow week; Justin decides after seeing the shadow week's numbers, including how often same-amount claims occurred.
+3. `DepositToAccountRef` = the WTB bank account (QBO Id 154) directly, vs Undeposited Funds per `docs/DEPOSIT-PIPELINE.md:48`. Recommended: the bank account. All three Hoppe payments used it, and Vanessa matches the feed line to the payment, not to a deposit batch.
+
+## Out of scope
+
+Worklist UI (Phase C), Lowe's/Amazon receipt sourcing, a QBO register cron for money out, the photo path's matching rules (only a pre-reserve claim check and a zero-match message are added), and making the weekly image job daily.
+
+## Codex review round 1
+
+- F1 (amount-only auto-apply, cross-path race): Partially accepted. Race narrowed, not closed: the 14-day Paid union rule, plus the round-2 claim check and wait rule; residual escalated to Decision 2.
+- F2 (billed predicate wrong): Accepted. Candidates require `qbInvoiceSentAt`; `qbInvoiceId`-only excluded; auto-apply needs both (Key finding 2, unit tests).
+- F3 (collision guard cannot work per-credit): Accepted. One batch POST per day with CSV control totals and a batch-wide preflight; `postDate`/`amountCents` become indexed columns (Ingress, Schema change).
+- F4 (back-date rule does not suppress a 1-day-old receipt): Accepted. Explicit `suppressClientReceipt` flag through the existing outbox, no new notifier (Notifications).
+- F5 (no production trigger in the PR): Accepted. Goal 7 is now a real deliverable with owner, retry semantics, a separate dryRun flip step, and a 5-day Phase A exit gate (Rollout gate).
+- F6 (dedup message unreachable after a sequential settle): Accepted. Applied-row lookup before the generic zero-match message, both orders defined (Dedup).
+- F7 (image selection had no cardinality rule): Accepted. Images selected by identity with an explicit zero/2+ cardinality rule (Matching; key format corrected in round 2, R2).
+
+## Codex review round 2
+
+- R1 (race not closed by the union rule; concurrent reservations of DIFFERENT milestones; photo candidates need no `qbInvoiceSentAt`): Partially accepted. Added the cross-source claim check in both paths (inside the reservation transaction, with `amountCents`/`postDate` written for both sources) and the 2-day wait rule for bank credits; all "race is closed" claims removed; the residual is stated in Risks and escalated in Decision 2. Payer evidence still not required (branch deposits have none); that stays Justin's call.
+- R2 (image lookup by bare bankReference finds nothing): Accepted. `scripts/post-bank-images.mjs:105` stores `sourceExternalId` as `` `${ref}:${side}` `` under `source = "WTB_ONLINE"` (:29); the lookup is now source-equality plus a `bankReference + ":"` prefix match, with a unit test for the `:front` suffix.
+- R3 (existing-row collision rule contradicted identical-reference replay): Accepted. The preflight resolves replays first (terminal returns its outcome, `proposed` re-evaluates, stale reclaims) and excludes them from collision classification; a collision is a DIFFERENT bankReference with the same postDate and amountCents.
