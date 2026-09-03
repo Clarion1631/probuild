@@ -337,9 +337,36 @@ export interface ClockOutTimeEntryRow {
     reviewReason: string | null;
     /** Skip-lunch request state (PENDING | APPROVED | DENIED | null) — feeds the meal rule. */
     mealSkipStatus?: string | null;
+    /** Row version. Present on the real (full-row) read; only the in-transaction snapshot's copy is load-bearing. */
+    updatedAt?: Date;
 }
 
-/** Bad input discovered only once the STORED startTime is known, inside the close transaction. */
+/**
+ * The entry as it ACTUALLY is at write time: re-read inside the close
+ * transaction, under the FOR UPDATE row lock taken by acquirePayrollLocks().
+ *
+ * Every clock-out decision derives from this, never from the copy read before
+ * the transaction. A concurrent PATCH can move the punch to another project
+ * (logistics notes suddenly required), hand it to another worker (attestations
+ * are no longer the closer's to answer, and a manager stamp is now owed),
+ * approve a meal skip, or compose a review reason onto it — all in the window
+ * between the handler's first read and the write. Re-reading only `startTime`
+ * left every one of those decisions running on stale data.
+ */
+export interface ClockOutStoredSnapshot {
+    id: string;
+    userId: string;
+    projectId: string;
+    startTime: Date;
+    endTime: Date | null;
+    notes: string | null;
+    reviewReason: string | null;
+    mealSkipStatus: string | null;
+    /** Row version for the closing compare-and-set — ANY concurrent write bumps it. */
+    updatedAt: Date;
+}
+
+/** Bad input discovered only once the STORED row is known, inside the close transaction. */
 class ClockOutInputError extends Error {
     readonly status: number;
     readonly code?: string;
@@ -353,6 +380,9 @@ class ClockOutInputError extends Error {
 
 /** Client clock skew allowance for a supplied endTime — see the PUT handler. */
 const CLOCK_OUT_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+/** One string for the pre-transaction fail-fast and the authoritative in-transaction check. */
+const LOGISTICS_NOTES_REQUIRED_MESSAGE = "Notes are required to clock out of a logistics job";
 
 export interface ClockOutDependencies {
     authenticate(req: Request): Promise<ClockOutAuthResult>;
@@ -399,13 +429,15 @@ export interface ClockOutDependencies {
         id: string,
         userId: string,
         /**
-         * Builds the update from the entry's STORED startTime, read inside the
-         * transaction. Duration, the meal deduction and both costs all derive
-         * from that instant, so computing them from a value read before the
-         * transaction would price a shift that had since been moved.
+         * Builds the update from the entry's STORED row, re-read inside the
+         * transaction under FOR UPDATE. Duration, the meal deduction, both
+         * costs, the logistics-notes requirement, authorization, the
+         * attestation scrubbing and the manager-edit stamp all derive from it,
+         * so computing any of them from values read before the transaction
+         * would decide a punch that had since been moved.
          */
         buildData: (
-            storedStartTime: Date,
+            stored: ClockOutStoredSnapshot,
             lockedOwner: {
                 name: string | null;
                 email: string;
@@ -450,24 +482,23 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // UI sends it only from its explicit "close at $0" control, so a
             // silent $0 close can never be the default outcome.
             const acknowledgeZeroRate = body.acknowledgeZeroRate === true;
-            // Attestations are the WORKER's word: a manager closing someone
-            // else's punch cannot answer the lunch/rest questions for them —
-            // those land as "no answer" and get the review flag instead.
-            let mealSkipped: unknown = body.mealSkipped;
-            let restBreaksMissed: unknown = body.restBreaksMissed;
 
             if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
 
             const existing = await dependencies.findTimeEntry(id);
             if (!existing) return NextResponse.json({ error: "Time Entry not found" }, { status: 404 });
 
+            // Fail-fast. Re-decided inside the close transaction against the
+            // row-locked snapshot (buildData), because a reassignment in the
+            // meantime changes who may close this punch. Attestations are the
+            // WORKER's word — a manager closing someone else's punch cannot
+            // answer the lunch/rest questions for them, so those land as "no
+            // answer" and get the review flag instead. That scrubbing is
+            // likewise done from the snapshot, not from here.
             if (existing.userId !== user.id && user.role !== "MANAGER" && user.role !== "ADMIN") {
                 return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
             }
-            if (existing.userId !== user.id) {
-                mealSkipped = undefined;
-                restBreaksMissed = undefined;
-            }
+            const preMealSkipped: unknown = existing.userId === user.id ? body.mealSkipped : undefined;
 
             // A closed entry can never be re-closed via PUT — the client must
             // use the PATCH edit flow to change an already-set endTime.
@@ -530,24 +561,32 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // cost-code/estimate-item context on the entry, so notes are the
             // only record of what was actually done — require one (already on
             // the entry, or supplied in this request).
-            const isLogistics = await dependencies.findProjectIsLogistics(existing.projectId);
-            const logisticsCheck = checkLogisticsClockOutNotes({
-                isLogistics,
+            //
+            // Fail-fast ONLY. The authoritative version of this check runs
+            // again inside the close transaction, against the row-locked
+            // snapshot (see buildData): a manager moving this punch onto a
+            // logistics project between here and the write would otherwise
+            // close it with no notes at all, because nothing downstream ever
+            // looked at the entry's project again.
+            const suppliedNotes = typeof notes === "string" ? notes : undefined;
+            const preLogistics = await dependencies.findProjectIsLogistics(existing.projectId);
+            const preLogisticsCheck = checkLogisticsClockOutNotes({
+                isLogistics: preLogistics,
                 settingEndTime: true,
                 existingNotes: existing.notes,
-                suppliedNotes: typeof notes === "string" ? notes : undefined,
+                suppliedNotes,
             });
-            if (!logisticsCheck.ok) {
+            if (!preLogisticsCheck.ok) {
                 return NextResponse.json(
-                    { error: "Notes are required to clock out of a logistics job", code: "LOGISTICS_NOTES_REQUIRED" },
+                    { error: LOGISTICS_NOTES_REQUIRED_MESSAGE, code: "LOGISTICS_NOTES_REQUIRED" },
                     { status: 400 }
                 );
             }
 
             // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
             // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
-            const closerIsOwner = existing.userId === user.id;
-            const owner = closerIsOwner
+            const preCloserIsOwner = existing.userId === user.id;
+            const owner = preCloserIsOwner
                 ? { ...user, name: null as string | null }
                 : await dependencies.findOwnerRates(existing.userId);
             if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
@@ -562,19 +601,31 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             // the row-locked owner inside the close transaction (see buildData):
             // a rate import committing in between would otherwise let a $0 shift
             // through on the strength of a stale read.
-            const acknowledged = canAcknowledgeZeroRate(user, existing.userId) && acknowledgeZeroRate;
-            if (zeroRateBlocks(owner) && !acknowledged) {
-                return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
+            const preAcknowledged = canAcknowledgeZeroRate(user, existing.userId) && acknowledgeZeroRate;
+            if (zeroRateBlocks(owner) && !preAcknowledged) {
+                return zeroRateBlockedResponse({ closerIsOwner: preCloserIsOwner, ownerName: owner.name });
             }
 
-            // EVERYTHING below derives from the entry's STORED startTime, which
-            // is read inside the close transaction under FOR UPDATE and handed
-            // to this builder. Duration, the WA meal deduction and both costs
-            // are all functions of that instant, so computing them out here
-            // from a value read before the transaction would price a shift that
-            // had since been moved to another day.
+            // Settlement rides inside the close transaction and reads the
+            // worker's attestation. buildData recomputes that from the
+            // row-locked snapshot, so the value it settles with is written here
+            // (buildData always runs before settleDayWithinTx in the same
+            // transaction) rather than frozen from the pre-transaction read.
+            const settleClosing: { id: string; mealSkipped: unknown } = {
+                id: existing.id,
+                mealSkipped: preMealSkipped,
+            };
+
+            // EVERYTHING below derives from the entry's STORED row, which is
+            // re-read inside the close transaction under FOR UPDATE and handed
+            // to this builder. Duration, the WA meal deduction, both costs, the
+            // logistics-notes requirement, authorization, the attestation
+            // scrubbing and the manager-edit stamp are all functions of that
+            // snapshot, so deciding any of them out here from a value read
+            // before the transaction would judge a punch that had since been
+            // moved to another day, another project, or another worker.
             const buildData = async (
-                storedStart: Date,
+                stored: ClockOutStoredSnapshot,
                 lockedOwner: {
                     name: string | null;
                     email: string;
@@ -584,6 +635,47 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     burdenRate: number;
                 }
             ): Promise<Record<string, unknown>> => {
+                const storedStart = stored.startTime;
+
+                // ── Authorization, re-decided on the locked row ─────────────
+                // The pre-transaction check ran against the entry's owner as it
+                // was THEN. A reassignment in between changes who may close
+                // this punch, whose word the attestations are, and whether a
+                // manager-edit stamp is owed.
+                const closerIsOwner = stored.userId === user.id;
+                if (!closerIsOwner && user.role !== "MANAGER" && user.role !== "ADMIN") {
+                    throw new ClockOutInputError(403, "Unauthorized to edit this entry");
+                }
+                // Attestations are the WORKER's word: a manager closing someone
+                // else's punch cannot answer the lunch/rest questions for them.
+                const storedMealSkipped: unknown = closerIsOwner ? body.mealSkipped : undefined;
+                const storedRestBreaksMissed: unknown = closerIsOwner ? body.restBreaksMissed : undefined;
+                // The settlement that runs later in THIS transaction must see
+                // the same answer this update is built from.
+                settleClosing.id = stored.id;
+                settleClosing.mealSkipped = storedMealSkipped;
+
+                const acknowledged = canAcknowledgeZeroRate(user, stored.userId) && acknowledgeZeroRate;
+
+                // ── Logistics notes, re-decided on the locked row ───────────
+                // THE authoritative check. A manager moving the punch onto a
+                // logistics project after the fail-fast above would otherwise
+                // let it close with no record of what was actually done.
+                const isLogistics = await dependencies.findProjectIsLogistics(stored.projectId);
+                const logisticsCheck = checkLogisticsClockOutNotes({
+                    isLogistics,
+                    settingEndTime: true,
+                    existingNotes: stored.notes,
+                    suppliedNotes,
+                });
+                if (!logisticsCheck.ok) {
+                    throw new ClockOutInputError(
+                        400,
+                        LOGISTICS_NOTES_REQUIRED_MESSAGE,
+                        "LOGISTICS_NOTES_REQUIRED"
+                    );
+                }
+
                 // THE authoritative $0 check: the owner as they are right now,
                 // row-locked in this transaction. The pre-read above is only a
                 // fail-fast — a rate set to $0 between it and here has to be
@@ -614,15 +706,15 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 // worked-through attestation covers it. durationHours is PAID hours
                 // (what payroll/export/summary read); shiftHours keeps the raw span.
                 const dayEntries = await dependencies.findDayEntries(
-                    existing.userId,
+                    stored.userId,
                     toCompanyDayKey(storedStart),
-                    existing.id
+                    stored.id
                 );
                 const meal = computeMealDeduction({
                     dayEntries,
                     closing: { startTime: storedStart, endTime: end },
-                    mealSkipped,
-                    mealSkipStatus: existing.mealSkipStatus ?? null,
+                    mealSkipped: storedMealSkipped,
+                    mealSkipStatus: stored.mealSkipStatus ?? null,
                     // Intermediate close (meal break / Switch Task / duplicate cleanup):
                     // nothing settles here — see wa-breaks.ts MealDeductionInput.deferMeal.
                     deferMeal: deferMeal === true,
@@ -651,17 +743,18 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 // flag, so the worked-through attestation is not applied on top of it
                 // (the outcome column still says WAIVED_APPROVED for the audit trail).
                 const mealWaiver = applyMealSkippedWaiver({
-                    mealSkipped: meal.outcome === "WORKED_THROUGH" ? true : mealSkipped === false ? false : undefined,
+                    mealSkipped:
+                        meal.outcome === "WORKED_THROUGH" ? true : storedMealSkipped === false ? false : undefined,
                     settingEndTime: true,
-                    existingReviewReason: existing.reviewReason,
+                    existingReviewReason: stored.reviewReason,
                 });
                 Object.assign(updateData, mealWaiver);
                 // Rest-break attestation composes onto the same reviewReason string
                 // (rest breaks are paid — this only ever documents and flags).
                 const rest = applyRestBreakAttestation({
-                    restBreaksMissed,
+                    restBreaksMissed: storedRestBreaksMissed,
                     settingEndTime: true,
-                    existingReviewReason: mealWaiver.reviewReason ?? existing.reviewReason,
+                    existingReviewReason: mealWaiver.reviewReason ?? stored.reviewReason,
                 });
                 Object.assign(updateData, rest);
                 // A deduction the worker was never asked about is flagged, never silent.
@@ -669,19 +762,19 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     updateData,
                     applyNoAttestationNotice({
                         outcome: meal.outcome,
-                        mealSkipped,
-                        existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
+                        mealSkipped: storedMealSkipped,
+                        existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? stored.reviewReason,
                     })
                 );
 
                 // Runs LAST so it composes onto whatever reason the meal/rest
                 // notices above already wrote, and cannot be overwritten by them.
                 if (zeroRate) {
-                    Object.assign(updateData, appendZeroRateReview(updateData.reviewReason ?? existing.reviewReason));
+                    Object.assign(updateData, appendZeroRateReview(updateData.reviewReason ?? stored.reviewReason));
                 }
 
                 if (user.role === "MANAGER" || user.role === "ADMIN") {
-                    if (existing.userId !== user.id) {
+                    if (!closerIsOwner) {
                         updateData.editedByManagerId = user.id;
                         updateData.editedAt = new Date();
                     }
@@ -704,7 +797,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                     expectedDayKey: toCompanyDayKey(existing.startTime),
                     // Settlement rides along in the same transaction (deferMeal
                     // closes settle nothing — the day settles on the final punch).
-                    settle: deferMeal !== true ? { closing: { id: existing.id, mealSkipped } } : null,
+                    settle: deferMeal !== true ? { closing: settleClosing } : null,
                 });
             } catch (error) {
                 if (error instanceof ClockOutInputError) {
@@ -834,13 +927,28 @@ const clockOutHandler = createClockOutHandler({
                     dayKeys: [dayLockKey(userId, guard.expectedDayKey)],
                 });
 
-                // The row, re-read under the FOR UPDATE taken above. Everything
-                // priced below derives from THIS instant.
+                // The row, re-read under the FOR UPDATE taken above. EVERY
+                // clock-out decision derives from this snapshot — not just the
+                // instant. Selecting only "startTime" here is what let a
+                // concurrent move to a logistics project close a punch with no
+                // notes: the requirement was decided against the project the
+                // entry used to be on.
                 const [stored] = (await client.$queryRawUnsafe(
-                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                    `SELECT "id", "userId", "projectId", "startTime", "endTime", "notes",
+                            "reviewReason", "mealSkipStatus", "updatedAt"
+                     FROM "TimeEntry" WHERE "id" = $1`,
                     id
-                )) as Array<{ startTime: Date }>;
+                )) as ClockOutStoredSnapshot[];
                 if (!stored) return { ok: false as const, current: null };
+
+                // Already closed by a concurrent writer. Answered here rather
+                // than left to the compare-and-set below, so the caller gets
+                // ALREADY_CLOCKED_OUT instead of whatever buildData would have
+                // objected to first on a row that is no longer closable.
+                if (stored.endTime != null) {
+                    const current = await t.timeEntry.findUnique({ where: { id } });
+                    return { ok: false as const, current };
+                }
 
                 // If it moved to a different day we hold the WRONG day lock, so
                 // settling would re-plan a day we never serialised. Bail and let
@@ -849,18 +957,36 @@ const clockOutHandler = createClockOutHandler({
                     return { ok: false as const, moved: true as const };
                 }
 
+                // Reassigned to another worker mid-flight: the day lock we hold
+                // and the settlement candidates we pinned are the OLD owner's,
+                // and the rates below would be read for the wrong person. Fail
+                // closed rather than settle a day we never serialised.
+                if (stored.userId !== userId) {
+                    return { ok: false as const, moved: true as const };
+                }
+
                 // The owner's rates, row-locked in THIS transaction. A rate
                 // import committing between the pre-read and here would
                 // otherwise be ignored and the shift stamped at a stale rate.
                 const lockedOwner = await readOwnerRatesForUpdate(client, userId, toNum);
                 if (!lockedOwner) return { ok: false as const, current: null };
-                const data = await buildData(stored.startTime, lockedOwner);
+                const data = await buildData(stored, lockedOwner);
 
-                // Compare-and-set on startTime as well as the open check: a
-                // concurrent edit that moved the punch within the same day
-                // would otherwise have its change priced away by this close.
+                // Compare-and-set on the whole row version, not just the open
+                // check: `updatedAt` moves on ANY concurrent write, so a punch
+                // reassigned, re-projected, re-noted or meal-skip-approved
+                // between the snapshot above and this write fails closed with a
+                // 409 instead of being closed on decisions made from a row that
+                // no longer exists. `startTime`/`userId` stay in the predicate
+                // as an explicit statement of what this update was priced from.
                 const claim = await t.timeEntry.updateMany({
-                    where: { id, userId, endTime: null, startTime: stored.startTime },
+                    where: {
+                        id,
+                        userId,
+                        endTime: null,
+                        startTime: stored.startTime,
+                        updatedAt: stored.updatedAt,
+                    },
                     data,
                 });
                 if (claim.count === 0) {

@@ -59,10 +59,28 @@ export const EXPECTED_SCHEMA = "public";
  * Every object this script is responsible for, WITH ITS DEFINITION.
  *
  * Presence is not correctness. An index can exist on the wrong columns, a CHECK
- * can be altered to something weaker, a column can come back nullable, RLS can
- * be switched off, and an object with the right name can be sitting in another
- * schema entirely — every one of those passes a bare "does it exist" test while
- * the guarantee it was written for is gone.
+ * can be altered to something weaker, a column can come back nullable, a DEFAULT
+ * can be dropped, RLS can be switched off, and an object with the right name can
+ * be sitting in another schema entirely — every one of those passes a bare
+ * "does it exist" test while the guarantee it was written for is gone.
+ *
+ * COMPLETENESS is the other half, and it is the half that failed. The list used
+ * to hold only the columns added by an `ALTER TABLE ... ADD COLUMN`, so
+ * everything a `CREATE TABLE` brought with it was unverified — including
+ * `PayrollPeriod.exportHash`, which src/lib/gusto-export-db.ts selects on every
+ * export, and every primary key and DEFAULT in this migration. A verification
+ * pass that does not name an object cannot report it missing, so the script
+ * would have printed "verified N/N" against a database with no exportHash
+ * column at all.
+ *
+ * The list is therefore the COMPLETE managed schema of
+ * prisma/migrations/20260901000000_payroll_phase5/migration.sql: every table,
+ * every column that migration creates (with type, nullability and default),
+ * every primary key, every index (with its columns and uniqueness), every
+ * CHECK/FK constraint, and every table it puts under RLS.
+ * tests/payroll-apply-script-parity.test.ts parses that migration and fails the
+ * build if anything it declares is absent here — so the list cannot drift
+ * behind the SQL it describes.
  *
  * Used two ways: `--dry-run` reports what is missing or drifted (and prints
  * "nothing to do" when nothing is), and the normal run verifies the same list
@@ -72,12 +90,30 @@ export const EXPECTED_SCHEMA = "public";
 export const EXPECTED_OBJECTS = [
     { kind: "column", table: "User", name: "lastRateSyncAt", type: "timestamp with time zone", nullable: true },
     { kind: "column", table: "User", name: "payType", type: "text", nullable: true },
-    { kind: "column", table: "User", name: "payrollRevision", type: "integer", nullable: false },
+    // NOT NULL DEFAULT 0: the rate-import signature is keyed on this counter, so
+    // a lost default would make every new row's revision NULL and the signature
+    // unbuildable.
+    { kind: "column", table: "User", name: "payrollRevision", type: "integer", nullable: false, default: "0" },
 
     { kind: "table", name: "PayrollPeriod" },
+    // The CREATE TABLE columns, not just the ALTER-added ones. exportHash is the
+    // case in point — selected by src/lib/gusto-export-db.ts and, until this
+    // list was completed, verified by nothing.
+    { kind: "column", table: "PayrollPeriod", name: "id", type: "text", nullable: false },
     { kind: "column", table: "PayrollPeriod", name: "periodStart", type: "timestamp with time zone", nullable: false },
     { kind: "column", table: "PayrollPeriod", name: "periodEnd", type: "timestamp with time zone", nullable: false },
     { kind: "column", table: "PayrollPeriod", name: "lockedAt", type: "timestamp with time zone", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "lockedById", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "exportHash", type: "text", nullable: true },
+    {
+        kind: "column",
+        table: "PayrollPeriod",
+        name: "createdAt",
+        type: "timestamp with time zone",
+        nullable: false,
+        default: "CURRENT_TIMESTAMP",
+    },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_pkey", contype: "p" },
     { kind: "column", table: "PayrollPeriod", name: "timeZone", type: "text", nullable: true },
     { kind: "column", table: "PayrollPeriod", name: "summaryCsvSnapshot", type: "text", nullable: true },
     { kind: "column", table: "PayrollPeriod", name: "detailCsvSnapshot", type: "text", nullable: true },
@@ -98,27 +134,43 @@ export const EXPECTED_OBJECTS = [
 
     // CHECK expressions, normalised. "exists and is validated" is not enough:
     // a constraint rewritten to `CHECK (true)` is still present and still valid.
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_fkey" },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", def: ['"periodEnd" > "periodStart"'] },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
-    { kind: "constraint", table: "User", name: "User_payType_check", def: ["HOURLY", "SALARY"] },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_fkey", contype: "f" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", contype: "c", def: ['"periodEnd" > "periodStart"'] },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", contype: "c", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", contype: "c", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
+    { kind: "constraint", table: "User", name: "User_payType_check", contype: "c", def: ["HOURLY", "SALARY"] },
 
     { kind: "column", table: "HelpRequest", name: "submissionId", type: "text", nullable: true },
     { kind: "column", table: "HelpRequest", name: "providerIssueRef", type: "text", nullable: true },
-    { kind: "column", table: "HelpRequest", name: "providerState", type: "text", nullable: true },
+    // DEFAULT 'pending' is load-bearing: reserveHelpRequest's INSERT does not
+    // name providerState, and a row that came out NULL reads as "never tried"
+    // to some paths and "unknown" to others.
+    { kind: "column", table: "HelpRequest", name: "providerState", type: "text", nullable: true, default: "'pending'" },
     { kind: "column", table: "HelpRequest", name: "providerLeaseToken", type: "text", nullable: true },
     { kind: "column", table: "HelpRequest", name: "providerLeaseExpiresAt", type: "timestamp with time zone", nullable: true },
     { kind: "index", table: "HelpRequest", name: "HelpRequest_userId_submissionId_key", unique: true, columns: ["userId", "submissionId"] },
     { kind: "index", table: "HelpRequest", name: "HelpRequest_userId_createdAt_idx", unique: false, columns: ["userId", "createdAt"] },
 
     { kind: "table", name: "HelpSubmissionQuota" },
+    { kind: "column", table: "HelpSubmissionQuota", name: "id", type: "text", nullable: false },
+    { kind: "column", table: "HelpSubmissionQuota", name: "userId", type: "text", nullable: false },
+    { kind: "column", table: "HelpSubmissionQuota", name: "hourBucket", type: "timestamp with time zone", nullable: false },
+    { kind: "column", table: "HelpSubmissionQuota", name: "count", type: "integer", nullable: false, default: "0" },
+    {
+        kind: "column",
+        table: "HelpSubmissionQuota",
+        name: "createdAt",
+        type: "timestamp with time zone",
+        nullable: false,
+        default: "CURRENT_TIMESTAMP",
+    },
+    { kind: "constraint", table: "HelpSubmissionQuota", name: "HelpSubmissionQuota_pkey", contype: "p" },
     { kind: "index", table: "HelpSubmissionQuota", name: "HelpSubmissionQuota_userId_hourBucket_key", unique: true, columns: ["userId", "hourBucket"] },
 
     // Not created by a statement — CONVERTED. 'r' is RESTRICT; 'c' is the old
     // CASCADE that silently destroyed payroll history.
-    { kind: "fk", table: "TimeEntry", name: "TimeEntry_userId_fkey", onDelete: "r" },
-    { kind: "fk", table: "TimeEntry", name: "TimeEntry_projectId_fkey", onDelete: "r" },
+    { kind: "fk", table: "TimeEntry", name: "TimeEntry_userId_fkey", contype: "f", onDelete: "r" },
+    { kind: "fk", table: "TimeEntry", name: "TimeEntry_projectId_fkey", contype: "f", onDelete: "r" },
 
     // RLS with ZERO policies is the intended state: it denies everything to any
     // role that does not bypass RLS. Prisma connects as the table owner (owners
@@ -138,6 +190,31 @@ export const EXPECTED_OBJECTS = [
 /** Collapse whitespace so a catalog definition can be compared to a written one. */
 function squash(text) {
     return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Compare a DEFAULT the way Postgres means it, not the way it happens to print.
+ *
+ * `DEFAULT 'pending'` on a text column comes back as `'pending'::text`, and
+ * `DEFAULT CURRENT_TIMESTAMP` may come back as either `CURRENT_TIMESTAMP` or
+ * `now()` depending on the server. None of those differences change what the
+ * column does, and pinning the exact spelling would make this check fail on a
+ * healthy database — which is worse than not checking, because the next person
+ * deletes the assertion. What it still catches is the thing that matters: a
+ * DEFAULT that was dropped, or changed to a different value.
+ *
+ * Exported so the parity test compares the migration's written defaults with
+ * EXPECTED_OBJECTS using this exact rule rather than a second, divergent one.
+ */
+export function normalizeDefault(text) {
+    let value = squash(text).toLowerCase();
+    if (!value) return "";
+    // Strip the type casts Postgres appends when it renders a default.
+    value = value.replace(/::[a-z0-9_ "]+(\[\])?/g, "");
+    // And the parentheses it sometimes wraps an expression in.
+    while (value.startsWith("(") && value.endsWith(")")) value = value.slice(1, -1).trim();
+    if (value === "now()") return "current_timestamp";
+    return value;
 }
 
 /**
@@ -189,7 +266,10 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
                     continue;
                 }
             }
-            if (object.default !== undefined && squash(row.column_default) !== squash(object.default)) {
+            if (
+                object.default !== undefined &&
+                normalizeDefault(row.column_default) !== normalizeDefault(object.default)
+            ) {
                 miss(object, `default is ${row.column_default}, expected ${object.default}`, row.column_default);
             }
             continue;
@@ -237,7 +317,7 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
 
         if (object.kind === "constraint" || object.kind === "fk") {
             const rows = await db.$queryRawUnsafe(
-                `SELECT c.convalidated, c.confdeltype, pg_get_constraintdef(c.oid) AS def
+                `SELECT c.convalidated, c.confdeltype, c.contype, pg_get_constraintdef(c.oid) AS def
                    FROM pg_constraint c
                    JOIN pg_class t ON t.oid = c.conrelid
                    JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -251,6 +331,13 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
                 continue;
             }
             const [row] = rows;
+            // 'p' PRIMARY KEY, 'c' CHECK, 'f' FOREIGN KEY, 'u' UNIQUE. A primary
+            // key replaced by a same-named CHECK exists, validates, and enforces
+            // nothing about row identity.
+            if (object.contype && row.contype !== object.contype) {
+                miss(object, `is a '${row.contype}' constraint, expected '${object.contype}'`, row.def);
+                continue;
+            }
             // NOT VALID is not enforcement: existing rows are exempt, so prod
             // would silently disagree with a replay of the same migration.
             if (!row.convalidated) {

@@ -197,6 +197,78 @@ test("a column that came back NULLABLE is reported", { skip }, async () => {
     }
 });
 
+// ── the objects the expected list used to omit entirely ────────────────────
+// A verifier can only report what it names. EXPECTED_OBJECTS listed the
+// ALTER-added columns and nothing a CREATE TABLE brought with it, so dropping
+// any of the below left the script printing "verified N/N objects" — including
+// exportHash, which src/lib/gusto-export-db.ts selects on every export.
+
+test("a dropped CREATE TABLE column (exportHash) is reported — it used to be invisible", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP COLUMN "exportHash"`);
+        const row = reported(await drift(db), "exportHash");
+        assert.ok(row, "a column the export reads must not be able to vanish silently");
+        assert.equal(row!.reason, "missing");
+    } finally {
+        await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "exportHash" TEXT`).catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("a DROPPED DEFAULT on User.payrollRevision is reported", { skip }, async () => {
+    // The rate-import signature is keyed on this counter; without the default a
+    // new row's revision is whatever the writer forgot to supply.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "User" ALTER COLUMN "payrollRevision" DROP DEFAULT`);
+        const row = reported(await drift(db), "payrollRevision");
+        assert.ok(row, "a lost DEFAULT must be reported");
+        assert.match(row!.reason, /default is null, expected 0/i);
+    } finally {
+        await db.$executeRawUnsafe(`ALTER TABLE "User" ALTER COLUMN "payrollRevision" SET DEFAULT 0`).catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("a CHANGED DEFAULT on HelpRequest.providerState is reported", { skip }, async () => {
+    // reserveHelpRequest's INSERT does not name providerState. A default of
+    // 'created' would make every brand-new report claim its GitHub issue exists.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "HelpRequest" ALTER COLUMN "providerState" SET DEFAULT 'created'`);
+        const row = reported(await drift(db), "providerState");
+        assert.ok(row, "a changed DEFAULT must be reported");
+        assert.match(row!.reason, /default is 'created'/);
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "HelpRequest" ALTER COLUMN "providerState" SET DEFAULT 'pending'`)
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("a PRIMARY KEY replaced by a same-named CHECK is reported, though it exists and validates", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "HelpSubmissionQuota" DROP CONSTRAINT "HelpSubmissionQuota_pkey"`);
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "HelpSubmissionQuota" ADD CONSTRAINT "HelpSubmissionQuota_pkey" CHECK (true)`
+        );
+        const row = reported(await drift(db), "HelpSubmissionQuota_pkey");
+        assert.ok(row, "row identity is not something a name alone guarantees");
+        assert.match(row!.reason, /is a 'c' constraint, expected 'p'/);
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "HelpSubmissionQuota" DROP CONSTRAINT IF EXISTS "HelpSubmissionQuota_pkey"`)
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "HelpSubmissionQuota" ADD CONSTRAINT "HelpSubmissionQuota_pkey" PRIMARY KEY ("id")`)
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
 test("everything is restored — the teardown actually worked", { skip }, async () => {
     // Each test above repairs what it broke. If any teardown silently failed,
     // this catches it rather than letting a later CI step fail confusingly.

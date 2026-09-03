@@ -95,6 +95,17 @@ Only Justin can do (credentials and store consoles — clearly separated):
 
 Phase 3 note (not Phase 5 work): `apps/mobile/app/(tabs)/expenses.tsx` will be repointed at `/api/receipts/intake` by the parent plan's Phase 3. Do not refactor it now; avoid merge-conflict-prone edits near it.
 
+### Follow-up owed by the mobile app: send a persisted `submissionId`
+
+The bug-report screen (`apps/mobile/lib/bugReport.ts`) posts `title`, `description` and `currentPage` and nothing else, so the server has no idempotency key from the one client that actually retries. It should generate a UUID **once, when the user taps Send**, persist it with the draft, and send it as `submissionId` on that submission and on every retry of it — a new UUID only for a new report. `/api/help-chat/request` already prefers an explicit `submissionId` over anything it derives, so this needs no server change; it is a one-field addition in the app and it makes retry safety exact instead of inferred.
+
+Until then the server derives the key itself, and the derivation is **content-based, with the time window applied as a lookup rather than hashed into the key** (`src/lib/help-chat/submission-guard.ts`):
+
+- `submissionId = sha256(userId + ":" + normalizedTitle + ":" + normalizedDescription)` (48 hex) plus a `-g<N>` generation suffix.
+- A submission resolves to the generation of an existing report with the same content **created within 24 hours**, so a retry at any point inside that window replays onto the original row and returns the original GitHub issue. Past the window the same content starts the next generation and files a genuinely new report, because a bug that comes back a week later is a real second report.
+
+The first version hashed `floor(now / 60s)` into the key instead. That is not an idempotency key: a retry fires because a response was **lost**, and the gap before it is whatever the network took — two retries of one report that straddle a minute boundary hashed differently and opened two GitHub issues, at exactly the moment the key was needed. No bucket size fixes that; every bucket has a boundary. Hence the content-only key. The residual imprecision is deliberate and small: two genuinely distinct reports with byte-identical title and description from the same person inside 24h collapse onto one. A client-supplied UUID removes even that, which is why it stays on this list.
+
 ## 6. Tests
 
 1. OT computation table (extend the pure-lib tests around `src/lib/overtime.ts` / `pay-period-summary-core.ts`): exactly 40h week (0 OT); 41h in one entry (1h OT split within the entry); workweek straddling periodStart (pre-period hours push in-period hours into OT); meal-deducted 9h shift paying 8.5h; multi-project same day (split entries, still one meal deduction per day); Sunday-to-Monday midnight entry attributed to the week of its startTime.

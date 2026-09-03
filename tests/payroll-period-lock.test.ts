@@ -24,7 +24,26 @@ import {
     periodLockedMessage,
     type LockedPeriodRow,
 } from "../src/lib/payroll-period";
-import type { ClockOutDependencies, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
+import type { ClockOutDependencies, ClockOutStoredSnapshot, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
+
+/**
+ * The row as the close transaction re-reads it under FOR UPDATE. The real
+ * dependency selects every one of these columns; these tests never move the
+ * row, so the snapshot is just the fixture.
+ */
+function snapshotOf(entry: ClockOutTimeEntryRow): ClockOutStoredSnapshot {
+    return {
+        id: entry.id,
+        userId: entry.userId,
+        projectId: entry.projectId,
+        startTime: entry.startTime,
+        endTime: entry.endTime,
+        notes: entry.notes,
+        reviewReason: entry.reviewReason,
+        mealSkipStatus: entry.mealSkipStatus ?? null,
+        updatedAt: entry.updatedAt ?? new Date(0),
+    };
+}
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-payroll-period-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -192,7 +211,7 @@ function clockOutDeps(lockedPeriods: LockedPeriodRow[], startTime: Date = INSIDE
         findDayEntries: async () => [],
         settleDay: async () => 0,
         flagSettlementFailed: async () => {},
-        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(startTime, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })),
+        closeTimeEntry: async (id, userId, buildData) => guardedClose(id, userId, await buildData(snapshotOf(entry), { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })),
         loadLockedPeriods: async () => lockedPeriods,
     };
     return { dependencies, updateCalls };
@@ -345,7 +364,7 @@ test("a lock taken AFTER the fail-fast check still stops the write (in-transacti
         const hit = lockedPeriodFor([period()], INSIDE);
         if (hit) return { ok: false as const, locked: hit };
         updateCalls.push({ id });
-        return { ok: true as const, entry: { id, userId, ...(await buildData(INSIDE, { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })) } };
+        return { ok: true as const, entry: { id, userId, ...(await buildData(snapshotOf({ id: "te1", userId: "u1", projectId: "p1", startTime: INSIDE, endTime: null, notes: null, reviewReason: null }), { hourlyRate: 20, burdenRate: 5, role: "FIELD_CREW", name: "Owner", email: "owner@example.com", payType: "HOURLY" })) } };
     };
     const { createClockOutHandler } = await routeModulePromise;
     const res = await createClockOutHandler(dependencies).PUT(putReq());
@@ -708,16 +727,36 @@ test("a period cannot be locked until its whole OT envelope has elapsed", () => 
     assert.match(body, /precheck\.overlappingLocks\.length > 0/);
 });
 
-test("the close is priced from the STORED startTime and compare-and-set on it", () => {
+test("the close is decided from the STORED row and compare-and-set on its version", () => {
     const source = readFileSync(path.join(__dirname, "..", "src", "app", "api", "time-entries", "route.ts"), "utf8");
     const dep = source.slice(source.indexOf("closeTimeEntry: async (id, userId, buildData, guard)"));
     const body = dep.slice(0, dep.indexOf(LF + "    },"));
-    // Read the row, price from what it says, and refuse to write if it moved
+    // Read the row, decide from what it says, and refuse to write if it moved
     // underneath us — a close computed from a pre-transaction read would price
-    // a shift that had since been shifted to another day.
-    assert.match(body, /SELECT "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
-    assert.match(body, /await buildData\(stored\.startTime, lockedOwner\)/);
+    // a shift that had since been shifted to another day, and would decide the
+    // logistics-notes rule against the project it used to be on.
+    const select = body.match(/SELECT[^`]*FROM "TimeEntry" WHERE "id" = \$1/);
+    assert.ok(select, "the in-transaction re-read must still be there");
+    for (const column of [
+        "id",
+        "userId",
+        "projectId",
+        "startTime",
+        "endTime",
+        "notes",
+        "reviewReason",
+        "mealSkipStatus",
+        "updatedAt",
+    ]) {
+        assert.ok(
+            select[0].includes(`"${column}"`),
+            `the close re-read must select "${column}" — every clock-out decision comes from this snapshot`
+        );
+    }
+    assert.match(body, /await buildData\(stored, lockedOwner\)/);
     assert.match(body, /startTime: stored\.startTime/, "the claim must CAS on startTime");
+    assert.match(body, /updatedAt: stored\.updatedAt/, "the claim must CAS on the row version");
+    assert.match(body, /stored\.userId !== userId/, "a reassignment mid-flight must fail closed");
     assert.match(body, /moved: true/);
     // PeriodLockedError leaves the transaction so the write rolls back; it is
     // converted to a result OUTSIDE. Catching it inside would commit.

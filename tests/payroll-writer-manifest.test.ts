@@ -91,11 +91,11 @@ const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
         kind: "guarded",
         why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts:862::updateMany": {
+    "app/api/time-entries/route.ts:982::updateMany": {
         kind: "guarded",
-        why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime",
+        why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime AND on updatedAt, so any concurrent write to the row the close was decided from fails it closed",
     },
-    "app/api/time-entries/route.ts:880::update": {
+    "app/api/time-entries/route.ts:1006::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },

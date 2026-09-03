@@ -336,23 +336,97 @@ export const MOBILE_SUBMISSION_ID_REQUIRED = "submission-id-required";
  * retries on network failure, and without SOME key each retry opens a second
  * GitHub issue.
  *
- * Derived from the content itself, bucketed to the minute: two identical
- * reports from the same user inside the same 60s window collapse onto one
- * row (a retry); two reports a minute apart, or with different text, are
- * treated as genuinely distinct — the right default for a key the client
- * never sees or sets. sha256 hex is 64 characters, exactly
- * HELP_SUBMISSION_ID_MAX, and matches the `[A-Za-z0-9_-]+` shape
- * checkHelpSubmission requires.
+ * WHY THERE IS NO TIME BUCKET IN THE KEY. The first version hashed
+ * `floor(now / 60s)` into it. A key that changes on a wall-clock boundary is
+ * not an idempotency key: the app's retry is triggered by a LOST RESPONSE, and
+ * the gap before it is whatever the network took. Two retries of one report
+ * that straddle 12:00:59 → 12:01:00 hash differently and open two GitHub
+ * issues — the exact duplicate the key exists to prevent, at the exact moment
+ * it is needed. Bucket size does not fix it; every bucket has a boundary.
+ *
+ * So the key is the CONTENT alone, and the window is applied as a LOOKUP
+ * instead (deriveMobileSubmissionId below): any retry inside 24h resolves to
+ * the key the first attempt used and replays onto that row; the same content
+ * reported again after the window resolves to the next generation and files a
+ * genuinely new report. The generation suffix is what lets both be true —
+ * `submissionId` is UNIQUE per (userId, submissionId), so a bare content hash
+ * would collapse a report and its legitimate recurrence a week later onto one
+ * row, forever.
+ *
+ * The mobile client should send a persisted per-submission UUID; see
+ * docs/plans/PHASE-5-GUSTO-AND-MOBILE-RELEASE-SPEC.md. Until it does, this is
+ * the server-side stand-in — an explicit submissionId always wins.
  */
-export function deriveMobileSubmissionId(
+export const HELP_DERIVED_KEY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Hex characters of the content hash kept in the key. Short enough to leave
+ * room for the "-g<N>" generation suffix inside HELP_SUBMISSION_ID_MAX (64);
+ * 48 hex is 192 bits, far past any collision concern for one user's reports.
+ */
+export const HELP_DERIVED_KEY_HASH_CHARS = 48;
+
+/** The content half of a derived key — same user, same words, same value, forever. */
+export function mobileSubmissionContentKey(userId: string, title: string, description: string): string {
+    const normalizedText = `${title}\n${description}`.trim().toLowerCase().replace(/\s+/g, " ");
+    return createHash("sha256")
+        .update(`${userId}:${normalizedText}`)
+        .digest("hex")
+        .slice(0, HELP_DERIVED_KEY_HASH_CHARS);
+}
+
+/** SQL LIKE pattern matching every generation of one content key. Hex holds no LIKE wildcard. */
+export function derivedKeyLikePattern(contentKey: string): string {
+    return `${contentKey}-g%`;
+}
+
+/**
+ * The whole windowing rule, pure: given the newest key this user already has
+ * for this exact content, what key does the submission in hand use?
+ *
+ *  - nothing prior          → generation 1, a new report;
+ *  - prior inside the window → THAT key, so the reservation replays onto the
+ *    existing row and the caller gets the original issue back;
+ *  - prior older than the window → the next generation, a new report.
+ */
+export function nextDerivedSubmissionId(
+    contentKey: string,
+    prior: { submissionId: string; createdAt: Date } | null,
+    now: Date = new Date()
+): string {
+    if (!prior) return `${contentKey}-g1`;
+    if (now.getTime() - prior.createdAt.getTime() <= HELP_DERIVED_KEY_WINDOW_MS) {
+        return prior.submissionId;
+    }
+    const generation = Number(/-g(\d+)$/.exec(prior.submissionId)?.[1] ?? 1);
+    return `${contentKey}-g${(Number.isFinite(generation) ? generation : 1) + 1}`;
+}
+
+/**
+ * Resolve the derived key for this submission: hash the content, then ask the
+ * database which generation of it is current.
+ *
+ * The read is ordinary (no lock). Two first-time attempts racing both compute
+ * generation 1 and reserveHelpRequest's ON CONFLICT DO NOTHING collapses them
+ * onto one row — which is the same protection an explicit submissionId gets.
+ */
+export async function deriveMobileSubmissionId(
     userId: string,
     title: string,
     description: string,
-    now: Date = new Date()
-): string {
-    const normalizedText = `${title}\n${description}`.trim().toLowerCase().replace(/\s+/g, " ");
-    const bucket = Math.floor(now.getTime() / 60_000);
-    return createHash("sha256").update(`${userId}:${normalizedText}:${bucket}`).digest("hex");
+    now: Date = new Date(),
+    client: {
+        $queryRaw: <T>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
+    } = prisma as never
+): Promise<string> {
+    const contentKey = mobileSubmissionContentKey(userId, title, description);
+    const rows = await client.$queryRaw<Array<{ submissionId: string; createdAt: Date }>>`
+        SELECT "submissionId", "createdAt" FROM "HelpRequest"
+        WHERE "userId" = ${userId} AND "submissionId" LIKE ${derivedKeyLikePattern(contentKey)}
+        ORDER BY "createdAt" DESC
+        LIMIT 1
+    `;
+    return nextDerivedSubmissionId(contentKey, rows[0] ?? null, now);
 }
 
 /** A `submitting` row older than this was abandoned mid-flight; a retry resumes it. */

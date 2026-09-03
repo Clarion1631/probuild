@@ -18,6 +18,10 @@ import {
     reserveHelpRequest,
     isMobileSubmission,
     deriveMobileSubmissionId,
+    derivedKeyLikePattern,
+    mobileSubmissionContentKey,
+    nextDerivedSubmissionId,
+    HELP_DERIVED_KEY_WINDOW_MS,
     HELP_DESCRIPTION_MAX,
     HELP_SUBMISSIONS_PER_HOUR,
     HELP_SUBMISSION_ID_MAX,
@@ -321,46 +325,101 @@ test("a mobile caller with no submissionId gets a DERIVED key, never a 400 for m
 // from what the mobile caller actually sent, so a Bearer request that omits
 // submissionId still gets retry safety without an app update.
 
-test("deriveMobileSubmissionId is deterministic, per-user, per-content, and minute-bucketed", () => {
-    const now = new Date("2026-09-02T12:00:30.000Z");
-    const a = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
-    const b = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
-    assert.equal(a, b, "same user/content/minute must reproduce the same key");
+test("the content key carries NO clock — the same report hashes the same at any instant", () => {
+    // THE bug this replaced: the key used to hash floor(now / 60s). A key that
+    // changes on a wall-clock boundary is not an idempotency key. The crew
+    // app's retry is triggered by a LOST RESPONSE and the gap before it is
+    // whatever the network took, so two retries of ONE report that straddle a
+    // minute boundary hashed differently and opened two GitHub issues. Bucket
+    // size never fixed it; every bucket has a boundary.
+    const a = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const b = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    assert.equal(a, b);
 
-    // 64 hex chars — sha256 digest length, which is also exactly
-    // HELP_SUBMISSION_ID_MAX and satisfies checkHelpSubmission's
-    // [A-Za-z0-9_-]+ shape without any further encoding.
-    assert.equal(a.length, 64);
-    assert.equal(a.length, HELP_SUBMISSION_ID_MAX);
-    assert.match(a, /^[a-f0-9]{64}$/);
-    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: a }).ok, true);
+    // The function takes no `now` at all — this is the structural half of the
+    // claim, and it is why no instant can change the answer.
+    assert.equal(mobileSubmissionContentKey.length, 3, "the content key must not accept a clock");
 
-    // A different user, same content and minute — must not collide.
-    const otherUser = deriveMobileSubmissionId("u2", "Bug", "It broke", now);
-    assert.notEqual(a, otherUser);
+    // A different user, same content — must not collide.
+    assert.notEqual(a, mobileSubmissionContentKey("u2", "Bug", "It broke"));
+    // Different content, same user — must not collide.
+    assert.notEqual(a, mobileSubmissionContentKey("u1", "Bug", "Something else broke"));
 
-    // Different content, same user and minute — must not collide.
-    const otherText = deriveMobileSubmissionId("u1", "Bug", "Something else broke", now);
-    assert.notEqual(a, otherText);
-
-    // Same user/content, one minute later — a NEW report, not a replay.
-    const nextMinute = new Date(now.getTime() + 60_000);
-    const later = deriveMobileSubmissionId("u1", "Bug", "It broke", nextMinute);
-    assert.notEqual(a, later);
-
-    // Same user/content, one second later but same 60s bucket — still the SAME
-    // key, so a retry a few seconds after a network failure collapses onto the
-    // original report instead of filing a second one.
-    const secondsLater = new Date(now.getTime() + 5_000);
-    const retry = deriveMobileSubmissionId("u1", "Bug", "It broke", secondsLater);
-    assert.equal(a, retry, "a retry seconds later, inside the same minute, must reuse the key");
+    // Whitespace/case are cosmetic: a retyped retry still collapses.
+    assert.equal(a, mobileSubmissionContentKey("u1", "  BUG  ", "  it   broke  "));
 });
 
-test("deriveMobileSubmissionId normalizes whitespace/case so retries with cosmetic differences still collapse", () => {
-    const now = new Date("2026-09-02T12:00:30.000Z");
-    const base = deriveMobileSubmissionId("u1", "Bug", "It broke", now);
-    const paddedAndCased = deriveMobileSubmissionId("u1", "  BUG  ", "  it   broke  ", now);
-    assert.equal(base, paddedAndCased);
+test("a derived key fits the submissionId contract the route validates against", () => {
+    const key = `${mobileSubmissionContentKey("u1", "Bug", "It broke")}-g1`;
+    assert.ok(key.length <= HELP_SUBMISSION_ID_MAX, `${key.length} > ${HELP_SUBMISSION_ID_MAX}`);
+    assert.match(key, /^[a-f0-9]{48}-g1$/);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: key }).ok, true);
+    // And every generation of it is still under the cap.
+    const far = `${mobileSubmissionContentKey("u1", "Bug", "It broke")}-g999999`;
+    assert.ok(far.length <= HELP_SUBMISSION_ID_MAX);
+});
+
+test("nextDerivedSubmissionId: no prior report starts generation 1", () => {
+    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    assert.equal(nextDerivedSubmissionId(key, null), `${key}-g1`);
+});
+
+test("nextDerivedSubmissionId: a retry ANY time inside the window reuses the original key", () => {
+    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const filedAt = new Date("2026-09-02T12:00:59.500Z");
+    const prior = { submissionId: `${key}-g1`, createdAt: filedAt };
+
+    // Seconds later, and — the case that used to break — on the far side of a
+    // minute boundary.
+    for (const gap of [1_000, 40_000, 60_000, 6 * 60 * 60_000, HELP_DERIVED_KEY_WINDOW_MS]) {
+        assert.equal(
+            nextDerivedSubmissionId(key, prior, new Date(filedAt.getTime() + gap)),
+            `${key}-g1`,
+            `a retry ${gap}ms later must replay onto the original report`
+        );
+    }
+});
+
+test("nextDerivedSubmissionId: past the window the same content is a NEW report, one generation on", () => {
+    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const filedAt = new Date("2026-09-02T12:00:00.000Z");
+    const justPast = new Date(filedAt.getTime() + HELP_DERIVED_KEY_WINDOW_MS + 1);
+    assert.equal(nextDerivedSubmissionId(key, { submissionId: `${key}-g1`, createdAt: filedAt }, justPast), `${key}-g2`);
+    // And it keeps counting, so a recurring bug never runs out of report slots.
+    assert.equal(nextDerivedSubmissionId(key, { submissionId: `${key}-g7`, createdAt: filedAt }, justPast), `${key}-g8`);
+    // A malformed/legacy prior key degrades to a fresh generation rather than NaN.
+    assert.equal(nextDerivedSubmissionId(key, { submissionId: "legacy-key", createdAt: filedAt }, justPast), `${key}-g2`);
+});
+
+test("deriveMobileSubmissionId asks the database for the current generation of this content", async () => {
+    const key = mobileSubmissionContentKey("u1", "Bug", "It broke");
+    const seen: unknown[][] = [];
+    const client = {
+        $queryRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
+            seen.push(values);
+            return [{ submissionId: `${key}-g1`, createdAt: new Date("2026-09-02T12:00:00.000Z") }] as never;
+        },
+    };
+    const inWindow = await deriveMobileSubmissionId(
+        "u1",
+        "Bug",
+        "It broke",
+        new Date("2026-09-03T11:00:00.000Z"),
+        client
+    );
+    assert.equal(inWindow, `${key}-g1`, "inside the window, the stored key is reused");
+    // Scoped to the user AND to every generation of this one content key.
+    assert.deepEqual(seen[0], ["u1", derivedKeyLikePattern(key)]);
+    assert.equal(derivedKeyLikePattern(key), `${key}-g%`);
+
+    const outOfWindow = await deriveMobileSubmissionId(
+        "u1",
+        "Bug",
+        "It broke",
+        new Date("2026-09-03T13:00:01.000Z"),
+        client
+    );
+    assert.equal(outOfWindow, `${key}-g2`);
 });
 
 test("a resume asks GitHub before filing, using the submission marker", () => {

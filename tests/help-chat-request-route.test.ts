@@ -67,7 +67,55 @@ const MOBILE_USER = {
     email: "crew@example.com",
 };
 
-/** What the route reads/writes through prisma for one fresh (non-replay) reservation. */
+/**
+ * A tiny in-memory "HelpRequest" table, honouring the two things the
+ * idempotency contract actually rests on: the UNIQUE (userId, submissionId)
+ * that makes a replay a replay, and createdAt, which the derived key's 24-hour
+ * window is measured against.
+ *
+ * A stateless stub cannot test idempotency — "did this submission already
+ * happen?" is a question about stored rows. The previous fixture always
+ * answered "fresh insert", which is why a key that changed at a minute
+ * boundary looked fine here.
+ */
+type FakeRow = {
+    id: string;
+    userId: string;
+    submissionId: string | null;
+    type: string;
+    question: string;
+    response: string;
+    currentPage: string | null;
+    conversationId: string | null;
+    status: string;
+    providerState: string | null;
+    changeLocation: string | null;
+    externalIssueRef: string | null;
+    providerIssueRef: string | null;
+    createdAt: Date;
+};
+
+const store: { rows: FakeRow[]; nextId: number } = { rows: [], nextId: 1 };
+
+/** GitHub issues the fake provider has opened. Reset with the store, or counts leak between tests. */
+let issueCounter = 0;
+
+function resetStore() {
+    store.rows = [];
+    store.nextId = 1;
+    issueCounter = 0;
+}
+
+/**
+ * Let time pass, without faking the clock (CI pins Node 20, where
+ * `mock.timers.setTime` does not exist). The route's window check compares
+ * `Date.now()` against the stored `createdAt`, so pushing the stored rows into
+ * the past is the same measurement from the other end.
+ */
+function ageStoredRowsBy(ms: number) {
+    for (const row of store.rows) row.createdAt = new Date(row.createdAt.getTime() - ms);
+}
+
 const fakePrisma = {
     user: {
         findUnique: async ({ where }: { where: { id?: string } }) =>
@@ -80,36 +128,124 @@ const fakePrisma = {
         findFirst: async () => null,
     },
     helpRequest: {
-        findUnique: async ({ where }: { where: { id: string } }) => ({
-            id: where.id,
-            providerState: "pending",
-            status: "submitted_no_issue",
-        }),
+        findUnique: async ({ where }: { where: { id: string } }) =>
+            store.rows.find((row) => row.id === where.id) ?? null,
     },
-    // reserveHelpRequest's transaction: one fresh INSERT ... RETURNING, then a
-    // COUNT that sees no prior reports (quota untouched).
+    /** deriveMobileSubmissionId's window lookup: newest generation of one content key. */
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = strings.join("?");
+        if (text.includes('SELECT "submissionId", "createdAt" FROM "HelpRequest"')) {
+            const [userId, likePattern] = values as [string, string];
+            const prefix = likePattern.replace(/%$/, "");
+            const matches = store.rows
+                .filter((row) => row.userId === userId && (row.submissionId ?? "").startsWith(prefix))
+                .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+            return matches.slice(0, 1).map((row) => ({ submissionId: row.submissionId, createdAt: row.createdAt }));
+        }
+        throw new Error(`unexpected top-level $queryRaw: ${text}`);
+    },
+    // reserveHelpRequest's transaction: INSERT ... ON CONFLICT DO NOTHING over
+    // the store, then the rolling-window COUNT.
     $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
         const tx = {
-            $queryRaw: (strings: TemplateStringsArray) => {
+            $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
                 const text = strings.join("?");
                 if (text.includes('INSERT INTO "HelpRequest"')) {
-                    return Promise.resolve([{ id: "mobile-req-1" }]);
+                    const [userId, type, question, response, currentPage, conversationId, submissionId] =
+                        values as [string, string, string, string, string | null, string | null, string | null];
+                    const conflict =
+                        submissionId != null &&
+                        store.rows.some((row) => row.userId === userId && row.submissionId === submissionId);
+                    if (conflict) return [];
+                    const row: FakeRow = {
+                        id: `mobile-req-${store.nextId++}`,
+                        userId,
+                        submissionId,
+                        type,
+                        question,
+                        response,
+                        currentPage,
+                        conversationId,
+                        status: "submitting",
+                        providerState: null,
+                        changeLocation: null,
+                        externalIssueRef: null,
+                        providerIssueRef: null,
+                        createdAt: new Date(),
+                    };
+                    store.rows.push(row);
+                    return [{ id: row.id }];
                 }
                 if (text.includes("COUNT(*)::int AS count")) {
-                    return Promise.resolve([{ count: 0 }]);
+                    const [userId, windowStart, exceptId] = values as [string, Date, string];
+                    const count = store.rows.filter(
+                        (row) => row.userId === userId && row.createdAt >= windowStart && row.id !== exceptId
+                    ).length;
+                    return [{ count }];
                 }
-                return Promise.resolve([]);
+                throw new Error(`unexpected tx $queryRaw: ${text}`);
             },
-            $executeRaw: () => Promise.resolve(1),
-            helpRequest: { findUnique: async () => null },
+            $executeRaw: async () => 1,
+            helpRequest: {
+                findUnique: async ({ where }: { where: { userId_submissionId: { userId: string; submissionId: string } } }) =>
+                    store.rows.find(
+                        (row) =>
+                            row.userId === where.userId_submissionId.userId &&
+                            row.submissionId === where.userId_submissionId.submissionId
+                    ) ?? null,
+            },
         };
         return fn(tx);
     },
-    // claimProviderLease / completeUnderLease, called on the top-level client.
-    $executeRaw: () => Promise.resolve(1),
+    /** claimProviderLease / renewProviderLease / completeUnderLease. */
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = strings.join("?");
+        if (text.includes(`"providerState" = 'created'`)) {
+            const [status, issueUrl, externalRef, providerRef, requestId] = values as [
+                string, string, string, string, string,
+            ];
+            const row = store.rows.find((r) => r.id === requestId);
+            if (!row) return 0;
+            Object.assign(row, {
+                status,
+                changeLocation: issueUrl,
+                externalIssueRef: externalRef,
+                providerIssueRef: providerRef,
+                providerState: "created",
+            });
+            return 1;
+        }
+        if (text.includes(`"providerState" = 'pending'`)) {
+            const [status, requestId] = values as [string, string];
+            const row = store.rows.find((r) => r.id === requestId);
+            if (!row) return 0;
+            Object.assign(row, { status, providerState: "pending" });
+            return 1;
+        }
+        // The lease claim/renewal: always granted in a single-threaded test.
+        return 1;
+    },
 };
 
-const PRISMA_SPECIFIERS = new Set(["@/lib/prisma", "../prisma"]);
+/**
+ * The GitHub side, faked at the module boundary so a filed report can exist
+ * without a network call. It still honours GITHUB_TOKEN, so the "no token =>
+ * saved but not filed" test below reads exactly as it did against the real
+ * module.
+ */
+const fakeGithub = {
+    createHelpChatGitHubIssue: async () =>
+        process.env.GITHUB_TOKEN
+            ? { number: ++issueCounter, url: `https://github.test/probuild/issues/${issueCounter}` }
+            : null,
+    findIssueByMarker: async () => null,
+};
+
+const MODULE_MOCKS = new Map<string, unknown>([
+    ["@/lib/prisma", { prisma: fakePrisma }],
+    ["../prisma", { prisma: fakePrisma }],
+    ["@/lib/help-chat/github", fakeGithub],
+]);
 
 let POST: (req: Request) => Promise<Response>;
 let signMobileToken: (user: { id: string; role: string; email: string }, via: "pin" | "google") => Promise<string>;
@@ -122,9 +258,9 @@ before(async () => {
         this: NodeModule,
         id: string,
     ) {
-        if (PRISMA_SPECIFIERS.has(id)) {
+        if (MODULE_MOCKS.has(id)) {
             requirePatchHit = true;
-            return { prisma: fakePrisma };
+            return MODULE_MOCKS.get(id);
         }
         // eslint-disable-next-line prefer-rest-params
         return originalRequire.apply(this, arguments as unknown as [string]);
@@ -159,7 +295,7 @@ before(async () => {
                 `route POST is ${typeof routeModule.POST}, signMobileToken is ` +
                 `${typeof mobileAuthModule.signMobileToken}, HELP_SUBMISSION_ID_MAX is ` +
                 `${typeof guardModule.HELP_SUBMISSION_ID_MAX}. The require() patch ` +
-                `${requirePatchHit ? "WAS" : "was NOT"} hit for one of ${[...PRISMA_SPECIFIERS].join(", ")}. ` +
+                `${requirePatchHit ? "WAS" : "was NOT"} hit for one of ${[...MODULE_MOCKS.keys()].join(", ")}. ` +
                 `If this fires, a prisma import in the route's dependency chain is using a ` +
                 `different literal specifier string on this Node/tsx combination — update ` +
                 `PRISMA_SPECIFIERS to match.`
@@ -170,7 +306,21 @@ before(async () => {
     HELP_SUBMISSION_ID_MAX = guardModule.HELP_SUBMISSION_ID_MAX as number;
 });
 
+/** One crew-app POST with a real Bearer token. */
+async function postMobileReport(payload: Record<string, unknown> = MOBILE_PAYLOAD) {
+    const token = await signMobileToken(MOBILE_USER, "pin");
+    const res = await POST(
+        new Request("https://example.test/api/help-chat/request", {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify(payload),
+        })
+    );
+    return { res, body: await res.json() };
+}
+
 test("the crew app's exact payload, posted with a real Bearer token, is accepted (2xx) — not the 400 the old submissionId gate produced", async () => {
+    resetStore();
     const originalGithubToken = process.env.GITHUB_TOKEN;
     // createHelpChatGitHubIssue returns null (no network call) without one —
     // the intended path for this fixture, and the one that keeps this test
@@ -196,7 +346,105 @@ test("the crew app's exact payload, posted with a real Bearer token, is accepted
         // bug never got this far at all, it 400'd before touching the DB.
         assert.equal(body.status, "pending");
         assert.equal(typeof body.submissionId, "string", "a derived key must be handed back for a future retry");
-        assert.equal(body.submissionId.length, HELP_SUBMISSION_ID_MAX);
+        assert.ok(body.submissionId.length <= HELP_SUBMISSION_ID_MAX);
+        assert.match(body.submissionId, /^[a-f0-9]{48}-g1$/, "a first report is generation 1 of its content key");
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+// ── the retry the derived key exists for ───────────────────────────────────
+// The crew app retries when a response is LOST, and the gap before the retry
+// is whatever the network took. The first version of the derived key hashed
+// floor(now/60s) into it, so a retry that happened to land on the far side of
+// a minute boundary produced a different key — a second row, a second GitHub
+// issue, for one report. The window is now applied as a lookup, so the key
+// itself does not move; the "key carries no clock at all" half of that is
+// pinned directly on the pure functions in
+// tests/help-chat-submission-guard.test.ts.
+
+test("a retry after a LOST response replays onto the original report — one issue, not two", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const first = await postMobileReport();
+        assert.equal(first.body.status, "filed");
+        const issue = first.body.githubIssue;
+        assert.ok(issue, "the first attempt files the issue");
+        assert.equal(store.rows.length, 1);
+
+        // The app never saw that response, and retries 40 seconds later — the
+        // gap that used to be able to straddle the old key's minute boundary.
+        ageStoredRowsBy(40_000);
+        const retry = await postMobileReport();
+
+        assert.equal(retry.res.status, 200, "a replay of a FILED report is terminal");
+        assert.equal(retry.body.duplicate, true);
+        assert.equal(retry.body.status, "filed");
+        assert.equal(retry.body.request.id, first.body.request.id, "same row, not a second report");
+        assert.equal(
+            retry.body.request.externalIssueRef,
+            `github-issue:${issue.number}`,
+            "the ORIGINAL issue comes back"
+        );
+        assert.equal(store.rows.length, 1, "no second HelpRequest row");
+        assert.equal(issueCounter, 1, "no second GitHub issue");
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+test("a retry hours later, still inside the 24h window, is the same replay", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const first = await postMobileReport();
+        ageStoredRowsBy(21 * 60 * 60 * 1000);
+        const retry = await postMobileReport();
+        assert.equal(retry.body.request.id, first.body.request.id);
+        assert.equal(store.rows.length, 1);
+        assert.equal(issueCounter, 1);
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+test("the same report filed again 25 hours later is a NEW report — the window is generous, not permanent", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const first = await postMobileReport();
+        ageStoredRowsBy(25 * 60 * 60 * 1000);
+        const again = await postMobileReport();
+
+        assert.notEqual(again.body.request.id, first.body.request.id, "a recurrence files its own report");
+        assert.equal(again.body.duplicate, undefined);
+        assert.equal(store.rows.length, 2);
+        assert.equal(issueCounter, 2, "the bug came back — that is a second issue, on purpose");
+        assert.match(String(store.rows[0].submissionId), /-g1$/);
+        assert.match(String(store.rows[1].submissionId), /-g2$/);
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+test("a DIFFERENT report from the same crew member is never collapsed onto the first", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        await postMobileReport();
+        const other = await postMobileReport({ ...MOBILE_PAYLOAD, title: "Mobile bug: photos will not upload" });
+        assert.equal(other.body.duplicate, undefined);
+        assert.equal(store.rows.length, 2);
+        assert.equal(issueCounter, 2);
     } finally {
         if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
         else process.env.GITHUB_TOKEN = originalGithubToken;

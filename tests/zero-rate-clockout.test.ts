@@ -24,7 +24,26 @@ import {
     zeroRateBlocks,
     zeroRateManagerMessage,
 } from "../src/lib/pay-rate-guard";
-import type { ClockOutDependencies, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
+import type { ClockOutDependencies, ClockOutStoredSnapshot, ClockOutTimeEntryRow } from "../src/app/api/time-entries/route";
+
+/**
+ * The row as the close transaction re-reads it under FOR UPDATE. The real
+ * dependency selects every one of these columns; these tests never move the
+ * row, so the snapshot is just the fixture.
+ */
+function snapshotOf(entry: ClockOutTimeEntryRow): ClockOutStoredSnapshot {
+    return {
+        id: entry.id,
+        userId: entry.userId,
+        projectId: entry.projectId,
+        startTime: entry.startTime,
+        endTime: entry.endTime,
+        notes: entry.notes,
+        reviewReason: entry.reviewReason,
+        mealSkipStatus: entry.mealSkipStatus ?? null,
+        updatedAt: entry.updatedAt ?? new Date(0),
+    };
+}
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-zero-rate-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -161,7 +180,7 @@ function deps(options: {
                       email: options.selfEmail ?? "worker@example.com",
                       payType: options.ownerPayType ?? null,
                   };
-            const data = await buildData(START, lockedOwner);
+            const data = await buildData(snapshotOf(entry), lockedOwner);
             updateCalls.push({ id, data });
             return { ok: true, entry: { id, userId, ...data } };
         },
@@ -321,7 +340,7 @@ test("a rate zeroed AFTER the precheck is still caught, inside the transaction",
     const { createClockOutHandler } = await routeModulePromise;
     dependencies.closeTimeEntry = async (id, userId, buildData) => {
         // The owner as the transaction finds them: rate gone.
-        const data = await buildData(START, {
+        const data = await buildData(snapshotOf({ id: "te1", userId: "u1", projectId: "p1", startTime: START, endTime: null, notes: null, reviewReason: null }), {
             hourlyRate: 0,
             burdenRate: 0,
             role: "FIELD_CREW",

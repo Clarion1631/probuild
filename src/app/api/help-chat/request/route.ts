@@ -55,21 +55,22 @@ export async function POST(req: NextRequest) {
   // The label still follows what the app says about itself.
   const fromMobile = fromMobileClient || isMobileSubmission(currentPage);
 
-  // A mobile caller with no idempotency key cannot be retried safely BY
-  // ITSELF: the app retries on network failure, and without a key every retry
-  // is a new report and a new GitHub issue. The crew app's bug-report screen
-  // does not send one (apps/mobile/lib/bugReport.ts posts
-  // title/description/currentPage only) — hard-rejecting the request 400'd
-  // every phone report. Derive a deterministic key from the content instead,
-  // bucketed to the minute (submission-guard.ts), so a client that omits the
-  // field still gets retry safety without an app update. The web widget is a
-  // human clicking once, so an explicit key there is passed through unchanged.
-  const effectiveSubmissionId =
-    fromMobileClient && !submissionId
-      ? deriveMobileSubmissionId(userId, title, description)
-      : submissionId;
-
   try {
+    // A mobile caller with no idempotency key cannot be retried safely BY
+    // ITSELF: the app retries on network failure, and without a key every retry
+    // is a new report and a new GitHub issue. The crew app's bug-report screen
+    // does not send one (apps/mobile/lib/bugReport.ts posts
+    // title/description/currentPage only) — hard-rejecting the request 400'd
+    // every phone report. Derive a key from the CONTENT instead, with the
+    // 24-hour window applied as a lookup rather than hashed into the key
+    // (submission-guard.ts explains why a time bucket is not an idempotency
+    // key). The web widget is a human clicking once, so an explicit key there
+    // is passed through unchanged.
+    const effectiveSubmissionId =
+      fromMobileClient && !submissionId
+        ? await deriveMobileSubmissionId(userId, title, description)
+        : submissionId;
+
     if (conversationId) {
       const conversation = await prisma.chatConversation.findFirst({
         where: { id: conversationId, userId },

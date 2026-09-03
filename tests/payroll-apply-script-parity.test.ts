@@ -199,6 +199,191 @@ test("the object list carries DEFINITIONS, not just names", async () => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// EXPECTED_OBJECTS must be the COMPLETE managed schema, derived from the
+// migration rather than hand-listed beside it.
+//
+// The list used to hold only what an `ALTER TABLE ... ADD COLUMN` created, so
+// everything a `CREATE TABLE` brought with it went unverified —
+// `PayrollPeriod.exportHash` among them, which src/lib/gusto-export-db.ts
+// selects on every export. The verification pass cannot report an object it
+// never names, so the script printed "verified N/N objects" against a schema
+// missing a column the runtime reads. Primary keys and DEFAULTs were in the
+// same blind spot.
+//
+// These tests parse the migration and require a matching EXPECTED_OBJECTS entry
+// for every table, column (type, nullability, default), primary key, index and
+// constraint it declares. Adding SQL without extending the list now fails here.
+// ---------------------------------------------------------------------------
+
+/** information_schema.data_type for the SQL types this migration writes. */
+const DATA_TYPE: Record<string, string> = {
+    TEXT: "text",
+    INTEGER: "integer",
+    "TIMESTAMPTZ(6)": "timestamp with time zone",
+    TIMESTAMPTZ: "timestamp with time zone",
+};
+
+type DeclaredColumn = { table: string; column: string; type: string; nullable: boolean; default?: string };
+
+function parseColumnTail(tail: string): { nullable: boolean; default?: string } {
+    const nullable = !/\bNOT\s+NULL\b/i.test(tail);
+    const match = /\bDEFAULT\s+(.+?)\s*$/i.exec(tail.replace(/,\s*$/, ""));
+    return { nullable, ...(match ? { default: match[1].trim() } : {}) };
+}
+
+/** Columns declared inside a CREATE TABLE body, plus the table's PRIMARY KEY name. */
+function declaredInCreateTable(sql: string): { columns: DeclaredColumn[]; primaryKeys: Array<{ table: string; name: string }> } {
+    const columns: DeclaredColumn[] = [];
+    const primaryKeys: Array<{ table: string; name: string }> = [];
+    const blocks = sql.matchAll(/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+"(\w+)"\s*\(([\s\S]*?)\n\);/gi);
+    for (const block of blocks) {
+        const table = block[1];
+        for (const line of block[2].split("\n")) {
+            const pk = /^\s*CONSTRAINT\s+"(\w+)"\s+PRIMARY KEY/i.exec(line);
+            if (pk) {
+                primaryKeys.push({ table, name: pk[1] });
+                continue;
+            }
+            const column = /^\s*"(\w+)"\s+([A-Z]+(?:\(\d+\))?)\s*(.*?)$/.exec(line);
+            if (!column) continue;
+            columns.push({ table, column: column[1], type: column[2], ...parseColumnTail(column[3]) });
+        }
+    }
+    return { columns, primaryKeys };
+}
+
+/** Columns added by ALTER TABLE, with their declared type/nullability/default. */
+function declaredInAlterTable(sql: string): DeclaredColumn[] {
+    const found: DeclaredColumn[] = [];
+    const pattern = /ALTER TABLE\s+"(\w+)"\s+ADD COLUMN(?:\s+IF NOT EXISTS)?\s+"(\w+)"\s+([A-Z]+(?:\(\d+\))?)([^;]*);/gi;
+    for (const match of sql.matchAll(pattern)) {
+        found.push({ table: match[1], column: match[2], type: match[3], ...parseColumnTail(match[4]) });
+    }
+    return found;
+}
+
+function declaredIndexes(sql: string): Array<{ name: string; unique: boolean; table: string; columns: string[] }> {
+    const pattern = /CREATE\s+(UNIQUE\s+)?INDEX(?:\s+IF NOT EXISTS)?\s+"(\w+)"\s+ON\s+"(\w+)"\s*\(([^)]*)\)/gi;
+    return [...sql.matchAll(pattern)].map((match) => ({
+        name: match[2],
+        unique: Boolean(match[1]),
+        table: match[3],
+        columns: match[4].split(",").map((part) => part.trim().replace(/^"|"$/g, "")),
+    }));
+}
+
+function declaredRlsTables(sql: string): string[] {
+    return [...sql.matchAll(/ALTER TABLE\s+"(\w+)"\s+ENABLE ROW LEVEL SECURITY/gi)].map((m) => m[1]);
+}
+
+type ExpectedObject = {
+    kind: string;
+    name?: string;
+    table?: string;
+    type?: string;
+    nullable?: boolean;
+    default?: string;
+    unique?: boolean;
+    columns?: string[];
+    contype?: string;
+    onDelete?: string;
+    policies?: number;
+};
+
+async function expectedObjects(): Promise<ExpectedObject[]> {
+    const { EXPECTED_OBJECTS } = await import("../scripts/apply-payroll-phase5.mjs");
+    return EXPECTED_OBJECTS as ExpectedObject[];
+}
+
+test("the migration parser finds the CREATE TABLE columns — the control", () => {
+    const { columns, primaryKeys } = declaredInCreateTable(read(MIGRATION));
+    // Without this, every "is it covered" assertion below is vacuously true.
+    assert.ok(columns.length >= 12, `expected CREATE TABLE columns, got ${columns.length}`);
+    assert.ok(
+        columns.some((c) => c.table === "PayrollPeriod" && c.column === "exportHash"),
+        "exportHash is the column that was missing from the expected list — the parser must see it"
+    );
+    assert.deepEqual(primaryKeys.map((p) => p.name).sort(), ["HelpSubmissionQuota_pkey", "PayrollPeriod_pkey"]);
+    assert.ok(declaredIndexes(read(MIGRATION)).length >= 8);
+});
+
+test("every COLUMN the migration declares is verified, with its type and nullability", async () => {
+    const { normalizeDefault } = await import("../scripts/apply-payroll-phase5.mjs");
+    const objects = await expectedObjects();
+    const sql = read(MIGRATION);
+    const declared = [...declaredInCreateTable(sql).columns, ...declaredInAlterTable(sql)];
+
+    for (const column of declared) {
+        const entry = objects.find(
+            (o) => o.kind === "column" && o.table === column.table && o.name === column.column
+        );
+        assert.ok(entry, `${column.table}.${column.column} is created by the migration but verified by nothing`);
+        const dataType = DATA_TYPE[column.type.toUpperCase()];
+        assert.ok(dataType, `no information_schema mapping for SQL type ${column.type}`);
+        assert.equal(entry!.type, dataType, `${column.table}.${column.column} expected type`);
+        assert.equal(entry!.nullable, column.nullable, `${column.table}.${column.column} expected nullability`);
+        if (column.default === undefined) {
+            assert.equal(entry!.default, undefined, `${column.table}.${column.column} declares no DEFAULT`);
+        } else {
+            assert.equal(
+                normalizeDefault(entry!.default),
+                normalizeDefault(column.default),
+                `${column.table}.${column.column} DEFAULT ${column.default} is not what the verifier expects`
+            );
+        }
+    }
+});
+
+test("every PRIMARY KEY the migration declares is verified as a primary key", async () => {
+    const objects = await expectedObjects();
+    for (const pk of declaredInCreateTable(read(MIGRATION)).primaryKeys) {
+        const entry = objects.find((o) => o.name === pk.name && o.table === pk.table);
+        assert.ok(entry, `${pk.name} is created but verified by nothing`);
+        // 'p' in pg_constraint.contype. Without it a same-named CHECK passes:
+        // it exists, it validates, and it says nothing about row identity.
+        assert.equal(entry!.contype, "p", `${pk.name} must be asserted to still BE a primary key`);
+    }
+});
+
+test("every INDEX the migration declares is verified on the right table, columns and uniqueness", async () => {
+    const objects = await expectedObjects();
+    for (const index of declaredIndexes(read(MIGRATION))) {
+        const entry = objects.find((o) => o.kind === "index" && o.name === index.name);
+        assert.ok(entry, `${index.name} is created but verified by nothing`);
+        assert.equal(entry!.table, index.table, index.name);
+        assert.equal(entry!.unique, index.unique, index.name);
+        assert.deepEqual(entry!.columns, index.columns, index.name);
+    }
+});
+
+test("every CONSTRAINT the migration adds is verified, and says what KIND it must be", async () => {
+    const objects = await expectedObjects();
+    const sql = read(MIGRATION);
+    for (const name of addedConstraints(sql)) {
+        const entry = objects.find((o) => o.name === name);
+        assert.ok(entry, `${name} is added but verified by nothing`);
+        assert.ok(entry!.contype, `${name} must pin its constraint kind — a same-named CHECK otherwise passes`);
+    }
+    // The two FKs are converted inside a DO block via format(%I), so they carry
+    // no literal ADD CONSTRAINT to parse. They are named in the ARRAY literal.
+    for (const name of ["TimeEntry_userId_fkey", "TimeEntry_projectId_fkey"]) {
+        assert.match(sql, new RegExp(name), `${name} should still be converted by the migration`);
+        const entry = objects.find((o) => o.name === name);
+        assert.ok(entry, `${name} is converted but verified by nothing`);
+        assert.equal(entry!.contype, "f", `${name} must be asserted to still BE a foreign key`);
+        assert.equal(entry!.onDelete, "r", `${name} must be asserted to be ON DELETE RESTRICT`);
+    }
+});
+
+test("every table the migration puts under RLS is verified as deny-all", async () => {
+    const objects = await expectedObjects();
+    const rls = objects.filter((o) => o.kind === "rls").map((o) => o.table);
+    for (const table of new Set(declaredRlsTables(read(MIGRATION)))) {
+        assert.ok(rls.includes(table), `${table} has RLS enabled by the migration but is verified by nothing`);
+    }
+});
+
 test("every catalog lookup is SCHEMA-QUALIFIED", async () => {
     const script = read(SCRIPT);
     const fn = script.slice(script.indexOf("export async function findSchemaDrift"));
