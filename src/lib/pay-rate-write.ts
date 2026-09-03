@@ -16,6 +16,7 @@ import { prisma } from "./prisma";
 import { hasPermission } from "./access-rules";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
 import { isKnownPayType, lockOwnerRowForUpdate } from "./pay-rate-guard";
+import { isPayrollEligibleRole } from "./payroll-config";
 import { acquirePayrollWriteLock } from "./payroll-period";
 
 export type RateActor = { role: string; permissions?: unknown } | null | undefined;
@@ -166,6 +167,28 @@ export async function applyRateChangeInTx(
     // waits rather than moving the rate underneath a day that is mid-reprice —
     // which would leave one day's shifts priced at two different rates.
     await lockOwnerRowForUpdate(tx, userId);
+
+    // STAFF ONLY, decided under the row lock this write already holds.
+    //
+    // A pay rate or a pay type on a portal CLIENT account is what puts a
+    // customer on the Gusto roster (round 8, finding 2). The roster endpoint
+    // and the CSV importer no longer offer one, but this function is the ONE
+    // place a rate is written and is reachable from three routes, so the
+    // refusal belongs here too — a screen that is fixed today is not a
+    // guarantee about the next caller. Read after the FOR UPDATE so a role
+    // change racing this write cannot slip between the check and the update.
+    const [owner] = (await tx.$queryRawUnsafe(
+        `SELECT "role" FROM "User" WHERE "id" = $1`,
+        userId
+    )) as Array<{ role: string }>;
+    if (!owner || !isPayrollEligibleRole(owner.role)) {
+        return {
+            ok: false,
+            status: 400,
+            error: "That account is not an employee, so it cannot be given a pay rate or a pay type.",
+        };
+    }
+
     await tx.user.update({ where: { id: userId }, data });
     return { ok: true, changed: true };
 }

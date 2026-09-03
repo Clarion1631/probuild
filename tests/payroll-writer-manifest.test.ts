@@ -83,31 +83,31 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "guarded" | "exempt"; why: string }> = {
     // ---- the payroll write paths -------------------------------------------
-    "app/api/time-entries/route.ts:298::create": {
+    "app/api/time-entries/route.ts:313::create": {
         kind: "guarded",
         why: "clock-in create, wrapped in withPayrollWriteTx (startTime is client-supplied, so it can aim at a locked period)",
     },
-    "app/api/time-entries/route.ts:128::updateMany": {
+    "app/api/time-entries/route.ts:143::updateMany": {
         kind: "guarded",
         why: "the stale-DEFERRED review flag, wrapped in withPayrollWrite — it sets needsReview, which gates the export",
     },
-    "app/api/time-entries/route.ts:1013::updateMany": {
+    "app/api/time-entries/route.ts:1028::updateMany": {
         kind: "guarded",
         why: "the clock-out claim, inside closeTimeEntry's locked transaction with a compare-and-set on startTime AND on updatedAt, so any concurrent write to the row the close was decided from fails it closed",
     },
-    "app/api/time-entries/route.ts:1038::update": {
+    "app/api/time-entries/route.ts:1053::update": {
         kind: "guarded",
         why: "settlement-failure flag, written inside the same locked transaction as the close it belongs to",
     },
-    "app/api/time-entries/[id]/route.ts:165::updateMany": {
+    "app/api/time-entries/[id]/route.ts:176::updateMany": {
         kind: "guarded",
         why: "the geofence telemetry branch — offsiteMs/isOffsite/lastLocationCheck touch no hours, cost or readiness flag, but it is still routed through withPayrollWriteTx (entryIds: [id]) so it cannot become a hole later without someone deliberately removing the wrapper",
     },
-    "app/api/time-entries/[id]/route.ts:588::updateMany": {
+    "app/api/time-entries/[id]/route.ts:599::updateMany": {
         kind: "guarded",
         why: "the PATCH edit claim, inside withPayrollWriteTx with a compare-and-set on updatedAt",
     },
-    "app/api/time-entries/[id]/route.ts:608::update": {
+    "app/api/time-entries/[id]/route.ts:619::update": {
         kind: "guarded",
         why: "the settlement-failure flag, written inside the same locked edit transaction",
     },

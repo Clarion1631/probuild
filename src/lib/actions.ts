@@ -15342,9 +15342,21 @@ function signRateRow(input: RowFingerprintInput): string {
         .digest("hex");
 }
 
-/** Everyone the import may write to, with rates as canonical decimal TEXT (never a float). */
+/**
+ * Everyone the import may write to, with rates as canonical decimal TEXT (never
+ * a float).
+ *
+ * STAFF ONLY. This loaded every User row, and diffRates matches on EMAIL first
+ * and then on an exact full name — so a portal CLIENT account sharing a name
+ * with somebody on the Gusto export could be matched, given a pay type and a
+ * pay rate, and from then on appear on every pay period's file (round 8,
+ * finding 2). A customer is not an employee, and the import has no business
+ * being able to make one.
+ */
 async function importableUsers() {
+    const { payrollEligibleUserWhere } = await import("./payroll-config");
     const users = await prisma.user.findMany({
+        where: payrollEligibleUserWhere(),
         select: {
             id: true, name: true, email: true, hourlyRate: true, status: true,
             payType: true, lastRateSyncAt: true, payrollRevision: true,
@@ -15499,6 +15511,7 @@ export async function applyGustoRateImport(
         await prisma.$transaction(async (tx) => {
             const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
             const { acquirePayrollWriteLock } = await import("./payroll-period");
+            const { payrollEligibleUserWhere } = await import("./payroll-config");
             // TIER 1 OF THE GLOBAL LOCK ORDER, before any row lock. Rates and
             // pay types are EXPORT INPUTS — pay type decides who is on the
             // Gusto roster at all — so this import has to serialise against a
@@ -15522,6 +15535,11 @@ export async function applyGustoRateImport(
                 // rolls the whole batch back, and nobody ends up half-imported.
                 const result = await tx.user.updateMany({
                     where: {
+                        // STAFF ONLY — see importableUsers. Belt and braces
+                        // with the load above: the preview is one request and
+                        // the apply is another, so a role change in between
+                        // must not be able to land a rate on a customer.
+                        ...payrollEligibleUserWhere(),
                         id: row.userId,
                         hourlyRate: live.hourlyRate,
                         payType: live.payType,
@@ -15591,6 +15609,7 @@ export async function setUserPayType(
     }
     const { acquirePayrollWriteLock } = await import("./payroll-period");
     const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
+    const { payrollEligibleUserWhere } = await import("./payroll-config");
     // A PAYROLL WRITE, not a profile edit. payType decides who appears on the
     // Gusto roster and whether their hours are summarised, so this is an input
     // to the export hash that lockPayrollPeriod freezes. Taking the shared
@@ -15602,7 +15621,16 @@ export async function setUserPayType(
         await acquirePayrollWriteLock(tx as never);
         await lockOwnerRowForUpdate(tx as never, userId);
         return tx.user.updateMany({
-            where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
+            // ...and only on a STAFF account. A pay type on a portal CLIENT is
+            // what puts a customer on the Gusto roster (round 8, finding 2);
+            // `count !== 1` below turns that into the same refusal a missing
+            // user gets.
+            where: {
+                AND: [
+                    payrollEligibleUserWhere(),
+                    options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
+                ],
+            },
             // lastRateSyncAt is NOT touched here — it means "a rate was actually
             // confirmed", and this write never touches hourlyRate/burdenRate.
             // payrollRevision moves instead: the rate-import token is signed over
@@ -15706,8 +15734,10 @@ export async function lockPayrollPeriod(
             timeZone,
         });
     } catch (error: any) {
-        const { isLockedSnapshotMissingError } = await import("./gusto-export-db");
-        if (isLockedSnapshotMissingError(error)) {
+        const { isLockedSnapshotMissingError, isNonStaffOnPayrollError } = await import("./gusto-export-db");
+        // Both are "there is no correct export for this period" — surfaced as a
+        // message rather than a thrown action, for the same reason.
+        if (isLockedSnapshotMissingError(error) || isNonStaffOnPayrollError(error)) {
             return { success: false as const, error: error.message };
         }
         throw error;

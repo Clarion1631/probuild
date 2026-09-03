@@ -191,3 +191,47 @@ export function lastFullPayPeriod(
     const currentStart = addDaysToKey(anchor, index * days);
     return { startKey: addDaysToKey(currentStart, -days), endKey: currentStart };
 }
+
+// ---------------------------------------------------------------------------
+// WHO CAN BE ON PAYROLL AT ALL
+// ---------------------------------------------------------------------------
+
+/**
+ * The roles a person can hold and be paid by this company.
+ *
+ * The same four the schema documents on User.role and the manager employee
+ * route validates against (VALID_ROLES). Everything else on that column is a
+ * PORTAL account: /api/clients/[id]/invite creates CLIENT rows so a customer
+ * can sign in and see their own project, and the NextAuth signIn callback
+ * activates one on first Google sign-in like any other user.
+ *
+ * That is how a customer reached payroll. Nothing between the invite and the
+ * Gusto file asked what ROLE the account held: the rates panel listed every
+ * ACTIVATED user, the CSV importer loaded every user and matched on name, and
+ * the export roster took every ACTIVATED user whose payType was HOURLY. So a
+ * customer could be shown in the rates panel, be name-matched by an import that
+ * set them HOURLY, and from then on appear as a zero-hour row in every pay
+ * period's file (round 8, finding 2).
+ *
+ * AN ALLOWLIST, deliberately, not `role != "CLIENT"`. A denylist is only
+ * correct until the next non-staff role is added — a SUBCONTRACTOR or VENDOR
+ * login would walk straight back through it, and the failure is silent.
+ */
+export const PAYROLL_STAFF_ROLES = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"] as const;
+
+/** Pure predicate — for a row already in hand. */
+export function isPayrollEligibleRole(role: string | null | undefined): boolean {
+    return typeof role === "string" && (PAYROLL_STAFF_ROLES as readonly string[]).includes(role);
+}
+
+/**
+ * THE Prisma `where` fragment. One definition, composed by the roster, the CSV
+ * importer, the rate writers and the export roster, so they cannot drift on who
+ * counts as an employee.
+ *
+ * Compose with AND rather than spreading it next to another `role` key — two
+ * `role` keys in one object literal silently keeps the last one.
+ */
+export function payrollEligibleUserWhere(): { role: { in: string[] } } {
+    return { role: { in: [...PAYROLL_STAFF_ROLES] } };
+}

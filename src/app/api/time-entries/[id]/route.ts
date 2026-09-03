@@ -6,6 +6,8 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
+import { hasPermission } from "@/lib/access-rules";
+import { timeEntryScalarSelect } from "@/lib/time-entry-projection";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx, settlementCandidateIds } from "@/lib/wa-breaks-db";
@@ -71,6 +73,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // finding 1). settleDay and friends now REQUIRE the zone, so it cannot be
     // dropped on the way through.
     const companyTimeZone = await resolveCompanyTimeZone();
+
+    // WHAT THIS VIEWER MAY READ BACK. The responses below used to be whole
+    // Prisma rows, so a crew member editing their own punch got laborCost and
+    // burdenCost with it (round 8, finding 1). The permissions row is loaded
+    // rather than inferred — see the same note in GET /api/time-entries.
+    const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
+    const canSeePay =
+        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
+    const responseSelect = timeEntryScalarSelect(canSeePay);
 
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
@@ -180,7 +191,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 { status: 409 }
             );
         }
-        const updated = await prisma.timeEntry.findUniqueOrThrow({ where: { id } });
+        const updated = await prisma.timeEntry.findUniqueOrThrow({ where: { id }, select: responseSelect });
         return NextResponse.json(JSON.parse(JSON.stringify(updated)));
     }
 
@@ -627,8 +638,14 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         throw error;
     }
 
-    const settled = await prisma.timeEntry.findUnique({ where: { id } });
-    return NextResponse.json(JSON.parse(JSON.stringify(settled ?? updated)));
+    const settled = await prisma.timeEntry.findUnique({ where: { id }, select: responseSelect });
+    // `updated` is the in-transaction row and is only the fallback when the
+    // re-read misses; project it the same way rather than leaking a whole row
+    // through the back door.
+    const projected =
+        settled ??
+        (await prisma.timeEntry.findUnique({ where: { id: (updated as { id: string }).id }, select: responseSelect }));
+    return NextResponse.json(JSON.parse(JSON.stringify(projected)));
 }
 
 // Manager/admin only. Field crew correct mistakes via PATCH (with editNotes audit);

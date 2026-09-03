@@ -164,14 +164,22 @@ export async function acquirePayrollWriteLock(tx: Pick<PayrollTxClient, "$execut
  *   payType  decides whether they are on the file as an hourly employee at all;
  *   name     printed in both CSVs;
  *   email    printed in both CSVs, and the key the salaried-email fallback and
- *            the Gusto employee mapping are looked up by.
+ *            the Gusto employee mapping are looked up by;
+ *   role     decides whether they can be on the roster AT ALL — the roster
+ *            predicate is `payrollEligibleUserWhere()` AND the above, so moving
+ *            an account into or out of the staff set adds or removes a row.
  *
- * `role` is deliberately NOT here: loadGustoExport selects id/name/email/payType
- * and nothing reads role, so a role change cannot move a byte of the export.
- * Keep this list in step with that select and with the roster `where` — the
+ * `role` was deliberately absent until round 8, on the reasoning that nothing in
+ * the CSVs is derived from it. That was true of the BYTES and false of the
+ * ROSTER: it only held while the roster asked no question about role, and once
+ * the staff predicate went in (a customer must not be on a payroll file) a role
+ * change became export-affecting like any other. It is still not selected into
+ * ExportUser and still prints nowhere — membership, not content.
+ *
+ * Keep this list in step with the roster `where` and the roster select — the
  * manifest test (tests/payroll-user-writer-manifest.test.ts) reads both.
  */
-export const EXPORT_AFFECTING_USER_FIELDS = ["status", "payType", "name", "email"] as const;
+export const EXPORT_AFFECTING_USER_FIELDS = ["status", "payType", "name", "email", "role"] as const;
 
 /** Does this Prisma `data` payload name any of them? Presence, not value — writing the same value still bumps updatedAt and still races. */
 export function touchesExportUserState(data: unknown): boolean {

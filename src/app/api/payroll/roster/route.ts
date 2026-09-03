@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { isSalariedOwner } from "@/lib/pay-rate-guard";
+import { payrollEligibleUserWhere } from "@/lib/payroll-config";
 
 /**
  * GET /api/payroll/roster — the Payroll rates panel's own data source.
@@ -55,10 +56,20 @@ export async function GET(_req: Request) {
         historicalIds = rows.map((row) => row.userId);
     }
 
+    // STAFF ONLY. This used to filter on activation alone, so every portal
+    // CLIENT account a customer had signed into once was listed in the Payroll
+    // rates panel — with a pay type and a rate waiting to be set on them
+    // (round 8, finding 2). The same predicate gates the CSV importer, the rate
+    // writers and the export roster.
     const users = await prisma.user.findMany({
-        where: historicalIds.length > 0
-            ? { OR: [{ status: "ACTIVATED" }, { id: { in: historicalIds } }] }
-            : { status: "ACTIVATED" },
+        where: {
+            AND: [
+                payrollEligibleUserWhere(),
+                historicalIds.length > 0
+                    ? { OR: [{ status: "ACTIVATED" }, { id: { in: historicalIds } }] }
+                    : { status: "ACTIVATED" },
+            ],
+        },
         select: {
             id: true,
             name: true,

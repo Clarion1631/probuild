@@ -58,9 +58,11 @@ function applyUpdate(target: Row, data: Record<string, unknown>) {
 
 function fakeTx() {
     return {
-        $queryRawUnsafe: async (_sql: string, ...args: unknown[]) => {
-            locked.push(String(args[0]));
-            return [];
+        $queryRawUnsafe: async (sql: string, ...args: unknown[]) => {
+            // The FOR UPDATE row lock, and then the staff-role read that gates
+            // every rate write (round 8, finding 2).
+            if (sql.includes("FOR UPDATE")) locked.push(String(args[0]));
+            return [{ id: String(args[0]), role: "FIELD_CREW" }];
         },
         // The payroll advisory lock — tier 1 of the global lock order, taken by
         // applyRateChangeInTx before the row lock (round 33, finding 1).
@@ -72,6 +74,10 @@ function fakeTx() {
             create: async ({ data }: { data: Record<string, unknown> }) => {
                 row = {
                     id: "u-new",
+                    // A BCRYPT-SHAPED value, so "the 201 body has no pinCode"
+                    // is a statement about the serializer and not about an
+                    // empty column (round 8, finding 1).
+                    pinCode: "$2a$10$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
                     // The database defaults the handler's create does not set —
                     // exactly the fields that made the stale body wrong.
                     hourlyRate: null,
@@ -251,4 +257,31 @@ test("the handler returns the re-read, never the create's return value", () => {
         tx.indexOf("applyRateChangeInTx") < tx.indexOf("findUniqueOrThrow"),
         "the re-read must come after the rate write, in the same transaction"
     );
+});
+
+test("the 201 body never carries the PIN hash", async () => {
+    // POST /api/users answered with a full findUniqueOrThrow row, so the bcrypt
+    // hash of the PIN it had just set went straight back out in the response —
+    // to a browser, a log, and anything in between (round 8, finding 1). GET
+    // /api/users already stripped it; the rule now lives in one helper that
+    // every User response uses.
+    installFakePrisma();
+    const res = await POST(createRequest({ name: "New Hire", email: NEW_EMAIL, pinCode: "1234" }));
+    assert.equal(res.status, 201);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    assert.ok(!("pinCode" in body), "a credential hash has no audience");
+    assert.equal(body.hasPin, true, "the fact the UI actually renders, without the hash");
+
+    // THE CONTROL: the committed row really does hold one, so the assertion
+    // above is about the serializer rather than about an absent value.
+    assert.ok((row as Row).pinCode, "the fake database stored a hash to leak");
+});
+
+test("toSafeUser drops the hash and keeps everything else", async () => {
+    const { toSafeUser, toSafeUserOrNull } = await import("../src/lib/user-serialization");
+    const safe = toSafeUser({ id: "u1", email: "a@b.c", pinCode: "$2a$10$x", role: "ADMIN" });
+    assert.deepEqual(safe, { id: "u1", email: "a@b.c", role: "ADMIN", hasPin: true });
+    assert.equal(toSafeUser({ id: "u1", pinCode: null }).hasPin, false);
+    assert.equal(toSafeUserOrNull(null), null);
 });

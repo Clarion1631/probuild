@@ -80,11 +80,11 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: string }> = {
     // ---- activation and profile edits: the round-34 hole --------------------
-    "app/api/users/[id]/route.ts:115::update": {
+    "app/api/users/[id]/route.ts:117::update": {
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
-    "app/api/users/route.ts:207::update": {
+    "app/api/users/route.ts:212::update": {
         kind: "wrapped",
         why: "PATCH /api/users writes name/role/status — the same payload, for the same reason",
     },
@@ -106,25 +106,25 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
     },
 
     // ---- already-guarded payroll writers ------------------------------------
-    "lib/pay-rate-write.ts:169::update": {
+    "lib/pay-rate-write.ts:192::update": {
         kind: "guarded",
         why: "THE rate/payType writer — takes acquirePayrollWriteLock and then the owner row lock, in the global order",
     },
-    "lib/actions.ts:15523::updateMany": {
+    "lib/actions.ts:15536::updateMany": {
         kind: "guarded",
         why: "applyGustoRateImport, inside a transaction that takes acquirePayrollWriteLock before any row lock",
     },
-    "lib/actions.ts:15604::updateMany": {
+    "lib/actions.ts:15623::updateMany": {
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
-    "app/api/users/[id]/route.ts:252::delete": {
+    "app/api/users/[id]/route.ts:254::delete": {
         kind: "guarded",
         why: "runs through deleteParentWithTimeEntries, which takes acquirePayrollWriteLock and refuses while any of the member's hours sit in a locked period",
     },
 
     // ---- exempt --------------------------------------------------------------
-    "app/api/users/route.ts:79::create": {
+    "app/api/users/route.ts:82::create": {
         kind: "exempt",
         why: "creates the row with status PENDING hard-coded and with no punches, so the roster predicate ((ACTIVATED and HOURLY) or punched) cannot match it; the payType that follows is written by applyRateChangeInTx, which does take the lock",
     },
@@ -132,7 +132,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "a CLIENT-role portal account: no payType, and User.status defaults to PENDING, so it cannot be on an hourly roster and it has no punches",
     },
-    "app/api/users/[id]/route.ts:185::update": {
+    "app/api/users/[id]/route.ts:187::update": {
         kind: "exempt",
         why: "connect/disconnect on assignedProjects only — dispatch crew assignment reaches no column the export reads",
     },
@@ -192,7 +192,7 @@ test("EXPORT_AFFECTING_USER_FIELDS matches what the export actually reads", () =
     const source = readFileSync(path.join(SRC, "lib", "gusto-export-db.ts"), "utf8");
     // The roster SELECT. Every column named there reaches buildGustoExport and
     // therefore the hashed bytes, so every one of them has to be in the list.
-    assert.match(source, /select: \{ id: true, name: true, email: true, payType: true \}/);
+    assert.match(source, /select: \{ id: true, name: true, email: true, payType: true, role: true \}/);
     for (const field of ["name", "email", "payType"]) {
         assert.ok(
             (EXPORT_AFFECTING_USER_FIELDS as readonly string[]).includes(field),
@@ -202,17 +202,48 @@ test("EXPORT_AFFECTING_USER_FIELDS matches what the export actually reads", () =
     // The roster PREDICATE, which is where status comes in.
     assert.match(source, /\{ status: "ACTIVATED", payType: "HOURLY" \}/);
     assert.ok((EXPORT_AFFECTING_USER_FIELDS as readonly string[]).includes("status"));
-    // `role` is deliberately absent: the export never selects it, so a role
-    // change cannot move a byte. Asserted so that "just add every column" cannot
-    // creep in and make every User write queue behind payroll for no guarantee.
-    assert.equal((EXPORT_AFFECTING_USER_FIELDS as readonly string[]).includes("role"), false);
+
+    // ...and `role`, since round 8. It prints in neither CSV, so it is not
+    // about the BYTES — it decides ROSTER MEMBERSHIP. The roster is
+    // `payrollEligibleUserWhere()` AND the predicate above, so moving an
+    // account into or out of the staff set adds or removes a row, exactly like
+    // activating somebody does.
+    assert.match(source, /payrollEligibleUserWhere\(\)/, "the roster is gated on the staff predicate");
+    assert.ok(
+        (EXPORT_AFFECTING_USER_FIELDS as readonly string[]).includes("role"),
+        "a role change moves somebody on or off the payroll roster"
+    );
+
+    // THE predicate lives in one place and is an ALLOWLIST. `role != "CLIENT"`
+    // would be correct only until the next non-staff role exists.
+    const config = readFileSync(path.join(SRC, "lib", "payroll-config.ts"), "utf8");
+    assert.match(config, /export const PAYROLL_STAFF_ROLES = \["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"\]/);
+    assert.match(config, /export function payrollEligibleUserWhere\(\)/);
+    assert.ok(!/role: \{ not: "CLIENT" \}/.test(config), "a denylist is one new role away from being wrong");
+
+    // Every payroll surface composes THAT predicate rather than its own copy.
+    for (const [file, why] of [
+        ["app/api/payroll/roster/route.ts", "the rates panel"],
+        ["lib/gusto-export-db.ts", "the export roster"],
+        ["lib/pay-rate-write.ts", "the one rate writer"],
+        ["lib/actions.ts", "the CSV importer and setUserPayType"],
+    ] as const) {
+        const text = readFileSync(path.join(SRC, file), "utf8");
+        assert.match(
+            text,
+            /payrollEligibleUserWhere\(\)|isPayrollEligibleRole\(/,
+            `${why} must decide "is this an employee" with the shared predicate`
+        );
+    }
 });
 
 test("touchesExportUserState reads the payload by KEY, not by value", () => {
     assert.equal(touchesExportUserState({ status: "ACTIVATED" }), true);
     assert.equal(touchesExportUserState({ name: null }), true, "a null name is still a name change");
     assert.equal(touchesExportUserState({ payType: undefined }), true, "the key being present is what matters");
-    assert.equal(touchesExportUserState({ role: "ADMIN", showOnDispatch: true }), false);
+    // `role` counts since round 8 — it decides roster membership.
+    assert.equal(touchesExportUserState({ role: "ADMIN" }), true);
+    assert.equal(touchesExportUserState({ showOnDispatch: true }), false);
     assert.equal(touchesExportUserState({}), false);
     assert.equal(touchesExportUserState(null), false);
     assert.equal(touchesExportUserState(undefined), false);

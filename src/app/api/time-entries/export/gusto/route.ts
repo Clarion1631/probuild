@@ -4,7 +4,12 @@ import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions"
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 import { validatePayrollRange } from "@/lib/payroll-config";
-import { isLockedSnapshotMissingError, loadGustoExport, type LoadedGustoExport } from "@/lib/gusto-export-db";
+import {
+    isLockedSnapshotMissingError,
+    isNonStaffOnPayrollError,
+    loadGustoExport,
+    type LoadedGustoExport,
+} from "@/lib/gusto-export-db";
 
 /**
  * GET /api/time-entries/export/gusto?periodStart=YYYY-MM-DD&periodEnd=YYYY-MM-DD&format=summary|detail
@@ -98,6 +103,16 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 if (isLockedSnapshotMissingError(error)) {
                     return NextResponse.json(
                         { error: error.message, code: "LOCKED_SNAPSHOT_MISSING" },
+                        { status: 409 }
+                    );
+                }
+                // A non-employee account has hours in this period. There is no
+                // correct file: paying a customer is wrong and silently
+                // dropping their hours from job costing is wrong too, so a
+                // human has to fix the account first.
+                if (isNonStaffOnPayrollError(error)) {
+                    return NextResponse.json(
+                        { error: error.message, code: "NON_STAFF_ON_PAYROLL", userIds: error.userIds },
                         { status: 409 }
                     );
                 }

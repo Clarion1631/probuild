@@ -765,7 +765,7 @@ test("the mangling reached the manual rate writers too, and is refused there", a
         $transaction: async (fn: any) =>
             fn({
                 user: { update: async () => ({}) },
-                $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+                $queryRawUnsafe: async (_q: string, id: string) => [{ id, role: "FIELD_CREW" }],
                 $executeRawUnsafe: async () => 0,
             }),
     };

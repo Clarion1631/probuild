@@ -5,6 +5,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
+import { toSafeUser } from "@/lib/user-serialization";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -37,7 +38,9 @@ export async function GET(req: NextRequest) {
         // Payroll fields are NOT selected here — this is a MANAGER-level roster
         // endpoint, and pay is gated on ADMIN-or-financialReports. The Payroll
         // rates panel reads its own payroll-scoped GET /api/payroll/roster.
-        const safeUsers = users.map(({ pinCode, ...u }) => ({ ...u, hasPin: !!pinCode }));
+        // The same helper every other User response uses now — this route
+        // already did it right, and the rule moved somewhere both can share.
+        const safeUsers = users.map(toSafeUser);
         return NextResponse.json(safeUsers);
     } catch (error: any) {
         console.error("GET /api/users error:", error);
@@ -152,7 +155,9 @@ export async function POST(req: Request) {
             }
         }
 
-        return NextResponse.json(newUser, { status: 201 });
+        // NEVER the raw row: `newUser` is a full findUniqueOrThrow, so this
+        // answered 201 with the freshly-hashed pinCode (round 8, finding 1).
+        return NextResponse.json(toSafeUser(newUser), { status: 201 });
     } catch (error: any) {
         console.error("POST /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });

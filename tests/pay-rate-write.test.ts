@@ -32,7 +32,13 @@ function fakeClient() {
             $transaction: async (fn: any) =>
                 fn({
                     user: { update: async (args: any) => { writes.push(args); return {}; } },
-                    $queryRawUnsafe: async (_q: string, id: string) => { locks.push(id); lockOrder.push(`row:${id}`); return [{ id }]; },
+                    $queryRawUnsafe: async (q: string, id: string) => {
+                        // ONE handler for both statements this write issues: the
+                        // FOR UPDATE row lock, and the staff-role read that
+                        // follows it (round 8, finding 2).
+                        if (q.includes("FOR UPDATE")) { locks.push(id); lockOrder.push(`row:${id}`); }
+                        return [{ id, role: "FIELD_CREW" }];
+                    },
                     $executeRawUnsafe: async (_q: string, key: string) => { lockOrder.push(`advisory:${key}`); return 0; },
                 }),
         },
@@ -128,7 +134,7 @@ test("the lock is taken BEFORE the write, not after it", async () => {
                 user: { update: async () => { order.push("write"); return {}; } },
                 $queryRawUnsafe: async (q: string, id: string) => {
                     order.push(q.includes("FOR UPDATE") ? "lock" : "read");
-                    return [{ id }];
+                    return [{ id, role: "FIELD_CREW" }];
                 },
                 $executeRawUnsafe: async () => { order.push("payroll"); return 0; },
             }),
@@ -136,7 +142,11 @@ test("the lock is taken BEFORE the write, not after it", async () => {
     await applyRateChange(ADMIN, "u1", { hourlyRate: "31.00" }, client as never);
     assert.deepEqual(
         order,
-        ["payroll", "lock", "write"],
+        // The "read" between the lock and the write is the staff-role check
+        // (round 8, finding 2). It sits AFTER the FOR UPDATE deliberately: a
+        // role change racing this write must not be able to land between the
+        // check and the update.
+        ["payroll", "lock", "read", "write"],
         "a lock taken after the write serializes nothing — and the payroll lock comes before the row lock"
     );
 });
@@ -209,7 +219,7 @@ test("applyRateChangeInTx does NOT open a transaction — a tx has no $transacti
     const writes: unknown[] = [];
     const tx = {
         user: { update: async (args: unknown) => { writes.push(args); return {}; } },
-        $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+        $queryRawUnsafe: async (_q: string, id: string) => [{ id, role: "FIELD_CREW" }],
         $executeRawUnsafe: async () => 0,
         // Deliberately absent: $transaction. Reaching for it is the bug.
     };
@@ -240,7 +250,7 @@ test("applyRateChange is the ONLY opener, and refuses before taking a connection
             opened = true;
             return fn({
                 user: { update: async () => ({}) },
-                $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+                $queryRawUnsafe: async (_q: string, id: string) => [{ id, role: "FIELD_CREW" }],
                 $executeRawUnsafe: async () => 0,
             });
         },

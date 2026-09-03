@@ -5,6 +5,8 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { hasPermission } from "@/lib/access-rules";
+import { timeEntrySelect } from "@/lib/time-entry-projection";
 import { dayKeyInTimeZone } from "@/lib/tz-date";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
@@ -51,10 +53,23 @@ export async function GET(req: Request) {
         whereClause.projectId = projectId;
     }
 
+    // WHAT THIS VIEWER MAY READ. `user: true` used to serialize the OWNER as a
+    // complete Prisma row: their pinCode BCRYPT HASH, hourlyRate, burdenRate and
+    // payType went to field crew for their own entries, and to a MANAGER for
+    // everybody in the company (round 8, finding 1). The projection is an
+    // allowlist per audience — see src/lib/time-entry-projection.ts.
+    //
+    // The permissions row is loaded rather than inferred: hasPermission falls
+    // back to role DEFAULTS when it is absent, and FINANCE's default includes
+    // financialReports — so an explicit revocation would have been ignored.
+    const viewerPermissions = await prisma.userPermission.findUnique({ where: { userId: user.id } });
+    const canSeePay =
+        user.role === "ADMIN" || hasPermission({ role: user.role, permissions: viewerPermissions }, "financialReports");
+
     const timeEntries = await prisma.timeEntry.findMany({
         where: whereClause,
-        include: {
-            user: true,
+        select: {
+            ...timeEntrySelect(canSeePay),
             // Explicit select — a full Project row would serialize
             // chatWebhookUrl (a credential) to field crew.
             project: {

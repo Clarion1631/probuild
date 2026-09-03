@@ -204,6 +204,26 @@ jobs:
           # reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # A portal CLIENT account is not an employee. The rates panel, the CSV
+      # importer, the rate writer and the export roster all used to ask only
+      # whether an account was ACTIVATED, so a customer who had signed in once
+      # could be given a pay type and then appear on every pay period's file.
+      - name: Prove a customer account can never reach payroll
+        run: npx tsx --test tests/payroll-staff-only-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
+      # GET /api/time-entries served the whole Prisma model plus the owner as a
+      # complete User row, so field crew received their own pinCode BCRYPT HASH
+      # and pay rates, and a manager received everybody's. Real requests with
+      # real mobile tokens, asserted as an allowlist.
+      - name: Prove the time-entry response is an allowlist per audience
+        run: npx tsx --test tests/time-entries-projection-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

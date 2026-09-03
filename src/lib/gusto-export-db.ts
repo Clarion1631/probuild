@@ -20,7 +20,13 @@ import { resolveCompanyTimeZone } from "./company-timezone";
 import { acquireIntegrationSettingsLock, getGustoSettings } from "./integration-store";
 import { workweekStartKey } from "./overtime";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
-import { isSalariedEmail, payrollLockEnvelope, salariedEmails } from "./payroll-config";
+import {
+    isPayrollEligibleRole,
+    isSalariedEmail,
+    payrollEligibleUserWhere,
+    payrollLockEnvelope,
+    salariedEmails,
+} from "./payroll-config";
 import {
     buildGustoExport,
     toDetailCsv,
@@ -261,6 +267,40 @@ export class LockedSnapshotMissingError extends Error {
 /** By NAME, not instanceof — the same module-identity reason every other guard in this repo uses a name check. */
 export function isLockedSnapshotMissingError(error: unknown): error is LockedSnapshotMissingError {
     return error instanceof Error && error.name === "LockedSnapshotMissingError";
+}
+
+/**
+ * An account that is NOT an employee has hours in this pay period.
+ *
+ * The zero-hour half of the roster is filtered to staff roles, so a portal
+ * CLIENT can no longer be manufactured onto the file by setting a pay type on
+ * them (round 8, finding 2). The other half is "anybody who actually punched",
+ * and that one is deliberately NOT filtered: the detail CSV is built by walking
+ * the roster, so dropping a punched account would delete real hours from the
+ * job-costing file rather than reporting a problem.
+ *
+ * So it REFUSES instead. A customer login with time entries is a genuine
+ * problem — a mis-set role, or a portal account that reached the crew API — and
+ * the answer is a human looking at it, not a payroll file that quietly pays
+ * them or a detail file that quietly loses their hours.
+ */
+export class NonStaffOnPayrollError extends Error {
+    readonly userIds: string[];
+    constructor(accounts: Array<{ id: string; email: string; role: string | null }>) {
+        super(
+            `${accounts.length === 1 ? "An account" : `${accounts.length} accounts`} with hours in this pay period ` +
+                `${accounts.length === 1 ? "is" : "are"} not an employee: ` +
+                accounts.map((account) => `${account.email} (${account.role ?? "no role"})`).join(", ") +
+                ". Nothing can be exported until that is corrected — a portal or customer login must not appear on a " +
+                "payroll file, and its hours must not be silently dropped from job costing either."
+        );
+        this.name = "NonStaffOnPayrollError";
+        this.userIds = accounts.map((account) => account.id);
+    }
+}
+
+export function isNonStaffOnPayrollError(error: unknown): error is NonStaffOnPayrollError {
+    return error instanceof Error && error.name === "NonStaffOnPayrollError";
 }
 
 /**
@@ -517,9 +557,16 @@ export async function loadGustoExport(
     const userRows = await client.user.findMany({
         where: {
             OR: [
-                // Known-hourly staff appear as 0.00 summary rows even with no
+                // Known-hourly STAFF appear as 0.00 summary rows even with no
                 // punches — their pay type is answered, so they cannot block.
-                { status: "ACTIVATED", payType: "HOURLY" },
+                //
+                // The role predicate is what keeps a customer off the file.
+                // /api/clients/[id]/invite creates CLIENT accounts and the
+                // sign-in callback activates them, so "ACTIVATED and HOURLY"
+                // alone put any portal account somebody had set a pay type on
+                // into EVERY pay period's roster, as a zero-hour summary row
+                // (round 8, finding 2).
+                { AND: [payrollEligibleUserWhere(), { status: "ACTIVATED", payType: "HOURLY" }] },
                 // Anyone who actually worked in the period, whatever their
                 // status or pay type.
                 { id: { in: punchedUserIds } },
@@ -531,9 +578,22 @@ export async function loadGustoExport(
             // this file says nothing about. Null pay types now reach the roster
             // only via punchedUserIds.
         },
-        select: { id: true, name: true, email: true, payType: true },
+        // `role` is read for the staff check below. It is NOT passed to
+        // buildGustoExport: nothing in the CSVs is derived from it, and adding
+        // it to ExportUser would put a column in the hash that no file prints.
+        select: { id: true, name: true, email: true, payType: true, role: true },
         orderBy: { id: "asc" },
     });
+
+    // REFUSE a non-employee with hours. The zero-hour half of the OR above is
+    // filtered to staff roles; this covers the punched half, which is not (see
+    // NonStaffOnPayrollError for why dropping them would be worse).
+    const nonStaff = userRows.filter((row) => !isPayrollEligibleRole(row.role));
+    if (nonStaff.length > 0) {
+        throw new NonStaffOnPayrollError(
+            nonStaff.map((row) => ({ id: row.id, email: row.email, role: row.role }))
+        );
+    }
 
     // The roster is settled; now PIN it. Inside a transaction the rows are
     // re-read FOR SHARE and those values are what gets hashed — see
