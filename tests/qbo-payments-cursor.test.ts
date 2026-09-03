@@ -23,6 +23,8 @@ import {
     type QBPaymentSyncResult,
 } from "../src/lib/quickbooks-payments";
 import { createRouteDeadline } from "../src/lib/quickbooks";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 const TOTAL = 600; // deliberately > the 500-row cap
 const KEY = PAYMENTS_CURSOR_KEYS.milestones;
@@ -214,4 +216,32 @@ test("a run with NO cursor never reads or writes the store", async () => {
     await runOnce(undefined);
     assert.equal(store.gets, 0);
     assert.deepEqual(store.sets, []);
+});
+
+// ── Wiring ──────────────────────────────────────────────────────────────────
+//
+// Every test above drives forEachPendingPage directly, so all of them still
+// pass if the sync simply stops handing it a cursor — and tsc would not object
+// either, since the argument is optional. Reading the source is the only check
+// available without standing up Postgres, and it is the same technique the
+// worker suite uses for its sweep query.
+
+const paymentsSource = readFileSync(
+    path.join(__dirname, "..", "src/lib/quickbooks-payments.ts"),
+    "utf8",
+);
+
+test("both rails are given their resume cursor", () => {
+    assert.match(paymentsSource, /^\s*milestoneCursor,$/m, "the milestone pass must resume");
+    assert.match(paymentsSource, /^\s*billingCursor,$/m, "so must the progress-billing pass");
+});
+
+test("only the UNSCOPED sweep carries a cursor", () => {
+    // A scoped on-view refresh looks at a handful of rows a user is staring at.
+    // Reading the shared cursor would make it skip the very row it was asked
+    // about; writing one would drag the cron's resume point to wherever that
+    // user happened to be looking, starving everything after it.
+    assert.match(paymentsSource, /const isSweep = !scope\?\.invoiceId && !scope\?\.projectId;/);
+    assert.match(paymentsSource, /const milestoneCursor = isSweep\s*\r?\n\s*\?\s*\{ store: cursorStore, key: PAYMENTS_CURSOR_KEYS\.milestones \}\s*\r?\n\s*: undefined;/);
+    assert.match(paymentsSource, /const billingCursor = isSweep\s*\r?\n\s*\?\s*\{ store: cursorStore, key: PAYMENTS_CURSOR_KEYS\.billings \}\s*\r?\n\s*: undefined;/);
 });

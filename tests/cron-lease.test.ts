@@ -10,6 +10,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { acquireCronLease, type CronLeaseStore } from "../src/lib/cron-lease";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 const KEY = "test-lease";
 
@@ -148,4 +150,36 @@ test("a CORRUPT lease value reads as expired rather than wedging the cron foreve
     const store = memoryStore("not-a-date|???");
     const lease = await acquireCronLease(KEY, 90_000, { store, now: at("2026-09-01T12:00:00.000Z"), token: "A" });
     assert.ok(lease);
+});
+
+// ── Wiring ──────────────────────────────────────────────────────────────────
+//
+// Everything above proves the lease MECHANISM. None of it would notice the
+// cron simply not taking one, or taking one that expires under its own pass —
+// and neither would tsc, because both are optional-looking call-site details.
+// These read the route, in the spirit of the sweep-query check in
+// receipt-intake-worker.test.ts.
+
+const workerRoute = readFileSync(
+    path.join(__dirname, "..", "src/app/api/cron/receipt-intake-worker/route.ts"),
+    "utf8",
+);
+
+test("the receipt-intake worker actually takes a lease", () => {
+    assert.match(
+        workerRoute,
+        /acquireLease:\s*\(\)\s*=>\s*acquireCronLease\(WORKER_LEASE_KEY,\s*WORKER_LEASE_MS\)/,
+        "buildDeps must wire the lease, or runIntakeWorker's whole-pass exclusion is inert",
+    );
+});
+
+test("the lease OUTLIVES the platform ceiling — which is why nothing heartbeats", () => {
+    // A lease shorter than maxDuration could lapse while its own pass was still
+    // running, letting a second invocation in on exactly the run it exists to
+    // exclude. The only alternative is heartbeating from a loop that spends its
+    // time blocked on Gemini and QuickBooks, so this inequality is load-bearing.
+    const ttl = Number(workerRoute.match(/const WORKER_LEASE_MS = ([\d_]+);/)?.[1].replace(/_/g, ""));
+    const maxDuration = Number(workerRoute.match(/export const maxDuration = (\d+);/)?.[1]) * 1_000;
+    assert.ok(Number.isFinite(ttl) && Number.isFinite(maxDuration), "both constants must be readable");
+    assert.ok(ttl > maxDuration, `lease TTL ${ttl}ms must exceed the ${maxDuration}ms function ceiling`);
 });
