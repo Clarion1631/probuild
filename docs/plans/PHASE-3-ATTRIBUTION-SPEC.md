@@ -333,7 +333,8 @@ backfill > null. Nothing but a human edit may change a row whose `costCodeSource
    and `costCodeSource`/`costCodeConfidence`: "capture" (confidence null) when a human
    chose `costCodeId` at capture; "ai" + `suggestedConfidence` when it fell back to
    `matchCostCode(suggestedPhaseCode)`. `POST /api/receipts/intake` accepts
-   `installedAtCustomer?: boolean` (defaulting per §5), and for drive/email/chat sources
+   `installedAtCustomer?: boolean` (**no default — see the TAX POSITION note below**; an
+   absent answer stays NULL and the excise report skips the row), and for drive/email/chat sources
    the read step sets `taxAtSource = taxCents > 0`.
 3. **receipt-ingest v1** (`receipt-ingest/route.ts:108`): add `projectId: project.id`,
    `costCodeSource: costCode ? "ai" : null`, `costCodeConfidence: null` (the category is

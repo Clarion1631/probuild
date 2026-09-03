@@ -1124,7 +1124,6 @@ export const SOURCE_FILE_BRIDGE_SQL = [
      DECLARE
          derived TEXT;
          next_index INT;
-         counter_key TEXT;
      BEGIN
          -- A row that already names its file speaks for itself: the new build
          -- inserted it, and it has chosen its own group ordinal.
@@ -1136,37 +1135,77 @@ export const SOURCE_FILE_BRIDGE_SQL = [
              NEW."sourceFileId" := derived;
          END IF;
 
-         IF NEW."sourceFileId" IS NULL THEN
+         -- AN IDENTITY THAT DOES NOT DEPEND ON PARSING THE URL (round 49,
+         -- item 2).
+         --
+         -- This used to RETURN early when no id could be derived -- a
+         -- shortened link, a re-hosted copy, a /uc?export=download form -- so
+         -- the old instance's insert took no lock at all. The new route's
+         -- exact-url fallback can see such a row only once it has COMMITTED;
+         -- against an in-flight one it read "nothing here" and inserted the
+         -- receipt again. The lock is what makes the two versions wait for
+         -- each other, so it cannot be conditional on the url being
+         -- parseable: when there is no file id, the normalised url IS the
+         -- identity, and the route hashes the same string.
+         --
+         -- An insert with no receipt url at all is not a Drive receipt: no
+         -- lock, no ordinal, nothing.
+         IF NEW."sourceFileId" IS NULL AND NEW."receiptUrl" IS NULL THEN
              RETURN NEW;
          END IF;
 
          -- THE SAME LOCK THE ROUTE TAKES, so an old-version insert and a
-         -- new-version request for one file cannot both believe they are first.
-         -- Transaction-scoped: released at COMMIT or ROLLBACK, nothing to leak.
-         PERFORM pg_advisory_xact_lock(
-             hashtextextended('receipt-ingest:' || NEW."sourceFileId", 0)
-         );
+         -- new-version request for one document cannot both believe they are
+         -- first. Transaction-scoped: released at COMMIT or ROLLBACK, nothing
+         -- to leak.
+         IF NEW."sourceFileId" IS NOT NULL THEN
+             PERFORM pg_advisory_xact_lock(
+                 hashtextextended('receipt-ingest:' || NEW."sourceFileId", 0)
+             );
+         ELSE
+             PERFORM pg_advisory_xact_lock(
+                 hashtextextended('receipt-ingest-url:' || lower(btrim(NEW."receiptUrl")), 0)
+             );
+             -- No id means no ordinal: the unique index is partial on
+             -- "sourceFileId" IS NOT NULL, so a number here would guard
+             -- nothing and would invite a reader to treat it as a group
+             -- position it cannot be. The row is still identified by its url,
+             -- which is what the route matches it on.
+             RETURN NEW;
+         END IF;
 
-         -- THE ORDINAL COUNTS WITHIN THIS TRANSACTION, NOT WITHIN THE TABLE.
+         -- THE ORDINAL COUNTS WHAT IS COMMITTED, NOT WHAT THIS TRANSACTION
+         -- HAS DONE (round 49, item 1 -- a P0 this replaces).
          --
-         -- MAX(existing) + 1 was the obvious rule and it is the wrong one: it
-         -- makes a RE-DELIVERY of a document the table already holds land on
-         -- fresh ordinals and insert cleanly, which is the duplicate this whole
-         -- bridge exists to stop. Counting per transaction instead means the N
-         -- groups of one delivery get 0,1,2..., and a SECOND delivery of the
-         -- same file starts at 0 again -- colliding with the row already there
-         -- and aborting on the partial unique index
-         -- ("sourceFileId", "sourceGroupIndex"). An old instance that retries a
-         -- document therefore fails loudly instead of duplicating it, and its
-         -- Apps Script does not archive the file.
+         -- The first version counted per TRANSACTION, on the theory that a
+         -- re-delivery would then collide with the rows already there and be
+         -- refused. That theory assumed the old handler writes its groups in
+         -- one transaction. It does not: the deployed handler calls
+         -- prisma.expense.create() once per group, each its own autocommit
+         -- statement (see the loop in the pre-Phase-3
+         -- src/app/api/integrations/receipt-ingest/route.ts). So every group of
+         -- one receipt got ordinal 0, group two violated the unique index the
+         -- moment group one committed, and a retry -- seeing group one --
+         -- answered alreadyIngested. The remaining groups were dropped for
+         -- good: money silently missing from a receipt the archive says was
+         -- imported.
          --
-         -- set_config(..., true) is transaction-local, so the counter cannot
-         -- survive a COMMIT or leak into another session. The key is hashed
-         -- because a Drive file id is not a legal GUC name.
+         -- MAX(committed) + 1, under the advisory lock above, is what the old
+         -- handler's actual boundaries need: three autocommit inserts become
+         -- 0, 1, 2 because each one sees its committed siblings.
+         --
+         -- WHAT THIS GIVES UP, said plainly: a re-delivery of a document that
+         -- is already complete no longer collides -- it appends. That is the
+         -- behaviour the old build has today with no bridge at all, and it is
+         -- still guarded on both sides (the old handler's own url dedupe, and
+         -- the new route's alreadyIngestedWhere). Losing groups is worse
+         -- than a duplicate a human can see, and the resume path in the route
+         -- is what makes the retry land the missing groups instead of nothing.
          IF NEW."sourceGroupIndex" IS NULL THEN
-             counter_key := 'probuild.bridge_' || md5(NEW."sourceFileId");
-             next_index := COALESCE(NULLIF(current_setting(counter_key, true), '')::int, -1) + 1;
-             PERFORM set_config(counter_key, next_index::text, true);
+             SELECT COALESCE(MAX("sourceGroupIndex"), -1) + 1
+               INTO next_index
+               FROM "Expense"
+              WHERE "sourceFileId" = NEW."sourceFileId";
              NEW."sourceGroupIndex" := next_index;
          END IF;
 
@@ -1776,7 +1815,7 @@ async function main() {
             ? [...postDeployStatements(companyTimeZone), ...postDeployTeardownStatements({ repairSplitJobs })]
             : backfillStatements(companyTimeZone);
         if (postDeployOnly) {
-            console.log("--post-deploy: the three backfills, then BOTH compatibility guards come out (see PROJECT_ID_BACKFILL and AMOUNT_TAX_GUARD_SQL).");
+            console.log(`--post-deploy: the three backfills, then ALL ${COMPATIBILITY_TRIGGERS.length} compatibility triggers come out: ${COMPATIBILITY_TRIGGERS.join(", ")}.`);
             console.log(
                 repairSplitJobs
                     ? "--repair-split-jobs: ALSO re-deriving projectId from the estimate for QBO-synced rows whose pair disagrees. Read SPLIT_JOB_REPAIR before trusting this on a database where humans have re-attributed expenses."

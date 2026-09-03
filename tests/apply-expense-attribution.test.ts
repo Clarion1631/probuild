@@ -1127,7 +1127,7 @@ test("the guard is idempotent: it drops its own trigger before creating it", () 
     assert.ok(dropIndex < createIndex, "drop must come before create");
 });
 
-test("the post-deploy pass takes BOTH guards back out", () => {
+test("the post-deploy pass takes ALL THREE compatibility triggers back out", () => {
     // They are compatibility scaffolding for ONE deploy. Left standing, the
     // split-job guard would overrule a future writer that legitimately moves
     // an estimate, and the amount/tax guard would re-open a review on every
@@ -1248,7 +1248,7 @@ test("the amount/tax guard is idempotent to re-create", () => {
     assert.match(AMOUNT_TAX_GUARD_SQL[0], /CREATE OR REPLACE FUNCTION/);
 });
 
-test("both guards go in BEFORE the projectId backfill", () => {
+test("every compatibility trigger goes in BEFORE the projectId backfill", () => {
     // From the moment the columns carry values, an old instance can damage
     // them. A guard created after the fill leaves exactly that window open.
     const fillAt = (statements as string[]).indexOf(PROJECT_ID_BACKFILL);
@@ -1659,17 +1659,45 @@ test("the bridge derives the file id the same way the backfill does", () => {
     }
 });
 
-test("the ordinal counts within the TRANSACTION, not within the table", () => {
-    // MAX(existing) + 1 is the obvious rule and it is the wrong one: a
-    // re-delivery would land on fresh ordinals and insert cleanly, which is
-    // exactly the duplicate this bridge exists to stop. Counting per
-    // transaction makes a second delivery collide with the rows already there.
+test("the ordinal counts what is COMMITTED, not what this transaction did", () => {
+    // ROUND 49, ITEM 1 — a P0 this replaces. The first version counted per
+    // TRANSACTION, which assumed the old handler writes its groups in one. It
+    // does not: the deployed handler calls prisma.expense.create() once per
+    // group, each its own autocommit statement, so every group got ordinal 0,
+    // group two violated the unique index the moment group one committed, and
+    // a retry answered alreadyIngested with the rest of the receipt missing.
     const fn = SOURCE_FILE_BRIDGE_SQL[0];
-    assert.match(fn, /set_config\(counter_key, next_index::text, true\)/,
-        "the counter must be TRANSACTION-local");
-    assert.match(fn, /current_setting\(counter_key, true\)/);
-    assert.doesNotMatch(fn, /MAX\("sourceGroupIndex"\)/,
-        "a table-wide MAX lets a re-delivery insert cleanly");
+    assert.match(fn, /SELECT COALESCE\(MAX\("sourceGroupIndex"\), -1\) \+ 1/,
+        "the ordinal comes from the committed rows for this file");
+    assert.match(fn, /WHERE "sourceFileId" = NEW\."sourceFileId"/);
+    assert.doesNotMatch(fn, /set_config\('probuild\.bridge_/,
+        "a transaction-local counter cannot survive the old handler's boundaries");
+    assert.doesNotMatch(fn, /current_setting\(counter_key/);
+    // ...and the read happens UNDER the advisory lock, or two concurrent old
+    // inserts would compute the same next ordinal.
+    assert.ok(
+        fn.indexOf("pg_advisory_xact_lock") < fn.indexOf('MAX("sourceGroupIndex")'),
+        "the lock has to be held before the MAX is read",
+    );
+});
+
+test("an unparseable url still gets an identity to lock on", () => {
+    // ROUND 49, ITEM 2. The bridge used to RETURN early when no Drive id could
+    // be derived, so a shortened or re-hosted link took no lock at all and an
+    // old instance's in-flight insert was invisible to the new route rather
+    // than merely uncommitted.
+    const fn = SOURCE_FILE_BRIDGE_SQL[0];
+    assert.match(fn, /hashtextextended\('receipt-ingest-url:' \|\| lower\(btrim\(NEW\."receiptUrl"\)\), 0\)/,
+        "the normalised url is the second identity");
+    // The route must hash the SAME string, normalised the same way.
+    const route = readFileSync(
+        path.resolve(__dirname, "..", "src", "app", "api", "integrations", "receipt-ingest", "route.ts"),
+        "utf8",
+    );
+    assert.match(route, /RECEIPT_INGEST_URL_LOCK_PREFIX = "receipt-ingest-url:"/);
+    assert.match(route, /receiptUrl\.trim\(\)\.toLowerCase\(\)/);
+    // Only a row with NO url at all escapes without a lock.
+    assert.match(fn, /IF NEW\."sourceFileId" IS NULL AND NEW\."receiptUrl" IS NULL THEN\s+RETURN NEW;/);
 });
 
 test("it fires BEFORE INSERT and only touches rows that stay silent", () => {
@@ -1679,8 +1707,8 @@ test("it fires BEFORE INSERT and only touches rows that stay silent", () => {
     // not renumber it.
     assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceFileId" IS NULL AND NEW\."receiptUrl" IS NOT NULL THEN/);
     assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceGroupIndex" IS NULL THEN/);
-    // ...and an expense with no Drive url at all pays nothing.
-    assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceFileId" IS NULL THEN\s+RETURN NEW;/);
+    // ...and an expense with no receipt url at all pays nothing.
+    assert.match(SOURCE_FILE_BRIDGE_SQL[0], /IF NEW\."sourceFileId" IS NULL AND NEW\."receiptUrl" IS NULL THEN\s+RETURN NEW;/);
 });
 
 test("the bridge and its teardown are BOTH in the committed migration", () => {
@@ -1759,4 +1787,24 @@ test("...and the whole chain passes with the right ref, refuses with a wrong one
 
     // ...and the banner built from that URL still hides the password.
     assert.doesNotMatch(targetBanner("prod", { url: PROD_URL, from: ".env.production.local", db: "postgres", host: "10.0.0.5" }), /s3cr3t/);
+});
+
+test("the operator message names the same triggers the teardown drops", () => {
+    // Round 49, item 4. The list grew to three and the message still said
+    // "BOTH compatibility guards", so an operator watching a --post-deploy
+    // run was told to expect two removals and saw three. One list, read in
+    // both places, is the only version of this that cannot drift again.
+    const source = readFileSync(
+        path.resolve(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    assert.equal(COMPATIBILITY_TRIGGERS.length, 3);
+    assert.match(source, /ALL \$\{COMPATIBILITY_TRIGGERS\.length\} compatibility triggers come out/,
+        "the message must COUNT the list rather than restate a number");
+    assert.doesNotMatch(source, /BOTH compatibility guards/, "the two-trigger wording is gone");
+    // ...and the teardown really does drop exactly that list.
+    const teardown = postDeployTeardownStatements();
+    for (const name of COMPATIBILITY_TRIGGERS) {
+        assert.ok(teardown.some(sql => sql.includes(`DROP TRIGGER IF EXISTS ${name}`)), `${name} is never dropped`);
+    }
 });

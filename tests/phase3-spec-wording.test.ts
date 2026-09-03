@@ -101,3 +101,21 @@ test("the report's filter is documented as it is implemented", () => {
     assert.match(report, /taxAmount: \{ not: 0 \}/);
     assert.match(report, /needsTaxReview: false/);
 });
+
+test("no document still advertises an installedAtCustomer DEFAULT", () => {
+    // Round 49, item 5. The rule shipped in round 2 — nothing defaults this
+    // field — and two planning documents went on describing the behaviour it
+    // replaced: the intake contract said "defaulting per §5" and the v2 plan
+    // said "default true for job-folder receipts, false for Shop". A spec that
+    // contradicts the code invites someone to implement the spec.
+    assert.doesNotMatch(SPEC, /\(defaulting per §5\)/);
+    assert.match(SPEC, /\*\*no default — see the TAX POSITION note below\*\*/);
+    assert.match(SPEC, /`installedAtCustomer` has no default/);
+
+    const plan = readFileSync(
+        path.resolve(__dirname, "..", "docs", "plans", "RECEIPT-PIPELINE-V2-PLAN.md"),
+        "utf8",
+    );
+    assert.doesNotMatch(plan, /default true for job-folder receipts/);
+    assert.match(plan, /\*\*nothing defaults it\*\*/);
+});

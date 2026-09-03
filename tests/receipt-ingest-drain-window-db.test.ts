@@ -143,6 +143,54 @@ function ingest(body: Record<string, unknown>) {
     }));
 }
 
+/** A url with no derivable Drive id: a shortened link, as Drive sometimes returns. */
+const SHORT_URL = "https://drive.google.com/open-short/abcdef";
+
+/** Three groups of one receipt, the shape the old handler writes one row at a time. */
+const THREE_GROUPS = [
+    { category: "Plumbing", amount: 10 },
+    { category: "Plumbing", amount: 20 },
+    { category: "Plumbing", amount: 30 },
+];
+
+/**
+ * THE PRE-FIX BRIDGE, kept verbatim so the control is the real thing rather
+ * than a description of it. Transaction-local counter: three autocommit
+ * inserts each start at 0.
+ */
+const PRE_FIX_BRIDGE_FUNCTION = `
+    CREATE OR REPLACE FUNCTION probuild_expense_source_file_bridge()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $bridge$
+    DECLARE
+        derived TEXT;
+        next_index INT;
+        counter_key TEXT;
+    BEGIN
+        IF NEW."sourceFileId" IS NULL AND NEW."receiptUrl" IS NOT NULL THEN
+            derived := COALESCE(
+                substring(NEW."receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+                substring(NEW."receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+            );
+            NEW."sourceFileId" := derived;
+        END IF;
+        IF NEW."sourceFileId" IS NULL THEN
+            RETURN NEW;
+        END IF;
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended('receipt-ingest:' || NEW."sourceFileId", 0)
+        );
+        IF NEW."sourceGroupIndex" IS NULL THEN
+            counter_key := 'probuild.bridge_' || md5(NEW."sourceFileId");
+            next_index := COALESCE(NULLIF(current_setting(counter_key, true), '')::int, -1) + 1;
+            PERFORM set_config(counter_key, next_index::text, true);
+            NEW."sourceGroupIndex" := next_index;
+        END IF;
+        RETURN NEW;
+    END;
+    $bridge$`;
+
 const PAYLOAD = {
     projectName: PROJECT_NAME,
     vendor: "Home Depot",
@@ -218,39 +266,177 @@ test("the bridge stamps an old-build insert on the way in", { skip }, async () =
     }
 });
 
-test("N groups of one old-build transaction get N distinct ordinals", { skip }, async () => {
+test("a 3-group delivery at the OLD HANDLER'S boundaries lands all three", { skip }, async () => {
+    // ROUND 49, ITEM 1 — the P0. The deployed handler does NOT wrap its groups
+    // in a transaction: it calls prisma.expense.create() once per group, each
+    // its own autocommit statement. Wrapping them in one transaction, as the
+    // first version of this test did, tested a shape production never
+    // produces — and hid that the transaction-local counter gave every group
+    // ordinal 0, so group two died on the unique index and was lost.
     await seed();
     await installBridge();
     try {
-        await db!.$transaction(async tx => {
-            const raw = tx as unknown as { $executeRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
-            await raw.$executeRawUnsafe(OLD_INSERT, `${PFX}-g0`, 10, FILE_URL, ESTIMATE);
-            await raw.$executeRawUnsafe(OLD_INSERT, `${PFX}-g1`, 20, FILE_URL, ESTIMATE);
-            await raw.$executeRawUnsafe(OLD_INSERT, `${PFX}-g2`, 30, FILE_URL, ESTIMATE);
-        });
+        await oldStyleInsert(db!, `${PFX}-g0`, 10);
+        await oldStyleInsert(db!, `${PFX}-g1`, 20);
+        await oldStyleInsert(db!, `${PFX}-g2`, 30);
+
         const rows = await rowsForFile();
-        assert.deepEqual(rows.map(r => r.sourceGroupIndex), [0, 1, 2]);
+        assert.equal(rows.length, 3, "all three groups are in the table");
+        assert.deepEqual(rows.map(r => r.sourceGroupIndex).sort((a, b) => (a ?? 0) - (b ?? 0)), [0, 1, 2]);
+        assert.deepEqual(
+            rows.map(r => Number(r.amount)).sort((a, b) => a - b),
+            [10, 20, 30],
+            "and the money is all of it, not just the first group",
+        );
     } finally {
         await cleanup();
     }
 });
 
-test("a SECOND old-build delivery of the same file is refused, not duplicated", { skip }, async () => {
-    // The ordinal counts within the TRANSACTION, so a re-delivery starts at 0
-    // again and collides with the row already there. The unique index refuses
-    // it, the old instance sees an error, and its Apps Script does not archive
-    // the file — which is the correct outcome for a document already booked.
+test("CONTROL: a transaction-local ordinal loses groups two and three", { skip }, async () => {
+    // The pre-fix bridge, verbatim, installed for this test only: the counter
+    // lives in a transaction-local GUC, so three autocommit inserts each start
+    // at 0. This is what production would have done to a three-group receipt.
+    await seed();
+    await removeBridge().catch(() => {});
+    try {
+        await db!.$executeRawUnsafe(PRE_FIX_BRIDGE_FUNCTION);
+        await db!.$executeRawUnsafe(`DROP TRIGGER IF EXISTS probuild_expense_source_file_bridge ON "Expense"`);
+        await db!.$executeRawUnsafe(
+            `CREATE TRIGGER probuild_expense_source_file_bridge
+             BEFORE INSERT ON "Expense" FOR EACH ROW
+             EXECUTE FUNCTION probuild_expense_source_file_bridge()`,
+        );
+
+        await oldStyleInsert(db!, `${PFX}-g0`, 10);
+        let second: unknown = null;
+        await oldStyleInsert(db!, `${PFX}-g1`, 20).catch(caught => { second = caught; });
+        let third: unknown = null;
+        await oldStyleInsert(db!, `${PFX}-g2`, 30).catch(caught => { third = caught; });
+
+        assert.ok(second, "group two collides on ordinal 0");
+        assert.ok(third, "and so does group three");
+        assert.equal((await rowsForFile()).length, 1, "two thirds of the receipt is gone");
+
+        // ...and the retry against the new route then calls it done, which is
+        // how the loss becomes permanent.
+        const res = await ingest({ ...PAYLOAD, groups: THREE_GROUPS });
+        const json = await res.json() as { alreadyIngested?: boolean; created?: number };
+        assert.equal(json.alreadyIngested, undefined, "the SHIPPED route resumes rather than reporting done");
+        assert.equal(json.created, 2, "it lands the two groups the old handler lost");
+    } finally {
+        await removeBridge().catch(() => {});
+        await cleanup();
+        await installBridge();
+    }
+});
+
+test("a retry after a PARTIAL old delivery lands the missing groups, not nothing", { skip }, async () => {
+    // The other half of the P0: a crash (or a lost response) after group one
+    // leaves exactly one row. The old rule — any row for this file means the
+    // document is done — answered alreadyIngested and the rest of the receipt
+    // was dropped for good.
+    await seed();
+    await installBridge();
+    try {
+        await oldStyleInsert(db!, `${PFX}-partial`, 10);
+        assert.equal((await rowsForFile()).length, 1, "the crash left one group behind");
+
+        const res = await ingest({ ...PAYLOAD, groups: THREE_GROUPS });
+        const json = await res.json() as { created?: number; alreadyIngested?: boolean };
+        assert.equal(json.alreadyIngested, undefined, "not 'done' — there are two groups still missing");
+        assert.equal(json.created, 2);
+
+        const rows = await rowsForFile();
+        assert.equal(rows.length, 3, "the document is whole");
+        assert.deepEqual(
+            rows.map(r => r.sourceGroupIndex).sort((a, b) => (a ?? 0) - (b ?? 0)),
+            [0, 1, 2],
+            "distinct ordinals, no duplicate of group one",
+        );
+
+        // ...and a SECOND retry of the complete document adds nothing.
+        const again = await ingest({ ...PAYLOAD, groups: THREE_GROUPS });
+        assert.deepEqual(await again.json(), { ok: true, alreadyIngested: true, created: 0 });
+        assert.equal((await rowsForFile()).length, 3);
+    } finally {
+        await cleanup();
+    }
+});
+
+test("an UNPARSEABLE url still serializes an old insert against the new route", { skip }, async () => {
+    // ROUND 49, ITEM 2. No /d/<id> and no ?id=<id>, so the bridge can derive
+    // nothing — and used to return without taking any lock, which left the new
+    // route reading "nothing here" while the old insert was still in flight.
+    // The normalised url is the identity both sides hash instead.
+    await seed();
+    await installBridge();
+    try {
+        const inserted = gate();
+        let oldError: unknown = null;
+        const oldSide = (async () => {
+            try {
+                await oldBuild!.$transaction(async tx => {
+                    const raw = tx as unknown as { $executeRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+                    await raw.$executeRawUnsafe(OLD_INSERT, `${PFX}-short`, 120.5, SHORT_URL, ESTIMATE);
+                    inserted.open();
+                    await new Promise(resolve => setTimeout(resolve, 750));
+                }, { timeout: 30_000 });
+            } catch (caught) {
+                oldError = caught;
+            }
+        })();
+
+        await inserted.reached;
+        const res = await ingest({ ...PAYLOAD, fileUrl: SHORT_URL });
+        const json = await res.json() as { created?: number; alreadyIngested?: boolean };
+        await oldSide;
+
+        assert.equal(oldError, null, `the old insert failed: ${oldError}`);
+        assert.equal(json.alreadyIngested, true, "it waited for the old insert, then saw it");
+        assert.equal(json.created, 0);
+        const rows = await db!.expense.findMany({
+            where: { receiptUrl: SHORT_URL }, select: { id: true, sourceFileId: true },
+        });
+        assert.equal(rows.length, 1, "one delivery, one row");
+        assert.equal(rows[0].sourceFileId, null, "and no fake file id was invented for it");
+    } finally {
+        await db!.expense.deleteMany({ where: { receiptUrl: SHORT_URL } });
+        await cleanup();
+    }
+});
+
+test("THE TRADE: a second OLD delivery appends, and the new route still refuses one", { skip }, async () => {
+    // Stated plainly, because round 49 changed it. With ordinals counted per
+    // TRANSACTION, a re-delivery restarted at 0 and died on the unique index —
+    // which looked like a free dedupe and was actually the P0: the old handler
+    // writes each group in its own autocommit, so that same rule killed group
+    // TWO of a first delivery and lost it.
+    //
+    // Counting COMMITTED rows fixes the loss and gives up the accidental
+    // dedupe: a second old-handler delivery appends. That is exactly what the
+    // old build does today with no bridge at all, it is guarded by the old
+    // handler's own url dedupe, and a duplicate a human can see on the expense
+    // list is a smaller failure than money silently missing from a receipt the
+    // archive says was imported.
+    //
+    // What this PR is responsible for — the NEW route never adding a copy —
+    // still holds, and is asserted here rather than assumed.
     await seed();
     await installBridge();
     try {
         await oldStyleInsert(db!, `${PFX}-first`);
-        let error: unknown = null;
-        await oldStyleInsert(db!, `${PFX}-second`).catch(caught => { error = caught; });
-        assert.ok(error, "the second delivery must fail");
-        // Postgres names the constraint and the colliding key; Prisma passes
-        // the message through with SQLSTATE 23505 (unique_violation).
-        assert.match(String((error as { message?: string })?.message ?? error), /23505|already exists/i);
-        assert.equal((await rowsForFile()).length, 1, "exactly one copy survives");
+        await oldStyleInsert(db!, `${PFX}-second`);
+        const rows = await rowsForFile();
+        assert.equal(rows.length, 2, "the old build appends, as it always did");
+        assert.deepEqual(rows.map(r => r.sourceGroupIndex).sort((a, b) => (a ?? 0) - (b ?? 0)), [0, 1],
+            "with distinct ordinals, so neither insert is lost");
+
+        // The new route, asked for the same one-group document, adds nothing:
+        // group 0 is present, so there is nothing missing to resume.
+        const res = await ingest(PAYLOAD);
+        assert.deepEqual(await res.json(), { ok: true, alreadyIngested: true, created: 0 });
+        assert.equal((await rowsForFile()).length, 2, "no third copy");
     } finally {
         await cleanup();
     }
@@ -310,19 +496,23 @@ test("...and they SERIALIZE: an in-flight old insert blocks the new route", { sk
 });
 
 test("the NEW route first, then an old-build delivery of the same file", { skip }, async () => {
-    // The other order. The new build writes ordinal 0 for its single group; the
-    // old instance's retry starts its own count at 0 and collides, so the
-    // duplicate is refused by the index rather than landing beside it.
+    // The other order. The new build writes ordinal 0; a straggler old instance
+    // appends at 1 (see THE TRADE above — its own url dedupe is what stops it
+    // in production, and this PR does not change that handler). What must hold
+    // is that nothing is LOST and that the new route does not then add a third.
     await seed();
     await installBridge();
     try {
         const res = await ingest(PAYLOAD);
         assert.equal((await res.json() as { created?: number }).created, 1);
 
-        let error: unknown = null;
-        await oldStyleInsert(db!, `${PFX}-late`).catch(caught => { error = caught; });
-        assert.ok(error, "the old build's second copy must be refused");
-        assert.equal((await rowsForFile()).length, 1, "still exactly one row for this file");
+        await oldStyleInsert(db!, `${PFX}-late`);
+        const rows = await rowsForFile();
+        assert.deepEqual(rows.map(r => r.sourceGroupIndex).sort((a, b) => (a ?? 0) - (b ?? 0)), [0, 1]);
+
+        const again = await ingest(PAYLOAD);
+        assert.deepEqual(await again.json(), { ok: true, alreadyIngested: true, created: 0 });
+        assert.equal((await rowsForFile()).length, 2, "the new route added nothing");
     } finally {
         await cleanup();
     }

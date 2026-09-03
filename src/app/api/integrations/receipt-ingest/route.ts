@@ -16,6 +16,22 @@ export const maxDuration = 60;
  * different scopes, and two of them can be held at once.
  */
 const RECEIPT_INGEST_LOCK_PREFIX = "receipt-ingest:";
+/**
+ * The SECOND identity, for a document whose url carries no Drive id (round 49,
+ * item 2).
+ *
+ * The drain-window trigger cannot always derive a file id — a shortened link, a
+ * re-hosted copy, a `/uc?export=download` form — and until it had this key it
+ * simply took no lock in that case, which left an old instance's in-flight
+ * insert invisible to this route rather than merely uncommitted. Both sides
+ * hash the same normalised string, so the same document serialises whether or
+ * not anyone can parse an id out of it.
+ */
+const RECEIPT_INGEST_URL_LOCK_PREFIX = "receipt-ingest-url:";
+/** Normalised exactly as the trigger normalises it: `lower(btrim(url))`. */
+function urlLockKey(receiptUrl: string): string {
+    return `${RECEIPT_INGEST_URL_LOCK_PREFIX}${receiptUrl.trim().toLowerCase()}`;
+}
 
 /**
  * Receipt/check ingest from the "GOLDEN TOUCH — RECEIPT + CHECK AUTOMATION"
@@ -44,6 +60,40 @@ interface IngestPayload {
     fileUrl?: string;
     fileName?: string;
     groups: IngestGroup[];
+}
+
+/**
+ * WHICH GROUPS OF THIS DOCUMENT ARE NOT IN THE TABLE YET (round 49, item 1).
+ *
+ * A partial delivery is a real state, not a theoretical one: the deployed old
+ * handler writes one autocommit INSERT per group, so a crash — or a lost
+ * response — after group one leaves exactly one row behind. The old rule
+ * ("any row for this file means the document is done") then answered
+ * `alreadyIngested` to the retry and the remaining groups were dropped for
+ * good, which is money missing from a receipt the archive says was imported.
+ *
+ * So the answer is per GROUP, keyed on the ordinal the row carries: the
+ * trigger numbers an old handler's rows 0, 1, 2... in arrival order, and this
+ * route writes its own group index, so the two agree by construction.
+ *
+ * A row with a NULL ordinal is the one shape that cannot be reasoned about
+ * positionally — it predates the trigger, and nothing says which group it was.
+ * That case answers "nothing is missing", which is the conservative direction:
+ * a possible duplicate is refused at the cost of a possible gap, and the gap is
+ * visible to a human on the expense list while a duplicate quietly doubles a
+ * job's cost.
+ */
+export function missingGroupIndexes(
+    rows: { sourceGroupIndex: number | null }[],
+    groupCount: number,
+): number[] {
+    if (rows.some(row => row.sourceGroupIndex === null)) return [];
+    const taken = new Set(rows.map(row => row.sourceGroupIndex));
+    const missing: number[] = [];
+    for (let index = 0; index < groupCount; index++) {
+        if (!taken.has(index)) missing.push(index);
+    }
+    return missing;
 }
 
 export async function POST(req: Request) {
@@ -111,11 +161,11 @@ export async function POST(req: Request) {
             { AND: [{ sourceFileId: null }, { receiptUrl }] },
         ],
     };
-    const existing = await prisma.expense.findFirst({
+    const existing = await prisma.expense.findMany({
         where: alreadyIngestedWhere,
-        select: { id: true },
+        select: { sourceGroupIndex: true },
     });
-    if (existing) {
+    if (existing.length && missingGroupIndexes(existing, body.groups.length).length === 0) {
         return NextResponse.json({ ok: true, alreadyIngested: true, created: 0 });
     }
 
@@ -282,20 +332,35 @@ export async function POST(req: Request) {
             // lock. A violation aborts the whole transaction — the document is
             // written whole or not at all — and the retry then reads the
             // winner's committed rows and answers `alreadyIngested`.
-            await raw.$queryRawUnsafe(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
-                `${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`,
-            );
-            const alreadyIngested = await tx.expense.findFirst({
+            // BOTH IDENTITIES, IN A FIXED ORDER (round 49, item 2): the file
+            // id first, then the normalised url. The trigger takes exactly one
+            // of the two — whichever the row it is stamping can be identified
+            // by — so it can never hold one and wait for the other, and this
+            // pair cannot cycle against it. Taking both here is what makes an
+            // old insert of a SHORTENED url block this read instead of being
+            // invisible to it.
+            for (const key of [`${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`, urlLockKey(receiptUrl)]) {
+                await raw.$queryRawUnsafe(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
+                    key,
+                );
+            }
+            const present = await tx.expense.findMany({
                 // The same predicate as the fast path, including the legacy
                 // `receiptUrl` arm — this is the authoritative one, taken under
-                // the per-file advisory lock that the drain-window trigger
-                // takes too, so an old instance's in-flight insert is either
-                // already visible here or still blocking this read.
+                // the advisory locks the drain-window trigger takes too, so an
+                // old instance's in-flight insert is either already visible
+                // here or still blocking this read.
                 where: alreadyIngestedWhere,
-                select: { id: true },
+                select: { sourceGroupIndex: true },
             });
-            if (alreadyIngested) return null;
+            // RESUME, DO NOT REPORT DONE. A partial old-handler delivery leaves
+            // some of the groups behind; this delivery lands exactly the ones
+            // that are missing, and answers `alreadyIngested` only when there
+            // is genuinely nothing left to write.
+            const missing = present.length ? missingGroupIndexes(present, body.groups.length) : null;
+            if (missing !== null && missing.length === 0) return null;
+            const wanted = missing === null ? null : new Set(missing);
 
             // THE WHOLE LOCK SET, IN THE CANONICAL ORDER, BEFORE THE LOOP
             // (round 37, item 3): Project -> Estimate -> EstimateItem, then
@@ -312,6 +377,8 @@ export async function POST(req: Request) {
 
             const outcomes: GroupResult[] = [];
             for (const [groupIndex, group] of body.groups.entries()) {
+                // Already landed by the delivery this one is resuming.
+                if (wanted && !wanted.has(groupIndex)) continue;
                 // Finite and non-zero by the validation above, which refuses
                 // the whole document rather than letting this loop skip a
                 // group out of a transaction that then reports success.

@@ -160,7 +160,10 @@ const fakePrisma: any = {
         // exact `receiptUrl`. Both are modelled as equality, and anything else
         // still throws — a regression to `contains` on the caller-supplied url
         // is what round 34 removed and it must not come back through this door.
-        findFirst: async (args: any) => {
+        findMany: async (args: any) => {
+            // A findMany since round 49, item 1: the route needs the ORDINALS,
+            // not just "is there a row", so it can resume a partial delivery
+            // instead of calling the document done.
             const arms = args?.where?.OR;
             if (!Array.isArray(arms) || arms.length !== 2) {
                 throw new Error(
@@ -177,10 +180,11 @@ const fakePrisma: any = {
                         JSON.stringify(args?.where),
                 );
             }
-            const hit = created.find(row =>
-                row.sourceFileId === wanted ||
-                (row.sourceFileId == null && row.receiptUrl === legacyUrl));
-            return hit ? { id: "exp-existing" } : null;
+            return created
+                .filter(row =>
+                    row.sourceFileId === wanted ||
+                    (row.sourceFileId == null && row.receiptUrl === legacyUrl))
+                .map(row => ({ sourceGroupIndex: row.sourceGroupIndex ?? null }));
         },
         create: async (args: { data: Record<string, unknown> }) => {
             created.push(args.data);
@@ -345,12 +349,32 @@ test("two concurrent deliveries of the same file ingest it exactly ONCE", async 
     assert.equal(second.status, 200);
 });
 
-test("the ingest lock is keyed on the DRIVE FILE, not on something coarser", async () => {
+test("the ingest lock is keyed on the DRIVE FILE, and on its url as well", async () => {
     // A lock on the project (or a constant) would serialise unrelated
     // receipts and still not identify this document; a lock on the whole
     // payload would change with every retry and guard nothing.
+    //
+    // TWO keys since round 49, item 2, in a fixed order: the drain-window
+    // trigger cannot always parse a Drive id out of the url it is handed (a
+    // shortened link, a re-hosted copy), and it locks the NORMALISED URL in
+    // that case. This route takes both, so it waits for such an insert instead
+    // of reading past it. The trigger only ever holds one of the two, so the
+    // pair cannot cycle against it.
     await post(PAYLOAD);
-    assert.deepEqual(lockKeys, ["receipt-ingest:drive-file-1"]);
+    assert.deepEqual(lockKeys, [
+        "receipt-ingest:drive-file-1",
+        "receipt-ingest-url:https://drive.google.com/file/d/drive-file-1/view",
+    ]);
+});
+
+test("the url key is NORMALISED the same way the trigger normalises it", async () => {
+    // `lower(btrim(url))` in SQL, `trim().toLowerCase()` here. A mismatch of a
+    // single character means two different locks and no serialisation at all.
+    await post({ ...PAYLOAD, fileUrl: "  HTTPS://Drive.Google.com/OPEN-SHORT/AbCdEf  " });
+    assert.deepEqual(lockKeys, [
+        "receipt-ingest:drive-file-1",
+        "receipt-ingest-url:https://drive.google.com/open-short/abcdef",
+    ]);
 });
 
 test("two deliveries of DIFFERENT files do not block each other", async () => {
@@ -358,7 +382,12 @@ test("two deliveries of DIFFERENT files do not block each other", async () => {
     assert.equal(created.length, 2);
     assert.deepEqual(
         [...lockKeys].sort(),
-        ["receipt-ingest:drive-file-1", "receipt-ingest:drive-file-2"],
+        [
+            "receipt-ingest-url:https://drive.google.com/file/d/drive-file-1/view",
+            "receipt-ingest-url:https://drive.google.com/file/d/drive-file-2/view",
+            "receipt-ingest:drive-file-1",
+            "receipt-ingest:drive-file-2",
+        ],
     );
 });
 
