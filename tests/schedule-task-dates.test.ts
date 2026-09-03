@@ -99,3 +99,26 @@ test("a milestone patch stores end === start regardless of the requested endDate
     assert.equal(updates[0].data.startDate.toISOString().slice(0, 10), "2026-09-10");
     assert.equal(updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-10");
 });
+
+test("linking an estimate item enforces project ownership and rejects sections", async () => {
+    function linkTx(item: any) {
+        const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+        tx.estimateItem = { findUnique: async () => item };
+        tx.scheduleTask.findFirst = async () => null;
+        return { tx, updates };
+    }
+    const foreign = linkTx({ type: "Labor", quantity: 8, budgetUnit: "hours", estimate: { projectId: "someone-elses-project" } });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(foreign.tx, TASK_ID, { estimateItemId: "item-1" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /not on this project/.test((err as Error).message),
+    );
+    const section = linkTx({ type: "Section", quantity: 0, budgetUnit: null, estimate: { projectId: PROJECT_ID } });
+    await assert.rejects(
+        () => updateScheduleTaskInTransaction(section.tx, TASK_ID, { estimateItemId: "item-2" }, actor, PROJECT_ID),
+        (err: unknown) => err instanceof ScheduleTaskValidationError && /sections cannot/.test((err as Error).message),
+    );
+    const labor = linkTx({ type: "Labor", quantity: 8, budgetUnit: "hours", estimate: { projectId: PROJECT_ID } });
+    await updateScheduleTaskInTransaction(labor.tx, TASK_ID, { estimateItemId: "item-3" }, actor, PROJECT_ID);
+    assert.equal(labor.updates.length, 1);
+    assert.equal(labor.updates[0].data.estimatedHours, 8);
+});

@@ -33,12 +33,19 @@ export const UPDATE_LEGACY_ROWS = `
     WHERE "projectId" IS NOT NULL AND "type" <> 'milestone' AND "endDate" <= "startDate"`;
 
 // Human-curated correction for multi-day tasks whose End was typed into the
-// old inclusive Calendar view: `--extend <id,id,...>` adds one day to exactly
-// those rows. Milestones and lead tasks are never touched.
-export const EXTEND_ROWS = `
+// old inclusive Calendar view: `--extend <id>:<shownEnd>,...` adds one day to
+// exactly those rows, and only while the row still shows that End
+// (compare-and-set on the stored end = shownEnd + 1 day). Re-running is a
+// no-op because the predicate no longer matches; a row edited since the
+// review fails the whole transaction. Milestones and lead tasks are never
+// touched.
+export const EXTEND_ROW = `
     UPDATE "ScheduleTask"
     SET "endDate" = "endDate" + interval '1 day'
-    WHERE "id" = ANY($1::text[]) AND "projectId" IS NOT NULL AND "type" <> 'milestone'`;
+    WHERE "id" = $1
+      AND "projectId" IS NOT NULL
+      AND "type" <> 'milestone'
+      AND "endDate" = ($2::date + interval '1 day')`;
 
 // Review list, printed in dry run: multi-day tasks that are current or upcoming.
 // A task whose dates were last typed into the old Calendar view (inclusive)
@@ -78,30 +85,44 @@ async function main() {
         }
 
         const review = await prisma.$queryRawUnsafe(SELECT_REVIEW_ROWS);
-        console.log(`\nreview: ${review.length} current/upcoming multi-day task(s). If a task's End was last set in the Calendar view before 2026-09-03, its shown End is now one day earlier than intended. Re-run with --extend <id,id,...> for the ones a human confirms:`);
+        console.log(`\nreview: ${review.length} current/upcoming multi-day task(s). If a task's End was last set in the Calendar view before 2026-09-03, its shown End is now one day earlier than intended. Re-run with --extend <token,token,...> using the tokens below for the ones a human confirms:`);
         for (const row of review) {
             const shownEnd = new Date(row.endDate.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-            console.log(`  ${row.id}  ${row.projectName}  |  ${row.name}  |  ${row.startDate.toISOString().slice(0, 10)} to ${shownEnd} (shown)`);
+            console.log(`  ${row.id}:${shownEnd}  ${row.projectName}  |  ${row.name}  |  ${row.startDate.toISOString().slice(0, 10)} to ${shownEnd} (shown)`);
         }
 
         const extendIdx = process.argv.indexOf("--extend");
-        const extendIds = extendIdx >= 0 && process.argv[extendIdx + 1]
+        const extendTokens = extendIdx >= 0 && process.argv[extendIdx + 1]
             ? process.argv[extendIdx + 1].split(",").map((s) => s.trim()).filter(Boolean)
             : [];
+        const extendPairs = extendTokens.map((token) => {
+            const [id, shownEnd] = token.split(":");
+            if (!id || !/^\d{4}-\d{2}-\d{2}$/.test(shownEnd ?? "")) {
+                throw new Error(`--extend token "${token}" must look like <taskId>:<YYYY-MM-DD shown end> (copy it from the review list)`);
+            }
+            return { id, shownEnd };
+        });
 
         if (!APPLY) {
-            if (extendIds.length) console.log(`would extend ${extendIds.length} task(s) by one day: ${extendIds.join(", ")}`);
+            if (extendPairs.length) console.log(`would extend ${extendPairs.length} task(s) by one day: ${extendPairs.map((p) => p.id).join(", ")}`);
             console.log("dry run — pass --yes to apply");
             return;
         }
 
         const { applied, extended } = await prisma.$transaction(async (tx) => {
             const applied = await tx.$executeRawUnsafe(UPDATE_LEGACY_ROWS);
-            const extended = extendIds.length ? await tx.$executeRawUnsafe(EXTEND_ROWS, extendIds) : 0;
+            let extended = 0;
+            for (const { id, shownEnd } of extendPairs) {
+                const n = await tx.$executeRawUnsafe(EXTEND_ROW, id, shownEnd);
+                if (n !== 1) {
+                    throw new Error(`Refusing: task ${id} no longer shows End ${shownEnd} (already extended or edited since review). Nothing was applied.`);
+                }
+                extended += n;
+            }
             return { applied, extended };
         });
         console.log(`applied: ${applied} rows`);
-        if (extendIds.length) console.log(`extended: ${extended} of ${extendIds.length} requested task(s) by one day`);
+        if (extendPairs.length) console.log(`extended: ${extended} task(s) by one day`);
     } finally {
         await prisma.$disconnect();
     }

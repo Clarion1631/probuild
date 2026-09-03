@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback, useEffect, type Dispatch, type SetStateAction } from "react";
 import { toast } from "sonner";
 import { updateScheduleTask } from "@/lib/actions";
+import { UNEXPECTED_SCHEDULE_TASK_ERROR } from "@/lib/schedule-task-result";
 import type { Task, ZoomLevel, EstimateSummary, TeamMember, Subcontractor } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency } from "./schedule-utils";
 import { useScheduleActions } from "./useScheduleActions";
@@ -179,12 +180,31 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
             }
             const currentTask = tasksRef.current.find(t => t.id === taskId);
             if (!currentTask) return;
-            const res = await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
-            if (!res.ok) {
-                const restoredStart = formatDate(origStart);
-                const restoredEnd = formatDate(origEnd);
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: restoredStart, endDate: restoredEnd } : t));
-                toast.error(res.error);
+            const draggedStart = currentTask.startDate;
+            const draggedEnd = currentTask.endDate;
+            const restoredStart = formatDate(origStart);
+            const restoredEnd = formatDate(origEnd);
+            // Only restore a field if it still holds the dragged value that failed —
+            // a newer successful edit landing meanwhile must not be overwritten.
+            const rollback = () => {
+                setTasks(prev => prev.map(t => {
+                    if (t.id !== taskId) return t;
+                    const restored: Partial<Task> = {};
+                    if (t.startDate === draggedStart) restored.startDate = restoredStart;
+                    if (t.endDate === draggedEnd) restored.endDate = restoredEnd;
+                    return Object.keys(restored).length ? { ...t, ...restored } : t;
+                }));
+            };
+            try {
+                const res = await updateScheduleTask(taskId, { startDate: draggedStart, endDate: draggedEnd });
+                if (!res.ok) {
+                    rollback();
+                    toast.error(res.error);
+                    return;
+                }
+            } catch {
+                rollback();
+                toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
                 return;
             }
             if (type === "move" && lastDayDelta !== 0) await actions.cascadeDependents(taskId, lastDayDelta);

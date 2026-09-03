@@ -355,6 +355,9 @@ export async function updateScheduleTaskInTransaction(
             if (!item || item.estimate.projectId !== locked.projectId) {
                 throw new ScheduleTaskValidationError("That estimate item is not on this project");
             }
+            if (item.type === "Section") {
+                throw new ScheduleTaskValidationError("Estimate sections cannot be scheduled as tasks");
+            }
             const existing = await tx.scheduleTask.findFirst({
                 where: { estimateItemId: data.estimateItemId, id: { not: taskId }, projectId: locked.projectId },
                 select: { id: true, name: true },

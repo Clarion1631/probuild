@@ -8228,7 +8228,9 @@ export async function updateCompanyScheduleTaskDatesAction(taskId: string, dates
     const caller = session?.user?.email
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
         : null;
-    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) {
+        return { ok: false, code: "FORBIDDEN", error: "Only admins and managers can move tasks on the company board." };
+    }
     return updateScheduleTask(taskId, dates);
 }
 

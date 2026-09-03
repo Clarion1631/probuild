@@ -64,5 +64,8 @@ export function toScheduleTaskFailure(e: unknown): ScheduleTaskFailure {
     if (e instanceof Error && e.message === "Forbidden") {
         return { ok: false, code: "FORBIDDEN", error: "You do not have access to this project's schedule." };
     }
+    if (e instanceof Error && e.message === "Unauthorized") {
+        return { ok: false, code: "FORBIDDEN", error: "Your session has expired. Sign in again to keep editing." };
+    }
     return { ok: false, code: "UNEXPECTED", error: UNEXPECTED_SCHEDULE_TASK_ERROR };
 }

@@ -20,6 +20,7 @@ import {
     todayUTC,
 } from "./schedule-utils";
 import { displayEndDate, storedEndDate } from "@/lib/schedule-dates";
+import { UNEXPECTED_SCHEDULE_TASK_ERROR } from "@/lib/schedule-task-result";
 import ColorPicker from "./ColorPicker";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
@@ -175,7 +176,7 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         } catch {
             // Server Action error messages are redacted in production builds, so a
             // generic message is the only honest one here.
-            toast.error(type === "milestone" ? "Failed to add milestone" : "Failed to add task");
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
@@ -224,18 +225,37 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
 
     async function patchTask(taskId: string, patch: Partial<Pick<Task, "name" | "status" | "color" | "startDate" | "endDate">>) {
         const before = tasks.find(t => t.id === taskId);
+        // Capture previous values for exactly the patch keys so rollback can be
+        // conditional: only restore a key if it still holds the optimistic value
+        // that failed — a newer successful edit landing meanwhile must not be
+        // overwritten.
+        const previous: Partial<Task> = {};
+        if (before) {
+            (Object.keys(patch) as (keyof typeof patch)[]).forEach(key => { (previous as any)[key] = before[key]; });
+        }
+        const rollback = () => {
+            if (!before) return;
+            setTasks(prev => prev.map(t => {
+                if (t.id !== taskId) return t;
+                const restored: Partial<Task> = {};
+                (Object.keys(patch) as (keyof typeof patch)[]).forEach(key => {
+                    if (t[key] === (patch as any)[key]) (restored as any)[key] = (previous as any)[key];
+                });
+                return Object.keys(restored).length ? { ...t, ...restored } : t;
+            }));
+        };
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...patch } : t));
         try {
             const res = await updateScheduleTask(taskId, patch);
             if (!res.ok) {
-                if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
+                rollback();
                 toast.error(res.error);
                 return;
             }
             startTransition(() => router.refresh());
         } catch {
-            if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
-            toast.error("Failed to save. The change was undone.");
+            rollback();
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
@@ -260,7 +280,7 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
             startTransition(() => router.refresh());
         } catch {
             restore();
-            toast.error("Failed to delete");
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 

@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import type { Task, EstimateItemSummary, PunchItem, Comment } from "./schedule-types";
 import { getDaysBetween, addDays, formatDate, computeCriticalPath } from "./schedule-utils";
 import { storedEndDate } from "@/lib/schedule-dates";
+import { UNEXPECTED_SCHEDULE_TASK_ERROR } from "@/lib/schedule-task-result";
 
 export function useScheduleActions(
     projectId: string,
@@ -66,6 +67,20 @@ export function useScheduleActions(
         }
     }, [selectedTaskId]);
 
+    // Restores only fields whose current value still equals the optimistic
+    // value that failed — a newer successful edit that landed while this one
+    // was in flight (or in transit) must not be clobbered by this rollback.
+    function rollbackTaskFields(taskId: string, optimistic: Partial<Task>, previous: Partial<Task>) {
+        setTasks(prev => prev.map(t => {
+            if (t.id !== taskId) return t;
+            const restored: Partial<Task> = {};
+            for (const key of Object.keys(optimistic) as (keyof Task)[]) {
+                if (t[key] === optimistic[key]) (restored as any)[key] = previous[key];
+            }
+            return Object.keys(restored).length ? { ...t, ...restored } : t;
+        }));
+    }
+
     // --- Cascade dependents (recursive) ---
     async function cascadeDependents(taskId: string, dayDelta: number, visited: Set<string> = new Set()) {
         if (visited.has(taskId)) return;
@@ -77,11 +92,19 @@ export function useScheduleActions(
             const prevEnd = dep.endDate;
             const ns = formatDate(addDays(new Date(dep.startDate), dayDelta));
             const ne = dep.type === "milestone" ? ns : formatDate(addDays(new Date(dep.endDate), dayDelta));
-            setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: ns, endDate: ne } : t));
-            const res = await updateScheduleTask(dep.id, { startDate: ns, endDate: ne });
-            if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: prevStart, endDate: prevEnd } : t));
-                toast.error(res.error);
+            const optimistic = { startDate: ns, endDate: ne };
+            const previous = { startDate: prevStart, endDate: prevEnd };
+            setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, ...optimistic } : t));
+            try {
+                const res = await updateScheduleTask(dep.id, optimistic);
+                if (!res.ok) {
+                    rollbackTaskFields(dep.id, optimistic, previous);
+                    toast.error(res.error);
+                    continue;
+                }
+            } catch {
+                rollbackTaskFields(dep.id, optimistic, previous);
+                toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
                 continue;
             }
             await cascadeDependents(dep.id, dayDelta, visited);
@@ -114,6 +137,8 @@ export function useScheduleActions(
             setTasks(prev => [...prev, { ...created, startDate: createdStart, endDate: createdEnd, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
             toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
             setShowNewTaskForm(false);
+        } catch {
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         } finally { setIsAdding(false); }
     }
 
@@ -127,11 +152,19 @@ export function useScheduleActions(
         if (task.type === "milestone") {
             const oldStart = task.startDate;
             const oldEnd = task.endDate;
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: value, endDate: value } : t));
-            const res = await updateScheduleTask(taskId, { startDate: value, endDate: value });
-            if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: oldStart, endDate: oldEnd } : t));
-                toast.error(res.error);
+            const optimistic = { startDate: value, endDate: value };
+            const previous = { startDate: oldStart, endDate: oldEnd };
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
+            try {
+                const res = await updateScheduleTask(taskId, optimistic);
+                if (!res.ok) {
+                    rollbackTaskFields(taskId, optimistic, previous);
+                    toast.error(res.error);
+                    return;
+                }
+            } catch {
+                rollbackTaskFields(taskId, optimistic, previous);
+                toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
                 return;
             }
             if (value !== oldStart) {
@@ -144,11 +177,19 @@ export function useScheduleActions(
         if (field === "endDate" && value <= task.startDate) { toast.error("End date must be on or after the start date"); return; }
         const oldStart = task.startDate;
         const oldEnd = task.endDate;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, [field]: value } : t));
-        const res = await updateScheduleTask(taskId, { [field]: value });
-        if (!res.ok) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: oldStart, endDate: oldEnd } : t));
-            toast.error(res.error);
+        const optimistic = { [field]: value };
+        const previous = { [field]: field === "startDate" ? oldStart : oldEnd };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
+        try {
+            const res = await updateScheduleTask(taskId, optimistic);
+            if (!res.ok) {
+                rollbackTaskFields(taskId, optimistic, previous);
+                toast.error(res.error);
+                return;
+            }
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
             return;
         }
         if (field === "startDate" && value !== oldStart) {
@@ -163,77 +204,86 @@ export function useScheduleActions(
             if (!promptedReason?.trim()) return;
             blockedReason = promptedReason.trim();
         }
-        const previous = tasksRef.current.find(t => t.id === taskId);
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status, blockedReason: status === "Blocked" ? (blockedReason ?? t.blockedReason) : null } : t));
+        const task = tasksRef.current.find(t => t.id === taskId);
+        if (!task) return;
+        const optimistic = { status, blockedReason: status === "Blocked" ? (blockedReason ?? task.blockedReason) : null };
+        const previous = { status: task.status, blockedReason: task.blockedReason };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { status, blockedReason: status === "Blocked" ? blockedReason : null });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
-            toast.error(error instanceof Error ? error.message : "Failed to update status");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleDoneWhenChange(taskId: string, doneWhen: string | null) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.doneWhen ?? null;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen } : t));
+        const optimistic = { doneWhen };
+        const previous = { doneWhen: tasksRef.current.find(t => t.id === taskId)?.doneWhen ?? null };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { doneWhen });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to update completion criteria");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleClientStageChange(taskId: string, clientStage: string | null) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.clientStage ?? null;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage } : t));
+        const optimistic = { clientStage };
+        const previous = { clientStage: tasksRef.current.find(t => t.id === taskId)?.clientStage ?? null };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { clientStage });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage: previous } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage: previous } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to update client stage");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleAppointmentChange(taskId: string, data: { scheduledTime?: string | null; confirmationStatus?: "planned" | "requested" | "confirmed" | null }) {
-        const previous = tasksRef.current.find(t => t.id === taskId);
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...data } : t));
+        const task = tasksRef.current.find(t => t.id === taskId);
+        if (!task) return;
+        const optimistic = data;
+        const previous = { scheduledTime: task.scheduledTime, confirmationStatus: task.confirmationStatus };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, data);
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
-            toast.error(error instanceof Error ? error.message : "Failed to update appointment");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleColorChange(taskId: string, color: string) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.color;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color } : t));
+        const optimistic = { color };
+        const previous = { color: tasksRef.current.find(t => t.id === taskId)?.color };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { color });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color: previous ?? t.color } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color: previous ?? t.color } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to update color");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
@@ -257,55 +307,58 @@ export function useScheduleActions(
                 return;
             }
             toast.success("Task deleted");
-        } catch (error) {
+        } catch {
             restore();
             if (wasSelected) setSelectedTaskId(taskId);
-            toast.error(error instanceof Error ? error.message : "Failed to delete task");
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleNameSave(taskId: string, name: string) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.name;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t));
+        const optimistic = { name };
+        const previous = { name: tasksRef.current.find(t => t.id === taskId)?.name };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { name });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: previous ?? t.name } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: previous ?? t.name } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to save name");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleEstimatedHoursSave(taskId: string, hours: number) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.estimatedHours ?? null;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t));
+        const optimistic = { estimatedHours: hours };
+        const previous = { estimatedHours: tasksRef.current.find(t => t.id === taskId)?.estimatedHours ?? null };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { estimatedHours: hours });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: previous } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: previous } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to save estimated hours");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleProgressChange(taskId: string, progress: number) {
-        const previous = tasksRef.current.find(t => t.id === taskId)?.progress;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t));
+        const optimistic = { progress };
+        const previous = { progress: tasksRef.current.find(t => t.id === taskId)?.progress };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         try {
-            const res = await updateScheduleTask(taskId, { progress });
+            const res = await updateScheduleTask(taskId, optimistic);
             if (!res.ok) {
-                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress: previous ?? t.progress } : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 toast.error(res.error);
             }
-        } catch (error) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress: previous ?? t.progress } : t));
-            toast.error(error instanceof Error ? error.message : "Failed to save progress");
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
@@ -447,46 +500,50 @@ export function useScheduleActions(
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
         const autoHours = (item.type === "Labor" || item.budgetUnit === "hours") ? (item.quantity ?? null) : null;
         const taskName = tasks.find(t => t.id === taskId)?.name ?? "";
-        const previous = tasksRef.current.find(t => t.id === taskId);
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item, ...(autoHours != null ? { estimatedHours: autoHours } : {}) } : t));
+        const task = tasksRef.current.find(t => t.id === taskId);
+        const optimistic = { estimateItemId: item.id, estimateItem: item, ...(autoHours != null ? { estimatedHours: autoHours } : {}) };
+        const previous = { estimateItemId: task?.estimateItemId ?? null, estimateItem: task?.estimateItem ?? null, estimatedHours: task?.estimatedHours ?? null };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: taskId, linkedTaskName: taskName } : ei));
         try {
             const res = await updateScheduleTask(taskId, { estimateItemId: item.id });
             if (!res.ok) {
-                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
                 toast.error(res.error);
                 return;
             }
             toast.success(autoHours != null ? `Linked — ${autoHours}h estimated` : "Linked to estimate item");
-        } catch (error) {
-            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
             setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
-            toast.error(error instanceof Error ? error.message : "Failed to link estimate item");
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
     async function handleUnlinkEstimateItem(taskId: string) {
         const itemId = tasks.find(t => t.id === taskId)?.estimateItemId;
-        const previous = tasksRef.current.find(t => t.id === taskId);
+        const task = tasksRef.current.find(t => t.id === taskId);
         const previousItem = itemId ? estimateItems.find(ei => ei.id === itemId) : undefined;
         const previousLinkedTaskId = previousItem?.linkedTaskId ?? null;
         const previousLinkedTaskName = previousItem?.linkedTaskName ?? null;
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+        const optimistic = { estimateItemId: null, estimateItem: null };
+        const previous = { estimateItemId: task?.estimateItemId ?? null, estimateItem: task?.estimateItem ?? null };
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...optimistic } : t));
         if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
         try {
             const res = await updateScheduleTask(taskId, { estimateItemId: null });
             if (!res.ok) {
-                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                rollbackTaskFields(taskId, optimistic, previous);
                 if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: previousLinkedTaskId, linkedTaskName: previousLinkedTaskName } : ei));
                 toast.error(res.error);
                 return;
             }
             toast.success("Estimate link removed");
-        } catch (error) {
-            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+        } catch {
+            rollbackTaskFields(taskId, optimistic, previous);
             if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: previousLinkedTaskId, linkedTaskName: previousLinkedTaskName } : ei));
-            toast.error(error instanceof Error ? error.message : "Failed to remove estimate link");
+            toast.error(UNEXPECTED_SCHEDULE_TASK_ERROR);
         }
     }
 
