@@ -172,8 +172,10 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
             setQuickAddName("");
             toast.success(type === "milestone" ? "Milestone added" : "Task added");
             startTransition(() => router.refresh());
-        } catch (err) {
-            toast.error(err instanceof Error && err.message ? err.message : "Failed to add task");
+        } catch {
+            // Server Action error messages are redacted in production builds, so a
+            // generic message is the only honest one here.
+            toast.error(type === "milestone" ? "Failed to add milestone" : "Failed to add task");
         }
     }
 
@@ -185,16 +187,26 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         setQuickAddName("");
     }
 
-    /** Toolbar "+ Task" / "+ Milestone": open the quick-add on today (or the first day of the visible range). */
+    /**
+     * Toolbar "+ Task" / "+ Milestone": open the quick-add on today, navigating
+     * the calendar to today if it is not on screen. The click that opens it
+     * bubbles to the root "close popovers" handler, so that one bubble is skipped.
+     */
+    const skipNextRootClose = useRef(false);
     function openQuickAddFromToolbar(type: "task" | "milestone") {
-        const visibleStart = subMode === "week" ? getWeekDays(anchor)[0] : getMonthGrid(anchor)[0];
-        const visibleEnd = addDays(visibleStart, subMode === "week" ? 6 : 41);
-        const date = today.getTime() >= visibleStart.getTime() && today.getTime() <= visibleEnd.getTime() ? today : visibleStart;
+        const date = todayUTC();
         const x = typeof window !== "undefined" ? window.innerWidth / 2 : 0;
         const y = typeof window !== "undefined" ? Math.min(220, window.innerHeight / 3) : 0;
+        skipNextRootClose.current = true;
+        setAnchor(date);
         setEditing(null);
         setQuickAdd({ date, x, y, type });
         setQuickAddName("");
+    }
+    function handleRootClick() {
+        if (skipNextRootClose.current) { skipNextRootClose.current = false; return; }
+        setQuickAdd(null);
+        setEditing(null);
     }
 
     /** Gantt-only tools: take the user to the view where the feature actually lives. */
@@ -216,9 +228,9 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         try {
             await updateScheduleTask(taskId, patch);
             startTransition(() => router.refresh());
-        } catch (err) {
+        } catch {
             if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
-            toast.error(err instanceof Error && err.message ? err.message : "Failed to save");
+            toast.error("Failed to save. The change was undone.");
         }
     }
 
@@ -323,10 +335,7 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
     };
 
     return (
-        <div className="flex flex-col h-full bg-hui-background" onClick={() => { setQuickAdd(null); setEditing(null); }}>
-            {/* Toolbar clicks must not bubble to the root, which treats any click as "close popovers" —
-                otherwise "+ Task" opens the quick-add and the same click closes it. */}
-            <div className="contents" onClick={e => e.stopPropagation()}>
+        <div className="flex flex-col h-full bg-hui-background" onClick={handleRootClick}>
             <ScheduleToolbar
                 projectId={projectId}
                 initialPublished={initialPublished}
@@ -372,7 +381,6 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
                     </div>
                 }
             />
-            </div>
 
             <div className="flex-1 overflow-auto">
                 {subMode === "week" ? (
