@@ -2390,6 +2390,33 @@ test("excluded rows are echoed, recorded nowhere, and do not disturb the tally",
     assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Paid");
 });
 
+test("REPRO (2026-08-28): counts.credits is the credits PROCESSED, excluded reported apart", async () => {
+    // The shape the runner has to be able to read: one sweepable credit that
+    // needs a human, one excluded credit that was never processed. `counts`
+    // must partition ONLY the processed one, or the runner's length/partition
+    // checks turn a clean day into a job failure that stops every later day.
+    seedMilestone({ amount: 999.99 }); // nothing at $24,000 — the credit needs a human
+    const { body } = await post({
+        source: "bank",
+        postDate: SETTLED_DAY,
+        credits: [{ bankReference: "26241015003021", amount: 24000, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", customerReference: null }],
+        excluded: [{ amount: 100, description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT", reason: "no bank reference" }],
+        creditCount: 2,
+        creditSum: 24100,
+    });
+
+    assert.equal(creditResult(body, "26241015003021").status, "unmatched");
+    assert.equal(body.counts.credits, 1, "the DECLARED row count (2) must never leak into counts.credits");
+    assert.equal(body.excludedCount, 1, "…it is reported here instead");
+    assert.equal(body.credits.length, body.counts.credits, "the array the runner reads and the count must agree");
+
+    // The buckets partition the processed credits only…
+    const { credits: total, replay: _replay, ...buckets } = body.counts as Record<string, number>;
+    assert.equal(Object.values(buckets).reduce((a, b) => a + b, 0), total);
+    // …and a day whose only outcome is `unmatched` is CLEAN.
+    assert.equal(body.ok, true, "asking a human is the sweep working, not a failure");
+});
+
 test("the batch response carries the counts the Bot Health line is built from", async () => {
     seedMilestone({ amount: 100 });   // clean → applied
     seedMilestone({ amount: 250 });   // duplicated below → both human
