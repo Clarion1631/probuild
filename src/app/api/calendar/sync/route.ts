@@ -8,12 +8,12 @@ function escapeIcal(str: string): string {
     return str.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
 }
 
-// Full UTC datetime, e.g. 20260717T000000Z — used for regular (non all-day) tasks.
+// Full UTC datetime, e.g. 20260717T000000Z — used for DTSTAMP.
 function formatIcalDateTime(date: Date): string {
     return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
-// Date-only, e.g. 20260717 — used for all-day (milestone) VEVENTs.
+// Date-only, e.g. 20260717 — used for all-day VEVENTs (every task is one now).
 // Reads UTC calendar components directly so a date stored as a UTC-midnight
 // DateTime renders as the same calendar day, regardless of server timezone.
 function formatIcalDateOnly(date: Date): string {
@@ -29,9 +29,6 @@ function addUTCDays(date: Date, days: number): Date {
     return d;
 }
 
-function isSameUTCDay(a: Date, b: Date): boolean {
-    return a.getUTCFullYear() === b.getUTCFullYear() && a.getUTCMonth() === b.getUTCMonth() && a.getUTCDate() === b.getUTCDate();
-}
 
 export async function GET(req: NextRequest) {
     const auth = await authenticateMobileOrSession(req);
@@ -86,21 +83,21 @@ export async function GET(req: NextRequest) {
                 .join("\\n")
         );
 
-        // Milestones and zero/one-day tasks render as all-day events so they
-        // land on the correct calendar day instead of a timed midnight block.
-        const isAllDay = task.type === "milestone" || isSameUTCDay(start, end);
+        // Every task and milestone renders as an all-day event. ScheduleTask.endDate
+        // is already stored EXCLUSIVE (the day after the last day of work — see
+        // src/lib/schedule-dates.ts), which is exactly what RFC 5545 expects for an
+        // all-day DTEND, so a normal task's stored end is used as-is. Milestones
+        // store end == start (a single point), so they get +1 here to render as one
+        // calendar day. A legacy row with end <= start (created before the
+        // convention was enforced) falls back to a one-day event the same way.
+        const dtEnd = task.type === "milestone" || end.getTime() <= start.getTime()
+            ? addUTCDays(start, 1)
+            : end;
 
-        const dtLines = isAllDay
-            ? [
-                  `DTSTART;VALUE=DATE:${formatIcalDateOnly(start)}`,
-                  // All-day DTEND is exclusive per RFC 5545, so a one-day event's
-                  // end is the day after its start.
-                  `DTEND;VALUE=DATE:${formatIcalDateOnly(addUTCDays(start, 1))}`,
-              ]
-            : [
-                  `DTSTART:${formatIcalDateTime(start)}`,
-                  `DTEND:${formatIcalDateTime(end)}`,
-              ];
+        const dtLines = [
+            `DTSTART;VALUE=DATE:${formatIcalDateOnly(start)}`,
+            `DTEND;VALUE=DATE:${formatIcalDateOnly(dtEnd)}`,
+        ];
 
         return [
             "BEGIN:VEVENT",

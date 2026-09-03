@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import ProjectViewTracker from "@/components/ProjectViewTracker";
 import SubTaskSummaryCard from "./SubTaskSummaryCard";
+import { displayEndDate, isTaskOverdue, toDateKey } from "@/lib/schedule-dates";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 export default async function SubPortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const sub = await getSubPortalSession();
@@ -44,14 +46,14 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
     const tasks = assignments.map((a) => a.task);
 
     // Calculate progress stats
-    const completed = tasks.filter((t) => t.status === "Completed").length;
+    const completed = tasks.filter((t) => t.status === "Complete").length;
     const inProgress = tasks.filter((t) => t.status === "In Progress").length;
     const notStarted = tasks.filter((t) => t.status === "Not Started").length;
     const overallProgress = tasks.length > 0 ? Math.round(tasks.reduce((sum, t) => sum + t.progress, 0) / tasks.length) : 0;
 
     function getStatusColor(status: string) {
         switch (status) {
-            case "Completed": return "bg-emerald-100 text-emerald-700";
+            case "Complete": return "bg-emerald-100 text-emerald-700";
             case "In Progress": return "bg-blue-100 text-blue-700";
             case "Not Started": return "bg-slate-100 text-slate-600";
             case "Delayed": return "bg-red-100 text-red-700";
@@ -163,9 +165,8 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                 {/* Task Rows */}
                 {tasks.map((task, idx) => {
                     const start = new Date(task.startDate);
-                    const end = new Date(task.endDate);
-                    const now = new Date();
-                    const isOverdue = now > end && task.status !== "Completed";
+                    const end = new Date(displayEndDate(toDateKey(task.startDate), toDateKey(task.endDate), task.type));
+                    const isOverdue = isTaskOverdue(task.startDate, task.endDate, toCompanyDayKey(new Date()), task.type) && task.status !== "Complete";
 
                     return (
                         <div

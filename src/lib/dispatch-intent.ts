@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { displayEndDate } from "@/lib/schedule-dates";
 
 export type DispatchAssignmentRole = "assigned" | "lead";
 
@@ -334,7 +335,7 @@ function taskDateSummary(
     if (startDelta === endDelta && startDelta !== 0) {
         return `${task.name}: ${startDelta > 0 ? "+" : ""}${startDelta} day${Math.abs(startDelta) === 1 ? "" : "s"} (${after.startDate})`;
     }
-    return `${task.name}: ${before.startDate}–${before.endDate} → ${after.startDate}–${after.endDate}`;
+    return `${task.name}: ${before.startDate}–${displayEndDate(before.startDate, before.endDate, task.type)} → ${after.startDate}–${displayEndDate(after.startDate, after.endDate, task.type)}`;
 }
 
 function invalid(message: string): DispatchPlanResult {

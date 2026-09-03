@@ -98,7 +98,12 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
 
     async function mutate(operation: () => Promise<unknown>, fallback: string, success?: string) {
         try {
-            await operation();
+            const result = await operation();
+            if (result && typeof result === "object" && "ok" in result && (result as { ok: unknown }).ok === false) {
+                toast.error((result as { error?: string }).error || fallback);
+                await refreshDetail();
+                return;
+            }
             if (success) toast.success(success);
             await refreshDetail();
             router.refresh();
@@ -128,7 +133,11 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
                         onDelete={id => {
                             void (async () => {
                                 try {
-                                    await deleteScheduleTask(id);
+                                    const result = await deleteScheduleTask(id);
+                                    if (!result.ok) {
+                                        toast.error(result.error || "Could not delete task");
+                                        return;
+                                    }
                                     toast.success("Task deleted");
                                     onDeleted(id);
                                     router.refresh();

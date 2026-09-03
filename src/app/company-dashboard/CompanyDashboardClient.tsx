@@ -9,6 +9,7 @@ import type { VancouverForecastDay } from "@/lib/weather";
 import { PROJECT_STATUSES } from "@/lib/project-status";
 import { applyChangeOrderToScheduleAction, generateProjectScheduleAction } from "@/lib/actions";
 import { formatCurrency, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { displayEndDate } from "@/lib/schedule-dates";
 import { ScheduleBoard } from "./schedule-board/ScheduleBoard";
 import { CrewPicker, TaskCrewPicker } from "./schedule-board/CrewPickers";
 import {
@@ -313,7 +314,7 @@ export default function CompanyDashboardClient({ data, weather, focus }: { data:
                                                                 <div className="min-w-0">
                                                                     <p className="truncate text-sm font-medium text-hui-textMain">{task.name}</p>
                                                                     <p className="text-xs text-hui-textMuted">
-                                                                        {task.type === "milestone" ? "Milestone" : task.status} · {task.startDate.slice(0, 10)} → {task.endDate.slice(0, 10)}
+                                                                        {task.type === "milestone" ? "Milestone" : task.status} · {task.startDate.slice(0, 10)} → {displayEndDate(task.startDate.slice(0, 10), task.endDate.slice(0, 10), task.type)}
                                                                     </p>
                                                                 </div>
                                                                 <div className="text-xs text-hui-textMuted">

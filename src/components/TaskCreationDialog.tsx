@@ -7,7 +7,8 @@ import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { createScheduleTask, getScheduleCrewMembers } from "@/lib/actions";
 import { CrewChecklist, type CrewOption } from "@/app/company-dashboard/schedule-board/CrewPickers";
-import { addDays, formatDate, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { formatDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { storedEndDate } from "@/lib/schedule-dates";
 
 type TaskCreationDialogProps = {
     open: boolean;
@@ -68,7 +69,7 @@ export default function TaskCreationDialog({
         setProjectId(defaultProjectId && projects.some(project => project.id === defaultProjectId) ? defaultProjectId : (projects[0]?.id ?? ""));
         setType("task");
         setStartDate(initialStart);
-        setEndDate(formatDate(addDays(parseUTCDate(initialStart), 1)));
+        setEndDate(initialStart);
         setScheduledTime("");
         setConfirmationStatus("planned");
         setCrewIds([...new Set(defaultCrewValues)]);
@@ -113,16 +114,16 @@ export default function TaskCreationDialog({
         if (!cleanName) { toast.error("Task name is required"); return; }
         if (!projectId) { toast.error("Choose a project"); return; }
         if (!startDate || (type !== "milestone" && !endDate)) { toast.error("Start and end dates are required"); return; }
-        if (type !== "milestone" && endDate <= startDate) { toast.error("End date must be after the start date"); return; }
+        if (type !== "milestone" && endDate < startDate) { toast.error("End date must be on or after the start date"); return; }
         const hours = estimatedHours.trim() ? Number(estimatedHours) : null;
         if (hours != null && (!Number.isFinite(hours) || hours < 0)) { toast.error("Estimated hours must be zero or greater"); return; }
 
         startTransition(async () => {
             try {
-                await createScheduleTask(projectId, {
+                const res = await createScheduleTask(projectId, {
                     name: cleanName,
                     startDate,
-                    endDate: type === "milestone" ? startDate : endDate,
+                    endDate: storedEndDate(startDate, endDate, type),
                     color: selectedProject?.color,
                     type,
                     estimateItemId: estimateItemId ?? null,
@@ -134,6 +135,10 @@ export default function TaskCreationDialog({
                     scheduledTime: type === "appointment" ? (scheduledTime || null) : null,
                     confirmationStatus: type === "appointment" ? confirmationStatus : null,
                 });
+                if (!res.ok) {
+                    toast.error(res.error || "Could not create task");
+                    return;
+                }
                 toast.success(type === "appointment" ? "Appointment created" : type === "milestone" ? "Milestone created" : "Task created");
                 onClose();
                 router.refresh();

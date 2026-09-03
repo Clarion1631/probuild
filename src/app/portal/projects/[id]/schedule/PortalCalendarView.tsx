@@ -2,6 +2,7 @@
 
 import { useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { addTaskCommentAsSub, updateTaskStatusAsSub } from "@/lib/actions";
+import { displayEndDate, isTaskOnDay } from "@/lib/schedule-dates";
 import type { PortalTask, PortalViewMode, PortalCalendarSubMode } from "./PortalScheduleView";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -19,10 +20,6 @@ const MONTH_LABELS = [
     "July", "August", "September", "October", "November", "December",
 ];
 
-function parseUTCDate(yyyyMmDd: string): Date {
-    const [y, m, d] = yyyyMmDd.split("-").map(Number);
-    return new Date(Date.UTC(y, m - 1, d));
-}
 function addDays(date: Date, days: number) {
     const d = new Date(date.getTime());
     d.setUTCDate(d.getUTCDate() + days);
@@ -54,9 +51,7 @@ function isSameUTCDay(a: Date, b: Date) {
         && a.getUTCDate() === b.getUTCDate();
 }
 function taskCoversDay(task: PortalTask, day: Date): boolean {
-    const start = parseUTCDate(task.startDate);
-    const end = parseUTCDate(task.endDate);
-    return day.getTime() >= start.getTime() && day.getTime() <= end.getTime();
+    return isTaskOnDay(task.startDate, task.endDate, day.toISOString().slice(0, 10), task.type);
 }
 
 interface Props {
@@ -255,7 +250,7 @@ export default function PortalCalendarView({
                                     </span>
                                 </h3>
                                 <p className="text-xs text-slate-500 mt-0.5">
-                                    {selectedTask.startDate} → {selectedTask.endDate}
+                                    {selectedTask.startDate} → {displayEndDate(selectedTask.startDate, selectedTask.endDate, selectedTask.type)}
                                     {selectedTask.progress > 0 && <> · {selectedTask.progress}% complete</>}
                                 </p>
                             </div>

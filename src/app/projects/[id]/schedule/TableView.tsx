@@ -9,7 +9,8 @@ import {
 import { toast } from "sonner";
 import { FloatingLayer } from "@/components/FloatingLayer";
 import type { Task, EstimateSummary, TeamMember, Subcontractor, SortKey, SortDir, FilterState } from "./schedule-types";
-import { STATUS_OPTIONS, STATUS_COLORS, getDaysBetween, addDays, formatDate, getInitials, formatCurrency } from "./schedule-utils";
+import { STATUS_OPTIONS, STATUS_COLORS, addDays, formatDate, getInitials, formatCurrency } from "./schedule-utils";
+import { displayEndDate, storedEndDate, durationDays } from "@/lib/schedule-dates";
 import { useScheduleActions } from "./useScheduleActions";
 import TaskDetailPanel from "./TaskDetailPanel";
 import DependencyPicker from "./DependencyPicker";
@@ -146,7 +147,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
         if (sortKey === "manual") return a.order - b.order;
         let cmp = 0;
         if (sortKey === "duration") {
-            cmp = getDaysBetween(new Date(a.startDate), new Date(a.endDate)) - getDaysBetween(new Date(b.startDate), new Date(b.endDate));
+            cmp = durationDays(a.startDate, a.endDate, a.type) - durationDays(b.startDate, b.endDate, b.type);
         } else if (sortKey === "progress" || sortKey === "actualHours") {
             cmp = (a[sortKey] ?? 0) - (b[sortKey] ?? 0);
         } else if (sortKey === "estimatedHours") {
@@ -536,7 +537,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                 {(dropProvided) => (
                                     <div ref={dropProvided.innerRef} {...dropProvided.droppableProps}>
                                         {filteredSortedTasks.map((task, index) => {
-                                            const duration = getDaysBetween(new Date(task.startDate), new Date(task.endDate));
+                                            const duration = durationDays(task.startDate, task.endDate, task.type);
                                             const isSelected = task.id === actions.selectedTaskId;
                                             const isCritical = actions.showCriticalPath && actions.criticalPathIds.has(task.id);
                                             const isLinkSource = actions.linkMode === task.id;
@@ -596,10 +597,10 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                                 {task.type === "milestone" ? (
                                                                     <span className="text-slate-300">—</span>
                                                                 ) : (
-                                                                    <input type="date" value={task.endDate} onChange={e => { e.stopPropagation(); actions.handleDateChange(task.id, "endDate", e.target.value); }} onClick={e => e.stopPropagation()} className="bg-transparent text-xs text-hui-textMain cursor-pointer hover:text-indigo-600 transition w-full border-0 p-0 focus:ring-0" />
+                                                                    <input type="date" value={displayEndDate(task.startDate, task.endDate, task.type)} onChange={e => { e.stopPropagation(); const v = e.target.value; if (!v) return; actions.handleDateChange(task.id, "endDate", storedEndDate(task.startDate, v, task.type)); }} onClick={e => e.stopPropagation()} className="bg-transparent text-xs text-hui-textMain cursor-pointer hover:text-indigo-600 transition w-full border-0 p-0 focus:ring-0" />
                                                                 )}
                                                             </div>
-                                                            <div className="px-3 py-2 text-hui-textMuted">{task.type === "milestone" ? "0d" : `${duration}d`}</div>
+                                                            <div className="px-3 py-2 text-hui-textMuted">{task.type === "milestone" ? "—" : `${duration}d`}</div>
                                                             <div className="px-3 py-2">
                                                                 <select value={task.status} onChange={e => { e.stopPropagation(); actions.handleStatusChange(task.id, e.target.value); }} onClick={e => e.stopPropagation()} className={`text-[10px] font-semibold px-2 py-1 rounded-full border-0 cursor-pointer ${STATUS_COLORS[task.status] || "bg-slate-100 text-slate-600"}`}>
                                                                     {STATUS_OPTIONS.map(s => (<option key={s} value={s}>{s}</option>))}
