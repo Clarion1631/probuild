@@ -275,6 +275,25 @@ export const statements = [
     // be told from "nobody has looked" without this column. Booking never
     // overwrites "manual".
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT`,
+    // WHO decided the deduction BASE — a different question from who decided
+    // the tax, and not always the same answer. A base-only PATCH deliberately
+    // leaves `taxSource` alone so a later OCR read may still fill `taxAmount`;
+    // booking then stamps `taxSource = 'ocr'` for the tax it filled, and while
+    // one column governed both figures that made the row claim a machine had
+    // decided a base a person had typed.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBaseSource" TEXT`,
+    // THE CONSERVATIVE READING OF THE ROWS THAT PREDATE THE COLUMN. Before the
+    // split, a human-entered base could only exist on a row a human had also
+    // spoken to about tax, so a non-NULL base beside a human `taxSource` was
+    // necessarily a human base — and saying so is what stops the next booking
+    // pass being able to claim it. Rows with an OCR or absent `taxSource` stay
+    // NULL: nobody wrote a base on them, and inventing a provenance is how a
+    // guess becomes a fact. Idempotent by the IS NULL predicate.
+    `UPDATE "Expense"
+   SET "taxDeductibleBaseSource" = 'manual'
+ WHERE "taxDeductibleBaseSource" IS NULL
+   AND "taxDeductibleBase" IS NOT NULL
+   AND "taxSource" IN ('manual', 'manual-none')`,
     // The re-anchor marker (see reanchorSql): a predicate on the time-of-day
     // cannot tell an already-re-anchored row from one legitimately written at
     // local midnight, so the fact is recorded on the row.
@@ -429,7 +448,7 @@ export const expectedColumns = {
     Expense: [
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
         "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
-        "taxSource", "attributionAnchoredAt", "updatedAt",
+        "taxSource", "taxDeductibleBaseSource", "attributionAnchoredAt", "updatedAt",
     ],
 };
 

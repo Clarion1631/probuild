@@ -53,9 +53,11 @@ export async function POST() {
             imported: result.imported,
             updated: result.updated,
             deactivated: result.removed,
-            // Rows whose create never happened because the estimate moved
-            // mid-sync (round 31, item 2) — distinct from "skipped", which is
-            // decided before the write is even attempted.
+            // Rows a write-time attribution race left incomplete: a create
+            // that never happened (round 31, item 2), or an existing row whose
+            // catch-up fill was refused so it is still on no job (round 33,
+            // item 3). Distinct from "skipped", which is decided before the
+            // write is even attempted.
             attributionRaceSkipped: result.attributionRaceSkipped,
             skipped: result.skipped.length,
         };

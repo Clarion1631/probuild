@@ -365,6 +365,52 @@ test("taxSource is declared everywhere the other tax columns are", () => {
     assert.match(schema, /taxSource\s+String\?/);
 });
 
+test("taxDeductibleBaseSource is declared in BOTH DDL paths, the verifier and the schema", () => {
+    // Round 33, item 4 — the same parity the column above buys, for the column
+    // that splits provenance per field. Prod runs the apply script and CI
+    // replays the migration, so a column in one and not the other is a
+    // database that cannot reproduce the other: P2022 on production, or a CI
+    // schema that silently disagrees with prod.
+    assert.ok(
+        (statements as string[]).some(s => /ADD COLUMN IF NOT EXISTS "taxDeductibleBaseSource" TEXT/.test(s)),
+        "the apply script adds it",
+    );
+    assert.match(migrationSql, /ADD COLUMN IF NOT EXISTS "taxDeductibleBaseSource" TEXT/);
+    assert.ok(
+        expectedColumns.Expense.includes("taxDeductibleBaseSource"),
+        "and the post-run verify would catch its absence",
+    );
+    const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+    assert.match(schema, /taxDeductibleBaseSource\s+String\?/);
+});
+
+test("the base-provenance backfill is identical in both DDL paths, and idempotent", () => {
+    // The conservative reading of the rows that predate the column: before the
+    // split, a human base could only stand on a row a human had also answered
+    // about tax. It must be the SAME statement in both files — prod runs one
+    // and CI replays the other, and a backfill that differs between them is a
+    // difference nothing else in the system would ever surface.
+    const backfill = (statements as string[]).find(
+        s => /"taxDeductibleBaseSource" = 'manual'/.test(s),
+    );
+    assert.ok(backfill, "the apply script carries the backfill");
+    // Not a second copy in the migration: the parity test above compares every
+    // script statement against the migration by meaning, so asserting the
+    // migration matches here is asserting the pair cannot drift.
+    assert.ok(
+        normalize(migrationSql).includes(normalize(backfill!).replace(/;$/, "")),
+        "and the migration carries the same one",
+    );
+    // Idempotent by predicate: a second run matches nothing, so a re-run
+    // cannot re-stamp a row a human has since cleared.
+    assert.match(backfill!, /"taxDeductibleBaseSource" IS NULL/);
+    // Only where a human actually decided. An OCR or absent taxSource means
+    // nobody typed the base, and inventing "manual" there would hand a guess
+    // the one provenance booking is forbidden to overwrite.
+    assert.match(backfill!, /"taxDeductibleBase" IS NOT NULL/);
+    assert.match(backfill!, /"taxSource" IN\('manual','manual-none'\)|"taxSource" IN \('manual', 'manual-none'\)/);
+});
+
 test("Prisma declares the same default, so the migration check sees them agree", () => {
     const schema = readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
     assert.match(schema, /updatedAt DateTime @default\(now\(\)\) @updatedAt/);

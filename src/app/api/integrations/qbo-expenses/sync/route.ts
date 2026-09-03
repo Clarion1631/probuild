@@ -84,10 +84,12 @@ export function createQboExpenseSyncHandlers(
                     imported: result.imported,
                     updated: result.updated,
                     deactivated: result.removed,
-                    // Rows whose create never happened at all because the
-                    // estimate moved mid-sync (round 31, item 2) — a nonzero
-                    // count means the backfill this run belongs to is NOT
-                    // complete, however clean imported/updated/removed look.
+                    // Rows a write-time attribution race left incomplete —
+                    // a create that never happened (round 31, item 2) or a
+                    // catch-up fill that was refused (round 33, item 3). A
+                    // nonzero count means the backfill this run belongs to is
+                    // NOT complete, however clean imported/updated/removed
+                    // look.
                     attributionRaceSkipped: result.attributionRaceSkipped,
                     // Bounded summary + reason histogram so the dashboard can
                     // say WHY instead of a bare scary count (shared shape with

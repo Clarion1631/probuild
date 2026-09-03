@@ -1277,11 +1277,19 @@ test("the catch-up FILL refuses too, when the estimate moved out from under the 
     // to be on by the time this transaction locks it. The fill is skipped —
     // the row stays unattributed for the next sync to retry — but the rest of
     // the plan (here, the new qbSyncToken) still lands.
+    //
+    // And the OUTCOME says so (round 33, item 3). This used to answer plain
+    // "updated", which is true about the write and silent about the row still
+    // being on no job — so the sync summary counted it as finished work and
+    // the backfill's incomplete-window check never saw it.
     const fake = createFakePrisma(
         [{ ...WRITE, id: "expense-1", projectId: null, receiptUrl: null }],
         new Map([["estimate-1", "project-moved"]]),
     );
-    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }),
+        "updated-attribution-skipped",
+    );
     const row = fake.rows.get("purchase-1");
     assert.equal(row?.projectId, null, "the fill is skipped, not silently re-pointed");
     assert.equal(row?.estimateId, "estimate-1", "unchanged — it already matched the write");
@@ -1300,7 +1308,10 @@ test("a fill onto a project-less estimate is SKIPPED, not written half", async (
         [{ ...WRITE, id: "expense-1", projectId: null, estimateId: "estimate-old", receiptUrl: null }],
         new Map([["estimate-1", null]]),
     );
-    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }),
+        "updated-attribution-skipped",
+    );
     const row = fake.rows.get("purchase-1");
     assert.equal(row?.projectId, null, "no job to attribute against");
     assert.equal(row?.estimateId, "estimate-old", "the row keeps the estimate it had");
@@ -1318,11 +1329,95 @@ test("a fill onto a DELETED estimate is skipped, and the reconciliation still la
         new Map(),
         new Set(["estimate-1"]),
     );
-    assert.equal(await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }), "updated");
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1" }),
+        "updated-attribution-skipped",
+    );
     const row = fake.rows.get("purchase-1");
     assert.equal(row?.projectId, null);
     assert.equal(row?.estimateId, "estimate-old", "never re-pointed at an estimate that is gone");
     assert.equal(row?.qbSyncToken, "1");
+});
+
+test("the sync LOOP counts a refused catch-up FILL as incomplete, not as an update", async () => {
+    // Round 33, item 3 — the full loop, not just upsertQboExpense.
+    //
+    // The bug this replaces: the fill was refused (correctly), the tax/amount
+    // CAS still committed, and the outcome came back "updated". The aggregator
+    // therefore incremented `updated` and never touched
+    // `attributionRaceSkipped` — so a row that exists on NO JOB was reported
+    // as finished work, and the backfill's incomplete-window detection, which
+    // reads exactly that counter, could not see it.
+    const fake = createFakePrisma(
+        [{ ...WRITE, id: "expense-1", projectId: null, receiptUrl: null }],
+        new Map([["estimate-1", "project-moved"]]),
+    );
+    const dependencies = createSyncDependencies(
+        [{ ...PURCHASE, syncToken: "1" }],
+        ACTIVE_PROJECTS,
+        (write) => upsertQboExpense(fake.client, write),
+    );
+
+    const result = await syncQboExpenses({ since: new Date("2026-01-01") }, dependencies);
+    assert.equal(result.updated, 0, "not finished work — the row is still on no job");
+    assert.equal(result.attributionRaceSkipped, 1, "counted where the backfill looks");
+    assert.equal(result.imported, 0);
+    assert.equal(fake.rows.get("purchase-1")?.projectId, null, "the fill really was refused");
+    assert.equal(fake.rows.get("purchase-1")?.qbSyncToken, "1", "and the reconciliation still landed");
+});
+
+test("run-qbo-backfill calls the window INCOMPLETE on a refused fill", async () => {
+    // The other end of the chain: the counter above is only worth writing if
+    // the script that decides "this window is done" actually acts on it. The
+    // real script is run here — its own aggregation, its own idempotency
+    // check, its own message — with `fetch` answering the shape the sync loop
+    // above produces. A source-text assertion would pass on a script that
+    // printed the words and shipped the window anyway.
+    const realFetch = globalThis.fetch;
+    const realArgv = process.argv.slice();
+    const realSecret = process.env.RECEIPT_INGEST_SECRET;
+    const realLog = console.log;
+    const fsMod = (await import("node:fs")).default;
+    const realWrite = fsMod.writeFileSync;
+    const lines: string[] = [];
+
+    // ONE chunk, so both passes are a single request each.
+    process.argv = [realArgv[0], "run-qbo-backfill", "2026-03-01", "2026-03-05"];
+    process.env.RECEIPT_INGEST_SECRET = "test-secret";
+    globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        // Exactly what the loop reports for a refused fill: nothing imported,
+        // nothing updated, one row left incomplete.
+        text: async () => JSON.stringify({
+            imported: 0, updated: 0, removed: 0, attributionRaceSkipped: 1, skipped: [],
+        }),
+    })) as unknown as typeof fetch;
+    // The script writes scripts/qbo-backfill-results.json; that file is
+    // committed, and a test must not rewrite it.
+    fsMod.writeFileSync = (() => {}) as typeof fsMod.writeFileSync;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+
+    try {
+        await import("../scripts/run-qbo-backfill.mjs");
+    } finally {
+        globalThis.fetch = realFetch;
+        process.argv = realArgv;
+        if (realSecret === undefined) delete process.env.RECEIPT_INGEST_SECRET;
+        else process.env.RECEIPT_INGEST_SECRET = realSecret;
+        fsMod.writeFileSync = realWrite;
+        console.log = realLog;
+    }
+
+    const output = lines.join("\n");
+    assert.match(output, /INCOMPLETE — this window is NOT done/);
+    assert.match(output, /pass 1 hit 1 attribution race\(s\)/);
+    assert.match(output, /pass 2 hit 1/);
+    assert.doesNotMatch(
+        output,
+        /Idempotency: PASS/,
+        "0/0/0 on imported\/updated\/removed must NOT read as a clean rerun while a row is incomplete",
+    );
 });
 
 test("an ALREADY-attributed row is untouched by the locked re-read", async () => {

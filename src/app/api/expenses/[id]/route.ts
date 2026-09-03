@@ -238,10 +238,13 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             "needsTaxReview",
             "installedAtCustomer",
             "taxDeductibleBase",
-            // Provenance for the four above. Accepting it here would let a
-            // caller stamp "manual" on a row nobody answered, which is the one
-            // value booking treats as untouchable.
+            // Provenance for the four above. Accepting either here would let
+            // a caller stamp "manual" on a row nobody answered, which is the
+            // one value booking treats as untouchable. Two columns, because
+            // the tax figure and the deduction base are decided separately —
+            // see the PATCH's provenance rules below.
             "taxSource",
+            "taxDeductibleBaseSource",
         ];
         for (const field of TAX_FIELDS_OWNED_BY_PATCH) {
             if (Object.prototype.hasOwnProperty.call(body, field)) {
@@ -648,21 +651,30 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         // WHICH OF THE FOUR STATES THIS REQUEST PUTS THE ROW IN.
         //
-        // `taxSource` governs `taxAmount` and `taxDeductibleBase` (see
-        // HUMAN_TAX_SOURCES in expense-attribution.ts):
+        // PROVENANCE IS PER FIELD (round 33, item 4). `taxSource` governs
+        // `taxAmount` ALONE; `taxDeductibleBaseSource` governs the deduction
+        // base (see HUMAN_TAX_SOURCES in expense-attribution.ts):
         //
         //   * an explicit `taxAmount: null` is a person saying this receipt has
-        //     NO sales tax -> "manual-none". Not an absence: it is the answer a
-        //     null figure cannot express on its own, and booking must not write
-        //     an OCR guess over it.
-        //   * any other `taxAmount` edit -> "manual".
-        //   * a `taxDeductibleBase`-ONLY edit does NOT stamp `taxSource`. The
-        //     base is a portion of the tax figure, not an answer about it —
-        //     stamping "manual" here would permanently block an OCR read from
+        //     NO sales tax -> `taxSource` "manual-none". Not an absence: it is
+        //     the answer a null figure cannot express on its own, and booking
+        //     must not write an OCR guess over it.
+        //   * any other `taxAmount` edit -> `taxSource` "manual".
+        //   * a `taxDeductibleBase`-ONLY edit still does NOT stamp `taxSource`.
+        //     The base is a portion of the tax figure, not an answer about it —
+        //     stamping "manual" there would permanently block an OCR read from
         //     ever filling `taxAmount` on a row nobody has actually spoken to
-        //     tax about (book.ts refuses to touch a human-sourced row).
-        //   * OMITTING `taxAmount` leaves the column alone, so a row nobody has
-        //     spoken about stays open to an automated read.
+        //     tax about (book.ts refuses to touch a human-sourced row). It
+        //     stamps `taxDeductibleBaseSource` "manual" instead, which says the
+        //     true thing about the field it actually answered.
+        //   * ONE COLUMN COULD NOT SAY BOTH. With `taxSource` governing the
+        //     pair, the sequence "bookkeeper sets a base, booking later fills
+        //     the tax" ended with `taxSource: "ocr"` standing over a base a
+        //     person had typed — stored provenance claiming a machine decided
+        //     a figure it never saw.
+        //   * OMITTING `taxAmount` leaves `taxSource` alone, so a row nobody
+        //     has spoken about stays open to an automated read; omitting
+        //     `taxDeductibleBase` leaves its source alone for the same reason.
         //
         // `installedAtCustomer` is NOT one of these — its own value is its
         // evidence (non-null means answered) and booking already refuses to
@@ -676,9 +688,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // with a human provenance and no human answer behind it, and no
         // automated read would ever be allowed to fill it.
         //
-        // So it clears the provenance AND both figures together.
+        // So it clears BOTH provenances and both figures together.
         // Otherwise, only a `taxAmount` edit stamps `taxSource` — a
-        // `taxDeductibleBase`-only edit leaves it untouched (see above).
+        // `taxDeductibleBase`-only edit leaves it untouched (see above) and
+        // stamps `taxDeductibleBaseSource` instead.
         const stampsTaxProvenance = editsTaxAmount && !taxIsUnknown;
         const nextTaxSource =
             editsTaxAmount && body.taxAmount === null ? "manual-none" : "manual";
@@ -910,15 +923,34 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                 ? Math.round((Number(expense.amount) - resultingTax) * 100) / 100
                 : null;
         const writesBase = editsBase || computedBase !== null;
+        // WHAT THE BASE COLUMN WILL ACTUALLY HOLD, named once — so its
+        // provenance is decided from the value being written rather than from
+        // which key the request happened to carry. A server-computed base is
+        // still a human's decision: it is `amount - tax` written out because
+        // the person who edited the tax left the base blank meaning "all of
+        // it", not a figure anything read off a receipt.
+        const nextBaseValue = computedBase !== null ? computedBase : nextBase;
 
         const data = {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
                 ...(taxIsUnknown
-                    // Both figures and the provenance, in one statement: a
-                    // half-retracted row is exactly the shape this is fixing.
-                    ? { taxDeductibleBase: null, taxSource: null }
+                    // Both figures and BOTH provenances, in one statement: a
+                    // half-retracted row is exactly the shape this is fixing,
+                    // and a base source left saying "manual" over a base that
+                    // is now null is the same lie in miniature.
+                    ? { taxDeductibleBase: null, taxSource: null, taxDeductibleBaseSource: null }
                     : writesBase
-                        ? { taxDeductibleBase: computedBase !== null ? computedBase : nextBase }
+                        ? {
+                            taxDeductibleBase: nextBaseValue,
+                            // Written in the SAME statement as the figure it
+                            // describes, and derived from it: a base is
+                            // "manual" exactly when this request leaves one
+                            // standing. Clearing the base back to blank clears
+                            // its source too — a blank is an absence, not a
+                            // decision, and locking the column on an absence
+                            // would freeze the row out of the pipeline.
+                            taxDeductibleBaseSource: nextBaseValue === null ? null : "manual",
+                        }
                         : {}),
                 ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
                 ...(derivesAtSource ? { taxAtSource: resultingAtSource } : {}),
@@ -935,10 +967,12 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                         // given the figures for.
                         ...(clearsReview ? { needsTaxReview: false } : {}),
                         // PROVENANCE IS PER DECISION, AND `taxSource` COVERS
-                        // EXACTLY TWO COLUMNS: taxAmount and taxDeductibleBase.
+                        // EXACTLY ONE COLUMN: taxAmount. The deduction base
+                        // carries its own, written above beside the figure it
+                        // describes (round 33, item 4).
                         //
                         // It is stamped only when this request actually carries
-                        // one of those FIGURES. Two consequences, both
+                        // the tax FIGURE. Two consequences, both
                         // deliberate:
                         //   * answering only the installed-at-customer question
                         //     does not claim a person supplied tax numbers, and

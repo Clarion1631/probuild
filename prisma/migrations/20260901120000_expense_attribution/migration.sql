@@ -31,6 +31,25 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "needsTaxReview" BOOLEAN NOT NULL
 -- "there is no tax here", which is a NULL taxAmount and so cannot be told from
 -- "nobody has looked" without this column. Booking never overwrites "manual".
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxSource" TEXT;
+-- WHO decided the deduction BASE, which is not the same question and not
+-- always the same answer. A base-only PATCH deliberately leaves `taxSource`
+-- alone so a later OCR read may still fill `taxAmount`; booking then stamps
+-- `taxSource = 'ocr'` for the tax it filled, and while one column governed
+-- both figures that made the row claim a machine had decided a base a person
+-- had typed. Per-field provenance makes the mixed state representable.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBaseSource" TEXT;
+-- THE CONSERVATIVE READING OF THE ROWS THAT PREDATE THE COLUMN. Before this
+-- split, a human-entered base could only exist on a row a human had also
+-- spoken to about tax, so a non-NULL base beside a human `taxSource` was
+-- necessarily a human base. Marking it as such is what stops the next booking
+-- pass from being able to claim it. Rows with an OCR or absent `taxSource`
+-- are left NULL: nobody wrote a base on them, and inventing a provenance is
+-- how a guess becomes a fact. Idempotent by the IS NULL predicate.
+UPDATE "Expense"
+   SET "taxDeductibleBaseSource" = 'manual'
+ WHERE "taxDeductibleBaseSource" IS NULL
+   AND "taxDeductibleBase" IS NOT NULL
+   AND "taxSource" IN ('manual', 'manual-none');
 -- The re-anchor marker. See the UPDATE the rollout script runs: a predicate on
 -- the time-of-day cannot tell a row that has already been re-anchored from one
 -- legitimately written at local midnight, so the fact is recorded.

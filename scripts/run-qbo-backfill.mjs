@@ -73,11 +73,14 @@ function aggregate(results) {
         total.imported += r.imported;
         total.updated += r.updated;
         total.removed += r.removed;
-        // Rows whose create never happened because the estimate moved
-        // mid-sync (round 31, item 2) — NOT rolled into imported/updated/
-        // removed, and NOT the same as "unchanged". A nonzero count here
-        // means real rows are still missing, however clean the other three
-        // counters look.
+        // Rows a write-time attribution race left INCOMPLETE — NOT rolled
+        // into imported/updated/removed, and NOT the same as "unchanged".
+        // Two shapes, and this window is unfinished for either: a create that
+        // never happened because the estimate moved mid-sync (round 31,
+        // item 2), and an existing row whose catch-up fill was refused for the
+        // same reason, so it is still on no job even though its tax and amount
+        // reconciled (round 33, item 3). The second used to be reported as a
+        // plain "updated", which a rerun reads as ordinary churn.
         total.attributionRaceSkipped += r.attributionRaceSkipped ?? 0;
         total.skipped.push(...(r.skipped ?? []));
     }
@@ -114,11 +117,11 @@ console.log(`Pass 2 totals: imported ${total2.imported}, updated ${total2.update
 
 // A clean rerun is 0/0/0 on imported/updated/removed AND 0 on
 // attributionRaceSkipped. That fourth count is not folded into the others —
-// it means a row's CREATE never happened at all because an estimate moved
-// mid-sync (round 31, item 2), which the old 0/0/0 check could not see: a
-// persistent race skips the same purchases on every pass, so pass 2 reports
-// 0/0/0 on the counters that WOULD have caught it while real rows stay
-// permanently unimported. This window is not done while either pass hit one.
+// it means an attribution race left a row incomplete, which the old 0/0/0
+// check could not see: a persistent race hits the same purchases on every
+// pass, so pass 2 reports 0/0/0 on the counters that WOULD have caught it
+// while real rows stay unattributed. This window is not done while either
+// pass hit one.
 const idempotent =
     total2.imported === 0 && total2.updated === 0 && total2.removed === 0 &&
     total2.attributionRaceSkipped === 0;
@@ -130,8 +133,9 @@ if (idempotent) {
 if (total1.attributionRaceSkipped > 0 || total2.attributionRaceSkipped > 0) {
     console.log(
         `INCOMPLETE — this window is NOT done: pass 1 hit ${total1.attributionRaceSkipped} attribution race(s), ` +
-        `pass 2 hit ${total2.attributionRaceSkipped}. Those rows were never created. Rerun this backfill for ` +
-        `${since}..${until} once the estimate moves have settled — do not treat this window as complete yet.`,
+        `pass 2 hit ${total2.attributionRaceSkipped}. Those rows were either never created, or exist with no ` +
+        `job attached because the catch-up fill was refused. Rerun this backfill for ${since}..${until} once ` +
+        `the estimate moves have settled — do not treat this window as complete yet.`,
     );
 }
 console.log("Full results: scripts/qbo-backfill-results.json");

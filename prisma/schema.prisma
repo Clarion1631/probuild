@@ -657,12 +657,25 @@ model Expense {
   /// total", which is only reached once installedAtCustomer is an explicit
   /// true. Set by a bookkeeper on the expense edit route.
   taxDeductibleBase   Decimal?
-  /// Who decided the tax fields on this row: "ocr" (read off the receipt by
-  /// the intake pipeline) or "manual" (a bookkeeper, through PATCH on the
-  /// expense route). Booking never overwrites a "manual" decision - including
-  /// the decision that there is NO tax, which is a null taxAmount and so
+  /// Who decided `taxAmount` on this row: "ocr" (read off the receipt by the
+  /// intake pipeline), "manual" (a bookkeeper supplied a figure, through PATCH
+  /// on the expense route) or "manual-none" (a bookkeeper looked and said this
+  /// receipt carries no sales tax). Booking never overwrites either human
+  /// state - including "there is NO tax", which is a null taxAmount and so
   /// cannot be told from "nobody has looked" without this column.
+  ///
+  /// `taxAmount` ONLY. The deduction base has its own column below, because
+  /// the two figures are decided separately and by different parties.
   taxSource           String?
+  /// Who decided `taxDeductibleBase`: "manual" (a bookkeeper, through PATCH)
+  /// or "ocr" if an automated pass ever supplies one. Split out from
+  /// `taxSource` because the pair is genuinely mixable and the single column
+  /// could not say so: a base-only PATCH deliberately leaves `taxSource`
+  /// alone (so a later OCR read may still fill the tax), and booking then
+  /// stamps `taxSource: "ocr"` for the tax it filled - which, while one column
+  /// governed both figures, made the row claim a machine had decided a base a
+  /// person had entered by hand.
+  taxDeductibleBaseSource String?
   /// Set by the one-off UTC re-anchor in the Phase 3 rollout script. A row that
   /// carries it has already had its `date` moved from UTC midnight to the
   /// company's calendar day, so a re-run skips it — the predicate alone cannot

@@ -60,6 +60,30 @@ let estimateProjectSequence: (string | null)[];
 let created: Record<string, unknown>[];
 
 /**
+ * A REAL mutex behind `pg_advisory_xact_lock`, so a concurrency claim can be
+ * tested rather than asserted.
+ *
+ * Postgres serialises two transactions that ask for the same key and releases
+ * at COMMIT/ROLLBACK; a fake that ignored the lock query would let both
+ * deliveries run straight through and the test would pass on a route with no
+ * lock at all. Each key gets a promise chain: the second acquirer waits for
+ * the first to settle. `lockKeys` records what was asked for, so a test can
+ * also prove the key is scoped to the FILE rather than to something coarser.
+ */
+const lockChain = new Map<string, Promise<void>>();
+let lockKeys: string[];
+
+async function acquireLock(key: string): Promise<() => void> {
+    lockKeys.push(key);
+    const prior = lockChain.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>(resolve => { release = resolve; });
+    lockChain.set(key, prior.then(() => mine));
+    await prior;
+    return release;
+}
+
+/**
  * Real Postgres only keeps what a transaction actually COMMITS — a throw
  * inside `prisma.$transaction` rolls back everything the callback wrote, not
  * just the statement that threw. The fake models that instead of trusting the
@@ -70,8 +94,23 @@ let created: Record<string, unknown>[];
 const fakePrisma: any = {
     $transaction: async (fn: any) => {
         const buffer: Record<string, unknown>[] = [];
+        const releases: (() => void)[] = [];
         const txClient = {
             ...fakePrisma,
+            // The lock is taken ON THIS TRANSACTION and released when it
+            // settles — the ordering the route depends on. The rows are
+            // published to `created` BEFORE the release, because Postgres
+            // makes a transaction's writes visible and drops its advisory
+            // locks at the same instant: releasing first would let the loser
+            // re-read an empty table and the dedupe would look broken when it
+            // is not.
+            $queryRawUnsafe: async (query: string, ...args: any[]) => {
+                if (/pg_advisory_xact_lock/.test(query)) {
+                    releases.push(await acquireLock(String(args[0])));
+                    return [{ lock_result: null }];
+                }
+                return fakePrisma.$queryRawUnsafe(query, ...args);
+            },
             expense: {
                 ...fakePrisma.expense,
                 create: async (args: { data: Record<string, unknown> }) => {
@@ -80,9 +119,13 @@ const fakePrisma: any = {
                 },
             },
         };
-        const result = await fn(txClient);
-        created.push(...buffer);
-        return result;
+        try {
+            const result = await fn(txClient);
+            created.push(...buffer);
+            return result;
+        } finally {
+            for (const release of releases) release();
+        }
     },
     $queryRawUnsafe: async (query: string, ...args: any[]) => {
         if (/FROM "Estimate" WHERE id/.test(query) && /"projectId"/.test(query)) {
@@ -103,7 +146,16 @@ const fakePrisma: any = {
         return [{ lock_result: null }];
     },
     expense: {
-        findFirst: async () => null,
+        // The dedupe query, answered from what has actually COMMITTED. A
+        // hard-coded null could never tell a first delivery from a second.
+        findFirst: async (args: any) => {
+            const needle = args?.where?.receiptUrl?.contains;
+            if (typeof needle !== "string") return null;
+            const hit = created.find(
+                row => typeof row.receiptUrl === "string" && row.receiptUrl.includes(needle),
+            );
+            return hit ? { id: "exp-existing" } : null;
+        },
         create: async (args: { data: Record<string, unknown> }) => {
             created.push(args.data);
             return { id: `exp-${created.length}` };
@@ -162,6 +214,8 @@ beforeEach(() => {
     lockedEstimateProject = "job-1";
     estimateProjectSequence = [];
     created = [];
+    lockKeys = [];
+    lockChain.clear();
 });
 
 function post(body: Record<string, unknown>) {
@@ -235,6 +289,116 @@ test("one moved group aborts the whole receipt, not just itself", async () => {
     assert.equal(body.ok, false);
     assert.equal(body.reason, "attribution-race");
     assert.equal(body.retryable, true);
+});
+
+// ── one delivery at a time, per Drive file (round 33, item 1) ──────────────
+
+test("two concurrent deliveries of the same file ingest it exactly ONCE", async () => {
+    // The bug this replaces: the dedupe read ran BEFORE the transaction, took
+    // no lock, and was the whole decision. Two deliveries of the same Drive
+    // file — the Apps Script retrying a request whose response was lost, or
+    // two runs overlapping — both read "no expense carries this file id" and
+    // both inserted every group. The receipt was booked twice on the same job,
+    // with nothing in the data to tell the copies apart.
+    //
+    // The lock is real in this fake (see acquireLock), so this only passes if
+    // the route actually takes it INSIDE the transaction and re-asks the
+    // dedupe underneath it.
+    const [first, second] = await Promise.all([post(PAYLOAD), post(PAYLOAD)]);
+    const bodies = [await first.json(), await second.json()];
+
+    assert.equal(created.length, 1, "one set of expenses, not two");
+    assert.equal(bodies.filter(b => b.created === 1).length, 1, "exactly one delivery wrote");
+    const loser = bodies.find(b => b.alreadyIngested);
+    assert.ok(loser, "the loser gets the idempotent answer, not a second copy");
+    assert.deepEqual(loser, { ok: true, alreadyIngested: true, created: 0 });
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+});
+
+test("the ingest lock is keyed on the DRIVE FILE, not on something coarser", async () => {
+    // A lock on the project (or a constant) would serialise unrelated
+    // receipts and still not identify this document; a lock on the whole
+    // payload would change with every retry and guard nothing.
+    await post(PAYLOAD);
+    assert.deepEqual(lockKeys, ["receipt-ingest:drive-file-1"]);
+});
+
+test("two deliveries of DIFFERENT files do not block each other", async () => {
+    await Promise.all([post(PAYLOAD), post({ ...PAYLOAD, fileId: "drive-file-2" })]);
+    assert.equal(created.length, 2);
+    assert.deepEqual(
+        [...lockKeys].sort(),
+        ["receipt-ingest:drive-file-1", "receipt-ingest:drive-file-2"],
+    );
+});
+
+// ── a malformed group refuses the whole document (round 33, item 2) ────────
+
+test("one malformed group writes NOTHING and names the group that failed", async () => {
+    // The bug this replaces: the loop `continue`d past a malformed group from
+    // inside the "atomic" transaction. Its valid sibling committed, the
+    // response said ok with a plausible `created` count, and the file-level
+    // dedupe then matched that sibling on every retry — so the malformed
+    // group could never be re-offered and its money silently left the books.
+    const res = await post({
+        ...PAYLOAD,
+        groups: [
+            { category: "Plumbing", amount: 120.5 },
+            { category: "Framing", amount: "not a number" },
+            { category: "Demo", amount: 0 },
+        ],
+    });
+    const body = await res.json();
+
+    assert.equal(created.length, 0, "the valid sibling did NOT commit on its own");
+    assert.equal(res.status, 422);
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "invalid-group");
+    assert.equal(body.retryable, true);
+    assert.deepEqual(body.invalidGroups, [
+        { index: 1, category: "Framing", reason: "amount is not a finite number" },
+        { index: 2, category: "Demo", reason: "amount rounds to zero" },
+    ]);
+});
+
+test("the SAME payload, corrected, ingests every group", async () => {
+    // The other half of the contract: refusing the document has to leave it
+    // re-sendable. Nothing was written, so the file-level dedupe does not
+    // match and the corrected delivery lands all three groups.
+    const refused = await post({
+        ...PAYLOAD,
+        groups: [
+            { category: "Plumbing", amount: 120.5 },
+            { category: "Framing", amount: "not a number" },
+        ],
+    });
+    assert.equal(refused.status, 422);
+    assert.equal(created.length, 0);
+
+    const res = await post({
+        ...PAYLOAD,
+        groups: [
+            { category: "Plumbing", amount: 120.5 },
+            { category: "Framing", amount: 80 },
+        ],
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.created, 2);
+    assert.equal(created.length, 2);
+});
+
+test("a document whose ONLY group is unusable is refused, not answered 200", async () => {
+    // This used to fall through to `{ ok: false, reason: "no-valid-groups" }`
+    // with a 200 — a status the Apps Script reads as "handled", which archives
+    // the file and retires the receipt unbooked.
+    const res = await post({ ...PAYLOAD, groups: [{ category: "Plumbing", amount: 0 }] });
+    const body = await res.json();
+    assert.equal(res.status, 422);
+    assert.equal(body.reason, "invalid-group");
+    assert.equal(created.length, 0);
 });
 
 test("attribution changing BETWEEN group 1 and group 2 rolls back group 1 too", async () => {

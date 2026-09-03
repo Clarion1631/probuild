@@ -339,9 +339,10 @@ return. As built:
 * `/reports/tax-paid-at-source` counts ONLY an explicit `true`;
 * `Expense.taxDeductibleBase` (added in this PR) holds the resold portion of a MIXED
   receipt, and the report uses it in place of the pre-tax total when it is set;
-* **`Expense.taxSource` is a four-state column**, not a label. It governs the two tax
-  FIGURES (`taxAmount`, `taxDeductibleBase`) and nothing else — `installedAtCustomer` is
-  its own evidence, since a non-null value already means somebody answered.
+* **`Expense.taxSource` is a four-state column**, not a label. It governs `taxAmount`
+  and nothing else — the deduction base has its own `Expense.taxDeductibleBaseSource`
+  (below), and `installedAtCustomer` is its own evidence, since a non-null value already
+  means somebody answered.
 
   | state | meaning | who writes it | may an automated pass overwrite the figures? |
   |---|---|---|---|
@@ -358,6 +359,26 @@ return. As built:
 
   OMITTING the `taxAmount` key leaves `taxSource` untouched: that request said nothing
   about tax, so nobody decided anything and a later read may still fill it.
+* **`Expense.taxDeductibleBaseSource` governs the deduction BASE, and only it.** The two
+  figures are decided separately, often by different parties, and one column could not
+  say so. A `taxDeductibleBase`-only PATCH deliberately leaves `taxSource` alone — the
+  base is a portion of the tax figure, not an answer about it, and stamping "manual"
+  there would lock an OCR read out of a row nobody has spoken to tax about. Booking then
+  fills `taxAmount` and stamps `taxSource: "ocr"`. While `taxSource` governed both
+  figures, that combination stored a claim that OCR had decided a base a bookkeeper had
+  typed by hand.
+
+  So: the PATCH stamps `taxDeductibleBaseSource: "manual"` whenever it leaves a base
+  standing (including the server-computed `amount − taxAmount`, which is the person's
+  "all of it" written out), and `null` when it clears the base back to blank. Booking
+  never writes the column at all: it supplies no base, so it has nothing to say about
+  one, and a human base keeps its own provenance through any number of OCR tax fills.
+  The "I do not know" retraction clears BOTH provenances with both figures.
+
+  Rows that predate the column are backfilled to `"manual"` where a base stands beside a
+  human `taxSource` — before the split a human base could only exist on a row a human had
+  also answered about tax, so that is the conservative reading. Rows with an OCR or
+  absent `taxSource` stay null.
 * **A blank deduction base means "the whole pre-tax total", and the SERVER stores it.**
   Not a null with a remembered meaning: when a PATCH writes the tax figures and leaves
   `taxDeductibleBase` blank, the row is saved with `amount − taxAmount` (sign intact, so a

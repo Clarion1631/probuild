@@ -280,8 +280,9 @@ test("PATCH reaches a QBO-managed row — the population the report is made of",
 test("PATCH touches NOTHING but the three ProBuild-only columns", async () => {
     await patch({ installedAtCustomer: true });
     // `needsTaxReview` rides along because answering IS clearing the flag.
-    // `taxSource` does NOT: it governs the two tax FIGURES, and this request
-    // carries neither (round 16, item 1).
+    // Neither provenance column does: `taxSource` governs `taxAmount` and
+    // `taxDeductibleBaseSource` governs the base, and this request carries
+    // neither figure (round 16, item 1; round 33, item 4).
     assert.deepEqual(
         Object.keys(updateArgs?.data ?? {}),
         ["installedAtCustomer", "needsTaxReview"],
@@ -532,6 +533,11 @@ test("PUT rejects EVERY tax-return field, by name", async () => {
     for (const field of [
         "taxAmount", "taxAtSource", "needsTaxReview",
         "installedAtCustomer", "taxDeductibleBase", "taxSource",
+        // Round 33, item 4. The second provenance column is refused for the
+        // same reason as the first: accepting it here would let a caller
+        // stamp "manual" on a base nobody typed, which is the value booking
+        // treats as untouchable.
+        "taxDeductibleBaseSource",
     ]) {
         const res = await call({ [field]: field === "taxAtSource" ? true : 1 });
         assert.equal(res.status, 400, field);
@@ -872,7 +878,79 @@ test("supplying taxAmount stamps manual; a base-only edit does not", async () =>
 test("a phase-only edit touches neither the flag nor the provenance", async () => {
     await patch({ costCodeId: null });
     assert.equal(updateArgs?.data.taxSource, undefined);
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, undefined);
     assert.equal(updateArgs?.data.needsTaxReview, undefined);
+});
+
+// ── provenance is PER FIELD (round 33, item 4) ─────────────────────────────
+
+test("a base-only edit stamps the BASE's provenance, and only that", async () => {
+    // The hole one column left. A base-only edit correctly leaves `taxSource`
+    // alone — so an OCR read may still fill `taxAmount` on a row nobody has
+    // spoken to about tax — but that left the human's base with no provenance
+    // at all, and booking then stamped `taxSource: "ocr"` over the whole row.
+    await patch({ taxDeductibleBase: 50 });
+    assert.equal(updateArgs?.data.taxDeductibleBase, 50);
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, "manual", "the field they answered");
+    assert.equal(updateArgs?.data.taxSource, undefined, "the field they did not");
+});
+
+test("a taxAmount-only edit stamps the TAX's provenance, and only that", async () => {
+    // The mirror image. The base column is untouched here, so its provenance
+    // must be too — a row whose base was filled by something else keeps
+    // whatever it already said.
+    await patch({ taxAmount: 16.55, taxDeductibleBase: 50 });
+    const both = updateArgs;
+    assert.equal(both?.data.taxSource, "manual");
+    assert.equal(both?.data.taxDeductibleBaseSource, "manual", "this request wrote a base too");
+
+    // ...and with the base left out entirely and one already on the row, the
+    // server does not recompute it, so nothing about the base is written.
+    storedExpense = { ...(storedExpense as object), taxDeductibleBase: 50 } as Record<string, unknown>;
+    await patch({ taxAmount: 16.55 });
+    assert.equal(updateArgs?.data.taxSource, "manual");
+    assert.equal(updateArgs?.data.taxDeductibleBase, undefined, "the base is not rewritten");
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, undefined, "so its source is not either");
+});
+
+test("the SERVER-computed base is a human's answer, and is stamped as one", async () => {
+    // "Blank means the whole pre-tax total" written out. The person edited the
+    // tax and left the base empty meaning "all of it"; the row stores
+    // `amount - tax` so it says so outright. That figure came from them, not
+    // from a receipt read, and the provenance has to agree or the next booking
+    // pass would treat it as fillable.
+    await patch({ taxAmount: 16.55 });
+    assert.equal(updateArgs?.data.taxDeductibleBase, 191.19, "amount - tax, stored");
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, "manual");
+});
+
+test("clearing the base back to blank clears its provenance too", async () => {
+    // A blank is an absence, not a decision. Leaving "manual" standing over a
+    // null base would lock the column out of the pipeline forever on the
+    // strength of a figure nobody is claiming any more.
+    storedExpense = {
+        ...(storedExpense as object), taxDeductibleBase: 50, taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    await patch({ taxDeductibleBase: null });
+    assert.equal(updateArgs?.data.taxDeductibleBase, null);
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, null);
+    assert.equal(updateArgs?.data.taxSource, undefined, "still not an answer about the tax");
+});
+
+test("'I do not know' retracts BOTH provenances, not just one", async () => {
+    // The retraction leaves no human answer standing anywhere on the row. A
+    // base source left saying "manual" over a base that is now null is the
+    // same half-retracted shape the taxSource clear exists to prevent.
+    storedExpense = {
+        ...(storedExpense as object),
+        taxAmount: 16.55, taxSource: "manual",
+        taxDeductibleBase: 50, taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: null, taxKnown: false });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, null);
+    assert.equal(updateArgs?.data.taxDeductibleBase, null);
+    assert.equal(updateArgs?.data.taxDeductibleBaseSource, null);
 });
 
 // ── an acknowledgement must carry real figures (round 17, item 2) ──────────

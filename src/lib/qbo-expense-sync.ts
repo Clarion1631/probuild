@@ -586,7 +586,27 @@ export interface QboExpensePersistenceClient {
 // the row already exists and nothing about it needed to change, which is a
 // closed loop; a skipped create is an open one, and a backfill counting the
 // two together cannot tell "nothing to do" from "something is still missing".
-export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged" | "skipped-attribution-race";
+//
+// "updated-attribution-skipped" is the SAME open loop reached on the UPDATE
+// path (round 33, item 3). The row exists but has no job: the catch-up fill
+// was refused because the estimate moved, was unassigned, or was deleted
+// between the plan and the lock. Everything else in the plan — the tax and
+// amount reconciliation, which has nothing to do with attribution — still
+// committed, which is exactly why this used to report plain "updated": true
+// about the write, and silent about the fact that a row the backfill exists
+// to complete is still incomplete. A persistent race skips the same row on
+// every pass, so pass 2 looked like ordinary churn instead of unfinished work.
+//
+// It governs every return below the skipped fill, not just the successful CAS.
+// Whether the tax half of the plan landed, was contended, or found the row
+// gone, the attribution is still missing and only a later sync can supply it —
+// so "unchanged" would be just as blind as "updated" was.
+export type QboExpenseUpsertResult =
+    | "imported"
+    | "updated"
+    | "unchanged"
+    | "skipped-attribution-race"
+    | "updated-attribution-skipped";
 
 function isIncomingQboSyncTokenCurrent(current: string | null, incoming: string): boolean {
     if (current === null) return true;
@@ -987,6 +1007,14 @@ export async function upsertQboExpense(
         const plan = planQboExpenseUpdate(existing, write);
         if (planIsNoop(existing, plan)) return "unchanged";
 
+        // Set by a refused fill below, and it outranks whatever the tax/amount
+        // CAS goes on to report. See QboExpenseUpsertResult: the row is
+        // incomplete either way, and the aggregator counts it as work still
+        // outstanding rather than as a finished update.
+        let attributionFillSkipped = false;
+        const settled = (outcome: "updated" | "unchanged"): QboExpenseUpsertResult =>
+            attributionFillSkipped ? "updated-attribution-skipped" : outcome;
+
         // The attribution fill is its OWN statement, and its predicate — not a
         // value read a few lines above — is what guarantees a human's
         // re-attribution survives. projectId and estimateId land together or
@@ -1022,6 +1050,7 @@ export async function upsertQboExpense(
                     write.qbPurchaseId,
                     plan.fill.estimateId,
                 );
+                attributionFillSkipped = true;
             } else {
                 await transaction.expense.updateMany({
                     where: { id: existing.id, projectId: null },
@@ -1038,7 +1067,7 @@ export async function upsertQboExpense(
             where: casWhere(existing),
             data: plan.data,
         });
-        if (cas.count > 0) return "updated";
+        if (cas.count > 0) return settled("updated");
 
         // The row moved between the read and the write despite the lock — i.e.
         // a writer that does NOT take it (a script, a migration, a path nobody
@@ -1054,16 +1083,16 @@ export async function upsertQboExpense(
                 vendor: true, date: true, description: true, status: true,
             },
         });
-        if (!fresh) return "unchanged";
+        if (!fresh) return settled("unchanged");
         const replanned = planQboExpenseUpdate(fresh, write);
-        if (planIsNoop(fresh, replanned)) return "unchanged";
+        if (planIsNoop(fresh, replanned)) return settled("unchanged");
         const retry = await transaction.expense.updateMany({
             where: casWhere(fresh),
             data: replanned.data,
         });
         // Still contended. Leaving it is correct: the sync's facts are
         // recoverable on the next run, a discarded tax correction is not.
-        return retry.count > 0 ? "updated" : "unchanged";
+        return settled(retry.count > 0 ? "updated" : "unchanged");
     });
 }
 
@@ -1498,12 +1527,21 @@ export interface QboExpenseSyncResult {
     imported: number;
     updated: number;
     removed: number;
-    // Rows whose CREATE was skipped mid-sync because the estimate moved
-    // between the matcher's read and the write lock (round 31, item 2). Never
-    // rolled into `skipped` — that array is populated BEFORE the write
-    // attempt (missing customer, equity draw, etc.) and this is a write-time
-    // race, not a match-time decision. A backfill is not complete while this
-    // is nonzero: the row it belongs to was never created at all.
+    // Rows a write-time attribution race left INCOMPLETE. Two shapes, counted
+    // together because a backfill has the same answer to both — rerun this
+    // window:
+    //   * the CREATE never happened, because the estimate moved between the
+    //     matcher's read and the write lock (round 31, item 2), and
+    //   * an existing row's catch-up FILL was refused for the same reason
+    //     (round 33, item 3), so the row is still on no job even though the
+    //     rest of its update committed.
+    //
+    // Never rolled into `skipped` — that array is populated BEFORE the write
+    // attempt (missing customer, equity draw, etc.) and these are write-time
+    // races, not match-time decisions. And never rolled into `updated`: a
+    // persistent race repeats on every pass, so counting the second shape as
+    // an ordinary update made a rerun look like harmless churn instead of
+    // unfinished work.
     attributionRaceSkipped: number;
     skipped: Array<{ qbPurchaseId: string; reason: string }>;
 }
@@ -1830,6 +1868,7 @@ export async function syncQboExpenses(
                 if (outcome === "imported") result.imported += 1;
                 if (outcome === "updated") result.updated += 1;
                 if (outcome === "skipped-attribution-race") result.attributionRaceSkipped += 1;
+                if (outcome === "updated-attribution-skipped") result.attributionRaceSkipped += 1;
                 // NO cost-code suggestion here. Overhead is not a job and does
                 // not get a job phase (same scope rule as
                 // scripts/suggest-expense-cost-codes.mjs).
@@ -1884,6 +1923,11 @@ export async function syncQboExpenses(
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
         if (outcome === "skipped-attribution-race") result.attributionRaceSkipped += 1;
+        // The fill-refused shape (round 33, item 3): the row exists, its tax
+        // and amount reconciled, and it is still on no job. Counted here
+        // rather than in `updated` so a rerun that keeps hitting the same race
+        // reads as an incomplete window instead of ordinary churn.
+        if (outcome === "updated-attribution-skipped") result.attributionRaceSkipped += 1;
 
         // Runs on "unchanged" too: a row imported before Phase 3 is unchanged
         // by definition and is exactly the row that still has no phase. The

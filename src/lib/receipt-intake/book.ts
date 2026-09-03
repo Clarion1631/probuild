@@ -892,9 +892,10 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     //
                     // The tax PATCH lets a bookkeeper set `taxDeductibleBase`
                     // while leaving `taxAmount` unanswered, and a base-only
-                    // edit does not stamp `taxSource` either - so a row like
-                    // that matches the guard below exactly like a legacy row
-                    // with no tax opinion at all. It is not one: writing this
+                    // edit does not stamp `taxSource` either (it stamps
+                    // `taxDeductibleBaseSource` instead) - so a row like that
+                    // matches the guard below exactly like a legacy row with
+                    // no tax opinion at all. It is not one: writing this
                     // OCR figure on top could push the human's base above the
                     // new ceiling (`amount - taxAmount`), which the DB CHECK
                     // (Expense_taxDeductibleBase_check,
@@ -942,10 +943,20 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                                 // filing period somebody has reconciled.
                                 taxAmount: taxToStore,
                                 taxAtSource: taxToStore !== null,
-                                // Provenance for `taxAmount` ONLY. A manually-set
-                                // `taxDeductibleBase` from an earlier PATCH is not
-                                // touched by this write and keeps whatever
-                                // provenance it already had.
+                                // Provenance for `taxAmount` ONLY, and now the
+                                // column means only that (round 33, item 4).
+                                // A manually-set `taxDeductibleBase` from an
+                                // earlier PATCH is not touched by this write
+                                // and keeps its own `taxDeductibleBaseSource`
+                                // — which is the point of the split. While one
+                                // column governed both figures, this line made
+                                // the row claim OCR had decided a base a
+                                // person typed, and the value was the human's
+                                // while the provenance said machine.
+                                //
+                                // `taxDeductibleBaseSource` is deliberately
+                                // ABSENT from this data: booking supplies no
+                                // base, so it has nothing to say about one.
                                 taxSource: "ocr",
                                 ...(taxNeedsReview ? { needsTaxReview: true } : {}),
                             },
@@ -1099,13 +1110,18 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // An implausible read is a question, not an answer: the row
                     // waits for a person and the report skips it meanwhile.
                     needsTaxReview: taxNeedsReview,
-                    // Provenance for the tax columns. "ocr" is a re-readable
+                    // Provenance for `taxAmount`. "ocr" is a re-readable
                     // guess; "manual" (written by the tax PATCH) is a person's
                     // answer, and this pipeline never writes over one. Null
                     // only when there was no tax read at all, which leaves a
                     // later bookkeeper free to answer without arguing with a
                     // machine — an implausible read still counts as "a machine
                     // looked", which is why it keeps "ocr".
+                    //
+                    // `taxDeductibleBaseSource` is left unset, because this
+                    // create writes no `taxDeductibleBase`: booking never
+                    // splits a receipt into a resold portion, so the base and
+                    // its provenance both start empty and wait for a person.
                     taxSource: taxApplied > 0 ? "ocr" : null,
                     installedAtCustomer: row.installedAtCustomer,
                     amount: amountCents / 100,

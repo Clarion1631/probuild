@@ -11,6 +11,13 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 /**
+ * Namespace for the per-Drive-file ingest lock. Prefixed so it cannot collide
+ * with `expenseLockKey`'s per-row keys or the QBO sync's per-Purchase ones —
+ * different scopes, and two of them can be held at once.
+ */
+const RECEIPT_INGEST_LOCK_PREFIX = "receipt-ingest:";
+
+/**
  * Receipt/check ingest from the "GOLDEN TOUCH — RECEIPT + CHECK AUTOMATION"
  * Google Apps Script. The script already AI-splits each document into category
  * groups (the 15 project steps) and emails the image to QuickBooks; this
@@ -57,8 +64,13 @@ export async function POST(req: Request) {
 
     const receiptUrl = body.fileUrl || `https://drive.google.com/file/d/${body.fileId}/view`;
 
-    // Dedupe: this Drive file was already ingested (the file id is stable across
-    // the script's archive move, so re-runs and re-sends are safe).
+    // Dedupe, FAST PATH ONLY (round 33, item 1). This read takes no lock and
+    // is not the decision: the authoritative check is the identical query
+    // repeated inside the write transaction, underneath the per-file advisory
+    // lock. It stays here because it also short-circuits the project match
+    // below — a re-delivery of a file whose Drive folder has since been
+    // renamed used to answer `alreadyIngested`, and must keep doing so rather
+    // than suddenly reporting `project-not-matched`.
     const existing = await prisma.expense.findFirst({
         where: { receiptUrl: { contains: body.fileId } },
         select: { id: true },
@@ -103,6 +115,56 @@ export async function POST(req: Request) {
         ? dateOnlyInTimeZone(body.date, companyTimeZone)
         : new Date();
 
+    // EVERY GROUP IS VALIDATED BEFORE ANY OF THEM IS INSERTED (round 33,
+    // item 2 — the failure mode this replaces).
+    //
+    // The loop below used to `continue` past a group whose amount was not a
+    // finite number, or was zero, from INSIDE the transaction that was meant
+    // to make the receipt atomic. Its valid siblings committed, the response
+    // said `ok: true` with a `created` count that looked right, and the
+    // file-level dedupe then matched those siblings on every retry — so the
+    // malformed group could never be re-offered, and its money silently left
+    // the books. "Atomic" was true of the statements and false of the
+    // document.
+    //
+    // A document is now accepted whole or refused whole. One bad group
+    // refuses all of them with a non-2xx naming the offending INDICES and
+    // reasons, so the Apps Script does not archive the file, the same bytes
+    // re-send, and a corrected payload ingests every group.
+    //
+    // There is no intake row to quarantine it on: this leg writes Expenses
+    // straight from the Apps Script and owns no `ReceiptIntake` row (that is
+    // the v2 pipeline's table, reached through a different route). The failure
+    // is surfaced the two ways this route has: a structured server-log line,
+    // and a response the caller cannot mistake for success.
+    const invalidGroups = body.groups.flatMap((group, index) => {
+        const category = typeof group?.category === "string" ? group.category : null;
+        const amount = Number(group?.amount);
+        if (!Number.isFinite(amount)) {
+            return [{ index, category, reason: "amount is not a finite number" }];
+        }
+        if (Math.round(amount * 100) / 100 === 0) {
+            return [{ index, category, reason: "amount rounds to zero" }];
+        }
+        return [];
+    });
+    if (invalidGroups.length > 0) {
+        console.error(
+            "[receipt-ingest] invalid-group: refusing the whole document",
+            JSON.stringify({ fileId: body.fileId, projectId: project.id, invalidGroups }),
+        );
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "invalid-group",
+                retryable: true,
+                fileId: body.fileId,
+                invalidGroups,
+            },
+            { status: 422 },
+        );
+    }
+
     // ONE TRANSACTION FOR THE WHOLE RECEIPT (round 31, item 1 — the failure
     // mode this replaces).
     //
@@ -130,12 +192,53 @@ export async function POST(req: Request) {
     const warnings: string[] = [];
 
     try {
-        const results = await prisma.$transaction(async tx => {
+        const outcome = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+
+            // ONE DELIVERY AT A TIME, PER DRIVE FILE (round 33, item 1 — the
+            // failure mode this replaces).
+            //
+            // The dedupe above ran BEFORE the transaction. Two concurrent
+            // deliveries of the same file — the Apps Script retrying a request
+            // whose response was lost, or two runs overlapping — both read
+            // "no expense carries this file id", and both then inserted every
+            // group. The receipt was booked twice, on the same job, with
+            // nothing in the data to tell the copies apart.
+            //
+            // `pg_advisory_xact_lock` serialises them on the file's identity
+            // for the rest of the transaction (it releases at COMMIT or
+            // ROLLBACK, so there is no unlock to forget), and the dedupe is
+            // re-asked underneath it. The loser now reads the winner's
+            // committed rows and returns the idempotent answer instead of a
+            // second copy.
+            //
+            // `hashtextextended` for the same reason `lockExpense` uses it: it
+            // returns the bigint the lock function wants, and collides far
+            // less often than the 32-bit `hashtext`. A collision only makes
+            // two unrelated files serialise, which costs nothing here.
+            //
+            // NO UNIQUE INDEX BACKS THIS UP, because the schema has no key to
+            // build one on: every group of one receipt shares the SAME
+            // `receiptUrl`, and there is no per-group ordinal column, so the
+            // only honest constraint would need columns this PR does not add.
+            // The lock is the whole guarantee — said plainly rather than
+            // implying a durable backstop that is not there.
+            await raw.$queryRawUnsafe(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
+                `${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`,
+            );
+            const alreadyIngested = await tx.expense.findFirst({
+                where: { receiptUrl: { contains: body.fileId } },
+                select: { id: true },
+            });
+            if (alreadyIngested) return null;
+
             const outcomes: GroupResult[] = [];
             for (const group of body.groups) {
+                // Finite and non-zero by the validation above, which refuses
+                // the whole document rather than letting this loop skip a
+                // group out of a transaction that then reports success.
                 const amount = Math.round(Number(group.amount) * 100) / 100;
-                if (!Number.isFinite(amount) || amount === 0) continue;
 
                 const costCode = matchCostCode(group.category || "", costCodes);
                 const lineSummary = (group.lines || [])
@@ -207,12 +310,19 @@ export async function POST(req: Request) {
             return outcomes;
         });
 
-        for (const outcome of results) {
-            if (!outcome.costCode) {
-                warnings.push(`No cost code matched "${outcome.category}" — expense created without a phase`);
-            } else if (outcome.phaseId === null) {
+        // The lock's loser: the winner's rows are committed and visible, so
+        // this delivery has nothing to add. Byte-identical to the fast path's
+        // answer above, because it is the same fact.
+        if (outcome === null) {
+            return NextResponse.json({ ok: true, alreadyIngested: true, created: 0 });
+        }
+
+        for (const result of outcome) {
+            if (!result.costCode) {
+                warnings.push(`No cost code matched "${result.category}" — expense created without a phase`);
+            } else if (result.phaseId === null) {
                 warnings.push(
-                    `"${outcome.category}" matched ${outcome.costCode.code}, which is not a phase of this job — expense created without one`,
+                    `"${result.category}" matched ${result.costCode.code}, which is not a phase of this job — expense created without one`,
                 );
             }
             created++;
@@ -231,8 +341,9 @@ export async function POST(req: Request) {
         throw error;
     }
 
-    if (created === 0) {
-        return NextResponse.json({ ok: false, reason: "no-valid-groups" });
-    }
+    // No `no-valid-groups` answer any more: an empty `groups` array is already
+    // a 400 at the top, and a group that would have produced it is now the 422
+    // above — which, unlike the old 200-with-`ok: false`, cannot be read as
+    // "handled, archive the file".
     return NextResponse.json({ ok: true, created, projectId: project.id, projectName: project.name, warnings });
 }

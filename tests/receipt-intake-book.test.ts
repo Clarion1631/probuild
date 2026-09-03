@@ -1409,6 +1409,43 @@ test("a newly created Expense records where its tax came from", async () => {
     await bookReceipt(row(), rec.deps);
     assert.equal(rec.expenses[0].taxSource, "ocr");
     assert.ok(rec.expenses[0].taxAmount > 0);
+    // And says nothing about a base it never wrote. Booking does not split a
+    // receipt into a resold portion, so both the base and its provenance start
+    // empty and wait for a person (round 33, item 4).
+    assert.equal(rec.expenses[0].taxDeductibleBase, undefined);
+    assert.equal(rec.expenses[0].taxDeductibleBaseSource, undefined);
+});
+
+test("MIXED PROVENANCE: a manual base survives an OCR tax fill with its own source", async () => {
+    // Round 33, item 4 — the state one column could not represent.
+    //
+    // A bookkeeper sets `taxDeductibleBase` and says nothing about the tax, so
+    // the PATCH deliberately leaves `taxSource` NULL (the row stays open to an
+    // automated read). Booking then fills `taxAmount` and stamps
+    // `taxSource: "ocr"`. While `taxSource` governed BOTH figures, the row
+    // came out of that sequence claiming OCR had decided a base a person had
+    // typed — the value was theirs and the provenance said machine.
+    //
+    // Now each figure carries its own: the tax reads "ocr" because a machine
+    // read it, the base still reads "manual" because a person entered it, and
+    // booking never touches the second column at all.
+    const rec = recorder();
+    rec.existingExpense = {
+        id: "expense-1", projectId: "proj-1", costCodeId: null, costCodeSource: null,
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: 20, taxDeductibleBaseSource: "manual", amount: 100,
+        installedAtCustomer: null, estimate: { projectId: "proj-1" },
+    };
+    const result = await bookReceipt(row({ totalCents: 10_000, taxCents: 900 }), rec.deps);
+    assert.equal(result.outcome, "booked");
+    assert.ok(Number(rec.existingExpense.taxAmount) > 0, "the OCR tax fills the gap it found");
+    assert.equal(rec.existingExpense.taxSource, "ocr", "and claims only the figure it read");
+    assert.equal(rec.existingExpense.taxDeductibleBase, 20, "the human base is untouched");
+    assert.equal(
+        rec.existingExpense.taxDeductibleBaseSource,
+        "manual",
+        "and still says a person decided it",
+    );
 });
 
 test("no tax means no provenance, so a bookkeeper can still answer", async () => {
