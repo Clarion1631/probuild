@@ -72,11 +72,19 @@ const DRILLDOWN_EXPENSE_SELECT = {
     qbPurchaseId: true,
     amount: true,
     receiptUrl: true,
+    // THE DENORMALIZED JOB, so the drill-down can ask the shared resolver
+    // instead of the estimate (Codex round 35, item 4). Without these two
+    // columns the display had no way to answer correctly even in principle: a
+    // RE-ATTRIBUTED expense's estimate still names the job it LEFT, and that is
+    // the job the panel linked to.
+    projectId: true,
+    project: { select: { id: true, name: true } },
     estimate: {
         select: {
             id: true,
             code: true,
             title: true,
+            projectId: true,
             project: { select: { id: true, name: true } },
         },
     },

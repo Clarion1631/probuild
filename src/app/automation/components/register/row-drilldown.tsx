@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { decimalToCents, type MergedRegisterRow } from "@/lib/register-merge";
+import { resolveExpenseProjectLabel } from "@/lib/expense-attribution";
 import type { OpenReviewIssue, RawExpense } from "../../register-data";
 import { amountSign, friendlyType } from "../format";
 import CopyIdButton from "../copy-id-button";
@@ -94,8 +95,15 @@ function JobCostBlock({ row, expense }: { row: MergedRegisterRow; expense: RawEx
         );
     }
 
-    const projectId = expense.estimate?.project?.id ?? row.projectId;
-    const projectName = expense.estimate?.project?.name ?? row.projectName;
+    // THE SHARED RESOLVER, in the right ORDER. This read the estimate FIRST
+    // and never looked at `Expense.projectId` at all, so a re-attributed
+    // expense showed — and linked to — the job it used to be on, in the panel a
+    // bookkeeper opens precisely to check where a charge landed. The register
+    // row stays as the last-resort fallback for an expense with no attribution
+    // of its own.
+    const resolved = resolveExpenseProjectLabel(expense);
+    const projectId = resolved.projectId ?? row.projectId;
+    const projectName = resolved.projectName ?? row.projectName;
     const expenseCents = decimalToCents(expense.amount);
 
     return (

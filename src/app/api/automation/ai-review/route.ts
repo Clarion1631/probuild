@@ -391,26 +391,42 @@ async function computeReasonableness(
         costCode: { name: string } | null;
         costType: { name: string } | null;
         projectId: string | null;
-        project: { name: string; status: string } | null;
-        estimate: { project: { name: string; status: string } | null } | null;
+        project: { id: string; name: string; status: string } | null;
+        estimate: {
+            projectId: string | null;
+            project: { id: string; name: string; status: string } | null;
+        } | null;
     },
 ): Promise<ReasonablenessVerdict> {
     try {
         const vendor = expense.vendor ?? pushEvent.vendor;
-        // The resolver's rule, applied to the display object: the denormalized
-        // job when the row has one, the estimate's otherwise. An AI review that
-        // names the wrong job is worse than one that names none, because a
-        // reader will act on it.
-        const project = expense.projectId
-            ? expense.project
-            : (expense.estimate?.project ?? null);
+        // THE SHARED RESOLVER, not a local copy of its rule (Codex round 35,
+        // item 4). This reader re-implemented the column-wins-over-estimate
+        // fallback inline, as a ternary on the denormalized id, while importing
+        // `resolveExpenseProjectLabel` and never calling it — a twelfth opinion
+        // about which job an expense is on, in the one reader whose output a
+        // human then acts on. An AI review that names the wrong job is worse
+        // than one that names none.
+        const { projectId: resolvedProjectId, projectName } = resolveExpenseProjectLabel(expense);
+        // The STATUS has to come from the same row the name did, so it is
+        // chosen by IDENTITY rather than by re-walking the fallback: a second
+        // traversal is a second chance to disagree, and "active" attached to
+        // the wrong job's name is a confident wrong answer.
+        const resolvedStatus =
+            resolvedProjectId === null
+                ? null
+                : expense.project?.id === resolvedProjectId
+                    ? expense.project.status
+                    : expense.estimate?.project?.id === resolvedProjectId
+                        ? expense.estimate.project.status
+                        : null;
         const vendorHistory = vendor ? await vendorExpenseStats(vendor, expense.id) : null;
         return await judgeReasonableness({
             vendor,
             amountCents: decimalToCents(expense.amount) ?? pushEvent.amountCents,
             date: expense.date ? expense.date.toISOString().slice(0, 10) : null,
-            projectName: project?.name ?? null,
-            projectActive: project ? OPEN_PROJECT_STATUSES.includes(project.status) : null,
+            projectName,
+            projectActive: resolvedStatus === null ? null : OPEN_PROJECT_STATUSES.includes(resolvedStatus),
             category: expense.costType?.name ?? expense.costCode?.name ?? null,
             vendorHistory,
         });
@@ -603,8 +619,15 @@ export async function POST(request: Request) {
             costCode: { select: { name: true } },
             costType: { select: { name: true } },
             projectId: true,
-            project: { select: { name: true, status: true } },
-            estimate: { select: { project: { select: { name: true, status: true } } } },
+            // `id` on both, because the resolver answers with an id and the
+            // status is then matched to it — see `computeReasonableness`.
+            project: { select: { id: true, name: true, status: true } },
+            estimate: {
+                select: {
+                    projectId: true,
+                    project: { select: { id: true, name: true, status: true } },
+                },
+            },
         },
     });
     if (!expense?.receiptUrl) {

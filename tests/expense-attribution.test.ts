@@ -279,3 +279,76 @@ test("the tax & phase modal does not send taxAtSource at all", () => {
     );
     assert.ok(!/taxAtSource[^;]*>\s*0/.test(modal), "and no positive-only copy survives");
 });
+
+
+// ── every READER goes through the shared resolver (Codex round 35, item 4) ──
+
+/**
+ * These are SOURCE-level guards on purpose. The bug they pin is not a wrong
+ * output from a function under test — it is a reader that never called the
+ * function at all, having written the rule out by hand a few lines away from an
+ * unused import of the real one. No behavioural test of the resolver can catch
+ * that, because the code under test never runs it.
+ *
+ * Each guard asserts BOTH halves, and both halves matter: calling the resolver
+ * while keeping the inline copy is how two answers survive side by side, and
+ * dropping the inline copy without calling the resolver is how a display loses
+ * its job entirely.
+ *
+ * They judge SOURCE TEXT, which is a weaker instrument than an AST and is used
+ * knowing that — so the comments in those files deliberately describe the
+ * banned shape rather than quoting it, and each guard is paired with a positive
+ * assertion that cannot be satisfied by deleting code.
+ */
+function expenseReaderSource(relative: string): string {
+    return readFileSync(path.join(__dirname, "..", relative), "utf8");
+}
+
+test("the AI review reader resolves the job through the shared resolver", () => {
+    // It named the wrong job for every re-attributed expense: the rule was
+    // right, but it was written out inline — and an inline copy is the one that
+    // drifts. This reader's verdict is READ BY A PERSON and acted on, so a
+    // confident wrong job costs more here than almost anywhere else.
+    const src = expenseReaderSource("src/app/api/automation/ai-review/route.ts");
+    assert.match(
+        src,
+        /resolveExpenseProjectLabel\(expense\)/,
+        "the AI review must ASK the resolver, not merely import it",
+    );
+    assert.ok(
+        !/expense\.projectId\s*\?(?!\.)/.test(src),
+        "and no inline ternary on the denormalized id may survive alongside it",
+    );
+    assert.ok(
+        !/expense\.projectId\s*\?\?/.test(src),
+        "nor the nullish-coalescing spelling of the same rule",
+    );
+});
+
+test("the register drill-down resolves the job through the shared resolver", () => {
+    // Found by sweeping for the same shape, and worse than the AI review's: it
+    // read the estimate FIRST and never consulted the denormalized column at
+    // all, so a re-attributed expense was shown — and LINKED — under the job it
+    // left, in the panel a bookkeeper opens precisely to check where a charge
+    // landed.
+    const src = expenseReaderSource("src/app/automation/components/register/row-drilldown.tsx");
+    assert.match(
+        src,
+        /resolveExpenseProjectLabel\(expense\)/,
+        "the drill-down must ask the resolver",
+    );
+    assert.ok(
+        !/expense\.estimate\?\.project\?\.id\s*\?\?/.test(src),
+        "and the estimate-first reading must not come back",
+    );
+    // The projection has to carry what the resolver answers FROM, or the
+    // resolver is being asked a question whose evidence was never selected —
+    // which reads as "this expense has no job" rather than as an error.
+    const data = expenseReaderSource("src/app/automation/register-data.ts");
+    const select = data.slice(
+        data.indexOf("const DRILLDOWN_EXPENSE_SELECT"),
+        data.indexOf("export type RawExpense"),
+    );
+    assert.match(select, /projectId: true/, "the denormalized column is selected");
+    assert.match(select, /project: \{ select: \{ id: true, name: true \} \}/);
+});

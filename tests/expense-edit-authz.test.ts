@@ -77,6 +77,10 @@ const fakePrisma: any = {
             const eq = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
             for (const key of [
                 "amount", "taxAmount", "taxDeductibleBase",
+                // The PUT pins the whole tax CLASSIFICATION it judged, not just
+                // the two figures — a provenance flipped under it means a
+                // different person's answer is now on the row (round 35, item 1).
+                "taxSource", "taxDeductibleBaseSource", "needsTaxReview",
                 // The attribution the authorization rested on, plus the row
                 // version that covers everything else.
                 "projectId", "estimateId", "updatedAt",
@@ -1353,4 +1357,176 @@ test("...and the SAME request succeeds when nothing moved", async () => {
     };
     assert.equal((await call({ itemId: "item-own" })).status, 200);
     assert.equal(updateArgs?.data.itemId, "item-own");
+});
+
+
+// ── PUT cannot leave an invalid tax classification (Codex round 35, item 1) ─
+
+/**
+ * A CLASSIFIED receipt: a person answered the tax questions, and the excise
+ * report reads the answers. Every test below starts here and changes only the
+ * GROSS — the field PUT owns and PATCH refuses — because that is the whole
+ * shape of the bug: the two invariants that make a classification valid
+ * (`taxDeductibleBase <= amount - taxAmount`, and tax within 12% of the gross)
+ * are RATIOS OF THE AMOUNT, and this route was the one writer of the amount
+ * that checked neither.
+ */
+function classifiedRow(overrides: Record<string, unknown> = {}) {
+    storedExpense = {
+        ...(storedExpense as object),
+        amount: 207.74,
+        taxAmount: 16.55,
+        taxAtSource: true,
+        taxDeductibleBase: 50,
+        taxSource: "manual",
+        taxDeductibleBaseSource: "manual",
+        needsTaxReview: false,
+        ...overrides,
+    } as Record<string, unknown>;
+}
+
+test("lowering the gross past the tax's plausibility band FLAGS the row", async () => {
+    // THE CASE FROM THE REVIEW. $207.74 with $16.55 of tax and a $50 deduction
+    // base, edited down to $100: the base still fits under the pre-tax ceiling,
+    // so the only check this route had said yes — and left $16.55 of tax on a
+    // $100 receipt, 16.6%, past the 12% band that BOTH writers of that column
+    // refuse. A figure no writer would have accepted, standing on the row as a
+    // certified deduction.
+    classifiedRow();
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200, "the amount edit itself is legitimate work");
+    assert.equal(updateArgs?.data.amount, 100, "and it lands");
+    assert.equal(
+        updateArgs?.data.needsTaxReview, true,
+        "but the classification it invalidated is sent back to a person",
+    );
+});
+
+test("a financialReports user whose edit leaves the tax plausible is NOT flagged", async () => {
+    // $16.55 on $200 is 8.3% — inside the band, base still under the ceiling,
+    // and the actor is entitled to certify tax figures. Flagging here would
+    // teach a bookkeeper that the flag means nothing.
+    classifiedRow();
+    const res = await call({ amount: "200.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.amount, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined, "nothing to re-check");
+});
+
+test("a timeClock user may change the gross, but may not keep a classification", async () => {
+    // The PATCH demands `financialReports` to touch these columns at all. Left
+    // alone, this route was the way around that: change the gross — which
+    // `timeClock` allows — and the classification silently follows the new
+    // number into the excise report, certified by nobody who could certify it.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow();
+    const res = await call({ amount: "200.00" });
+    assert.equal(res.status, 200, "changing a receipt's total is still their work");
+    assert.equal(
+        updateArgs?.data.needsTaxReview, true,
+        "the figures they cannot certify are re-opened, even though they still fit",
+    );
+});
+
+test("an UNCLASSIFIED row is never flagged — there is nothing to re-certify", async () => {
+    // No figure, no provenance: nobody has answered anything about this
+    // receipt's tax, so an amount edit invalidates nothing. Flagging it would
+    // fill the queue with rows that have no question waiting on them.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow({
+        taxAmount: null, taxAtSource: false, taxDeductibleBase: null,
+        taxSource: null, taxDeductibleBaseSource: null,
+    });
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined);
+});
+
+test("an amount edit that changes nothing does not flag a classified row", async () => {
+    // The trigger is the GROSS MOVING, not the key being present. A PUT that
+    // re-sends the same total (every "save" from a form that posts all its
+    // fields) must not re-open a classification nobody disturbed.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow();
+    const res = await call({ amount: "207.74", vendor: "Lowe's" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined);
+});
+
+test("the PUT writes under the shared per-expense lock", async () => {
+    // The PATCH has taken it since round 17. This handler is the OTHER writer
+    // of the values every tax invariant is built from, and took nothing.
+    const locks: unknown[][] = [];
+    const originalLock = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (...args: unknown[]) => { locks.push(args); return [{}]; };
+    try {
+        await call({ amount: "100.00" });
+        assert.equal(locks.length, 1, "exactly one lock, taken before the write");
+        assert.match(String(locks[0][0]), /pg_advisory_xact_lock/);
+        assert.equal(locks[0][1], "expense:e1", "the same key the PATCH uses");
+    } finally {
+        fakePrisma.$queryRawUnsafe = originalLock;
+    }
+});
+
+test("the PUT's CAS pins the tax classification it judged", async () => {
+    classifiedRow();
+    await call({ amount: "200.00" });
+    const where = updateArgs?.where as Record<string, unknown>;
+    assert.equal(where.amount, 207.74, "the gross the verdict was measured against");
+    assert.equal(where.taxAmount, 16.55);
+    assert.equal(where.taxDeductibleBase, 50);
+    assert.equal(where.taxSource, "manual");
+    assert.equal(where.taxDeductibleBaseSource, "manual");
+    assert.equal(where.needsTaxReview, false, "including the flag it may be about to raise");
+});
+
+test("a concurrent PATCH between the locked read and the write is refused", async () => {
+    // Models a writer that did NOT take the lock — the case the predicate
+    // exists for. The tax is raised after this request has read and judged it,
+    // so the write would land a verdict about figures that are no longer there.
+    classifiedRow();
+    assert.equal((await call({ amount: "200.00" })).status, 200, "control");
+
+    classifiedRow();
+    const originalFind = fakePrisma.expense.findUnique;
+    fakePrisma.expense.findUnique = async (args: any) => {
+        const snapshot = storedExpense;
+        // The locked re-read is the one that asks for the provenance columns.
+        if (args?.select?.taxSource) {
+            storedExpense = { ...(storedExpense as object), taxAmount: 20 } as Record<string, unknown>;
+        }
+        return snapshot;
+    };
+    try {
+        const stale = await call({ amount: "200.00" });
+        assert.equal(stale.status, 409);
+        assert.equal((await stale.json()).code, "EXPENSE_REATTRIBUTED");
+    } finally {
+        fakePrisma.expense.findUnique = originalFind;
+    }
+});
+
+test("a deduction base that stopped fitting under the lock is refused, not written", async () => {
+    // The pre-transaction ceiling check passed against the row as it was READ.
+    // A concurrent PATCH that writes a bigger base makes the same amount edit
+    // violate `Expense_taxDeductibleBase_check` — which Postgres answers with a
+    // constraint error and a 500. The locked re-check answers it as a 400 that
+    // names the remedy.
+    classifiedRow({ taxDeductibleBase: 10 });
+    const preRead = storedExpense;
+    const locked = { ...(storedExpense as object), taxDeductibleBase: 50 } as Record<string, unknown>;
+    const originalFind = fakePrisma.expense.findUnique;
+    fakePrisma.expense.findUnique = async (args: any) =>
+        args?.select?.taxSource ? locked : preRead;
+    try {
+        // ceiling = 60.00 - 16.55 = 43.45. A base of 10 fits; the 50 the lock
+        // finds does not.
+        const res = await call({ amount: "60.00" });
+        assert.equal(res.status, 400);
+        assert.equal((await res.json()).code, "BASE_ABOVE_CEILING");
+        assert.equal(updateArgs, null, "and nothing is written");
+    } finally {
+        fakePrisma.expense.findUnique = originalFind;
+    }
 });

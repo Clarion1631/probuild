@@ -312,13 +312,22 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // Same reason as the POST and the PATCH: the check above holds nothing,
         // and this route stamps "manual", which no automated pass may correct.
         const legacyWrite = await prisma.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            // THE SHARED PER-EXPENSE LOCK (round 35, item 1).
+            //
+            // The tax PATCH has taken it since round 17; this handler never
+            // did, and it is the OTHER writer of the values every tax
+            // invariant is built from. `taxDeductibleBase <= amount -
+            // taxAmount` and the 12% plausibility band are both ratios of the
+            // GROSS, and the gross is exactly what this route rewrites — so a
+            // PUT could read the tax figures, have a concurrent PATCH replace
+            // them, and then apply an amount that was only ever coherent
+            // against the values it first saw.
+            await lockExpense(raw, id);
             // The same locked re-resolve as the DELETE: this route stamps
             // "manual" and rewrites the amount, and a fallback-attributed row
             // can change jobs between the authorization above and this write.
-            const lockedProjectId = await resolveExpenseProjectUnderLock(
-                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
-                expense,
-            );
+            const lockedProjectId = await resolveExpenseProjectUnderLock(raw, expense);
             if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
                 return { expense: null, phaseRejected: null, denied: "forbidden" } as const;
             }
@@ -331,27 +340,127 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             // job it left and its item link validated against that job's
             // estimates, then written onto the job it joined.
             if (editsCostCode && nextCostCodeId) {
-                const verdict = await assertPhaseOfProjectTx(
-                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
-                    lockedProjectId,
-                    nextCostCodeId,
-                );
+                const verdict = await assertPhaseOfProjectTx(raw, lockedProjectId, nextCostCodeId);
                 if (!verdict.ok) {
                     return { expense: null, phaseRejected: verdict.reason, denied: null } as const;
                 }
             }
             if (body.itemId) {
-                const onThisJob = await itemBelongsToProjectTx(
-                    tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
-                    body.itemId,
-                    lockedProjectId,
-                );
+                const onThisJob = await itemBelongsToProjectTx(raw, body.itemId, lockedProjectId);
                 if (!onThisJob) {
                     return { expense: null, phaseRejected: null, denied: "item" } as const;
                 }
             }
+            // THE TAX CLASSIFICATION, RE-READ UNDER THE LOCK.
+            //
+            // Everything checked before the transaction was checked against the
+            // row as it was READ, on the global client — the one state the lock
+            // exists to distrust. These six columns are re-read here so the
+            // verdicts below, and the predicate that carries them, all speak
+            // about the same row the write lands on.
+            const current = await tx.expense.findUnique({
+                where: { id },
+                select: {
+                    amount: true,
+                    taxAmount: true,
+                    taxDeductibleBase: true,
+                    taxSource: true,
+                    taxDeductibleBaseSource: true,
+                    needsTaxReview: true,
+                },
+            });
+            if (!current) {
+                return { expense: null, phaseRejected: null, denied: "moved" } as const;
+            }
+            const lockedAmount = Number(current.amount);
+            const lockedTax = current.taxAmount === null ? null : Number(current.taxAmount);
+            const lockedBase =
+                current.taxDeductibleBase === null ? null : Number(current.taxDeductibleBase);
+            const lockedTaxSource = current.taxSource ?? null;
+            const lockedBaseSource = current.taxDeductibleBaseSource ?? null;
+            const finalAmount = nextAmount ?? lockedAmount;
+            const inCents = (value: number) => Math.round(value * 100);
+            const grossChanges =
+                nextAmount !== undefined && inCents(nextAmount) !== inCents(lockedAmount);
+
+            // `Expense_taxDeductibleBase_check`, MIRRORED IN CODE.
+            //
+            // Stated exactly as the constraint is — sign against the AMOUNT,
+            // magnitude against the pre-tax ceiling — rather than as the
+            // unsigned `base > ceiling` the fast-fail above uses, which cannot
+            // see every shape Postgres refuses. Reaching it means something
+            // moved under the request, and it is answered as a 400 naming the
+            // remedy instead of as the 500 a CHECK violation surfaces as.
+            const ceiling = Math.round((finalAmount - (lockedTax ?? 0)) * 100) / 100;
+            const baseFits =
+                lockedBase === null ||
+                lockedBase === 0 ||
+                (Number.isFinite(ceiling) &&
+                    Math.sign(lockedBase) === Math.sign(finalAmount) &&
+                    Math.abs(lockedBase) <= Math.abs(ceiling));
+            if (!baseFits) {
+                return { expense: null, phaseRejected: null, denied: "base" } as const;
+            }
+
+            // AND THE PLAUSIBILITY BOUND, WHICH THIS ROUTE NEVER RAN AT ALL.
+            //
+            // `taxAmount` is not editable here, but `amount` is — and the bound
+            // is a RATIO. Lowering a $207.74 receipt to $100 leaves its $16.55
+            // of tax at 16.6%, past the 12% band that `book.ts` and the tax
+            // PATCH both refuse; a receipt taken negative leaves a positive tax
+            // pointing the wrong way. Either way the edit walks the row into a
+            // classification NO writer of those columns would have accepted,
+            // and the excise report reads it as a certified figure.
+            //
+            // PUT cannot refuse it — changing a receipt's total is ordinary
+            // work, and the tax columns are not this route's to correct — so it
+            // takes BOOKING's remedy rather than the PATCH's: the row is
+            // flagged and a person is asked to look again.
+            const classified =
+                lockedTax !== null ||
+                lockedBase !== null ||
+                lockedTaxSource !== null ||
+                lockedBaseSource !== null;
+            const stillPlausible =
+                lockedTax === null || isPlausibleReceiptTax(lockedTax, finalAmount);
+            // ...AND THE ACTOR MATTERS AS MUCH AS THE ARITHMETIC.
+            //
+            // `timeClock` is all it takes to change a receipt's total;
+            // `financialReports` is what it takes to CERTIFY a tax
+            // classification, which is why the PATCH demands it for these very
+            // columns. A crew member who lowers the gross would otherwise leave
+            // a classification standing that they were never entitled to
+            // affirm — silently, and straight back into the excise report. So a
+            // gross change by anyone without that permission flags the row too,
+            // even when the resulting figures still sit inside the band. The
+            // flag costs a bookkeeper one glance; the alternative costs a
+            // filing.
+            const flagsReview =
+                classified &&
+                grossChanges &&
+                (!stillPlausible || !hasPermission(user, "financialReports"));
+
             const written = await tx.expense.updateMany({
-            where: { id, ...expenseStillOnProjectWhere(expense, lockedProjectId) },
+            where: {
+                id,
+                // COMPARE-AND-SET on the tax figures these verdicts rested on,
+                // pinned to what was read UNDER the lock. The lock orders the
+                // writers that take it; the predicate is what still protects
+                // against one that does not (a script, a migration, a path
+                // somebody forgets to wire).
+                //
+                // Normalised to null rather than passed through as undefined:
+                // Prisma reads an undefined filter as NO filter, so an
+                // un-normalised pin would silently drop itself on exactly the
+                // rows — the un-classified ones — where it looks harmless.
+                amount: current.amount,
+                taxAmount: current.taxAmount ?? null,
+                taxDeductibleBase: current.taxDeductibleBase ?? null,
+                taxSource: lockedTaxSource,
+                taxDeductibleBaseSource: lockedBaseSource,
+                needsTaxReview: Boolean(current.needsTaxReview),
+                ...expenseStillOnProjectWhere(expense, lockedProjectId),
+            },
             data: {
                 amount: nextAmount,
                 vendor: has("vendor") ? (body.vendor || null) : undefined,
@@ -369,6 +478,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                         costCodeConfidence: null,
                     }
                     : {}),
+                // Raised in the SAME statement as the gross that invalidated
+                // the classification. Two statements would leave a window in
+                // which the excise report sees the new amount under the old
+                // certification — which is the exact state the flag exists to
+                // keep out of a filing.
+                ...(flagsReview ? { needsTaxReview: true } : {}),
             },
             });
             if (written.count === 0) {
@@ -386,10 +501,19 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 { status: 400 },
             );
         }
+        if (legacyWrite.denied === "base") {
+            return NextResponse.json(
+                {
+                    error: "This amount would leave a deduction base above the pre-tax total. Reopen the expense and clear or lower the deduction base first.",
+                    code: "BASE_ABOVE_CEILING",
+                },
+                { status: 400 },
+            );
+        }
         if (legacyWrite.denied) {
             return NextResponse.json(
                 {
-                    error: "This expense moved to another job while you were editing it.",
+                    error: "This expense moved to another job, or its tax figures changed, while you were editing it. Reopen it and try again.",
                     code: "EXPENSE_REATTRIBUTED",
                 },
                 { status: 409 },
