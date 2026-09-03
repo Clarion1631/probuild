@@ -1456,11 +1456,6 @@ test.describe("round-10 finalize authorization and recovery", () => {
             maxRedirects: 0,
         });
         expect(res.status()).toBe(400);
-            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: Buffer.from('{"costCodeId": "e2e-mob-cc-demo"', "utf8"), // truncated: missing closing brace
-            maxRedirects: 0,
-        });
-        expect(res.status()).toBe(400);
         expect((await res.json()).reason).toBe("invalid-json");
 
         // Nothing was written: no late field applied and no state change.
