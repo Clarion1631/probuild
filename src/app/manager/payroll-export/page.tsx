@@ -26,7 +26,8 @@ import {
     payrollPeriodLength,
     validatePayrollRange,
 } from "@/lib/payroll-config";
-import { loadGustoExport } from "@/lib/gusto-export-db";
+import { isLockedSnapshotMissingError, loadGustoExport, type LoadedGustoExport } from "@/lib/gusto-export-db";
+import { jobCostingOnlyEmployees, summaryCsvEmployees, sumEmployeeTotals } from "@/lib/gusto-export-core";
 import PayrollLockControls from "./PayrollLockControls";
 
 interface Props {
@@ -85,7 +86,37 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const periodStart = startOfDateInTimeZone(startKey, timeZone);
     const periodEnd = startOfDateInTimeZone(endKeyExclusive, timeZone);
 
-    const result = await loadGustoExport(periodStart, periodEnd, { startKey, endKey: endKeyExclusive });
+    // THE SAME `timeZone` periodStart/periodEnd were derived from, 30 lines up.
+    // Passing it is what keeps the boundaries and the day/overtime
+    // classification in ONE zone: the loader used to resolve the zone again for
+    // itself, on a second connection at a second instant, so a zone change
+    // landing in between rendered a period whose query window was built in one
+    // zone and whose hours were classified in another.
+    let result: LoadedGustoExport;
+    try {
+        result = await loadGustoExport(periodStart, periodEnd, {
+            startKey,
+            endKey: endKeyExclusive,
+            timeZone,
+        });
+    } catch (error) {
+        // A locked period whose frozen CSVs are not all there. There is nothing
+        // safe to render: the numbers on this page are what a human approves,
+        // and showing live ones next to a lock badge invites approving a file
+        // that no longer exists. Refuse, and say how to fix it.
+        if (isLockedSnapshotMissingError(error)) {
+            return (
+                <div className="max-w-3xl mx-auto py-16 px-6 text-center space-y-3">
+                    <h1 className="text-xl font-bold text-hui-textMain">This locked period is missing its export</h1>
+                    <p className="text-sm text-hui-textMuted">{error.message}</p>
+                    <Link href="/manager/payroll-export" className="hui-btn hui-btn-primary text-sm">
+                        Back to the current period
+                    </Link>
+                </div>
+            );
+        }
+        throw error;
+    }
     // Overlap, not exact match: an ad-hoc range that merely overlaps a locked
     // period has no row of its own, and the exact lookup used to call it
     // unlocked while half of it was frozen.
@@ -106,14 +137,18 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const downloadHref = (format: "summary" | "detail") =>
         `/api/time-entries/export/gusto?periodStart=${startKey}&periodEnd=${endKeyExclusive}&format=${format}`;
 
-    const totals = result.employees.reduce(
-        (acc, employee) => ({
-            regular: acc.regular + employee.regularHours,
-            overtime: acc.overtime + employee.overtimeHours,
-            total: acc.total + employee.totalHours,
-        }),
-        { regular: 0, overtime: 0, total: 0 }
-    );
+    // THE NUMBERS BEING APPROVED. Totalled over the rows the summary CSV
+    // actually contains — through the same selector toSummaryCsv uses — because
+    // that CSV is the file being locked. Summing every row instead (salaried
+    // staff included, whose hours are carried for job costing and deliberately
+    // left out of the file) put bigger hours and a bigger head count on screen
+    // than the file underneath them.
+    const payrollEmployees = summaryCsvEmployees(result.employees);
+    const totals = sumEmployeeTotals(payrollEmployees);
+    // The complement, shown SEPARATELY and labelled — the hours are real and a
+    // reviewer wants to see them, they just are not on Gusto's file.
+    const jobCostingOnly = jobCostingOnlyEmployees(result.employees);
+    const jobCostingTotals = sumEmployeeTotals(jobCostingOnly);
 
     return (
         <div className="max-w-7xl mx-auto py-8 px-6 space-y-6">
@@ -260,6 +295,10 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                 </div>
             )}
 
+            <div className="space-y-2">
+            <p className="text-xs font-medium text-hui-textMuted">
+                On the summary CSV — the file Gusto imports. Salaried staff are not on it.
+            </p>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="hui-card p-6 border-l-[3px] border-l-[#2563eb]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">Regular hours</div>
@@ -275,8 +314,18 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                 </div>
                 <div className="hui-card p-6 border-l-[3px] border-l-[#ec4899]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">People</div>
-                    <div className="text-3xl font-bold text-hui-textMain tabular-nums">{result.employees.length}</div>
+                    <div className="text-3xl font-bold text-hui-textMain tabular-nums">{totals.people}</div>
                 </div>
+            </div>
+            {jobCostingOnly.length > 0 && (
+                <p className="text-xs text-hui-textMuted">
+                    Plus {jobCostingTotals.people} salaried{" "}
+                    {jobCostingTotals.people === 1 ? "person" : "people"} with{" "}
+                    <span className="tabular-nums font-medium">{jobCostingTotals.total.toFixed(2)}</span> hours in the
+                    table below. Those hours are in the DETAIL CSV for job costing and are deliberately absent from the
+                    summary CSV — Gusto pays them a salary, so exporting their hours would pay them twice.
+                </p>
+            )}
             </div>
 
             <div className="hui-card overflow-hidden">

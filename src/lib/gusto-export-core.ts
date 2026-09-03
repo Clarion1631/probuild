@@ -610,11 +610,46 @@ function hours(value: number | null | undefined): string {
     return (value ?? 0).toFixed(2);
 }
 
+/**
+ * THE rows the summary CSV contains: everybody who is NOT salaried.
+ *
+ * One selector, exported, because the review page has to answer the same
+ * question and got a different answer. Its four cards summed EVERY row in
+ * `employees` — salaried staff included, whose hours are carried for job
+ * costing and deliberately left out of the file — so the hours and the head
+ * count a human approved could be larger than the file they then locked. The
+ * page now totals through this function, so "what is on screen" and "what is in
+ * the CSV" cannot drift: they are the same predicate, in one place.
+ */
+export function summaryCsvEmployees(employees: EmployeeTotals[]): EmployeeTotals[] {
+    return employees.filter((employee) => !employee.salaried);
+}
+
+/** The complement — hours that exist for job costing but never reach Gusto's file. */
+export function jobCostingOnlyEmployees(employees: EmployeeTotals[]): EmployeeTotals[] {
+    return employees.filter((employee) => employee.salaried);
+}
+
+export type ExportTotals = { regular: number; overtime: number; total: number; people: number };
+
+/** Sum a set of employee rows. Pure, so the page and a test can total the same way. */
+export function sumEmployeeTotals(employees: EmployeeTotals[]): ExportTotals {
+    return employees.reduce<ExportTotals>(
+        (acc, employee) => ({
+            regular: acc.regular + employee.regularHours,
+            overtime: acc.overtime + employee.overtimeHours,
+            total: acc.total + employee.totalHours,
+            people: acc.people + 1,
+        }),
+        { regular: 0, overtime: 0, total: 0, people: 0 }
+    );
+}
+
 /** One row per NON-SALARIED employee. PTO/Sick are 0.00 — ProBuild does not track them; they are entered directly in Gusto. */
 export function toSummaryCsv(employees: EmployeeTotals[]): string {
     const rows: Array<Array<string | number | null | undefined>> = [[...GUSTO_SUMMARY_CSV_HEADER]];
-    for (const employee of employees) {
-        if (employee.salaried) continue;
+    // THE SAME selector the review page totals through — see summaryCsvEmployees.
+    for (const employee of summaryCsvEmployees(employees)) {
         rows.push([
             employee.user.name ?? "",
             employee.user.email,

@@ -128,6 +128,7 @@ test("the export's FOR SHARE blocks a concurrent company time-zone change", { sk
                     client: tx,
                     startKey: "2026-08-17",
                     endKey: "2026-08-31",
+                    timeZone: TZ,
                 });
                 sawZone = result.timeZone;
                 await held;
@@ -182,6 +183,7 @@ test("the export's FOR SHARE blocks a concurrent Gusto mapping save", { skip }, 
                     client: tx,
                     startKey: "2026-08-17",
                     endKey: "2026-08-31",
+                    timeZone: TZ,
                 });
                 // The mappings this export hashed, read back through the same
                 // transaction so it is the value the lock is holding.
@@ -253,6 +255,7 @@ test("the export fences a FIRST-EVER mapping save, with NO Integration row to lo
                     client: tx,
                     startKey: "2026-08-17",
                     endKey: "2026-08-31",
+                    timeZone: TZ,
                 });
                 assert.equal(typeof result.exportHash, "string");
                 sawMappings = (await getGustoSettings(tx)).employeeMappings;
@@ -318,6 +321,7 @@ test("the export takes the SAME key the saver takes — not merely 'an' advisory
                     client: tx,
                     startKey: "2026-08-17",
                     endKey: "2026-08-31",
+                    timeZone: TZ,
                 }),
             { timeout: 30_000 }
         );

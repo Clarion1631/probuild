@@ -4,7 +4,7 @@ import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions"
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 import { validatePayrollRange } from "@/lib/payroll-config";
-import { loadGustoExport, type LoadedGustoExport } from "@/lib/gusto-export-db";
+import { isLockedSnapshotMissingError, loadGustoExport, type LoadedGustoExport } from "@/lib/gusto-export-db";
 
 /**
  * GET /api/time-entries/export/gusto?periodStart=YYYY-MM-DD&periodEnd=YYYY-MM-DD&format=summary|detail
@@ -38,7 +38,21 @@ export interface GustoExportDependencies {
     /** Resolved staff viewer, or null when there is no session. */
     authenticate(): Promise<GustoExportViewer | null>;
     resolveTimeZone(): Promise<string>;
-    load(periodStart: Date, periodEnd: Date, keys: { startKey: string; endKey: string }): Promise<LoadedGustoExport>;
+    /**
+     * `timeZone` is part of the payload, not an afterthought: it is the ONE
+     * resolution that both the period boundaries above and the day/overtime
+     * classification inside the loader are derived from. The handler used to
+     * resolve the zone, build the boundaries from it, and then call the loader
+     * without it — so the loader resolved the zone a second time, on a different
+     * connection at a different instant, and a zone change landing in between
+     * produced a CSV whose boundaries were queried in one zone and whose days
+     * were classified in another.
+     */
+    load(
+        periodStart: Date,
+        periodEnd: Date,
+        keys: { startKey: string; endKey: string; timeZone: string }
+    ): Promise<LoadedGustoExport>;
 }
 
 export function createGustoExportHandler(dependencies: GustoExportDependencies) {
@@ -66,7 +80,29 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
             const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
 
-            const result = await dependencies.load(periodStart, periodEnd, { startKey: range.startKey, endKey: range.endKey });
+            let result: LoadedGustoExport;
+            try {
+                // The SAME `timeZone` periodStart/periodEnd were just derived
+                // from — one resolution for the whole request.
+                result = await dependencies.load(periodStart, periodEnd, {
+                    startKey: range.startKey,
+                    endKey: range.endKey,
+                    timeZone,
+                });
+            } catch (error) {
+                // A locked period with an incomplete frozen export. There is no
+                // correct file to return: the snapshot is gone and a recomputed
+                // one is not what payroll was paid, so this REFUSES rather than
+                // falling through to the live CSV below (which is exactly what
+                // it used to do). 409, with the recovery instruction.
+                if (isLockedSnapshotMissingError(error)) {
+                    return NextResponse.json(
+                        { error: error.message, code: "LOCKED_SNAPSHOT_MISSING" },
+                        { status: 409 }
+                    );
+                }
+                throw error;
+            }
 
             // A LOCKED period is served from its snapshot, verbatim. No
             // readiness check and no recompute: this is the file that was sent
@@ -144,6 +180,8 @@ const handler = createGustoExportHandler({
         return { role: user.role, canReadFinancialReports: hasPermission(user, "financialReports") };
     },
     resolveTimeZone: resolveCompanyTimeZone,
+    // `keys` carries startKey, endKey AND the resolved timeZone, so the loader
+    // is computed in the same zone the boundaries were built in.
     load: (periodStart, periodEnd, keys) => loadGustoExport(periodStart, periodEnd, keys),
 });
 

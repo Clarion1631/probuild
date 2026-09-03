@@ -310,3 +310,30 @@ ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"
 -- takes over as the value the rate-import signature is keyed on.
 -- ---------------------------------------------------------------------------
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0;
+
+-- ---------------------------------------------------------------------------
+-- Round-6 gate, finding 4: a LOCKED period must carry its whole frozen export.
+--
+-- The export served a locked period from its snapshot only when BOTH csv
+-- columns were non-null. A row with lockedAt set and a null snapshot therefore
+-- produced "no snapshot" while STILL counting as the exact locked period, so
+-- the overlap refusal did not fire either and the endpoint fell through to a
+-- freshly recomputed, live CSV. A locked period is exactly where live data is
+-- the wrong answer: the file was built from mutable inputs and recomputing it
+-- does not reproduce what payroll was paid.
+--
+-- The loader now refuses such a row, and this makes the row unrepresentable.
+-- exportHash is included because it is what the review page compares a fresh
+-- download against — a snapshot with no hash cannot answer "is this the file
+-- that went to payroll".
+--
+-- Unlock clears lockedAt AND both snapshots in one UPDATE, and lock writes all
+-- of them together, so both live writers already satisfy this.
+-- ---------------------------------------------------------------------------
+ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_locked_snapshot_complete";
+ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete"
+    CHECK (
+        "lockedAt" IS NULL
+        OR ("summaryCsvSnapshot" IS NOT NULL AND "detailCsvSnapshot" IS NOT NULL AND "exportHash" IS NOT NULL)
+    ) NOT VALID;
+ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_locked_snapshot_complete";

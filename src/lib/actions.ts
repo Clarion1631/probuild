@@ -15687,13 +15687,31 @@ export async function lockPayrollPeriod(
 
     // Pass 1, OUTSIDE the transaction: readiness. Cheap, and it gives the human
     // a useful message instead of a rolled-back transaction.
-    const precheck = await loadGustoExport(periodStart, periodEnd, {
-        startKey: range.startKey,
-        endKey: range.endKey,
-        // The zone periodStart/periodEnd were derived from, asserted rather than
-        // re-resolved — see the `timeZone` option on loadGustoExport.
-        timeZone,
-    });
+    //
+    // The loader THROWS on a locked period whose frozen CSVs are incomplete
+    // (LockedSnapshotMissingError, round 6). This action returns structured
+    // refusals rather than throwing, so that one is turned into a message here —
+    // otherwise the one period that needs an admin to unlock and re-lock it
+    // would answer with a generic action failure and no instruction.
+    let precheck: Awaited<ReturnType<typeof loadGustoExport>>;
+    try {
+        precheck = await loadGustoExport(periodStart, periodEnd, {
+            startKey: range.startKey,
+            endKey: range.endKey,
+            // THE zone periodStart/periodEnd were derived from. Required, and it
+            // is what the export is computed in — see the `timeZone` option on
+            // loadGustoExport. Outside a transaction there is nothing held still
+            // to check it against; the confirm pass below runs inside one and
+            // does check.
+            timeZone,
+        });
+    } catch (error: any) {
+        const { isLockedSnapshotMissingError } = await import("./gusto-export-db");
+        if (isLockedSnapshotMissingError(error)) {
+            return { success: false as const, error: error.message };
+        }
+        throw error;
+    }
     // An already-locked period is NOT re-lockable. Re-running the lock would
     // overwrite lockedAt, the locker, the hash and both snapshots — rewriting
     // the payroll audit trail after mutable names, Gusto mappings or cost codes

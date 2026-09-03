@@ -194,6 +194,7 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
                     client: tx,
                     startKey: START_KEY,
                     endKey: END_KEY,
+                    timeZone: TZ,
                 });
                 const row = result.employees.find((employee) => employee.user.id === user.id);
                 assert.ok(row, "the seeded hourly member is on this period's roster");
@@ -239,7 +240,7 @@ test("the export's FOR SHARE blocks a concurrent pay-type change, and hashes the
         // person on the roster under BOTH pay types (see seed): without it the
         // row is simply absent here and `salaried` reads undefined, which would
         // prove nothing about the lock.
-        const reread = await loadGustoExport(PERIOD_START, PERIOD_END, { startKey: START_KEY, endKey: END_KEY });
+        const reread = await loadGustoExport(PERIOD_START, PERIOD_END, { startKey: START_KEY, endKey: END_KEY, timeZone: TZ });
         const rereadRow = reread.employees.find((employee) => employee.user.id === user.id);
         assert.ok(rereadRow, "the member still has hours in this period, so they are still on the roster");
         assert.equal(rereadRow.salaried, true, "and the fresh read sees the pay type that committed after the export");

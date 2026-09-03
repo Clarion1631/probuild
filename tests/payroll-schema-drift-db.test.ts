@@ -30,6 +30,21 @@ function reported(rows: Array<{ object: { name?: string; table?: string }; reaso
     return rows.find((row) => (row.object.name ?? row.object.table) === name);
 }
 
+/** The round-6 locked-snapshot CHECK, in the exact shape the migration and the apply script write. */
+const LOCKED_SNAPSHOT_CHECK = `CHECK (
+    "lockedAt" IS NULL
+    OR ("summaryCsvSnapshot" IS NOT NULL AND "detailCsvSnapshot" IS NOT NULL AND "exportHash" IS NOT NULL)
+)`;
+
+/** Is that constraint actually there right now? Used as a PRECONDITION, so a test cannot silently no-op. */
+async function hasLockedSnapshotCheck(db: PrismaClient): Promise<boolean> {
+    const rows = (await db.$queryRawUnsafe(
+        `SELECT 1 FROM pg_constraint WHERE conname = 'PayrollPeriod_locked_snapshot_complete'
+           AND conrelid = '"PayrollPeriod"'::regclass`
+    )) as unknown[];
+    return rows.length > 0;
+}
+
 test("a clean database reports NO drift — the control", { skip }, async () => {
     const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     try {
@@ -212,6 +227,17 @@ test("a dropped CREATE TABLE column (exportHash) is reported — it used to be i
         assert.equal(row!.reason, "missing");
     } finally {
         await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" ADD COLUMN IF NOT EXISTS "exportHash" TEXT`).catch(() => {});
+        // DROP COLUMN takes every constraint OVER that column with it, silently.
+        // PayrollPeriod_locked_snapshot_complete names exportHash, so restoring
+        // the column alone left the constraint gone for every test after this
+        // one — and the "an ABSENT locked-snapshot CHECK" case below then found
+        // nothing to drop. A teardown has to undo the cascade, not just the
+        // statement it typed.
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete" ${LOCKED_SNAPSHOT_CHECK}`
+            )
+            .catch(() => {});
         await db.$disconnect();
     }
 });
@@ -351,6 +377,68 @@ test("an ABSENT User.payrollRevision is reported as drift — this is what prod 
     } finally {
         await db
             .$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0`)
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+// ── the locked-snapshot CHECK (round 6, finding 4) ─────────────────────────
+// Its absence is what let a locked period with a null snapshot exist at all,
+// and the export then served live data for it. The dry run has to say so.
+
+test("an ABSENT locked-snapshot CHECK is reported, and the dry run exits nonzero", { skip }, async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        // PRECONDITION, asserted rather than assumed: an earlier test that
+        // dropped a column this constraint names would have taken it with it,
+        // and then "dropping" it here would be a no-op that still reported
+        // drift — a green test proving nothing.
+        assert.equal(await hasLockedSnapshotCheck(db), true, "the constraint must exist before this test drops it");
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_locked_snapshot_complete"`
+        );
+        const rows = await drift(db);
+        const row = reported(rows, "PayrollPeriod_locked_snapshot_complete");
+        assert.ok(row, "the constraint that makes a snapshot-less lock unrepresentable must not vanish quietly");
+        assert.equal(row!.reason, "missing");
+        assert.equal(driftVerdict(rows).exitCode, 1);
+    } finally {
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete" ${LOCKED_SNAPSHOT_CHECK}`
+            )
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("the same CHECK WEAKENED to cover only one column is reported", { skip }, async () => {
+    // Same name, still validated, still a CHECK — and it would now accept a
+    // locked period with no detail CSV and no hash. Presence is not correctness.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_locked_snapshot_complete"`
+        );
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete"
+             CHECK ("lockedAt" IS NULL OR "summaryCsvSnapshot" IS NOT NULL)`
+        );
+        const row = reported(await drift(db), "PayrollPeriod_locked_snapshot_complete");
+        assert.ok(row, "a weakened CHECK must be reported");
+        assert.match(row!.reason, /definition lost/);
+        assert.match(row!.reason, /detailCsvSnapshot|exportHash/, "and it names what went missing");
+    } finally {
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_locked_snapshot_complete"`
+            )
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete" ${LOCKED_SNAPSHOT_CHECK}`
+            )
             .catch(() => {});
         await db.$disconnect();
     }

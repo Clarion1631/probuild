@@ -20,7 +20,10 @@ import path from "node:path";
 import {
     blockingEntries,
     buildGustoExport,
+    jobCostingOnlyEmployees,
     planDeferredSettlements,
+    summaryCsvEmployees,
+    sumEmployeeTotals,
     toDetailCsv,
     toSummaryCsv,
     type ExportEntry,
@@ -853,4 +856,130 @@ test("an OPEN context punch of a current worker with in-period hours still block
     ];
     const blocking = blockingEntries(entries, [alice], ENVELOPE_START, PERIOD_END, PERIOD_START, PERIOD_END);
     assert.deepEqual(blocking.map((row) => [row.id, row.reason]), [["alice-open-context", "open"]]);
+});
+
+// ── The review page totals the SAME set the summary CSV contains (round 6, finding 3) ──
+//
+// /manager/payroll-export summed every row in `result.employees` for its four
+// cards — salaried staff included, whose hours are carried for job costing and
+// deliberately left out of the file (toSummaryCsv skips them). So the hours and
+// the head count a human read, approved and then FROZE could be larger than the
+// file underneath them. There is now one selector, `summaryCsvEmployees`, used
+// by both, and these tests hold the two to the same number.
+
+/** Parse a summary CSV back into numbers, so the comparison is against the FILE, not against another call to the same helper. */
+function parseSummaryCsv(csv: string): { rows: number; regular: number; overtime: number; total: number } {
+    const lines = csv.trim().split("\n");
+    const body = lines.slice(1); // drop the header
+    let regular = 0;
+    let overtime = 0;
+    for (const line of body) {
+        // Every field is quoted by csvField, and none of the numeric ones can
+        // contain a comma, so a plain split is exact for these columns.
+        const cells = line.split(",").map((cell) => cell.replace(/^"|"$/g, ""));
+        regular += Number(cells[3]);
+        overtime += Number(cells[4]);
+    }
+    return { rows: body.length, regular, overtime, total: regular + overtime };
+}
+
+test("the review page's card totals equal the summary CSV's totals, salaried staff excluded", () => {
+    // A mixed roster: two hourly people with real hours (one of them into
+    // overtime, so regular and overtime are both non-trivial) and one salaried
+    // person who also worked. The salaried hours are the whole point — they are
+    // in `employees`, in the table and in the DETAIL csv, and NOT in the file.
+    const entries = [
+        // Alice: 45 hours in one Mon-Sun week -> 40 regular + 5 overtime.
+        ...[0, 1, 2, 3, 4].map((day) =>
+            entry({
+                userId: alice.id,
+                startTime: `2026-08-${17 + day}T15:00:00Z`,
+                durationHours: 9,
+            })
+        ),
+        // Dana: a flat 8-hour day.
+        entry({ userId: dana.id, startTime: "2026-08-18T15:00:00Z", durationHours: 8 }),
+        // CJ is SALARIED and worked 6 hours. Job costing wants them; Gusto
+        // must not see them, because Gusto already pays CJ a salary.
+        entry({ userId: cj.id, startTime: "2026-08-19T15:00:00Z", durationHours: 6 }),
+    ];
+
+    const result = buildGustoExport({
+        entries,
+        users: [alice, dana, cj],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.payType === "SALARY",
+    });
+
+    const fromCsv = parseSummaryCsv(toSummaryCsv(result.employees));
+    // EXACTLY what page.tsx computes for its four cards.
+    const cards = sumEmployeeTotals(summaryCsvEmployees(result.employees));
+
+    assert.equal(cards.people, fromCsv.rows, "the People card counts the rows in the file");
+    assert.equal(cards.regular.toFixed(2), fromCsv.regular.toFixed(2), "Regular hours card");
+    assert.equal(cards.overtime.toFixed(2), fromCsv.overtime.toFixed(2), "Overtime hours card");
+    assert.equal(cards.total.toFixed(2), fromCsv.total.toFixed(2), "Total hours card");
+
+    // THE CONTROL. Without it the assertions above would pass just as well on a
+    // roster where the two sets happen to be identical. The naive total — the
+    // one the page used to show — is a DIFFERENT number, by exactly CJ's hours.
+    const naive = sumEmployeeTotals(result.employees);
+    assert.equal(naive.people, cards.people + 1, "the salaried person really is in `employees`");
+    assert.equal(
+        Number((naive.total - cards.total).toFixed(2)),
+        6,
+        "and their 6 hours are exactly what the old card total added on top of the file"
+    );
+
+    // The complement is the other half of what the page shows, separately labelled.
+    const jobCosting = sumEmployeeTotals(jobCostingOnlyEmployees(result.employees));
+    assert.equal(jobCosting.people, 1);
+    assert.equal(jobCosting.total.toFixed(2), "6.00");
+    assert.equal(
+        jobCosting.people + cards.people,
+        result.employees.length,
+        "the two sets partition the roster — nobody is shown twice and nobody vanishes"
+    );
+});
+
+test("a salaried person with hours never reaches the summary CSV at all", () => {
+    // The invariant the selector encodes, stated directly against the bytes.
+    const result = buildGustoExport({
+        entries: [entry({ userId: cj.id, startTime: "2026-08-19T15:00:00Z", durationHours: 6 })],
+        users: [cj],
+        periodStart: PERIOD_START,
+        periodEnd: PERIOD_END,
+        timeZone: TZ,
+        isSalaried: (user) => user.payType === "SALARY",
+    });
+    const csv = toSummaryCsv(result.employees);
+    assert.equal(parseSummaryCsv(csv).rows, 0, "header only");
+    assert.ok(!csv.includes(cj.email));
+    // And the page would show 0 on every card for this period, matching.
+    const cards = sumEmployeeTotals(summaryCsvEmployees(result.employees));
+    assert.deepEqual(cards, { regular: 0, overtime: 0, total: 0, people: 0 });
+});
+
+test("the review page totals THROUGH the shared selector — not its own copy of the rule", () => {
+    // The behavioural tests above compare two functions. This is what stops the
+    // page from growing a second, divergent implementation of "who is on the
+    // file": there is one selector, and the page has to call it.
+    const page = readFileSync(
+        path.join(__dirname, "..", "src", "app", "manager", "payroll-export", "page.tsx"),
+        "utf8"
+    );
+    assert.match(page, /summaryCsvEmployees\(result\.employees\)/, "the cards total the CSV's set");
+    assert.match(page, /const totals = sumEmployeeTotals\(payrollEmployees\)/);
+    // The old shape: a hand-rolled reduce over EVERY employee, and a People card
+    // reading result.employees.length.
+    assert.ok(
+        !/result\.employees\.reduce\(/.test(page),
+        "a hand-rolled total over every employee is the bug this replaced"
+    );
+    assert.ok(
+        !/tabular-nums">\{result\.employees\.length\}/.test(page),
+        "the People card must not count the whole roster"
+    );
 });

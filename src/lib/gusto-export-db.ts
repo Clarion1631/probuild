@@ -218,6 +218,68 @@ const PAYROLL_PERIOD_SELECT = {
     lockedBy: { select: { name: true, email: true } },
 } as const;
 
+/**
+ * A period says it is LOCKED but its frozen CSVs are not all there.
+ *
+ * This is the one state the export must never paper over. `snapshot` used to be
+ * built only when BOTH csv columns were non-null, and a row with `lockedAt` set
+ * and a null snapshot simply produced `snapshot: null` — which still counted as
+ * "the exact period is locked", so the overlap refusal did not fire either, and
+ * the endpoint fell through to serving a FRESHLY RECOMPUTED csv with
+ * `X-Export-Source: live`. A locked period is precisely the case where live
+ * data is the wrong answer: the file was built from mutable inputs (a name, a
+ * pay type, a Gusto id, a punch's project and cost code) and recomputing it
+ * today does not reproduce what payroll was actually paid. Failing open there
+ * hands a bookkeeper a plausible file that is not the one that was sent.
+ *
+ * So it THROWS, from the loader, rather than returning a flag a caller can
+ * forget to read: an unhandled throw is a 500, which is wrong but safe, whereas
+ * an unread flag is a wrong CSV that looks right. The two callers that can
+ * reach it (the download endpoint and the review page) catch it and show the
+ * recovery instruction below.
+ *
+ * Since round 6 the database also refuses to hold such a row
+ * (PayrollPeriod_locked_snapshot_complete), so this is defence in depth for
+ * rows written before that constraint existed, or by anything that bypasses it.
+ */
+export class LockedSnapshotMissingError extends Error {
+    readonly periodStartKey: string | null;
+    readonly periodEndKey: string | null;
+    constructor(periodStartKey: string | null, periodEndKey: string | null) {
+        super(
+            `Pay period ${periodStartKey ?? "?"} to ${periodEndKey ?? "?"} is locked, but the frozen CSVs that were ` +
+                "sent to payroll are missing from it. Nothing can be exported for this period: a recomputed file " +
+                "would not be the one that was paid. An admin has to unlock the period and lock it again to rebuild " +
+                "the snapshot."
+        );
+        this.name = "LockedSnapshotMissingError";
+        this.periodStartKey = periodStartKey;
+        this.periodEndKey = periodEndKey;
+    }
+}
+
+/** By NAME, not instanceof — the same module-identity reason every other guard in this repo uses a name check. */
+export function isLockedSnapshotMissingError(error: unknown): error is LockedSnapshotMissingError {
+    return error instanceof Error && error.name === "LockedSnapshotMissingError";
+}
+
+/**
+ * Is this locked row complete enough to serve? Exported so the callers and the
+ * tests share ONE definition of "complete" with the loader.
+ *
+ * `exportHash` counts. It is what the review page compares a fresh download
+ * against, and a snapshot whose hash is missing cannot answer "is this the file
+ * that went to payroll" at all.
+ */
+export function lockedSnapshotIsComplete(
+    period: Pick<PayrollPeriodRow, "lockedAt" | "summaryCsvSnapshot" | "detailCsvSnapshot" | "exportHash"> | null | undefined
+): boolean {
+    if (!period?.lockedAt) return true;
+    return (
+        period.summaryCsvSnapshot != null && period.detailCsvSnapshot != null && period.exportHash != null
+    );
+}
+
 /** Domain separator between the two documents so csv content can never be shuffled across the boundary undetected. */
 export function hashExport(summaryCsv: string, detailCsv: string): string {
     return createHash("sha256")
@@ -290,17 +352,37 @@ export async function loadGustoExport(
         /** Read through a transaction client — used by lockPayrollPeriod to recompute inside its own transaction. */
         client?: ExportDbClient;
         /**
-         * The zone the CALLER already resolved and is acting on — the one
-         * lockPayrollPeriod derived periodStart/periodEnd from and is about to
-         * persist on the period row.
+         * REQUIRED. The zone the CALLER already resolved, and the one it derived
+         * `periodStart` / `periodEnd` from.
          *
-         * Not used as the answer: it is an ASSERTION. The zone is resolved once
-         * here, through `client`, under the FOR SHARE taken above, and a caller
-         * whose value disagrees is told so instead of quietly getting an export
-         * computed in a different zone from the one being recorded.
+         * IT IS THE ANSWER, not a hint. Every caller resolves the company zone
+         * to build the half-open boundaries it passes in; this loader then uses
+         * the SAME value to decide which company-local day each punch falls in,
+         * which workweek that day belongs to, and therefore how much of the
+         * period is overtime. One resolution drives both halves.
+         *
+         * It used to be optional and merely an assertion, with the loader
+         * re-resolving the zone for itself. Outside a transaction that second
+         * read is on a different connection at a different instant, so a zone
+         * change landing between the caller's resolve and the loader's produced
+         * an export whose BOUNDARIES were queried in zone A and whose days and
+         * overtime were classified in zone B — a file that never described any
+         * single configuration. Both live callers (the download endpoint and the
+         * review page) were in exactly that shape. Required, rather than
+         * defaulted, so no caller can drop it again: the type is the guard.
+         *
+         * INSIDE a transaction the loader ALSO re-resolves through `client`, under
+         * the FOR SHARE taken above, and refuses if the two disagree. That check
+         * is only meaningful there — it is what stops lockPayrollPeriod freezing a
+         * period whose stored `timeZone` does not describe its own CSVs — and it
+         * cannot fire spuriously, because the row is held for the whole
+         * transaction. Outside one there is nothing holding still to check
+         * against, and refusing a read-only download over a benign race would be
+         * gratuitous when using the caller's zone throughout is a correct,
+         * self-consistent answer.
          */
-        timeZone?: string;
-    } = {}
+        timeZone: string;
+    }
 ): Promise<LoadedGustoExport> {
     const client = options.client ?? prisma;
 
@@ -310,16 +392,26 @@ export async function loadGustoExport(
         await lockExportInputRows(client as Prisma.TransactionClient);
     }
 
-    // Resolved ONCE, through `client`, and everything below is derived from it.
-    // A global-client read here would be a second connection outside the
-    // caller's transaction — free to see a zone the FOR SHARE above is holding
-    // still, and to hand back an envelope that disagrees with the entries.
-    const timeZone = await resolveCompanyTimeZone(client);
-    if (options.timeZone !== undefined && options.timeZone !== timeZone) {
-        throw new Error(
-            `The company time zone changed (${options.timeZone} to ${timeZone}) while this pay period was being read. ` +
-                "Nothing was changed - refresh and try again."
-        );
+    // THE zone, from the caller, used for everything below: the envelope, the
+    // day keys, the workweek split, the overtime threshold. The caller already
+    // derived periodStart/periodEnd from this exact value, so the boundaries and
+    // the classification cannot come from two different resolutions.
+    const timeZone = options.timeZone;
+
+    // Inside a transaction, CHECK it against the row this transaction is holding
+    // FOR SHARE. Resolved through `client` — a global-client read would be a
+    // second connection outside the transaction, free to see a zone the lock
+    // above is holding still. Outside a transaction there is nothing being held,
+    // so there is nothing to check against and the caller's value simply stands
+    // (see the `timeZone` option).
+    if (isTransactionClient(client)) {
+        const locked = await resolveCompanyTimeZone(client);
+        if (locked !== timeZone) {
+            throw new Error(
+                `The company time zone changed (${timeZone} to ${locked}) while this pay period was being read. ` +
+                    "Nothing was changed - refresh and try again."
+            );
+        }
     }
 
     // The Gusto employee mappings, read in the SAME transaction and under the
@@ -344,6 +436,12 @@ export async function loadGustoExport(
     // two statements on a single connection that has a statement in flight, and
     // the saved round trip is worth nothing next to the entry query below.
     const period = await findPayrollPeriod(startKey, endKey, client);
+    // FAIL CLOSED, here, before a single hour is read. A locked row missing any
+    // part of its frozen export has no correct answer to give — see
+    // LockedSnapshotMissingError.
+    if (!lockedSnapshotIsComplete(period)) {
+        throw new LockedSnapshotMissingError(period?.periodStartKey ?? startKey, period?.periodEndKey ?? endKey);
+    }
     // Ownership: the pay-period range, on its stable day keys (see above).
     const overlappingLocks = await findOverlappingLockedPeriods(startKey, endKey, client);
 
@@ -479,6 +577,11 @@ export async function loadGustoExport(
     const summaryCsv = toSummaryCsv(built.employees);
     const detailCsv = toDetailCsv(built.detail);
 
+    // A locked row that reached this line HAS all three parts — the guard above
+    // threw otherwise. The null tests that used to be here read as a tolerance
+    // for the incomplete case, and that reading is exactly what fell through to
+    // live data; they are now narrowing for the type checker, over a fact
+    // already established.
     const snapshot =
         period?.lockedAt && period.summaryCsvSnapshot != null && period.detailCsvSnapshot != null
             ? {

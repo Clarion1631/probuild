@@ -70,16 +70,57 @@ test("gusto-export-db reaches the global prisma client NOWHERE — every read is
     );
 });
 
-test("the time zone and the Gusto mappings are read through the same client, once", () => {
-    assert.match(DB_SOURCE, /const timeZone = await resolveCompanyTimeZone\(client\);/);
-    assert.match(DB_SOURCE, /const gustoSettings = await getGustoSettings\(client\);/);
-    // Resolved ONCE and everything derived from it — a second resolve is a
-    // second chance to disagree with the first.
+test("the zone comes from the CALLER, and is only re-resolved as an in-transaction check", () => {
+    // Round-6 finding 2. The loader used to resolve the company zone for itself
+    // and treat the caller's value as an optional assertion. Outside a
+    // transaction that is a SECOND read, on a second connection, at a second
+    // instant — so a zone change landing between the caller's resolve (which
+    // built periodStart/periodEnd) and the loader's own produced an export whose
+    // query window was built in one zone and whose days, workweeks and overtime
+    // were classified in another. Both live callers were in that shape.
+    assert.match(DB_SOURCE, /const timeZone = options\.timeZone;/, "the caller's zone IS the answer");
+    // Exactly one resolve remains, and it is the in-transaction CHECK — where
+    // the CompanySettings row is being held FOR SHARE, so the comparison is
+    // against something that cannot move, and a disagreement is a real one.
     assert.equal(
         (DB_SOURCE.match(/resolveCompanyTimeZone\(/g) || []).length,
         1,
-        "the zone must be resolved exactly once inside loadGustoExport"
+        "the zone must not be resolved a second time on the live path"
     );
+    const resolveAt = DB_SOURCE.indexOf("await resolveCompanyTimeZone(client)");
+    assert.ok(resolveAt > 0);
+    const branchAt = DB_SOURCE.lastIndexOf("if (isTransactionClient(client))", resolveAt);
+    assert.ok(branchAt > 0 && resolveAt - branchAt < 500, "the resolve sits inside the transaction-only branch");
+    // And the mappings still go out on the caller's client.
+    assert.match(DB_SOURCE, /const gustoSettings = await getGustoSettings\(client\);/);
+});
+
+test("outside a transaction the loader does NOT re-resolve the zone — it uses the caller's", async () => {
+    // The pre-fix mix, made visible: the fake client answers a DIFFERENT zone
+    // from the one the caller resolved and built its boundaries from. Under the
+    // old code that second answer won and the export classified days in it.
+    // Now the caller's value is used throughout and the client is never asked.
+    const recorded: Recorded = [];
+    const base = { ...fakeTx(recorded, { timeZone: "Pacific/Honolulu" }), $transaction: async () => undefined };
+    const result = await load(base, { timeZone: TZ });
+    assert.equal(result.timeZone, TZ, "the export is computed in the zone the caller resolved");
+    assert.ok(
+        !recorded.includes("companySettings.findUnique"),
+        "and the zone is not read a second time at all — one resolution, one zone"
+    );
+});
+
+test("INSIDE a transaction a moved zone still REFUSES — the check is where it can hold", async () => {
+    // The lock path's guarantee runs the other way: lockPayrollPeriod writes the
+    // zone onto the period row, so a disagreement between the caller's value and
+    // the row this transaction is holding FOR SHARE has to roll the lock back
+    // rather than freeze a period whose stored zone does not describe its CSVs.
+    const recorded: Recorded = [];
+    await assert.rejects(
+        () => load(fakeTx(recorded, { timeZone: "Pacific/Honolulu" }), { timeZone: TZ }),
+        /company time zone changed \(America\/Los_Angeles to Pacific\/Honolulu\)/
+    );
+    assert.ok(!recorded.includes("timeEntry.findMany"), "and no hours are read, let alone hashed");
 });
 
 test("the settings rows are pinned FOR SHARE before anything is read", () => {
@@ -180,6 +221,7 @@ async function load(client: unknown, extra: Record<string, unknown> = {}) {
         startKey: "2026-08-17",
         endKey: "2026-08-31",
         ...extra,
+        timeZone: TZ,
     });
 }
 

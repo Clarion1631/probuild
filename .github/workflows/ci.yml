@@ -176,6 +176,20 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # A LOCKED period that has lost its frozen CSVs used to fall through to a
+      # freshly recomputed LIVE csv — the one case where live data is definitely
+      # the wrong answer, because the file was built from mutable inputs and
+      # cannot be reproduced. Two defences, both proven here on a real database:
+      # the CHECK constraint makes the row unrepresentable, and the endpoint
+      # refuses (409) if one exists anyway.
+      - name: Prove a locked period with no snapshot fails closed
+        run: npx tsx --test tests/payroll-locked-snapshot-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Drives the real export endpoint, which reaches the app's prisma
+          # singleton — same pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

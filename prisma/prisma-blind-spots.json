@@ -101,6 +101,11 @@
       "def": "CHECK (((\"periodStartKey\" IS NOT NULL) AND (\"periodEndKey\" IS NOT NULL)))"
     },
     {
+      "name": "PayrollPeriod_locked_snapshot_complete",
+      "table": "\"PayrollPeriod\"",
+      "def": "CHECK (((\"lockedAt\" IS NULL) OR ((\"summaryCsvSnapshot\" IS NOT NULL) AND (\"detailCsvSnapshot\" IS NOT NULL) AND (\"exportHash\" IS NOT NULL))))"
+    },
+    {
       "name": "PayrollPeriod_range_check",
       "table": "\"PayrollPeriod\"",
       "def": "CHECK ((\"periodEnd\" > \"periodStart\"))"

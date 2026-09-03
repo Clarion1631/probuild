@@ -273,6 +273,7 @@ test("the roster cannot move between a lock's read and its COMMIT", { skip }, as
                     client: tx,
                     startKey: START_KEY,
                     endKey: END_KEY,
+                    timeZone: TZ,
                 });
                 firstRoster = before.employees.map((employee) => employee.user.id).sort();
                 firstHash = before.exportHash;
@@ -283,6 +284,7 @@ test("the roster cannot move between a lock's read and its COMMIT", { skip }, as
                     client: tx,
                     startKey: START_KEY,
                     endKey: END_KEY,
+                    timeZone: TZ,
                 });
                 secondRoster = after.employees.map((employee) => employee.user.id).sort();
                 secondHash = after.exportHash;
@@ -317,7 +319,7 @@ test("the roster cannot move between a lock's read and its COMMIT", { skip }, as
         // well against an activation that never changed anything: a fresh
         // export, after the transaction is done, must show the new hire on the
         // roster and a different hash.
-        const fresh = await loadGustoExport(PERIOD_START, PERIOD_END, { startKey: START_KEY, endKey: END_KEY });
+        const fresh = await loadGustoExport(PERIOD_START, PERIOD_END, { startKey: START_KEY, endKey: END_KEY, timeZone: TZ });
         assert.deepEqual(
             fresh.employees.map((employee) => employee.user.id).sort(),
             [worker.id, pending.id].sort(),

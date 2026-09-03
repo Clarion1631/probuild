@@ -183,7 +183,7 @@ test("a lock is found by its STABLE day keys, not by reconstructed timestamps", 
     // LIVE csv instead of the frozen snapshot, and unlock updated zero rows
     // while still reporting success.
     const snapshot = { summaryCsv: "FROZEN\n", detailCsv: "FROZEN-D\n", exportHash: "frozen" };
-    const seen: Array<{ start: Date; keys: { startKey: string; endKey: string } }> = [];
+    const seen: Array<{ start: Date; keys: { startKey: string; endKey: string; timeZone: string } }> = [];
     const handler = createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         // The company zone has CHANGED since the lock was taken.
@@ -201,14 +201,20 @@ test("a lock is found by its STABLE day keys, not by reconstructed timestamps", 
 
     // The day keys handed to the loader are the ones from the REQUEST, verbatim
     // — they do not pass through the (now different) time zone.
-    assert.deepEqual(seen[0].keys, { startKey: "2026-08-17", endKey: "2026-08-31" });
+    assert.deepEqual(seen[0].keys, {
+        startKey: "2026-08-17",
+        endKey: "2026-08-31",
+        // And the zone the timestamp below was derived from, handed through so
+        // the loader classifies days in the SAME zone (round-6 finding 2).
+        timeZone: "America/New_York",
+    });
     // The timestamp, by contrast, IS zone-derived — which is exactly why it
     // cannot be the lock's identity.
     assert.equal(seen[0].start.toISOString(), "2026-08-17T04:00:00.000Z");
 });
 
 test("the loader is always given the request's day keys, on the live path too", async () => {
-    const seen: Array<{ startKey: string; endKey: string }> = [];
+    const seen: Array<{ startKey: string; endKey: string; timeZone: string }> = [];
     const handler = createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => "America/Los_Angeles",
@@ -218,7 +224,94 @@ test("the loader is always given the request's day keys, on the live path too", 
         },
     });
     await handler.GET(url());
-    assert.deepEqual(seen, [{ startKey: "2026-08-17", endKey: "2026-08-31" }]);
+    assert.deepEqual(seen, [
+        { startKey: "2026-08-17", endKey: "2026-08-31", timeZone: "America/Los_Angeles" },
+    ]);
+});
+
+// ── ONE zone resolution drives the whole request (round 6, finding 2) ────────
+//
+// The handler resolves the company zone, builds the half-open period boundaries
+// from it, and then hands those boundaries to the loader. It used to hand over
+// the boundaries WITHOUT the zone, so the loader resolved the zone a second
+// time — a second read, on a different connection, at a different instant. A
+// zone change landing in between produced a CSV whose query window was built in
+// zone A and whose days, workweeks and overtime were classified in zone B: a
+// file that never described any single configuration of the company.
+
+test("the zone the boundaries were built from is the zone the loader is given", async () => {
+    // The zone is resolved exactly ONCE per request, and that same value reaches
+    // the loader — so the boundaries and the classification cannot disagree even
+    // if somebody changes the company zone a millisecond later.
+    let resolves = 0;
+    const seen: Array<{ start: Date; end: Date; timeZone: string }> = [];
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => {
+            resolves += 1;
+            // A zone that MOVES on every call. Under the old code the loader's
+            // own second resolution would have differed from this one; here
+            // there is only one resolution, so the value cannot drift.
+            return resolves === 1 ? "America/Los_Angeles" : "Pacific/Honolulu";
+        },
+        load: async (periodStart, periodEnd, keys) => {
+            seen.push({ start: periodStart, end: periodEnd, timeZone: keys.timeZone });
+            return loaded();
+        },
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 200);
+    assert.equal(resolves, 1, "the handler must resolve the company zone exactly once");
+    assert.equal(seen.length, 1);
+    assert.equal(
+        seen[0].timeZone,
+        "America/Los_Angeles",
+        "the loader gets the FIRST zone — the one the boundaries below were derived from"
+    );
+    // And the boundaries really were derived from that same zone: 2026-08-17
+    // 00:00 in Los Angeles is 07:00Z. In Honolulu it would be 10:00Z, so this
+    // assertion distinguishes the two.
+    assert.equal(seen[0].start.toISOString(), "2026-08-17T07:00:00.000Z");
+    assert.equal(seen[0].end.toISOString(), "2026-08-31T07:00:00.000Z");
+});
+
+// ── A locked period with an incomplete snapshot fails CLOSED (finding 4) ─────
+
+test("a locked period whose frozen CSVs are missing is a 409, never live data", async () => {
+    // The loader throws LockedSnapshotMissingError rather than returning a flag
+    // a caller could forget to read. What this pins is that the endpoint turns
+    // it into a refusal instead of falling through to the live CSV below it —
+    // which is exactly what it used to do, complete with X-Export-Source: live.
+    const { LockedSnapshotMissingError } = await import("../src/lib/gusto-export-db");
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => "America/Los_Angeles",
+        load: async () => {
+            throw new LockedSnapshotMissingError("2026-08-17", "2026-08-31");
+        },
+    });
+
+    const res = await handler.GET(url());
+    assert.equal(res.status, 409);
+    assert.equal(res.headers.get("x-export-source"), null, "no CSV of any kind comes back");
+    const body = (await res.json()) as { error: string; code: string };
+    assert.equal(body.code, "LOCKED_SNAPSHOT_MISSING");
+    assert.match(body.error, /2026-08-17 to 2026-08-31/);
+    assert.match(body.error, /unlock the period and lock it again/, "the refusal says how to recover");
+});
+
+test("an unrelated loader failure is NOT swallowed into that 409", async () => {
+    // The catch is narrow on purpose: a database outage must not be reported to
+    // a bookkeeper as "this period's snapshot is missing, go and re-lock it".
+    const handler = createGustoExportHandler({
+        authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
+        resolveTimeZone: async () => "America/Los_Angeles",
+        load: async () => {
+            throw new Error("connection terminated");
+        },
+    });
+    await assert.rejects(() => handler.GET(url()), /connection terminated/);
 });
 
 test("a range that OVERLAPS a locked period without being it is a 409", async () => {

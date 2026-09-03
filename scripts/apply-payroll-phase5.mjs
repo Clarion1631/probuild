@@ -156,6 +156,23 @@ export const EXPECTED_OBJECTS = [
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", contype: "c", def: ['"periodEnd" > "periodStart"'] },
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", contype: "c", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", contype: "c", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
+    // A LOCKED period carries its WHOLE frozen export, or it does not exist.
+    // The export used to fall through to live data for a locked row with a null
+    // snapshot; the loader now refuses, and this makes the row unrepresentable.
+    // All four column names are pinned, so a constraint weakened to check only
+    // one of them reads as drift.
+    {
+        kind: "constraint",
+        table: "PayrollPeriod",
+        name: "PayrollPeriod_locked_snapshot_complete",
+        contype: "c",
+        def: [
+            '"lockedAt" IS NULL',
+            '"summaryCsvSnapshot" IS NOT NULL',
+            '"detailCsvSnapshot" IS NOT NULL',
+            '"exportHash" IS NOT NULL',
+        ],
+    },
     { kind: "constraint", table: "User", name: "User_payType_check", contype: "c", def: ["HOURLY", "SALARY"] },
 
     { kind: "column", table: "HelpRequest", name: "submissionId", type: "text", nullable: true },
@@ -852,6 +869,38 @@ async function main() {
         );
         await prisma.$executeRawUnsafe(
             `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
+        );
+
+        // ----------------------------------------------------------------------
+        // Round-6 gate, finding 4: a LOCKED period carries its WHOLE frozen
+        // export, or it does not exist.
+        //
+        // The download endpoint served a locked period from its snapshot only
+        // when both csv columns were non-null. A row with lockedAt set and a
+        // null snapshot produced "no snapshot" while still counting as the exact
+        // locked period, so the overlap refusal did not fire either and the
+        // endpoint fell through to a freshly recomputed LIVE csv — the one case
+        // where live data is definitely the wrong answer. The loader now refuses
+        // such a row; this makes it unrepresentable.
+        //
+        // VALIDATE, not NOT VALID, for the same reason as every other CHECK
+        // here: an unvalidated constraint exempts existing rows, so prod would
+        // disagree with CI's replay. If this VALIDATE ever fails, a malformed
+        // locked period really is in the table and has to be looked at before
+        // the fix can ship — which is the correct outcome, not an obstacle.
+        // ----------------------------------------------------------------------
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_locked_snapshot_complete"`
+        );
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_locked_snapshot_complete"
+                CHECK (
+                    "lockedAt" IS NULL
+                    OR ("summaryCsvSnapshot" IS NOT NULL AND "detailCsvSnapshot" IS NOT NULL AND "exportHash" IS NOT NULL)
+                ) NOT VALID`
+        );
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_locked_snapshot_complete"`
         );
 
         // ----------------------------------------------------------------------
