@@ -775,3 +775,77 @@ test("the mangling reached the manual rate writers too, and is refused there", a
     }
     assert.equal((await applyRateChange({ role: "ADMIN" }, "u1", { hourlyRate: "$28.50" }, client as never)).ok, true);
 });
+
+// ── An identity-less row is an ERROR, not a silent skip (round 34, finding 3) ──
+//
+// `if (!name && !email) continue` treated "no name and no email" as "blank
+// row". A row like `,,28.50,HOURLY` is not blank: it carries a rate and a pay
+// type, for nobody. It disappeared from the preview with no error, the other
+// rows still applied, and the human never learned that one line of their file
+// had been thrown away. The rule now is the one the comment always claimed:
+// skip a row only when EVERY cell in it is empty.
+
+const IDENTITYLESS_HEADER = "Employee name,Email,Compensation rate,Compensation type";
+
+test("a populated row with no name and no email is an ERROR, not a silent skip", () => {
+    const parsed = parseGustoRateCsv(
+        [IDENTITYLESS_HEADER, "Tim Brennan,tim@example.com,31.00,Hourly", ",,28.50,HOURLY"].join(LF)
+    );
+
+    // The readable row still parses...
+    assert.deepEqual(
+        parsed.rows.map((row) => row.email),
+        ["tim@example.com"],
+        "the identified row is still read"
+    );
+    // ...and the identity-less one is REPORTED rather than dropped.
+    assert.equal(parsed.errors.length, 1, "the populated row with no identity must be an error");
+    assert.match(parsed.errors[0], /^Row 3: /, "the error names the line the human has to go and fix");
+    assert.match(parsed.errors[0], /no name or email/);
+    // The values that vanished are the point — a rate for nobody.
+    assert.equal(
+        parsed.rows.some((row) => row.hourlyRate === "28.50"),
+        false,
+        "and the orphan rate is NOT quietly imported onto somebody either"
+    );
+});
+
+test("a SALARY row with no identity is refused too — the pay-type branch is not a way past the check", () => {
+    // The pay-type branch returns before the rate is even parsed, so an
+    // identity check placed after it would let `,,92000,Salary` through.
+    const parsed = parseGustoRateCsv([IDENTITYLESS_HEADER, ",,92000,Salary"].join(LF));
+    assert.deepEqual(parsed.rows, [], "nothing to apply");
+    assert.equal(parsed.errors.length, 1);
+    assert.match(parsed.errors[0], /^Row 2: /);
+});
+
+test("a genuinely EMPTY row is still skipped, silently — blank lines are not errors", () => {
+    // Every cell empty or whitespace: a trailing newline, a bare comma row, and
+    // a spaces-only row. A real export ends with a newline, and refusing that
+    // would make the importer unusable on correct files.
+    for (const blank of ["", ",,,", "  ,  ,  ,  "]) {
+        const parsed = parseGustoRateCsv(
+            [IDENTITYLESS_HEADER, "Tim Brennan,tim@example.com,31.00,Hourly", blank].join(LF)
+        );
+        assert.deepEqual(parsed.errors, [], `"${blank}" is blank and must not be an error`);
+        assert.equal(parsed.rows.length, 1, `"${blank}" is skipped`);
+    }
+});
+
+test("the identity-less row blocks the APPLY, so nothing is half-imported", () => {
+    // applyGustoRateImport re-parses the file itself and refuses when the parse
+    // reports ANY error, before it opens a transaction. That gate already
+    // exists and is tested above; what this pins is that the identity-less row
+    // now reaches it — it used to parse clean.
+    const csv = [IDENTITYLESS_HEADER, "Tim Brennan,tim@example.com,31.00,Hourly", ",,28.50,HOURLY"].join(LF);
+    assert.ok(parseGustoRateCsv(csv).errors.length > 0, "the server's own re-parse sees an error");
+
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const fn = actions.slice(actions.indexOf("export async function applyGustoRateImport"));
+    const body = fn.slice(0, fn.indexOf(LF + "/**"));
+    const refusal = body.indexOf("reparsed.errors.length > 0");
+    const write = body.indexOf("prisma.$transaction");
+    assert.ok(refusal > 0, "apply re-parses and refuses on errors");
+    assert.ok(write > 0, "and it does have a write to refuse");
+    assert.ok(refusal < write, "the refusal must come BEFORE anything is written");
+});

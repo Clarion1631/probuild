@@ -134,7 +134,25 @@ export const EXPECTED_OBJECTS = [
 
     // CHECK expressions, normalised. "exists and is validated" is not enough:
     // a constraint rewritten to `CHECK (true)` is still present and still valid.
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_fkey", contype: "f" },
+    // EVERY PART OF IT PINNED, not just "a foreign key of this name exists".
+    // That was the whole check, and a same-named ON DELETE CASCADE passes it:
+    // deleting the admin who locked a period would then delete the PayrollPeriod
+    // row itself, taking the frozen exportHash and both CSV snapshots with it —
+    // the immutable record of what payroll was actually paid. 'n' is SET NULL,
+    // which keeps the period and forgets only who locked it. The referenced
+    // table and both column lists are pinned too, because an FK of the right
+    // name pointing at the wrong table (or the wrong column) enforces a
+    // relationship nobody asked for while reading as healthy.
+    {
+        kind: "constraint",
+        table: "PayrollPeriod",
+        name: "PayrollPeriod_lockedById_fkey",
+        contype: "f",
+        onDelete: "n",
+        references: "User",
+        columns: ["lockedById"],
+        refColumns: ["id"],
+    },
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", contype: "c", def: ['"periodEnd" > "periodStart"'] },
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", contype: "c", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", contype: "c", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
@@ -169,8 +187,26 @@ export const EXPECTED_OBJECTS = [
 
     // Not created by a statement — CONVERTED. 'r' is RESTRICT; 'c' is the old
     // CASCADE that silently destroyed payroll history.
-    { kind: "fk", table: "TimeEntry", name: "TimeEntry_userId_fkey", contype: "f", onDelete: "r" },
-    { kind: "fk", table: "TimeEntry", name: "TimeEntry_projectId_fkey", contype: "f", onDelete: "r" },
+    {
+        kind: "fk",
+        table: "TimeEntry",
+        name: "TimeEntry_userId_fkey",
+        contype: "f",
+        onDelete: "r",
+        references: "User",
+        columns: ["userId"],
+        refColumns: ["id"],
+    },
+    {
+        kind: "fk",
+        table: "TimeEntry",
+        name: "TimeEntry_projectId_fkey",
+        contype: "f",
+        onDelete: "r",
+        references: "Project",
+        columns: ["projectId"],
+        refColumns: ["id"],
+    },
 
     // RLS with ZERO policies is the intended state: it denies everything to any
     // role that does not bypass RLS. Prisma connects as the table owner (owners
@@ -316,11 +352,26 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
         }
 
         if (object.kind === "constraint" || object.kind === "fk") {
+            // conkey/confkey are attnum arrays, resolved to NAMES here and kept in
+            // KEY ORDER (`WITH ORDINALITY`, not attnum order) — a two-column FK
+            // declared the other way round is a different constraint. confrelid
+            // is 0 for a non-FK, so the referenced class is LEFT JOINed and its
+            // SCHEMA is read alongside the name: a decoy "User" in another
+            // schema would otherwise answer for the real one.
             const rows = await db.$queryRawUnsafe(
-                `SELECT c.convalidated, c.confdeltype, c.contype, pg_get_constraintdef(c.oid) AS def
+                `SELECT c.convalidated, c.confdeltype, c.contype, pg_get_constraintdef(c.oid) AS def,
+                        rt.relname AS reftable, rn.nspname AS refschema,
+                        (SELECT array_agg(a.attname ORDER BY k.ord)
+                           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS cols,
+                        (SELECT array_agg(a.attname ORDER BY k.ord)
+                           FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS refcols
                    FROM pg_constraint c
                    JOIN pg_class t ON t.oid = c.conrelid
                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                   LEFT JOIN pg_class rt ON rt.oid = c.confrelid
+                   LEFT JOIN pg_namespace rn ON rn.oid = rt.relnamespace
                   WHERE n.nspname = $1 AND t.relname = $2 AND c.conname = $3`,
                 schema,
                 object.table,
@@ -346,6 +397,40 @@ export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = 
             }
             if (object.onDelete && row.confdeltype !== object.onDelete) {
                 miss(object, `ON DELETE is '${row.confdeltype}', expected '${object.onDelete}'`, row.def);
+                continue;
+            }
+            // WHAT it points at. Schema-qualified for the same reason every
+            // other lookup here is: a same-named table in another schema is not
+            // this table.
+            if (object.references) {
+                if (row.reftable !== object.references || row.refschema !== schema) {
+                    miss(
+                        object,
+                        `references ${row.refschema ?? "?"}.${row.reftable ?? "nothing"}, expected ${schema}.${object.references}`,
+                        row.def
+                    );
+                    continue;
+                }
+            }
+            // ...and WHICH columns, on both sides, in order.
+            const listMismatch = (actual, expected) => {
+                const list = Array.isArray(actual) ? actual : [];
+                return list.length !== expected.length || list.some((name, i) => name !== expected[i]);
+            };
+            if (object.columns && listMismatch(row.cols, object.columns)) {
+                miss(
+                    object,
+                    `columns are [${(row.cols ?? []).join(", ")}], expected [${object.columns.join(", ")}]`,
+                    row.def
+                );
+                continue;
+            }
+            if (object.refColumns && listMismatch(row.refcols, object.refColumns)) {
+                miss(
+                    object,
+                    `referenced columns are [${(row.refcols ?? []).join(", ")}], expected [${object.refColumns.join(", ")}]`,
+                    row.def
+                );
                 continue;
             }
             if (object.def) {

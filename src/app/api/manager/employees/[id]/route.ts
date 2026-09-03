@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
+import { withPayrollUserWrite } from "@/lib/payroll-period";
 
 const VALID_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
 const VALID_STATUSES = new Set(["PENDING", "ACTIVATED", "DISABLED"]);
@@ -99,14 +100,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     },
                 });
             }
-            return tx.user.update({
-                where: { id },
-                data,
-                select: {
-                    id: true, email: true, name: true, role: true, status: true,
-                    hourlyRate: true, burdenRate: true,
-                },
-            });
+            // The mobile manager screen can activate or disable somebody,
+            // and status is half of the Gusto roster predicate. Same tier-1
+            // payroll lock as every other export-input writer.
+            return withPayrollUserWrite(tx, data, () =>
+                tx.user.update({
+                    where: { id },
+                    data,
+                    select: {
+                        id: true, email: true, name: true, role: true, status: true,
+                        hourlyRate: true, burdenRate: true,
+                    },
+                })
+            );
         });
     } catch (error) {
         if (error instanceof RateChangeError) {

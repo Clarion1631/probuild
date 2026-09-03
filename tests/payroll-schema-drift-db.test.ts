@@ -269,6 +269,93 @@ test("a PRIMARY KEY replaced by a same-named CHECK is reported, though it exists
     }
 });
 
+// ── the payroll snapshot's own FK (round 34, finding 4) ────────────────────
+// PayrollPeriod_lockedById_fkey was checked as "a foreign-key constraint of
+// this name". A same-named ON DELETE CASCADE passes that, and deleting the
+// admin who locked a period would then delete the period row — the frozen
+// exportHash and both CSV snapshots, the immutable record of what payroll was
+// actually paid. These break it one part at a time.
+
+test("the payroll snapshot FK recreated as ON DELETE CASCADE is reported, and the dry run exits nonzero", { skip }, async () => {
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_lockedById_fkey"`);
+        // Same name, same table, same column, still a validated foreign key —
+        // and it destroys payroll history when a user row goes.
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_lockedById_fkey"
+             FOREIGN KEY ("lockedById") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE`
+        );
+        const rows = await drift(db);
+        const row = reported(rows, "PayrollPeriod_lockedById_fkey");
+        assert.ok(row, "a CASCADE on the payroll snapshot must be reported");
+        assert.match(row!.reason, /ON DELETE is 'c', expected 'n'/);
+        // And the deploy step a human reads the exit code of actually fails.
+        assert.equal(driftVerdict(rows).exitCode, 1, "--dry-run must exit nonzero on this");
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_lockedById_fkey"`)
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_lockedById_fkey"
+                 FOREIGN KEY ("lockedById") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE`
+            )
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("the same FK pointed at a DIFFERENT TABLE is reported", { skip }, async () => {
+    // Right name, right column, right ON DELETE — and it now says a lock was
+    // taken by a Project. An FK is a relationship, not a name.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT "PayrollPeriod_lockedById_fkey"`);
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_lockedById_fkey"
+             FOREIGN KEY ("lockedById") REFERENCES "Project"("id") ON DELETE SET NULL ON UPDATE CASCADE`
+        );
+        const row = reported(await drift(db), "PayrollPeriod_lockedById_fkey");
+        assert.ok(row, "the referenced table must be pinned, not assumed");
+        assert.match(row!.reason, /references public.Project, expected public.User/);
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "PayrollPeriod" DROP CONSTRAINT IF EXISTS "PayrollPeriod_lockedById_fkey"`)
+            .catch(() => {});
+        await db
+            .$executeRawUnsafe(
+                `ALTER TABLE "PayrollPeriod" ADD CONSTRAINT "PayrollPeriod_lockedById_fkey"
+                 FOREIGN KEY ("lockedById") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE`
+            )
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
+test("an ABSENT User.payrollRevision is reported as drift — this is what prod is presumed to be", { skip }, async () => {
+    // The deploy procedure in the PR body turns on this: the 9/2 accidental
+    // import applied the earlier objects but NOT this column, so prod is
+    // presumed to lack it and --dry-run has to say so. The DEFAULT test above
+    // only proves a weakened column is caught; this proves an absent one is.
+    const { driftVerdict } = await import("../scripts/apply-payroll-phase5.mjs");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await db.$executeRawUnsafe(`ALTER TABLE "User" DROP COLUMN "payrollRevision"`);
+        const rows = await drift(db);
+        const row = reported(rows, "payrollRevision");
+        assert.ok(row, "the column every User read now selects must not be able to be silently absent");
+        assert.equal(row!.reason, "missing");
+        assert.equal(driftVerdict(rows).exitCode, 1);
+    } finally {
+        await db
+            .$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "payrollRevision" INTEGER NOT NULL DEFAULT 0`)
+            .catch(() => {});
+        await db.$disconnect();
+    }
+});
+
 test("everything is restored — the teardown actually worked", { skip }, async () => {
     // Each test above repairs what it broke. If any teardown silently failed,
     // this catches it rather than letting a later CI step fail confusingly.

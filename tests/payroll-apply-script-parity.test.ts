@@ -209,9 +209,44 @@ test("the object list carries DEFINITIONS, not just names", async () => {
     assert.ok(checks.length >= 4, "the CHECK expressions must be pinned, not just their names");
 
     // FKs assert ON DELETE specifically — present-but-CASCADE is the bug.
-    const fks = EXPECTED_OBJECTS.filter((o: { kind: string }) => o.kind === "fk");
-    assert.equal(fks.length, 2);
-    for (const fk of fks) assert.equal(fk.onDelete, "r");
+    //
+    // Filtered on contype rather than `kind`, because that is what actually
+    // makes an entry a foreign key to the verifier. PayrollPeriod_lockedById_fkey
+    // is written as kind "constraint" (the migration adds it with a literal
+    // ADD CONSTRAINT), so a `kind === "fk"` filter skipped it entirely and it
+    // was the ONE FK pinning nothing but its own name — a same-named
+    // ON DELETE CASCADE would have passed the dry run, and deleting the admin
+    // who locked a period would have deleted the period, its exportHash and
+    // both frozen CSVs.
+    const fks = EXPECTED_OBJECTS.filter((o: { contype?: string }) => o.contype === "f");
+    assert.equal(fks.length, 3, "the two converted TimeEntry FKs and PayrollPeriod_lockedById_fkey");
+    for (const fk of fks) {
+        assert.ok(fk.onDelete, `${fk.name} must pin ON DELETE — present-but-CASCADE is the bug`);
+        assert.ok(fk.references, `${fk.name} must pin the table it references`);
+        assert.ok(
+            Array.isArray(fk.columns) && fk.columns.length > 0,
+            `${fk.name} must pin its own column list`
+        );
+        assert.ok(
+            Array.isArray(fk.refColumns) && fk.refColumns.length > 0,
+            `${fk.name} must pin the referenced column list`
+        );
+    }
+    // Named individually, so a wholesale "make them all RESTRICT" edit cannot
+    // quietly change what the payroll snapshot's FK promises. 'n' is SET NULL:
+    // the period survives its locker being deleted, and only forgets who they
+    // were. 'r' is RESTRICT: a punch's user or job cannot be deleted at all.
+    const byName = new Map(fks.map((fk) => [fk.name, fk]));
+    assert.deepEqual(
+        [...byName.keys()].sort(),
+        ["PayrollPeriod_lockedById_fkey", "TimeEntry_projectId_fkey", "TimeEntry_userId_fkey"]
+    );
+    assert.equal(byName.get("PayrollPeriod_lockedById_fkey")!.onDelete, "n");
+    assert.equal(byName.get("PayrollPeriod_lockedById_fkey")!.references, "User");
+    assert.deepEqual(byName.get("PayrollPeriod_lockedById_fkey")!.columns, ["lockedById"]);
+    assert.deepEqual(byName.get("PayrollPeriod_lockedById_fkey")!.refColumns, ["id"]);
+    assert.equal(byName.get("TimeEntry_userId_fkey")!.onDelete, "r");
+    assert.equal(byName.get("TimeEntry_projectId_fkey")!.onDelete, "r");
 
     // All five protected tables, RLS on, zero policies (that IS the deny-all).
     // TimeEntry and HelpRequest were the adversarial-review finding: RLS shipped
@@ -322,6 +357,8 @@ type ExpectedObject = {
     columns?: string[];
     contype?: string;
     onDelete?: string;
+    references?: string;
+    refColumns?: string[];
     policies?: number;
 };
 

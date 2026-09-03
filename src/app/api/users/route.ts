@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
+import { withPayrollUserWrite } from "@/lib/payroll-period";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
 
@@ -197,11 +198,18 @@ export async function PATCH(req: Request) {
                     { hourlyRate, burdenRate, payType: body.payType }
                 );
                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-                return tx.user.update({
-                    where: { id },
-                    data,
-                    include: { permissions: true, projectAccess: { select: { projectId: true } } },
-                });
+                // status and name are EXPORT INPUTS — activating somebody
+                // adds them to the Gusto roster, and their name is printed in
+                // both CSVs. withPayrollUserWrite takes the shared payroll
+                // advisory lock first, so this cannot land between a period
+                // lock's roster read and its COMMIT (see payroll-period.ts).
+                return withPayrollUserWrite(tx, data, () =>
+                    tx.user.update({
+                        where: { id },
+                        data,
+                        include: { permissions: true, projectAccess: { select: { projectId: true } } },
+                    })
+                );
             });
             ({ pinCode: _pin, ...user } = updated);
         } catch (error) {

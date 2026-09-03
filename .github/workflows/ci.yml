@@ -161,6 +161,21 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # ACTIVATION is the other half of the Gusto roster predicate
+      # ("(ACTIVATED and HOURLY) or punched"), and no activation writer took the
+      # payroll advisory lock — so a sign-in could add somebody to a pay
+      # period's file between the lock's roster read and its COMMIT. The export
+      # cannot defend itself there: FOR SHARE can only lock rows its own
+      # predicate returned. The manifest test pins WHICH call sites are wrapped;
+      # only this step shows PostgreSQL holds the writer off.
+      - name: Prove an activation cannot land while a pay period is being locked
+        run: npx tsx --test tests/payroll-activation-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

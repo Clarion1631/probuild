@@ -369,7 +369,29 @@ export function parseGustoRateCsv(text: string): RateImportParse {
         const email = at(emailAt).toLowerCase() || null;
         const rateText = at(rateAt);
 
-        if (!name && !email) continue; // blank row
+        // A row is SKIPPED only when it is genuinely EMPTY. It used to be skipped
+        // whenever it carried no name and no email, which silently discarded a
+        // POPULATED row: `,,28.50,HOURLY` — a real rate, for nobody — vanished
+        // from the preview while every other row in the file still applied. An
+        // importer that quietly drops data is not strict, whatever the rest of
+        // this parser does: the human never saw the row, so they never went and
+        // fixed the one line that was wrong.
+        //
+        // parseCsvGrid already removes all-blank rows, so this test is normally
+        // vacuous; it stays because it is the rule being stated, and the rule is
+        // what a later change to the grid reader has to keep.
+        const isBlankRow = cells.every((cell) => (cell ?? "").trim() === "");
+        if (isBlankRow) continue;
+        if (!name && !email) {
+            // An ERROR, not a skip — and errors block the apply
+            // (applyGustoRateImport refuses a file with any of them), so no
+            // half-applied import can come out of a file with a row like this.
+            errors.push(
+                `Row ${lineNumber}: no name or email, so there is no way to tell which team member this row belongs to. ` +
+                    `Fill one in, or delete the row.`
+            );
+            continue;
+        }
 
         // Pay type FIRST: it decides whether the rate column means anything.
         const payType = normalizePayType(at(payTypeAt));

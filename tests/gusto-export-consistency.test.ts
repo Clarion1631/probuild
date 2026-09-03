@@ -85,6 +85,21 @@ test("the time zone and the Gusto mappings are read through the same client, onc
 test("the settings rows are pinned FOR SHARE before anything is read", () => {
     assert.match(DB_SOURCE, /FROM "CompanySettings" WHERE "id" = \$1 FOR SHARE/);
     assert.match(DB_SOURCE, /FROM "Integration" WHERE "id" = \$1 FOR SHARE/);
+    // And the advisory lock that covers the Integration row's ABSENCE, taken
+    // through the STORE's own helper rather than a second copy of the key —
+    // two literals is how the reader and the writer end up on different keys.
+    assert.ok(DB_SOURCE.includes("acquireIntegrationSettingsLock(client)"));
+    assert.ok(
+        DB_SOURCE.includes(
+            'import { acquireIntegrationSettingsLock, getGustoSettings } from "./integration-store";'
+        ),
+        "the key must come from the store, not be retyped here"
+    );
+    assert.ok(
+        DB_SOURCE.indexOf("acquireIntegrationSettingsLock(client)") <
+            DB_SOURCE.indexOf('FROM "CompanySettings" WHERE "id" = $1 FOR SHARE'),
+        "the advisory lock comes before the row locks"
+    );
     // Ordering in the source is not the proof — the recording fake below is —
     // but a lock taken after the read it is meant to protect is worth catching
     // here too.
@@ -111,6 +126,13 @@ function fakeTx(recorded: Recorded, options: { timeZone?: string; mappings?: Rec
         $queryRawUnsafe: async (sql: string) => {
             recorded.push(`raw:${sql.replace(/\s+/g, " ").trim()}`);
             return [];
+        },
+        // The advisory lock — recorded BY KEY, because the key is the whole
+        // point: it has to be the one integration-store's saver takes, or the
+        // two serialise on nothing.
+        $executeRawUnsafe: async (_sql: string, ...args: unknown[]) => {
+            recorded.push(`advisory:${String(args[0])}`);
+            return 0;
         },
         companySettings: {
             findUnique: async () => {
@@ -168,7 +190,12 @@ test("every read goes out on the supplied transaction client, and the locks come
     // Nothing was left for the global client to do: if any read had escaped,
     // it would be missing from this list (and, with no database behind the
     // singleton, would have thrown instead).
-    assert.deepEqual(recorded.slice(0, 2), [
+    assert.deepEqual(recorded.slice(0, 3), [
+        // FIRST, and on the saver's OWN key. FOR SHARE below cannot lock the
+        // Integration row's ABSENCE, so on a database that has never saved an
+        // integration the row lock is a no-op and saveGustoSettings could insert
+        // the first mapping between this read and the lock's COMMIT.
+        "advisory:integration:system_settings",
         'raw:SELECT "id" FROM "CompanySettings" WHERE "id" = $1 FOR SHARE',
         'raw:SELECT "id" FROM "Integration" WHERE "id" = $1 FOR SHARE',
     ]);

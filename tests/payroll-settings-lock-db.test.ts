@@ -17,7 +17,15 @@
  *     the period is overtime) each punch falls in, and lockPayrollPeriod freezes
  *     a hash over the result.
  *
- *  2. `saveGustoSettings` / `saveQBSettings` serialise against each other on one
+ *  1b. THE Integration ROW MAY NOT EXIST YET, and `FOR SHARE` cannot lock a
+ *     row's absence. On a database that has never saved an integration the
+ *     export's row lock is a silent no-op, so `saveGustoSettings` could insert
+ *     the FIRST employee mapping between the export's read and the lock's
+ *     COMMIT — and lockPayrollPeriod would freeze a hash built without a
+ *     mapping that was already committed. The export therefore takes the
+ *     SAME advisory key the saver takes, which covers absence as well as
+ *     presence.
+ * *  2. `saveGustoSettings` / `saveQBSettings` serialise against each other on one
  *     advisory-lock key, so two savers of DIFFERENT keys cannot each merge into
  *     the same stale blob and have the second overwrite the first. The two share
  *     one encrypted row, so a lost write there disconnects an integration.
@@ -206,6 +214,125 @@ test("the export's FOR SHARE blocks a concurrent Gusto mapping save", { skip }, 
         );
     } finally {
         await restore();
+        await reader.$disconnect().catch(() => {});
+    }
+});
+
+test("the export fences a FIRST-EVER mapping save, with NO Integration row to lock", { skip }, async () => {
+    // The round-34 finding, exactly. Before the fix the only fence on this row
+    // was `SELECT ... FOR SHARE`, and there is no row to lock here: the
+    // statement matched nothing, held nothing, and reported nothing wrong. The
+    // saver serialises on its own advisory key rather than on this
+    // transaction, so it was free to INSERT the first mapping after the export
+    // had read "no mappings" and before lockPayrollPeriod committed the hash.
+    const { loadGustoExport } = await import("../src/lib/gusto-export-db");
+    const { saveGustoSettings, getGustoSettings } = await import("../src/lib/integration-store");
+    const reader = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const restore = await seedSettings(reader, {});
+
+    try {
+        // THE SETUP THAT MATTERS: no Integration row at all, committed before
+        // the export starts. This is a fresh install, or any company that has
+        // not connected an integration yet.
+        await reader.integration.delete({ where: { id: "system_settings" } }).catch(() => {});
+        assert.equal(
+            await reader.integration.findUnique({ where: { id: "system_settings" } }),
+            null,
+            "the row really is absent — without this the FOR SHARE would be doing the work and this test would prove nothing"
+        );
+
+        let release: () => void = () => {};
+        const held = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let sawMappings: Record<string, string> | undefined;
+
+        const exporting = reader.$transaction(
+            async (tx) => {
+                const result = await loadGustoExport(PERIOD_START, PERIOD_END, {
+                    client: tx,
+                    startKey: "2026-08-17",
+                    endKey: "2026-08-31",
+                });
+                assert.equal(typeof result.exportHash, "string");
+                sawMappings = (await getGustoSettings(tx)).employeeMappings;
+                await held;
+            },
+            { timeout: 30_000 }
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        assert.equal(sawMappings, undefined, "the export hashed a period with no mappings at all");
+
+        // The first save this database has ever seen. It must WAIT, even though
+        // there is nothing for a row lock to hold.
+        const save = saveGustoSettings({ connected: true, employeeMappings: { "u-first": "GUSTO-FIRST" } });
+        assert.equal(
+            await stillPending(save, 1_000),
+            true,
+            "the FIRST mapping save must block on the export's advisory lock — FOR SHARE cannot lock an absent row"
+        );
+
+        release();
+        await exporting;
+        await save;
+
+        // And it lands afterwards, so the fence delays rather than loses it.
+        assert.equal((await getGustoSettings()).employeeMappings?.["u-first"], "GUSTO-FIRST");
+    } finally {
+        await restore();
+        await reader.$disconnect().catch(() => {});
+    }
+});
+
+test("the export takes the SAME key the saver takes — not merely 'an' advisory lock", { skip }, async () => {
+    // The mirror of "a save WAITS for the integration advisory lock" below: hold
+    // integration-store's exact key on one connection and prove the EXPORT
+    // blocks on it. A fix that invented its own key would pass the test above
+    // (the saver and the export would still serialise with each other) and
+    // would silently stop serialising with every other writer of that row.
+    const { loadGustoExport } = await import("../src/lib/gusto-export-db");
+    const { INTEGRATION_LOCK_KEY } = await import("../src/lib/integration-store");
+    const holder = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const reader = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const restore = await seedSettings(holder, {});
+
+    try {
+        assert.equal(INTEGRATION_LOCK_KEY, "integration:system_settings", "the key the saver takes");
+        let release: () => void = () => {};
+        const held = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const holding = holder.$transaction(
+            async (tx) => {
+                await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, INTEGRATION_LOCK_KEY);
+                await held;
+            },
+            { timeout: 30_000 }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 400));
+
+        const exporting = reader.$transaction(
+            async (tx) =>
+                loadGustoExport(PERIOD_START, PERIOD_END, {
+                    client: tx,
+                    startKey: "2026-08-17",
+                    endKey: "2026-08-31",
+                }),
+            { timeout: 30_000 }
+        );
+        assert.equal(
+            await stillPending(exporting, 1_000),
+            true,
+            "the export must serialise on integration-store's own key"
+        );
+
+        release();
+        await holding;
+        assert.equal(typeof (await exporting).exportHash, "string", "and it completes once the key is free");
+    } finally {
+        await restore();
+        await holder.$disconnect().catch(() => {});
         await reader.$disconnect().catch(() => {});
     }
 });

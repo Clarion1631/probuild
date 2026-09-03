@@ -22,6 +22,13 @@
 //   lib/time-expense-actions update/delete/deleteMany
 //   app/projects/[id]/timeclock/actions create/update/delete
 //
+// AND, on the OTHER table the export is built from, every writer that changes a
+// User's export-affecting state (status, payType, name, email) goes through
+// withPayrollUserWrite below. The canonical list is
+// tests/payroll-user-writer-manifest.test.ts. Activation is the one that was
+// missing: the roster is "(ACTIVATED and HOURLY) or punched", so a sign-in
+// flipping PENDING -> ACTIVATED adds a row to a pay period's file.
+//
 // Deliberately NOT gated, because they cannot change a period's hours: writers
 // that only touch flags, notes, cost coding, change-order tags or billing
 // stamps (markTimeEntryReviewed, meal-skip decisions, logistics routing and
@@ -146,6 +153,76 @@ export function isPeriodLockedError(error: unknown): error is PeriodLockedError 
  */
 export async function acquirePayrollWriteLock(tx: Pick<PayrollTxClient, "$executeRawUnsafe">): Promise<void> {
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock_shared(hashtext($1))`, PAYROLL_ADVISORY_LOCK_KEY);
+}
+
+/**
+ * The User columns the Gusto export is BUILT FROM — its roster predicate and
+ * the bytes it hashes.
+ *
+ *   status   the roster is `status = ACTIVATED AND payType = HOURLY` OR
+ *            "punched inside the period", so activating somebody ADDS a row;
+ *   payType  decides whether they are on the file as an hourly employee at all;
+ *   name     printed in both CSVs;
+ *   email    printed in both CSVs, and the key the salaried-email fallback and
+ *            the Gusto employee mapping are looked up by.
+ *
+ * `role` is deliberately NOT here: loadGustoExport selects id/name/email/payType
+ * and nothing reads role, so a role change cannot move a byte of the export.
+ * Keep this list in step with that select and with the roster `where` — the
+ * manifest test (tests/payroll-user-writer-manifest.test.ts) reads both.
+ */
+export const EXPORT_AFFECTING_USER_FIELDS = ["status", "payType", "name", "email"] as const;
+
+/** Does this Prisma `data` payload name any of them? Presence, not value — writing the same value still bumps updatedAt and still races. */
+export function touchesExportUserState(data: unknown): boolean {
+    if (!data || typeof data !== "object") return false;
+    const payload = data as Record<string, unknown>;
+    return EXPORT_AFFECTING_USER_FIELDS.some((field) => field in payload);
+}
+
+/**
+ * THE entry point for a User write that can change what the payroll export
+ * contains. Takes tier 1 of the global lock order FIRST, then runs the write.
+ *
+ * WHY THIS EXISTS. The rate writers (pay-rate-write.ts, setUserPayType,
+ * applyGustoRateImport) already took the shared payroll lock, but ACTIVATION did
+ * not — and activation is the other half of the roster predicate. So this could
+ * happen, with everything else in this file working exactly as designed:
+ *
+ *   lockPayrollPeriod  takes the EXCLUSIVE payroll lock, reads the roster
+ *                      (a PENDING hourly hire is not on it), hashes, ...
+ *   PATCH /api/users   sets that hire to ACTIVATED and COMMITS
+ *   lockPayrollPeriod  ...COMMITS the reviewed hash
+ *
+ * and the period is frozen around a roster that already had one more person on
+ * it than the file says. The export cannot defend itself here: the row it needs
+ * to hold is one its own roster query did not return, and `SELECT ... FOR SHARE`
+ * can only lock rows a predicate matched. That is the same shape as the
+ * overlapping-period check — a predicate over rows that may not qualify yet —
+ * and the same answer applies: an advisory lock, which serialises against the
+ * PREDICATE rather than against any row.
+ *
+ * SHARED, not exclusive, and the SAME key lock creation takes: these writers do
+ * not conflict with each other (Prisma's own row lock serialises two edits of
+ * one person), only with a period being locked.
+ *
+ * LOCK ORDER: tier 1, so it must be taken BEFORE any User row lock. Every call
+ * site passes a `write` closure rather than a pre-locked row for exactly that
+ * reason. Re-taking it inside a transaction that already holds it (a route that
+ * ran applyRateChangeInTx first) is granted immediately — an advisory lock is
+ * re-entrant within one transaction — so the two cannot deadlock each other.
+ *
+ * A payload that names none of EXPORT_AFFECTING_USER_FIELDS takes NO lock: a
+ * project-access edit or a "seen" timestamp cannot move the export, and making
+ * every User write queue behind payroll would be a real cost for no guarantee.
+ */
+export async function withPayrollUserWrite<T>(
+    tx: Pick<PayrollTxClient, "$executeRawUnsafe">,
+    data: unknown,
+    write: () => Promise<T>
+): Promise<T> {
+    if (touchesExportUserState(data)) await acquirePayrollWriteLock(tx);
+    return write();
 }
 
 /**

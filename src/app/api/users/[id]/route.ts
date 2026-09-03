@@ -6,7 +6,7 @@ import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { deleteParentWithTimeEntries, isTimeEntriesExistError } from "@/lib/payroll-parent-delete";
-import { isPeriodLockedError, periodLockedResponse } from "@/lib/payroll-period";
+import { isPeriodLockedError, periodLockedResponse, withPayrollUserWrite } from "@/lib/payroll-period";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -105,7 +105,14 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                         if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                     }
                     if (Object.keys(data).length > 0) {
-                        await tx.user.update({ where: { id }, data });
+                        // `data` can carry status and name, both EXPORT INPUTS:
+                        // activating somebody ADDS a row to the Gusto roster,
+                        // and their name is printed in both CSVs. The payroll
+                        // advisory lock (tier 1, taken inside withPayrollUserWrite
+                        // before the row is touched) is what makes this write
+                        // wait for a period being locked instead of committing
+                        // between that lock's roster read and its COMMIT.
+                        await withPayrollUserWrite(tx, data, () => tx.user.update({ where: { id }, data }));
                     }
                 });
             } catch (error) {

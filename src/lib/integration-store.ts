@@ -51,7 +51,33 @@ const INTEGRATION_ROW_ID = "system_settings";
  * advisory lock covers the row's ABSENCE as well as its presence, exactly like
  * acquirePayrollLockCreationLock in payroll-period.ts. Both are taken.
  */
-const INTEGRATION_LOCK_KEY = `integration:${INTEGRATION_ROW_ID}`;
+export const INTEGRATION_LOCK_KEY = `integration:${INTEGRATION_ROW_ID}`;
+
+/**
+ * Take that advisory lock on the CALLER's transaction.
+ *
+ * Exported because the payroll export has to take THE SAME ONE. It reads the
+ * Gusto employee mappings under `SELECT ... FOR SHARE` on the Integration row,
+ * which is a real fence only while the row EXISTS — and on a database that has
+ * never saved an integration it does not. FOR SHARE then locks nothing at all,
+ * a save can insert the first mapping between the export's read and its COMMIT,
+ * and lockPayrollPeriod freezes a hash computed without a mapping that was
+ * committed before it. Locking the row's ABSENCE is exactly what the advisory
+ * lock is for (see INTEGRATION_LOCK_KEY), so the reader takes it too.
+ *
+ * `pg_advisory_xact_lock` releases at COMMIT or ROLLBACK — it cannot outlive
+ * the transaction even if the caller throws.
+ *
+ * LOCK ORDER: the export takes this AFTER the payroll advisory lock and BEFORE
+ * the two settings rows. Nothing that holds this key ever goes on to wait for a
+ * payroll lock (updateIntegrationSettings takes this key and then the
+ * Integration row, and nothing else), so no cycle is introduced.
+ */
+export async function acquireIntegrationSettingsLock(
+    tx: { $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number> }
+): Promise<void> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, INTEGRATION_LOCK_KEY);
+}
 
 /**
  * Read the decrypted blob.
@@ -122,8 +148,10 @@ async function updateIntegrationSettings(
     apply: (current: IntegrationSettings) => IntegrationSettings
 ): Promise<void> {
     await prisma.$transaction(async (tx) => {
-        // Covers the row's absence (see INTEGRATION_LOCK_KEY)...
-        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, INTEGRATION_LOCK_KEY);
+        // Covers the row's absence (see INTEGRATION_LOCK_KEY). Through the
+        // shared helper, because the payroll export takes the SAME key and the
+        // two must not be able to drift onto different statements...
+        await acquireIntegrationSettingsLock(tx);
         // ...and the row itself. Stated precisely, because it is easy to
         // overclaim: the advisory lock above already serialises every writer
         // that comes through HERE, and the upsert below already conflicts with

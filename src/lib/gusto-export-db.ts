@@ -17,7 +17,7 @@ import { createHash } from "crypto";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { resolveCompanyTimeZone } from "./company-timezone";
-import { getGustoSettings } from "./integration-store";
+import { acquireIntegrationSettingsLock, getGustoSettings } from "./integration-store";
 import { workweekStartKey } from "./overtime";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
 import { isSalariedEmail, payrollLockEnvelope, salariedEmails } from "./payroll-config";
@@ -63,17 +63,36 @@ function isTransactionClient(client: ExportDbClient): boolean {
  * other, only with somebody CHANGING these rows (integration-store's
  * updateIntegrationSettings takes FOR UPDATE on the same Integration row).
  *
+ * THE ROW LOCK IS NOT THE FENCE ON THE Integration ROW — the advisory lock is.
+ * FOR SHARE can only lock a row that EXISTS, and on a database that has never
+ * saved an integration there is no row: the statement locks nothing, returns
+ * nothing, and reports no problem. saveGustoSettings serialises on its OWN
+ * advisory key rather than on this transaction, so it was free to INSERT the
+ * first employee mapping after this read and before this transaction's COMMIT —
+ * and lockPayrollPeriod would freeze a hash over a mappings blob that was
+ * already stale at the instant it committed. Taking the SAME key the saver
+ * takes (acquireIntegrationSettingsLock) covers the row's absence as well as
+ * its presence, which is the whole reason that key exists. The FOR SHARE stays:
+ * it is a second fence against anything that ever writes "Integration" without
+ * going through integration-store.
+ *
+ * Taken FIRST, before either row lock, so a saver blocks before it has read
+ * anything rather than after it has built a document from a stale blob.
+ *
  * Only meaningful inside a transaction. On the base client every statement is
  * its own transaction, so the lock would be released before the next line —
  * hence the guard rather than a lock that silently promises nothing. The page
  * render and the download endpoint are ordinary reads and take nothing.
  *
  * LOCK ORDER: taken AFTER the payroll advisory lock (tier 1) and BEFORE any
- * TimeEntry row lock, and nothing that holds these two rows ever goes on to
- * wait for a payroll lock — so this adds no cycle to the order documented in
- * payroll-period.ts.
+ * TimeEntry row lock, and nothing that holds the integration key or these two
+ * rows ever goes on to wait for a payroll lock — so this adds no cycle to the
+ * order documented in payroll-period.ts.
  */
 async function lockExportInputRows(client: Prisma.TransactionClient): Promise<void> {
+    // The saver's own key — covers the Integration row's ABSENCE, which no row
+    // lock can. See the note above.
+    await acquireIntegrationSettingsLock(client);
     await client.$queryRawUnsafe(`SELECT "id" FROM "CompanySettings" WHERE "id" = $1 FOR SHARE`, "singleton");
     await client.$queryRawUnsafe(`SELECT "id" FROM "Integration" WHERE "id" = $1 FOR SHARE`, "system_settings");
 }
