@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "expectedSha256" TEXT,
     "uploadUrlExpiresAt" TIMESTAMP(3),
     "uploadLeaseVersion" INTEGER NOT NULL DEFAULT 0,
+    "uploadLeaseNonce" TEXT,
     "vendor" TEXT,
     "txnDate" DATE,
     "totalCents" INTEGER,
@@ -68,6 +69,7 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses" INTEGER NOT NU
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "expectedSha256" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "uploadUrlExpiresAt" TIMESTAMP(3);
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "uploadLeaseVersion" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "uploadLeaseNonce" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;

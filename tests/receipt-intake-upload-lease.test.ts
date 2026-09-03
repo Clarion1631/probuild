@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import {
     discardUnresumedLease,
     liveLeasePath,
+    newLeaseNonce,
     reuseLiveLease,
     type LeaseRow,
 } from "../src/lib/receipt-intake/upload-lease";
@@ -26,18 +27,24 @@ import { uploadPathFor } from "../src/lib/receipt-intake/stored-object";
 
 const HOUR = 60 * 60_000;
 
+/** The generation the CREATING request stamped on the lease. */
+const CREATED_NONCE = "lease-nonce-created";
+
+type LeaseFixture = LeaseRow & { uploadLeaseNonce: string };
+
 /** A recoverable park: the state the earlier fix did NOT cover. */
-const parked = (over: Partial<LeaseRow> = {}): LeaseRow => ({
+const parked = (over: Partial<LeaseFixture> = {}): LeaseFixture => ({
     id: "row-1",
     state: "NEEDS_REVIEW",
     stateReason: "sha-mismatch",
     uploadLeaseVersion: 2,
     storagePath: uploadPathFor("row-1", 2, "png"),
     uploadUrlExpiresAt: new Date(Date.now() + HOUR),
+    uploadLeaseNonce: CREATED_NONCE,
     ...over,
 });
 
-const staging = (over: Partial<LeaseRow> = {}): LeaseRow => parked({
+const staging = (over: Partial<LeaseFixture> = {}): LeaseFixture => parked({
     state: "STAGING",
     stateReason: null,
     uploadLeaseVersion: 1,
@@ -58,6 +65,7 @@ interface Store {
  */
 function client(rows: (LeaseRow | Record<string, unknown>)[]) {
     const store: Store = { rows: rows.map(r => ({ ...r } as Record<string, unknown>)), signed: [], deleted: [] };
+    let adoptions = 0;
     const matching = (where: Record<string, unknown>) => (row: Record<string, unknown>) =>
         Object.entries(where).every(([key, want]) => {
             const have = row[key];
@@ -85,6 +93,9 @@ function client(rows: (LeaseRow | Record<string, unknown>)[]) {
             return { uploadUrl: `https://example/${storagePath}`, token: "tok", storagePath };
         },
         expiresAt: () => new Date(Date.now() + 2 * HOUR),
+        // Deterministic, and never the creator's: an adoption must always be
+        // distinguishable from the lease it adopted.
+        nonce: () => "lease-nonce-adopted-" + (++adoptions),
     };
     return { store, deps };
 }
@@ -265,11 +276,12 @@ test("an extended lease whose URL cannot be signed is a 503, not a fall-through"
 // ── The finding: a failed signer deleted a row another request had RESUMED ──
 
 /** The lease /start just wrote, as the request that wrote it knows it. */
-const asCreated = (row: LeaseRow) => ({
+const asCreated = (row: LeaseFixture) => ({
     id: row.id,
     storagePath: row.storagePath,
     uploadLeaseVersion: row.uploadLeaseVersion,
     uploadUrlExpiresAt: row.uploadUrlExpiresAt!,
+    uploadLeaseNonce: row.uploadLeaseNonce,
 });
 
 test("A RESUMED ROW SURVIVES the original request's signer failure", async () => {
@@ -332,9 +344,10 @@ test("a row that PUBLISHED under us is not deleted", async () => {
 });
 
 test("the discard CAS reads every column an adopter would have moved", async () => {
-    // Each of the four is the ONLY witness for one way the row can be adopted:
-    // the expiry for a lease reuse, the version and path for a resume, the
-    // state for a publish.
+    // Each is a witness for one way the row can be adopted: the version and
+    // path for a resume, the state for a publish, and the NONCE for a lease
+    // reuse -- which the expiry alone could not see, because a reuse writes the
+    // same "now + 2h" the original issue did.
     const created = staging();
     const { store, deps } = client([created]);
     for (const [column, value] of [
@@ -342,6 +355,7 @@ test("the discard CAS reads every column an adopter would have moved", async () 
         ["uploadLeaseVersion", 9],
         ["storagePath", "receipts/intake/row-1.v9.png"],
         ["state", "NEEDS_REVIEW"],
+        ["uploadLeaseNonce", "lease-nonce-adopted-1"],
     ] as const) {
         store.rows = [{ ...created, [column]: value } as Record<string, unknown>];
         assert.equal(
@@ -351,4 +365,85 @@ test("the discard CAS reads every column an adopter would have moved", async () 
         );
         assert.equal(store.rows.length, 1, column);
     }
+});
+
+// -- The hole in the previous round's own fix: an expiry is not an identity ---
+
+test("SAME-MILLISECOND EXPIRY: an adopted row still survives the discard", async () => {
+    // The previous CAS pinned `uploadUrlExpiresAt` and argued the adopter's
+    // value must read strictly LATER, because it can only run after this
+    // request's INSERT committed. That is an argument about ORDER; the CAS needs
+    // INEQUALITY. Production issues both the initial and the resumed expiry as
+    // "now + 2h" and Date.now() has millisecond resolution, so two requests a
+    // few hundred microseconds apart write the SAME instant -- and the delete
+    // then removed a row the retry had already been handed a working URL for.
+    const created = staging();
+    const { store, deps } = client([created]);
+
+    // The adopter, with a clock that lands on the exact instant we wrote.
+    const sameInstant = {
+        ...deps,
+        expiresAt: () => new Date(created.uploadUrlExpiresAt!.getTime()),
+    };
+    const resumed = await reuseLiveLease(created, "png", sameInstant);
+    assert.equal(resumed?.kind, "signed");
+    assert.equal(
+        (store.rows[0].uploadUrlExpiresAt as Date).getTime(),
+        created.uploadUrlExpiresAt!.getTime(),
+        "the expiry is byte-identical: the OLD CAS's only witness saw nothing",
+    );
+    assert.notEqual(store.rows[0].uploadLeaseNonce, CREATED_NONCE, "but the generation moved");
+
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
+    assert.equal(store.rows.length, 1, "the row survives");
+    assert.deepEqual(store.deleted, [], "and nothing is dropped");
+    const signed = (resumed as { signed: { storagePath: string } }).signed;
+    assert.equal(signed.storagePath, store.rows[0].storagePath, "the retry's URL still names a live row");
+});
+
+test("CLOCK SKEW: an adoption whose expiry reads EARLIER also survives", async () => {
+    // Two hosts, two clocks. The adopter's "now + 2h" can land BEFORE ours, so
+    // any reasoning that treats the expiry as monotonic is wrong in both
+    // directions -- and a CAS written as a comparison rather than an equality
+    // would delete this row.
+    const created = staging();
+    const { store, deps } = client([created]);
+    const skewed = {
+        ...deps,
+        expiresAt: () => new Date(created.uploadUrlExpiresAt!.getTime() - 5 * 60_000),
+    };
+    const resumed = await reuseLiveLease(created, "png", skewed);
+    assert.equal(resumed?.kind, "signed");
+    assert.ok(
+        (store.rows[0].uploadUrlExpiresAt as Date).getTime() < created.uploadUrlExpiresAt!.getTime(),
+        "the adopted lease really does expire earlier than the one we wrote",
+    );
+
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
+    assert.equal(store.rows.length, 1);
+});
+
+test("the control, restated: with NO adoption the generation is untouched and the row goes", async () => {
+    // Without this, a CAS that matched nothing would pass both tests above while
+    // leaking a STAGING row -- and its sourceRef -- on every signer failure.
+    const created = staging();
+    const { store, deps } = client([created]);
+    assert.equal(store.rows[0].uploadLeaseNonce, CREATED_NONCE);
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "discarded");
+    assert.deepEqual(store.rows, []);
+});
+
+test("every adoption stamps a FRESH generation, so two of them never collide", async () => {
+    const created = staging();
+    const { store, deps } = client([created]);
+    await reuseLiveLease(created, "png", deps);
+    const first = store.rows[0].uploadLeaseNonce;
+    await reuseLiveLease(created, "png", deps);
+    assert.notEqual(store.rows[0].uploadLeaseNonce, first, "the second adoption wrote its own");
+    assert.notEqual(first, CREATED_NONCE);
+});
+
+test("the real generator is unique per call -- the fake's determinism is the test's", () => {
+    const seen = new Set(Array.from({ length: 200 }, () => newLeaseNonce()));
+    assert.equal(seen.size, 200);
 });

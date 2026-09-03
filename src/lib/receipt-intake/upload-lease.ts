@@ -19,6 +19,7 @@
  * out from under the first attempt. The rule does not depend on the state, so
  * neither does this module — both /start branches go through it.
  */
+import { randomUUID } from "node:crypto";
 import { publishFence, uploadPathFor, type ObservedRow } from "./stored-object";
 
 export interface LeaseRow extends ObservedRow {
@@ -47,6 +48,25 @@ export interface LeaseDeps {
     /** When a freshly issued URL stops working. */
     expiresAt: () => Date;
     now?: () => number;
+    /**
+     * The adoption generation written on every lease issue or extension. A
+     * fresh, unguessable value each call — see `newLeaseNonce`.
+     */
+    nonce?: () => string;
+}
+
+/**
+ * The value `uploadLeaseNonce` carries, and the reason it is random rather than
+ * a counter.
+ *
+ * A counter would have to be READ before it could be incremented, which is one
+ * more thing for two concurrent adopters to agree about; a random value needs
+ * no read at all and still gives the discard CAS the only property it wants —
+ * "nobody else has written this column since I did". Uniqueness is the whole
+ * contract; ordering is not.
+ */
+export function newLeaseNonce(): string {
+    return randomUUID();
 }
 
 export type LeaseReuse =
@@ -88,6 +108,15 @@ export function liveLeasePath(row: LeaseRow, ext: string, now: number = Date.now
  * branch: we know a live lease existed a moment ago, so re-pathing and deleting
  * on the strength of a row that just moved is precisely what this prevents. The
  * client retries and reads whatever the winner left.
+ *
+ * THE ADOPTION IS ALSO STAMPED, with a fresh `uploadLeaseNonce`. That column is
+ * what `discardUnresumedLease` pins, and it is written here rather than being
+ * inferred from the expiry: an extension and an original issue both compute
+ * "now + 2h", so the expiry can legitimately come out identical and the discard
+ * would then delete the very row this call just adopted. The nonce is NOT part
+ * of this CAS's where clause — two honest retries may both reuse the same live
+ * lease over the same path, and turning that into a 409 would break the
+ * idempotency this module exists to provide.
  */
 export async function reuseLiveLease(
     row: LeaseRow,
@@ -103,7 +132,11 @@ export async function reuseLiveLease(
     // here looked at, is not quietly re-armed.
     const { count } = await deps.db.updateMany({
         where: { id: row.id, storagePath: row.storagePath, ...publishFence(row) },
-        data: { ...rearm, uploadUrlExpiresAt: deps.expiresAt() },
+        data: {
+            ...rearm,
+            uploadUrlExpiresAt: deps.expiresAt(),
+            uploadLeaseNonce: (deps.nonce ?? newLeaseNonce)(),
+        },
     });
     if (count === 0) return { kind: "conflict" };
 
@@ -117,6 +150,8 @@ export interface CreatedLease {
     storagePath: string;
     uploadLeaseVersion: number;
     uploadUrlExpiresAt: Date;
+    /** The generation THIS request wrote. The discard below pins it exactly. */
+    uploadLeaseNonce: string;
 }
 
 export interface DiscardClient {
@@ -142,16 +177,27 @@ export interface DiscardClient {
  * protection against a DIFFERENT document reusing it was gone with it.
  *
  * So the delete is a CAS over the lease THIS request wrote. Every way another
- * request can adopt the row moves one of these four columns:
+ * request can adopt the row writes `uploadLeaseNonce`, and each also moves one
+ * of the other pinned columns:
  *   - reuseLiveLease extends `uploadUrlExpiresAt` (same path, same version)
  *   - the resume branch bumps `uploadLeaseVersion` and repaths `storagePath`
  *   - anything that publishes or parks it moves `state` off STAGING
  *
- * The expiry alone is enough to see the reuse: a retry can only reach it AFTER
- * this request's INSERT committed (that is what gave it the unique violation),
- * so its `expiresAt()` is read strictly later than ours — never the same
- * millisecond as a value that was computed before a round trip the retry had to
- * observe the result of.
+ * THE EXPIRY IS NOT ENOUGH ON ITS OWN, which is what the previous round got
+ * wrong. It reasoned that a retry can only reach the reuse AFTER this INSERT
+ * committed, so its `expiresAt()` must read strictly later than ours. That is
+ * an argument about ORDER, and this CAS needs INEQUALITY: production issues
+ * both the initial and the resumed expiry as "now + 2h", `Date.now()` has
+ * millisecond resolution, and two requests a few hundred microseconds apart —
+ * or on two hosts whose clocks are merely close — write the SAME instant. The
+ * pin then matched, the row another request had just adopted was deleted, its
+ * bytes landed at a path nothing pointed at, and /finalize 404'd.
+ *
+ * `uploadLeaseNonce` closes that: it is a fresh random value on every issue and
+ * every adoption, so "nobody wrote this column after I did" is a property of
+ * the value itself rather than of a clock. The other three columns stay in the
+ * fence — they are cheap, and each one independently rules out a class of
+ * adopter.
  *
  * `resumed` is not an error: somebody else owns this row and their URL works.
  * The caller answers the idempotent conflict rather than reporting a failure
@@ -168,6 +214,7 @@ export async function discardUnresumedLease(
             storagePath: created.storagePath,
             uploadLeaseVersion: created.uploadLeaseVersion,
             uploadUrlExpiresAt: created.uploadUrlExpiresAt,
+            uploadLeaseNonce: created.uploadLeaseNonce,
         },
     });
     return count > 0 ? "discarded" : "resumed";

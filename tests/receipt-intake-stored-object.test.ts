@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     canonicalStoragePath,
+    declaredShaConflict,
     downloadVerified,
     finalizeDisposition,
     inspectStoredObject,
@@ -728,4 +729,69 @@ test("the three verdicts /start maps: mutated -> mismatch, fault -> transient, m
 
     // Only verified bytes reach alreadyReceived.
     assert.deepEqual(await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: PNG })), { ok: true });
+});
+
+// -- A DECLARED hash is answered on EVERY success path (round-34 item 3) -----
+
+const SHA_A = "a".repeat(64);
+const SHA_B = "b".repeat(64);
+
+test("a declared hash that disagrees with the row's verified one is a conflict", () => {
+    assert.equal(declaredShaConflict(SHA_A, SHA_B), true);
+    // Case is not identity: /start lowercases what it stores, a forwarder may
+    // not, and rejecting on case alone would break honest callers.
+    assert.equal(declaredShaConflict(SHA_A.toUpperCase(), SHA_A), false);
+    assert.equal(declaredShaConflict(SHA_A, SHA_A.toUpperCase()), false);
+    assert.equal(declaredShaConflict(SHA_A, SHA_A), false);
+});
+
+test("silence is not a conflict: no declared hash, and no verified one", () => {
+    // The caller asserted nothing.
+    assert.equal(declaredShaConflict(SHA_A, null), false);
+    assert.equal(declaredShaConflict(SHA_A, ""), false);
+    // A STAGING row (fileSha256 is "") or a legacy row written before sealing
+    // existed has no verified identity to compare against — the publish path
+    // checks the declared hash against the BYTES instead, which is stronger.
+    assert.equal(declaredShaConflict("", SHA_B), false);
+    assert.equal(declaredShaConflict(null, SHA_B), false);
+});
+
+test("/finalize enforces it ABOVE the disposition split, so no success bypasses it", () => {
+    // The hole: `declaredSha` was compared to the STORED BYTES on the publish
+    // path only. A finalize against an already-settled row (RECEIVED, READ,
+    // BOOKED) verified storage against the ROW's hash, never looked at the hash
+    // the REQUEST carried, and returned 200 alreadyFinalized — so a forwarder
+    // with a stale or wrong row id was told we held ITS receipt while we held a
+    // different one, and it deletes its only copy on that answer.
+    const finalize = replayRoutes["POST /api/receipts/intake/{id}/finalize"];
+    const guardAt = finalize.indexOf("declaredShaConflict(row.fileSha256, declaredSha)");
+    assert.notEqual(guardAt, -1, "the guard must be wired to the row's verified hash");
+    assert.ok(guardAt < finalize.indexOf("const disposition = finalizeDisposition(row)"),
+        "above the disposition split");
+    assert.ok(guardAt < finalize.indexOf("alreadyFinalized: true"), "above every success response");
+    assert.ok(guardAt < finalize.indexOf("await applyLateFields("), "and above every write");
+    // A 409, never a 2xx and never a write.
+    const guard = finalize.slice(guardAt, finalize.indexOf("// Authorize the late fields"));
+    assert.match(guard, /error: "sha-mismatch"/);
+    assert.match(guard, /status: 409/);
+    assert.ok(!/prisma\.receiptIntake\.update/.test(guard), "nothing is written on the way out");
+});
+
+test("the OTHER two replay paths already refuse a mismatching hash", () => {
+    // Same rule, and it has to hold in all three or a forwarder can pick the
+    // endpoint that answers most generously.
+    //
+    // /start requires `sha256` and compares it to whatever the row has recorded
+    // BEFORE it can reach the settled "alreadyReceived" answer; the inline POST
+    // hashes the bytes in the request body and compares those. Neither needs the
+    // helper above — they already fail closed — but if either check is ever
+    // removed this says so.
+    assert.match(
+        replayRoutes["POST /api/receipts/intake/start"],
+        /if \(!knownSha \|\| knownSha !== expectedSha256\) \{/,
+    );
+    assert.match(
+        replayRoutes["POST /api/receipts/intake"],
+        /if \(existing\.fileSha256 !== fileSha256\) \{/,
+    );
 });

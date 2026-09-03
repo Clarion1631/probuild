@@ -3066,6 +3066,18 @@ model ReceiptIntake {
   /// v1, and every destructive write fences on the version it observed, so the
   /// sweep's verdict lands on nothing.
   uploadLeaseVersion Int       @default(0)
+  /// The ADOPTION GENERATION of the current lease: a fresh random value written
+  /// every time a lease is issued, extended or re-armed for this row.
+  ///
+  /// It exists because /start's own discard CAS needed a column that provably
+  /// MOVES on adoption and it had none. That CAS pinned `uploadUrlExpiresAt`,
+  /// but a reuse writes "now + 2h" exactly as the original issue did — so two
+  /// requests landing in the same millisecond (or on hosts whose clocks agree
+  /// too well) wrote the SAME expiry, the CAS matched, and the delete removed a
+  /// row another request had already adopted and handed a working URL for. The
+  /// version cannot serve instead: it is embedded in the object path, so
+  /// bumping it on a same-path reuse would break the lease-reuse contract.
+  uploadLeaseNonce   String?
 
   // read results (cents, like AutomationEvent)
   vendor     String?

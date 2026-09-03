@@ -6,6 +6,7 @@ import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import {
+    declaredShaConflict,
     finalizeDisposition,
     inspectStoredObject,
     publishFence,
@@ -255,6 +256,38 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         row.createdById === auth.user.id ||
         STAFF_READ_ROLES.includes(auth.user.role);
     if (!maySee) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // THE DECLARED HASH IS ENFORCED HERE, ONCE, AHEAD OF EVERY OUTCOME.
+    //
+    // It used to be checked on the publish path alone — against the STORED
+    // BYTES, further down — which meant a finalize against an already-settled
+    // row (RECEIVED, READ, BOOKED) verified storage against the ROW's hash,
+    // never looked at the hash the REQUEST carried, and answered 200
+    // alreadyFinalized. A forwarder holding a stale or wrong row id was
+    // therefore told we had ITS receipt while we had a different one, and it
+    // deletes its only copy on that answer.
+    //
+    // Placed above the disposition split rather than inside the settled branch
+    // so that no success response in this handler can be added later that
+    // bypasses it. The publish path still re-checks the declared hash against
+    // the bytes it just read, which is the stronger question and the only one
+    // a STAGING row (`fileSha256` is "") can be asked at all.
+    //
+    // Same rule /start already applies to its own settled replay: a recorded
+    // `fileSha256` that disagrees with the caller's hash is a 409, never a
+    // rebinding of this identity to different bytes.
+    if (declaredShaConflict(row.fileSha256, declaredSha)) {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "sha-mismatch",
+                reason: "this row holds a different document than the sha256 you declared",
+                recordedSha256: row.fileSha256,
+                state: row.state,
+            },
+            { status: 409 },
+        );
+    }
 
     // Authorize the late fields BEFORE anything is written or published.
     const denied = await authorizeFinalization(auth, row.projectId, lateFields);

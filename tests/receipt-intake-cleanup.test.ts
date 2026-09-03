@@ -15,6 +15,7 @@ const ROOT = path.resolve(__dirname, "..");
 const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cleanup.ts"), "utf8");
 const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
 const bucket = readFileSync(path.join(ROOT, "src/lib/receipt-intake/bucket.ts"), "utf8");
+const start = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/start/route.ts"), "utf8");
 
 /**
  * The body of one top-level function, EOL-agnostic.
@@ -106,4 +107,58 @@ test("a missing storage client is an ERROR for the cleanup path", () => {
     // but the receipts one.
     assert.ok(!/removeSecureDoc/.test(cleanup), "cleanup never uses the quiet variant");
     assert.ok(!/SECURE_BUCKET/.test(cleanup), "and never touches the shared document bucket");
+});
+
+// -- A repath that cannot sign must not leave its old object behind ----------
+
+/**
+ * Both /start branches that take a NEW lease re-point the row BEFORE signing —
+ * deliberately, so a sweep cannot reject the row for the OLD upload while a URL
+ * for the new one is already in the client's hands.
+ *
+ * The consequence nobody had followed through: the moment that CAS lands, the
+ * previous path is unreferenced whatever happens next. The cleanup used to sit
+ * AFTER the signer, so every `storage-unavailable` return leaked an object that
+ * nothing pointed at (the row moved), nothing swept (the stale-STAGING sweep
+ * looks at rows), and nothing remembered (no cleanup event had been recorded).
+ *
+ * The fix is ordering, not a new mechanism: the same guarded
+ * `deleteObjectOrRecord` the happy path already used, moved above the signer.
+ */
+const startBranches = {
+    "the recoverable re-arm": start.slice(
+        start.indexOf("const retryPath ="),
+        start.indexOf("// IDENTITY MUST BE PROVEN"),
+    ),
+    "the expired-lease resume": start.slice(start.indexOf("const resumePath =")),
+};
+
+test("the OLD object is cleaned up before the signer can fail, in BOTH branches", () => {
+    for (const [name, branch] of Object.entries(startBranches)) {
+        assert.notEqual(branch.length, 0, name);
+        const cleanupAt = branch.indexOf("deleteObjectOrRecord(existing.storagePath");
+        const signAt = branch.indexOf("await signUpload(");
+        assert.notEqual(cleanupAt, -1, `${name}: the previous lease's object must still be cleaned up`);
+        assert.notEqual(signAt, -1, `${name}: the branch must still sign a URL`);
+        assert.ok(
+            cleanupAt < signAt,
+            `${name}: the cleanup must run BEFORE the signer, or a 503 orphans the old object`,
+        );
+        // Guarded, not a bare delete: a delete that fails records a pending
+        // cleanup, which is the only thing that will remember those bytes.
+        assert.match(branch, /deleteObjectOrRecord\(existing\.storagePath, "start-(rearmed|resumed)-repath"\)/);
+        // ...and still only when the path actually moved. Deleting the path the
+        // row was just re-pointed AT would destroy the live upload target.
+        assert.match(branch, /if \((retryPath|resumePath) !== existing\.storagePath\) \{/);
+    }
+});
+
+test("a signer failure still answers 503, and the row keeps the NEW lease", () => {
+    // The row is not rolled back: it holds the new path and a live expiry, so
+    // the caller's retry lands in reuseLiveLease and is handed a URL over that
+    // same path. Rolling back instead would re-open the window this ordering
+    // exists to close.
+    for (const [name, branch] of Object.entries(startBranches)) {
+        assert.match(branch, /reason: "storage-unavailable" \}, \{ status: 503 \}/, name);
+    }
 });

@@ -192,8 +192,62 @@ export interface CreateQBReceiptPurchaseInput {
  */
 export type ReceiptAttachmentStatus = "attached" | "already-attached" | "skipped" | `failed:${string}`;
 
+/**
+ * What QuickBooks ACTUALLY holds for a Purchase that already exists, read off
+ * the entity rather than assumed from the payload we would have sent.
+ *
+ * `projectNames` is a list because the job rides on each LINE's CustomerRef and
+ * a Purchase can carry several: one name is an answer, two is an ambiguity that
+ * nobody may resolve automatically.
+ */
+export interface BookedPurchaseValues {
+    /** QBO's `TotalAmt`. Null only when the entity did not carry a usable one. */
+    totalAmount: number | null;
+    /** QBO's `TxnDate`, as a calendar day. Null when absent or not a real date. */
+    txnDate: string | null;
+    /** `EntityRef.name`. Null when QBO returned the ref without a display name. */
+    vendor: string | null;
+    /** Distinct `CustomerRef.name`s across the expense lines. */
+    projectNames: string[];
+    /** Dollars posted to the reimbursable-sales-tax account. */
+    taxAmount: number;
+}
+
+/**
+ * What may be done with a Purchase that is already in the books.
+ *
+ * - `match`  — the books agree with this document; book it as planned.
+ * - `derive` — they disagree about the AMOUNT, DATE or VENDOR. QuickBooks is
+ *   the booked truth for those (real money posted against them, and the
+ *   difference is OCR noise on our side), so the Expense is written from the
+ *   QBO values and the difference is recorded.
+ * - `review` — they disagree about the PROJECT or the TAX SPLIT, or QBO did not
+ *   give a usable total or date at all. Those are attribution decisions, not
+ *   noise: which job carries the cost, and whether the sales tax is sitting on
+ *   the reclaimable account. Neither side may be preferred automatically, so no
+ *   Expense is written and a human looks.
+ */
+export interface ExistingPurchaseCheck {
+    verdict: "match" | "derive" | "review";
+    /** Stable, sorted field names: "amount" | "date" | "vendor" | "project" | "tax". */
+    differences: string[];
+    booked: BookedPurchaseValues;
+}
+
 export type CreateQBReceiptPurchaseResult =
-    | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: true; attachment: ReceiptAttachmentStatus }
+    | {
+        ok: true;
+        qbPurchaseId: string;
+        docNumber: string;
+        alreadyExists: true;
+        attachment: ReceiptAttachmentStatus;
+        /**
+         * The books, compared against what THIS document says. Present only on
+         * the alreadyExists branch, because it is the only one where a Purchase
+         * we did not write in this call decides what the Expense should say.
+         */
+        existing: ExistingPurchaseCheck;
+    }
     | { ok: true; qbPurchaseId: string; docNumber: string; alreadyExists: false; attachment: ReceiptAttachmentStatus }
     | { ok: false; reason: "project-not-matched"; projectName: string }
     | { ok: false; reason: "docnumber-conflict"; docNumber: string }
@@ -275,6 +329,127 @@ function findExactProjectMatch(
     const target = normalizeProjectName(projectName);
     const matches = projects.filter(p => normalizeProjectName(p.name) === target);
     return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * The cents a booked value may differ by and still count as the same money.
+ *
+ * Two, matching the tolerance the group/total reconciliation above already
+ * allows: a two-line tax split can round each half independently.
+ */
+const BOOKED_AMOUNT_TOLERANCE_CENTS = 2;
+
+/** A QBO ReferenceType's display name, when it carried one. */
+function refName(ref: unknown): string | null {
+    if (!ref || typeof ref !== "object") return null;
+    const name = (ref as { name?: unknown }).name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+function expenseLineDetail(line: unknown): Record<string, unknown> | null {
+    if (!line || typeof line !== "object") return null;
+    const detail = (line as { AccountBasedExpenseLineDetail?: unknown }).AccountBasedExpenseLineDetail;
+    return detail && typeof detail === "object" ? (detail as Record<string, unknown>) : null;
+}
+
+/**
+ * READ THE BOOKS. Every value comes off the QBO entity — nothing is inferred
+ * from the payload this process would have sent, because the whole point is to
+ * find out where the two disagree.
+ */
+export function readBookedPurchase(purchase: Record<string, unknown>, taxAccountId: string): BookedPurchaseValues {
+    const rawTotal = Number(purchase.TotalAmt);
+    const rawDate = purchase.TxnDate;
+    const lines = Array.isArray(purchase.Line) ? purchase.Line : [];
+
+    let taxCents = 0;
+    const projectNames = new Set<string>();
+    for (const line of lines) {
+        const detail = expenseLineDetail(line);
+        if (!detail) continue;
+        const customer = refName(detail.CustomerRef);
+        if (customer) projectNames.add(customer);
+        const account = (detail.AccountRef as { value?: unknown } | undefined)?.value;
+        if (account !== undefined && String(account) === taxAccountId) {
+            const amount = Number((line as { Amount?: unknown }).Amount);
+            if (Number.isFinite(amount)) taxCents += Math.round(amount * 100);
+        }
+    }
+
+    return {
+        totalAmount: Number.isFinite(rawTotal) && rawTotal > 0 ? rawTotal : null,
+        txnDate: isValidCalendarDate(rawDate) ? rawDate : null,
+        vendor: refName(purchase.EntityRef),
+        projectNames: Array.from(projectNames),
+        taxAmount: taxCents / 100,
+    };
+}
+
+function normalizeVendorName(name: string): string {
+    return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * COMPARE THE BOOKS AGAINST THIS DOCUMENT, and say which way the disagreement
+ * has to be resolved. See ExistingPurchaseCheck for the rule and why the two
+ * halves are split where they are.
+ *
+ * An UNREADABLE total or date is a `review`, never a pass. QBO returns both on
+ * every Purchase, so their absence means we are not looking at what we think we
+ * are looking at — and "I could not check" must not read the same as "I checked
+ * and it agrees" on the one path that decides what a real Expense records.
+ *
+ * A missing vendor or customer NAME is different: QBO documents the `name` on a
+ * ReferenceType as optional, so its absence is a fact about the response shape
+ * rather than about the books. Those compare only when a name is present, and
+ * the snapshot records what was (and was not) readable.
+ */
+export function compareExistingPurchase(
+    booked: BookedPurchaseValues,
+    input: Pick<CreateQBReceiptPurchaseInput, "projectName" | "vendor" | "date" | "totalAmount" | "groups">,
+): ExistingPurchaseCheck {
+    const derive: string[] = [];
+    const review: string[] = [];
+
+    const plannedCents = Math.round(Number(input.totalAmount) * 100);
+    if (booked.totalAmount === null) {
+        review.push("amount");
+    } else if (Math.abs(Math.round(booked.totalAmount * 100) - plannedCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        derive.push("amount");
+    }
+
+    if (booked.txnDate === null) {
+        review.push("date");
+    } else if (booked.txnDate !== input.date) {
+        derive.push("date");
+    }
+
+    const plannedVendor = (input.vendor ?? "").trim();
+    if (booked.vendor && plannedVendor && normalizeVendorName(booked.vendor) !== normalizeVendorName(plannedVendor)) {
+        derive.push("vendor");
+    }
+
+    // One name that matches is the only pass. Two names is an ambiguity a human
+    // resolves — QBO let the lines be split across jobs and nothing here can
+    // decide which one this receipt belongs to.
+    if (booked.projectNames.length > 0) {
+        const agrees = booked.projectNames.length === 1
+            && normalizeProjectName(booked.projectNames[0]) === normalizeProjectName(input.projectName);
+        if (!agrees) review.push("project");
+    }
+
+    const plannedTaxCents = input.groups
+        .filter(g => g.tax === true)
+        .reduce((sum, g) => sum + Math.round(Number(g.amount) * 100), 0);
+    const bookedTaxCents = Math.round(booked.taxAmount * 100);
+    if (Math.abs(bookedTaxCents - plannedTaxCents) > BOOKED_AMOUNT_TOLERANCE_CENTS) {
+        review.push("tax");
+    }
+
+    const differences = [...review, ...derive].sort();
+    if (review.length > 0) return { verdict: "review", differences, booked };
+    if (derive.length > 0) return { verdict: "derive", differences, booked };
+    return { verdict: "match", differences, booked };
 }
 
 /** Same round-trip validation parseBackfillDate uses in the qbo-expenses/sync route. */
@@ -690,24 +865,39 @@ export async function createQBReceiptPurchase(
 
     const docNumber = input.fileId.slice(0, 21);
     const marker = `[gtr-file:${input.fileId}]`;
+    // Read once, up here, because the idempotency branch below needs the tax
+    // account to tell a reclaimable-tax line apart from an expense line.
+    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
+    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
+    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
 
     // Idempotency first — never re-create a Purchase for a file already
     // pushed. A DocNumber hit whose PrivateNote does NOT carry this file's
     // full marker is a genuine id collision (truncated to 21 chars — two
     // different Drive fileIds can share that prefix), not a re-send: refuse
     // rather than silently attach to the wrong Purchase.
-    const existing = await qbQueryFn<{ Id: string; PrivateNote?: string }>(
+    //
+    // `SELECT *`, not `Id, PrivateNote`. Two fields were enough to answer "is
+    // this our Purchase"; they were NOT enough to answer "does it say what this
+    // document says", and the caller went on to write an Expense from the OCR
+    // read regardless. A v1-cutover Purchase, or one posted from an earlier
+    // revision of the same Drive file, then left ProBuild's job cost carrying a
+    // number, a date or a job the books do not have. QBO cannot return a
+    // nested Line/EntityRef/TxnTaxDetail from a field list, so the whole entity
+    // is fetched — it is one row, and only on the replay path.
+    const existing = await qbQueryFn<Record<string, unknown>>(
         tokens,
-        `SELECT Id, PrivateNote FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
+        `SELECT * FROM Purchase WHERE DocNumber = '${escapeQBString(docNumber)}'`,
     );
     if (existing.length > 0) {
-        if (existing.length > 1 || !(existing[0].PrivateNote ?? "").includes(marker)) {
+        if (existing.length > 1 || !(String(existing[0].PrivateNote ?? "")).includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
         // THE PURCHASE EXISTS. Say so before doing anything else with it: the
         // attachment re-check below is a QBO round trip that can fail, and the
         // caller still has to know a Purchase is there.
         await deps.onExistingPurchase?.();
+        const booked = compareExistingPurchase(readBookedPurchase(existing[0], taxAccountId), input);
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
         // Purchase response was lost (timeout/kill) AFTER QBO committed it —
@@ -716,12 +906,19 @@ export async function createQBReceiptPurchase(
         // every retry took this same early return. Re-check and fill the gap.
         const attachment = await ensureAttachmentOnExistingPurchase(
             tokens,
-            existing[0].Id,
+            String(existing[0].Id),
             input,
             qbQueryFn,
             uploadAttachment,
         );
-        return { ok: true, qbPurchaseId: existing[0].Id, docNumber, alreadyExists: true, attachment };
+        return {
+            ok: true,
+            qbPurchaseId: String(existing[0].Id),
+            docNumber,
+            alreadyExists: true,
+            attachment,
+            existing: booked,
+        };
     }
 
     const projects = await listProjects();
@@ -804,10 +1001,6 @@ export async function createQBReceiptPurchase(
         }
         throw error;
     }
-
-    const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
-    const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
-    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
 
     const refSuffix = input.invoice
         ? ` · Invoice ${input.invoice}`

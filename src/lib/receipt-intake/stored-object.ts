@@ -159,6 +159,30 @@ export async function downloadVerified(
 }
 
 /**
+ * A DECLARED HASH IS A CLAIM ABOUT WHICH DOCUMENT THIS CALL IS ABOUT — and it
+ * has to be answered on every path that can say "we have it", not only on the
+ * one that publishes.
+ *
+ * /finalize checked `sha256` against the STORED BYTES on the publish path and
+ * nowhere else, so a call against an already-settled row (RECEIVED, READ,
+ * BOOKED) verified the object against the ROW's recorded hash, ignored the
+ * different hash the request carried, and returned 200 alreadyFinalized. A
+ * forwarder that sent the wrong row id — a stale mapping, a reused id, a
+ * mis-parsed response — was told we held ITS document while we held somebody
+ * else's, and it deletes its only copy on that answer.
+ *
+ * Both halves must be present for this to be an answer: with no declared hash
+ * the caller asserted nothing, and an empty `fileSha256` is a row that was
+ * written before sealing existed (see downloadVerified) and has no verified
+ * identity to compare against. Neither is evidence of a conflict, and refusing
+ * on either would break honest callers.
+ */
+export function declaredShaConflict(recordedSha: string | null, declaredSha: string | null): boolean {
+    if (!declaredSha || !recordedSha) return false;
+    return recordedSha.toLowerCase() !== declaredSha.toLowerCase();
+}
+
+/**
  * "WE ALREADY HAVE IT" — THE ONE RULE BOTH REPLAY PATHS ANSWER IT WITH.
  *
  * `POST /api/receipts/intake` (a forwarder re-sending the same bytes) and

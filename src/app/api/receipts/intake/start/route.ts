@@ -14,7 +14,7 @@ import {
     uploadPathFor,
     verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
-import { discardUnresumedLease, reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
+import { discardUnresumedLease, newLeaseNonce, reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
 import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -147,6 +147,11 @@ export async function POST(req: Request) {
     // the value the discard below CASes on. Calling uploadLeaseExpiry() twice
     // would compare a fresh instant against the stored one and never match.
     const leaseExpiresAt = uploadLeaseExpiry();
+    // The generation THIS request stamps on the lease. The expiry alone could
+    // not identify it — a concurrent retry's reuse writes "now + 2h" too, and
+    // the two can be the same millisecond — so the discard CAS pins this
+    // instead. See discardUnresumedLease.
+    const leaseNonce = newLeaseNonce();
 
     let created: { id: string; sourceRef: string; state: string };
     try {
@@ -177,6 +182,7 @@ export async function POST(req: Request) {
                 // the row for what is at that path.
                 uploadUrlExpiresAt: leaseExpiresAt,
                 uploadLeaseVersion: 1,
+                uploadLeaseNonce: leaseNonce,
             },
             select: { id: true, sourceRef: true, state: true },
         });
@@ -310,6 +316,10 @@ export async function POST(req: Request) {
                         expectedSha256,
                         uploadUrlExpiresAt: uploadLeaseExpiry(),
                         uploadLeaseVersion: nextLease,
+                        // Same generation stamp every adoption writes, so a
+                        // concurrent discard can never mistake this row for
+                        // the lease it created.
+                        uploadLeaseNonce: newLeaseNonce(),
                         // The stored hash is what /finalize verifies against.
                         // Whatever was recorded describes bytes that are gone
                         // or were never right.
@@ -322,13 +332,30 @@ export async function POST(req: Request) {
                 if (count === 0) {
                     return leaseConflict(existing.id);
                 }
-                const rearmed = await signUpload(retryPath);
-                if (!rearmed) {
-                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-                }
-                // The previous lease's object (if any) is unreferenced now.
+                // THE OLD OBJECT IS UNREFERENCED THE INSTANT THE CAS LANDS —
+                // so it is cleaned up here, BEFORE the signing that may fail,
+                // rather than after it.
+                //
+                // The row moves first on purpose (see above), which means the
+                // previous path is orphaned whether or not a URL is ever
+                // issued for the new one. Doing the cleanup only on the happy
+                // path left every 503 below leaking an object nothing
+                // referenced and nothing remembered: not the row (it points
+                // elsewhere now), not the stale-STAGING sweep (it looks at
+                // rows), not the cleanup queue (nobody had recorded it).
+                // deleteObjectOrRecord is exactly the guarded path for this —
+                // it deletes, and records a pending cleanup when the delete
+                // fails.
                 if (retryPath !== existing.storagePath) {
                     await deleteObjectOrRecord(existing.storagePath, "start-rearmed-repath");
+                }
+                const rearmed = await signUpload(retryPath);
+                if (!rearmed) {
+                    // The row keeps the NEW path and a live expiry, so the
+                    // caller's retry lands in reuseLiveLease and is handed a
+                    // URL over that same path. Nothing is orphaned by the
+                    // failure itself.
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
                 return NextResponse.json({
                     ok: true,
@@ -465,14 +492,22 @@ export async function POST(req: Request) {
                     storagePath: resumePath,
                     uploadLeaseVersion: nextLease,
                     uploadUrlExpiresAt: uploadLeaseExpiry(),
+                    uploadLeaseNonce: newLeaseNonce(),
                 },
             });
             if (count === 0) return leaseConflict(existing.id);
-            const resumed = await signUpload(resumePath);
-            if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+            // BEFORE the signing, for the same reason as the re-arm above: the
+            // CAS already re-pointed the row, so the previous lease's object is
+            // unreferenced whatever the signer does next. Cleaning up only on
+            // success meant a 503 here left it in the bucket with nothing
+            // pointing at it and nothing remembering it.
             if (resumePath !== existing.storagePath) {
                 await deleteObjectOrRecord(existing.storagePath, "start-resumed-repath");
             }
+            const resumed = await signUpload(resumePath);
+            // The row is on the new path with a live expiry, so a retry resumes
+            // through reuseLiveLease over that same path.
+            if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             return NextResponse.json({
                 ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
             });
@@ -495,14 +530,22 @@ export async function POST(req: Request) {
         // retry had just adopted — its bytes landed at a path no row pointed
         // at, /finalize 404d on an id that no longer existed, and the
         // sourceRef stopped protecting anything. See discardUnresumedLease for
-        // the four columns the CAS reads and why the expiry alone catches a
-        // reuse.
+        // the columns the CAS reads and why the expiry alone could NOT see the
+        // reuse: an adoption writes "now + 2h" exactly as this request did, so
+        // the two can be the same millisecond. `leaseNonce` is what actually
+        // identifies this request's lease.
         //
         // Still best effort, exactly as before: a cleanup that could not run at
         // all leaves a STAGING row with no object, which the stale-STAGING
         // sweep already knows how to park. It never leaves a row deleted.
         const discarded = await discardUnresumedLease(
-            { id, storagePath, uploadLeaseVersion: 1, uploadUrlExpiresAt: leaseExpiresAt },
+            {
+                id,
+                storagePath,
+                uploadLeaseVersion: 1,
+                uploadUrlExpiresAt: leaseExpiresAt,
+                uploadLeaseNonce: leaseNonce,
+            },
             prisma.receiptIntake,
         ).catch(() => null);
         if (discarded === "resumed") {

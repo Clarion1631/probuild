@@ -25,6 +25,7 @@ import {
     expectedConstraints,
     foreignKeyDrift,
     parseSizeLimit,
+    expectedColumns,
     statements,
     targetMatches,
     verifyConstraints,
@@ -211,6 +212,24 @@ test("the busyPasses column is ALSO added by an ALTER, so an earlier table upgra
     const alter = statements.find((s: string) => /ADD COLUMN IF NOT EXISTS "busyPasses"/.test(s));
     assert.ok(alter, "the apply script must ALTER as well as CREATE");
     assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "busyPasses"/);
+});
+
+test("uploadLeaseNonce is created, ALTERed, and verified in all three places", () => {
+    // The adoption generation /start's discard CAS pins. A column that reached
+    // only the CREATE would never land on a database where the rollout script
+    // had already run once, and the CAS would then fence on a column that does
+    // not exist.
+    const createTable = statements.find((x: string) => x.includes('CREATE TABLE IF NOT EXISTS "ReceiptIntake"'));
+    assert.match(createTable!, /"uploadLeaseNonce"\s+TEXT/);
+    assert.ok(
+        statements.some((x: string) => /ADD COLUMN IF NOT EXISTS "uploadLeaseNonce" TEXT/.test(x)),
+        'the apply script must ALTER as well as CREATE',
+    );
+    assert.match(migrationSql, /ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "uploadLeaseNonce" TEXT/);
+    // NULLABLE on purpose: rows written before this column existed carry null,
+    // and /start stamps a value on every lease it issues from here on.
+    assert.ok(!/"uploadLeaseNonce"[^,]*NOT NULL/.test(createTable!));
+    assert.ok(expectedColumns.ReceiptIntake.includes('uploadLeaseNonce'), 'and verification must look for it');
 });
 
 test("STAGING is in the state set, and is the column DEFAULT", () => {

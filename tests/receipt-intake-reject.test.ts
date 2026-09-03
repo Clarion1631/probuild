@@ -286,7 +286,7 @@ test("both /start branches take the live-lease rule from the SAME place", () => 
     // Two copies of "may I reuse this lease" is how the STAGING path came to be
     // fixed while the recovery path stayed broken.
     assert.equal((start.match(/await reuseLiveLease\(/g) ?? []).length, 2, "recovery and resume");
-    assert.match(start, /import \{ discardUnresumedLease, reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
+    assert.match(start, /import \{ discardUnresumedLease, newLeaseNonce, reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
     // And one 409 helper, so every lost claim answers identically.
     assert.equal(
         (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
@@ -489,12 +489,23 @@ test("/start's signer-failure cleanup is a CAS over the lease it wrote, not a de
     );
     const branch = start.slice(start.indexOf("const signed = await signUpload(storagePath);"));
     assert.match(branch, /await discardUnresumedLease\(/);
-    assert.match(branch, /\{ id, storagePath, uploadLeaseVersion: 1, uploadUrlExpiresAt: leaseExpiresAt \}/);
-    // The SAME value that was written to the row — a second uploadLeaseExpiry()
+    // The SAME values that were written to the row. A second uploadLeaseExpiry()
     // call would compare a fresh instant against the stored one and never match,
     // which would leak a STAGING row (and its sourceRef) on every signer fault.
     assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
-    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\n\s+uploadLeaseVersion: 1,/);
+    assert.match(start, /const leaseNonce = newLeaseNonce\(\);/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\n\s+uploadLeaseVersion: 1,\n\s+uploadLeaseNonce: leaseNonce,/);
+    // AND THE GENERATION IS IN THE CAS. Pinning the expiry alone was the hole
+    // in the previous round's own fix: an adoption computes "now + 2h" exactly
+    // as this request did, so the two can land on the same millisecond and the
+    // pin matches a row somebody else already owns.
+    const discardArgs = branch.slice(branch.indexOf("await discardUnresumedLease("));
+    for (const pinned of [
+        /id,/, /storagePath,/, /uploadLeaseVersion: 1,/,
+        /uploadUrlExpiresAt: leaseExpiresAt,/, /uploadLeaseNonce: leaseNonce,/,
+    ]) {
+        assert.match(discardArgs.slice(0, discardArgs.indexOf("prisma.receiptIntake")), pinned);
+    }
     // A lost CAS is the idempotent conflict, never an error about a row that is
     // alive and in somebody else's hands.
     assert.match(branch, /if \(discarded === "resumed"\) \{/);

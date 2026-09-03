@@ -29,6 +29,9 @@ import {
     phaseSuggestionIsConfident,
     RECEIPT_PHASE_CONFIDENCE_MIN,
 } from "../src/lib/receipt-intake/intake-core";
+import { QBO_PURCHASE_MISMATCH_PREFIX } from "../src/lib/receipt-intake/book";
+import { finalizeDisposition, RECOVERABLE_PARK_REASONS } from "../src/lib/receipt-intake/stored-object";
+import { startOfDateInTimeZone } from "../src/lib/tz-date";
 import { QBTimeoutError } from "../src/lib/quickbooks";
 import {
     QboAccountConfigError,
@@ -74,6 +77,32 @@ function atExisting<T>(fn: (...args: any[]) => Promise<T>) {
         return fn(tokens, input, deadline);
     };
 }
+
+/**
+ * "QuickBooks holds this Purchase and it says what this document says."
+ *
+ * Every already-exists stub carries one, because the real
+ * createQBReceiptPurchase always does — and the difference between `match` and
+ * anything else decides whether an Expense is written from the read at all.
+ */
+const BOOKS_AGREE = {
+    verdict: "match" as const,
+    differences: [] as string[],
+    booked: {
+        totalAmount: 364.98,
+        txnDate: "2026-08-03",
+        vendor: "Lowes",
+        projectNames: ["Berg ADU"],
+        taxAmount: 29.2,
+    },
+};
+
+/** The same shape, disagreeing however a test needs it to. */
+const booksSay = (
+    verdict: "derive" | "review",
+    differences: string[],
+    booked: Partial<typeof BOOKS_AGREE.booked> = {},
+) => ({ verdict, differences, booked: { ...BOOKS_AGREE.booked, ...booked } });
 
 const NOW = new Date("2026-09-01T12:00:00.000Z");
 
@@ -533,7 +562,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
     // books without its image. It was the one path exempt from the check.
     const failing = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500", existing: BOOKS_AGREE,
         })) as any,
     });
     const failed = await bookReceipt(row(), failing.deps);
@@ -542,7 +571,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
 
     const skipped = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped", existing: BOOKS_AGREE,
         })) as any,
     });
     const skippedResult = await bookReceipt(row(), skipped.deps);
@@ -559,7 +588,7 @@ test("a previous attachment failure does NOT block the recovery attempt", async 
     const r = recorder({
         createPurchase: atExisting(async (_t: any, input: any) => {
             r.purchaseCalls.push(input);
-            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE } as any;
         }) as any,
     });
     const result = await bookReceipt(row({ lastError: "attachment-failed:failed:500" }), r.deps);
@@ -625,7 +654,7 @@ test("alreadyExists books identically — the lost-response retry", async () => 
     const r = recorder({
         createPurchase: atExisting(async (_t: any, input: any) => ({
             ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
-            alreadyExists: true, attachment: "already-attached",
+            alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
@@ -1120,7 +1149,7 @@ test("the already-exists branch does NOT go through onBeforeCreate", async () =>
             seen.push("create-called");
             await onExisting?.();
             void onBeforeCreate;
-            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE } as any;
         },
     });
     const result = await bookReceipt(row(), r.deps);
@@ -1136,7 +1165,7 @@ test("attempt 20 on an ALREADY-EXISTING purchase retains the strong key", async 
     // same receipt would then book it a second time.
     const r = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
@@ -1148,7 +1177,7 @@ test("attempt 20 on an ALREADY-EXISTING purchase retains the strong key", async 
 test("a terminal attachment refusal on an existing purchase also retains the key", async () => {
     const r = recorder({
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:415",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:415", existing: BOOKS_AGREE,
         })) as any,
     });
     const result = await bookReceipt(row(), r.deps);
@@ -1160,7 +1189,7 @@ test("a STALE claim on the existing-purchase hook aborts, exactly like the creat
     const r = recorder({
         markSendAttempted: async () => false,
         createPurchase: atExisting(async () => ({
-            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached",
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached", existing: BOOKS_AGREE,
         })) as any,
     });
     assert.deepEqual(await bookReceipt(row(), r.deps), { outcome: "stale" });
@@ -1183,4 +1212,121 @@ test("the QBO core fires onExistingPurchase before it touches the attachment", (
     );
     // And the create hook is NOT fired on this path.
     assert.ok(!body.includes("onBeforeCreate"), "onBeforeCreate belongs to the create path only");
+});
+
+// -- An EXISTING QBO Purchase decides the Expense (round-34 item 2) ----------
+
+/**
+ * `alreadyExists` is not only the lost-response retry. It is every v1-cutover
+ * document (the Apps Script posted the Purchase from its OWN read of the file)
+ * and every Drive revision that kept its fileId. The Expense used to be written
+ * from THIS pass's OCR values regardless, so ProBuild's job cost could carry a
+ * total, a date or a job QuickBooks does not have — under a `qbPurchaseId` that
+ * says the two are the same document.
+ */
+function existingPurchase(existing: unknown) {
+    return atExisting(async () => ({
+        ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true,
+        attachment: "already-attached", existing,
+    })) as any;
+}
+
+test("a matching Purchase books exactly as it always did", async () => {
+    // The control. Without it every assertion below would pass on a code path
+    // that had simply stopped booking.
+    const r = recorder({ createPurchase: existingPurchase(BOOKS_AGREE) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses.length, 1);
+    assert.equal(r.expenses[0].amount, 364.98);
+    assert.equal(r.expenses[0].vendor, "Lowes");
+    assert.ok(!/existing QuickBooks Purchase/.test(r.expenses[0].description));
+    assert.equal(r.events[0].detail.qboDerivedFields, undefined);
+});
+
+test("AMOUNT: the Expense is DERIVED from the books, not from the read", async () => {
+    // Real money posted against QBO's number, and the Expense is linked to that
+    // very Purchase. Writing 364.98 next to a Purchase the books say is 372.10
+    // is a variance report that can never tie out.
+    const r = recorder({ createPurchase: existingPurchase(booksSay("derive", ["amount"], { totalAmount: 372.1 })) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses.length, 1);
+    assert.equal(r.expenses[0].amount, 372.1, "the books' total, not the OCR one");
+    assert.match(
+        r.expenses[0].description,
+        /amount taken from the existing QuickBooks Purchase/,
+        "and it says so, so a bookkeeper reading the Expense knows why",
+    );
+    assert.equal(r.events[0].amountCents, 37210, "the audit row records what was booked");
+    assert.deepEqual(r.events[0].detail.qboDerivedFields, ["amount"]);
+});
+
+test("DATE and VENDOR are derived the same way", async () => {
+    const r = recorder({
+        createPurchase: existingPurchase(booksSay("derive", ["date", "vendor"], {
+            txnDate: "2026-08-01",
+            vendor: "Lowe's Home Improvement #1234",
+        })),
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses[0].vendor, "Lowe's Home Improvement #1234");
+    // Re-anchored to the company's calendar day, exactly as the normal path
+    // does — the derived day goes through the same conversion, not around it.
+    assert.equal(
+        (r.expenses[0].date as Date).toISOString(),
+        startOfDateInTimeZone("2026-08-01", "America/Los_Angeles").toISOString(),
+    );
+});
+
+test("PROJECT: a disagreement parks the row and writes NO Expense", async () => {
+    // Which job carries the cost is an attribution decision. Deriving it would
+    // move money between jobs on QuickBooks' say-so; using the read would file
+    // it under a job the books disagree with. Neither is ours to choose.
+    const r = recorder({ createPurchase: existingPurchase(booksSay("review", ["project"], { projectNames: ["Mesplay Kitchen"] })) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    assert.equal((result as any).reason, "qbo-purchase-mismatch:project");
+    assert.equal(
+        (result as any).releaseStrongKey,
+        false,
+        "a Purchase provably exists, so the dedup key must NOT go back",
+    );
+    assert.equal(r.expenses.length, 0, "nothing is written from the read");
+    assert.equal(r.intakeUpdates.length, 0, "and the row is not marked BOOKED");
+});
+
+test("TAX: a split the books do not have parks too, naming every difference", async () => {
+    const r = recorder({ createPurchase: existingPurchase(booksSay("review", ["project", "tax"])) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal((result as any).reason, "qbo-purchase-mismatch:project,tax");
+    assert.equal(r.expenses.length, 0);
+});
+
+test("the mismatch park is NOT recoverable by a re-upload", async () => {
+    // A re-upload of the same bytes changes nothing about the books, and
+    // dragging the row back to RECEIVED would re-read it into the same
+    // disagreement. It is a human's decision, like every other non-sweeper park.
+    assert.ok(!RECOVERABLE_PARK_REASONS.some(reason => QBO_PURCHASE_MISMATCH_PREFIX.startsWith(reason)));
+    assert.equal(
+        finalizeDisposition({
+            state: "NEEDS_REVIEW",
+            stateReason: `${QBO_PURCHASE_MISMATCH_PREFIX}project`,
+            uploadLeaseVersion: 1,
+        }),
+        "not-recoverable",
+    );
+});
+
+test("a FRESHLY created Purchase never consults the books — there is nothing to consult", async () => {
+    // alreadyExists:false carries no comparison at all: this call wrote the
+    // Purchase from these very values, so they agree by construction.
+    const r = recorder();
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.equal(r.expenses[0].amount, 364.98);
+    assert.equal(r.events[0].detail.qboDerivedFields, undefined);
 });

@@ -1334,8 +1334,22 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     );
     assert.match(
         lease,
-        /data: \{ \.\.\.rearm, uploadUrlExpiresAt: deps\.expiresAt\(\) \}/,
+        /uploadUrlExpiresAt: deps\.expiresAt\(\),/,
         "the shared rule stamps it too",
+    );
+    // And the ADOPTION GENERATION alongside it, on every one of the four. The
+    // expiry alone cannot identify a lease -- a reuse writes the same "now + 2h"
+    // the original issue did, so the discard CAS pins this instead.
+    assert.match(lease, /uploadLeaseNonce: \(deps\.nonce \?\? newLeaseNonce\)\(\),/);
+    assert.equal(
+        (start.match(/uploadLeaseNonce: newLeaseNonce\(\)/g) ?? []).length,
+        2,
+        "the re-arm and the resume each stamp a fresh generation inline",
+    );
+    assert.equal(
+        (start.match(/uploadLeaseNonce: leaseNonce/g) ?? []).length,
+        2,
+        "and the create holds ITS generation in a const, because the discard CAS pins that exact value",
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
     assert.equal(signed, 3, "one signUpload call per inline branch");

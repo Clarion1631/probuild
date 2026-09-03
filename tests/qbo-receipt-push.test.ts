@@ -8,7 +8,10 @@ import {
     QboVendorDuplicateError,
     QboPurchaseFaultError,
     stableAttachmentFileName,
+    compareExistingPurchase,
+    readBookedPurchase,
     type CreateQBReceiptPurchaseInput,
+    type ExistingPurchaseCheck,
     type QboReceiptProjectCandidate,
     type QboReceiptPushDependencies,
     type ReceiptAttachmentStatus,
@@ -45,6 +48,46 @@ function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): Creat
     };
 }
 
+/**
+ * A QBO Purchase that AGREES with baseInput(), in the shape QBO really returns
+ * one: TotalAmt and TxnDate on the entity, the vendor on EntityRef, and the job
+ * on each expense line's CustomerRef.
+ *
+ * The fixtures used to be `{ Id, PrivateNote }` because those were the only two
+ * fields the code selected — which is exactly the finding: two fields can say
+ * "this is our Purchase" and cannot say "and it agrees with this document".
+ */
+function bookedPurchase(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        Id: "purchase-99",
+        TotalAmt: 150,
+        TxnDate: "2026-07-15",
+        EntityRef: { value: "vendor-1", name: "Home Depot", type: "Vendor" },
+        Line: [{
+            Amount: 150,
+            DetailType: "AccountBasedExpenseLineDetail",
+            AccountBasedExpenseLineDetail: {
+                AccountRef: { value: EXPENSE_ACCOUNT_ID, name: "COGS Supplies & materials" },
+                CustomerRef: { value: "cust-1", name: "Mueller Remodel" },
+            },
+        }],
+        ...over,
+    };
+}
+
+/** The verdict a matching books row produces, for the result deepEquals below. */
+const MATCHED = {
+    verdict: "match",
+    differences: [],
+    booked: {
+        totalAmount: 150,
+        txnDate: "2026-07-15",
+        vendor: "Home Depot",
+        projectNames: ["Mueller Remodel"],
+        taxAmount: 0,
+    },
+};
+
 /** The account-identity check runs against whatever id was queried — return the shape it expects for either. */
 function defaultAccountRow(query: string): Array<{ Id: string; Name: string; AccountType: string }> {
     if (query.includes(`'${BANK_ACCOUNT_ID}'`)) {
@@ -60,7 +103,7 @@ function defaultAccountRow(query: string): Array<{ Id: string; Name: string; Acc
 }
 
 interface DepsOverrides {
-    existingRows?: Array<{ Id: string; PrivateNote?: string }>;
+    existingRows?: Array<Record<string, unknown>>;
     createdId?: string;
     customerId?: string;
     vendorId?: string;
@@ -120,7 +163,7 @@ function createDeps(overrides: DepsOverrides = {}) {
 test("createQBReceiptPurchase short-circuits when the DocNumber and marker both match", async () => {
     const input = baseInput();
     const marker = `[gtr-file:${input.fileId}]`;
-    const { deps, calls } = createDeps({ existingRows: [{ Id: "purchase-99", PrivateNote: `note ${marker}` }] });
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
     const result = await createQBReceiptPurchase(TOKENS, input, deps);
 
     assert.deepEqual(result, {
@@ -130,6 +173,7 @@ test("createQBReceiptPurchase short-circuits when the DocNumber and marker both 
         alreadyExists: true,
         // No file in this input, so there is nothing to attach.
         attachment: "skipped",
+        existing: MATCHED,
     });
     assert.equal(calls.creates.length, 0);
     assert.equal(calls.vendorCalls.length, 0);
@@ -471,7 +515,7 @@ function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependenc
         getFreshTokens: overrides.getFreshTokens ?? (async () => TOKENS),
         createPurchase:
             overrides.createPurchase ??
-            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const })),
+            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck })),
         // Stub the audit logger: unit tests must never touch the real Prisma client.
         logEvent: overrides.logEvent ?? (() => {}),
         // Same for the pause switch — the real read fails CLOSED (paused) with no DB.
@@ -492,7 +536,7 @@ test("route POST forwards tax:true only as an explicit boolean — string \"true
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -807,7 +851,7 @@ test("route POST forwards overheadCategory only as a string", async () => {
     const { POST } = createRouteHandlers({
         createPurchase: async (_tokens, input) => {
             inputs.push(input);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     for (const overheadCategory of ["Meals", 42]) {
@@ -849,7 +893,7 @@ test("already-exists uploads the receipt when the lost first attempt never attac
     const marker = `[gtr-file:${input.fileId}]`;
     const uploads: Array<{ purchaseId: string; fileName: string }> = [];
     const { deps, calls } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [], // QBO has the Purchase but no file on it
         uploadAttachment: async (_t, purchaseId, file) => {
             uploads.push({ purchaseId, fileName: file.fileName });
@@ -865,6 +909,7 @@ test("already-exists uploads the receipt when the lost first attempt never attac
         docNumber: input.fileId.slice(0, 21),
         alreadyExists: true,
         attachment: "attached",
+        existing: MATCHED,
     });
     // Still idempotent on the books: no second Purchase.
     assert.equal(calls.creates.length, 0);
@@ -878,7 +923,7 @@ test("already-exists does NOT re-upload when the deterministic filename is alrea
     const marker = `[gtr-file:${input.fileId}]`;
     let uploadCount = 0;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [attachableRow("99", stableAttachmentFileName(input.fileId, input.fileName))],
         uploadAttachment: async () => {
             uploadCount += 1;
@@ -901,7 +946,7 @@ test("already-exists does NOT treat an unrelated receipt's identical caller-chos
     const marker = `[gtr-file:${input.fileId}]`;
     let uploadCount = 0;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         // Same caller-chosen "FileName" as the unrelated receipt would have
         // produced under the old naive scheme, but it is not OUR stable name.
         attachableRows: [attachableRow("99", "receipt.jpg")],
@@ -921,7 +966,7 @@ test("already-exists ignores an Attachable that belongs to a different entity ty
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         // Same id + filename, but linked to an Invoice — entity ids are only
         // unique per type, so this must not count as our receipt.
         attachableRows: [{
@@ -943,7 +988,7 @@ test("a failed attachment LOOKUP is retryable, not a terminal ok:true", async ()
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
     const { deps } = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableQueryImpl: async () => {
             throw new Error("QBO down");
         },
@@ -974,7 +1019,7 @@ test("an attachment upload that times out PROPAGATES from both paths, so the pus
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: async () => timeout(),
     });
@@ -998,7 +1043,7 @@ test("a thrown NETWORK-ish attachment failure is retryable from both paths", asy
     );
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: boom,
     });
@@ -1018,7 +1063,7 @@ test("a TERMINAL attachment status still rides along on ok:true from both paths"
     assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:fault");
 
     const existing = createDeps({
-        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        existingRows: [bookedPurchase({ Id: "99", PrivateNote: `note ${marker}` })],
         attachableRows: [],
         uploadAttachment: terminal,
     });
@@ -1349,7 +1394,7 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
         },
         createPurchase: async (_t, _i, deadline) => {
             seen.push(deadline);
-            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const };
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true, attachment: "already-attached" as const, existing: MATCHED as ExistingPurchaseCheck };
         },
     });
     await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -1451,4 +1496,179 @@ test("ensureQBVendor: the post-6240 re-query is refused once the budget is gone"
     const control = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
     assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-42");
     assert.equal(control.urls.length, 4);
+});
+
+// -- An EXISTING Purchase is validated, not assumed (round-34 item 2) --------
+
+/**
+ * The finding: the idempotency query selected `Id, PrivateNote`, so a Purchase
+ * that was already in the books was treated as interchangeable with the read
+ * this pass had just done — and book.ts then wrote the Expense from the OCR
+ * values. A v1-cutover Purchase (the Apps Script posted it from its OWN read)
+ * or a Drive revision that kept its fileId therefore left ProBuild's job cost
+ * carrying a total, a date or a job QuickBooks does not have.
+ */
+const TAX_INPUT = {
+    projectName: "Mueller Remodel",
+    vendor: "Home Depot",
+    date: "2026-07-15",
+    totalAmount: 150,
+    groups: [
+        { category: "Receipt (pre-tax)", amount: 137.5 },
+        { category: "Sales tax", amount: 12.5, tax: true },
+    ],
+};
+
+const readBooked = (over: Record<string, unknown> = {}) =>
+    readBookedPurchase(bookedPurchase(over), TAX_ACCOUNT_ID);
+
+test("the idempotency query asks for the WHOLE Purchase, not two fields", async () => {
+    const input = baseInput();
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps, calls } = createDeps({ existingRows: [bookedPurchase({ PrivateNote: `note ${marker}` })] });
+    await createQBReceiptPurchase(TOKENS, input, deps);
+    // QBO cannot return a nested Line / EntityRef from a field list.
+    assert.match(calls.queries[0], /^SELECT \* FROM Purchase WHERE DocNumber = /);
+});
+
+test("a Purchase that agrees is a match, and books unchanged", () => {
+    const check = compareExistingPurchase(readBooked(), baseInput());
+    assert.equal(check.verdict, "match");
+    assert.deepEqual(check.differences, []);
+});
+
+test("AMOUNT: a difference is DERIVED from the books, never taken from the read", () => {
+    // Real money posted against QBO's number. The disagreement is OCR noise on
+    // our side, so the books win and the Expense records what was actually paid.
+    const check = compareExistingPurchase(readBooked({ TotalAmt: 162.75 }), baseInput());
+    assert.equal(check.verdict, "derive");
+    assert.deepEqual(check.differences, ["amount"]);
+    assert.equal(check.booked.totalAmount, 162.75);
+});
+
+test("AMOUNT: a sub-tolerance difference is not a difference at all", () => {
+    // Two cents, the same tolerance the group/total reconciliation allows: a
+    // two-line tax split can round each half independently.
+    for (const total of [150.01, 149.98, 150.02]) {
+        assert.equal(compareExistingPurchase(readBooked({ TotalAmt: total }), baseInput()).verdict, "match", String(total));
+    }
+    assert.equal(compareExistingPurchase(readBooked({ TotalAmt: 150.03 }), baseInput()).verdict, "derive");
+});
+
+test("DATE and VENDOR differences are derived too", () => {
+    const date = compareExistingPurchase(readBooked({ TxnDate: "2026-07-11" }), baseInput());
+    assert.deepEqual([date.verdict, date.differences, date.booked.txnDate], ["derive", ["date"], "2026-07-11"]);
+
+    const vendor = compareExistingPurchase(
+        readBooked({ EntityRef: { value: "v9", name: "The Home Depot #4712" } }),
+        baseInput(),
+    );
+    assert.deepEqual([vendor.verdict, vendor.differences], ["derive", ["vendor"]]);
+    // Case and spacing are not identity.
+    const same = compareExistingPurchase(readBooked({ EntityRef: { value: "v1", name: "  home   depot " } }), baseInput());
+    assert.equal(same.verdict, "match");
+});
+
+test("PROJECT: a different job is a REVIEW — nothing may pick a side automatically", () => {
+    // Which job carries the cost is an attribution decision, not noise. Deriving
+    // it would silently move money between jobs; using the read would file it
+    // under a job the books disagree with.
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [{
+                Amount: 150,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: EXPENSE_ACCOUNT_ID },
+                    CustomerRef: { value: "cust-9", name: "Mesplay Kitchen" },
+                },
+            }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["project"]);
+    assert.deepEqual(check.booked.projectNames, ["Mesplay Kitchen"]);
+});
+
+test("PROJECT: lines split across TWO jobs is an ambiguity, and also a review", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+                { Amount: 75, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } },
+            ],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.booked.projectNames.sort(), ["Mesplay Kitchen", "Mueller Remodel"]);
+});
+
+test("TAX: a split the books do not have is a review, not a derive", () => {
+    // The reseller-permit reclaim is a state filing. Whether this document's
+    // sales tax is sitting on the reclaimable account is a fact about the books
+    // that a human has to reconcile, not a number to copy either way.
+    const noSplit = compareExistingPurchase(readBooked(), TAX_INPUT);
+    assert.equal(noSplit.verdict, "review");
+    assert.deepEqual(noSplit.differences, ["tax"]);
+    assert.equal(noSplit.booked.taxAmount, 0);
+
+    // The control: the same document against a Purchase that DOES carry the
+    // split on the tax account books clean.
+    const split = compareExistingPurchase(
+        readBooked({
+            Line: [
+                { Amount: 137.5, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+                { Amount: 12.5, AccountBasedExpenseLineDetail: { AccountRef: { value: TAX_ACCOUNT_ID }, CustomerRef: { name: "Mueller Remodel" } } },
+            ],
+        }),
+        TAX_INPUT,
+    );
+    assert.equal(split.verdict, "match");
+    assert.equal(split.booked.taxAmount, 12.5);
+});
+
+test("an UNREADABLE total or date is a review — never a silent pass", () => {
+    // QBO returns both on every Purchase, so their absence means we are not
+    // looking at what we think we are. "I could not check" must not read the
+    // same as "I checked and it agrees" on the path that decides what a real
+    // Expense records.
+    for (const over of [{ TotalAmt: undefined }, { TotalAmt: "n/a" }, { TotalAmt: 0 }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("amount"));
+    }
+    for (const over of [{ TxnDate: undefined }, { TxnDate: "07/15/2026" }, { TxnDate: "2026-02-31" }]) {
+        const check = compareExistingPurchase(readBooked(over), baseInput());
+        assert.equal(check.verdict, "review", JSON.stringify(over));
+        assert.ok(check.differences.includes("date"));
+    }
+});
+
+test("a ref with no display name is not comparable, and is not a mismatch", () => {
+    // QBO documents `name` on a ReferenceType as optional, so its absence is a
+    // fact about the response shape rather than about the books. Parking on it
+    // would break every honest lost-response retry.
+    const check = compareExistingPurchase(
+        readBooked({
+            EntityRef: { value: "vendor-1" },
+            Line: [{ Amount: 150, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { value: "cust-1" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "match");
+    assert.equal(check.booked.vendor, null);
+    assert.deepEqual(check.booked.projectNames, []);
+});
+
+test("a REVIEW outranks a DERIVE when both kinds of difference are present", () => {
+    const check = compareExistingPurchase(
+        readBooked({
+            TotalAmt: 999,
+            Line: [{ Amount: 999, AccountBasedExpenseLineDetail: { AccountRef: { value: EXPENSE_ACCOUNT_ID }, CustomerRef: { name: "Mesplay Kitchen" } } }],
+        }),
+        baseInput(),
+    );
+    assert.equal(check.verdict, "review");
+    assert.deepEqual(check.differences, ["amount", "project"]);
 });

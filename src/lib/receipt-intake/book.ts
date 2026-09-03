@@ -600,11 +600,59 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`, purchaseMayExist(sent));
     }
 
+    // WHEN THE PURCHASE WAS ALREADY IN THE BOOKS, THE BOOKS DECIDE.
+    //
+    // `alreadyExists` is not only the lost-response retry. It is also every
+    // v1-cutover document (the Apps Script posted the Purchase from its OWN
+    // read of the file) and every Drive revision that kept its fileId — and in
+    // both, QuickBooks may hold a total, a date, a vendor or a job that this
+    // pipeline's OCR pass does not agree with. Writing the Expense from the OCR
+    // read regardless left ProBuild's job cost carrying a number the books do
+    // not have, under a `qbPurchaseId` that says the two are the same document.
+    //
+    // The split is deliberate (see ExistingPurchaseCheck in qbo-receipt-push):
+    // amount/date/vendor are DERIVED from QuickBooks, because real money posted
+    // against those values and the disagreement is OCR noise on our side;
+    // project and tax are ATTRIBUTION, so a mismatch parks with no Expense
+    // written at all. Nothing here rewrites QuickBooks either way — the
+    // Purchase is left exactly as it is.
+    let expenseTotalCents = row.totalCents;
+    let expenseCalendarDay = calendarDay;
+    let expenseVendor = row.vendor;
+    let derivedNote = "";
+    let derivedFields: string[] | undefined;
+    if (result.alreadyExists && result.existing.verdict !== "match") {
+        const existing = result.existing;
+        if (existing.verdict === "review") {
+            // The key is RETAINED unconditionally: a Purchase provably exists.
+            return {
+                outcome: "needs-review",
+                reason: `${QBO_PURCHASE_MISMATCH_PREFIX}${existing.differences.join(",")}`,
+                releaseStrongKey: false,
+            };
+        }
+        // `derive`: every field it names was readable, so each fallback below
+        // is unreachable — they are there so a future field cannot silently
+        // turn a "derive" into a null write.
+        const booked = existing.booked;
+        expenseTotalCents = booked.totalAmount === null
+            ? expenseTotalCents
+            : Math.round(booked.totalAmount * 100);
+        expenseCalendarDay = booked.txnDate ?? expenseCalendarDay;
+        expenseVendor = booked.vendor ?? expenseVendor;
+        derivedFields = existing.differences;
+        derivedNote = ` · ${existing.differences.join(", ")} taken from the existing QuickBooks Purchase`;
+        console.warn(
+            "[receipt-intake] expense derived from the existing QBO Purchase",
+            JSON.stringify({ rowId: row.id, qbPurchaseId: result.qbPurchaseId, differences: existing.differences }),
+        );
+    }
+
     // 5. One transaction: the Expense and the row's BOOKED state land together
     //    or not at all. alreadyExists:true books the same way — that is the
     //    lost-response retry, and QBO's idempotency has already guaranteed
     //    there is exactly one Purchase.
-    const amountCents = expenseAmountCents(groups, row.totalCents);
+    const amountCents = expenseAmountCents(groups, expenseTotalCents);
     const taxApplied = appliedTaxCents(groups);
     // RE-VALIDATE THE PHASE AGAINST THE FINAL PROJECT.
     //
@@ -668,7 +716,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     estimateId,
                     costCodeId,
                     amount: amountCents / 100,
-                    vendor: row.vendor || "Unknown",
+                    vendor: expenseVendor || "Unknown",
                     // RE-ANCHORED at write time. `txnDate` is a @db.Date column
                     // and round-trips as UTC midnight, so writing it straight
                     // into Expense.date (a full timestamp) records 5pm the
@@ -676,7 +724,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // report that bounds by local midnight then counts the
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
-                    date: startOfDateInTimeZone(calendarDay, timeZone),
+                    date: startOfDateInTimeZone(expenseCalendarDay, timeZone),
                     // Booked with a qbPurchaseId already set — the Purchase is
                     // live in QuickBooks by the time this row commits, so this
                     // Expense is QBO-managed from birth, exactly like a QBO
@@ -697,6 +745,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                         `[Receipt intake] ${docRef}` +
                         phaseCheck.note +
                         (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
+                        derivedNote +
                         ` · booked to QuickBooks`,
                 },
                 select: { id: true },
@@ -762,6 +811,9 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 expenseId,
                 sourceRef: row.sourceRef,
                 costCodeId,
+                // Which fields (if any) this Expense took from the books rather
+                // than from the read. Absent on the normal path.
+                qboDerivedFields: derivedFields,
                 // Carried through so the Command Center can show HOW confident
                 // the phase pick was, and so a low-confidence run is auditable
                 // after the fact rather than only at review time.
@@ -834,6 +886,18 @@ class StaleClaimError extends Error {
 
 /** Marks a retry as "the Purchase exists but its receipt did not attach". */
 export const ATTACHMENT_FAILED_PREFIX = "attachment-failed:";
+
+/**
+ * Marks a park as "QuickBooks already holds this Purchase and it does not say
+ * what this document says". Its own reason, not folded into `qbo-fault:`,
+ * because nothing is wrong with QuickBooks: the books and the read disagree
+ * about the job or the tax split, and only a human may choose between them.
+ *
+ * Deliberately NOT in RECOVERABLE_PARK_REASONS — a re-upload of the same bytes
+ * changes nothing, and dragging the row back would re-read it into the same
+ * disagreement.
+ */
+export const QBO_PURCHASE_MISMATCH_PREFIX = "qbo-purchase-mismatch:";
 
 /**
  * Is this attachment failure QBO refusing the file, rather than a blip?
