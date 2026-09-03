@@ -2432,8 +2432,10 @@ function createHandler(actor: RouteMcpActor) {
                     projectId: z.string().max(50).describe("Target project id"),
                     tasks: z.array(z.object({
                         name: z.string().trim().min(1).max(300),
-                        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
-                        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").describe("First day of work, YYYY-MM-DD."),
+                        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").describe(
+                            "Exclusive: the day AFTER the last day of work, YYYY-MM-DD. A one-day task on 2026-09-03 has endDate 2026-09-04. Milestones: same as startDate.",
+                        ),
                         type: z.enum(["task", "milestone", "appointment"]).optional(),
                         crewNames: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
                         leadName: z.string().trim().min(1).max(200).optional(),
@@ -2458,12 +2460,14 @@ function createHandler(actor: RouteMcpActor) {
             {
                 title: "Update a schedule task's dates",
                 description:
-                    "Moves one task's startDate and/or endDate. Dates must use YYYY-MM-DD; normal tasks require endDate after startDate and milestones stay on one day. " +
-                    "TWO-STEP, SINGLE-USE: call without confirmToken for the exact before/after preview, obtain user approval, then repeat the same arguments with that token.",
+                    "Moves one task's startDate and/or endDate. Dates must use YYYY-MM-DD; endDate is EXCLUSIVE (the day after the last day of work), so normal tasks require endDate strictly after startDate and milestones stay on one day. " +
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for the exact before/after preview (shown with the inclusive last work day), obtain user approval, then repeat the same arguments with that token.",
                 inputSchema: {
                     taskId: z.string().max(50),
-                    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
-                    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
+                    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional().describe("First day of work, YYYY-MM-DD."),
+                    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional().describe(
+                        "Exclusive: the day AFTER the last day of work, YYYY-MM-DD. A one-day task on 2026-09-03 has endDate 2026-09-04. Milestones: same as startDate.",
+                    ),
                     confirmToken: z.string().length(64).optional(),
                 },
             },

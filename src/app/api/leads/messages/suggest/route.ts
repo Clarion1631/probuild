@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { displayEndDate, toDateKey, formatDateKey } from "@/lib/schedule-dates";
 
 // POST /api/leads/messages/suggest — AI-generated message suggestion
 export async function POST(request: Request) {
@@ -58,7 +59,7 @@ export async function POST(request: Request) {
                     startDate: { lte: new Date(Date.now() + 14 * 86400000) }, // Next 2 weeks
                     endDate: { gte: new Date() },
                 },
-                select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true },
+                select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true, type: true },
                 orderBy: { startDate: "asc" },
                 take: 10,
             },
@@ -67,7 +68,7 @@ export async function POST(request: Request) {
 
     if (linkedProject?.scheduleTasks?.length) {
         scheduleContext = `\n\nUPCOMING SCHEDULE (next 2 weeks):\n${linkedProject.scheduleTasks.map(t =>
-            `- ${t.name}: ${t.startDate.toLocaleDateString()} to ${t.endDate.toLocaleDateString()} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
+            `- ${t.name}: ${formatDateKey(toDateKey(t.startDate))} to ${formatDateKey(displayEndDate(toDateKey(t.startDate), toDateKey(t.endDate), t.type))} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
         ).join("\n")}`;
     }
 

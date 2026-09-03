@@ -3,6 +3,8 @@ import { Prisma } from "@prisma/client";
 
 import { addDays } from "@/app/projects/[id]/schedule/schedule-utils";
 import { prisma } from "./prisma";
+import { displayEndDate } from "./schedule-dates";
+import { ScheduleTaskValidationError } from "./schedule-task-result";
 import {
     applyChangeOrderToScheduleInTransaction,
     canonicalContractEstimateQuery,
@@ -209,18 +211,18 @@ async function resolveCrewNames(
 }
 
 function validatePlannedTask(task: PlanScheduleTaskInput): void {
-    if (!task.name.trim()) throw new Error("Task name is required");
+    if (!task.name.trim()) throw new ScheduleTaskValidationError("Task name is required");
     const type = task.type ?? "task";
     if (!(SCHEDULE_TASK_TYPES as readonly string[]).includes(type)) {
-        throw new Error(`Invalid schedule task type "${type}"`);
+        throw new ScheduleTaskValidationError(`Invalid schedule task type "${type}"`);
     }
     const startDate = parseStartDateInput(task.startDate);
     const endDate = parseStartDateInput(task.endDate);
-    if (type !== "milestone" && endDate < startDate) {
-        throw new Error("Task end date cannot be before its start date");
+    if (type !== "milestone" && endDate <= startDate) {
+        throw new ScheduleTaskValidationError("Task end date must be after its start date (the end date is the day after the last day of work)");
     }
     if (task.estimatedHours != null && (!Number.isFinite(task.estimatedHours) || task.estimatedHours < 0)) {
-        throw new Error("Estimated hours must be zero or greater");
+        throw new ScheduleTaskValidationError("Estimated hours must be zero or greater");
     }
     if (task.scheduledTime !== undefined) {
         if (type !== "appointment") throw new Error("Scheduled time is only available for appointments");
@@ -398,7 +400,8 @@ export async function planSchedule(input: {
             ...resolved.tasks.map((task, index) => {
                 const source = input.tasks[index];
                 const crew = task.crew.map(member => member.name).join(", ") || "unassigned";
-                return `${index + 1}. ${source.name.trim()} — ${source.startDate} to ${source.endDate}; crew: ${crew}${task.lead ? `; lead: ${task.lead.name}` : ""}`;
+                // Confirmations speak the user's dates: End is the last day of work.
+                return `${index + 1}. ${source.name.trim()} — ${source.startDate} to ${displayEndDate(source.startDate, source.endDate, source.type)}; crew: ${crew}${task.lead ? `; lead: ${task.lead.name}` : ""}`;
             }),
         ].join("\n");
         return issueConfirmation("plan_schedule", args, preview, actorLabel);
@@ -439,8 +442,8 @@ async function validateTaskDates(input: { taskId: string; startDate?: string; en
     const startDate = input.startDate === undefined ? task.startDate : parseStartDateInput(input.startDate);
     const requestedEndDate = input.endDate === undefined ? task.endDate : parseStartDateInput(input.endDate);
     const endDate = task.type === "milestone" ? startDate : requestedEndDate;
-    if (task.type !== "milestone" && endDate < startDate) {
-        throw new Error("Task end date cannot be before its start date");
+    if (task.type !== "milestone" && endDate <= startDate) {
+        throw new ScheduleTaskValidationError("Task end date must be after its start date (the end date is the day after the last day of work)");
     }
     return { task, startDate, endDate };
 }
@@ -455,10 +458,16 @@ export async function updateTaskDates(input: {
     const args = { taskId: input.taskId, startDate: input.startDate, endDate: input.endDate };
     if (!input.confirmToken) {
         const { task, startDate, endDate } = await validateTaskDates(args);
+        // Preview shows the INCLUSIVE end (last day of work) — the user never
+        // sees the stored exclusive value.
+        const prevStartKey = task.startDate.toISOString().slice(0, 10);
+        const prevEndKey = task.endDate.toISOString().slice(0, 10);
+        const nextStartKey = startDate.toISOString().slice(0, 10);
+        const nextEndKey = endDate.toISOString().slice(0, 10);
         return issueConfirmation(
             "update_task_dates",
             args,
-            `Move "${task.name}" from ${task.startDate.toISOString().slice(0, 10)}–${task.endDate.toISOString().slice(0, 10)} to ${startDate.toISOString().slice(0, 10)}–${endDate.toISOString().slice(0, 10)}.`,
+            `Move "${task.name}" from ${prevStartKey}–${displayEndDate(prevStartKey, prevEndKey, task.type)} to ${nextStartKey}–${displayEndDate(nextStartKey, nextEndKey, task.type)}.`,
             actorLabel,
         );
     }

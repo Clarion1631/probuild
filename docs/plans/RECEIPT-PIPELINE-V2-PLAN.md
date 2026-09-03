@@ -14,7 +14,7 @@ Every dollar spent lands in ProBuild with a job and a phase within a day, every 
 |---|---|
 | 1 | Fix the QuickBooks hang first (it is Intuit's outage today, but our code must fail fast and retry, not hang 60 s). |
 | 2 | Retire Telegram for GTR bots. Alerts go to a Google Chat "Bot Health" space plus one daily email digest to Justin. |
-| 3 | QuickBooks bank feed by API is bank truth, nightly, no browser. WTB CSV becomes a monthly hand check. |
+| 3 | Money OUT: QuickBooks bank feed by API is bank truth, nightly, no browser. Money IN: the daily WTB CSV export stays daily and is the trigger for the deposit sweep, because the QBO API only shows deposits after a human books them (amended 2026-09-02, see `DEPOSIT-SWEEP-PLAN.md`). |
 | 4 | Job and phase get picked at capture time. Crew taps them in the mobile app; AI suggests for everything else. |
 | 5 | Percent complete is computed automatically from daily logs, photos, and schedule progress, and Richard adjusts it by hand. It is NOT asked in the job Team spaces. |
 | 6 | Crew pay and burden rates come from Gusto. ProBuild must export time to Gusto at go-live. |
@@ -136,7 +136,7 @@ Tabs by state: Needs job, Needs review, Booking (with reason), Booked today, Mis
 
 ### Bank (decision 3) and sourcing missing receipts (decision 9)
 
-- Nightly ProBuild cron pulls the QBO bank register by API into `BankLine` (the verified `post-qbo-register.mjs` logic, moved server-side). WTB CSV: monthly, by hand, control totals only. Check images: weekly batch when a human is logged in, per `WTB-CHECK-IMAGES.md`.
+- Nightly ProBuild cron pulls the QBO bank register by API into `BankLine` (the verified `post-qbo-register.mjs` logic, moved server-side) for money OUT. The daily WTB CSV export stays DAILY: it is the only human-free source that sees an unbooked customer deposit, and `parse-wtb-daily-csv.mjs --sweep` posts each finished day's credits to the deposit sweep (`DEPOSIT-SWEEP-PLAN.md`, shipped 2026-09-03). Check images: weekly batch when a human is logged in, per `WTB-CHECK-IMAGES.md`.
 - Amazon: check whether the Amazon Business ↔ QuickBooks app is connected (it auto-attaches order receipts to purchases). If yes, Amazon is solved on the QBO side; if no, connect it. Amazon order emails already flow through the puller as a second net.
 - Lowe's: no API. Primary net is the emailed receipt (already pulled). For in-store card purchases with no email, the MyLowe's Pro purchase history CSV is the source; run it as a weekly Hermes batch when a person is logged in, and match to bank lines. Do not build a daily browser job for it.
 
