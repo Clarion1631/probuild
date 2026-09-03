@@ -9,7 +9,9 @@ import {
     BANK_PULL_AMBIGUOUS_KEY,
     BANK_PULL_AMBIGUOUS_STALE_KEY,
     BANK_PULL_BLOCKED_REASON_KEY,
+    BANK_PULL_UNCERTIFIED_KEY,
     BANK_PULL_UNCLEARED_KEY,
+    uncertifiedWindowValue,
 } from "@/lib/pipeline-health";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
@@ -76,10 +78,11 @@ const WINDOW_STATE_KEY = "bankRegisterPullWindow";
 async function readWindowState(): Promise<PullWindowState> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: WINDOW_STATE_KEY } });
-        if (!row?.value) return { highWater: null, lastFullSweep: null, continueAfter: null };
+        if (!row?.value) return { highWater: null, lastFullSweep: null, continueAfter: null, uncertifiedBounds: null };
         const parsed = JSON.parse(row.value) as Partial<PullWindowState>;
         const resume = parsed.continueAfter;
         const retry = parsed.retryPending;
+        const uncertified = parsed.uncertifiedBounds;
         return {
             highWater: typeof parsed.highWater === "string" ? parsed.highWater : null,
             lastFullSweep: typeof parsed.lastFullSweep === "string" ? parsed.lastFullSweep : null,
@@ -97,11 +100,22 @@ async function readWindowState(): Promise<PullWindowState> {
                 && Number.isInteger(retry.attempts) && retry.attempts > 0
                 ? { startDate: retry.startDate, endDate: retry.endDate, reason: retry.reason, attempts: retry.attempts }
                 : null,
+            // SAME ALL-OR-NOTHING RULE as the retry marker, and for a sharper
+            // reason: this one WITHHOLDS the freshness stamp and widens every
+            // future window. A half-read pair of bounds would either hold the
+            // stamp down forever over dates that are not a window, or — worse —
+            // read as "nothing outstanding" and certify days nobody pulled.
+            uncertifiedBounds: uncertified
+                && isYmd(uncertified.startDate) && isYmd(uncertified.endDate)
+                && uncertified.startDate <= uncertified.endDate
+                ? { startDate: uncertified.startDate, endDate: uncertified.endDate }
+                : null,
+            uncertifiedSince: typeof parsed.uncertifiedSince === "string" ? parsed.uncertifiedSince : null,
         };
     } catch {
         // A corrupt or unreadable state is "we know nothing", which plans the
         // widest safe window — never a narrow one built on a bad mark.
-        return { highWater: null, lastFullSweep: null, continueAfter: null };
+        return { highWater: null, lastFullSweep: null, continueAfter: null, uncertifiedBounds: null };
     }
 }
 
@@ -493,6 +507,21 @@ async function runPull() {
         console.error("[cron/bank-register-pull] blocked-reason write failed", error instanceof Error ? error.message : "UnknownError");
     }
 
+    // WHICH DAYS ARE STILL UNCERTIFIED, if any (round-35 gate, finding 1).
+    // Written on EVERY run, empty when the span is clear, so the health reason
+    // appears the night the probe fails and disappears the run it is re-read —
+    // never latched, and never inferred from a stamp that simply stopped moving.
+    try {
+        const value = uncertifiedWindowValue(summary.uncertified ?? null);
+        await prisma.automationSetting.upsert({
+            where: { key: BANK_PULL_UNCERTIFIED_KEY },
+            update: { value },
+            create: { key: BANK_PULL_UNCERTIFIED_KEY, value },
+        });
+    } catch (error) {
+        console.error("[cron/bank-register-pull] uncertified-window write failed", error instanceof Error ? error.message : "UnknownError");
+    }
+
     if (!summary.ok) {
         console.error("[cron/bank-register-pull]", JSON.stringify(summary));
     } else if (summary.inserted > 0 || summary.observations > 0) {
@@ -524,7 +553,14 @@ async function runPull() {
     // nothing. `clearedProbeOk` is already folded into `complete`; it is named
     // here too because THIS is the line the invariant is about, and a future
     // change to `complete` must not quietly reopen it (round-33 gate, finding 1).
-    if (summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0) {
+    // AND NO OUTSTANDING UNCERTIFIED DAYS. `complete` and `clearedProbeOk` are
+    // both statements about THIS run's window; neither one can see the week
+    // behind it whose clearance probe failed and whose retries were exhausted.
+    // That was the fourth shape of the lie: a narrow, healthy, complete overlap
+    // window stamped the clock over observations that had never been certified
+    // and were never offered to the mint (round-35 gate, finding 1).
+    if (summary.ok && summary.complete && summary.clearedProbeOk && ambiguousCount === 0
+        && !summary.uncertified) {
         try {
             await prisma.automationSetting.upsert({
                 where: { key: BANK_PULL_LAST_SUCCESS_KEY },

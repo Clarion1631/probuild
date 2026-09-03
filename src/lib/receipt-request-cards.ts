@@ -337,7 +337,12 @@ export function serializeThreads(
 // ── Posting ──────────────────────────────────────────────────────────────────
 
 const WEBHOOK_HOST = "chat.googleapis.com";
-const POST_TIMEOUT_MS = 10_000;
+/**
+ * The webhook's own ceiling. EXPORTED because the caller has to budget for it:
+ * a cron with four seconds of wall clock left cannot afford to start a call
+ * that may legitimately take ten (Codex PR #443 gate round 35, finding 3).
+ */
+export const CARD_POST_TIMEOUT_MS = 10_000;
 
 /**
  * The server POSTs to this URL, so restrict it to Google Chat's webhook
@@ -380,7 +385,23 @@ export type PostOutcome =
  *
  * Never throws — every failure mode is one of the three outcomes above.
  */
-export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promise<PostOutcome> {
+export async function postOwnerCard(
+    webhookUrl: string,
+    card: OwnerCard,
+    options: { timeoutMs?: number } = {},
+): Promise<PostOutcome> {
+    /**
+     * THE CALLER'S DEADLINE, NOT JUST OURS (round-35 gate, finding 3).
+     *
+     * `AbortSignal.timeout(10s)` bounds this fetch against a slow Chat. It says
+     * nothing about the INVOCATION, which also has to write POSTED, the thread
+     * ids and the per-item history after we return — so a call started with
+     * eight seconds of cron budget left could be killed mid-completion, and a
+     * row stranded in POSTING becomes UNCERTAIN for a card that may never have
+     * been sent. Clamped to our own ceiling in both directions: a caller may
+     * only ever shorten this, never lengthen it.
+     */
+    const timeoutMs = Math.max(1, Math.min(CARD_POST_TIMEOUT_MS, options.timeoutMs ?? CARD_POST_TIMEOUT_MS));
     // Never sent: not a Chat webhook at all.
     if (!isValidChatWebhookUrl(webhookUrl)) {
         return { kind: "rejected", owner: card.owner, reason: "invalid-webhook-url" };
@@ -394,7 +415,7 @@ export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promis
             method: "POST",
             headers: { "Content-Type": "application/json; charset=UTF-8" },
             body: JSON.stringify({ text: card.text }),
-            signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
         });
     } catch (error) {
         // A timeout or a socket error says nothing about whether Chat processed

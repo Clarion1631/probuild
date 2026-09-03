@@ -305,6 +305,43 @@ export interface PullWindowState {
      * continuation slots — see PROBE_RETRY_LIMIT.
      */
     retryPending?: PullRetryPending | null;
+    /**
+     * THE DAYS WHOSE CLEARANCE NOBODY EVER ANSWERED, carried until a run
+     * actually reads them again (Codex PR #443 gate round 35, finding 1).
+     *
+     * `retryPending` is the SHORT-TERM half of this: it schedules up to
+     * PROBE_RETRY_LIMIT re-runs and is then dropped, on purpose, so a dead
+     * report endpoint stops burning continuation slots. Dropping it used to end
+     * the story — and that was the hole. The failed run had already advanced
+     * the high-water mark (it ingested its whole window, so `windowFullyIngested`
+     * was true), so the NEXT nightly run planned the ordinary 3-day overlap,
+     * found a healthy probe, and stamped `bankRegisterPullLastSuccess` over a
+     * stretch of observations that never got a clearance answer and were never
+     * offered to the mint. The register read "current" while a week of it was
+     * uncertified.
+     *
+     * So the bounds outlive the retry. Two rules hang off them and both are
+     * load-bearing: the next run EXTENDS its window back to cover them (see
+     * `extendWindowForUncertified`), and the freshness stamp is withheld while
+     * they exist at all (see the route). They are cleared only by a run that
+     * actually re-read them with a working probe.
+     */
+    uncertifiedBounds?: PullUncertifiedBounds | null;
+    /** When the oldest still-outstanding uncertified window first failed (ISO). */
+    uncertifiedSince?: string | null;
+}
+
+/**
+ * A contiguous span of dates whose clearance status is unknown.
+ *
+ * ONE span, not a set of them: a hole in the middle is deliberately not
+ * representable, and `mergeUncertifiedBounds` unions rather than tracking
+ * fragments. Re-reading a few days that were already certified costs one
+ * idempotent fetch; forgetting a day that was not is a permanently wrong ledger.
+ */
+export interface PullUncertifiedBounds {
+    startDate: string;
+    endDate: string;
 }
 
 export interface PullRetryPending {
@@ -328,6 +365,102 @@ export interface PullRetryPending {
  * being retried.
  */
 export const PROBE_RETRY_LIMIT = 6;
+
+const DAY_MS = 86_400_000;
+
+/** Shift a YYYY-MM-DD by whole days, staying in UTC. */
+function shiftYmd(ymd: string, days: number): string {
+    return new Date(Date.parse(`${ymd}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+/** Whole days spanned by [from, to] inclusive. */
+function spanDays(from: string, to: string): number {
+    return Math.floor((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS) + 1;
+}
+
+/**
+ * Widen the outstanding uncertified span to include a window that just failed
+ * its probe.
+ *
+ * A UNION, so the result may swallow days in between that WERE certified. That
+ * is the safe direction: those days get re-fetched through an idempotent ingest
+ * and re-probed, which costs one query. The other direction — tracking
+ * fragments and getting the bookkeeping wrong — loses a day nobody read.
+ */
+export function mergeUncertifiedBounds(
+    existing: PullUncertifiedBounds | null | undefined,
+    window: { startDate: string; endDate: string },
+): PullUncertifiedBounds {
+    if (!existing) return { startDate: window.startDate, endDate: window.endDate };
+    return {
+        startDate: existing.startDate < window.startDate ? existing.startDate : window.startDate,
+        endDate: existing.endDate > window.endDate ? existing.endDate : window.endDate,
+    };
+}
+
+/**
+ * Remove the part of the uncertified span that a run has now re-read WITH a
+ * working clearance probe.
+ *
+ * Only a prefix or a suffix can be subtracted, because the result has to stay
+ * one contiguous span. A covered range strictly INSIDE the bounds would leave a
+ * hole, and a shape that cannot hold a hole must not pretend it did — so that
+ * case subtracts nothing. Conservative on purpose: over-reporting the
+ * uncertified span delays a stamp, under-reporting it certifies days nobody
+ * read, and only one of those is recoverable.
+ */
+export function subtractCertifiedWindow(
+    bounds: PullUncertifiedBounds | null | undefined,
+    covered: { startDate: string; endDate: string },
+): PullUncertifiedBounds | null {
+    if (!bounds) return null;
+    if (covered.startDate <= bounds.startDate && covered.endDate >= bounds.endDate) return null;
+    if (covered.startDate <= bounds.startDate && covered.endDate >= bounds.startDate) {
+        return { startDate: shiftYmd(covered.endDate, 1), endDate: bounds.endDate };
+    }
+    if (covered.endDate >= bounds.endDate && covered.startDate <= bounds.endDate) {
+        return { startDate: bounds.startDate, endDate: shiftYmd(covered.startDate, -1) };
+    }
+    return { startDate: bounds.startDate, endDate: bounds.endDate };
+}
+
+/**
+ * PULL THE PLANNED WINDOW BACK OVER ANYTHING STILL UNCERTIFIED, before this run
+ * is allowed to certify anything (round-35 gate, finding 1).
+ *
+ * Gating the high-water mark on the probe already means the ordinary planner
+ * usually re-covers a failed window on its own. USUALLY is not an invariant:
+ * a deep sweep that failed starts 60 days back while the mark sits days later,
+ * so the sweep the next night — one day newer at both ends — misses the oldest
+ * day of the span it is supposed to be re-reading. This closes that by asking
+ * for the union outright.
+ *
+ * Too wide for one ask is not an error: it takes the OLDEST slice and sets
+ * `continues`, which keeps `complete` false (so nothing is stamped) while the
+ * high-water mark advances over the slice that WAS read. The span then drains
+ * forward exactly the way a capped planner window does.
+ */
+export function extendWindowForUncertified(
+    window: PullWindow,
+    bounds: PullUncertifiedBounds | null | undefined,
+): PullWindow {
+    if (!bounds) return window;
+    if (bounds.startDate >= window.startDate && bounds.endDate <= window.endDate) return window;
+    const startDate = bounds.startDate < window.startDate ? bounds.startDate : window.startDate;
+    const endDate = bounds.endDate > window.endDate ? bounds.endDate : window.endDate;
+    if (spanDays(startDate, endDate) <= PULL_MAX_WINDOW_DAYS) {
+        return { ...window, startDate, endDate };
+    }
+    return {
+        startDate,
+        endDate: shiftYmd(startDate, PULL_MAX_WINDOW_DAYS - 1),
+        // NOT a deep sweep any more: this window was chosen to chase an
+        // uncertified span, and stamping `lastFullSweep` from it would claim a
+        // sweep that only covered part of its range.
+        fullSweep: false,
+        continues: true,
+    };
+}
 
 export interface PullWindow {
     startDate: string;
@@ -659,6 +792,18 @@ export interface BankRegisterPullSummary {
      * false` and left nothing behind.
      */
     retryPending?: PullRetryPending | null;
+    /**
+     * The days whose clearance is STILL unknown once this run is done, as they
+     * were persisted — null when there are none.
+     *
+     * The route reads this and nothing else to decide whether it may stamp
+     * `bankRegisterPullLastSuccess`: a narrow, healthy, complete window over
+     * three days is not evidence about the week behind it that never got a
+     * clearance answer (round-35 gate, finding 1).
+     */
+    uncertified?: PullUncertifiedBounds | null;
+    /** When the outstanding uncertified span first went unanswered (ISO). */
+    uncertifiedSince?: string | null;
     minted?: {
         minted: number;
         skipped: Record<string, number>;
@@ -699,11 +844,21 @@ export async function runBankRegisterPull(
     const retryWindow = dependencies.windowState?.retryPending ?? null;
     // The window is PLANNED from the persisted high-water mark when the caller
     // keeps one; the fixed-days form is the fallback for tests and one-offs.
-    const planned = retryWindow
+    const plannedBase: PullWindow = retryWindow
         ? { startDate: retryWindow.startDate, endDate: retryWindow.endDate, fullSweep: false, continues: false }
         : dependencies.windowState
             ? planPullWindow(dependencies.windowState, new Date(nowMs))
             : { startDate: ymdDaysAgo(days - 1, nowMs), endDate: new Date(nowMs).toISOString().slice(0, 10), fullSweep: false, continues: false };
+    /**
+     * AND WHATEVER IT PLANNED, IT MUST COVER EVERY DAY STILL UNCERTIFIED.
+     *
+     * The retry marker expires after PROBE_RETRY_LIMIT attempts; the bounds do
+     * not. Without this the run after an exhausted retry asked for the ordinary
+     * 3-day overlap, got a clean probe over it, and stamped the freshness clock
+     * — certifying a register whose older half had never been read with a
+     * working clearance report (round-35 gate, finding 1).
+     */
+    const planned = extendWindowForUncertified(plannedBase, dependencies.windowState?.uncertifiedBounds);
     const { startDate, endDate } = planned;
     const elapsed = dependencies.elapsedMs ?? (() => 0);
     const budgetMs = dependencies.budgetMs ?? Number.POSITIVE_INFINITY;
@@ -1016,6 +1171,36 @@ export async function runBankRegisterPull(
     }
     summary.retryPending = retryPending;
 
+    /**
+     * THE DURABLE HALF: WHICH DAYS ARE STILL UNCERTIFIED.
+     *
+     * `retryPending` schedules the next attempt and is deliberately dropped
+     * once the attempts run out. These bounds are the OBLIGATION underneath it
+     * and are never dropped on a clock — only a run that re-reads them with a
+     * working probe may clear them.
+     *
+     * A window is subtracted only when this run both READ all of it
+     * (`!summary.continues`) and got a real clearance answer over it. A
+     * truncated run read part of its window, and part is not an answer about
+     * the whole.
+     */
+    const inheritedBounds = dependencies.windowState?.uncertifiedBounds ?? null;
+    const inheritedSince = dependencies.windowState?.uncertifiedSince ?? null;
+    let uncertifiedBounds: PullUncertifiedBounds | null = inheritedBounds;
+    let uncertifiedSince: string | null = inheritedSince;
+    if (!clearedProbeOk) {
+        uncertifiedBounds = mergeUncertifiedBounds(inheritedBounds, { startDate, endDate });
+        // The clock starts at the FIRST failure and keeps running: an operator
+        // needs to know how long the hole has been open, not when the most
+        // recent attempt at it failed.
+        uncertifiedSince = inheritedSince ?? new Date(nowMs).toISOString();
+    } else if (summary.ok && !summary.continues) {
+        uncertifiedBounds = subtractCertifiedWindow(inheritedBounds, { startDate, endDate });
+    }
+    if (uncertifiedBounds === null) uncertifiedSince = null;
+    summary.uncertified = uncertifiedBounds;
+    summary.uncertifiedSince = uncertifiedSince;
+
     if (dependencies.saveWindowState && dependencies.windowState && summary.ok) {
         // NOT `summary.complete`. This asks the narrower question "did this run
         // ingest every batch of the window it fetched?", and a CAPPED window
@@ -1024,11 +1209,23 @@ export async function runBankRegisterPull(
         // same window forever. `summary.complete` is about the whole picture
         // and is deliberately false for a capped window.
         const windowFullyIngested = !summary.continues;
+        /**
+         * AND IT MUST ALSO BE CERTIFIED (round-35 gate, finding 1).
+         *
+         * A failed clearance probe ingests its whole window, so
+         * `windowFullyIngested` is true and the mark used to advance straight
+         * over it. That is what made the hole permanent: the next run planned
+         * from the advanced mark, asked about a NARROWER span, got a healthy
+         * probe, and stamped success — while the days behind it had never been
+         * read with a working clearance report and were never offered to the
+         * mint. An uncertified window is not a swept window.
+         */
+        const windowSwept = windowFullyIngested && clearedProbeOk;
         // The mark still only moves when the window was fully ingested —
         // stepping it past rows this one never stored would lose them. And it
         // moves to the window's END DATE, not merely the newest row that
         // happened to come back (see advanceScanBoundary).
-        const highWater = windowFullyIngested
+        const highWater = windowSwept
             ? advanceScanBoundary(dependencies.windowState.highWater, endDate, lines)
             : dependencies.windowState.highWater;
         summary.highWater = highWater;
@@ -1036,7 +1233,9 @@ export async function runBankRegisterPull(
             await dependencies.saveWindowState({
                 mintRemainingCursor: summary.minted?.remainingCursor ?? null,
                 highWater,
-                lastFullSweep: windowFullyIngested && planned.fullSweep
+                // Same rule: a sweep nobody could certify is not a sweep that
+                // happened, and recording it would push the next one a week out.
+                lastFullSweep: windowSwept && planned.fullSweep
                     ? endDate
                     : dependencies.windowState.lastFullSweep,
                 // Cleared on a finished window; set when we stopped part way.
@@ -1046,6 +1245,11 @@ export async function runBankRegisterPull(
                 // is now certified — the same "latches nothing" rule the blocked
                 // reason follows.
                 retryPending,
+                // The obligation that outlives the retry schedule. Written on
+                // every save, so a run that genuinely re-read the span clears
+                // it and a run that did not carries it forward untouched.
+                uncertifiedBounds,
+                uncertifiedSince,
             });
         } catch (error) {
             // Same reasoning as the sweep's cursor: work committed, the

@@ -264,7 +264,7 @@ test("card history is written only AFTER a validated post", () => {
     // record, which costs one un-recorded thread and is self-correcting on the
     // next card.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     // It rides INSIDE the completion transaction now — same ordering, and the
     // pair commits together (tests/receipt-request-cards.test.ts).
     const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now, tx);");

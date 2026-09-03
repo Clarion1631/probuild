@@ -786,6 +786,60 @@ test("the stale reason rides alongside the others, it does not replace them", ()
     assert.deepEqual([...result.reasons].sort(), ["bank-pull-stale", "errors-24h:3"]);
 });
 
+test("days whose bank clearance was never answered are named, and outlive the retry schedule", () => {
+    /**
+     * Codex PR #443 gate round 35, finding 1. `bank-pull-blocked` is about the
+     * RUN that just ended, so it clears the moment one succeeds. The hole in
+     * the register does not: the retry marker is dropped after
+     * PROBE_RETRY_LIMIT attempts on purpose, and the span it was chasing stays
+     * uncertified until some run actually re-reads it. That span also withholds
+     * the freshness stamp, so unreported the only symptom is a stamp that
+     * quietly stopped moving — which reads as a dead pull.
+     */
+    const result = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok" as const,
+            enabled: true,
+            lastSuccessAt: iso(2 * HOUR),
+            ambiguousCount: 0,
+            uncertifiedWindow: "2026-08-09..2026-08-12",
+        },
+    }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.reasons, ["bank-pull-uncertified:2026-08-09..2026-08-12"]);
+
+    // It stands ALONGSIDE a per-run block, never instead of it: one says a
+    // retry is scheduled, the other says which days are still unread.
+    const both = evaluatePipelineHealth(snapshot({
+        bankPull: {
+            status: "ok" as const,
+            enabled: true,
+            lastSuccessAt: iso(2 * HOUR),
+            ambiguousCount: 0,
+            blockedReason: "probe-retries-exhausted",
+            uncertifiedWindow: "2026-08-09..2026-08-12",
+        },
+    }));
+    assert.deepEqual(both.reasons, [
+        "bank-pull-blocked:probe-retries-exhausted",
+        "bank-pull-uncertified:2026-08-09..2026-08-12",
+    ]);
+
+    // Empty is the cleared state, and a FAILED probe must not invent a span.
+    assert.deepEqual(
+        evaluatePipelineHealth(snapshot({
+            bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(2 * HOUR), ambiguousCount: 0, uncertifiedWindow: "" },
+        })).reasons,
+        [],
+    );
+    assert.equal(
+        evaluatePipelineHealth(snapshot({
+            bankPull: { status: "error", reason: "error", enabled: true, lastSuccessAt: iso(2 * HOUR), ambiguousCount: 0, uncertifiedWindow: "2026-08-09..2026-08-12" },
+        })).reasons.includes("bank-pull-uncertified:2026-08-09..2026-08-12"),
+        false,
+    );
+});
+
 test("an uncertain Chat card is a real, actionable failure", () => {
     // Those rows are deliberately never auto-retried, so nothing but a human
     // clears them. Until one looks, the crew simply never got asked — which is

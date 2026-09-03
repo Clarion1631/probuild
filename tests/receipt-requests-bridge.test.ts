@@ -284,7 +284,7 @@ test("card history is written only AFTER a validated post", () => {
     // Writing it first marked items everCarded for attempts that never reached
     // Chat, deprioritising work nobody had actually been asked about.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     // It rides INSIDE the completion transaction now — same ordering, and the
     // pair commits together (tests/receipt-request-cards.test.ts).
     const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now, tx);");
@@ -509,7 +509,7 @@ test("the lease release is a single fenced statement", () => {
 test("cards write POSTING before the webhook and never repost an uncertain row", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
-    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     assert.ok(markAt > 0 && postAt > markAt, "POSTING must be written BEFORE the call");
     // A post that succeeded but whose completion write lost is UNCERTAIN.
     assert.match(source, /if \(completed\.count === 0\) \{[\s\S]{0,200}status: "UNCERTAIN"/);
@@ -748,7 +748,7 @@ test("the card snapshot is re-verified under the claim, immediately before the s
     // that already holds the claim token.
     const rebuildAt = source.indexOf("const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);");
     const markAt = source.indexOf('data: { status: "POSTING", itemsJson: JSON.stringify(card.items) }');
-    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });");
     assert.ok(rebuildAt > 0 && markAt > rebuildAt && postAt > markAt);
     // The truth is read fresh, not carried from the selection scan. It is
     // EXPORTED, and takes `cache`/`recompute`/`deadlineExceeded` DI seams

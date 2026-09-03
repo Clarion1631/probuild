@@ -7,6 +7,7 @@ import { decodeReasonCodes, type ReasonCode } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, effectiveOwner, hasResolution, isComponentDeadlineExceeded } from "@/lib/receipt-requests";
 import {
     CARD_OWNERS_ASKED,
+    CARD_POST_TIMEOUT_MS,
     CARD_RATE_CEILING,
     buildCardFromItems,
     isPacificWeekday,
@@ -62,6 +63,22 @@ export const maxDuration = 60;
 
 const CLAIM_LOCK_KEY = "receipt-request-cards";
 
+/**
+ * Where the candidate scan's resume point lives (AutomationSetting is a KV
+ * table, same store the sweep's own cursors use).
+ *
+ * WHY IT HAS TO BE DURABLE (Codex PR #443 gate round 35, finding 2). The scan
+ * reads oldest-first and cannot filter by owner in SQL — `owner` lives inside
+ * `displayDetails`, a TEXT column holding JSON. The page cap and the wall clock
+ * both stop it part way, and starting from scratch every invocation means a
+ * long prefix of `office`/`unassigned` issues (which nobody is ever asked
+ * about, and which are also the oldest) is re-read on every run and the tail is
+ * never reached. An owner whose only open items live behind that prefix would
+ * never appear on a card at all — the exact starvation the paging scan was
+ * introduced to fix, reintroduced by the time-based safety valve.
+ */
+const SCAN_CURSOR_KEY = "receiptRequestCardsScanCursor";
+
 /** Page size for the candidate scan. See scanCandidates for why it pages. */
 /**
  * How far back the history repair looks, and how many cards it fixes per run.
@@ -109,6 +126,79 @@ const REVALIDATION_DEADLINE_MS = 45_000;
 /** How much of the revalidation budget is left, measured from `startedAt`. */
 function remainingRevalidationBudgetMs(startedAt: number): number {
     return REVALIDATION_DEADLINE_MS - (Date.now() - startedAt);
+}
+
+/**
+ * THE INVOCATION'S HARD WALL. `maxDuration` is 60s; stopping at 55 leaves room
+ * to serialise a summary instead of being killed with the answer unwritten.
+ *
+ * Wider than `REVALIDATION_DEADLINE_MS` on purpose: that budget bounds the
+ * re-verification QUERIES, which are optional work that degrades safely (an
+ * unverified item is simply not sent). This one bounds the SEND, which does not
+ * degrade safely at all.
+ */
+const RUN_DEADLINE_MS = 55_000;
+
+/**
+ * What still has to happen after the webhook answers: the POSTED write, the
+ * thread/message ids, and `recordCardOnIssues` for every item — one interactive
+ * transaction, all of it after the network call returns.
+ */
+const SEND_COMPLETION_MARGIN_MS = 4_000;
+
+/**
+ * WHAT ENTERING `POSTING` COSTS, WORST CASE (Codex PR #443 gate round 35,
+ * finding 3).
+ *
+ * The 45-second budget bounded the revalidation and nothing else. The send
+ * phase then flipped a row to POSTING and called Chat, which starts a FRESH
+ * 10-second timeout of its own, and the completion writes followed that. A run
+ * that reached the send phase near its wall clock was killed between the
+ * POSTING write and the response — and a row stranded in POSTING is converted
+ * to UNCERTAIN by the next run, which is the one state that is never resent.
+ * So a card nobody had ever sent became a card nobody would ever send.
+ *
+ * A run refuses to enter POSTING without this much budget left. The cost of
+ * refusing is a card that goes out on the 16:30 retry pass instead of at 07:30;
+ * the cost of not refusing is a chase that silently disappears.
+ */
+const SEND_HEADROOM_MS = CARD_POST_TIMEOUT_MS + SEND_COMPLETION_MARGIN_MS;
+
+/** How much of the invocation's wall clock is left, measured from `startedAt`. */
+function remainingRunBudgetMs(startedAt: number): number {
+    return RUN_DEADLINE_MS - (Date.now() - startedAt);
+}
+
+/** The resume point for the candidate scan. Absent or empty means "from the top". */
+async function readScanCursor(): Promise<string | null> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: SCAN_CURSOR_KEY } });
+        return row?.value ? row.value : null;
+    } catch {
+        // A cursor we cannot read is "start from the top" — the pre-existing
+        // behaviour, which is correct but slow, never a guess at a position.
+        return null;
+    }
+}
+
+/**
+ * Persist where the scan stopped. Reports failure rather than throwing: a
+ * cron that has a card ready must still send it, and the cost of a lost
+ * checkpoint is one repeated prefix, not a wrong card. The summary says so, so
+ * a cursor that never advances is visible instead of looking like a quiet queue.
+ */
+async function writeScanCursor(value: string | null): Promise<boolean> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: SCAN_CURSOR_KEY },
+            update: { value: value ?? "" },
+            create: { key: SCAN_CURSOR_KEY, value: value ?? "" },
+        });
+        return true;
+    } catch (error) {
+        console.error("[cron/receipt-request-cards] scan cursor write failed", error instanceof Error ? error.message : "UnknownError");
+        return false;
+    }
 }
 
 async function claim(): Promise<boolean> {
@@ -174,6 +264,18 @@ function toCandidate(issue: {
  * so `overflowExact` is false and the card prints no "and N more" it cannot
  * stand behind — rather than a killed invocation that claims nothing at all.
  *
+ * AND IT RESUMES WHERE THE LAST RUN STOPPED (Codex PR #443 gate round 35,
+ * finding 2). Both stops above — the page cap and the clock — used to leave
+ * nothing behind, so every invocation re-read the same oldest prefix. That
+ * prefix is mostly `office` and `unassigned` items, which are never asked
+ * about, so an owner whose open items sit past it could be starved forever
+ * while every run reported a healthy scan. Filtering by owner in SQL is still
+ * unavailable for the reason above, so instead the scan carries a durable
+ * position: it resumes after `startCursor`, and once it reaches the end of the
+ * queue it WRAPS to the top and keeps going until it meets its own start again.
+ * `exhausted` stays true only for a genuinely complete pass, so the card's "and
+ * N more" is still only printed when it is a real total.
+ *
  * EXPORTED for the same reason `loadCardItemTruth` is: the run's own clock is a
  * 45-second budget with no injection seam at the route boundary, so the only way
  * to prove the scan STOPS on it — rather than to assert that the source contains
@@ -181,12 +283,29 @@ function toCandidate(issue: {
  */
 export async function scanCandidates(
     deadlineExceeded: () => boolean = () => false,
-): Promise<{ candidates: CardCandidateIssue[]; pages: number; exhausted: boolean; deadlineHit: boolean }> {
+    startCursor: string | null = null,
+): Promise<{
+    candidates: CardCandidateIssue[];
+    pages: number;
+    exhausted: boolean;
+    deadlineHit: boolean;
+    /** Where the NEXT run should resume, or null to start from the top. */
+    nextCursor: string | null;
+    /** Whether this pass ran off the end of the queue and restarted at the top. */
+    wrapped: boolean;
+}> {
     const candidates: CardCandidateIssue[] = [];
-    let cursor: string | undefined;
+    // Wrapping re-reads rows this pass already saw. Deduped by id, because the
+    // overflow count the card prints is a count of DISTINCT open items.
+    const seen = new Set<string>();
+    let cursor: string | undefined = startCursor ?? undefined;
     let pages = 0;
     let exhausted = false;
     let deadlineHit = false;
+    let wrapped = false;
+    // Carried forward when this pass stops early. Starts at the inherited
+    // position so a run that reads nothing at all does not rewind the queue.
+    let nextCursor: string | null = startCursor;
 
     while (pages < SCAN_MAX_PAGES) {
         if (deadlineExceeded()) { deadlineHit = true; break; }
@@ -203,16 +322,40 @@ export async function scanCandidates(
             select: { id: true, targetKey: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
         });
         pages++;
-        if (page.length === 0) { exhausted = true; break; }
-        cursor = page[page.length - 1].id;
+        if (page.length > 0) nextCursor = page[page.length - 1].id;
 
         for (const row of page) {
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
             const candidate = toCandidate(row);
             if (!CARD_OWNERS_ASKED.includes(candidate.owner as never)) continue;
             if (candidate.acknowledged) continue;
             candidates.push(candidate);
         }
-        if (page.length < SCAN_PAGE_SIZE) { exhausted = true; break; }
+
+        // BACK AT OUR OWN STARTING POINT: the wrap has covered the prefix this
+        // pass originally skipped, so the queue has been read end to end.
+        if (wrapped && startCursor !== null && page.some(row => row.id === startCursor)) {
+            exhausted = true;
+            nextCursor = null;
+            break;
+        }
+        if (page.length < SCAN_PAGE_SIZE) {
+            if (startCursor === null || wrapped) {
+                // Read from the top through to the end: a genuinely complete
+                // pass, so the next run may start fresh.
+                exhausted = true;
+                nextCursor = null;
+                break;
+            }
+            // The tail is done but the prefix we resumed past has not been read
+            // this pass. Restart at the top rather than declaring a total we
+            // never counted.
+            wrapped = true;
+            cursor = undefined;
+            continue;
+        }
+        cursor = page[page.length - 1].id;
         // RUNS TO EXHAUSTION. It used to stop as soon as each owner had a full
         // card, which was enough to CHOOSE the items but not to COUNT the rest
         // — so "and 4 more" was whatever the scan happened to have seen, which
@@ -222,7 +365,7 @@ export async function scanCandidates(
         // number rather than printing a guess.
     }
 
-    return { candidates, pages, exhausted, deadlineHit };
+    return { candidates, pages, exhausted, deadlineHit, nextCursor, wrapped };
 }
 
 /**
@@ -416,9 +559,15 @@ export async function GET(request: Request) {
     // below and find an empty list, which is the same lost day wearing a
     // different hat. A retry that may not select still needs no scan: it only
     // re-posts what an earlier run claimed.
+    const scanResumedFrom = selectionAllowed ? await readScanCursor() : null;
     const scan = selectionAllowed
-        ? await scanCandidates(() => remainingRevalidationBudgetMs(runStartedAt) <= 0)
-        : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true, deadlineHit: false };
+        ? await scanCandidates(() => remainingRevalidationBudgetMs(runStartedAt) <= 0, scanResumedFrom)
+        : { candidates: [] as CardCandidateIssue[], pages: 0, exhausted: true, deadlineHit: false, nextCursor: null, wrapped: false };
+    // CHECKPOINTED IMMEDIATELY, before selection or any send. The whole value of
+    // the cursor is that a run which spends its budget scanning still leaves the
+    // next one further along; writing it after the send phase would lose it on
+    // exactly the runs that needed it most.
+    const scanCursorPersisted = selectionAllowed ? await writeScanCursor(scan.nextCursor) : true;
     const toPost: Array<{ card: OwnerCard; rowId: string; token: string; resumed: boolean }> = [];
     // Sent, but we never confirmed it. Reported, never reposted.
     const uncertain: string[] = [];
@@ -562,6 +711,10 @@ export async function GET(request: Request) {
     // not a quiet day: a 200 here meant nobody was ever told the crew's card
     // did not go out.
     const failures: string[] = [];
+    // Rows this run held back because it did not have the wall clock left to
+    // send them safely. NOT a failure and NOT uncertain: nothing was sent, the
+    // claim is released, and the next invocation picks the row up unchanged.
+    const sendDeferred: string[] = [];
     // ONE cache for the whole run, not one per owner: two owners' cards can
     // each carry a line from the SAME competing component (same amount,
     // adjacent dates, different assignees), and a cache scoped to a single
@@ -569,6 +722,33 @@ export async function GET(request: Request) {
     // second time for the other owner.
     const revalidationCache = new Map<string, ReasonCode[]>();
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
+        /**
+         * ENOUGH WALL CLOCK TO FINISH WHAT WE START (round-35 gate, finding 3).
+         *
+         * Everything below this point is unsafe to be killed part way: the
+         * POSTING write, a webhook call that opens its own fresh timeout, and
+         * the completion transaction that records the thread ids. A kill
+         * between the first and the last leaves the row in POSTING, which the
+         * NEXT run reads as `uncertain-delivery` and never resends — so a card
+         * that was never sent becomes a card nobody will ever send.
+         *
+         * Checked BEFORE the revalidation, not just before the POSTING write:
+         * revalidation is itself several real queries, and spending them only
+         * to refuse the send afterwards wastes the budget of the run that
+         * WOULD have sent it.
+         *
+         * Releasing the claim is what makes this recoverable rather than a
+         * lost day — the row keeps its selection and the 16:30 retry pass
+         * takes it as an ordinary resumed card.
+         */
+        if (remainingRunBudgetMs(runStartedAt) <= SEND_HEADROOM_MS) {
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, postedAt: null, status: { in: ["PENDING", "POSTED"] } },
+                data: { claimedAt: null, claimToken: null },
+            });
+            sendDeferred.push(claimedCard.owner);
+            continue;
+        }
         // RE-VERIFY UNDER THE CLAIM, IMMEDIATELY BEFORE THE SEND.
         //
         // The snapshot was chosen at the top of the run — or, on a retry pass,
@@ -607,6 +787,28 @@ export async function GET(request: Request) {
         // starvation the ordering exists to prevent. The post is now only a
         // success when it returns both bridge identities, so "carded" means
         // "there is a real thread to reply in".
+        /**
+         * THE SAME DEADLINE, HANDED IN. The gate above proves there was room
+         * for a full-length call when this item started; the revalidation
+         * between then and here has spent some of it, so the call gets what is
+         * ACTUALLY left minus the completion writes, never the flat ten
+         * seconds it would otherwise assume. `postOwnerCard` clamps to its own
+         * ceiling, so this can only ever shorten the call.
+         */
+        const sendTimeoutMs = Math.min(
+            CARD_POST_TIMEOUT_MS,
+            remainingRunBudgetMs(runStartedAt) - SEND_COMPLETION_MARGIN_MS,
+        );
+        if (sendTimeoutMs <= 0) {
+            // The revalidation ate the headroom the gate had measured. Same
+            // answer as the gate: release, defer, send nothing.
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, postedAt: null, status: { in: ["PENDING", "POSTED"] } },
+                data: { claimedAt: null, claimToken: null },
+            });
+            sendDeferred.push(card.owner);
+            continue;
+        }
         // POSTING, BEFORE the call. This is the whole point of the state: a
         // crash after this write and before the response is distinguishable
         // from a crash before it, so the next run knows not to repost.
@@ -623,7 +825,7 @@ export async function GET(request: Request) {
             continue;
         }
 
-        const result = await postOwnerCard(webhookUrl, card);
+        const result = await postOwnerCard(webhookUrl, card, { timeoutMs: sendTimeoutMs });
 
         if (result.kind === "rejected") {
             // Chat provably did NOT take it: nothing is in the space. Back to
@@ -770,6 +972,11 @@ export async function GET(request: Request) {
         // resolve on the Receipts tab, not a reason to fail every later run.
         uncertainTransitions,
         inFlightOwners: inFlight,
+        // Held back for want of wall clock, claim released, nothing sent. The
+        // reason rides along so a run that keeps deferring is distinguishable
+        // from a quiet morning.
+        sendDeferredOwners: sendDeferred,
+        ...(sendDeferred.length > 0 ? { deferredReason: "send-deferred" as const } : {}),
         // Rows deleted this run because their stored itemsJson parsed to
         // nothing. Worth seeing, not worth failing the run over.
         invalidRows,
@@ -778,6 +985,14 @@ export async function GET(request: Request) {
         scanned: scan.candidates.length,
         scanPages: scan.pages,
         scanExhausted: scan.exhausted,
+        // The scan's durable position. A `scanResumedFrom` that never changes
+        // across runs is a stuck cursor, which looks exactly like a quiet queue
+        // without this; `scanWrapped` says the pass really did cover the prefix
+        // it had skipped, which is what makes `scanExhausted` trustworthy.
+        scanResumedFrom,
+        scanNextCursor: scan.nextCursor,
+        scanWrapped: scan.wrapped,
+        scanCursorPersisted,
         // WHY the scan was not exhausted, when it was the clock rather than the
         // page cap. Both produce the same honest `overflowExact: false`, and
         // they need different fixes — one is a backlog, the other is a slow run.

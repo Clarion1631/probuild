@@ -400,8 +400,10 @@ test("the sweep reads the pull marker the pull actually writes", () => {
     const pull = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
     assert.match(sweep, /BANK_PULL_LAST_SUCCESS_KEY[\s\S]*from "@\/lib\/pipeline-health"/);
     assert.match(pull, /BANK_PULL_LAST_SUCCESS_KEY[\s\S]*from "@\/lib\/pipeline-health"/);
-    // And the pull still only stamps a COMPLETE, unambiguous success.
-    assert.match(pull, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0\) \{/);
+    // And the pull still only stamps a COMPLETE, unambiguous success — with a
+    // fifth condition since round 35: no days left uncertified behind this
+    // window (a healthy 3-day overlap says nothing about the week before it).
+    assert.match(pull, /if \(summary\.ok && summary\.complete && summary\.clearedProbeOk && ambiguousCount === 0[\s]*&& !summary\.uncertified\) \{/);
     // A read failure is NOT fresh: "we could not check" is not evidence.
     assert.match(sweep, /return \{ fresh: false, lastSuccessAt: null \};/);
 });
