@@ -225,9 +225,9 @@ test("provenance rules are shared by BOTH upload paths", async () => {
     assert.equal(scoped.sourceRef, "web:u1:3f2504e0-4f89-41d3-9a0c-0305e82c3301", "scoped to the USER");
 
     const mobile = { ok: true, via: "session", userVia: "mobile-jwt", user: { id: "u2", role: "FIELD_CREW" } } as any;
-    const minted = decideSource(mobile, {});
-    assert.ok(minted.ok);
-    assert.match(minted.sourceRef, /^mobile:[0-9a-f-]{36}$/);
+    // No uploadId AND no checksum: refused rather than minting a random,
+    // non-idempotent key — see "a bare retry with no uploadId..." below.
+    assert.deepEqual(decideSource(mobile, {}), { ok: false, reason: "missing-idempotency-key" });
 
     const secret = {
         ok: true, via: "secret", user: null, userVia: null,
@@ -248,6 +248,48 @@ test("provenance rules are shared by BOTH upload paths", async () => {
     // tests/apply-receipt-intake.test.ts, which ties it to the bucket policy
     // and the booking preflight.
     assert.equal(MAX_STORED_BYTES, 8 * 1024 * 1024);
+});
+
+// ── A bare retry with no uploadId is still idempotent (round-31 gate, 3) ───
+
+test("a session/mobile caller with no uploadId is keyed by content, not a random mint", async () => {
+    const { decideSource } = await import("../src/lib/receipt-intake/intake-core");
+    const mobile = { ok: true, via: "session", userVia: "mobile-jwt", user: { id: "u2", role: "FIELD_CREW" } } as any;
+    const web = { ok: true, via: "session", userVia: "next-auth", user: { id: "u3", role: "ADMIN" } } as any;
+
+    // Neither an uploadId nor a checksum: there is nothing to derive a durable
+    // key from, so this is refused rather than minted at random.
+    assert.deepEqual(decideSource(mobile, {}), { ok: false, reason: "missing-idempotency-key" });
+    assert.deepEqual(decideSource(mobile, { checksum: "" }), { ok: false, reason: "missing-idempotency-key" });
+    assert.deepEqual(decideSource(mobile, { checksum: "not-hex" }), { ok: false, reason: "missing-idempotency-key" });
+    // Too short to be a real sha256, even though every character is hex.
+    assert.deepEqual(decideSource(mobile, { checksum: "ab".repeat(16) }), { ok: false, reason: "missing-idempotency-key" });
+
+    const checksum = "a".repeat(64);
+    const first = decideSource(mobile, { checksum });
+    assert.ok(first.ok);
+    assert.equal(first.sourceRef, `session:u2:${checksum}`, "scoped to the USER, not just the content");
+    // SAME user, SAME bytes, called again — the exact scenario a retried
+    // upload with no client token produces. THE SAME sourceRef is the whole
+    // point: it is what makes the second POST collide with the row the first
+    // one already created instead of minting a second one.
+    assert.deepEqual(decideSource(mobile, { checksum }), first);
+
+    // Uppercase hex is normalised the same way as an uploadId is lowercased.
+    assert.deepEqual(decideSource(mobile, { checksum: checksum.toUpperCase() }), first);
+
+    // Different user, same bytes -> a DIFFERENT key. Two people photographing
+    // the same physical receipt must not collide with each other.
+    const other = decideSource(web, { checksum });
+    assert.ok(other.ok);
+    assert.notEqual(other.sourceRef, first.sourceRef);
+
+    // uploadId still wins when the caller supplies one — behaviour unchanged
+    // from before this fix, checksum or not.
+    const uploadId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    const withUploadId = decideSource(mobile, { uploadId, checksum });
+    assert.ok(withUploadId.ok);
+    assert.equal(withUploadId.sourceRef, `mobile:u2:${uploadId}`);
 });
 
 // ── Two secrets, two blast radii (Phase 3 gate, c) ─────────────────────────
@@ -336,6 +378,75 @@ test("an unset secret refuses that capability — never fails open", async () =>
                 new Request("https://probuild.test/api/receipts/intake", {
                     method: "POST",
                     headers: { "x-receipt-intake-secret": "anything" },
+                }),
+                need,
+            );
+            assert.equal(res.ok, false, need);
+            assert.equal((res as { response: Response }).response.status, 401, need);
+        }
+    } finally {
+        env.RECEIPT_INTAKE_SECRET = before.i;
+        env.RECEIPT_ARCHIVE_SECRET = before.a;
+    }
+});
+
+test("ONLY ONE secret configured refuses BOTH capabilities — never accepts the one that IS set", async () => {
+    // The regression: `secretMatches(provided, undefined)` is false for every
+    // input, so with only RECEIPT_INTAKE_SECRET set, a caller presenting it
+    // sailed straight through — not because it held real archive authority,
+    // but because there was no archive secret to fail the OTHER compare
+    // against either. The invariant has to be checked on the env vars
+    // themselves, not merely inferred from "both compares matched".
+    const { authenticateIntake } = await loadAuth();
+    const env = process.env as Record<string, string | undefined>;
+    const before = { i: env.RECEIPT_INTAKE_SECRET, a: env.RECEIPT_ARCHIVE_SECRET };
+    const req = (secret: string) =>
+        new Request("https://probuild.test/api/receipts/intake", {
+            method: "POST",
+            headers: { "x-receipt-intake-secret": secret },
+        });
+
+    try {
+        // Only RECEIPT_INTAKE_SECRET set.
+        env.RECEIPT_INTAKE_SECRET = "ingest-key";
+        delete env.RECEIPT_ARCHIVE_SECRET;
+        for (const need of ["ingest", "archive"] as const) {
+            const res = await authenticateIntake(req("ingest-key"), need);
+            assert.equal(res.ok, false, `intake-only, need=${need}`);
+            assert.equal((res as { response: Response }).response.status, 401, `intake-only, need=${need}`);
+        }
+
+        // Only RECEIPT_ARCHIVE_SECRET set.
+        delete env.RECEIPT_INTAKE_SECRET;
+        env.RECEIPT_ARCHIVE_SECRET = "archive-key";
+        for (const need of ["ingest", "archive"] as const) {
+            const res = await authenticateIntake(req("archive-key"), need);
+            assert.equal(res.ok, false, `archive-only, need=${need}`);
+            assert.equal((res as { response: Response }).response.status, 401, `archive-only, need=${need}`);
+        }
+    } finally {
+        env.RECEIPT_INTAKE_SECRET = before.i;
+        env.RECEIPT_ARCHIVE_SECRET = before.a;
+    }
+});
+
+test("BOTH secrets set to the SAME value refuses BOTH capabilities, whatever is presented", async () => {
+    // The "configuring ONE value for both variables" test above only drives
+    // the case where the caller happens to present that shared value. This
+    // pins the invariant independently of what's on the wire: an unrelated
+    // wrong guess must not be waved through by way of "the equal-secret check
+    // never even ran".
+    const { authenticateIntake } = await loadAuth();
+    const env = process.env as Record<string, string | undefined>;
+    const before = { i: env.RECEIPT_INTAKE_SECRET, a: env.RECEIPT_ARCHIVE_SECRET };
+    env.RECEIPT_INTAKE_SECRET = "shared";
+    env.RECEIPT_ARCHIVE_SECRET = "shared";
+    try {
+        for (const need of ["ingest", "archive"] as const) {
+            const res = await authenticateIntake(
+                new Request("https://probuild.test/api/receipts/intake", {
+                    method: "POST",
+                    headers: { "x-receipt-intake-secret": "shared" },
                 }),
                 need,
             );

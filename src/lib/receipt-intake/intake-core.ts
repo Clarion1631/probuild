@@ -2,7 +2,6 @@
  * Shared intake rules, so the single-shot POST and the two-step
  * start/finalize flow cannot drift apart on provenance, idempotency or limits.
  */
-import { randomUUID } from "node:crypto";
 import type { IntakeAuth } from "./intake-auth";
 
 /**
@@ -73,7 +72,13 @@ export type SourceDecision =
  */
 export function decideSource(
     auth: Extract<IntakeAuth, { ok: true }>,
-    body: { source?: string | null; sourceRef?: string | null; uploadId?: string | null },
+    body: {
+        source?: string | null;
+        sourceRef?: string | null;
+        uploadId?: string | null;
+        /** sha256 of the bytes being (or about to be) uploaded, hex, any case. */
+        checksum?: string | null;
+    },
 ): SourceDecision {
     if (auth.via === "secret") {
         const source = String(body.source ?? "");
@@ -104,7 +109,15 @@ export function decideSource(
         if (!UUID_PATTERN.test(body.uploadId)) return { ok: false, reason: "invalid-uploadId" };
         return { ok: true, source, sourceRef: `${source}:${auth.user.id}:${body.uploadId.toLowerCase()}` };
     }
-    return { ok: true, source, sourceRef: `${source}:${randomUUID()}` };
+
+    // No client-chosen token: fall back to a STABLE key derived from the
+    // bytes themselves, scoped to the user. Minting a random uuid here meant
+    // every retry with no uploadId — a flaky connection, a double-tap on a
+    // slow spinner — was accepted as a brand new receipt, because nothing
+    // about the row's identity depended on what was actually uploaded.
+    const checksum = (body.checksum ?? "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(checksum)) return { ok: false, reason: "missing-idempotency-key" };
+    return { ok: true, source, sourceRef: `session:${auth.user.id}:${checksum}` };
 }
 
 /**

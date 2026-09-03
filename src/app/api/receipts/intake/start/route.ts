@@ -102,6 +102,10 @@ export async function POST(req: Request) {
         source: str(body.source),
         sourceRef: str(body.sourceRef),
         uploadId: str(body.uploadId),
+        // Already validated above (64 lowercase hex): the client's own hash of
+        // what it is about to upload is exactly the checksum a no-uploadId
+        // session caller needs a STABLE key derived from.
+        checksum: expectedSha256,
     });
     if (!decided.ok) return NextResponse.json({ ok: false, reason: decided.reason }, { status: 400 });
 

@@ -186,6 +186,11 @@ export async function POST(req: Request) {
     const mimeType = sniffMime(parsed.bytes, parsed.declaredMime);
     if (!mimeType) return unsupportedType(parsed.declaredMime);
 
+    // Computed BEFORE decideSource, not just before the insert: a session/
+    // mobile caller with no uploadId is scoped by this hash, so decideSource
+    // needs it to mint a STABLE key rather than a random one.
+    const fileSha256 = createHash("sha256").update(parsed.bytes).digest("hex");
+
     // PROVENANCE AND IDENTITY ARE NOT CALLER INPUT for a human, and the rules
     // are decideSource()'s — THE SAME FUNCTION /start calls, not a copy.
     //
@@ -200,6 +205,7 @@ export async function POST(req: Request) {
         source: parsed.source,
         sourceRef: parsed.sourceRef,
         uploadId: parsed.uploadId,
+        checksum: fileSha256,
     });
     if (!decided.ok) return bad(decided.reason);
     const { source, sourceRef } = decided;
@@ -223,7 +229,6 @@ export async function POST(req: Request) {
     const id = randomUUID();
     const ext = EXT_BY_MIME[mimeType] ?? "bin";
     const storagePath = `receipts/intake/${id}.${ext}`;
-    const fileSha256 = createHash("sha256").update(parsed.bytes).digest("hex");
 
     // ROW FIRST, THEN THE OBJECT.
     //

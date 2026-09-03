@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
+import { SOURCE_REF_PATTERNS } from "@/lib/receipt-intake/intake-core";
 
 export const dynamic = "force-dynamic";
 
@@ -43,6 +44,14 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     const driveFileId = typeof body.driveFileId === "string" ? body.driveFileId.trim() : "";
     if (!driveFileId) {
         return NextResponse.json({ ok: false, reason: "missing-driveFileId" }, { status: 400 });
+    }
+    // SAME shape rule a `drive` sourceRef's tail is held to (intake-core.ts):
+    // a real Drive file id, not an arbitrary string. This value is written to
+    // `archiveDriveFileId`, echoed in logs, and compared for equality on every
+    // replay — "any non-empty string" let a single stray character ("x") or an
+    // oversized payload become the permanent archive identity for a row.
+    if (!SOURCE_REF_PATTERNS.drive.test(driveFileId)) {
+        return NextResponse.json({ ok: false, reason: "invalid-driveFileId" }, { status: 400 });
     }
 
     const row = await prisma.receiptIntake.findUnique({

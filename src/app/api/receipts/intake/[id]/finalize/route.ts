@@ -148,11 +148,21 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
 
     const { id } = await context.params;
 
+    // A GENUINELY empty body means "no fields" — the declared hash and the
+    // late fields are all optional. But `req.json()` throws on malformed JSON
+    // too, and a bare try/catch could not tell the two apart: a truncated or
+    // corrupted body was silently treated as an empty one, so a request-level
+    // bug never surfaced as an error the caller could see or retry against.
+    // Reading the raw text first is what makes the difference legible: only a
+    // body that is empty (or whitespace) after trimming may mean "no fields".
     let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
-    try {
-        body = await req.json();
-    } catch {
-        // A finalize with no body is fine — the declared hash is optional.
+    const rawBody = await req.text();
+    if (rawBody.trim()) {
+        try {
+            body = JSON.parse(rawBody);
+        } catch {
+            return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+        }
     }
     const declaredSha = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
 

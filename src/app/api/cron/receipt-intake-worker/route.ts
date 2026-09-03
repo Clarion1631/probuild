@@ -262,34 +262,50 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             }
         }
 
+        const ELIGIBLE: Prisma.ReceiptIntakeWhereInput = {
+            // STAGING is absent on purpose: the row exists but its object
+            // does not, so claiming it would park a good receipt as
+            // "file-missing". sweepStaleStaging is what watches those.
+            state: { in: ["RECEIVED", "READ", "BOOKING"] },
+            OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+            ...NOT_DRY_RUN_PARKED,
+        };
+
         const due = await tx.receiptIntake.findMany({
-            where: {
-                // STAGING is absent on purpose: the row exists but its object
-                // does not, so claiming it would park a good receipt as
-                // "file-missing". sweepStaleStaging is what watches those.
-                state: { in: ["RECEIVED", "READ", "BOOKING"] },
-                OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-                ...NOT_DRY_RUN_PARKED,
-            },
+            where: ELIGIBLE,
             orderBy: { createdAt: "asc" },
             take: BATCH_SIZE,
-            select: WORKER_ROW_SELECT,
+            select: { id: true },
         });
         if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
 
-        // THE claim. Anything this run took is invisible to the next one for
-        // the lease, whether or not the advisory lock held — AND it is stamped
-        // with a fresh token, so a completing write can prove it still owns the
-        // row rather than merely having owned it once.
+        // THE claim is ATOMIC with the select it followed: the UPDATE re-checks
+        // the SAME eligibility predicate rather than blindly writing every id
+        // the SELECT returned. Between those two statements — even inside this
+        // one transaction, under READ COMMITTED — another writer with no reason
+        // to touch the advisory lock (a late `retryRow`, a `deferRead`, an admin
+        // action) can still move a row's `nextRetryAt` into the future or its
+        // state off the eligible list. Claiming by id alone would stomp that
+        // write and hand the row to this pass anyway; re-checking the predicate
+        // here means such a row is left untouched instead.
+        const ids = due.map(r => r.id);
         const claimToken = randomUUID();
-        await tx.receiptIntake.updateMany({
-            where: { id: { in: due.map(r => r.id) } },
+        const claimed = await tx.receiptIntake.updateMany({
+            where: { id: { in: ids }, ...ELIGIBLE },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS), claimToken, claimedAt: now },
         });
-        // The rows were SELECTed before the stamp, so hand back the token this
-        // pass just wrote rather than whatever they were carrying before.
+        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+
+        // Re-read by id AND the fresh token — never by the original id list —
+        // so only the rows this UPDATE actually touched are handed to the pass.
+        // A row the predicate above skipped keeps its OLD claimToken and is
+        // invisible here even though its id is still in `ids`.
+        const rows = await tx.receiptIntake.findMany({
+            where: { id: { in: ids }, claimToken },
+            select: WORKER_ROW_SELECT,
+        });
         return {
-            rows: due.map(row => ({ ...row, claimToken })) as WorkerRow[],
+            rows: rows as WorkerRow[],
             shadowRetired,
             requeued,
             shadowQuarantined,
