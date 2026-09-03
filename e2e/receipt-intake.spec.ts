@@ -1011,10 +1011,23 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         minted.push(id);
 
         // Exactly what the stale-STAGING sweep leaves behind when the upload
-        // never landed.
+        // never landed -- INCLUDING A DEAD LEASE.
+        //
+        // The sweeper only ever picks rows whose `uploadUrlExpiresAt` is null or
+        // already past (see sweepStaleStaging's WHERE), so a `file-missing` park
+        // in production always has an expired lease. Leaving the fresh two-hour
+        // one this /start issued would be a state the sweeper cannot produce --
+        // and since round 20 a LIVE lease is immutable, so the corrected-hash
+        // retry below would be answered 409 lease-conflict instead of re-armed.
+        // That refusal is correct for a live lease and is covered by its own
+        // case below; this one is about the recovery.
         await prisma.receiptIntake.update({
             where: { id },
-            data: { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+            data: {
+                state: "NEEDS_REVIEW",
+                stateReason: "file-missing",
+                uploadUrlExpiresAt: new Date(Date.now() - 60_000),
+            },
         });
 
         // The client comes back with the correct document — a DIFFERENT hash
@@ -1057,6 +1070,83 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         expect(done?.state).toBe("RECEIVED", "the swept row recovered all the way to published");
         expect(done?.stateReason).toBeNull();
         expect(done?.fileSha256).toBe(sha(PNG_BASE64));
+    });
+
+    test("a parked row whose lease is STILL LIVE is refused, not re-armed", async ({ request }) => {
+        // The other half of the rule the case above depends on. A live lease's
+        // identity -- path, declared type, announced hash -- is immutable for
+        // its lifetime: re-arming it would bump the version, repath the row and
+        // rotate the generation while the first caller's signed URL still
+        // worked and still pointed at the object about to be orphaned.
+        const ref = `${REF_PREFIX}swept-live-lease`;
+        const first = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(OTHER_PNG_BASE64),
+        });
+        expect(first.status()).toBe(200);
+        const started = await first.json();
+        minted.push(started.id);
+
+        // Parked, but the lease this /start issued is untouched and live.
+        await prisma.receiptIntake.update({
+            where: { id: started.id },
+            data: { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+        });
+
+        const conflicting = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(conflicting.status()).toBe(409);
+        const body = await conflicting.json();
+        expect(body.error).toBe("lease-conflict");
+        expect(body.field).toBe("sha256");
+        expect(body.retryable).toBe(true);
+        expect(body.leaseExpiresAt, "so the caller knows how long to wait").toBeTruthy();
+
+        // NOTHING MOVED: the first caller's URL is still the row's.
+        const row = await prisma.receiptIntake.findUnique({ where: { id: started.id } });
+        expect(row?.storagePath).toBe(started.storagePath);
+        expect(row?.uploadLeaseNonce).toBe(started.uploadLease);
+        expect(row?.uploadLeaseVersion).toBe(1);
+
+        // ...and the SAME retry succeeds once that lease has lapsed, which is
+        // what makes the refusal a wait rather than a dead end.
+        await prisma.receiptIntake.update({
+            where: { id: started.id },
+            data: { uploadUrlExpiresAt: new Date(Date.now() - 60_000) },
+        });
+        const rearmed = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(rearmed.status()).toBe(200);
+        const rearmedBody = await rearmed.json();
+        expect(rearmedBody.kind).toBe("upload");
+        expect(rearmedBody.recovered).toBe(true);
+        expect(rearmedBody.uploadLease).not.toBe(started.uploadLease);
+    });
+
+    test("a CHANGED file type against a live lease is refused the same way", async ({ request }) => {
+        const ref = `${REF_PREFIX}live-lease-mime`;
+        const first = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64),
+        });
+        expect(first.status()).toBe(200);
+        const started = await first.json();
+        minted.push(started.id);
+
+        // Same document, same hash, DIFFERENT declared type. The path is derived
+        // from (id, leaseVersion, ext), so this cannot reuse the lease -- and it
+        // must not repath one that is live either.
+        const swapped = await startWith(request, {
+            source: "drive", sourceRef: ref, mimeType: "application/pdf", sha256: sha(PNG_BASE64),
+        });
+        expect(swapped.status()).toBe(409);
+        const body = await swapped.json();
+        expect(body.error).toBe("lease-conflict");
+        expect(body.field).toBe("mime");
+
+        const row = await prisma.receiptIntake.findUnique({ where: { id: started.id } });
+        expect(row?.storagePath).toBe(started.storagePath, "still the PNG path");
+        expect(row?.uploadLeaseNonce).toBe(started.uploadLease);
     });
 
     test("a park a re-upload CANNOT fix still answers alreadyReceived", async ({ request }) => {

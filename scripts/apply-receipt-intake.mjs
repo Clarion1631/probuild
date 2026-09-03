@@ -1020,7 +1020,19 @@ async function main() {
 
         // The bucket last: a failure here must not leave the table half-made,
         // and the schema is useless without somewhere to put the bytes anyway.
-        await applyBucket();
+        // THE BUCKET IS PART OF THE PROD TARGET, not of the schema. It lives
+        // in Supabase, and `--target ci` runs against a throwaway Postgres
+        // container with no Supabase project behind it -- demanding a service
+        // key there would mean either failing every CI run or putting a real
+        // key in the workflow, and the whole point of that target is that it
+        // cannot reach a real project. The bucket's own policy is asserted
+        // separately by tests/apply-receipt-intake.test.ts, against the
+        // constants the code writes through.
+        if (chosen.target === "prod") {
+            await applyBucket();
+        } else {
+            console.log(`bucket ${RECEIPT_BUCKET}: skipped (--target ${chosen.target} has no Supabase project)`);
+        }
 
         console.log("\nReceiptIntake migration applied and verified.");
     } finally {
