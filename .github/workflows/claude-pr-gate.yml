@@ -50,6 +50,9 @@ jobs:
         id: review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Attacker-controlled text goes through env, never into the script body:
+          # a `${{ }}` expansion inside `run:` is spliced in before Bash parses it.
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
           # Prior rounds: earlier gate verdicts AND the author's replies (fixes,
@@ -88,7 +91,7 @@ jobs:
              VERDICT: APPROVE  or  VERDICT: REQUEST_CHANGES followed by a numbered
              list of required changes, each tagged P0 or P1 with the failure scenario.
 
-             PR title: ${{ github.event.pull_request.title }}
+             PR title: $PR_TITLE
              PR body: $(gh pr view ${{ github.event.pull_request.number }} --json body -q .body)" \
             | tee /tmp/review.txt
           VERDICT=$(grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' /tmp/review.txt | tail -1)
