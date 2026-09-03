@@ -490,3 +490,19 @@ test("no e2e spec passes a message to a matcher that takes no argument", () => {
     }
     assert.deepEqual(offenders, [], `pass the message to expect() instead:\n${offenders.join("\n")}`);
 });
+test("the object lock is keyed by the PATH, not by a constant", () => {
+    // A constant key would still serialize -- and would serialize EVERYTHING,
+    // turning a per-object mutex into a global one that two unrelated receipts
+    // queue behind. The granularity is the point, and it is not observable from
+    // a race between two claimants of the SAME path.
+    const cleanup = source("src/lib/receipt-intake/storage-cleanup.ts");
+    const lockBody = functionBody(cleanup, "export async function lockObjectPath");
+    assert.match(
+        lockBody,
+        /hashtext\(\$\{OBJECT_LOCK_PREFIX \+ storagePath\}\)/,
+        "the key carries the path",
+    );
+    // And the prefix is a namespace, not the whole key: two features hashing
+    // bare paths into one advisory-lock space would collide on nothing useful.
+    assert.match(cleanup, /export const OBJECT_LOCK_PREFIX = "receipt-object:";/);
+});

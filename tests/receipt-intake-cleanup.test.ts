@@ -244,6 +244,7 @@ import {
     CLEANUP_SCAN_FACTOR,
     CLEANUP_SWEEPABLE_STATUSES,
     claimsConflict,
+    acquireObjectClaim,
     claimObjectPath,
     recordPendingCleanup,
     objectClaimDueAt,
@@ -1465,8 +1466,12 @@ function budgetSpy(deadline: RouteDeadline, stepMs: number) {
 }
 
 test("verifyStoredCopy hands BOTH its storage calls the same shrinking budget", async () => {
-    const route = createRouteDeadline(20_000);
-    const spy = budgetSpy(route, 6_000);
+    // A budget SMALLER than STORAGE_CALL_MAX_MS, deliberately: with a real
+    // deadline every call is capped by what the ROUTE has left, and with
+    // none it gets the full fifteen seconds. A 20s route at t=0 would
+    // produce 15_000 either way, and the assertion would prove nothing.
+    const route = createRouteDeadline(9_000);
+    const spy = budgetSpy(route, 2_000);
 
     // The size probe, then the download: the two calls this function makes.
     await verifyStoredCopy(
@@ -1475,6 +1480,9 @@ test("verifyStoredCopy hands BOTH its storage calls the same shrinking budget", 
         spy.at(),
         async (_path, _lister, deadline) => {
             spy.observe(deadline);
+            // A slow probe, so the download that follows it demonstrably has
+            // LESS of the route's budget left -- which is the whole property.
+            await new Promise(resolve => setTimeout(resolve, 60));
             return { ok: true, size: 10 };
         },
         async (_path, deadline) => {
@@ -1487,10 +1495,11 @@ test("verifyStoredCopy hands BOTH its storage calls the same shrinking budget", 
     for (const budget of spy.seen) {
         assert.ok(budget > 0, `a real budget, not an absent one (${budget})`);
         assert.ok(
-            budget <= 20_000,
-            "and never more than the route ever had",
+            budget <= 9_000,
+            `capped by what the ROUTE has left, never a fresh ${STORAGE_CALL_MAX_MS}ms (${budget})`,
         );
     }
+    assert.ok(spy.seen[1] < spy.seen[0], "and the second call gets strictly less than the first");
 });
 
 test("PRE-FIX CONTROL: with no deadline, every call in the chain gets a fresh 15s", async () => {
@@ -1539,4 +1548,84 @@ test("EVERY route and cron creates exactly ONE deadline, and threads it", () => 
         assert.match(sig, /deadline: RouteDeadline \| undefined/, `${fn} takes the deadline`);
         assert.ok(!/deadline\?: /.test(sig), `${fn}'s deadline is NOT optional`);
     }
+});
+// -- The exclusion matrix, against the claim TABLE (round-21 finding 1) ----
+//
+// One row per path is the invariant; these are the rules the acquisition
+// applies on top of it. Driven through the shipped function rather than
+// restated, so a rule that stops being applied fails here.
+
+/** A tx fake carrying just the claim table and the lock. */
+function claimTx(seed: ClaimRow[] = []) {
+    const claims = new Map<string, ClaimRow>(seed.map(c => [c.storagePath, { ...c }]));
+    let locks = 0;
+    const tx = {
+        $executeRaw: async () => { locks += 1; return 1; },
+        receiptObjectClaim: {
+            findUnique: async ({ where }: { where: { storagePath: string } }) =>
+                claims.get(where.storagePath) ?? null,
+            upsert: async (
+                { where, create, update }: {
+                    where: { storagePath: string };
+                    create: ClaimRow;
+                    update: Partial<ClaimRow>;
+                },
+            ) => {
+                const held = claims.get(where.storagePath);
+                const next = held ? { ...held, ...update } : { ...create };
+                claims.set(where.storagePath, next as ClaimRow);
+                return next;
+            },
+            deleteMany: async () => ({ count: 0 }),
+        },
+    } as unknown as Prisma.TransactionClient;
+    return { tx, claims, locks: () => locks };
+}
+
+test("EXCLUSION: publishing and deleting cannot both hold a live claim", async () => {
+    const PATH = "receipts/intake/row-1.v1.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const live = now.getTime() + 60_000;
+    const until = new Date(live);
+
+    for (const [held, want, refused] of [
+        ["publishing", "deleting", true],
+        ["deleting", "publishing", true],
+        // TWO DELETERS MAY NOT SHARE. Both would proceed to remove the same
+        // object, and the second would delete bytes the first had already
+        // accounted for -- or, worse, an object a publisher put back between
+        // them.
+        ["deleting", "deleting", true],
+        // TWO PUBLISHERS MAY: the path is content-addressed, so they are
+        // writing identical bytes and the seal is an upsert.
+        ["publishing", "publishing", false],
+    ] as const) {
+        const w = claimTx([{ storagePath: PATH, token: "held", kind: held, expiresAt: until }]);
+        const got = await acquireObjectClaim(w.tx, PATH, want, until, now);
+        assert.equal(got.ok, !refused, `${held} vs ${want}`);
+        if (refused) assert.equal((got as { heldBy: string }).heldBy, held);
+        assert.ok(w.locks() >= 1, "and the lock was taken first, either way");
+    }
+});
+
+test("A LAPSED claim is taken over, so a dead holder cannot wedge a path", async () => {
+    const PATH = "receipts/intake/row-1.v1.png";
+    const now = new Date("2026-09-03T12:00:00.000Z");
+    const w = claimTx([{
+        storagePath: PATH,
+        token: "dead-holder",
+        kind: "deleting",
+        expiresAt: new Date(now.getTime() - 1),
+    }]);
+
+    const got = await acquireObjectClaim(w.tx, PATH, "publishing", new Date(now.getTime() + 60_000), now);
+
+    assert.equal(got.ok, true, "an expired claim holds nothing");
+    assert.equal(w.claims.get(PATH)?.kind, "publishing");
+    assert.notEqual(
+        w.claims.get(PATH)?.token,
+        "dead-holder",
+        "and the token changes, so the old holder's own re-read tells it it lost",
+    );
+    assert.equal(w.claims.size, 1, "still one row: the path is the primary key");
 });

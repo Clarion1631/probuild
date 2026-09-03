@@ -1068,3 +1068,14 @@ test("the REAL pooler URL passes the guard, and a wrong project ref does not", a
     assert.equal(refused.problems.length, 1);
     assert.match(refused.problems[0], /same pooler host, different project/);
 });
+
+test("the claims table is in BOTH the migration and the script", () => {
+    // The invariant that makes a second live claim impossible is a PRIMARY KEY,
+    // so it only exists if the table does -- in both places, or a fresh CI
+    // database and a production one disagree about whether the guard is there.
+    for (const [label, sql] of [["migration", migrationSql], ["script", statements.join(";")]] as const) {
+        assert.match(sql, /CREATE TABLE IF NOT EXISTS "ReceiptObjectClaim"/, label);
+        assert.match(sql, /"storagePath" TEXT NOT NULL/, label);
+        assert.match(sql, /CONSTRAINT "ReceiptObjectClaim_pkey" PRIMARY KEY \("storagePath"\)/, `${label}: one row per path`);
+    }
+});
