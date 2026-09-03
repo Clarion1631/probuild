@@ -51,6 +51,8 @@ import {
     reservationLostNote,
     selectPayerBearingImage,
     sweepBatchOk,
+    sweepClaimFreshSince,
+    SWEEP_TASK_CLAIM,
     type BankCredit,
     type SweepCounts,
 } from "@/lib/deposit-sweep";
@@ -635,7 +637,9 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
 
     // Last chance to notice a human took this deposit's review task (G2): the
     // next statement is the QuickBooks money boundary.
-    const lostTask = await assertSweepOwnsTask(row);
+    const lostTask = await assertSweepOwnsTask(row, {
+        invoiceCode: schedule.invoiceCode, qbInvoiceId: schedule.qbInvoiceId,
+    });
     if (lostTask) return lostTask;
 
     // Persist the EXACT bytes BEFORE the network call fires — a crash/timeout on the
@@ -1357,9 +1361,10 @@ function describeBoundaryMarkers(row: DepositIngest): string[] {
  *   archiveOfficeTask (src/lib/actions.ts) → archivedAt
  * so a human assigning, moving or archiving makes every later re-assert miss.
  * A human assign deliberately WINS over the sweep's claim: that is the
- * contention this exists to have.
+ * contention this exists to have. The marker, its TTL and the human-facing
+ * refusal message live in src/lib/deposit-sweep.ts because src/lib/actions.ts
+ * enforces the other half of the same rule.
  */
-const SWEEP_TASK_CLAIM = "Deposit sweep working";
 
 /** The column createDepositReviewTask files every deposit review into. */
 async function intakeColumn(): Promise<{ id: string; name: string } | null> {
@@ -1404,6 +1409,11 @@ async function sweepStillOwnsTask(officeTaskId: string | null): Promise<boolean>
         where: {
             id: officeTaskId, archivedAt: null, assigneeId: null,
             columnId: intake.id, status: SWEEP_TASK_CLAIM,
+            // A claim older than the TTL is one a crashed sweep left behind,
+            // and a human is free to override it — so this sweep must not go
+            // on believing it holds one. The write below refreshes updatedAt,
+            // which is what keeps a live claim alive.
+            updatedAt: { gte: sweepClaimFreshSince() },
         },
         data: { status: SWEEP_TASK_CLAIM },
     });
@@ -1416,12 +1426,41 @@ async function sweepStillOwnsTask(officeTaskId: string | null): Promise<boolean>
  * A lost claim reconciles with the reservation RETAINED — whoever holds the
  * task now owns both it and the milestone.
  */
-async function assertSweepOwnsTask(row: DepositIngest): Promise<NextResponse | null> {
+async function assertSweepOwnsTask(
+    row: DepositIngest,
+    ctx: { invoiceCode?: string; qbInvoiceId?: string | null } = {},
+): Promise<NextResponse | null> {
     if (row.source !== BANK_DEPOSIT_SOURCE || !row.officeTaskId) return null;
     if (await sweepStillOwnsTask(row.officeTaskId)) return null;
-    return await finalizeReconcile(row,
-        "a human took the review task for this deposit while the sweep was working it, so the sweep stopped before " +
-        "writing anything — whoever holds that task now owns this credit", {});
+    const base = "a human took the review task for this deposit while the sweep was working it, so the sweep stopped";
+    return await finalizeReconcile(row, `${base}${await stagedHandoffNote(row, ctx)}`, {});
+}
+
+/**
+ * What to tell the human about what the sweep had ALREADY done, in the words
+ * that stop them creating a second invoice (gate review H2).
+ *
+ * The row is re-read because `row` is loaded before stageInvoicePush writes the
+ * marker in the same request — the in-memory copy is stale on exactly the path
+ * this note exists for. Saying "before writing anything" once a QuickBooks
+ * invoice has been created is the specific lie this replaces.
+ */
+async function stagedHandoffNote(
+    row: DepositIngest,
+    ctx: { invoiceCode?: string; qbInvoiceId?: string | null } = {},
+): Promise<string> {
+    const persisted = await prisma.depositIngest.findUnique({
+        where: { id: row.id },
+        select: { extracted: true, paymentScheduleId: true },
+    });
+    const staged = stagedScheduleIdOf(persisted?.extracted ?? row.extracted);
+    if (!staged) return " before writing anything — whoever holds that task now owns this credit";
+    const named = [
+        ctx.invoiceCode ? `invoice ${ctx.invoiceCode}` : null,
+        ctx.qbInvoiceId ? `QuickBooks invoice ${ctx.qbInvoiceId}` : null,
+    ].filter(Boolean).join(", ");
+    return ` — BUT it had already created a QuickBooks invoice for milestone ${staged}` +
+        `${named ? ` (${named})` : ""}. Check QuickBooks before creating another invoice or recording this payment.`;
 }
 
 /** Hand the task back when a re-evaluation ended without writing money. Pinned
@@ -2229,8 +2268,32 @@ async function finalizeReconcile(row: DepositIngest, reason: string, opts: { nul
         where: { id: row.id },
         data: { status: "reconcile", lastError: reason.slice(0, 1000), ...(opts.nullReservation ? { paymentScheduleId: null } : {}) },
     });
+    // A reconcile is a human's job now, so the sweep gives the task back rather
+    // than leaving its claim to block them for the rest of the TTL.
+    await releaseReviewTask(row);
+    // …and the task must SAY what happened. Reusing an existing officeTaskId
+    // used to leave a human reading stale "unmatched" notes for a row that had
+    // since created a QuickBooks invoice (gate review H2).
+    if (row.officeTaskId) await appendTaskNote(row.officeTaskId, `Deposit sweep: ${reason}`);
     const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, reason, "reconcile");
     return NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId });
+}
+
+/** Add a line to a task's notes without ever clobbering a human's edit: the
+ *  notes we rewrite are pinned to the value we read, so a concurrent edit makes
+ *  this write find nothing. Never throws — the terminal state is already
+ *  persisted, and a missing note must not undo it. */
+async function appendTaskNote(officeTaskId: string, note: string): Promise<void> {
+    try {
+        const task = await prisma.officeTask.findUnique({ where: { id: officeTaskId }, select: { notes: true } });
+        if (!task || (task.notes ?? "").includes(note)) return;
+        await prisma.officeTask.updateMany({
+            where: { id: officeTaskId, notes: task.notes },
+            data: { notes: [task.notes, note].filter(Boolean).join("\n") },
+        });
+    } catch (e) {
+        console.error("[deposit-ingest] could not append the reconcile note to the review task:", e);
+    }
 }
 
 /** Create the ONE review task for a terminal row, tolerating crashes and concurrent

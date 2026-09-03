@@ -42,6 +42,11 @@ import {
     isDeterministicQboGuardFailure,
     isNotCustomerDepositReason,
     notCustomerDepositNote,
+    notSweepClaimedWhere,
+    SWEEP_CLAIM_BUSY_MESSAGE,
+    SWEEP_CLAIM_TTL_MS,
+    SWEEP_TASK_CLAIM,
+    sweepClaimFreshSince,
     MAX_BANK_CREDITS_PER_BATCH,
     CLAIMING_STATUSES,
     MONEY_BOUNDARY_CLAIM_STATUSES,
@@ -327,6 +332,9 @@ let onOfficeTaskRead: ((id: string) => void) | null = null;
 let onDepositRead: ((row: Row | null) => void) | null = null;
 /** When set, buildQBPaymentRequest rejects with this deterministic guard. */
 let qboGuardReason: string | null = null;
+/** Fires inside sendQBPaymentCreateRequest, i.e. AT the payment boundary and
+ *  after applyQboLinked's ownership assertion. */
+let onSendPayment: (() => void) | null = null;
 
 let qboBalanceByInvoice = new Map<string, number>();
 
@@ -341,6 +349,7 @@ const fakeQuickbooks = {
         return { ok: true, requestBody: JSON.stringify({ TotalAmt: opts.amount, ...opts }) };
     },
     sendQBPaymentCreateRequest: async (_tokens: unknown, requestBody: string, requestId: string) => {
+        onSendPayment?.();
         calls.sendQBPaymentCreateRequest.push({ requestBody, requestId });
         return { paymentId: `qb-payment-${calls.sendQBPaymentCreateRequest.length}`, amount: 0 };
     },
@@ -557,6 +566,7 @@ beforeEach(() => {
     onOfficeTaskRead = null;
     onDepositRead = null;
     qboGuardReason = null;
+    onSendPayment = null;
     scheduleSeq = 0;
     tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
     process.env.DEPOSIT_INGEST_SECRET = SECRET;
@@ -3394,5 +3404,178 @@ test("G4: closing a task loses to any human change, not just an edit", async t =
         const after = tables.officeTask.rows.find(x => x.id === task.id)!;
         assert.ok(after.archivedAt, "an untouched task is still closed by the replay");
         assert.match(String(after.notes), /Closed by the deposit sweep/);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. Gate round 2 (PR #458): mutual exclusion, and honest handoff notes
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * What every human task mutation in src/lib/actions.ts does: a CAS carrying
+ * notSweepClaimedWhere(). Applied here against the fake table through the SAME
+ * exported predicate the real actions use, so these interleavings exercise the
+ * shared rule rather than a hand-copied twin of it.
+ */
+function humanTaskMutation(taskId: string, data: Row): { refused: boolean } {
+    const hits = tables.officeTask.rows.filter(r => matchWhere(r, { id: taskId, ...notSweepClaimedWhere() }));
+    for (const row of hits) {
+        Object.assign(row, data);
+        row.updatedAt = new Date();
+    }
+    return { refused: hits.length === 0 };
+}
+
+test("H1: the claim predicate the human actions carry", async t => {
+    const claimed = (ageMs: number) => ({
+        id: "t1", status: SWEEP_TASK_CLAIM, updatedAt: new Date(Date.now() - ageMs),
+    });
+
+    await t.test("a FRESH claim is excluded — the human write refuses", () => {
+        assert.equal(matchWhere(claimed(60_000), notSweepClaimedWhere()), false);
+    });
+
+    await t.test("a STALE claim is fair game — a crashed sweep must not block anyone forever", () => {
+        assert.equal(matchWhere(claimed(SWEEP_CLAIM_TTL_MS + 60_000), notSweepClaimedWhere()), true);
+        // …and the boundary is the TTL, not some other number.
+        assert.ok(Math.abs(sweepClaimFreshSince().getTime() - (Date.now() - SWEEP_CLAIM_TTL_MS)) < 50,
+            "the cutoff is exactly one TTL back");
+    });
+
+    await t.test("an unclaimed task is untouched by the rule", () => {
+        assert.equal(matchWhere({ id: "t1", status: "To Do", updatedAt: new Date() }, notSweepClaimedWhere()), true);
+    });
+
+    await t.test("the refusal has a message a human can act on", () => {
+        assert.match(SWEEP_CLAIM_BUSY_MESSAGE, /deposit sweep is booking this deposit right now/);
+    });
+});
+
+test("H1: a human mutation AFTER the sweep's assertion is refused, and the sweep finishes alone", async t => {
+    await t.test("attempted between the assertion and the invoice creation", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-EXCL-INVOICE");
+        let refused: boolean | null = null;
+        // Fires inside the push mock: the assertion has already passed and the
+        // staging marker is written. This is the window the gate named.
+        onStagedPush = () => { refused = humanTaskMutation(task.id, { assigneeId: "user-marge" }).refused; };
+
+        const { body } = await post(bankBatch([{ ref: "REF-EXCL-INVOICE", amount }]));
+        assert.equal(refused, true, "the live claim must refuse the human write");
+        const result = creditResult(body, "REF-EXCL-INVOICE");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 1);
+        assert.equal(tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId ?? null, null);
+    });
+
+    await t.test("attempted between the assertion and the payment submission", async () => {
+        const { amount, task } = await seedReEvaluableRow("REF-EXCL-PAYMENT");
+        tables.officeBoardColumn.rows.push({ id: "col-2", name: "In Progress", position: 1, createdAt: new Date() });
+        let refused: boolean | null = null;
+        onSendPayment = () => {
+            refused = humanTaskMutation(task.id, { columnId: "col-2", status: "In Progress" }).refused;
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-EXCL-PAYMENT", amount }]));
+        assert.equal(refused, true, "the live claim must refuse the human move at the payment boundary");
+        assert.equal(creditResult(body, "REF-EXCL-PAYMENT").status, "applied");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 1, "exactly one payment, from the sweep alone");
+        assert.equal(tables.officeTask.rows.find(x => x.id === task.id)!.columnId, "col-1");
+    });
+
+    await t.test("…but a STALE claim lets the human through", async () => {
+        const { amount, task } = await seedReEvaluableRow("REF-EXCL-STALE");
+        let refused: boolean | null = null;
+        onStagedPush = () => {
+            // A sweep that crashed 20 minutes ago holds no real claim.
+            tables.officeTask.rows.find(x => x.id === task.id)!.updatedAt =
+                new Date(Date.now() - SWEEP_CLAIM_TTL_MS - 60_000);
+            refused = humanTaskMutation(task.id, { assigneeId: "user-marge" }).refused;
+        };
+
+        await post(bankBatch([{ ref: "REF-EXCL-STALE", amount }]));
+        assert.equal(refused, false, "a stale claim must not block a human forever");
+        assert.equal(tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId, "user-marge");
+    });
+});
+
+test("H1: the sweep treats its OWN stale claim as lost", async () => {
+    const { milestone, amount, task } = await seedReEvaluableRow("REF-EXCL-SELFSTALE");
+    // The claim goes stale between the claim and the money boundary (a very
+    // slow run, or a clock the sweep cannot trust). It must not book on it.
+    onFreshTokens = () => {
+        tables.officeTask.rows.find(x => x.id === task.id)!.updatedAt =
+            new Date(Date.now() - SWEEP_CLAIM_TTL_MS - 60_000);
+    };
+
+    const { body } = await post(bankBatch([{ ref: "REF-EXCL-SELFSTALE", amount }]));
+    const result = creditResult(body, "REF-EXCL-SELFSTALE");
+    assert.equal(result.status, "reconcile", `expected reconcile, got ${result.status}: ${result.reason}`);
+    assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("H2: the handoff note tells the truth about what was already created", async t => {
+    await t.test("BEFORE staging: nothing was written, and it says so", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-NOTE-PRE");
+        onFreshTokens = () => {
+            tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId = "user-marge";
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-NOTE-PRE", amount }]));
+        const reason = String(creditResult(body, "REF-NOTE-PRE").reason);
+        assert.match(reason, /stopped before writing anything/);
+        assert.doesNotMatch(reason, /already created a QuickBooks invoice/);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceId, null);
+    });
+
+    await t.test("AFTER staging: it names the milestone and the invoice, and warns off a second one", async () => {
+        const { milestone, amount, task } = await seedReEvaluableRow("REF-NOTE-POST");
+        tables.officeBoardColumn.rows.push({ id: "col-2", name: "In Progress", position: 1, createdAt: new Date() });
+        // The human takes it AFTER the invoice exists (a stale claim is the one
+        // way their write lands in this window).
+        onStagedPush = () => {
+            const live = tables.officeTask.rows.find(x => x.id === task.id)!;
+            live.columnId = "col-2";
+            live.status = "In Progress";
+        };
+
+        const { body } = await post(bankBatch([{ ref: "REF-NOTE-POST", amount }]));
+        const reason = String(creditResult(body, "REF-NOTE-POST").reason);
+        assert.doesNotMatch(reason, /before writing anything/, "that sentence is a lie once an invoice exists");
+        assert.match(reason, /already created a QuickBooks invoice for milestone/);
+        assert.match(reason, new RegExp(milestone), "the milestone is named");
+        assert.match(reason, /Check QuickBooks before creating another invoice or recording this payment/);
+        assert.equal(calls.pushMilestoneToQuickBooks.length, 1);
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    });
+
+    await t.test("the existing review task GAINS the reconcile line", async () => {
+        const { amount, task } = await seedReEvaluableRow("REF-NOTE-TASK");
+        const notesBefore = tables.officeTask.rows.find(x => x.id === task.id)!.notes;
+        onFreshTokens = () => {
+            tables.officeTask.rows.find(x => x.id === task.id)!.assigneeId = "user-marge";
+        };
+
+        await post(bankBatch([{ ref: "REF-NOTE-TASK", amount }]));
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.notEqual(after.notes, notesBefore, "a human must not be left reading stale unmatched notes");
+        assert.match(String(after.notes), /Deposit sweep: a human took the review task/);
+        assert.match(String(after.notes), new RegExp(String(notesBefore).split("\n")[0].slice(0, 20)),
+            "…and the original notes survive");
+    });
+
+    await t.test("a reconcile hands the claim back rather than holding it for the whole TTL", async () => {
+        const { amount, task } = await seedReEvaluableRow("REF-NOTE-RELEASE");
+        const columnName = tables.officeBoardColumn.rows[0].name;
+        qboGuardReason = "invoice-not-found"; // forces a reconcile after staging
+
+        await post(bankBatch([{ ref: "REF-NOTE-RELEASE", amount }]));
+        const after = tables.officeTask.rows.find(x => x.id === task.id)!;
+        assert.equal(after.status, columnName, "the claim marker must not outlive the reconcile");
+        assert.match(String(after.notes), /Deposit sweep:/);
     });
 });

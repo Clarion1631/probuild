@@ -161,6 +161,54 @@ export const MONEY_BOUNDARY_CLAIM_STATUSES = [...RESERVATION_RETAINING_STATUSES]
  */
 export const MONEY_IN_FLIGHT_STATUSES = ["qbo_unknown", "qbo_created", "reconcile"] as const;
 
+/**
+ * REVIEW-TASK MUTUAL EXCLUSION, shared by the sweep and the human task actions.
+ *
+ * The sweep claims a deposit's OfficeTask before re-evaluating its row (see
+ * claimReviewTask in the deposit-ingest route) by writing this marker into
+ * `OfficeTask.status`. OfficeTask has no ownership column and `assigneeId` is a
+ * foreign key to User, so claiming with it would mean seeding a synthetic bot
+ * user that then surfaces in the team list, the dispatch board and every
+ * assignee picker. `status` is the least-abusive column that exists:
+ * schema.prisma calls it LEGACY ("kept in sync with column.name on create/move
+ * ... reads should use columnId") and nothing in src/ branches on it or renders
+ * it.
+ *
+ * EXCLUSION IS MUTUAL, which is the point: while the claim is FRESH, the human
+ * mutations in src/lib/actions.ts (assign, move, archive, delete) refuse with
+ * SWEEP_CLAIM_BUSY_MESSAGE, and the sweep's own re-assert before each money
+ * boundary treats a claim it cannot see as lost. Both sides express the rule as
+ * a CAS against the same row, so whichever statement lands first wins and the
+ * other is told it lost.
+ *
+ * FRESHNESS is `OfficeTask.updatedAt` (Prisma `@updatedAt`, written by every
+ * update including the sweep's own re-assert, so a long-running sweep keeps its
+ * claim alive). A claim older than the TTL belongs to a sweep that crashed: the
+ * human may then override it (their write clears the marker) and the sweep must
+ * treat it as lost. A deposit batch is capped at 60s of function time, so 15
+ * minutes is far longer than any honest claim needs.
+ */
+export const SWEEP_TASK_CLAIM = "Deposit sweep working";
+
+export const SWEEP_CLAIM_TTL_MS = 15 * 60_000;
+
+export const SWEEP_CLAIM_BUSY_MESSAGE =
+    "The deposit sweep is booking this deposit right now; try again in a few minutes.";
+
+/** The oldest `updatedAt` a claim can carry and still be considered live. */
+export function sweepClaimFreshSince(now: Date = new Date()): Date {
+    return new Date(now.getTime() - SWEEP_CLAIM_TTL_MS);
+}
+
+/**
+ * The Prisma `where` fragment every human task mutation carries: "this row is
+ * not under a LIVE sweep claim". Shared rather than retyped, so the sweep's
+ * notion of a live claim and the humans' can never drift apart.
+ */
+export function notSweepClaimedWhere(now: Date = new Date()) {
+    return { NOT: { status: SWEEP_TASK_CLAIM, updatedAt: { gte: sweepClaimFreshSince(now) } } };
+}
+
 /** BankImage.source that scripts/post-bank-images.mjs writes for WTB documents. */
 export const BANK_IMAGE_SOURCE = "WTB_ONLINE";
 
