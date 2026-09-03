@@ -303,11 +303,24 @@ BEGIN
 
     -- Did this row carry a tax answer BEFORE the write? Read off OLD, the
     -- same way planExpenseUpdate reads it off the stored row.
+    --
+    -- The columns, and how each KIND is read, are
+    -- TAX_CLASSIFICATION_FIGURE_COLUMNS and
+    -- TAX_CLASSIFICATION_SOURCE_COLUMNS in
+    -- src/lib/expense-attribution.ts -- the ONE definition the QBO sync
+    -- and the expense PUT handler both read too, and the shape of this
+    -- expression is pinned against those constants in
+    -- tests/apply-expense-attribution.test.ts. A FIGURE counts whenever
+    -- it is present at all; a PROVENANCE counts only when it is a HUMAN
+    -- one, because a machine guess with no surviving figure has nothing
+    -- left to invalidate. Deciding that differently in each writer was
+    -- how the three drifted apart in the first place.
     was_classified :=
         OLD."taxAmount" IS NOT NULL
         OR OLD."taxDeductibleBase" IS NOT NULL
         OR OLD."installedAtCustomer" IS NOT NULL
-        OR COALESCE(OLD."taxSource", '') IN ('manual', 'manual-none');
+        OR COALESCE(OLD."taxSource", '') IN ('manual', 'manual-none')
+        OR COALESCE(OLD."taxDeductibleBaseSource", '') IN ('manual', 'manual-none');
 
     -- 1. The recorded tax cannot fit the new gross: it points the other
     --    way, or it is bigger. Everything the row claimed about tax goes,

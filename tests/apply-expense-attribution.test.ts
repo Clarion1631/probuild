@@ -41,6 +41,12 @@ import {
     statements,
     targetMatches,
 } from "../scripts/apply-expense-attribution.mjs";
+import {
+    HUMAN_TAX_SOURCES,
+    TAX_CLASSIFICATION_COLUMNS,
+    TAX_CLASSIFICATION_FIGURE_COLUMNS,
+    TAX_CLASSIFICATION_SOURCE_COLUMNS,
+} from "../src/lib/expense-attribution";
 
 const migrationSql = readFileSync(
     path.join(__dirname, "..", "prisma", "migrations", "20260901120000_expense_attribution", "migration.sql"),
@@ -938,7 +944,37 @@ test("the amount/tax guard is a transcription of planExpenseUpdate, not a new po
     assert.match(fn, /base_ceiling := NEW\."amount" - COALESCE\(NEW\."taxAmount", 0\)/);
     // Branch 3: an ordinary move that breaks nothing still re-opens a review,
     // read off the OLD row exactly as planExpenseUpdate reads it off `existing`.
-    assert.match(fn, /was_classified :=[\s\S]{0,300}OLD\."taxSource", ''\) IN \('manual', 'manual-none'\)/);
+    //
+    // Pinned against TAX_CLASSIFICATION_COLUMNS itself rather than against a
+    // copy of the column list (round 38, item 3): the whole finding was that
+    // three writers each carried their own answer to "is this row classified?"
+    // and the narrowest of them decided what reached a state filing. Adding a
+    // column to the shared constant now fails this test until the trigger
+    // learns about it too.
+    const classifiedClause = fn.slice(fn.indexOf("was_classified :="));
+    const clauseBody = classifiedClause.slice(0, classifiedClause.indexOf(";"));
+    // A FIGURE counts whenever it is present at all...
+    assert.deepEqual(
+        [...clauseBody.matchAll(/OLD\."(\w+)" IS NOT NULL/g)].map(m => m[1]),
+        [...TAX_CLASSIFICATION_FIGURE_COLUMNS],
+        "the figure columns must be named, each as a plain IS NOT NULL",
+    );
+    // ...a PROVENANCE only when it is a HUMAN one, and the values have to be
+    // HUMAN_TAX_SOURCES rather than a list retyped in SQL.
+    assert.deepEqual(
+        [...clauseBody.matchAll(/COALESCE\(OLD\."(\w+)", ''\) IN \(([^)]*)\)/g)].map(m => m[1]),
+        [...TAX_CLASSIFICATION_SOURCE_COLUMNS],
+        "the provenance columns must be named, each tested against the human values",
+    );
+    for (const [, , values] of clauseBody.matchAll(/COALESCE\(OLD\."(\w+)", ''\) IN \(([^)]*)\)/g)) {
+        assert.deepEqual(
+            values.split(",").map(value => value.trim().replace(/^'|'$/g, "")),
+            [...HUMAN_TAX_SOURCES],
+        );
+    }
+    // Nothing outside the shared list may appear in the test at all.
+    const allNamed = [...clauseBody.matchAll(/OLD\."(\w+)"/g)].map(m => m[1]);
+    assert.deepEqual(allNamed, [...TAX_CLASSIFICATION_COLUMNS]);
     // ...and the review flag is the only thing branch 3 sets.
     assert.match(fn, /IF was_classified THEN\s+NEW\."needsTaxReview" := true;\s+END IF;/);
     // The derived flag is re-derived last, so no path can leave the row in

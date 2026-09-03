@@ -843,6 +843,7 @@ function lockTrace(stub: ReturnType<typeof createStub>) {
     (stub.db as any).$transaction = async (fn: any) => fn(stub.db);
     (stub.db as any).$queryRawUnsafe = async (query: string, ...args: unknown[]) => {
         const kind = query.includes("pg_advisory_xact_lock") ? "expense-lock"
+            : query.includes('FROM "Project"') ? "project-share"
             : query.includes('FROM "Estimate"') ? "estimate-share"
             : query.includes('JOIN "Estimate"') ? "phase-share"
             : query.includes('FROM "EstimateItem"') ? "item-share"
@@ -875,7 +876,15 @@ test("the cost fill share-locks the estimate, the item and the phase rows BEFORE
     assert.ok(trace.every(entry => !String(entry.kind).includes("update")));
 });
 
-test("the project fill share-locks the estimate its answer comes from", async () => {
+test("the project fill takes PROJECT, estimate, then the row — the canonical order", async () => {
+    // ROUND 38, ITEM 2. This pass writes `Expense.projectId`, and Postgres
+    // enforces that foreign key by taking `FOR KEY SHARE` on the referenced
+    // `Project` row. So omitting `phaseProjectId` from the lock set never
+    // meant "no Project lock": it meant the Project was locked IMPLICITLY, by
+    // the UPDATE, after this transaction already held the Estimate and the
+    // Expense — Estimate -> Expense -> Project, a cycle against a job editor
+    // holding its Project row FOR UPDATE. The one pass whose whole job is
+    // writing this column was the one still doing it in the wrong order.
     const stub = createStub(
         [expense({ id: "e1", projectId: null, estimate: { projectId: "job-1" } })],
         [],
@@ -884,12 +893,20 @@ test("the project fill share-locks the estimate its answer comes from", async ()
     await runBackfill({ db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID });
 
     const kinds = trace.map(entry => entry.kind);
-    assert.deepEqual(
-        kinds,
-        ["estimate-share", "expense-lock"],
-        "the estimate first, then the row, then the write",
+    assert.equal(kinds[0], "project-share", "the JOB is locked before anything else");
+    assert.deepEqual(trace[0].args, ["job-1"], "and it is the job about to be stamped");
+    const expenseLockAt = kinds.lastIndexOf("expense-lock");
+    assert.ok(expenseLockAt > 0, "the per-expense lock is still taken");
+    assert.ok(
+        kinds.indexOf("estimate-share") > 0 && kinds.indexOf("estimate-share") < expenseLockAt,
+        "the estimate the project was read off is held, after the Project and before the row",
     );
-    assert.deepEqual(trace[0].args, ["est-job-1"], "the estimate the project was read off");
+    assert.ok(
+        trace.some(entry => entry.kind === "estimate-share" && (entry.args as string[])[0] === "est-job-1"),
+        "the estimate the project was read off",
+    );
+    // FOR SHARE throughout: two readers must not block each other.
+    assert.ok(trace.every(entry => !String(entry.kind).includes("update")));
 });
 
 test("an INTERLEAVED estimate move is refused: the write no-ops", async () => {
@@ -915,7 +932,11 @@ test("an INTERLEAVED estimate move is refused: the write no-ops", async () => {
     const result = await runBackfill({
         db: stub.db, apply: true, log: () => {}, overheadProjectId: OVERHEAD_ID,
     });
-    assert.deepEqual(sequence, ["share-lock"], "the lock was attempted");
+    assert.ok(sequence.length > 0, "the locks were attempted");
+    assert.deepEqual(
+        new Set(sequence), new Set(["share-lock"]),
+        "every one of them is a SHARE lock",
+    );
     assert.equal(result.written.projectIds, 0, "and the stale answer was not written");
     assert.equal(stub.rows[0].projectId ?? null, null);
 });

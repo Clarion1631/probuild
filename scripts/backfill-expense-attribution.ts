@@ -750,7 +750,24 @@ export async function runBackfill({
         for (const id of ids) {
             const result = await writeUnderAttributionLocks(
                 db,
-                { expenseId: id, estimateIds: [estimateId] },
+                // `phaseProjectId` IS NOT OPTIONAL HERE (round 38, item 2).
+                //
+                // This pass writes `Expense.projectId`, and Postgres enforces
+                // that foreign key by taking `FOR KEY SHARE` on the referenced
+                // `Project` row. Omitting it from the lock set did not mean
+                // "no Project lock" — it meant the Project lock was taken
+                // IMPLICITLY, by the UPDATE, after this transaction already
+                // held the Estimate and the Expense. That is
+                // Estimate -> Expense -> Project against a job editor holding
+                // its Project row FOR UPDATE, i.e. the same cycle round 36
+                // fixed for the cost-code pass, hiding in the one pass whose
+                // whole job is writing this column. The loser Postgres picks
+                // is as likely to be the bookkeeper's save as this script.
+                //
+                // Naming it makes `lockPhaseRowsForShare` take the Project
+                // FOR SHARE first, so the UPDATE's own key-share lock is a
+                // free re-acquisition on a row already held.
+                { expenseId: id, estimateIds: [estimateId], phaseProjectId: projectId },
                 // BOTH halves of the derivation, re-asserted at write time even
                 // though the locks are held: the lock stops the rows moving
                 // from here on, the predicate covers everything that happened

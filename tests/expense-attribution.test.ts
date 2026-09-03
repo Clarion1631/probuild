@@ -13,6 +13,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     HUMAN_COST_CODE_SOURCES,
+    HUMAN_TAX_SOURCES,
+    TAX_CLASSIFICATION_COLUMNS,
+    TAX_CLASSIFICATION_FIGURE_COLUMNS,
+    TAX_CLASSIFICATION_SOURCE_COLUMNS,
+    hasTaxClassification,
     expenseForProjectWhere,
     expenseForProjectsWhere,
     expenseHasAnyProjectWhere,
@@ -152,6 +157,56 @@ test("expenseForProjectsWhere and expenseHasAnyProjectWhere keep the same shape"
             { projectId: null, estimate: { projectId: { not: null } } },
         ],
     });
+});
+
+test("hasTaxClassification counts EVERY column a person can answer", () => {
+    // ROUND 38, ITEM 3. Three writers each carried their own version of this
+    // test and the narrowest one — the expense PUT handler's, which omitted
+    // `installedAtCustomer` — decided which stale deductions reached a state
+    // filing. One definition, and every column in it.
+    assert.deepEqual(
+        [...TAX_CLASSIFICATION_COLUMNS],
+        ["taxAmount", "taxDeductibleBase", "installedAtCustomer", "taxSource", "taxDeductibleBaseSource"],
+    );
+    // Nothing said at all.
+    assert.equal(hasTaxClassification({}), false);
+    assert.equal(
+        hasTaxClassification({
+            taxAmount: null, taxDeductibleBase: null, installedAtCustomer: null,
+            taxSource: null, taxDeductibleBaseSource: null,
+        }),
+        false,
+    );
+    // Any one of them, on its own, is an answer...
+    for (const column of TAX_CLASSIFICATION_FIGURE_COLUMNS) {
+        assert.equal(hasTaxClassification({ [column]: 1 }), true, `${column} alone must count`);
+    }
+    for (const column of TAX_CLASSIFICATION_SOURCE_COLUMNS) {
+        for (const value of HUMAN_TAX_SOURCES) {
+            assert.equal(
+                hasTaxClassification({ [column]: value }),
+                true,
+                `${column} = ${value} alone must count`,
+            );
+        }
+        // ...but a MACHINE provenance is not one. An "ocr" source whose figure
+        // has since been cleared is a guess with nothing left to invalidate,
+        // and flagging those would bury the rows a person must actually look
+        // at (the QBO sync's own control asserts this).
+        assert.equal(
+            hasTaxClassification({ [column]: "ocr" }),
+            false,
+            `${column} = ocr must NOT count on its own`,
+        );
+    }
+    // A tri-state, not a truthiness test: an explicit FALSE is a person saying
+    // "no, this was not resold", which is as much a decision as a true.
+    assert.equal(hasTaxClassification({ installedAtCustomer: false }), true);
+    // ...and so is a ZERO tax figure.
+    assert.equal(hasTaxClassification({ taxAmount: 0 }), true);
+    assert.equal(hasTaxClassification({ taxDeductibleBase: 0 }), true);
+    // An absent key is "not selected", which is not an answer.
+    assert.equal(hasTaxClassification({ taxAmount: undefined }), false);
 });
 
 test("notHumanCodedExpenseWhere has an explicit NULL branch", () => {

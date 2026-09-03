@@ -36,8 +36,12 @@ import { assertPhaseOfProjectTx, lockAttributionParents } from "../src/lib/phase
 import { lockEstimateAttribution } from "../src/lib/expense-attribution";
 import {
     applyQboExpenseCostCodeSuggestion,
+    upsertQboExpense,
     type QboCostCodeSuggestionClient,
+    type QboExpensePersistenceClient,
 } from "../src/lib/qbo-expense-sync";
+import { createParsedReceiptExpense } from "../src/app/api/receipts/parse/route";
+import { runBackfill } from "../scripts/backfill-expense-attribution";
 
 const url =
     process.env.PHASE_INVARIANT_DB_TEST_URL ??
@@ -286,6 +290,234 @@ test("two attribution writers never block each other at all", { skip }, async ()
             })(),
         ]);
         assert.deepEqual(both, ["a", "b"]);
+    } finally {
+        await cleanup();
+    }
+});
+
+// ── the lock nobody writes down: foreign keys (round 38, item 1) ────────────
+//
+// An INSERT or UPDATE that sets `Expense.projectId` makes Postgres take
+// `FOR KEY SHARE` on the referenced `Project` row to enforce the foreign key,
+// and `FOR KEY SHARE` conflicts with the `FOR UPDATE` a Project-first job
+// editor holds. So a transaction can be `Estimate -> Project` without its
+// source ever containing the string `"Project"` — which is how three writers
+// survived round 37 untouched: the QBO create path, the QBO attribution fill,
+// and the AI receipt parser. None of them runs under `withTxRetry`, so the
+// 40P01 is not absorbed anywhere; it surfaces as a failed sync or a failed
+// upload, and the victim Postgres picks is as likely to be the person's save.
+
+const OTHER_PURCHASE = `${PFX}-purchase-2`;
+
+test("CONTROL: an implicit FK write of projectId deadlocks all on its own", { skip }, async () => {
+    // The pre-fix sequence with no explicit Project lock anywhere: share-lock
+    // the estimate, then INSERT a row carrying `projectId`. Nothing here names
+    // `"Project"`, and it is still a cycle.
+    await seed();
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await lockEstimateAttribution(raw, ESTIMATE);
+            await tx.expense.create({
+                data: {
+                    id: `${PFX}-fk-control`, estimateId: ESTIMATE, projectId: PROJECT,
+                    amount: 10, vendor: "FK control", status: "Pending",
+                },
+            });
+        }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `a foreign key alone must be able to deadlock; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await writerDb!.expense.deleteMany({ where: { id: `${PFX}-fk-control` } });
+        await cleanup();
+    }
+});
+
+test("the QBO CREATE path, for real, against a Project-first editor", { skip }, async () => {
+    // `upsertQboExpense` with no existing row: it share-locks the estimate and
+    // then inserts a row carrying `projectId`. Round 37 read it as
+    // estimate-only because it never mentions the Project.
+    await seed();
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let result: string | null = null;
+        let writerError: unknown = null;
+        try {
+            result = await upsertQboExpense(writerDb as unknown as QboExpensePersistenceClient, {
+                qbPurchaseId: OTHER_PURCHASE,
+                qbSyncToken: "1",
+                qbSyncedAt: new Date(),
+                estimateId: ESTIMATE,
+                projectId: PROJECT,
+                amount: 125.5,
+                vendor: "Summit Plumbing",
+                date: new Date("2026-09-01T12:00:00Z"),
+                description: "[QuickBooks import] rough-in",
+                status: "Reviewed",
+            });
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the sync was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the sync failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        assert.equal(result, "imported", "it waited for the editor and then did its job");
+
+        const created = await editorDb!.expense.findUnique({
+            where: { qbPurchaseId: OTHER_PURCHASE },
+            select: { projectId: true, estimateId: true },
+        });
+        assert.deepEqual(created, { projectId: PROJECT, estimateId: ESTIMATE });
+    } finally {
+        await writerDb!.expense.deleteMany({ where: { qbPurchaseId: OTHER_PURCHASE } });
+        await cleanup();
+    }
+});
+
+test("the QBO ATTRIBUTION FILL, for real, against a Project-first editor", { skip }, async () => {
+    // The other half of `upsertQboExpense`: an existing row with no job. It
+    // takes the per-expense lock, share-locks the estimate, and then UPDATES
+    // `projectId` — `Expense -> Estimate -> Project` before the fix.
+    await seed();
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let result: string | null = null;
+        let writerError: unknown = null;
+        try {
+            result = await upsertQboExpense(writerDb as unknown as QboExpensePersistenceClient, {
+                qbPurchaseId: PURCHASE,
+                qbSyncToken: "4",
+                qbSyncedAt: new Date(),
+                estimateId: ESTIMATE,
+                projectId: PROJECT,
+                amount: 375,
+                vendor: "Summit Plumbing",
+                date: new Date("2026-09-01T12:00:00Z"),
+                description: "[QuickBooks import] rough-in, revised",
+                status: "Reviewed",
+            });
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the fill was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the fill failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        assert.equal(result, "updated", "the attribution fill landed");
+
+        const filled = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true },
+        });
+        assert.deepEqual(filled, { projectId: PROJECT }, "the job it had none of");
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the AI receipt parser's write, for real, against a Project-first editor", { skip }, async () => {
+    // `createParsedReceiptExpense` is the parse route's transaction, split out
+    // so two connections can drive it: the handler around it needs an image, an
+    // Anthropic key and a session, none of which has anything to do with the
+    // lock order.
+    await seed();
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let created: { id: string } | null = null;
+        let writerError: unknown = null;
+        try {
+            created = await createParsedReceiptExpense(writerDb as never, {
+                projectId: PROJECT,
+                estimateId: ESTIMATE,
+                description: "[AI 92%] Summit Plumbing receipt — pending bookkeeper review",
+                amount: 88.4,
+                date: new Date("2026-09-01T12:00:00Z"),
+                vendor: "Summit Plumbing",
+            });
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the parser was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the parser failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        assert.ok(created?.id, "it waited for the editor and then wrote the row");
+        await writerDb!.expense.deleteMany({ where: { id: created!.id } });
+    } finally {
+        await cleanup();
+    }
+});
+
+test("the BACKFILL's project-fill pass, for real, against a Project-first editor", { skip }, async () => {
+    // ROUND 38, ITEM 2. `runBackfill` is the production script, driven here
+    // exactly as an operator drives it (`--apply`). Its project pass called
+    // `writeUnderAttributionLocks` with no `phaseProjectId`, which did not mean
+    // "no Project lock" — it meant the Project was locked implicitly, by the
+    // UPDATE, after the Estimate and the Expense.
+    await seed();
+    // The pass fills rows that have NO job; the seeded expense has none.
+    try {
+        const projectHeld = gate();
+        const editor = projectFirstEditor(projectHeld);
+        await projectHeld.reached;
+
+        let written: { projectIds: number } | null = null;
+        let writerError: unknown = null;
+        try {
+            const outcome = await runBackfill({
+                db: writerDb as never,
+                apply: true,
+                log: () => {},
+                overheadProjectId: `${PFX}-overhead-not-a-real-job`,
+            });
+            written = outcome.written;
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the backfill was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the backfill failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        assert.ok((written?.projectIds ?? 0) >= 1, "it waited for the editor and then attributed the row");
+
+        const filled = await editorDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { projectId: true },
+        });
+        assert.deepEqual(filled, { projectId: PROJECT });
     } finally {
         await cleanup();
     }

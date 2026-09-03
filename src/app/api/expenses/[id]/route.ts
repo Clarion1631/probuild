@@ -9,6 +9,7 @@ import {
 } from "@/lib/qbo-expense-guard";
 import {
     expenseStillOnProjectWhere,
+    hasTaxClassification,
     isPlausibleReceiptTax,
     itemBelongsToProjectTx,
     maxPlausibleTaxAmount,
@@ -380,15 +381,22 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             //
             // Everything checked before the transaction was checked against the
             // row as it was READ, on the global client — the one state the lock
-            // exists to distrust. These six columns are re-read here so the
+            // exists to distrust. These columns are re-read here so the
             // verdicts below, and the predicate that carries them, all speak
             // about the same row the write lands on.
+            //
+            // `installedAtCustomer` IS ONE OF THEM (round 38, item 3). It was
+            // not selected and not pinned, because the `classified` test below
+            // did not mention it — and it is the ONE column that can carry a
+            // bookkeeper's whole tax answer on its own, with every figure left
+            // null. See `hasTaxClassification`.
             const current = await tx.expense.findUnique({
                 where: { id },
                 select: {
                     amount: true,
                     taxAmount: true,
                     taxDeductibleBase: true,
+                    installedAtCustomer: true,
                     taxSource: true,
                     taxDeductibleBaseSource: true,
                     needsTaxReview: true,
@@ -441,11 +449,21 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             // work, and the tax columns are not this route's to correct — so it
             // takes BOOKING's remedy rather than the PATCH's: the row is
             // flagged and a person is asked to look again.
-            const classified =
-                lockedTax !== null ||
-                lockedBase !== null ||
-                lockedTaxSource !== null ||
-                lockedBaseSource !== null;
+            // THE SHARED DEFINITION, not a fourth local copy (round 38, item
+            // 3). This one used to omit `installedAtCustomer`, so a row whose
+            // only classification was a bookkeeper's explicit "installed at
+            // the customer" — every figure null — was treated as unclassified
+            // and its gross could be edited with no review flag, while the QBO
+            // sync and the rollout trigger both counted the same row as
+            // classified. Three writers, three answers, and the narrowest one
+            // decided what reached the excise return.
+            const classified = hasTaxClassification({
+                taxAmount: lockedTax,
+                taxDeductibleBase: lockedBase,
+                installedAtCustomer: current.installedAtCustomer,
+                taxSource: lockedTaxSource,
+                taxDeductibleBaseSource: lockedBaseSource,
+            });
             const stillPlausible =
                 lockedTax === null || isPlausibleReceiptTax(lockedTax, finalAmount);
             // ...AND THE ACTOR MATTERS AS MUCH AS THE ARITHMETIC.
@@ -481,6 +499,11 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 amount: current.amount,
                 taxAmount: current.taxAmount ?? null,
                 taxDeductibleBase: current.taxDeductibleBase ?? null,
+                // Pinned for the same reason it is now READ: the review verdict
+                // rests on it, so a PATCH answering the installed-at-customer
+                // question between this read and the write must lose the CAS
+                // rather than have its answer decided against.
+                installedAtCustomer: current.installedAtCustomer ?? null,
                 taxSource: lockedTaxSource,
                 taxDeductibleBaseSource: lockedBaseSource,
                 needsTaxReview: Boolean(current.needsTaxReview),

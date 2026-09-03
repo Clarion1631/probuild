@@ -1435,6 +1435,70 @@ test("lowering the gross past the tax's plausibility band FLAGS the row", async 
     );
 });
 
+test("an installedAtCustomer-ONLY classification is still a classification", async () => {
+    // ROUND 38, ITEM 3 — the row this handler could not see.
+    //
+    // A bookkeeper answers the one question that decides whether a receipt is
+    // deductible at all ("yes, this material was installed at the customer")
+    // and supplies no figures: every tax column stays NULL and
+    // `installedAtCustomer` carries the entire classification. This route's
+    // `classified` test named four columns and not that one — and did not even
+    // SELECT it under the lock — so a crew member could halve the gross and
+    // the row went back into the excise report with a deduction certified
+    // against a total that no longer exists. The QBO sync and the rollout
+    // trigger both counted the same row as classified; the narrowest of the
+    // three decided what got filed.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow({
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: null, taxDeductibleBaseSource: null,
+        installedAtCustomer: true,
+    });
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200, "changing a receipt's total is still their work");
+    assert.equal(updateArgs?.data.amount, 100);
+    assert.equal(
+        updateArgs?.data.needsTaxReview, true,
+        "the only answer on the row was invalidated, so it goes back to a person",
+    );
+});
+
+test("an explicit installedAtCustomer FALSE counts too, and is CAS-pinned", async () => {
+    // A tri-state: `false` is a person saying "no, this was not resold", which
+    // is as much a decision as `true` and as capable of being wrong about a
+    // different basket of goods. Reading it as falsy would drop exactly the
+    // rows a bookkeeper has already excluded from the filing.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow({
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: null, taxDeductibleBaseSource: null,
+        installedAtCustomer: false,
+    });
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, true);
+    // The verdict rests on the column, so the write has to lose to a PATCH
+    // that answered it in the gap.
+    assert.equal(
+        (updateArgs?.where as Record<string, unknown>).installedAtCustomer, false,
+        "the value the verdict was measured against is in the predicate",
+    );
+});
+
+test("a row with NO answer at all, installedAtCustomer included, is not flagged", async () => {
+    // The control for the two above: without it they pass on a route that
+    // flags every gross change.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow({
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: null, taxDeductibleBaseSource: null,
+        installedAtCustomer: null,
+    });
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined, "nobody has said anything to invalidate");
+});
+
 test("a financialReports user whose edit leaves the tax plausible is NOT flagged", async () => {
     // $16.55 on $200 is 8.3% — inside the band, base still under the ceiling,
     // and the actor is entitled to certify tax figures. Flagging here would

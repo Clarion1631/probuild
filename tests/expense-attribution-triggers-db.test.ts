@@ -253,6 +253,23 @@ test("a bookkeeper's explicit 'no tax here' IS a classification", { skip }, asyn
     assert.equal((await readRow())!.needsTaxReview, true);
 });
 
+test("an installedAtCustomer answer ALONE is a classification", { skip }, async () => {
+    // ROUND 38, ITEM 3. Every figure NULL and one tri-state answered: the
+    // bookkeeper said this material was resold to the customer, which is the
+    // single fact that makes the receipt deductible at all. The trigger reads
+    // the same TAX_CLASSIFICATION_COLUMNS the sync and the PUT handler do, so
+    // this row is flagged like any other.
+    await seedClassified({
+        taxAmount: null, taxAtSource: false, taxSource: null,
+        taxDeductibleBase: null, taxDeductibleBaseSource: null,
+        installedAtCustomer: true,
+    });
+    await oldBuildSetsAmount(500);
+    const row = await readRow();
+    assert.equal(row!.needsTaxReview, true);
+    assert.equal(row!.installedAtCustomer, true, "and the answer itself is left alone");
+});
+
 test("an UPDATE that does not move the gross changes nothing", { skip }, async () => {
     // A form that posts all its fields re-sends the same total on every save.
     // The trigger is the gross MOVING, not the column being present.

@@ -40,11 +40,19 @@ function walk(dir: string, out: string[] = []): string[] {
  * fails on a file that does nothing of the sort. The window is generous enough
  * to span a formatted `data: { ... }` block and short enough not to run into
  * the next unrelated statement.
+ *
+ * The window was 2000 and had to grow (round 38): the expense PUT's `where`
+ * clause gained a `installedAtCustomer` CAS pin and the comment explaining it,
+ * which pushed `costCodeId` in the SAME statement's `data` block past the cut
+ * — and the tripwire reported the file as "no longer an Expense cost-code
+ * writer" instead of reporting anything true. The companion test below is the
+ * only reason that was noticed rather than silently reducing the scan to
+ * nothing, which is exactly what it exists for.
  */
 function writesAnExpenseCostCode(source: string): boolean {
     const writes = /(?:prisma|tx|transaction|client)\.expense\.(?:create|update|updateMany)\s*\(/g;
     for (let match = writes.exec(source); match; match = writes.exec(source)) {
-        const window = source.slice(match.index, match.index + 2000);
+        const window = source.slice(match.index, match.index + 3000);
         // `costCodeId` as an assigned VALUE inside the payload — never a
         // `select: { costCodeId: true }` and never a `where` predicate. Both
         // spellings count: `costCodeId: <value>` and the property SHORTHAND

@@ -7,9 +7,10 @@ import { after } from "next/server";
 import { suggestCode } from "./expense-cost-suggest";
 import {
     HUMAN_COST_CODE_SOURCES,
-    HUMAN_TAX_SOURCES,
     expenseStillOnProjectWhere,
+    hasTaxClassification,
     lockEstimateAttribution,
+    peekEstimateProjectId,
     notHumanCodedExpenseWhere,
     resolveExpenseProjectId,
     resolveExpenseProjectUnderLock,
@@ -723,6 +724,10 @@ export function planQboExpenseUpdate(
                 | "taxDeductibleBase"
                 | "installedAtCustomer"
                 | "taxSource"
+                // Read by the shared `hasTaxClassification`. Optional like the
+                // rest: a caller that does not select it hands over undefined,
+                // which normalises to null and cannot widen the verdict.
+                | "taxDeductibleBaseSource"
             >
         >,
     write: QboExpenseWrite,
@@ -838,21 +843,30 @@ export function planQboExpenseUpdate(
     // `installedAtCustomer` yes describing a different basket of goods. The
     // numbers still satisfy every CHECK, so nothing else would ever ask.
     //
-    // "Classified" means a human's tax answer is on the row in any form —
-    // a tax amount, an installed-at-customer decision, a hand allocation, or
-    // `taxSource: "manual"`. That last one is not redundant: a bookkeeper who
-    // decides a receipt carries NO tax leaves every one of the other three
-    // NULL, so without it the single most reviewable row — a human's explicit
-    // "no tax", now describing a different gross — is the one row a re-sync
-    // would say nothing about.
+    // "Classified" means a tax answer is on the row in any form — a tax
+    // amount, an installed-at-customer decision, a hand allocation, or a
+    // `taxSource`. That last one is not redundant: a bookkeeper who decides a
+    // receipt carries NO tax leaves every one of the others NULL, so without
+    // it the single most reviewable row — a human's explicit "no tax", now
+    // describing a different gross — is the one row a re-sync would say
+    // nothing about.
     // For those rows an amount change is a REVIEW, never a silent acceptance:
     // the classification is kept (it may well still be right) and the row is
     // flagged, which the report reads as "not until a person looks".
-    const classified =
-        existingTax !== null ||
-        existingBase !== null ||
-        existing.installedAtCustomer != null ||
-        (HUMAN_TAX_SOURCES as readonly string[]).includes(existing.taxSource ?? "");
+    //
+    // ONE DEFINITION, shared with the expense PUT handler and transcribed by
+    // the rollout compatibility trigger (round 38, item 3). This one was the
+    // widest of the three and is still correct under the shared rule: the two
+    // clauses it gains — a non-human `taxSource`, and
+    // `taxDeductibleBaseSource` — only ever appear beside a figure that
+    // already counted.
+    const classified = hasTaxClassification({
+        taxAmount: existingTax,
+        taxDeductibleBase: existingBase,
+        installedAtCustomer: existing.installedAtCustomer ?? null,
+        taxSource: existing.taxSource ?? null,
+        taxDeductibleBaseSource: existing.taxDeductibleBaseSource ?? null,
+    });
     const existingAmount =
         existing.amount === null || existing.amount === undefined ? null : Number(existing.amount);
     const amountMoved =
@@ -950,6 +964,7 @@ export async function upsertQboExpense(
                 updatedAt: true,
                 taxAmount: true,
                 taxDeductibleBase: true,
+                taxDeductibleBaseSource: true,
                 // Read for the classification test in planQboExpenseUpdate: a
                 // human's installed-at-customer answer counts as a tax
                 // classification even when no tax amount was recorded, and
@@ -970,6 +985,36 @@ export async function upsertQboExpense(
         ) {
             return "unchanged";
         }
+
+        // THE ATTRIBUTION PARENTS, IN THE CANONICAL ORDER, BEFORE ANY OTHER
+        // LOCK THIS TRANSACTION TAKES (round 38, item 1):
+        // Project -> Estimate -> EstimateItem -> CostCode -> Expense.
+        //
+        // THE LOCK NOBODY WROTE DOWN. Neither branch below names `"Project"`,
+        // so round 37 read them as estimate-only and left them alone. They are
+        // not: both write `Expense.projectId`, and Postgres enforces that
+        // foreign key by taking `FOR KEY SHARE` on the referenced `Project`
+        // row — which conflicts with the `FOR UPDATE` a job editor holds. So
+        // the create path was `Estimate -> Project` and the fill path was
+        // `Expense -> Estimate -> Project`, both cycles against a Project-first
+        // writer, and neither runs under `withTxRetry`.
+        //
+        // `attributionCandidate` is read WITHOUT a lock (`peekEstimateProjectId`)
+        // precisely so it can precede the acquisition; both branches then
+        // require the locked re-read to agree with it, and refuse otherwise.
+        // The matcher's own answer is preferred when it has one, because that
+        // is the value the branches already fence on.
+        //
+        // Taken unconditionally, before the branch, because the fill path is
+        // decided only AFTER `lockExpense` — and Expense sits last in the
+        // order, so a parent acquired after it is already too late.
+        const attributionCandidate =
+            write.projectId ?? (await peekEstimateProjectId(transaction, write.estimateId));
+        await lockAttributionParents(transaction, {
+            projectId: attributionCandidate,
+            estimateId: write.estimateId,
+        });
+
         if (!existing) {
             // THE PAIR, RE-READ UNDER LOCK (round 21, item 1).
             //
@@ -1001,9 +1046,16 @@ export async function upsertQboExpense(
             // nobody can resolve. Both are the same fact — the attribution the
             // matcher decided on is gone — so both get the same answer the
             // moved-estimate case gets.
-            const plannedProjectId = write.projectId ?? null;
+            // `attributionCandidate` REPLACES the matcher-only check (round
+            // 38, item 1). It equals `write.projectId` whenever the matcher
+            // named one, so the fence is unchanged for that case; when the
+            // matcher named none it is the unlocked peek, and requiring the
+            // locked read to agree is what guarantees the `Project` row this
+            // INSERT's foreign key will touch is one this transaction already
+            // holds. The old code accepted ANY project in that case and wrote
+            // it — the implicit `FOR KEY SHARE` out of order.
             const pair = await lockEstimateAttribution(transaction, write.estimateId);
-            if (!pair || (plannedProjectId !== null && pair.projectId !== plannedProjectId)) {
+            if (!pair || pair.projectId !== attributionCandidate) {
                 console.warn(
                     pair
                         ? "QBO expense import skipped: estimate moved between match and write"
@@ -1061,9 +1113,15 @@ export async function upsertQboExpense(
             // no longer names a job (or no longer exists). That is the one
             // write this whole block exists to prevent, done deliberately.
             // There is nothing to fill from, so nothing is filled.
-            const plannedProjectId = plan.fill.projectId ?? null;
+            // Same fence as the create path, and for the same reason: this
+            // UPDATE sets `projectId`, so its foreign key takes `FOR KEY SHARE`
+            // on that `Project` row. `attributionCandidate` is the project
+            // whose row `lockAttributionParents` already holds; anything else
+            // would be acquired here, after the Estimate and after the Expense.
+            // `plan.fill.estimateId` is `write.estimateId` (the plan is built
+            // from `write`), which is the estimate that call locked.
             const pair = await lockEstimateAttribution(transaction, plan.fill.estimateId);
-            if (!pair || (plannedProjectId !== null && pair.projectId !== plannedProjectId)) {
+            if (!pair || pair.projectId !== attributionCandidate) {
                 // The estimate moved, was unassigned, or was deleted between the
                 // plan and this lock. Skip the fill — the row stays unattributed
                 // and the next sync retries against the estimate's current

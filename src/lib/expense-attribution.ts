@@ -337,6 +337,94 @@ export function isPlausibleReceiptTax(taxAmount: number, grossAmount: number): b
 export const HUMAN_TAX_SOURCES = ["manual", "manual-none"] as const;
 
 /**
+ * THE ONE DEFINITION OF "SOMEBODY HAS ANSWERED THE TAX QUESTION ON THIS ROW"
+ * (round 38, item 3).
+ *
+ * Three writers ask it and all three used to answer it differently:
+ *
+ *   * `planExpenseUpdate` (the QBO sync) counted a tax amount, a deduction
+ *     base, an `installedAtCustomer` decision, or a HUMAN `taxSource`;
+ *   * the expense PUT counted a tax amount, a base, or EITHER provenance —
+ *     and omitted `installedAtCustomer` entirely, and did not even select it
+ *     under the lock. So a row whose only classification was a bookkeeper's
+ *     "yes, this was installed at the customer" had its gross edited with no
+ *     `needsTaxReview` at all, while the sync and the rollout trigger both
+ *     treat that row as classified. The excise report then reads a
+ *     deduction certified against a total that no longer exists;
+ *   * the rollout compatibility trigger transcribes the sync's version.
+ *
+ * A disagreement between them is not a style problem: whichever one is
+ * narrowest decides which stale deductions reach a state filing.
+ *
+ * So there is one rule, and it reads the two KINDS of column differently
+ * because they mean different things:
+ *
+ *   * A FIGURE — a tax amount, a deduction base, an installed-at-customer
+ *     answer — counts whenever it is present at all. Who supplied it does not
+ *     matter: a gross that moves underneath it makes it describe a purchase
+ *     that no longer exists either way. `installedAtCustomer` is a tri-state
+ *     and `null` is the "nobody has said" one, so it is compared against null
+ *     and never for truthiness: an explicit FALSE is a person's answer exactly
+ *     as much as an explicit TRUE, and it is the answer that keeps a receipt
+ *     OUT of a filing.
+ *   * A PROVENANCE counts only when it is a HUMAN one. `taxSource: "manual-none"`
+ *     — a bookkeeper who looked and said this receipt carries no tax — leaves
+ *     every figure NULL, so without this clause the single most reviewable row
+ *     in the table would be the one row nothing ever asked about. A machine
+ *     provenance is deliberately NOT a classification: an "ocr" source with no
+ *     surviving figure is a guess with nothing left to invalidate, and flagging
+ *     those would bury the rows a person actually needs to look at.
+ */
+export const TAX_CLASSIFICATION_FIGURE_COLUMNS = [
+    "taxAmount",
+    "taxDeductibleBase",
+    "installedAtCustomer",
+] as const;
+
+/** Provenance columns: a HUMAN value here is itself an answer. See above. */
+export const TAX_CLASSIFICATION_SOURCE_COLUMNS = [
+    "taxSource",
+    "taxDeductibleBaseSource",
+] as const;
+
+/** Every column the rule reads, figures first — the order the trigger states them in. */
+export const TAX_CLASSIFICATION_COLUMNS = [
+    ...TAX_CLASSIFICATION_FIGURE_COLUMNS,
+    ...TAX_CLASSIFICATION_SOURCE_COLUMNS,
+] as const;
+
+/** The row facts `hasTaxClassification` reads. Decimals may arrive as anything. */
+export interface TaxClassificationFacts {
+    taxAmount?: unknown;
+    taxDeductibleBase?: unknown;
+    installedAtCustomer?: boolean | null;
+    taxSource?: string | null;
+    taxDeductibleBaseSource?: string | null;
+}
+
+/**
+ * Has ANY tax answer been recorded on this row? See
+ * `TAX_CLASSIFICATION_COLUMNS` for why this has exactly one definition.
+ *
+ * Callers pass the row as it is at the moment the decision is made ABOUT — for
+ * a write that moves the gross, that is the row BEFORE the write, because the
+ * question is whether a classification is being invalidated, not whether one
+ * is being supplied.
+ */
+export function hasTaxClassification(row: TaxClassificationFacts): boolean {
+    const read = (column: string) => (row as Record<string, unknown>)[column];
+    if (TAX_CLASSIFICATION_FIGURE_COLUMNS.some(column => {
+        const value = read(column);
+        return value !== null && value !== undefined;
+    })) {
+        return true;
+    }
+    return TAX_CLASSIFICATION_SOURCE_COLUMNS.some(column =>
+        (HUMAN_TAX_SOURCES as readonly string[]).includes(String(read(column) ?? "")),
+    );
+}
+
+/**
  * The `where` fragment for "an automated pass may write the tax figures here".
  *
  * The explicit NULL branch is not decoration: SQL `NOT IN (…)` is NULL for a
@@ -444,6 +532,39 @@ export function expenseStillOnProjectWhere(
  * `null` means the estimate has no project — no scope to attribute against, and
  * every caller must refuse rather than write half a pair.
  */
+/**
+ * WHICH JOB IS THIS ESTIMATE ON — ASKED WITHOUT TAKING ANY LOCK (round 38,
+ * item 1).
+ *
+ * A plain `SELECT`, deliberately with no `FOR SHARE`/`FOR UPDATE` clause, so
+ * it may run BEFORE the canonical acquisition without contributing to it.
+ *
+ * It exists because of the implicit lock nobody writes down: an INSERT or
+ * UPDATE that sets `Expense.projectId` makes Postgres take `FOR KEY SHARE` on
+ * the referenced `Project` row to enforce the foreign key, and `FOR KEY SHARE`
+ * conflicts with the `FOR UPDATE` a Project-first job editor holds. So a
+ * transaction that share-locks an Estimate and only then writes `projectId` is
+ * `Estimate -> Project` even though its source never names `"Project"`.
+ *
+ * The fix is to lock the project explicitly first, which needs its id first —
+ * and reading it under a lock would be the very inversion being fixed. This
+ * read is therefore an UNVERIFIED candidate: the caller passes it to
+ * `lockAttributionParents`, re-reads the estimate under the lock that call
+ * takes, and REFUSES if the two disagree. A disagreement means the estimate
+ * moved in the microseconds between, and the row it would write belongs to a
+ * job whose `Project` row this transaction is not holding.
+ */
+export async function peekEstimateProjectId(
+    tx: ExpenseTxClient,
+    estimateId: string,
+): Promise<string | null> {
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "projectId" FROM "Estimate" WHERE id = $1`,
+        estimateId,
+    )) as { projectId: string | null }[];
+    return rows?.[0]?.projectId ?? null;
+}
+
 export async function lockEstimateAttribution(
     tx: ExpenseTxClient,
     estimateId: string,
