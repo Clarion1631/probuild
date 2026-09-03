@@ -47,8 +47,14 @@ import {
     MONEY_BOUNDARY_CLAIM_STATUSES,
     RESERVATION_RETAINING_STATUSES,
     LIVE_APPLY_ENV_VAR,
+    PROGRESS_WINDOW_DAYS,
+    bankCreditFingerprint,
+    booksWithoutOverride,
+    cumulativeMilestoneShare,
     hasPayerCorroboration,
     liveApplyEnabled,
+    milestoneProgressTokens,
+    progressCorroboration,
     requestedByInstant,
     parseBankBatch,
     qboGuardNote,
@@ -197,6 +203,9 @@ const tables = {
     officeTask: new Table("officeTask"),
     officeBoardColumn: new Table("officeBoardColumn"),
     project: new Table("project"),
+    // The job-progress corroboration reads these two.
+    inspection: new Table("inspection"),
+    dailyLog: new Table("dailyLog"),
     // Only the real settle path (M3) reaches these.
     invoice: new Table("invoice"),
     estimatePaymentSchedule: new Table("estimatePaymentSchedule"),
@@ -205,6 +214,8 @@ const tables = {
 };
 
 const queries: { paymentSchedule: Row[]; bankImage: Row[] } = { paymentSchedule: [], bankImage: [] };
+/** Ordered trace of the calls that matter for serialization proofs. */
+const callLog: string[] = [];
 /** fileId → the status its DepositIngest row was CREATED with. */
 const createdStatus = new Map<string, string>();
 
@@ -214,6 +225,10 @@ const fakePrisma: Row = {
             const row = await tables.depositIngest.create(args);
             createdStatus.set(String(row.fileId), String(row.status));
             return row;
+        },
+        findFirst: async (args: { where?: Row }) => {
+            callLog.push("CLAIM_QUERY");
+            return tables.depositIngest.findFirst(args);
         },
     }),
     bankImage: {
@@ -238,6 +253,8 @@ const fakePrisma: Row = {
     officeTask: tables.officeTask,
     officeBoardColumn: tables.officeBoardColumn,
     project: tables.project,
+    inspection: tables.inspection,
+    dailyLog: tables.dailyLog,
     invoice: tables.invoice,
     estimatePaymentSchedule: tables.estimatePaymentSchedule,
     estimate: tables.estimate,
@@ -245,7 +262,12 @@ const fakePrisma: Row = {
     $transaction: async (fn: (tx: Row) => Promise<unknown>) => fn(fakePrisma),
     // lockMoneyParents' SELECT ... FOR UPDATE. Nothing to lock in memory.
     $queryRaw: async () => [],
-    $executeRaw: async () => 0,
+    // The claim domain's advisory lock. Recorded (with the call order) so the
+    // test can prove it is taken BEFORE the claim query, not after it.
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        callLog.push(`SQL:${strings.join("?")}|${values.join(",")}`);
+        return 0;
+    },
     $executeRawUnsafe: async () => 0,
 };
 
@@ -378,6 +400,10 @@ function seedMilestone(opts: {
     const id = `sched-${scheduleSeq}`;
     tables.paymentSchedule.rows.push({
         id,
+        // Real Prisma rows always carry these; the cumulative-share ordering
+        // reads them.
+        createdAt: new Date(TODAY.getTime() - 60 * 86_400_000),
+        dueDate: null,
         name: opts.name ?? `Milestone ${scheduleSeq}`,
         status: opts.status ?? "Pending",
         amount: opts.amount,
@@ -441,6 +467,7 @@ beforeEach(() => {
     queries.paymentSchedule = [];
     queries.bankImage = [];
     createdStatus.clear();
+    callLog.length = 0;
     for (const key of Object.keys(calls) as Array<keyof typeof calls>) calls[key] = [];
     qboBalanceByInvoice = new Map();
     scheduleSeq = 0;
@@ -623,6 +650,127 @@ test("chronology: the bound is the END of the post date, in the company's day", 
     assert.equal(new Date("2026-08-24T23:00:00Z") <= bound, true, "4pm Pacific on the day");
     assert.equal(new Date("2026-08-25T06:59:00Z") <= bound, true, "11:59pm Pacific on the day");
     assert.equal(new Date("2026-08-25T16:00:00Z") <= bound, false, "9am Pacific the next day");
+});
+
+test("replay identity: the fingerprint is the credit, not just its reference", () => {
+    const credit = { postDate: "2026-08-24", amountCents: 1_344_768, baiCode: "174", description: "OTHER DEPOSITS", transactionDetail: "DEPOSIT - DDA/MMKT" };
+    // Cosmetic re-rendering of the same row is the same credit.
+    assert.equal(
+        bankCreditFingerprint(credit),
+        bankCreditFingerprint({ ...credit, description: "  other   deposits ", transactionDetail: "deposit - dda/mmkt " }),
+    );
+    // Anything that makes it a DIFFERENT deposit changes it.
+    for (const change of [
+        { postDate: "2026-08-25" },
+        { amountCents: 1_344_769 },
+        { baiCode: "165" },
+        { description: "INTEREST PAID" },
+        { transactionDetail: "MOBILE D 1234" },
+    ]) {
+        assert.notEqual(bankCreditFingerprint({ ...credit, ...change }), bankCreditFingerprint(credit), JSON.stringify(change));
+    }
+});
+
+test("progress tokens: a milestone name's distinctive words, and only those", () => {
+    assert.deepEqual(milestoneProgressTokens("Rough In complete"), ["ROUGH"]);
+    assert.deepEqual(milestoneProgressTokens("Drywall complete"), ["DRYWALL"]);
+    assert.deepEqual(milestoneProgressTokens("Tile & Finish Carpentry"), ["TILE", "FINISH", "CARPENTRY"]);
+    // Nothing distinctive: (b) must not be able to fire on a name like this,
+    // or ANY log would corroborate it.
+    assert.deepEqual(milestoneProgressTokens("Final Payment"), []);
+    assert.deepEqual(milestoneProgressTokens("Deposit"), []);
+});
+
+test("job progress: the field has to agree that this phase is done", async t => {
+    const base = {
+        postDate: "2026-08-24",
+        milestoneName: "Rough In complete",
+        inspections: [] as Array<{ result: string; date: string | null }>,
+        dailyLogs: [] as Array<{ date: string; workPerformed: string }>,
+        percentComplete: null as number | null,
+        percentCompleteAsOf: null as string | null,
+        requiredPercent: null as number | null,
+    };
+
+    await t.test("(a) a passed inspection inside the window", () => {
+        const result = progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-08-21" }] });
+        assert.equal(result.corroborated, true);
+        assert.equal(result.via, "inspection");
+        assert.match(result.detail, /inspection passed on 2026-08-21/);
+    });
+
+    await t.test("…but not a FAILED one, and not one outside the window", () => {
+        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "FAILED", date: "2026-08-21" }] }).corroborated, false);
+        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-07-01" }] }).corroborated, false);
+        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-08-26" }] }).corroborated, false, "after the deposit");
+        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: null }] }).corroborated, false);
+    });
+
+    await t.test("(b) a daily log that names this phase", () => {
+        const result = progressCorroboration({
+            ...base,
+            dailyLogs: [{ date: "2026-08-20", workPerformed: "Finished rough plumbing and electrical rough-in" }],
+        });
+        assert.equal(result.corroborated, true);
+        assert.equal(result.via, "daily-log");
+        assert.match(result.detail, /2026-08-20/);
+    });
+
+    await t.test("…but a log about a DIFFERENT phase corroborates nothing", () => {
+        const result = progressCorroboration({
+            ...base,
+            dailyLogs: [{ date: "2026-08-20", workPerformed: "Hung drywall in the hall bath and taped corners" }],
+        });
+        assert.equal(result.corroborated, false);
+        assert.match(result.detail, /no daily log mentioning "rough"/);
+    });
+
+    await t.test("…and a name with no distinctive words can never match a log", () => {
+        const result = progressCorroboration({
+            ...base,
+            milestoneName: "Final Payment",
+            dailyLogs: [{ date: "2026-08-20", workPerformed: "final payment work complete milestone deposit" }],
+        });
+        assert.equal(result.corroborated, false);
+        assert.match(result.detail, /no distinctive words/);
+    });
+
+    await t.test("(c) percent complete past this milestone's share", () => {
+        const result = progressCorroboration({ ...base, percentComplete: 62, percentCompleteAsOf: "2026-08-25", requiredPercent: 60 });
+        assert.equal(result.corroborated, true);
+        assert.equal(result.via, "percent-complete");
+    });
+
+    await t.test("…but not when it is short, nor when it predates the deposit", () => {
+        assert.equal(progressCorroboration({ ...base, percentComplete: 55, percentCompleteAsOf: "2026-08-25", requiredPercent: 60 }).corroborated, false);
+        assert.equal(progressCorroboration({ ...base, percentComplete: 62, percentCompleteAsOf: "2026-08-01", requiredPercent: 60 }).corroborated, false);
+    });
+
+    await t.test("nothing at all is not corroboration", () => {
+        assert.equal(progressCorroboration(base).corroborated, false);
+    });
+});
+
+test("cumulative share: what portion of the invoice a milestone bills through", () => {
+    const milestones = [
+        { id: "m1", amount: 10_000, dueDate: "2026-07-01", createdAt: "2026-06-01T00:00:00Z" },
+        { id: "m2", amount: 20_000, dueDate: "2026-08-01", createdAt: "2026-06-01T00:00:00Z" },
+        { id: "m3", amount: 20_000, dueDate: null, createdAt: "2026-06-01T00:00:00Z" },
+    ];
+    assert.equal(cumulativeMilestoneShare(milestones, "m1", 50_000), 20);
+    assert.equal(cumulativeMilestoneShare(milestones, "m2", 50_000), 60);
+    assert.equal(cumulativeMilestoneShare(milestones, "m3", 50_000), 100, "a null due date sorts last");
+    assert.equal(cumulativeMilestoneShare(milestones, "nope", 50_000), null);
+    assert.equal(cumulativeMilestoneShare(milestones, "m1", 0), null);
+});
+
+test("the ladder: payer evidence and job progress both book without the switch", () => {
+    assert.equal(booksWithoutOverride("verified"), true);
+    assert.equal(booksWithoutOverride("recorded"), true);
+    assert.equal(booksWithoutOverride("progress"), true);
+    assert.equal(booksWithoutOverride("amount_only"), false);
+    assert.equal(booksWithoutOverride("unknown"), false);
+    assert.equal(hasPayerCorroboration("progress"), false, "progress is a SEPARATE rung, not payer evidence");
 });
 
 test("claim sets: every state that can still HOLD a milestone counts as a claim", () => {
@@ -1569,8 +1717,11 @@ test("P0: with the live-apply switch OFF, a perfect amount-only match is SUGGEST
     const { body } = await post(bankBatch([{ ref: "REF-SUGGEST", amount: 6161.61 }]));
     const result = creditResult(body, "REF-SUGGEST");
     assert.equal(result.status, "proposed", `expected suggest-only, got ${result.status}: ${result.reason}`);
-    assert.match(String(result.reason), /suggest-only/);
-    assert.match(String(result.reason), new RegExp(LIVE_APPLY_ENV_VAR));
+    // The reason has to tell the operator what was missing, not just that a
+    // flag is off: this is the line a human acts on.
+    assert.match(String(result.reason), /amount matches Milestone \d+ but/);
+    assert.match(String(result.reason), /no daily log|no passed inspection/);
+    assert.match(String(result.reason), new RegExp(`set ${LIVE_APPLY_ENV_VAR}=true to book anyway`));
     assert.equal(calls.buildQBPaymentRequest.length, 0, "no money boundary is touched at all");
     assert.equal(depositRow("REF-SUGGEST")!.paymentScheduleId, milestone, "the suggestion is recorded");
     assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
@@ -1681,7 +1832,10 @@ test("P0: a swept credit that needs a human but gets NO task is unresolved, not 
 });
 
 test("P1: the preflight leaves an ACTIVE worker alone, and a cancelled one stops before QuickBooks", async t => {
-    await t.test("a fresh processing row is not cancelled; the other credit carries the reason", async () => {
+    await t.test("a fresh PRE-BOUNDARY worker is cancelled, so both credits reach a human", async () => {
+        // Leaving it running was wrong: it could still win its own
+        // processing→qbo_unknown CAS and create a payment for a credit this
+        // preflight had already ruled a collision.
         seedMilestone({ amount: 8383.83 });
         tables.depositIngest.rows.push({
             id: "row-busy", fileId: bankFileId("REF-BUSY"), status: "processing", source: BANK_DEPOSIT_SOURCE,
@@ -1695,10 +1849,37 @@ test("P1: the preflight leaves an ACTIVE worker alone, and a cancelled one stops
             { ref: "REF-OTHER", amount: 8383.83 },
         ]));
 
-        assert.equal(depositRow("REF-BUSY")!.status, "processing", "an in-flight worker is never yanked out from under");
-        const other = creditResult(body, "REF-OTHER");
-        assert.equal(other.status, "unmatched");
-        assert.match(String(other.reason), /REF-BUSY is being processed right now and was left to finish/);
+        for (const ref of ["REF-BUSY", "REF-OTHER"]) {
+            assert.equal(creditResult(body, ref).status, "unmatched", `${ref} must go to a human`);
+            assert.match(String(depositRow(ref)!.lastError), /different bank credits/);
+        }
+        assert.equal(depositRow("REF-BUSY")!.paymentScheduleId ?? null, null, "the cancelled worker releases its reservation");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    });
+
+    await t.test("a twin already PAST the boundary is left alone, and this credit is escalated", async () => {
+        // That payment exists in QuickBooks and cannot be called back, so the
+        // colliding credit is not merely unmatched — it is unresolved.
+        seedMilestone({ amount: 8585.85 });
+        tables.depositIngest.rows.push({
+            id: "row-committed", fileId: bankFileId("REF-COMMITTED"), status: "qbo_created", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-COMMITTED", extracted: JSON.stringify({ fileId: bankFileId("REF-COMMITTED") }),
+            attempts: 1, amountCents: 858_585, postDate: utc(SETTLED_DAY), qbPaymentId: "qb-payment-live",
+            qbRequestPayload: "{}", paymentScheduleId: "sched-committed",
+            processingStartedAt: new Date(), updatedAt: new Date(),
+        });
+
+        const { body } = await post(bankBatch([
+            { ref: "REF-COMMITTED", amount: 8585.85 },
+            { ref: "REF-TOOLATE", amount: 8585.85 },
+        ]));
+
+        assert.equal(depositRow("REF-COMMITTED")!.status, "qbo_created", "a committed payment is never yanked");
+        assert.equal(depositRow("REF-COMMITTED")!.paymentScheduleId, "sched-committed", "…and keeps its reservation");
+        const late = creditResult(body, "REF-TOOLATE");
+        assert.equal(late.status, "reconcile", "the collision with a committed payment is unresolved money");
+        assert.match(String(late.reason), /REF-COMMITTED has already reached QuickBooks/);
+        assert.equal(body.ok, false);
     });
 
     await t.test("a row cancelled mid-flight stops at the money boundary with no QuickBooks call", async () => {
@@ -1777,6 +1958,141 @@ test("B1: a COLLISION that cannot file its task is unresolved too, not a quiet u
         } finally {
             (tables.officeTask as Row).create = realCreate;
         }
+    });
+});
+
+test("R7: a reused bank reference carrying DIFFERENT money is a human's problem", async t => {
+    await t.test("the same credit twice is a replay", async () => {
+        seedMilestone({ amount: 1234.56 });
+        const batch = bankBatch([{ ref: "REF-FP", amount: 1234.56 }]);
+        assert.equal(creditResult((await post(batch)).body, "REF-FP").status, "applied");
+        const second = await post(batch);
+        assert.equal(creditResult(second.body, "REF-FP").status, "applied");
+        assert.equal(creditResult(second.body, "REF-FP").alreadyApplied, true);
+        assert.equal(calls.sendQBPaymentCreateRequest.length, 1);
+    });
+
+    await t.test("the same reference with a different amount is NOT", async () => {
+        seedMilestone({ amount: 2345.67 });
+        seedMilestone({ amount: 9999.99 });
+        await post(bankBatch([{ ref: "REF-REUSED", amount: 2345.67 }]));
+        const paymentsAfterFirst = calls.sendQBPaymentCreateRequest.length;
+
+        const { body } = await post(bankBatch([{ ref: "REF-REUSED", amount: 9999.99 }]));
+        const result = creditResult(body, "REF-REUSED");
+        assert.equal(result.status, "reconcile");
+        assert.match(String(result.reason), /bank reference reused with different data/);
+        assert.equal(body.ok, false, "unresolved: the runner must fail");
+        assert.ok(result.officeTaskId, "and a human is asked");
+        assert.equal(calls.sendQBPaymentCreateRequest.length, paymentsAfterFirst, "no second payment");
+    });
+
+    await t.test("a cosmetic re-render of the same credit is still a replay", async () => {
+        seedMilestone({ amount: 3456.78 });
+        await post(bankBatch([{ ref: "REF-COSMETIC", amount: 3456.78 }]));
+        const { body } = await post(bankBatch([{ ref: "REF-COSMETIC", amount: 3456.78, detail: "deposit -  dda/mmkt " }]));
+        assert.equal(creditResult(body, "REF-COSMETIC").status, "applied");
+        assert.equal(creditResult(body, "REF-COSMETIC").alreadyApplied, true);
+    });
+});
+
+test("R7: the claim domain is SERIALIZED — the advisory lock is taken before the claim query", async t => {
+    await t.test("on the bank path", async () => {
+        seedMilestone({ amount: 4567.89 });
+        await post(bankBatch([{ ref: "REF-LOCK", amount: 4567.89 }]));
+
+        const lockIndex = callLog.findIndex(entry => entry.startsWith("SQL:") && entry.includes("pg_advisory_xact_lock"));
+        const claimIndex = callLog.indexOf("CLAIM_QUERY");
+        assert.ok(lockIndex >= 0, `no advisory lock was taken: ${callLog.join(" | ")}`);
+        assert.ok(claimIndex >= 0, "the claim query never ran");
+        assert.ok(lockIndex < claimIndex, "the lock must precede the read, or two writers can both pass the check");
+        // Keyed on the amount — the only thing the two sources share.
+        assert.match(callLog[lockIndex], /deposit-claim:456789/);
+    });
+
+    await t.test("and on the photo path", async () => {
+        tables.project.rows.push({ id: "project-1", name: "Hoppe Hall Bath", client: { name: "Hoppe" } });
+        seedMilestone({ amount: 5678.90, requested: false, projectName: "Hoppe Hall Bath" });
+
+        const { body } = await post({
+            fileId: "drive-photo-lock", projectName: "Hoppe Hall Bath", amount: 5678.90,
+            checkDate: SETTLED_DAY, checkNumber: "7777", payerName: "Hoppe",
+        });
+        assert.equal(body.status, "applied", `photo leg failed: ${body.reason}`);
+
+        const lockIndex = callLog.findIndex(entry => entry.startsWith("SQL:") && entry.includes("pg_advisory_xact_lock"));
+        const claimIndex = callLog.indexOf("CLAIM_QUERY");
+        assert.ok(lockIndex >= 0 && claimIndex >= 0 && lockIndex < claimIndex, `lock ${lockIndex} claim ${claimIndex}`);
+        assert.match(callLog[lockIndex], /deposit-claim:567890/);
+    });
+});
+
+test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log rule)", async t => {
+    const hoppe = () => {
+        delete process.env[LIVE_APPLY_ENV_VAR]; // the switch stays OFF throughout
+        return seedMilestone({
+            amount: 13447.68, name: "Rough In complete", invoiceCode: "INV-00173",
+            projectName: "Hoppe Hall Bath", clientName: "Hoppe",
+        });
+    };
+
+    await t.test("an inspection passed three days before the credit → books", async () => {
+        const milestone = hoppe();
+        tables.inspection.rows.push({
+            id: "insp-1", projectId: "project-1", result: "PASSED", type: "Rough-in",
+            performedDate: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 4)), scheduledDate: null,
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-INSPECTED", amount: 13447.68 }]));
+        const result = creditResult(body, "REF-INSPECTED");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+
+    await t.test("a daily log naming the phase → books", async () => {
+        const milestone = hoppe();
+        tables.dailyLog.rows.push({
+            id: "log-1", projectId: "project-1", date: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 2)),
+            workPerformed: "Completed rough plumbing; inspector walked the rough-in",
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-LOGGED", amount: 13447.68 }]));
+        const result = creditResult(body, "REF-LOGGED");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+
+    await t.test("no logs and no inspection → suggest-only", async () => {
+        hoppe();
+        const { body } = await post(bankBatch([{ ref: "REF-NOEVIDENCE", amount: 13447.68 }]));
+        const result = creditResult(body, "REF-NOEVIDENCE");
+        assert.equal(result.status, "proposed");
+        assert.match(String(result.reason), /amount matches Rough In complete but/);
+        assert.match(String(result.reason), /no daily log mentioning "rough"/);
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+    });
+
+    await t.test("a log about a DIFFERENT phase → suggest-only", async () => {
+        hoppe();
+        tables.dailyLog.rows.push({
+            id: "log-2", projectId: "project-1", date: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 2)),
+            workPerformed: "Hung drywall in the hall bath and taped the corners",
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-WRONGPHASE", amount: 13447.68 }]));
+        assert.equal(creditResult(body, "REF-WRONGPHASE").status, "proposed");
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+    });
+
+    await t.test("an inspection on ANOTHER project does not corroborate this one", async () => {
+        hoppe();
+        tables.inspection.rows.push({
+            id: "insp-other", projectId: "project-elsewhere", result: "PASSED", type: "Rough-in",
+            performedDate: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 4)), scheduledDate: null,
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-OTHERPROJECT", amount: 13447.68 }]));
+        assert.equal(creditResult(body, "REF-OTHERPROJECT").status, "proposed");
     });
 });
 

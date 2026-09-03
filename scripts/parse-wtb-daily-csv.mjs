@@ -169,7 +169,7 @@ function sortLines(lines) {
         || String(a.checkNumber ?? "").localeCompare(String(b.checkNumber ?? "")));
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
     const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT, sweep: false, sweepDryRun: false };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
@@ -194,6 +194,13 @@ function parseArgs(argv) {
             args.account = value;
         }
         else if (!arg.startsWith("--") && !args.csvPath) args.csvPath = arg;
+        // Anything else is refused rather than ignored. A typo in an unattended
+        // cron used to be silent and catastrophic in the quiet direction:
+        // `--sweep-dryrun` (no second hyphen) parsed as "not --sweep-dry-run",
+        // was dropped on the floor, and the job POSTed a LIVE batch believing
+        // it was shadowing. Nothing is posted unless the flags are understood.
+        else if (arg.startsWith("--")) throw new Error(`unknown flag ${arg} — see the usage block at the top of this file`);
+        else throw new Error(`unexpected argument ${arg} (the CSV path is already ${args.csvPath})`);
     }
     return args;
 }

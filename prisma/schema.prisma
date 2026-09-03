@@ -763,6 +763,11 @@ model DepositIngest {
   // Deposit sweep (bank source). null source = the original photo path.
   source        String? // null | "bank"
   bankReference String? // the bank's per-deposit id, e.g. "26236015002406" (bank rows only)
+  // Normalised identity of the credit this row was created from
+  // (postDate|amountCents|baiCode|description|transactionDetail). A replay is
+  // only a replay if it is the SAME credit: the bank reusing a reference for
+  // different money must be a human's problem, not a silent overwrite.
+  bankFingerprint String?
   postDate      DateTime? @db.Date // bank: the CSV Post Date; photo: the extracted checkDate
   amountCents   Int? // the deposit amount, in cents, for both sources
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     buildDayStatements,
+    parseArgs,
     buildSweepPayload,
     canSweepDay,
     postSweep,
@@ -665,4 +666,37 @@ test("sweep: every credit a human must look at gets its own line, with the money
             "REF-X unknown amount: reconcile — ",
         );
     });
+});
+
+test("args: an unknown flag stops the run before anything is posted", async t => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => { fetches += 1; return new Response("{}"); }) as typeof fetch;
+    try {
+        await t.test("a typo'd flag is refused, not ignored", () => {
+            // The dangerous direction: `--sweep-dryrun` silently dropped meant
+            // the cron POSTed a LIVE batch believing it was shadowing.
+            assert.throws(() => parseArgs(["daily.csv", "--sweep-dryrun"]), /unknown flag --sweep-dryrun/);
+            assert.throws(() => parseArgs(["daily.csv", "--dryrun"]), /unknown flag --dryrun/);
+            assert.throws(() => parseArgs(["daily.csv", "--sweep", "--nope"]), /unknown flag --nope/);
+        });
+
+        await t.test("a stray positional argument is refused too", () => {
+            assert.throws(() => parseArgs(["daily.csv", "other.csv"]), /unexpected argument other\.csv/);
+        });
+
+        await t.test("the real flags still parse", () => {
+            const args = parseArgs(["daily.csv", "--sweep-dry-run", "--post", "https://probuild.example", "--account", "WTB-0723"]);
+            assert.equal(args.csvPath, "daily.csv");
+            assert.equal(args.sweep, true);
+            assert.equal(args.sweepDryRun, true);
+            assert.equal(args.post, "https://probuild.example");
+            assert.equal(parseArgs(["daily.csv", "--dry-run"]).dryRun, true);
+            assert.equal(parseArgs(["daily.csv", "--sweep"]).sweepDryRun, false);
+        });
+
+        assert.equal(fetches, 0, "argument parsing never touches the network");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
 });

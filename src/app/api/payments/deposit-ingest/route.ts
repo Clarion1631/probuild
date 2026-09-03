@@ -10,6 +10,7 @@ import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
 import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
+import { withTxRetry } from "@/lib/tx-retry";
 import { attributeDeposit, type MilestoneCandidate } from "@/lib/deposit-attribution";
 import {
     BANK_APPLY_MIN_AGE_DAYS,
@@ -29,7 +30,11 @@ import {
     crossSourceClaimNote,
     describeCandidates,
     findCollisions,
-    hasPayerCorroboration,
+    PROGRESS_CONFIDENCE,
+    PROGRESS_WINDOW_DAYS,
+    bankCreditFingerprint,
+    booksWithoutOverride,
+    cumulativeMilestoneShare,
     isCustomerDepositClass,
     isDeterministicQboGuardFailure,
     isNotCustomerDepositReason,
@@ -41,6 +46,7 @@ import {
     isoDaysAfter,
     isoDaysBefore,
     parseBankBatch,
+    progressCorroboration,
     qboGuardNote,
     reservationLostNote,
     selectPayerBearingImage,
@@ -800,7 +806,13 @@ interface BankCreditResult {
 
 const BANK_CANDIDATE_SELECT = {
     id: true, name: true, status: true, amount: true, invoiceId: true, qbInvoiceId: true,
-    invoice: { select: { code: true, project: { select: { name: true } }, client: { select: { name: true } } } },
+    invoice: {
+        select: {
+            code: true, totalAmount: true,
+            project: { select: { id: true, name: true } },
+            client: { select: { name: true } },
+        },
+    },
 } as const;
 
 type BankCandidate = {
@@ -810,7 +822,12 @@ type BankCandidate = {
     amount: unknown;
     invoiceId: string;
     qbInvoiceId: string | null;
-    invoice: { code: string; project: { name: string } | null; client: { name: string } | null };
+    invoice: {
+        code: string;
+        totalAmount: unknown;
+        project: { id: string; name: string } | null;
+        client: { name: string } | null;
+    };
 };
 
 const centsOf = (amount: unknown) => Math.round(toNum(amount) * 100);
@@ -904,20 +921,21 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
     // Persist every collision verdict BEFORE any matching runs, so the batch can
     // die at any point from here on without a colliding credit ever being
     // eligible to book money.
-    const inFlight = new Set<string>();
+    const pastBoundary = new Set<string>();
     for (const credit of credits) {
         const others = collisions.get(credit.bankReference);
         if (!others) continue;
         const verdict = await persistCollisionVerdict(credit, postDate, others);
-        if (verdict === "in-flight") inFlight.add(credit.bankReference);
+        if (verdict === "past-boundary") pastBoundary.add(credit.bankReference);
     }
-    // A credit whose twin is actively being worked right now still gets its own
-    // verdict, and its reason names the row that was left alone.
+    // A credit that collided with a row already past the money boundary is not
+    // just "needs a human" — there is a QuickBooks payment in play that nobody
+    // can cancel from here. Escalate it so the batch reports unresolved.
     for (const credit of credits) {
         const others = collisions.get(credit.bankReference);
-        if (!others || inFlight.has(credit.bankReference)) continue;
-        const busy = others.filter(ref => inFlight.has(ref));
-        if (busy.length > 0) await noteInFlightTwin(credit, postDate, others, busy);
+        if (!others || pastBoundary.has(credit.bankReference)) continue;
+        const committed = others.filter(ref => pastBoundary.has(ref));
+        if (committed.length > 0) await escalateAgainstCommittedTwin(credit, postDate, others, committed);
     }
 
     const results: BankCreditResult[] = [];
@@ -979,7 +997,7 @@ async function persistCollisionVerdict(
     credit: BankCredit,
     postDate: string,
     others: string[],
-): Promise<"recorded" | "in-flight"> {
+): Promise<"recorded" | "past-boundary"> {
     const payload = bankPayloadFor(credit, postDate);
     const reason = collisionNote(credit, postDate, others);
     const existing = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
@@ -1008,48 +1026,53 @@ async function persistCollisionVerdict(
 
     if (["applied", "unmatched", "reconcile"].includes(existing.status)) return "recorded";
 
-    // NEVER yank a row out from under a worker that is actively holding it. A
-    // fresh `processing` lease means another request is mid-flight on this exact
-    // credit — possibly between building a QuickBooks payment and sending it —
-    // and cancelling it here would race that money write rather than prevent it.
-    // Let it finish (its own boundary CAS below is what stops it if it must
-    // stop) and record the collision on the other credit instead.
-    const leaseIsFresh = existing.processingStartedAt != null
-        && existing.processingStartedAt.getTime() > Date.now() - STALE_PROCESSING_MS;
-    if (existing.status === "processing" && leaseIsFresh) return "in-flight";
-
+    // A row that has NOT reached the money yet is cancelled here, whatever its
+    // lease says. Leaving a fresh `processing` worker alone was the wrong call:
+    // it could still win its own processing→qbo_unknown CAS a moment later and
+    // create a payment for a credit this preflight had already ruled a
+    // collision — "both credits go to a human" has to mean both. The CAS below
+    // and the worker's boundary CAS are the same lock from opposite ends:
+    // whichever lands first, the other sees zero rows and stops.
+    //
+    // Only a row PAST the boundary is left alone, because cancelling it would
+    // strand a QuickBooks payment that already exists. That one needs a human,
+    // and so does the credit that collided with it.
     const boundaryMarked = !!(existing.qbPaymentId || existing.qbRequestPayload || existing.settleStartedAt);
-    const status = boundaryMarked ? "reconcile" : "unmatched";
+    const pastBoundary = boundaryMarked || ["qbo_unknown", "qbo_created"].includes(existing.status);
+    if (pastBoundary) return "past-boundary";
+
+    const status = "unmatched";
     const claimed = await prisma.depositIngest.updateMany({
         where: { id: existing.id, status: existing.status },
         data: {
-            status, lastError: reason.slice(0, 1000),
-            // Only an unmarked row releases its reservation — a boundary-marked
-            // one keeps it so the human can see which milestone is at stake.
-            ...(boundaryMarked ? {} : { paymentScheduleId: null }),
+            // Pre-boundary by construction (past-boundary rows returned above),
+            // so releasing the reservation here is safe and correct.
+            status, lastError: reason.slice(0, 1000), paymentScheduleId: null,
         },
     });
     if (claimed.count === 0) return "recorded"; // another worker moved it; its own path decides
     const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
     if (fresh && !fresh.officeTaskId) {
-        const taskId = await ensureReviewTask(fresh, reason, status === "reconcile" ? "reconcile" : "unmatched");
-        if (status !== "reconcile") await escalateUnseenBankReview(fresh, reason, taskId);
+        const taskId = await ensureReviewTask(fresh, reason, "unmatched");
+        await escalateUnseenBankReview(fresh, reason, taskId);
     }
     return "recorded";
 }
 
-/** Re-file a colliding credit's reason so it names the twin that was left
- *  running, rather than implying both were stopped. */
-async function noteInFlightTwin(
+/** A collision whose twin already reached QuickBooks: that twin cannot be
+ *  called back, so this credit is not merely unmatched — it is unresolved, and
+ *  the batch must say so. */
+async function escalateAgainstCommittedTwin(
     credit: BankCredit,
     postDate: string,
     others: string[],
-    busy: string[],
+    committed: string[],
 ): Promise<void> {
-    const reason = `${collisionNote(credit, postDate, others)}; ${busy.join(", ")} is being processed right now and was left to finish`;
+    const reason = `${collisionNote(credit, postDate, others)}; ${committed.join(", ")} has already reached QuickBooks and ` +
+        `cannot be called back, so a human must decide what this credit is`;
     await prisma.depositIngest.updateMany({
         where: { fileId: bankFileId(credit.bankReference), status: { in: ["unmatched", "reconcile"] } },
-        data: { lastError: reason.slice(0, 1000) },
+        data: { status: "reconcile", lastError: reason.slice(0, 1000) },
     });
 }
 
@@ -1112,13 +1135,31 @@ type BankClaim = { kind: "claimed"; row: DepositIngest } | { kind: "settled"; re
  * re-evaluates.
  */
 async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
+    const fingerprint = bankCreditFingerprint(payload);
     const columns = {
         source: BANK_DEPOSIT_SOURCE,
         bankReference: payload.bankReference,
         postDate: isoDateToUtc(payload.postDate),
         amountCents: payload.amountCents,
+        bankFingerprint: fingerprint,
     };
     let row = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
+
+    // A replay is only a replay if it is the SAME credit. `bank:<reference>` is
+    // the idempotency key, so a bank that reuses a reference for different
+    // money would otherwise have its new deposit silently swallowed as a
+    // duplicate of the old one.
+    if (row && row.bankFingerprint && row.bankFingerprint !== fingerprint) {
+        const reason = `bank reference reused with different data — this row was created from ` +
+            `[${row.bankFingerprint}] but the batch now posts [${fingerprint}]; a human must work out which deposit is which`;
+        await prisma.depositIngest.updateMany({
+            where: { id: row.id, status: { not: "reconcile" } },
+            data: { status: "reconcile", lastError: reason.slice(0, 1000) },
+        });
+        const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
+        const officeTaskId = fresh.officeTaskId ?? await ensureReviewTask(fresh, reason, "reconcile");
+        return { kind: "settled", response: NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId }) };
+    }
     if (!row) {
         try {
             return {
@@ -1351,14 +1392,22 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
             `photo path first) — would apply to ${describeCandidates([describeOne(picked)])}`);
     }
 
-    // Suggest-only unless a human has turned live apply on, OR this credit
-    // actually carries payer corroboration. An amount-only match is the weakest
-    // tier there is; whether it may move money by itself is a decision, not a
-    // default (see LIVE_APPLY_ENV_VAR).
-    if (!hasPayerCorroboration(attribution.confidence) && !liveApplyEnabled()) {
+    // THE CORROBORATION LADDER (deposit-sweep.ts). Payer evidence books on its
+    // own. Failing that, ask the FIELD whether this milestone's work is
+    // actually done — Justin's rule: the money should align with the daily logs
+    // from the chat spaces. Only a credit with neither needs the switch.
+    let confidence = attribution.confidence as string;
+    let corroborationDetail = "";
+    if (!booksWithoutOverride(confidence)) {
+        const progress = await checkProgressCorroboration(picked, payload.postDate);
+        corroborationDetail = progress.detail;
+        if (progress.corroborated) confidence = PROGRESS_CONFIDENCE;
+    }
+
+    if (!booksWithoutOverride(confidence) && !liveApplyEnabled()) {
         return await finalizeProposed(row, picked.id,
-            `suggest-only: this is an amount-only match (${attribution.confidence}) with no payer corroboration, and ` +
-            `${LIVE_APPLY_ENV_VAR} is not "true" — would apply to ${describeCandidates([describeOne(picked)])}`);
+            `amount matches ${picked.name} but ${corroborationDetail} confirms that phase is done; ` +
+            `set ${LIVE_APPLY_ENV_VAR}=true to book anyway — would apply to ${describeCandidates([describeOne(picked)])}`);
     }
 
     const reserved = await reserveMilestone(row, picked.id, { amountCents: payload.amountCents, postDate: payload.postDate });
@@ -1369,6 +1418,62 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         { id: picked.id, invoiceId: picked.invoiceId, qbInvoiceId: picked.qbInvoiceId, invoiceCode: picked.invoice.code },
         payload,
     );
+}
+
+/**
+ * Fetch what the FIELD knows about the candidate's project around the deposit,
+ * and let the pure rule decide (progressCorroboration). Four small reads, and
+ * only on the payer-less path — a credit with a named payer never gets here.
+ */
+async function checkProgressCorroboration(picked: BankCandidate, postDate: string) {
+    const projectId = picked.invoice.project?.id ?? null;
+    if (!projectId) {
+        return { corroborated: false, via: null, detail: "the milestone's invoice has no project, so no field evidence could be checked" };
+    }
+    const from = isoDateToUtc(isoDaysBefore(postDate, PROGRESS_WINDOW_DAYS));
+    const to = isoDateToUtc(isoDaysAfter(postDate, 1)); // exclusive upper bound on the post day
+
+    const [inspections, dailyLogs, project, siblings] = await Promise.all([
+        prisma.inspection.findMany({
+            where: { projectId, result: { in: ["PASSED", "APPROVED"] } },
+            select: { result: true, performedDate: true, scheduledDate: true },
+            orderBy: { performedDate: "desc" },
+            take: 50,
+        }),
+        prisma.dailyLog.findMany({
+            where: { projectId, date: { gte: from, lt: to } },
+            select: { date: true, workPerformed: true },
+            orderBy: { date: "desc" },
+            take: 100,
+        }),
+        prisma.project.findUnique({
+            where: { id: projectId },
+            select: { percentComplete: true, percentCompleteAsOf: true },
+        }),
+        prisma.paymentSchedule.findMany({
+            where: { invoiceId: picked.invoiceId },
+            select: { id: true, amount: true, dueDate: true, createdAt: true },
+        }),
+    ]);
+
+    return progressCorroboration({
+        postDate,
+        milestoneName: picked.name,
+        inspections: inspections.map(i => ({ result: i.result, date: isoOf(i.performedDate ?? i.scheduledDate) })),
+        dailyLogs: dailyLogs.map(l => ({ date: isoOf(l.date) ?? "", workPerformed: l.workPerformed ?? "" })),
+        percentComplete: project?.percentComplete == null ? null : toNum(project.percentComplete),
+        percentCompleteAsOf: isoOf(project?.percentCompleteAsOf ?? null),
+        requiredPercent: cumulativeMilestoneShare(
+            siblings.map(m => ({
+                id: m.id,
+                amount: toNum(m.amount),
+                dueDate: isoOf(m.dueDate),
+                createdAt: m.createdAt.toISOString(),
+            })),
+            picked.id,
+            toNum(picked.invoice.totalAmount),
+        ),
+    });
 }
 
 /** How many REQUESTED, still-pending milestones sit at exactly this amount.
@@ -1475,8 +1580,17 @@ async function reserveMilestone(
         ? [...MONEY_BOUNDARY_CLAIM_STATUSES]
         : [...CLAIMING_STATUSES];
     try {
-        await prisma.$transaction(async (tx) => {
+        await withTxRetry(() => prisma.$transaction(async (tx) => {
             if (claim.amountCents != null && claim.postDate) {
+                // The claim check is a READ followed by a WRITE, and under READ
+                // COMMITTED two transactions at the same amount can both read
+                // "nobody else is claiming this" and then both write. Serialize
+                // the domain first: an advisory lock keyed on the AMOUNT (the
+                // only thing the two sources share) is held to the end of this
+                // transaction, so the second entrant blocks here and then sees
+                // the first one's row. Cheap, deadlock-free (one lock, always
+                // taken first), and released by commit or rollback either way.
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`deposit-claim:${claim.amountCents}`}))`;
                 const other = await tx.depositIngest.findFirst({
                     where: {
                         id: { not: row.id },
@@ -1493,7 +1607,7 @@ async function reserveMilestone(
                 if (other) throw new CrossSourceClaimError(crossSourceClaimNote({ ...other, postDate: isoOf(other.postDate) }));
             }
             await tx.depositIngest.update({ where: { id: row.id }, data: { paymentScheduleId: scheduleId } });
-        });
+        }));
         return { ok: true };
     } catch (e: any) {
         if (e instanceof CrossSourceClaimError) return { ok: false, reason: e.message };
