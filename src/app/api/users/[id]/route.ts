@@ -4,6 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
+import { toSafeUser } from "@/lib/user-safe";
 
 // GET: get user details with permissions and project access
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -38,7 +39,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
             orderBy: { createdAt: "desc" },
         });
 
-        return NextResponse.json({ user, allProjects });
+        return NextResponse.json({ user: toSafeUser(user), allProjects });
     } catch (error: any) {
         console.error("GET /api/users/[id] error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
@@ -164,7 +165,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             },
         });
 
-        return NextResponse.json(user);
+        return NextResponse.json(user && toSafeUser(user));
     } catch (error: any) {
         console.error("PUT /api/users/[id] error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });

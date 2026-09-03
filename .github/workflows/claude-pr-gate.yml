@@ -50,21 +50,48 @@ jobs:
         id: review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Attacker-controlled text goes through env, never into the script body:
+          # a `${{ }}` expansion inside `run:` is spliced in before Bash parses it.
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          # Prior rounds: earlier gate verdicts AND the author's replies (fixes,
+          # disputes). Without this the reviewer is stateless — PR #453 (2026-09-03)
+          # went four rounds, each raising new items and one reversing its own
+          # earlier request, because every run re-read the diff from scratch.
+          gh pr view ${{ github.event.pull_request.number }} --json comments \
+            -q '.comments[] | "--- " + .author.login + " (" + .createdAt + ")\n" + .body + "\n"' \
+            > /tmp/prior.txt || true
           # effort high, not xhigh: xhigh blew the review budget on ~40KB diffs
           # (same finding as the fleet's review_chain.py, 2026-08-28)
           codex exec \
             --model gpt-5.6-sol \
             -c model_reasoning_effort="high" \
             --sandbox read-only \
-            "You are a harsh, skeptical code reviewer. Review the diff in /tmp/pr.diff
-             against the PR intent below. Look for bugs, security issues, missed edge
-             cases, and incomplete fixes. End your output with exactly one line:
-             VERDICT: APPROVE  or  VERDICT: REQUEST_CHANGES followed by a numbered
-             list of required changes.
+            "You are a rigorous but fair code reviewer acting as a merge gate. Review
+             the diff in /tmp/pr.diff against the PR intent below. Look for bugs,
+             security issues, missed edge cases, and incomplete fixes.
 
-             PR title: ${{ github.event.pull_request.title }}
+             /tmp/prior.txt holds the earlier rounds on this PR: your previous
+             verdicts and the author's replies. Rules for converging:
+             - An item the author marked fixed: verify it in the diff; do not restate it.
+             - An item the author disputed with a rationale: accept it unless the
+               rationale is factually wrong, and say why if you reject it.
+             - Do not raise a new item in a later round that the earlier rounds could
+               have raised on the same code, unless it is a P0/P1 defect.
+             - Do not reverse a position you took in an earlier round without
+               explicitly acknowledging it.
+             - Missing tests, style, and refactoring suggestions are advisory, never
+               grounds for REQUEST_CHANGES.
+             - APPROVE when no P0/P1 defect (data loss, wrong money, auth bypass,
+               security, broken core flow) remains. List advisory notes under a
+               heading 'Non-blocking'.
+
+             End your output with exactly one line:
+             VERDICT: APPROVE  or  VERDICT: REQUEST_CHANGES followed by a numbered
+             list of required changes, each tagged P0 or P1 with the failure scenario.
+
+             PR title: $PR_TITLE
              PR body: $(gh pr view ${{ github.event.pull_request.number }} --json body -q .body)" \
             | tee /tmp/review.txt
           VERDICT=$(grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' /tmp/review.txt | tail -1)
