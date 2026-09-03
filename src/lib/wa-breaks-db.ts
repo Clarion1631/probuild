@@ -14,6 +14,37 @@ function dayWindow(dayKey: string) {
 }
 
 /**
+ * Every CLOSED TimeEntry id in the day's settlement window — a plain,
+ * UNLOCKED read (same predicate settleDayInTx locks below, minus FOR UPDATE).
+ *
+ * Exported so a caller that is about to trigger settlement can fold this
+ * candidate set into the ONE row lock it takes for its whole write, before it
+ * locks anything. Locking only a caller-declared row first and letting
+ * settlement separately lock this wider window afterwards, later in the same
+ * transaction, is what let two adjacent-day settlements deadlock: each holds
+ * its own declared row, then each waits on a row inside this window that the
+ * other transaction already holds — an AB-BA cycle that no ORDER BY on either
+ * lock, taken on its own, can prevent. Folding the candidates into the
+ * caller's row lock up front makes it the transaction's first (and normally
+ * only) TimeEntry lock; settleDayInTx's own re-lock of the same window later
+ * is then a no-op re-acquire of rows this transaction already holds.
+ */
+export async function settlementCandidateIds(
+    tx: { $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown> },
+    userId: string,
+    dayKey: string
+): Promise<string[]> {
+    const window = dayWindow(dayKey);
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "id" FROM "TimeEntry" WHERE "userId" = $1 AND "endTime" IS NOT NULL AND "startTime" >= $2 AND "startTime" < $3`,
+        userId,
+        window.gte,
+        window.lt
+    )) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+}
+
+/**
  * The worker's OTHER closed entries on the given company-local day. A UTC
  * day either side is a superset of any local day; the toCompanyDayKey filter
  * is what makes it exact (same helper the rule and the clock-in binding use).

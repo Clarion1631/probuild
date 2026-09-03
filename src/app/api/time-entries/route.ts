@@ -9,7 +9,7 @@ import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedW
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
-import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
+import { flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx, settlementCandidateIds } from "@/lib/wa-breaks-db";
 import {
     assertEntriesUnlockedInTx,
     assertPeriodUnlocked,
@@ -819,7 +819,18 @@ const clockOutHandler = createClockOutHandler({
                 // them are collected up front — the day comes from what the
                 // caller expects, because the row cannot be read before its own
                 // lock is taken.
-                await assertEntriesUnlockedInTx(client, [guard.entryId], {
+                //
+                // When this close will also settle the day (guard.settle), the
+                // settlement's own 72-hour candidate window is folded into the
+                // SAME row lock rather than left for settleDayWithinTx to lock
+                // separately afterwards — see settlementCandidateIds. Locking
+                // just guard.entryId here and letting settlement lock the wider
+                // window later let two adjacent-day closes deadlock on each
+                // other's rows.
+                const settlementCandidates = guard.settle
+                    ? await settlementCandidateIds(client, userId, guard.expectedDayKey)
+                    : [];
+                await assertEntriesUnlockedInTx(client, [guard.entryId, ...settlementCandidates], {
                     dayKeys: [dayLockKey(userId, guard.expectedDayKey)],
                 });
 

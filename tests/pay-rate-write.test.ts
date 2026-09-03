@@ -94,8 +94,10 @@ test("pay type rides the same path, and only accepts the two real values", async
     const { writes, client } = fakeClient();
     assert.equal((await applyRateChange(ADMIN, "u1", { payType: "SALARY" }, client)).ok, true);
     assert.equal(writes[0].data.payType, "SALARY");
-    // A pay-type-only change is not a rate confirmation, so it does not stamp.
-    assert.equal(writes[0].data.lastRateSyncAt, undefined);
+    // A pay-type-only change ALSO stamps lastRateSyncAt: a stale Gusto approval
+    // (signed over the old rate + pay type + old stamp) must not be replayable
+    // by a write that only touches payType — see the round-31 gate finding.
+    assert.ok(writes[0].data.lastRateSyncAt instanceof Date, "a pay-type-only write must also advance the staleness stamp");
     assert.equal((await applyRateChange(ADMIN, "u1", { payType: "GUESS" }, client)).ok, false);
 });
 
@@ -158,6 +160,25 @@ test("the rate import locks every affected row, in a stable order", () => {
     assert.match(body, /\[\.\.\.clean\]\.sort\(\(a, b\) => a\.userId\.localeCompare\(b\.userId\)\)/);
     // Locks first, then the compare-and-set writes.
     assert.ok(body.indexOf("lockOwnerRowForUpdate") < body.indexOf("tx.user.updateMany"));
+});
+
+test("a pay-type-only write through the user PATCH route's shape advances lastRateSyncAt", async () => {
+    // Mirrors exactly the payload src/app/api/users/[id]/route.ts (and the
+    // manager employees / users POST routes) hand to applyRateChangeInTx: an
+    // edit that carries payType but leaves hourlyRate and burdenRate
+    // undefined. Before the round-31 fix, only hourlyRate/burdenRate changes
+    // stamped lastRateSyncAt, so a stale Gusto-import approval could be
+    // replayed later by a payType-only PATCH that never touched a rate.
+    const { writes, client } = fakeClient();
+    const result = await applyRateChange(
+        ADMIN,
+        "u1",
+        { hourlyRate: undefined, burdenRate: undefined, payType: "HOURLY" },
+        client
+    );
+    assert.deepEqual(result, { ok: true, changed: true });
+    assert.equal(writes[0].data.payType, "HOURLY");
+    assert.ok(writes[0].data.lastRateSyncAt instanceof Date);
 });
 
 // ── The opener vs the in-transaction worker (review round 19, item 1) ───────

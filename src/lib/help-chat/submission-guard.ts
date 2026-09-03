@@ -159,13 +159,6 @@ export function isThrottled(recentCount: number): boolean {
     return recentCount >= HELP_SUBMISSIONS_PER_HOUR;
 }
 
-/** The hour window a submission counts against. */
-export function hourBucket(now: Date = new Date()): Date {
-    const bucket = new Date(now);
-    bucket.setUTCMinutes(0, 0, 0);
-    return bucket;
-}
-
 /**
  * 200 when the report reached GitHub, 202 when it is only saved here.
  *
@@ -373,7 +366,6 @@ export async function reserveHelpRequest(input: {
  */
 client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prisma as never
 ): Promise<ReserveResult> {
-    const bucket = hourBucket();
     try {
         return await client.$transaction(async (tx) => {
             // ONE statement decides "new report" vs "replay". The old shape read
@@ -426,23 +418,30 @@ client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prism
             // takes the branch above and never reaches here, so replaying a
             // submission can never throttle the user out of their own report.
             //
-            // The decision is entirely in the UPDATE: five concurrent callers
-            // all read the same count under the old count-then-insert and all
-            // passed. Throwing rolls the INSERT above back with it.
-            await tx.$executeRaw`
-                INSERT INTO "HelpSubmissionQuota" ("id", "userId", "hourBucket", "count")
-                VALUES (gen_random_uuid()::text, ${input.userId}, ${bucket}, 0)
-                ON CONFLICT ("userId", "hourBucket") DO NOTHING
-            `;
-            const claimed = await tx.$queryRaw<Array<{ count: number }>>`
-                UPDATE "HelpSubmissionQuota"
-                SET "count" = "count" + 1
+            // ROLLING window, not a UTC clock-hour bucket: the bucket reset at
+            // the top of every hour, so 5 filed at 12:59:59 and 5 more at
+            // 13:00:00 both passed — 10 reports a few seconds apart, "5 an
+            // hour" in name only. throttleWindowStart()/isThrottled() are the
+            // real rule; this is the one place that counts against them.
+            //
+            // An advisory lock scoped to this user, held for the rest of the
+            // transaction, is what makes the count-then-decide below safe
+            // against two submissions racing in at once: without it, two
+            // concurrent transactions could each COUNT the same 4 prior rows,
+            // each conclude "room for one more", and both commit a 5th —
+            // exactly the double-tap the old UPDATE...WHERE count < N made
+            // impossible with a single atomic statement. Serializing here
+            // reproduces that guarantee for a plain COUNT.
+            const lockKey = `help-submission-quota:${input.userId}`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+            const windowStart = throttleWindowStart();
+            const counted = await tx.$queryRaw<Array<{ count: number }>>`
+                SELECT COUNT(*)::int AS count FROM "HelpRequest"
                 WHERE "userId" = ${input.userId}
-                  AND "hourBucket" = ${bucket}
-                  AND "count" < ${HELP_SUBMISSIONS_PER_HOUR}
-                RETURNING "count"
+                  AND "createdAt" >= ${windowStart}
+                  AND "id" != ${inserted[0].id}
             `;
-            if (claimed.length === 0) throw new HelpThrottledError();
+            if (isThrottled(counted[0]?.count ?? 0)) throw new HelpThrottledError();
 
             return { ok: true, id: inserted[0].id, existing: false, resume: false, providerState: null };
         });

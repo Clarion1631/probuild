@@ -7,7 +7,7 @@ import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
-import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx } from "@/lib/wa-breaks-db";
+import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay, settleDayWithinTx, settlementCandidateIds } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 import {
     assertEntriesUnlockedInTx,
@@ -412,13 +412,27 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         // Every lock this write needs, declared up front and taken in the
         // global order (payroll -> days -> rows). Both days: the edit can move
         // the punch, and settlement then re-plans the old day AND the new one.
+        //
+        // Both days' settlement candidates are folded into entryIds here too —
+        // this edit always re-plans BOTH days below (settleDayWithinTx), and
+        // locking only `id` up front, then letting settlement lock each day's
+        // wider 72-hour window afterward, is what let two adjacent-day edits
+        // deadlock on each other's rows (see settlementCandidateIds).
+        const oldDayKey = toCompanyDayKey(existing.startTime);
+        const newDayKey = toCompanyDayKey(newStart);
+        const settlementCandidates = new Set<string>();
+        for (const dayKey of new Set([oldDayKey, newDayKey])) {
+            for (const cid of await settlementCandidateIds(prisma, existing.userId, dayKey)) {
+                settlementCandidates.add(cid);
+            }
+        }
         updated = await withPayrollWriteTx(
             {
-                entryIds: [id],
+                entryIds: [id, ...settlementCandidates],
                 instants: [newStart],
                 dayKeys: [
-                    dayLockKey(existing.userId, toCompanyDayKey(existing.startTime)),
-                    dayLockKey(existing.userId, toCompanyDayKey(newStart)),
+                    dayLockKey(existing.userId, oldDayKey),
+                    dayLockKey(existing.userId, newDayKey),
                 ],
             },
             async (tx) => {
@@ -642,7 +656,22 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
                 // validates its STORED startTime — the values read above are
                 // stale the moment another writer moves the row.
                 guard: async (tx) => {
-                    await assertEntriesUnlockedInTx(tx, [id], { dayKeys });
+                    // Both days this delete can re-plan (deleteEntryAndSettle
+                    // settles knownDayKey AND actualDay below) — folded into
+                    // THIS row lock rather than left for settleDayInTx to lock
+                    // separately afterward, for the same reason as the PATCH
+                    // edit above: a narrow declared-row lock followed by a
+                    // wider day-window lock, later in the same transaction,
+                    // let two adjacent-day deletes deadlock on each other's
+                    // rows. See settlementCandidateIds.
+                    const settlementCandidates = new Set<string>();
+                    for (const cid of await settlementCandidateIds(tx, existing.userId, toCompanyDayKey(existing.startTime))) {
+                        settlementCandidates.add(cid);
+                    }
+                    for (const cid of await settlementCandidateIds(tx, fresh.userId, toCompanyDayKey(fresh.startTime))) {
+                        settlementCandidates.add(cid);
+                    }
+                    await assertEntriesUnlockedInTx(tx, [id, ...settlementCandidates], { dayKeys });
                     const [now] = (await tx.$queryRawUnsafe(
                         `SELECT "userId", "startTime" FROM "TimeEntry" WHERE "id" = $1`,
                         id

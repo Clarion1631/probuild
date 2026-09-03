@@ -15506,12 +15506,15 @@ export async function applyGustoRateImport(
                         status: { not: "DISABLED" },
                     },
                     data: {
-                        // A pay-type-only row leaves the rate — and its
-                        // "last confirmed" stamp — untouched.
-                        ...(row.newHourly != null
-                            ? { hourlyRate: new Prisma.Decimal(row.newHourly), lastRateSyncAt: syncedAt }
-                            : {}),
+                        ...(row.newHourly != null ? { hourlyRate: new Prisma.Decimal(row.newHourly) } : {}),
                         ...(row.payType ? { payType: row.payType } : {}),
+                        // Every clean row carries a rate change, a pay-type
+                        // change, or both (checked above) — the stamp moves
+                        // whenever either does. A pay-type-only row used to
+                        // leave the "last confirmed" stamp untouched, which let
+                        // a stale approval get replayed through a payType-only
+                        // write later.
+                        lastRateSyncAt: syncedAt,
                     },
                 });
                 if (result.count !== 1) {

@@ -32,3 +32,24 @@ export function authorizeBugWidgetUser(user: BugWidgetActor): BugWidgetAuthResul
     }
     return { ok: true };
 }
+
+/**
+ * Whether this caller may trigger the "agent-task" pipeline: GitHub Actions
+ * watches for that label and hands the issue to Phantom, which then acts on
+ * the repo unattended. Every ACTIVATED role above can FILE a bug report — that
+ * is the whole point of G5 — but filing one must not, by itself, let ordinary
+ * crew kick off an automated agent against the codebase. Only ADMIN/MANAGER
+ * can.
+ */
+export function canTriggerBugWidgetAgent(user: BugWidgetActor): boolean {
+    return !!user && (user.role === "ADMIN" || user.role === "MANAGER");
+}
+
+/**
+ * The labels /api/help-chat/bug-fix files the GitHub issue under. Everyone
+ * else's report still becomes a real issue — just routed to a human via
+ * needs-triage instead of straight to the agent.
+ */
+export function bugFixIssueLabels(user: BugWidgetActor): string[] {
+    return canTriggerBugWidgetAgent(user) ? ["bug-fix", "agent-task"] : ["bug-fix", "needs-triage"];
+}

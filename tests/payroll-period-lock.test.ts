@@ -437,14 +437,17 @@ test("PATCH and DELETE on /api/time-entries/[id] both still call the lock guard"
     assert.ok(splitAt > 0, "DELETE handler not found — this check needs updating");
     const patchHalf = source.slice(0, splitAt);
     const deleteHalf = source.slice(splitAt);
-    // PATCH: a cheap fail-fast check, then the real in-transaction guard.
+    // PATCH: a cheap fail-fast check, then the real in-transaction guard. Round
+    // 31 folded both days' settlement candidates into entryIds too — see the
+    // "folds BOTH days' settlement candidates" test.
     assert.match(patchHalf, /assertPeriodUnlocked\(\[existing\.startTime, newStart\]\)/);
-    assert.match(patchHalf, /withPayrollWriteTx\([\s\S]{0,200}entryIds: \[id\][\s\S]{0,300}dayKeys: \[/);
+    assert.match(patchHalf, /withPayrollWriteTx\([\s\S]{0,300}entryIds: \[id, \.\.\.settlementCandidates\][\s\S]{0,300}dayKeys: \[/);
     // The edit and the day re-plan it triggers commit together.
     assert.match(patchHalf, /settleDayWithinTx\(/);
     // DELETE: the guard runs inside deleteEntryAndSettle's own transaction, and
-    // locks the day before the row (the global order).
-    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id\], \{ dayKeys \}\)/);
+    // locks the day before the row (the global order). Round 31 folded both
+    // owner/day settlement candidates into the row lock too.
+    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id, \.\.\.settlementCandidates\], \{ dayKeys \}\)/);
     assert.match(deleteHalf, /dayLockKey\(/);
 });
 
@@ -678,7 +681,7 @@ test("DELETE guards on the entry ID, re-reading the stored time inside the trans
         "utf8"
     );
     const deleteHalf = source.slice(source.indexOf("export async function DELETE"));
-    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id\], \{/);
+    assert.match(deleteHalf, /assertEntriesUnlockedInTx\(tx, \[id, \.\.\.settlementCandidates\], \{/);
     assert.match(deleteHalf, /dayLockKey\(/, "the day must be locked before the row");
 });
 
@@ -1122,4 +1125,72 @@ test("the canonical manual create prices INSIDE its payroll transaction", () => 
     assert.match(coreBody, /appendZeroRateReview\(null\)/);
     // One transaction: the insert is in the same callback.
     assert.ok(coreBody.indexOf("timeEntry.create(") > txAt);
+});
+
+// ── Settlement's day-window superset joins the caller's row lock (round-31 gate, item 2) ──
+//
+// A close/edit/delete used to lock only its own declared row (or rows) via
+// assertEntriesUnlockedInTx, THEN trigger settlement later in the SAME
+// transaction, which separately locked the whole 72-hour day window. Two
+// transactions settling ADJACENT days do not share a day-advisory-lock key, so
+// nothing serialized the two row-lock steps against each other: each could
+// hold its own declared row and then block waiting on a row the other already
+// held inside its window — an AB-BA cycle. The fix folds settlement's window
+// into the SAME ordered row lock the caller takes, before anything else is
+// locked.
+
+test("settlementCandidateIds: a plain, unlocked read of closed entries in the window", async () => {
+    const { settlementCandidateIds } = await import("../src/lib/wa-breaks-db");
+    const calls: Array<{ query: string; values: unknown[] }> = [];
+    const tx = {
+        $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+            calls.push({ query, values });
+            return [{ id: "e2" }, { id: "e3" }];
+        },
+    };
+    const ids = await settlementCandidateIds(tx, "u1", "2026-08-20");
+    assert.deepEqual(ids, ["e2", "e3"]);
+    assert.equal(calls.length, 1);
+    // No FOR UPDATE: this is a plain read used to BUILD the id list a caller
+    // then folds into its own locked query — it must not itself take a lock.
+    assert.doesNotMatch(calls[0].query, /FOR UPDATE/);
+    assert.match(calls[0].query, /"endTime" IS NOT NULL/);
+    assert.equal(calls[0].values[0], "u1");
+});
+
+test("clock-out folds the day's settlement candidates into the SAME row lock, before locking anything", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "app", "api", "time-entries", "route.ts"), "utf8");
+    const fn = source.slice(source.indexOf("closeTimeEntry: async"));
+    const body = fn.slice(0, fn.indexOf(LF + "});"));
+    const candidatesAt = body.indexOf("settlementCandidateIds(client");
+    const lockAt = body.indexOf("assertEntriesUnlockedInTx(client, [guard.entryId, ...settlementCandidates]");
+    assert.ok(candidatesAt > -1, "the day's candidates must be fetched");
+    assert.ok(lockAt > -1, "and merged into the entryIds this transaction locks");
+    assert.ok(candidatesAt < lockAt, "the candidates must be known BEFORE the row lock is taken");
+    // settleDayWithinTx still runs afterward (its own re-lock of the same
+    // window is then just a redundant re-acquire) — this pins that it runs
+    // AFTER the merged lock, not that it was removed.
+    assert.ok(body.indexOf("settleDayWithinTx(") > lockAt);
+});
+
+test("the PATCH edit folds BOTH days' settlement candidates into entryIds before withPayrollWriteTx locks", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const fn = source.slice(source.indexOf("updated = await withPayrollWriteTx"));
+    const before = source.slice(0, source.indexOf("updated = await withPayrollWriteTx"));
+    assert.match(before, /settlementCandidateIds\(prisma, existing\.userId, dayKey\)/);
+    assert.match(fn.slice(0, 400), /entryIds: \[id, \.\.\.settlementCandidates\]/);
+});
+
+test("the DELETE guard folds both owner/day settlement candidates into entryIds before locking", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const guard = source.slice(source.indexOf("guard: async (tx) => {"));
+    const body = guard.slice(0, guard.indexOf("assertEntriesUnlockedInTx(tx, [id, ...settlementCandidates]"));
+    assert.match(body, /settlementCandidateIds\(tx, existing\.userId, toCompanyDayKey\(existing\.startTime\)\)/);
+    assert.match(body, /settlementCandidateIds\(tx, fresh\.userId, toCompanyDayKey\(fresh\.startTime\)\)/);
 });

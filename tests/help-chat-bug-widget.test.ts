@@ -19,7 +19,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { authorizeBugWidgetUser, BUG_WIDGET_ROLES } from "../src/lib/help-chat/bug-widget-auth";
+import {
+    authorizeBugWidgetUser,
+    bugFixIssueLabels,
+    BUG_WIDGET_ROLES,
+    canTriggerBugWidgetAgent,
+} from "../src/lib/help-chat/bug-widget-auth";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-help-chat-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -44,6 +49,46 @@ test("no authenticated user is 401; a disabled or pending account is 403", () =>
     // positive (=== ACTIVATED), so a future status value fails closed too.
     assert.equal(authorizeBugWidgetUser({ role: "ADMIN", status: "PENDING" }).ok, false);
     assert.equal(authorizeBugWidgetUser({ role: "CLIENT", status: "ACTIVATED" }).ok, false);
+});
+
+// ── Filing does not equal triggering an agent (round-31 gate, item 3) ───────
+//
+// Every ACTIVATED role may file a bug report (test above). But the report
+// used to always carry "agent-task" — the label GitHub Actions watches to
+// hand the issue to Phantom, which then acts on the repo unattended. Ordinary
+// crew could reach that by filing a bug report from the widget. Only
+// ADMIN/MANAGER may trigger it now; everyone else still gets a real issue,
+// routed to a human via needs-triage.
+
+test("only ADMIN/MANAGER can trigger the agent pipeline — every other filer role cannot", () => {
+    for (const role of BUG_WIDGET_ROLES) {
+        const expected = role === "ADMIN" || role === "MANAGER";
+        assert.equal(canTriggerBugWidgetAgent({ role, status: "ACTIVATED" }), expected, role);
+    }
+    assert.equal(canTriggerBugWidgetAgent(null), false);
+});
+
+test("a FIELD_CREW or EMPLOYEE bug report is filed WITHOUT the agent-task label", () => {
+    for (const role of ["FIELD_CREW", "EMPLOYEE", "FINANCE"] as const) {
+        const labels = bugFixIssueLabels({ role, status: "ACTIVATED" });
+        assert.ok(!labels.includes("agent-task"), `${role} must not reach agent-task`);
+        assert.deepEqual(labels, ["bug-fix", "needs-triage"], role);
+    }
+});
+
+test("ADMIN/MANAGER bug reports still get agent-task — the automation trigger is not removed entirely", () => {
+    for (const role of ["ADMIN", "MANAGER"] as const) {
+        assert.deepEqual(bugFixIssueLabels({ role, status: "ACTIVATED" }), ["bug-fix", "agent-task"], role);
+    }
+});
+
+test("the bug-fix route resolves its GitHub labels from bugFixIssueLabels(auth.user), not a hardcoded array", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /labels: bugFixIssueLabels\(auth\.user\)/);
+    assert.doesNotMatch(source, /labels: \["bug-fix", "agent-task"\]/, "must not hand every filer role automation");
 });
 
 test("both routes authenticate through authenticateMobileOrSession, not getServerSession", () => {

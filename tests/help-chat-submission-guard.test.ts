@@ -15,7 +15,6 @@ const LF = String.fromCharCode(10);
 import {
     checkHelpSubmission,
     helpChatResponse,
-    hourBucket,
     reserveHelpRequest,
     isMobileSubmission,
     HELP_DESCRIPTION_MAX,
@@ -188,7 +187,7 @@ test("submissionId is optional, bounded, and makes a retry idempotent", () => {
     // The idempotency lookup comes FIRST: a client retrying a request that
     // actually succeeded must not be charged another slot for it.
     assert.ok(
-        fn.indexOf("findUnique") < fn.indexOf("HelpSubmissionQuota"),
+        fn.indexOf("findUnique") < fn.indexOf("pg_advisory_xact_lock"),
         "the submissionId lookup must precede the counter"
     );
 });
@@ -214,21 +213,39 @@ test("the idempotency key is scoped PER USER, not globally", () => {
     assert.match(migration, /"HelpRequest_userId_submissionId_key" ON "HelpRequest"\("userId", "submissionId"\)/);
 });
 
-test("the throttle is a conditional UPDATE on a counter row, not a count-then-insert", () => {
+test("the throttle counts a ROLLING window, not a UTC clock-hour bucket, serialized by an advisory lock", () => {
+    // A fixed hourBucket() reset at the top of every hour: 5 filed at 12:59:59
+    // and 5 more at 13:00:00 both passed the old UPDATE...WHERE "hourBucket" =
+    // $bucket check — 10 reports seconds apart, "5 an hour" in name only. The
+    // fix counts against throttleWindowStart()/isThrottled() instead, which
+    // slide with `now` rather than resetting on the clock.
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
-    // Five concurrent requests all read the same count and all inserted. A
-    // conditional UPDATE lets the database decide, once.
-    assert.match(fn, /UPDATE "HelpSubmissionQuota"/);
-    assert.match(fn, /SET "count" = "count" \+ 1/);
-    assert.match(fn, /AND "count" < \$\{HELP_SUBMISSIONS_PER_HOUR\}/);
-    assert.match(fn, /RETURNING "count"/);
-    assert.match(fn, /ON CONFLICT \("userId", "hourBucket"\) DO NOTHING/, "insert-on-missing first");
+    assert.doesNotMatch(fn, /HelpSubmissionQuota/, "the bucket table must not be read or written any more");
+    assert.doesNotMatch(fn, /hourBucket\(/);
+    assert.match(fn, /throttleWindowStart\(\)/);
+    assert.match(fn, /isThrottled\(counted\[0\]\?\.count \?\? 0\)/);
+    assert.match(fn, /SELECT COUNT\(\*\)::int AS count FROM "HelpRequest"/);
+    assert.match(fn, /"createdAt" >= \$\{windowStart\}/);
+    // Excluded by id, not by re-deriving "prior to this insert" from time —
+    // the row this request just inserted must not double-count itself.
+    assert.match(fn, /"id" != \$\{inserted\[0\]\.id\}/);
+
+    // Serialized per user: a plain COUNT is not atomic on its own — two
+    // transactions could each count the same 4 prior rows and both commit a
+    // 5th. The advisory lock forces the second to wait for the first to
+    // commit (or roll back) before it can even read the count.
+    assert.match(fn, /pg_advisory_xact_lock\(hashtext\(\$\{lockKey\}\)\)/);
+    assert.match(fn, /const lockKey = `help-submission-quota:\$\{input\.userId\}`/);
+    const lockAt = fn.indexOf("pg_advisory_xact_lock");
+    const countAt = fn.indexOf("SELECT COUNT(*)");
+    assert.ok(lockAt > -1 && lockAt < countAt, "the lock must be taken BEFORE the count is read");
 });
 
-test("the hour bucket is the truncated hour", () => {
-    assert.equal(hourBucket(new Date("2026-09-02T14:37:12.500Z")).toISOString(), "2026-09-02T14:00:00.000Z");
-    assert.equal(hourBucket(new Date("2026-09-02T15:00:00.000Z")).toISOString(), "2026-09-02T15:00:00.000Z");
+test("hourBucket is gone — the bucket table is no longer read, written, or referenced", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    assert.doesNotMatch(source, /export function hourBucket/);
+    assert.doesNotMatch(source, /HelpSubmissionQuota/);
 });
 
 test("the slot and the row commit together, or neither does", () => {
@@ -244,7 +261,7 @@ test("the slot and the row commit together, or neither does", () => {
     // insert now comes FIRST so that a replay (which conflicts and returns no
     // row) never reaches the counter. Charging the quota first meant a client
     // retrying its own report could throttle itself out of it.
-    assert.ok(tx.indexOf('INSERT INTO "HelpRequest"') < tx.indexOf('UPDATE "HelpSubmissionQuota"'));
+    assert.ok(tx.indexOf('INSERT INTO "HelpRequest"') < tx.indexOf("pg_advisory_xact_lock"));
     // Throwing is what rolls the slot back when the limit is gone.
     assert.match(fn, /throw new HelpThrottledError\(\)/);
 });
@@ -262,7 +279,7 @@ test("a retry resumes a submission stranded mid-flight instead of returning earl
     // A resume must not consume a second slot — it was already paid for.
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
     assert.ok(
-        fn.indexOf("resume: stale") < fn.indexOf("HelpSubmissionQuota"),
+        fn.indexOf("resume: stale") < fn.indexOf("pg_advisory_xact_lock"),
         "the resume path returns before the counter is touched"
     );
 
@@ -406,10 +423,15 @@ test("the provider lease is a compare-and-set, taken before any GitHub call", ()
 /**
  * A fake client standing in for one Postgres connection. `insertWins` is what
  * that connection's `INSERT ... ON CONFLICT DO NOTHING` returns: a row when it
- * won the race, nothing when another connection got there first.
+ * won the race, nothing when another connection got there first. `priorCount`
+ * is what the rolling-window COUNT sees for OTHER rows already in the window
+ * (defaults to 0 — plenty of room) — a real COUNT(*) always returns exactly
+ * one row, never zero, so `quota: false` below maps to a count AT the limit
+ * rather than an empty result set.
  */
-function fakeClient(options: { insertWins: boolean; existing?: any; quota?: boolean }) {
+function fakeClient(options: { insertWins: boolean; existing?: any; quota?: boolean; priorCount?: number }) {
     const sql: string[] = [];
+    const priorCount = options.quota === false ? HELP_SUBMISSIONS_PER_HOUR : (options.priorCount ?? 0);
     const tx = {
         $queryRaw: (strings: TemplateStringsArray) => {
             const text = strings.join("?");
@@ -417,8 +439,8 @@ function fakeClient(options: { insertWins: boolean; existing?: any; quota?: bool
             if (text.includes('INSERT INTO "HelpRequest"')) {
                 return Promise.resolve(options.insertWins ? [{ id: "new-row" }] : []);
             }
-            if (text.includes('"HelpSubmissionQuota"')) {
-                return Promise.resolve(options.quota === false ? [] : [{ count: 1 }]);
+            if (text.includes("COUNT(*)::int AS count")) {
+                return Promise.resolve([{ count: priorCount }]);
             }
             return Promise.resolve([]);
         },
@@ -473,7 +495,7 @@ test("two concurrent requests with the same submissionId BOTH succeed on one row
 test("a replay does not spend a quota slot — only a genuinely new report does", async () => {
     const fresh = fakeClient({ insertWins: true });
     await reserveHelpRequest(SUBMISSION, fresh.client as never);
-    assert.ok(fresh.sql.some((s) => s.includes('"HelpSubmissionQuota"')), "a new report charges the quota");
+    assert.ok(fresh.sql.some((s) => s.includes("COUNT(*)::int AS count")), "a new report charges the quota");
 
     const replay = fakeClient({
         insertWins: false,
@@ -481,7 +503,7 @@ test("a replay does not spend a quota slot — only a genuinely new report does"
     });
     await reserveHelpRequest(SUBMISSION, replay.client as never);
     assert.ok(
-        !replay.sql.some((s) => s.includes('"HelpSubmissionQuota"')),
+        !replay.sql.some((s) => s.includes("COUNT(*)::int AS count")),
         "a retry must not be able to throttle the user out of their own report"
     );
 });
@@ -493,6 +515,40 @@ test("the quota rolls the new row back with it when the slot is gone", async () 
     assert.equal(result.ok === false && result.reason, "throttled");
     // Both statements ran in ONE $transaction callback, so the throw undoes the insert.
     assert.ok(throttled.sql.some((s) => s.includes('INSERT INTO "HelpRequest"')));
+});
+
+test("5 filed at 12:59:59 and a 6th at 13:00:00 — the 6th is rejected, the UTC hour boundary buys nothing", () => {
+    // The bug this fix closes: a UTC clock-hour bucket resets at the top of
+    // every hour regardless of how recently the last report landed. Five
+    // reports at 12:59:59 filled the 12:00 bucket; one second later, 13:00:00
+    // opened a fresh bucket at count 0 and let a 6th (and a 7th, an 8th...)
+    // straight through — ten reports a couple of seconds apart passed as "5 an
+    // hour". throttleWindowStart/isThrottled measure from `now`, not from the
+    // top of the hour, so they do not reset just because the clock ticked
+    // over.
+    const fiveAt125959 = new Date("2026-09-02T12:59:59.000Z");
+    const sixthAt130000 = new Date("2026-09-02T13:00:00.000Z");
+
+    // isThrottled is exactly what reserveHelpRequest calls with the count of
+    // OTHER reports already inside the rolling window — five prior reports,
+    // one second old, are still inside a window that opens 3,600,000ms ago.
+    assert.ok(
+        throttleWindowStart(sixthAt130000).getTime() < fiveAt125959.getTime(),
+        "the 12:59:59 reports are still inside the window one second later"
+    );
+    assert.equal(isThrottled(5), true, "5 prior reports still in the window reject the 6th");
+
+    // A bucket keyed on the truncated hour would have said otherwise: 12:59:59
+    // and 13:00:00 truncate to two DIFFERENT hours, so a bucket-based check
+    // would see 0 prior reports in the new bucket and let the 6th (wrongly)
+    // through. Pin that the fix no longer buckets by hour at all (see the
+    // "counts a ROLLING window" test above) rather than re-deriving a bucket
+    // here to prove it differs.
+    const truncatedOld = new Date(fiveAt125959);
+    truncatedOld.setUTCMinutes(0, 0, 0);
+    const truncatedNew = new Date(sixthAt130000);
+    truncatedNew.setUTCMinutes(0, 0, 0);
+    assert.notEqual(truncatedOld.getTime(), truncatedNew.getTime(), "the two instants really do cross an hour bucket");
 });
 
 test("a report that is saved but NOT filed answers 202, not 200", () => {

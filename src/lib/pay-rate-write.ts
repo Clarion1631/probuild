@@ -127,9 +127,11 @@ export async function applyRateChangeInTx(
         data.payType = payType;
     }
 
-    // "Last confirmed", stamped by EVERY path that writes a rate — the whole
-    // point of the staleness marker is that no rate write can skip it.
-    if (touchesRates) data.lastRateSyncAt = new Date();
+    // "Last confirmed", stamped by EVERY path that writes a rate OR pay type —
+    // a stale Gusto approval could otherwise be replayed by a pay-type-only
+    // write that never touches hourlyRate/burdenRate. The whole point of the
+    // staleness marker is that no payroll-affecting write can skip it.
+    if (touchesRates || touchesPayType) data.lastRateSyncAt = new Date();
 
     // EXCLUSIVE row lock, then the write, on the CALLER's transaction.
     // Settlement reads the same row FOR SHARE while it reprices a day, so this

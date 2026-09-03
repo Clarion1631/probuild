@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { prisma } from "@/lib/prisma";
 import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
-import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
+import { authorizeBugWidgetUser, bugFixIssueLabels } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   claimProviderLease,
@@ -156,7 +156,10 @@ export async function POST(req: NextRequest) {
         description: issueDetails,
         currentPage: currentPage || null,
         labelPrefix: "Bug Fix",
-        labels: ["bug-fix", "agent-task"],
+        // Phase 5 G5 opened the widget to every ACTIVATED role, but the
+        // agent-task label is what hands the issue to Phantom unattended —
+        // only ADMIN/MANAGER can trigger that (bug-widget-auth.ts).
+        labels: bugFixIssueLabels(auth.user),
         metadata: [
           steps ? `**Steps to Reproduce:**\n${steps}` : "",
           `**Conversation ID:** \`${conversationId}\``,
