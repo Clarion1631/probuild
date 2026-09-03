@@ -40,7 +40,7 @@ import {
     type QboCostCodeSuggestionClient,
     type QboExpensePersistenceClient,
 } from "../src/lib/qbo-expense-sync";
-import { createParsedReceiptExpense } from "../src/app/api/receipts/parse/route";
+import { createParsedReceiptExpense } from "../src/lib/receipt-parse-expense";
 import { runBackfill } from "../scripts/backfill-expense-attribution";
 
 const url =

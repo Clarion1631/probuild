@@ -419,7 +419,12 @@ test("the writers we know about are actually in the scanned set", () => {
     const expected = [
         "src/app/api/expenses/route.ts",
         "src/app/api/integrations/receipt-ingest/route.ts",
-        "src/app/api/receipts/parse/route.ts",
+        // Moved out of api/receipts/parse/route.ts in round 38 so a DB test
+        // could drive the write with two connections; importing the route
+        // itself pulls in mobile-auth, which refuses to load without
+        // NEXTAUTH_SECRET. This list following the move is the tripwire
+        // doing its job.
+        "src/lib/receipt-parse-expense.ts",
         "src/lib/time-expense-core.ts",
         "src/lib/receipt-intake/book.ts",
         "src/lib/qbo-expense-sync.ts",

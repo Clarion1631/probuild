@@ -1499,15 +1499,121 @@ test("a row with NO answer at all, installedAtCustomer included, is not flagged"
     assert.equal(updateArgs?.data.needsTaxReview, undefined, "nobody has said anything to invalidate");
 });
 
-test("a financialReports user whose edit leaves the tax plausible is NOT flagged", async () => {
-    // $16.55 on $200 is 8.3% — inside the band, base still under the ceiling,
-    // and the actor is entitled to certify tax figures. Flagging here would
-    // teach a bookkeeper that the flag means nothing.
+// ── a PERMISSION is not a REVIEW (Codex round 39, item 1) ──────────────────
+//
+// The rule these all share: EVERY gross change on a classified row flags it.
+// The only thing that prevents the flag is an explicit acknowledgement in the
+// same request naming the figures reviewed AND the total they were reviewed
+// against. Holding `financialReports` is necessary for that ack to count and
+// is never sufficient on its own.
+
+/** The ack that matches `classifiedRow()` reviewed against a new gross. */
+const ackFor = (amount: number) => ({
+    amount,
+    taxAmount: 16.55,
+    taxDeductibleBase: 50,
+    installedAtCustomer: null,
+});
+
+test("a financialReports user's gross change WITHOUT an ack is flagged", async () => {
+    // THE CASE FROM THE REVIEW. $16.55 on $200 is 8.3% — inside the band, base
+    // still under the ceiling, and the actor is entitled to certify tax
+    // figures. This used to pass unflagged, which reads as "a finance user's
+    // edit is self-certifying". Holding the role is evidence of neither having
+    // looked nor having been asked to, and the $16.55 now describes a purchase
+    // that no longer exists — certified by nobody, straight into the excise
+    // return. The DB rollout trigger flags every gross change on a classified
+    // row; the handler must not be the weaker of the two.
     classifiedRow();
     const res = await call({ amount: "200.00" });
+    assert.equal(res.status, 200, "changing a receipt's total is still ordinary work");
+    assert.equal(updateArgs?.data.amount, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, true, "but nobody has re-checked the tax");
+});
+
+test("...and WITH a matching acknowledgement it is not flagged", async () => {
+    // The control that keeps the rule from being "flag everything, always":
+    // a person who states the figures they reviewed and the total they
+    // reviewed them against has done the thing the flag asks for.
+    classifiedRow();
+    const res = await call({ amount: "200.00", taxReviewAck: ackFor(200) });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.amount, 200);
-    assert.equal(updateArgs?.data.needsTaxReview, undefined, "nothing to re-check");
+    assert.equal(updateArgs?.data.needsTaxReview, undefined, "the review already happened");
+});
+
+test("an ack naming a DIFFERENT total is refused, not silently downgraded", async () => {
+    // A stale form: they reviewed the figures against $250 and the request
+    // writes $200. Downgrading that to a flag would tell them their
+    // certification succeeded.
+    classifiedRow();
+    const res = await call({ amount: "200.00", taxReviewAck: ackFor(250) });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).code, "TAX_REVIEW_ACK_STALE");
+    assert.equal(updateArgs, null, "nothing was written");
+});
+
+test("an ack naming FIGURES the row no longer holds is refused", async () => {
+    // A concurrent PATCH moved the tax between the form load and the save, so
+    // the figures they looked at are not the ones this write leaves behind.
+    classifiedRow();
+    const res = await call({
+        amount: "200.00",
+        taxReviewAck: { ...ackFor(200), taxDeductibleBase: 25 },
+    });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).code, "TAX_REVIEW_ACK_STALE");
+    assert.equal(updateArgs, null);
+});
+
+test("an ack that omits installedAtCustomer's actual value is refused", async () => {
+    // It is a tri-state and part of the classification, so certifying the two
+    // money figures while being silent about it is a half-answer.
+    classifiedRow({ installedAtCustomer: true });
+    const res = await call({ amount: "200.00", taxReviewAck: ackFor(200) });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).code, "TAX_REVIEW_ACK_STALE");
+});
+
+test("an ack from an actor who may not certify tax does not count", async () => {
+    // Necessary, not sufficient — and not the other way round either. A crew
+    // member can send the object; it buys nothing.
+    currentUser = { id: "u-crew", role: "FIELD_CREW", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    classifiedRow();
+    const res = await call({ amount: "200.00", taxReviewAck: ackFor(200) });
+    assert.equal(res.status, 200, "they may still change the total");
+    assert.equal(updateArgs?.data.needsTaxReview, true, "they may not certify the tax");
+});
+
+test("an ack cannot certify a classification the band refuses", async () => {
+    // $16.55 on $100 is 16.6%, past the 12% band both writers of that column
+    // enforce. A figure no writer would have accepted is not made acceptable
+    // by somebody saying they looked at it.
+    classifiedRow();
+    const res = await call({ amount: "100.00", taxReviewAck: ackFor(100) });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, true);
+});
+
+test("a malformed ack is refused rather than ignored", async () => {
+    // Ignoring it would look exactly like a successful certification.
+    classifiedRow();
+    for (const ack of [true, null, [], { amount: 200 }, { ...ackFor(200), amount: "200" }]) {
+        updateArgs = null;
+        const res = await call({ amount: "200.00", taxReviewAck: ack });
+        assert.equal(res.status, 400, JSON.stringify(ack));
+        assert.equal((await res.json()).code, "TAX_REVIEW_ACK_MALFORMED");
+        assert.equal(updateArgs, null);
+    }
+});
+
+test("an ack on an edit that does not move the gross is inert", async () => {
+    // Nothing to certify, nothing to refuse: the ack is only consulted when a
+    // classification is actually being put at risk.
+    classifiedRow();
+    const res = await call({ amount: "207.74", taxReviewAck: ackFor(999) });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.needsTaxReview, undefined);
 });
 
 test("a timeClock user may change the gross, but may not keep a classification", async () => {

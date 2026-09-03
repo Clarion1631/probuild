@@ -175,6 +175,66 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             }
         }
 
+        // THE TAX-REVIEW ACKNOWLEDGEMENT, PARSED ONCE, ATOMICALLY
+        // (round 39, item 1).
+        //
+        // This route may not write the tax columns, so an ack here cannot be
+        // "the new figures" the way the PATCH's is. It is the opposite: a
+        // statement that the figures ALREADY ON THE ROW were looked at against
+        // the total this request is about to write. All four parts are
+        // required and are compared under the lock, so a stale form or a
+        // concurrent PATCH cannot be certified by accident — see the
+        // `ackMatches` note below.
+        //
+        // Absent is the normal case and means "not reviewed", which flags.
+        // Present-but-malformed is a client bug and is refused rather than
+        // quietly ignored, because ignoring it would look exactly like a
+        // successful certification to the caller.
+        const num = (value: unknown) =>
+            typeof value === "number" && Number.isFinite(value) ? value : null;
+        const numOrNull = (value: unknown) =>
+            value === null || (typeof value === "number" && Number.isFinite(value));
+        let reviewAck:
+            | {
+                amount: number;
+                taxAmount: number | null;
+                taxDeductibleBase: number | null;
+                installedAtCustomer: boolean | null;
+            }
+            | null = null;
+        if (Object.prototype.hasOwnProperty.call(body, "taxReviewAck")) {
+            const ack = body.taxReviewAck as Record<string, unknown> | null;
+            const shaped =
+                !!ack &&
+                typeof ack === "object" &&
+                !Array.isArray(ack) &&
+                num(ack.amount) !== null &&
+                numOrNull(ack.taxAmount) &&
+                numOrNull(ack.taxDeductibleBase) &&
+                (ack.installedAtCustomer === null || typeof ack.installedAtCustomer === "boolean");
+            if (!shaped) {
+                return NextResponse.json(
+                    {
+                        error: "taxReviewAck must be an object carrying amount, taxAmount, taxDeductibleBase and installedAtCustomer — the figures reviewed, and the total they were reviewed against.",
+                        code: "TAX_REVIEW_ACK_MALFORMED",
+                    },
+                    { status: 400 },
+                );
+            }
+            reviewAck = {
+                amount: num(ack!.amount)!,
+                taxAmount: ack!.taxAmount === null ? null : (ack!.taxAmount as number),
+                taxDeductibleBase:
+                    ack!.taxDeductibleBase === null ? null : (ack!.taxDeductibleBase as number),
+                installedAtCustomer: (ack!.installedAtCustomer as boolean | null) ?? null,
+            };
+        }
+        /** Two nullable money figures, compared in whole cents. */
+        const sameFigure = (a: number | null, b: number | null) =>
+            a === null || b === null
+                ? a === null && b === null
+                : Math.round(a * 100) === Math.round(b * 100);
+
         // Phase 3 (spec §3.7): an edit here is a HUMAN re-coding the expense,
         // so it takes the highest precedence and no automated pass may touch it
         // again. `costCodeSource` is never read off the body — a client cannot
@@ -466,22 +526,57 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             });
             const stillPlausible =
                 lockedTax === null || isPlausibleReceiptTax(lockedTax, finalAmount);
-            // ...AND THE ACTOR MATTERS AS MUCH AS THE ARITHMETIC.
+            // A PERMISSION IS NOT A REVIEW (round 39, item 1).
             //
-            // `timeClock` is all it takes to change a receipt's total;
-            // `financialReports` is what it takes to CERTIFY a tax
-            // classification, which is why the PATCH demands it for these very
-            // columns. A crew member who lowers the gross would otherwise leave
-            // a classification standing that they were never entitled to
-            // affirm — silently, and straight back into the excise report. So a
-            // gross change by anyone without that permission flags the row too,
-            // even when the resulting figures still sit inside the band. The
-            // flag costs a bookkeeper one glance; the alternative costs a
-            // filing.
-            const flagsReview =
-                classified &&
-                grossChanges &&
-                (!stillPlausible || !hasPermission(user, "financialReports"));
+            // This used to flag only when the resulting figures were
+            // implausible OR the actor lacked `financialReports`, which reads
+            // as "a finance user's edit is self-certifying". It is not.
+            // Changing a receipt's total is ordinary work that anyone with
+            // `timeClock` may do; deciding that the tax figures still describe
+            // the new total is a separate act, and holding a role is evidence
+            // of neither having done it nor having been asked to. A bookkeeper
+            // lowering a $412.10 receipt to $398 left $34.06 of tax and a $200
+            // deduction base standing, inside every band, certified by nobody —
+            // and straight into the excise return. The DB rollout trigger flags
+            // EVERY gross change on a classified row; the handler must not be
+            // the weaker of the two.
+            //
+            // So every gross change on a classified row flags it, and the ONLY
+            // thing that prevents the flag is an explicit acknowledgement in
+            // the same request naming the figures that were reviewed and the
+            // amount they were reviewed AGAINST. `financialReports` is
+            // necessary for that ack to count — certifying tax is what that
+            // permission is for — but it is never sufficient on its own.
+            //
+            // The ack does not CLEAR a flag that is already set: that is the
+            // PATCH's job (`taxReviewAck`, which requires the figures
+            // themselves), and this route may not write the tax columns at all.
+            // TWO QUESTIONS, ANSWERED SEPARATELY. "Does this ack describe the
+            // write that is landing?" is about the ROW, and the answer "no" is
+            // a 409: the person certified something else. "May this actor
+            // certify tax at all?" is about the ACTOR, and a crew member's
+            // perfectly accurate ack simply buys nothing — their edit is
+            // flagged like any other. Collapsing the two would answer 409 to
+            // somebody whose only problem is a permission.
+            const ackDescribesThisWrite =
+                reviewAck !== null &&
+                inCents(reviewAck.amount) === inCents(finalAmount) &&
+                sameFigure(reviewAck.taxAmount, lockedTax) &&
+                sameFigure(reviewAck.taxDeductibleBase, lockedBase) &&
+                (reviewAck.installedAtCustomer ?? null) === (current.installedAtCustomer ?? null);
+            const ackCounts = ackDescribesThisWrite && hasPermission(user, "financialReports");
+            // AN ACK THAT DESCRIBES A DIFFERENT ROW IS NOT AN ACK. The person
+            // certified figures, or a total, that this write is not producing —
+            // a stale form, or a concurrent PATCH that moved the tax underneath
+            // them. Answering 409 sends them back to re-read rather than
+            // silently downgrading their certification to a flag they never saw.
+            if (reviewAck !== null && classified && grossChanges && !ackDescribesThisWrite) {
+                return { expense: null, phaseRejected: null, denied: "ack" } as const;
+            }
+            // ...and an ack cannot certify an IMPOSSIBLE classification: a tax
+            // outside the 12% band is a figure no writer of that column would
+            // have accepted, whoever says otherwise.
+            const flagsReview = classified && grossChanges && !(ackCounts && stillPlausible);
 
             const written = await tx.expense.updateMany({
             where: {
@@ -553,6 +648,15 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         });
         if (legacyWrite.denied === "forbidden") {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (legacyWrite.denied === "ack") {
+            return NextResponse.json(
+                {
+                    error: "The tax figures you reviewed are not the ones on this expense any more, or the total you reviewed them against is not the one being saved. Reopen it, check the figures, and try again.",
+                    code: "TAX_REVIEW_ACK_STALE",
+                },
+                { status: 409 },
+            );
         }
         if (legacyWrite.denied === "item") {
             return NextResponse.json(
