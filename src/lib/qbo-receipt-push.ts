@@ -493,7 +493,18 @@ function attributionAgrees(lines: BookedExpenseLine[], expectedProjectName: stri
     return ids.size <= 1 && confirmedByName;
 }
 
-function normalizeVendorName(name: string): string {
+/**
+ * THE ONE VENDOR COMPARISON IN THE CODEBASE.
+ *
+ * Exported because `book.ts` needs the identical question — "are these two
+ * spellings the same vendor?" — when it reconciles a receipt against an
+ * Expense the QBO importer already wrote. It used to compare byte-for-byte
+ * there while this compared case- and whitespace-insensitively, so QBO's
+ * canonical "Home Depot" and a receipt's "  home   depot " were the SAME
+ * vendor to the identity check and a `expense-conflict:vendor` park to the
+ * reconcile. Two normalizers is how that happens; one cannot.
+ */
+export function normalizeVendorName(name: string): string {
     return name.trim().toLowerCase().replace(/\s+/g, " ");
 }
 

@@ -38,6 +38,8 @@ import {
     QboAccountConfigError,
     QboPurchaseFaultError,
     QboVendorDuplicateError,
+    // ONE vendor comparison for the whole pipeline — see normalizeVendorName.
+    normalizeVendorName,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
     type QboReceiptGroup,
@@ -632,17 +634,38 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // not have, under a `qbPurchaseId` that says the two are the same document.
     //
     // The split is deliberate (see ExistingPurchaseCheck in qbo-receipt-push):
-    // amount/date/vendor are DERIVED from QuickBooks, because real money posted
-    // against those values and the disagreement is OCR noise on our side;
-    // project and tax are ATTRIBUTION, so a mismatch parks with no Expense
-    // written at all. Nothing here rewrites QuickBooks either way — the
-    // Purchase is left exactly as it is.
+    // amount/date/vendor are OCR noise on our side and QuickBooks is the booked
+    // truth for them; project and tax are ATTRIBUTION, so a mismatch parks with
+    // no Expense written at all. Nothing here rewrites QuickBooks either way —
+    // the Purchase is left exactly as it is.
+    //
+    // TOLERANCE IS FOR IDENTITY, NOT FOR VALUES — and conflating the two is the
+    // bug this block used to have.
+    //
+    // `compareExistingPurchase` allows a Purchase to differ by up to two cents
+    // on the amount or the tax, and to spell the vendor with different case and
+    // spacing, and still call it the SAME purchase. That tolerance exists so a
+    // rounding split or a capitalisation difference does not send a perfectly
+    // ordinary receipt to a human. It says nothing about which numbers to
+    // STORE. Adopting only on `derive` meant a verdict of `match` wrote the OCR
+    // total into job cost while QuickBooks held a figure one cent away, logged
+    // the OCR tax to the audit register as "what posted", and — on the
+    // importer-won crash gap — met the importer's QBO-sourced row at the exact
+    // comparison in reconcileExistingExpense and parked a receipt that was
+    // never wrong about anything.
+    //
+    // So: once the Purchase is IDENTIFIED, every value persisted or reported
+    // comes from what QuickBooks actually posted. `match` and `derive` adopt
+    // identically; only `differences` (the beyond-tolerance fields) is a
+    // reporting distinction.
     let expenseTotalCents = row.totalCents;
     let expenseCalendarDay = calendarDay;
     let expenseVendor = row.vendor;
+    /** QBO's posted tax, in cents. Null until a Purchase is identified. */
+    let bookedTaxCents: number | null = null;
     let derivedNote = "";
     let derivedFields: string[] | undefined;
-    if (result.alreadyExists && result.existing.verdict !== "match") {
+    if (result.alreadyExists) {
         const existing = result.existing;
         if (existing.verdict === "review") {
             // The key is RETAINED unconditionally: a Purchase provably exists.
@@ -652,21 +675,24 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 releaseStrongKey: false,
             };
         }
-        // `derive`: every field it names was readable, so each fallback below
-        // is unreachable — they are there so a future field cannot silently
-        // turn a "derive" into a null write.
+        // Both surviving verdicts mean "this is the same purchase". A null here
+        // is unreachable for `derive` (a field it names was readable by
+        // definition) and possible for `match` only if QBO omitted the ref's
+        // display name — in which case the OCR value is all there is.
         const booked = existing.booked;
-        expenseTotalCents = booked.totalAmount === null
-            ? expenseTotalCents
-            : Math.round(booked.totalAmount * 100);
-        expenseCalendarDay = booked.txnDate ?? expenseCalendarDay;
-        expenseVendor = booked.vendor ?? expenseVendor;
-        derivedFields = existing.differences;
-        derivedNote = ` · ${existing.differences.join(", ")} taken from the existing QuickBooks Purchase`;
-        console.warn(
-            "[receipt-intake] expense derived from the existing QBO Purchase",
-            JSON.stringify({ rowId: row.id, qbPurchaseId: result.qbPurchaseId, differences: existing.differences }),
-        );
+        if (booked.totalAmount !== null) expenseTotalCents = Math.round(booked.totalAmount * 100);
+        if (booked.txnDate !== null) expenseCalendarDay = booked.txnDate;
+        if (booked.vendor !== null) expenseVendor = booked.vendor;
+        // Never null: a tax reading QBO did not give would have been `review`.
+        bookedTaxCents = Math.round(booked.taxAmount * 100);
+        if (existing.differences.length > 0) {
+            derivedFields = existing.differences;
+            derivedNote = ` · ${existing.differences.join(", ")} taken from the existing QuickBooks Purchase`;
+            console.warn(
+                "[receipt-intake] expense derived from the existing QBO Purchase",
+                JSON.stringify({ rowId: row.id, qbPurchaseId: result.qbPurchaseId, differences: existing.differences }),
+            );
+        }
     }
 
     // 5. One transaction: the Expense and the row's BOOKED state land together
@@ -674,7 +700,12 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     //    lost-response retry, and QBO's idempotency has already guaranteed
     //    there is exactly one Purchase.
     const amountCents = expenseAmountCents(groups, expenseTotalCents);
-    const taxApplied = appliedTaxCents(groups);
+    // WHAT POSTED, and for an already-existing Purchase that is QBO's figure,
+    // not the one this pass built from the OCR read. `appliedTaxCents` reads
+    // back the groups WE were about to send; on the alreadyExists path those
+    // groups were never sent, so reporting them as "what posted" put a number
+    // in the sales-tax filing register that no Purchase ever carried.
+    const taxApplied = bookedTaxCents ?? appliedTaxCents(groups);
     // RE-VALIDATE THE PHASE AGAINST THE FINAL PROJECT.
     //
     // Both the captured code and the model's suggestion were resolved while the
@@ -727,6 +758,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             ? `Check #${(row.refNumber ?? "").replace(/^Check/, "") || "?"}${row.memo ? ` — "${row.memo}"` : ""}`
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
+        // The attribution the Expense ACTUALLY ends up carrying. Decided inside
+        // the transaction (only the reconcile knows whether the row already had
+        // a phase) and carried out here, because the audit event has to report
+        // what was persisted rather than what this pass proposed.
+        let effective: EffectiveAttribution = costCodeId
+            ? { costCodeId, costCodeSource: "receipt", preserved: false }
+            : { costCodeId: null, costCodeSource: "none", preserved: false };
         const expenseId = await deps.db.$transaction(async tx => {
             // THE SAME LOCK THE QBO IMPORTER TAKES, before this Purchase id is
             // read at all.
@@ -766,6 +804,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 if (verdict.conflicts.length > 0) {
                     throw new ExpenseConflictError(verdict.conflicts);
                 }
+                effective = verdict.attribution;
                 // Fill what the importer could not know. `costCodeId` and
                 // `receiptUrl` are not in QboExpenseWrite at all, so a
                 // non-null value on an imported row can only have been put
@@ -874,14 +913,24 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 intakeId: row.id,
                 expenseId,
                 sourceRef: row.sourceRef,
-                costCodeId,
+                // THE PERSISTED value, not the one this pass picked. When a
+                // human's phase was already on the row it stands, and an audit
+                // row naming the worker's choice would assert a cost code that
+                // was never applied to anything.
+                costCodeId: effective.costCodeId,
+                costCodeSource: effective.costCodeSource,
+                // Explicit, so "the worker's pick lost" is greppable rather
+                // than something a reader has to infer from two ids.
+                phasePreserved: effective.preserved || undefined,
                 // Which fields (if any) this Expense took from the books rather
                 // than from the read. Absent on the normal path.
                 qboDerivedFields: derivedFields,
                 // Carried through so the Command Center can show HOW confident
                 // the phase pick was, and so a low-confidence run is auditable
-                // after the fact rather than only at review time.
-                suggestedConfidence: costCodeId && costCodeId === row.suggestedCostCodeId
+                // after the fact rather than only at review time. Against the
+                // EFFECTIVE code: a confidence score attached to a suggestion
+                // that was not the one persisted describes nothing.
+                suggestedConfidence: effective.costCodeId && effective.costCodeId === row.suggestedCostCodeId
                     ? row.suggestedConfidence
                     : undefined,
                 phaseRejected: phaseCheck.rejected || undefined,
@@ -1003,10 +1052,34 @@ export interface ReceiptExpenseValues {
     receiptUrl: string;
 }
 
+/**
+ * What the Expense will ACTUALLY carry once this reconcile is applied.
+ *
+ * Returned rather than re-derived at the audit site, because the caller cannot
+ * work it out: the reconcile is the only thing that knows whether the row
+ * already had a phase. The booking event used to log the value the WORKER
+ * picked whatever happened, so a receipt whose phase was preserved from a
+ * human's earlier choice produced an audit row asserting a cost code that was
+ * never applied to anything.
+ */
+export interface EffectiveAttribution {
+    costCodeId: string | null;
+    /** Where the persisted value came from. */
+    costCodeSource: "receipt" | "existing" | "none";
+    /** True when a value already on the row displaced the one this pass chose. */
+    preserved: boolean;
+}
+
+export interface ExpenseReconcile {
+    conflicts: string[];
+    fill: Record<string, unknown>;
+    attribution: EffectiveAttribution;
+}
+
 export function reconcileExistingExpense(
     existing: ExistingExpense,
     receipt: ReceiptExpenseValues,
-): { conflicts: string[]; fill: Record<string, unknown> } {
+): ExpenseReconcile {
     const conflicts: string[] = [];
     const fill: Record<string, unknown> = {};
 
@@ -1014,8 +1087,20 @@ export function reconcileExistingExpense(
     if (Math.round(Number(existing.amount) * 100) !== receipt.amountCents) conflicts.push("amount");
 
     // Nullable, so an absence is missing attribution rather than a contradiction.
+    //
+    // THE SAME NORMALIZER the identity check uses. Comparing byte-for-byte here
+    // while `compareExistingPurchase` compared case- and whitespace-insensitively
+    // meant QBO's canonical "Home Depot" and the receipt's "  home   depot "
+    // were one vendor to the check that decided these are the same purchase and
+    // two vendors to the check that decided whether to link them — so the
+    // importer-won crash gap parked a receipt nothing was wrong with. (The
+    // receipt's own vendor is now QBO's display name on that path anyway; this
+    // is what keeps the two answers consistent for every other path, and for a
+    // legacy row the importer never touched.)
     if (!existing.vendor) fill.vendor = receipt.vendor;
-    else if (existing.vendor !== receipt.vendor) conflicts.push("vendor");
+    else if (normalizeVendorName(existing.vendor) !== normalizeVendorName(receipt.vendor)) {
+        conflicts.push("vendor");
+    }
 
     if (!existing.date) fill.date = receipt.date;
     else if (!sameCalendarDay(existing.date, receipt)) conflicts.push("date");
@@ -1026,7 +1111,25 @@ export function reconcileExistingExpense(
     if (!existing.costCodeId && receipt.costCodeId) fill.costCodeId = receipt.costCodeId;
     if (!existing.receiptUrl) fill.receiptUrl = receipt.receiptUrl;
 
-    return { conflicts, fill };
+    return { conflicts, fill, attribution: effectiveAttribution(existing, receipt) };
+}
+
+function effectiveAttribution(
+    existing: ExistingExpense,
+    receipt: ReceiptExpenseValues,
+): EffectiveAttribution {
+    if (existing.costCodeId) {
+        return {
+            costCodeId: existing.costCodeId,
+            costCodeSource: "existing",
+            // Only a CONTEST counts as preserved: a receipt with no phase to
+            // offer, or one offering the same phase, displaced nothing.
+            preserved: !!receipt.costCodeId && receipt.costCodeId !== existing.costCodeId,
+        };
+    }
+    return receipt.costCodeId
+        ? { costCodeId: receipt.costCodeId, costCodeSource: "receipt", preserved: false }
+        : { costCodeId: null, costCodeSource: "none", preserved: false };
 }
 
 /**
