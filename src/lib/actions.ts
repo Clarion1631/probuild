@@ -11992,7 +11992,7 @@ export async function updateSelectionItemNote(
                 where: { id },
                 select: { id: true, projectId: true, deletedAt: true },
             }),
-        assertAccess: (projectId) => assertDecisionActorAccess(projectId),
+        assertAccess: assertDecisionActorAccess,
         updateNote: async (id, normalizedNote) => {
             // CAS on deletedAt: the findItem check above is non-atomic with
             // this write, so a concurrent soft-delete must make the update
@@ -12017,7 +12017,7 @@ export async function updateSelectionItemNote(
 export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
     return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
         findItem: findThreadItem,
-        assertAccess: (projectId) => assertDecisionActorAccess(projectId),
+        assertAccess: assertDecisionActorAccess,
         markRead: async (proposalId, seenIds, isStaff) => {
             // Mirrors the decision-soft-delete guard in createComment
             // (selection-item-thread-dependencies.ts): findThreadItem's
@@ -12186,12 +12186,10 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
 // selection-item-thread-core.ts/selection-item-note-persistence-core.ts use.
 
 export async function applySuggestedDecision(itemId: string, decisionId: string): Promise<{ applied: boolean }> {
-    await assertActiveStaff();
     return aiSortApplySuggestedDecision(itemId, decisionId);
 }
 
 export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
-    await assertActiveStaff();
     return aiSortDismissSelectionSuggestion(itemId);
 }
 
@@ -12199,7 +12197,6 @@ export async function createDecisionForSuggestion(
     projectId: string,
     name: string,
 ): Promise<{ decisionId: string; existed: boolean }> {
-    await assertActiveStaff();
     return aiSortCreateDecisionForSuggestion(projectId, name);
 }
 

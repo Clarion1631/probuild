@@ -43,6 +43,23 @@ const ACTION_MODULES = [
 const GATE = /^(assert|require|ensure)[A-Z]|^currentStaffUser|^getServerSession|^getSessionOrDev|^resolveSessionClientId|^getSubPortalSession|^getPortalSession|^canAccess|^hasPermission|^isCronAuthorized/;
 
 /**
+ * Wrappers that authorize by DELEGATION: a one-line pass-through to a core
+ * whose own default gate runs before it touches anything.
+ *
+ * These are not exceptions — each entry names the module and the gate, and the
+ * test below READS that core and fails if the gate is not there. Without
+ * this the checker sees a body calling only `aiSortApplySuggestedDecision(...)`
+ * and calls it ungated, which is exactly the false positive that got a
+ * redundant `assertActiveStaff()` bolted onto three correct functions and
+ * broke the contract scripts/verify-selection-ai-sort.ts pins on them.
+ */
+const DELEGATES: Record<string, { module: string; gate: string }> = {
+    "actions.ts:applySuggestedDecision": { module: "src/lib/selection-ai-sort-apply-core.ts", gate: "assertAiSortStaffAccess" },
+    "actions.ts:dismissSelectionSuggestion": { module: "src/lib/selection-ai-sort-apply-core.ts", gate: "assertAiSortStaffAccess" },
+    "actions.ts:createDecisionForSuggestion": { module: "src/lib/selection-ai-sort-apply-core.ts", gate: "assertAiSortStaffAccess" },
+};
+
+/**
  * Exports that legitimately authorize NOTHING, each with the reason.
  *
  * Every entry is a READ whose result is already public, or is scoped by the
@@ -72,9 +89,27 @@ function exportedFunctions(file: string): Array<{ name: string; gated: boolean }
             && node.name
             && node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
         ) {
-            const body = node.body ? node.body.getText(sf) : "";
-            const calls = [...body.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map((m) => m[1]);
-            out.push({ name: node.name.getText(sf), gated: calls.some((c) => GATE.test(c)) });
+            // IDENTIFIER NODES from the AST — not a regex over the body text.
+            //
+            // Identifiers rather than call expressions, because a gate is just as
+            // real when it is HANDED to a core as a callback (`assertAccess:
+            // assertDecisionActorAccess`) as when it is called directly. Insisting
+            // on the call shape made this checker demand that correct code be
+            // rewritten as `(x) => assertDecisionActorAccess(x)` purely to be
+            // recognised — a checker that changes the code it checks is worse than
+            // no checker.
+            //
+            // From the AST rather than the text, because widening to identifiers
+            // would otherwise let a COMMENT or a STRING mentioning a gate count as
+            // one. `getText()` includes both; the AST contains neither.
+            let gated = false;
+            const scanIdentifiers = (n: ts.Node) => {
+                if (gated) return;
+                if (ts.isIdentifier(n) && GATE.test(n.text)) { gated = true; return; }
+                ts.forEachChild(n, scanIdentifiers);
+            };
+            if (node.body) scanIdentifiers(node.body);
+            out.push({ name: node.name.getText(sf), gated });
         }
         ts.forEachChild(node, visit);
     };
@@ -92,6 +127,7 @@ test("round 49: every exported Server Action authorizes itself, or is an allowli
             if (fn.gated) continue;
             const key = `${short}:${fn.name}`;
             if (ALLOWED[key]) continue;
+            if (DELEGATES[key]) continue;
             ungated.push(key);
         }
     }
@@ -167,4 +203,24 @@ test("round 49: the gate helper is not itself a dispatchable action", () => {
         "permissions.ts must not be a server-action module",
     );
     assert.match(permissions, /export async function assertActiveStaff\(\)/);
+});
+
+test("round 49: every delegating wrapper really does delegate to a gated core", () => {
+    // The DELEGATES map is only safe if the cores it names actually gate. This
+    // reads each one and checks, so an entry cannot become a silent exception
+    // if that core is refactored.
+    for (const [key, { module, gate }] of Object.entries(DELEGATES)) {
+        const core = readFileSync(module, "utf8");
+        assert.ok(
+            core.includes(gate),
+            `${key} delegates to ${module}, which no longer mentions ${gate}`,
+        );
+        // ...and the gate is the DEFAULT, not something a caller may replace
+        // with a no-op: the wrapper passes no deps at all.
+        assert.match(
+            core,
+            new RegExp(`assertAccess\\s*=\\s*deps\\.assertAccess\\s*\\?\\?\\s*${gate}`),
+            `${module}: ${gate} must be the default gate, not merely present`,
+        );
+    }
 });
