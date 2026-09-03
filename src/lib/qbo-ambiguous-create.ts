@@ -22,7 +22,7 @@
  * wrapper, so a test of the refusal exercises the real decision.
  */
 import { prisma } from "./prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow, clientCustomerStillMatches } from "./tx-retry";
 import { logAutomationEvent } from "./automation-events";
 import { canResolveAmbiguousCreate, canAccessProject, type ProjectScopedUser } from "./access-rules";
 import {
@@ -129,15 +129,24 @@ export interface ResolveAmbiguousCreateInput {
 /**
  * The transaction client the guarded write runs on.
  *
- * `$queryRaw` is here because `lockMoneyParents` uses it to take the
- * Estimate → Invoice row locks; `invoice.findUnique` because the parent state
- * this resolver's decision depends on (the client's QuickBooks customer, the
- * invoice's tax rate) has to be RE-READ inside those locks.
+ * `$queryRaw` is here because `lockMoneyParents` / `lockClientRow` use it to
+ * take the Estimate → Invoice → Client row locks; `invoice.findUnique` and
+ * `client.findUnique` because the parent state this resolver's decision depends
+ * on (the client's QuickBooks customer, the invoice's tax rate) has to be
+ * RE-READ inside those locks.
+ *
+ * `client` is a delegate of its own rather than an `Invoice.client` relation
+ * select on purpose: reading the customer THROUGH the invoice is exactly the
+ * bug this shape now prevents — a relation read takes no lock on the Client
+ * row, so the mapping could be re-pointed between that read and the child
+ * write. The Client id comes off the locked Invoice, the Client row is locked,
+ * and only then is `qbCustomerId` read.
  */
 export interface AmbiguousCreateTx {
     paymentSchedule: { updateMany(args: any): Promise<{ count: number }> };
     progressBilling: { updateMany(args: any): Promise<{ count: number }> };
     invoice: { findUnique(args: any): Promise<any> };
+    client: { findUnique(args: any): Promise<any> };
     $queryRaw(...args: any[]): Promise<unknown>;
 }
 
@@ -644,12 +653,24 @@ export async function resolveAmbiguousInvoiceCreateCore(
  * This closes that window the same way every other money path does:
  *
  *   1. `withTxRetry` + `$transaction`, so a deadlock re-runs cleanly.
- *   2. `lockMoneyParents` in the canonical Estimate → Invoice order, so this
- *      cannot deadlock against a settle or a reprice running concurrently.
+ *   2. `lockMoneyParents` in the canonical Estimate → Invoice → Client order,
+ *      so this cannot deadlock against a settle or a reprice running
+ *      concurrently. The Client id is not known until the Invoice has been
+ *      read, so the Client lock is taken as a third step once it is — still in
+ *      the canonical direction.
  *   3. RE-READ the parent state under those locks and recompute the issuance
  *      hash from it. Any divergence from what the marker was written against
  *      aborts with `mismatch` and writes nothing.
- *   4. Only then the child CAS.
+ *   4. Re-assert the customer mapping as a compare-and-set immediately before
+ *      the child write, so a writer that ignored the lock order is caught by a
+ *      value comparison instead of being trusted.
+ *   5. Only then the child CAS.
+ *
+ * Locking the Invoice does NOT lock its Client: Postgres takes no transitive
+ * row locks through a foreign key, so reading `Invoice.client.qbCustomerId`
+ * left `resolveCustomerAndItem` free to re-point the client between step 3 and
+ * step 5 — the recovery then linked (or released) a row against a customer it
+ * no longer bills. Steps 2–4 are what close that window.
  *
  * Both rails go through here — the milestone rail and the progress-billing
  * rail — and so do both outcomes, the link and the clear.
@@ -666,7 +687,7 @@ async function writeUnderParentLocks(
         message: "This changed while it was being resolved. Refresh and look again.",
     };
     return withTxRetry(() => db.$transaction(async (tx) => {
-        // Canonical order: Estimate → Invoice → child rows.
+        // Canonical order: Estimate → Invoice → Client → child rows.
         // `tx` is the narrow seam shape above; lockMoneyParents only uses its
         // `$queryRaw`, which that shape declares.
         await lockMoneyParents(tx as any, { estimateId: parked.estimateId, invoiceId: parked.invoiceId });
@@ -679,13 +700,33 @@ async function writeUnderParentLocks(
         }
         const parent = await tx.invoice.findUnique({
             where: { id: parked.invoiceId },
-            select: { taxRate: true, client: { select: { qbCustomerId: true } } },
+            // `clientId` — the scalar, not the `client` relation. The customer
+            // id is read from the CLIENT ROW, after that row has been locked;
+            // pulling it through this relation is the read that took no lock.
+            select: { taxRate: true, clientId: true },
         });
         if (!parent) {
             return { ok: false as const, refused: mismatchRefusal(parked, "its invoice is missing") };
         }
+        // Non-null in the schema, so this is the "somebody made it nullable"
+        // guard: an unlockable client is an unverifiable customer.
+        if (!parent.clientId) {
+            return { ok: false as const, refused: mismatchRefusal(parked, "its client is missing") };
+        }
+        // Third canonical lock. FOR SHARE: this transaction only READS the
+        // mapping, and a concurrent remap takes FOR UPDATE, so the two
+        // serialize — the remap either waits for this resolve to commit, or
+        // commits first and is seen by the read below.
+        await lockClientRow(tx as any, parent.clientId, "share");
+        const client = await tx.client.findUnique({
+            where: { id: parent.clientId },
+            select: { qbCustomerId: true },
+        });
+        if (!client) {
+            return { ok: false as const, refused: mismatchRefusal(parked, "its client is missing") };
+        }
         const parentState: ParentIssuanceState = {
-            customerId: parent.client?.qbCustomerId ?? null,
+            customerId: client.qbCustomerId ?? null,
             invoiceTaxRate: parent.taxRate,
         };
         // The customer the row bills RIGHT NOW, under the lock, must still be
@@ -707,6 +748,18 @@ async function writeUnderParentLocks(
             return {
                 ok: false as const,
                 refused: mismatchRefusal(parked, "the money it was issued for has changed on its parent invoice (its tax rate or billing customer)"),
+            };
+        }
+
+        // Belt and braces, immediately before the child write: the customer
+        // mapping is re-asserted as a compare-and-set against the value this
+        // transaction just read. The FOR SHARE lock already makes it stable
+        // against every writer that takes the canonical lock; this catches one
+        // that does not, by comparing the value rather than trusting the lock.
+        if (!(await clientCustomerStillMatches(tx as any, parent.clientId, parentState.customerId))) {
+            return {
+                ok: false as const,
+                refused: mismatchRefusal(parked, "its QuickBooks customer was re-pointed while this was being resolved"),
             };
         }
 

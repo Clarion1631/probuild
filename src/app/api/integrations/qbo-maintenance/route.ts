@@ -281,15 +281,40 @@ export async function POST(req: Request) {
         if (payLinks.reason) abortedReason = payLinks.reason;
     }
 
+    // Pay-link rows this run never reached, and rows that still carry the
+    // pending marker now that it has finished. Either one means a client is
+    // holding a bill with no way to pay it, which is precisely the state this
+    // sweep exists to remove — so neither may sit inside an ok:true response.
+    // A run that never got to call the sweep (the options loop hit the wall
+    // first) reports nothing here: `abortedReason` is already saying so.
+    const payLinkUnvisited = payLinks?.unvisited.total ?? 0;
+    const payLinkUnresolved = payLinks?.unresolved.total ?? 0;
+
     // Work left undone, by any route: the options loop stopped early, the
-    // pay-link sweep hit its per-rail cap, or rows were skipped inside it.
-    const truncated = abortedReason !== null || !!payLinks?.truncated || (payLinks?.skipped ?? 0) > 0;
+    // pay-link sweep hit its per-rail cap, rows were skipped inside it, or it
+    // never reached rows that were eligible when it started.
+    const truncated = abortedReason !== null || !!payLinks?.truncated
+        || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0;
 
     // `ok` reflects the RUN, not the fact that the handler returned. A run that
     // stopped early, left rows unvisited, or failed on a row has work
     // outstanding and must not read as a clean pass — that reading is what let
     // a 200-row cap look like a complete sweep for as long as it did.
-    const ok = !truncated && failedRows === 0 && missingInQbo === 0;
+    const ok = !truncated && failedRows === 0 && missingInQbo === 0 && payLinkUnresolved === 0;
+
+    // One ordered list rather than the chain of mutually-exclusive conditional
+    // spreads this used to be: each new reason made every existing condition
+    // depend on all the others, and the two pay-link reasons would have needed
+    // a four-term guard apiece. Same precedence as before, plus the new two.
+    const reason =
+        abortedReason
+        ?? (failedRows > 0 ? "row-errors" : null)
+        // A missing invoice is reported under its own reason so the health
+        // digest can tell it apart from a row that merely errored.
+        ?? (missingInQbo > 0 ? "qbo-invoice-missing" : null)
+        ?? (payLinkUnvisited > 0 ? "pay-link-unvisited" : null)
+        ?? (payLinkUnresolved > 0 ? "pay-link-unresolved" : null);
+
     return NextResponse.json({
         ok,
         checked: results.length,
@@ -303,12 +328,8 @@ export async function POST(req: Request) {
             }
             : {}),
         ...(truncated ? { truncated: true, retry: true } : {}),
-        ...(abortedReason ? { reason: abortedReason, remaining } : {}),
-        ...(!abortedReason && failedRows > 0 ? { reason: "row-errors" } : {}),
-        // A missing invoice is reported under its own reason so the health
-        // digest can tell it apart from a row that merely errored. Only when
-        // nothing louder already claimed `reason`.
-        ...(!abortedReason && failedRows === 0 && missingInQbo > 0 ? { reason: "qbo-invoice-missing" } : {}),
+        ...(reason ? { reason } : {}),
+        ...(abortedReason ? { remaining } : {}),
         ...(payLinks ? { payLinks } : {}),
         results,
     });

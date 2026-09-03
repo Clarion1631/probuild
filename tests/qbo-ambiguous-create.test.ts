@@ -144,16 +144,36 @@ function billingRow(overrides: Record<string, any> = {}): any {
  * these tests skip that path entirely and prove nothing about what production
  * runs.
  *
- * `onLocked` runs at the moment the locks are held and the parent has not yet
- * been re-read — the interleaving seam the round-36 tests use to move the
- * client mapping or the invoice tax rate underneath a resolve that already
- * decided.
+ * The fake ENFORCES the lock discipline rather than merely allowing it:
+ *  - the parent invoice cannot be read before the Estimate and Invoice locks,
+ *  - `Client.qbCustomerId` cannot be read before the CLIENT row lock, and
+ *  - the `seams` fire AT the moment each lock is granted and BEFORE the row
+ *    behind it is read, so a test's concurrent edit lands in the only window
+ *    that is actually reachable: after the pre-flight read that made the
+ *    decision, before the guarded re-read that has to catch it.
+ *
+ * That last point is the round-37 correction. `onLocked` used to run before
+ * `fn(tx)` was even called, which meant a test could "prove" the guard by
+ * mutating the fixture before anything had read it — it would have passed
+ * against a resolver that took no locks at all and read the customer through
+ * `Invoice.client`. Firing at the lock, with the client read refused until the
+ * lock is held, is what makes these tests discriminate.
  */
 function makeDb(
     milestone: any | null,
     billing: any | null,
-    parentInvoice: any = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } },
-    onLocked?: () => void,
+    parentInvoice: any = { estimateId: "est-1", taxRate: 8.9, clientId: "cli-1" },
+    seams: {
+        onInvoiceLocked?: () => void;
+        onClientLocked?: () => void;
+        /**
+         * Fires AFTER the customer mapping has been read under the lock — a
+         * writer that ignored the lock order entirely. Only the compare-and-set
+         * before the child write can catch this one.
+         */
+        onClientRead?: () => void;
+    } = {},
+    clientRow: any = { qbCustomerId: CUSTOMER_ID },
 ) {
     const delegate = (row: any) => ({
         async findUnique() {
@@ -170,18 +190,52 @@ function makeDb(
     const paymentSchedule = delegate(milestone);
     const progressBilling = delegate(billing);
     const locks: string[] = [];
+    const held = { estimate: false, invoice: false, client: false };
     const tx = {
         paymentSchedule,
         progressBilling,
         invoice: {
             async findUnique() {
+                if (!held.estimate || !held.invoice) {
+                    throw new Error("parent invoice read before the Estimate -> Invoice locks were taken");
+                }
                 return parentInvoice ? { ...parentInvoice } : null;
             },
         },
-        // lockMoneyParents issues one tagged-template SELECT ... FOR UPDATE per
-        // parent; recording them lets a test assert the canonical order.
+        client: {
+            async findUnique() {
+                // The assertion this fake exists for: locking the Invoice does
+                // NOT lock its Client, so reading the customer mapping without
+                // the Client row lock is the bug, not a shortcut.
+                if (!held.client) throw new Error("Client.qbCustomerId read before the Client row was locked");
+                const seen = clientRow ? { ...clientRow } : null;
+                seams.onClientRead?.();
+                return seen;
+            },
+        },
+        // lockMoneyParents / lockClientRow issue one tagged-template
+        // SELECT ... FOR UPDATE|SHARE per parent; recording them lets a test
+        // assert the canonical order.
         async $queryRaw(strings: TemplateStringsArray, ...values: any[]) {
-            locks.push(`${strings.join("?")}|${values.join(",")}`);
+            const sql = strings.join("?");
+            locks.push(`${sql}|${values.join(",")}`);
+            // The belt-and-braces compare-and-set: one statement that both
+            // locks and pins the value, so the fake has to honour the pin.
+            if (/"Client"/.test(sql) && /qbCustomerId/.test(sql)) {
+                const expected = values[1] ?? null;
+                return clientRow && (clientRow.qbCustomerId ?? null) === expected ? [{ id: "cli-1" }] : [];
+            }
+            if (/"Estimate"/.test(sql)) held.estimate = true;
+            if (/"Invoice"/.test(sql) && !held.invoice) {
+                held.invoice = true;
+                // An invoice edit that committed before this lock was granted.
+                seams.onInvoiceLocked?.();
+            }
+            if (/"Client"/.test(sql) && !held.client) {
+                held.client = true;
+                // A customer remap that committed before this lock was granted.
+                seams.onClientLocked?.();
+            }
             return [];
         },
     };
@@ -190,11 +244,21 @@ function makeDb(
         progressBilling,
         locks,
         parent: parentInvoice,
+        client: clientRow,
         async $transaction<T>(fn: (t: any) => Promise<T>): Promise<T> {
-            onLocked?.();
             return fn(tx);
         },
     };
+}
+
+/** The parent invoice as the resolver reads it under the locks. */
+function parentFixture(overrides: Record<string, unknown> = {}) {
+    return { estimateId: "est-1", taxRate: 8.9, clientId: "cli-1", ...overrides };
+}
+
+/** The Client row the resolver reads AFTER locking it. */
+function clientFixture(qbCustomerId: string | null = CUSTOMER_ID) {
+    return { qbCustomerId };
 }
 
 const events: any[] = [];
@@ -972,11 +1036,18 @@ test("round 36 gate: customer AND tax matching links, under the canonical money 
 
     assert.equal(res.ok, true);
     assert.equal(row.qbInvoiceId, "qb-9");
-    // Estimate before Invoice — the one global order every money-path
-    // transaction takes, so this resolve cannot deadlock against a settle.
-    assert.equal(db.locks.length, 2);
-    assert.match(db.locks[0], /"Estimate".*est-1/);
-    assert.match(db.locks[1], /"Invoice".*inv-1/);
+    // Estimate -> Invoice -> Client — the one global order every money-path
+    // transaction takes, so this resolve cannot deadlock against a settle or
+    // against the customer remap in resolveCustomerAndItem.
+    assert.equal(db.locks.length, 4);
+    assert.match(db.locks[0], /"Estimate"[\s\S]*FOR UPDATE[\s\S]*est-1/);
+    assert.match(db.locks[1], /"Invoice"[\s\S]*FOR UPDATE[\s\S]*inv-1/);
+    // FOR SHARE: this transaction only reads the mapping. The remap takes
+    // FOR UPDATE, and the two conflict, which is the whole serialization.
+    assert.match(db.locks[2], /"Client"[\s\S]*FOR SHARE[\s\S]*cli-1/);
+    // ...and the value is re-pinned in a compare-and-set immediately before the
+    // child write, so a writer that skipped the lock is caught by comparison.
+    assert.match(db.locks[3], /"Client"[\s\S]*qbCustomerId[\s\S]*IS NOT DISTINCT FROM/);
 });
 
 // ─── Round 36 gate: PARENT-row state is re-read under the locks ────────────
@@ -989,10 +1060,10 @@ test("round 36 gate: customer AND tax matching links, under the canonical money 
 
 test("round 36 gate: a client re-pointed at another QuickBooks customer DURING the resolve is refused", async () => {
     const row = milestoneRow();
-    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
-    // Fires once the locks are held, before the parent is re-read: exactly the
-    // window between the decision and the write.
-    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const client = clientFixture();
+    // Fires at the moment the CLIENT row lock is granted, before the mapping
+    // has been read: exactly the window between the decision and the write.
+    const db = makeDb(row, null, parentFixture(), { onClientLocked: () => { client.qbCustomerId = "99"; } }, client);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: ambiguousCreateFingerprint(row) },
         deps([invoice("qb-9", MILESTONE_NOTE)], db),
@@ -1001,6 +1072,26 @@ test("round 36 gate: a client re-pointed at another QuickBooks customer DURING t
     assert.equal(res.ok, false);
     assert.equal(!res.ok && res.refusal, "mismatch");
     assert.equal(row.qbInvoiceId, null, "nothing written — the row now bills a different customer");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
+});
+
+test("round 37 gate: a remap that IGNORES the lock is still caught, by the value pin on the write", async () => {
+    // Belt and braces. The FOR SHARE lock makes the mapping stable against
+    // every writer that takes the canonical lock; this one does not take it at
+    // all, and commits after the under-lock read. The compare-and-set on the
+    // Client row, immediately before the child write, is the only thing left
+    // between that and a link committed against a customer we no longer bill.
+    const row = milestoneRow();
+    const client = clientFixture();
+    const db = makeDb(row, null, parentFixture(), { onClientRead: () => { client.qbCustomerId = "99"; } }, client);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
     assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked");
 });
 
@@ -1021,8 +1112,8 @@ test("round 36 gate: an invoice tax-rate edit DURING the resolve is refused", as
         taxAmount: null,
         qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, identity, AMBIGUOUS_MARKER_AT),
     });
-    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
-    const db = makeDb(row, null, parent, () => { parent.taxRate = 10; });
+    const parent = parentFixture();
+    const db = makeDb(row, null, parent, { onInvoiceLocked: () => { parent.taxRate = 10; } });
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, expectedState: ambiguousCreateFingerprint(row) },
         deps([invoice("qb-9", MILESTONE_NOTE, 1089, { totalTax: derivedTax!.taxAmount })], db),
@@ -1038,8 +1129,8 @@ test("round 36 gate: the CLEAR is guarded the same way — a customer remap mid-
     // answer was reached against one customer mapping; if that moved while we
     // looked, the answer is meaningless and the marker must stay.
     const row = milestoneRow();
-    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
-    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const client = clientFixture();
+    const db = makeDb(row, null, parentFixture(), { onClientLocked: () => { client.qbCustomerId = "99"; } }, client);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         deps([], db),
@@ -1066,8 +1157,8 @@ test("round 36 gate: a parked row whose parent invoice has vanished is refused, 
 
 test("round 36 gate: the progress-billing rail is guarded too", async () => {
     const row = billingRow();
-    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
-    const db = makeDb(null, row, parent, () => { parent.client.qbCustomerId = "99"; });
+    const client = clientFixture();
+    const db = makeDb(null, row, parentFixture(), { onClientLocked: () => { client.qbCustomerId = "99"; } }, client);
     const res = await resolveAmbiguousInvoiceCreateCore(
         {
             kind: "progressBilling",
@@ -1096,8 +1187,8 @@ test("round 36 gate: the under-lock CUSTOMER check stands alone when the marker 
     // between a mid-resolve client remap and a released row.
     const { issuanceHash: _dropped, ...noHash } = MILESTONE_IDENTITY;
     const row = milestoneRow({ qbSyncError: composeCreateMarker(AMBIGUOUS_CREATE_MARKER, noHash, AMBIGUOUS_MARKER_AT) });
-    const parent = { estimateId: "est-1", taxRate: 8.9, client: { qbCustomerId: CUSTOMER_ID } };
-    const db = makeDb(row, null, parent, () => { parent.client.qbCustomerId = "99"; });
+    const client = clientFixture();
+    const db = makeDb(row, null, parentFixture(), { onClientLocked: () => { client.qbCustomerId = "99"; } }, client);
     const res = await resolveAmbiguousInvoiceCreateCore(
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         deps([], db),

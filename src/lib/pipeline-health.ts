@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { PAYLINK_PENDING_MARKER } from "@/lib/qbo-create-markers";
 
 /**
  * One summary of the receipt/QBO pipeline's health, shared by the on-demand
@@ -106,6 +107,18 @@ export interface PipelineHealth {
      * or a refresh that stranded). Optional so an older snapshot still fits.
      */
     qboAuth?: CountProbe;
+    /**
+     * Rows on either money rail that are LINKED to a QuickBooks invoice but
+     * still carry the `paylink-pending` marker — a bill the client has no way
+     * to pay yet.
+     *
+     * The pay-link sweep is supposed to clear these, and it reports its own
+     * `unresolved` count; but a maintenance run that never happened reports
+     * nothing at all, and that silence used to read as health. This is the
+     * standing measurement, taken here, that does not depend on any sweep
+     * having run.
+     */
+    payLinksPending: CountProbe;
 }
 
 /**
@@ -273,6 +286,12 @@ export function evaluatePipelineHealth(input: {
     stuck: CountProbe;
     /** Optional so existing snapshots stay valid; absent means "not measured". */
     qboAuth?: CountProbe;
+    /**
+     * REQUIRED, for the same reason `purchaseSyncRun` is: an optional count is
+     * one a caller can forget to take, and "absent" would then read as "no
+     * unpaid-link rows" — the false green this probe exists to remove.
+     */
+    payLinksPending: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -285,6 +304,7 @@ export function evaluatePipelineHealth(input: {
         ["receipts24h", input.receipts24h],
         ["bank", input.bank],
         ["stuck", input.stuck],
+        ["payLinksPending", input.payLinksPending],
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -305,6 +325,14 @@ export function evaluatePipelineHealth(input: {
         // Nothing will book until a human reconnects QuickBooks, so say that
         // rather than folding it into a generic error count.
         reasons.push("quickbooks-reconnect-needed");
+    }
+
+    if (input.payLinksPending.status === "ok" && input.payLinksPending.count > 0) {
+        // Linked in QuickBooks, no pay link written. The invoice exists and the
+        // client cannot pay it, and the maintenance sweep reporting ok:true
+        // while one of these sat in front of its cursor is exactly why this is
+        // measured here rather than taken on that sweep's word.
+        reasons.push(`pay-links-pending:${input.payLinksPending.count}`);
     }
 
     if (input.stuck.status === "ok" && input.stuck.count > 0) {
@@ -421,7 +449,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
     /** Any probe failure is reported as such — never silently downgraded to "nothing found". */
     const probe = runProbe;
 
-    const [intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth] = await Promise.all([
+    const [intuit, lastPurchase, purchaseSyncRun, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck, qboAuth, payLinksPending] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
         // QBO purchase sync land" timestamp this is asking for.
@@ -562,6 +590,21 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             }),
             0,
         ),
+        // Both money rails, one number: a milestone and a progress billing in
+        // this state are the same problem for the client, and splitting them
+        // here would only invite a caller to check one.
+        probe<number>(
+            "payLinksPending",
+            async () => {
+                const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
+                const [milestones, billings] = await Promise.all([
+                    prisma.paymentSchedule.count({ where }),
+                    prisma.progressBilling.count({ where }),
+                ]);
+                return milestones + billings;
+            },
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -599,6 +642,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         },
         stuck: { status: stuck.status, reason: stuck.reason, count: stuck.value },
         qboAuth: { status: qboAuth.status, reason: qboAuth.reason, count: qboAuth.value },
+        payLinksPending: { status: payLinksPending.status, reason: payLinksPending.reason, count: payLinksPending.value },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -617,6 +661,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         bank: snapshot.bank,
         stuck: snapshot.stuck,
         qboAuth: snapshot.qboAuth,
+        payLinksPending: snapshot.payLinksPending,
     };
 }
 
@@ -678,6 +723,9 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Automation errors (24h, all kinds): ${health.stuck.status === "error" ? "unavailable (probe failed)" : health.stuck.count}`,
     ];
+    if (health.payLinksPending?.status === "ok" && health.payLinksPending.count > 0) {
+        lines.push(`${health.payLinksPending.count} QuickBooks invoice(s) are linked but still have no pay link — run QBO maintenance (sync-payment-options).`);
+    }
     if (health.qboAuth && health.qboAuth.status === "ok" && health.qboAuth.count > 0) {
         lines.push(`QuickBooks could not be used with the stored credential ${health.qboAuth.count} time(s) in 24h — reconnect it in Settings → Integrations.`);
     }

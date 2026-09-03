@@ -8,7 +8,18 @@ import { Prisma } from "@prisma/client";
  * `PaymentSchedule.sourceScheduleId`). To stay deadlock-free those transactions
  * must acquire their row locks in ONE global order. The canonical order is:
  *
- *     Estimate  →  Invoice  →  child schedule rows
+ *     Estimate  →  Invoice  →  Client  →  child schedule rows
+ *
+ * `Client` joined that order when the ambiguous-create recovery was found
+ * reading `Client.qbCustomerId` through the Invoice relation: locking the
+ * Invoice does NOT lock the Client transitively, so a concurrent
+ * `resolveCustomerAndItem` could re-point the client at another QuickBooks
+ * customer between the recovery's read and its write, and the write committed
+ * anyway. It sits AFTER Invoice because the only way to learn which client a
+ * money row bills is to read the Invoice — so the Invoice lock is already held
+ * by the time the Client id is known. Every path that reads or writes
+ * `Client.qbCustomerId` for a money decision takes this lock: `FOR SHARE` when
+ * it only reads it, `FOR UPDATE` when it re-points it (`lockClientRow`).
  *
  * Callers lock the parent row(s) FOR UPDATE at the TOP of the transaction (via
  * `lockMoneyParents`), BEFORE reading sibling schedules or computing aggregates.
@@ -66,15 +77,21 @@ export async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promis
 
 /**
  * Take the canonical money-path row locks at the top of a transaction:
- * Estimate first, then Invoice. Pass whichever ids the flow will touch; a
- * null/undefined id skips that row, and a missing row locks nothing (the
- * caller's own existence checks still handle "not found"). Because every
+ * Estimate first, then Invoice, then Client. Pass whichever ids the flow will
+ * touch; a null/undefined id skips that row, and a missing row locks nothing
+ * (the caller's own existence checks still handle "not found"). Because every
  * money-path transaction locks in this same order, no two can deadlock on the
- * Estimate/Invoice pair.
+ * Estimate/Invoice/Client chain.
+ *
+ * `clientId` is usually NOT known up front — it is read off the Invoice — so
+ * most callers take the first two locks here and then call `lockClientRow`
+ * once they have read it. Passing it here is the shorthand for the callers
+ * that already know it.
  */
 export async function lockMoneyParents(
     tx: Prisma.TransactionClient,
-    ids: { estimateId?: string | null; invoiceId?: string | null },
+    ids: { estimateId?: string | null; invoiceId?: string | null; clientId?: string | null },
+    opts?: { clientLock?: ClientLockMode },
 ): Promise<void> {
     if (ids.estimateId) {
         await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ids.estimateId} FOR UPDATE`;
@@ -82,6 +99,69 @@ export async function lockMoneyParents(
     if (ids.invoiceId) {
         await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${ids.invoiceId} FOR UPDATE`;
     }
+    if (ids.clientId) {
+        await lockClientRow(tx, ids.clientId, opts?.clientLock ?? "update");
+    }
+}
+
+/**
+ * `FOR SHARE` for a transaction that only READS `Client.qbCustomerId` and must
+ * not have it change underneath (several such readers may run at once);
+ * `FOR UPDATE` for the one that re-points it. The two modes conflict, which is
+ * exactly the serialization that makes a remap either wait for the reader or
+ * be seen by it.
+ */
+export type ClientLockMode = "share" | "update";
+
+/**
+ * Third and last of the canonical money parents (see the header): the Client
+ * row a money document bills, taken AFTER Estimate and Invoice.
+ *
+ * A reader must take this BEFORE it reads `qbCustomerId`, not after — reading
+ * through an `Invoice.client` relation takes no lock on the Client at all, and
+ * that is the hole this closes. Never upgrade: a transaction that has taken
+ * `share` here must not later take `update` on the same row, or two of them
+ * deadlock on the upgrade.
+ */
+export async function lockClientRow(
+    tx: Prisma.TransactionClient,
+    clientId: string,
+    mode: ClientLockMode,
+): Promise<void> {
+    // Two literals rather than one interpolated mode: the lock strength is not
+    // a value Prisma can parameterise, and building the SQL by concatenation
+    // would put a caller-supplied string into the statement.
+    if (mode === "update") {
+        await tx.$queryRaw`SELECT id FROM "Client" WHERE id = ${clientId} FOR UPDATE`;
+    } else {
+        await tx.$queryRaw`SELECT id FROM "Client" WHERE id = ${clientId} FOR SHARE`;
+    }
+}
+
+/**
+ * The Client lock AND the compare-and-set of `qbCustomerId` in one statement.
+ *
+ * Belt and braces for a reader that has already taken `lockClientRow(share)`:
+ * the lock alone makes the value stable, but only against writers that respect
+ * the lock order. This re-asserts, at the moment of the write, that the row
+ * still carries the exact customer id the decision was made against — so a
+ * writer that skipped the lock entirely is caught by a value comparison rather
+ * than trusted. Returns false when the mapping moved (or the row is gone).
+ *
+ * `IS NOT DISTINCT FROM` rather than `=` so a NULL mapping compares as a value:
+ * `NULL = NULL` is NULL, which would make "the client has no customer id" pass
+ * a check it never actually satisfied.
+ */
+export async function clientCustomerStillMatches(
+    tx: Prisma.TransactionClient,
+    clientId: string,
+    expectedQbCustomerId: string | null,
+): Promise<boolean> {
+    const rows = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Client"
+        WHERE id = ${clientId} AND "qbCustomerId" IS NOT DISTINCT FROM ${expectedQbCustomerId}
+        FOR SHARE`;
+    return Array.isArray(rows) && rows.length === 1;
 }
 
 /**

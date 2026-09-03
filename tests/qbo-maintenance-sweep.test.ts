@@ -40,13 +40,41 @@ function rows(count: number, prefix = "ps"): FakeRow[] {
 }
 
 /** Paging semantics Prisma gives us: orderBy id asc, cursor + skip:1, take. */
-function makePrisma(all: FakeRow[], opts: { onPage?: () => void; settings?: Map<string, string> } = {}) {
+function makePrisma(
+    all: FakeRow[],
+    opts: {
+        onPage?: () => void;
+        settings?: Map<string, string>;
+        /**
+         * QuickBooks invoice ids of rows carrying `paylink-pending`, per rail.
+         * Real rows, served by BOTH `findMany` and `count`, so the pay-link
+         * sweep actually visits them and its counters mean what they say.
+         */
+        pendingPayLinks?: { milestone?: string[]; progressBilling?: string[] };
+    } = {},
+) {
     const seen: string[] = [];
     // Backs automationSettingCursorStore (src/lib/quickbooks-payments.ts) —
     // the same key/value table the sweep's resume cursor now persists to.
     // Pre-seed via `opts.settings`, or read it back afterward, to assert on
     // what a run stored for the NEXT invocation to pick up.
     const settingsStore = opts.settings ?? new Map<string, string>();
+    const pending = (kind: "milestone" | "progressBilling", prefix: string) =>
+        (opts.pendingPayLinks?.[kind] ?? []).map((qbInvoiceId, i) => ({
+            id: `${prefix}-${String(i).padStart(4, "0")}`,
+            qbInvoiceId,
+            code: `${prefix.toUpperCase()}-${i}`,
+            invoice: { code: `${prefix.toUpperCase()}-${i}` },
+        }));
+    const pendingPage = (list: any[], args: any) => {
+        const where = args?.where ?? {};
+        const matched = list.filter((r) => {
+            if (where.id?.gt !== undefined && !(r.id > where.id.gt)) return false;
+            if (where.id?.lt !== undefined && !(r.id < where.id.lt)) return false;
+            return true;
+        });
+        return typeof args?.take === "number" ? matched.slice(0, args.take) : matched;
+    };
     return {
         seen,
         settingsStore,
@@ -80,11 +108,24 @@ function makePrisma(all: FakeRow[], opts: { onPage?: () => void; settings?: Map<
                 },
             },
             automationEvent: { async create() { return {}; } },
-            progressBilling: { async findMany() { return []; }, async updateMany() { return { count: 0 }; } },
+            progressBilling: {
+                async findMany(args: any) {
+                    return pendingPage(pending("progressBilling", "pb"), args).map((r) => ({ ...r }));
+                },
+                async count(args: any) {
+                    return pendingPage(pending("progressBilling", "pb"), { where: args?.where }).length;
+                },
+                // Nothing clears here: these fixtures model rows QuickBooks
+                // refuses per-invoice, which keep their marker by design.
+                async updateMany() { return { count: 0 }; },
+            },
             paymentSchedule: {
                 async findMany(args: any) {
                     opts.onPage?.();
-                    if (args.select?.qbInvoiceId && args.where?.qbSyncError) return []; // the pay-link sweep
+                    // The pay-link sweep's page, not the payment-options one.
+                    if (args.select?.qbInvoiceId && args.where?.qbSyncError) {
+                        return pendingPage(pending("milestone", "pl"), args).map((r) => ({ ...r }));
+                    }
                     let list = all;
                     if (args.cursor?.id) {
                         const at = all.findIndex((r) => r.id === args.cursor.id);
@@ -95,6 +136,15 @@ function makePrisma(all: FakeRow[], opts: { onPage?: () => void; settings?: Map<
                     return page.map((r) => ({ ...r }));
                 },
                 async count(args: any) {
+                    // Two different collections share this delegate: the
+                    // payment-options sweep (unpaid, linked rows) and the
+                    // pay-link sweep (rows carrying the pending marker). Only
+                    // the marker filter identifies the second one, and
+                    // answering it with `all.length` would report every unpaid
+                    // milestone as an unresolved pay link.
+                    if (args?.where?.qbSyncError !== undefined) {
+                        return pendingPage(pending("milestone", "pl"), { where: args.where }).length;
+                    }
                     const gt = args?.where?.id?.gt;
                     return gt ? all.filter((r) => r.id > gt).length : all.length;
                 },
@@ -324,4 +374,51 @@ test("round 35 gate: a sweep with nothing missing still reports ok", async () =>
     assert.equal(body.ok, true);
     assert.equal(body.missingInQbo, undefined);
     assert.equal(body.reason, undefined);
+});
+
+test("round 37 gate: a pay-link row left unresolved makes the run ok:false", async () => {
+    // The false green this gate closes. The options loop finished cleanly and
+    // the pay-link sweep returned without aborting, so every existing signal
+    // said "clean" — while a milestone sat there LINKED to a QuickBooks invoice
+    // with no pay link on it, which is a bill the client cannot pay.
+    const all = rows(3);
+    const { client } = makePrisma(all, { pendingPayLinks: { milestone: ["qb-pl-1"] } });
+    // 404 on the pay-link read is a per-invoice refusal: the sweep visits the
+    // row, deliberately leaves the marker, and moves its cursor past it.
+    const body = await withEnvAndFakes(client, makeFetch({ "qb-pl-1": 404 }), async () => {
+        const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+        return (await POST(request())).json();
+    });
+
+    assert.equal(body.failed, 0);
+    assert.equal(body.missingInQbo, undefined);
+    assert.equal(body.ok, false, "a row still carrying paylink-pending is outstanding work");
+    assert.equal(body.reason, "pay-link-unresolved");
+    assert.equal(body.payLinks.unresolved.milestone, 1);
+    assert.equal(body.payLinks.unresolved.total, 1);
+    // Nothing was UNVISITED: the sweep reached everything it could see. The two
+    // counters answer different questions and must not be conflated — and it is
+    // `unresolved`, not `unvisited`, that names this run.
+    assert.equal(body.payLinks.unvisited.total, 0);
+    assert.equal(body.payLinks.skipped, 1, "visited, and deliberately left pending");
+});
+
+test("round 37 gate: pay-link counters cover BOTH rails and sum", async () => {
+    const all = rows(2);
+    const { client } = makePrisma(all, {
+        pendingPayLinks: { milestone: ["qb-pl-1", "qb-pl-2"], progressBilling: ["qb-pb-1", "qb-pb-2", "qb-pb-3"] },
+    });
+    const body = await withEnvAndFakes(
+        client,
+        makeFetch({ "qb-pl-1": 404, "qb-pl-2": 404, "qb-pb-1": 404, "qb-pb-2": 404, "qb-pb-3": 404 }),
+        async () => {
+            const { POST } = await import("../src/app/api/integrations/qbo-maintenance/route");
+            return (await POST(request())).json();
+        },
+    );
+
+    assert.equal(body.ok, false);
+    assert.equal(body.payLinks.unresolved.milestone, 2);
+    assert.equal(body.payLinks.unresolved.progressBilling, 3);
+    assert.equal(body.payLinks.unresolved.total, 5);
 });

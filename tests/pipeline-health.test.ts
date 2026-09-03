@@ -36,6 +36,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         receipts24h: { status: "ok" as const, counts: { created: 4 } },
         bank: { status: "ok" as const, at: iso(48 * HOUR) },
         stuck: { status: "ok" as const, count: 0 },
+        payLinksPending: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
     };
@@ -48,7 +49,7 @@ test("a healthy snapshot is ok with no reasons", () => {
 // ─── False green from a failed probe ────────────────────────────────────────
 
 test("ANY failed probe forces ok:false with probe-failed:<name>", () => {
-    const names = ["lastPurchaseSync", "purchaseSyncRun", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck"] as const;
+    const names = ["lastPurchaseSync", "purchaseSyncRun", "lastReceiptPush", "lastPaymentsSync", "receipts24h", "bank", "stuck", "payLinksPending"] as const;
     for (const name of names) {
         const base = snapshot();
         const broken = {
@@ -164,6 +165,29 @@ test("multiple independent failures all appear", () => {
     ]);
 });
 
+// ─── Pay links that were never written ─────────────────────────────────────
+
+test("a milestone linked in QuickBooks with no pay link makes health red", () => {
+    // The maintenance sweep can report `ok: true` and still leave one of these
+    // behind — a bill the client cannot pay. Health measures it directly rather
+    // than taking that sweep's word for it, so a maintenance run that never
+    // happened cannot read as health either.
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "ok", count: 2 } }));
+    assert.equal(v.ok, false);
+    assert.ok(v.reasons.includes("pay-links-pending:2"), v.reasons.join(","));
+});
+
+test("no pending pay links adds no reason", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "ok", count: 0 } }));
+    assert.deepEqual(v, { ok: true, reasons: [] });
+});
+
+test("a FAILED pay-link probe reports the probe, not a count of zero", () => {
+    const v = evaluatePipelineHealth(snapshot({ payLinksPending: { status: "error", count: 0 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["probe-failed:payLinksPending"], "the 0 fallback is not evidence");
+});
+
 // ─── Digest formatting ─────────────────────────────────────────────────────
 
 function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
@@ -181,6 +205,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
         receipts24h: { status: "ok", counts: { created: 4, fallback: 1 } },
         bank: { status: "ok", at: "2026-08-29T00:00:00.000Z" },
         stuck: { status: "ok", count: 0 },
+        payLinksPending: { status: "ok" as const, count: 0 },
         ...overrides,
     };
 }

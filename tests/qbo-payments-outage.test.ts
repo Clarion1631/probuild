@@ -1618,11 +1618,32 @@ test("a linked-but-paylink-pending row is a success, not a failure", async () =>
 
 // --- The paylink-pending sweep finishes what a timeout left behind ---
 
-/** In-memory PaymentSchedule/ProgressBilling pair for the sweep. */
+/**
+ * In-memory PaymentSchedule/ProgressBilling pair for the sweep.
+ *
+ * `findMany` honours the FILTER, the ORDER and the TAKE, and `count` answers
+ * from the same rows. It used to ignore `args` entirely and hand back every
+ * row: the cursor, the page cap and the wrap were all invisible to these tests,
+ * which is how a cursor that reset without ever visiting the head of the
+ * collection shipped green.
+ */
 function makeSweepDb(milestones: any[], billings: any[]) {
+    const eligible = (rows: any[], where: any) =>
+        rows.filter((r) => {
+            if (where.qbSyncError !== undefined && r.qbSyncError !== where.qbSyncError) return false;
+            if (where.qbInvoiceId?.not === null && r.qbInvoiceId === null) return false;
+            if (where.id?.gt !== undefined && !(r.id > where.id.gt)) return false;
+            if (where.id?.lt !== undefined && !(r.id < where.id.lt)) return false;
+            return true;
+        });
     const delegate = (rows: any[]) => ({
-        async findMany() {
-            return rows.map((r) => ({ ...r }));
+        async findMany(args: any) {
+            const matched = eligible(rows, args?.where ?? {}).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+            const taken = typeof args?.take === "number" ? matched.slice(0, args.take) : matched;
+            return taken.map((r) => ({ ...r }));
+        },
+        async count(args: any) {
+            return eligible(rows, args?.where ?? {}).length;
         },
         async updateMany(args: any) {
             const row = rows.find((r) => r.id === args.where.id);
@@ -1636,6 +1657,25 @@ function makeSweepDb(milestones: any[], billings: any[]) {
     return { paymentSchedule: delegate(milestones), progressBilling: delegate(billings) };
 }
 
+/** An in-memory stand-in for the AutomationSetting cursor store. */
+function makeCursorStore(initial: Record<string, string> = {}) {
+    const values: Record<string, string> = { ...initial };
+    return {
+        values,
+        async get(key: string) {
+            return values[key] ?? null;
+        },
+        async set(key: string, value: string) {
+            values[key] = value;
+        },
+    };
+}
+
+/** A pending row on the milestone rail. */
+function pendingMilestone(id: string, marker: string) {
+    return { id, qbInvoiceId: `qb-${id}`, qbSyncError: marker, qbInvoiceLink: null, invoice: { code: `INV-${id}` } };
+}
+
 test("the sweep finishes pay links on BOTH rails and clears the marker", async () => {
     const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
     const milestones = [{ id: "ps-1", qbInvoiceId: "qb-1", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null, invoice: { code: "INV-1" } }];
@@ -1647,7 +1687,12 @@ test("the sweep finishes pay links on BOTH rails and clears the marker", async (
         readPayLink: async (_t, id) => `https://pay.example/${id}`,
     });
 
-    assert.deepEqual(result, { checked: 2, repaired: 2, noLink: 0, skipped: 0 });
+    assert.equal(result.checked, 2);
+    assert.equal(result.repaired, 2);
+    assert.equal(result.noLink, 0);
+    assert.equal(result.skipped, 0);
+    assert.equal(result.unvisited.total, 0);
+    assert.equal(result.unresolved.total, 0, "both markers are gone");
     assert.equal(milestones[0].qbInvoiceLink, "https://pay.example/qb-1");
     assert.equal(milestones[0].qbSyncError, null);
     assert.equal(billings[0].qbInvoiceLink, "https://pay.example/qb-2");
@@ -1707,6 +1752,155 @@ test("a row that changed under the sweep is skipped, not overwritten", async () 
     assert.equal(result.repaired, 0);
     assert.equal(result.skipped, 1);
     assert.equal(milestones[0].qbInvoiceLink, null, "the unlink wins");
+});
+
+// --- The pay-link cursor: a short tail is not a visited head ---
+
+test("a retained marker BEFORE the cursor is reported unresolved, never a clean run", async () => {
+    // The false-green shape. `ps-01` sits at the head of the collection and its
+    // pay-link read is refused per-invoice, so it keeps its marker forever. The
+    // cursor is parked past it, the post-cursor tail is short and nonempty, and
+    // the old code processed that tail, reset the cursor and returned a result
+    // whose every counter said "clean". The head row was never looked at.
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER, PAYLINK_CURSOR_KEYS } =
+        await import("../src/lib/quickbooks-payments");
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const milestones = [pendingMilestone("ps-01", PAYLINK_PENDING_MARKER), pendingMilestone("ps-09", PAYLINK_PENDING_MARKER)];
+    const db = makeSweepDb(milestones, []);
+    const cursorStore = makeCursorStore({ [PAYLINK_CURSOR_KEYS.milestones]: "ps-05" });
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        cursorStore,
+        // 404 is a per-invoice refusal: the row keeps its marker by design.
+        readPayLink: async () => {
+            throw new QboHttpError("gone", 404);
+        },
+    });
+
+    assert.equal(result.unresolved.milestone, 2, "both rows still carry the marker");
+    assert.equal(result.unresolved.total, 2);
+    assert.equal(result.unvisited.total, 0, "the wrap DID reach the head in this run");
+    assert.equal(milestones[0].qbSyncError, PAYLINK_PENDING_MARKER);
+});
+
+test("a short tail with budget left wraps to the head IN THE SAME RUN, and only then resets the cursor", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER, PAYLINK_CURSOR_KEYS } =
+        await import("../src/lib/quickbooks-payments");
+    const milestones = [pendingMilestone("ps-01", PAYLINK_PENDING_MARKER), pendingMilestone("ps-09", PAYLINK_PENDING_MARKER)];
+    const db = makeSweepDb(milestones, []);
+    const cursorStore = makeCursorStore({ [PAYLINK_CURSOR_KEYS.milestones]: "ps-05" });
+    const visited: string[] = [];
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        cursorStore,
+        readPayLink: async (_t, id) => {
+            visited.push(id);
+            return `https://pay.example/${id}`;
+        },
+    });
+
+    assert.deepEqual(visited, ["qb-ps-09", "qb-ps-01"], "tail first, then the bounded wrap to the head");
+    assert.equal(result.repaired, 2);
+    assert.equal(result.unvisited.total, 0);
+    assert.equal(result.unresolved.total, 0);
+    assert.equal(
+        cursorStore.values[PAYLINK_CURSOR_KEYS.milestones],
+        "",
+        "reset only because the head was actually visited",
+    );
+});
+
+test("a run that stops part-way through the wrap persists where it got to, and does NOT reset", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER, PAYLINK_CURSOR_KEYS } =
+        await import("../src/lib/quickbooks-payments");
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const milestones = [
+        pendingMilestone("ps-01", PAYLINK_PENDING_MARKER),
+        pendingMilestone("ps-02", PAYLINK_PENDING_MARKER),
+        pendingMilestone("ps-09", PAYLINK_PENDING_MARKER),
+    ];
+    const db = makeSweepDb(milestones, []);
+    const cursorStore = makeCursorStore({ [PAYLINK_CURSOR_KEYS.milestones]: "ps-05" });
+    let calls = 0;
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        cursorStore,
+        readPayLink: async (_t, id) => {
+            calls++;
+            // ps-09 (the tail) and ps-01 succeed; the connection dies before ps-02.
+            if (calls > 2) throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/x");
+            return `https://pay.example/${id}`;
+        },
+    });
+
+    assert.equal(result.reason, "qbo-timeout");
+    assert.equal(
+        cursorStore.values[PAYLINK_CURSOR_KEYS.milestones],
+        "ps-01",
+        "resume inside the head, not from the top and not from the old cursor",
+    );
+    assert.equal(result.unvisited.milestone, 1, "ps-02 was eligible and never reached");
+    assert.equal(result.unresolved.milestone, 1, "ps-02 still carries its marker");
+});
+
+test("budget exhausted on the first rail: the NEXT run starts on the other one", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER, PAYLINK_ORDER_KEY } =
+        await import("../src/lib/quickbooks-payments");
+    const cursorStore = makeCursorStore();
+    const order: string[] = [];
+    const run = async () => {
+        const milestones = [pendingMilestone("ps-01", PAYLINK_PENDING_MARKER)];
+        const billings = [{ id: "pb-01", code: "INV-1-P1", qbInvoiceId: "qb-pb-01", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null }];
+        const db = makeSweepDb(milestones, billings);
+        const seen: string[] = [];
+        const result = await sweepPendingPayLinks(TOKENS, undefined, {
+            db,
+            cursorStore,
+            readPayLink: async (_t, id) => {
+                seen.push(id);
+                // One row's worth of budget, then the connection is gone —
+                // exactly the repeated exhaustion that starved the second rail.
+                if (seen.length > 1) {
+                    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+                    throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/x");
+                }
+                return `https://pay.example/${id}`;
+            },
+        });
+        order.push(seen[0]);
+        return result;
+    };
+
+    const first = await run();
+    assert.equal(first.railFirst, "milestone", "the historical order is kept for the first run");
+    assert.equal(cursorStore.values[PAYLINK_ORDER_KEY], "milestone");
+    const second = await run();
+    assert.equal(second.railFirst, "progressBilling");
+    assert.deepEqual(order, ["qb-ps-01", "qb-pb-01"], "the second rail is reached on the next run, not starved");
+});
+
+test("mixed-rail counts add up", async () => {
+    const { sweepPendingPayLinks, PAYLINK_PENDING_MARKER } = await import("../src/lib/quickbooks-payments");
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const milestones = [pendingMilestone("ps-01", PAYLINK_PENDING_MARKER), pendingMilestone("ps-02", PAYLINK_PENDING_MARKER)];
+    const billings = [{ id: "pb-01", code: "INV-1-P1", qbInvoiceId: "qb-pb-01", qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceLink: null }];
+    const db = makeSweepDb(milestones, billings);
+
+    const result = await sweepPendingPayLinks(TOKENS, undefined, {
+        db,
+        // Every row refused per-invoice: all three keep their markers.
+        readPayLink: async () => {
+            throw new QboHttpError("gone", 404);
+        },
+    });
+
+    assert.equal(result.unresolved.milestone, 2);
+    assert.equal(result.unresolved.progressBilling, 1);
+    assert.equal(result.unresolved.total, result.unresolved.milestone + result.unresolved.progressBilling);
+    assert.equal(result.unvisited.total, result.unvisited.milestone + result.unvisited.progressBilling);
 });
 
 // --- The pay-link read reports its failures instead of answering null ---

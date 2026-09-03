@@ -12,7 +12,7 @@
  */
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { getQBSettings, saveQBSettings } from "./integration-store";
@@ -241,7 +241,20 @@ export async function resolveCustomerAndItem(
 
     const customerId = await ensureQBCustomer(tokens, client, deadline);
     if (customerId !== client.qbCustomerId) {
-        await prisma.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+        // Re-pointing a client at another QuickBooks customer is a money-path
+        // write: the ambiguous-create recovery decides whether to link or
+        // release a parked invoice against exactly this value. It therefore
+        // takes the canonical Client lock (see tx-retry.ts) so that decision
+        // either happens entirely before this remap or entirely after it,
+        // never straddling it. FOR UPDATE, not FOR SHARE — this is the writer.
+        //
+        // Only the lock-and-write is inside the transaction. `ensureQBCustomer`
+        // above is a QuickBooks round trip and must never be held across a row
+        // lock; the re-read under the lock is what makes the write safe anyway.
+        await withTxRetry(() => prisma.$transaction(async (tx) => {
+            await lockClientRow(tx, client.id, "update");
+            await tx.client.update({ where: { id: client.id }, data: { qbCustomerId: customerId } });
+        }));
     }
 
     const qb = await getQBSettings();
@@ -446,6 +459,20 @@ export interface PayLinkPendingRow {
 export interface PayLinkSweepDelegate {
     findMany(args: any): Promise<any[]>;
     updateMany(args: any): Promise<{ count: number }>;
+    /**
+     * How many rows currently match the pending-marker filter. Read twice per
+     * run — once before the loop, once after — because "the sweep returned" and
+     * "the sweep finished the work" are different claims, and only a count
+     * taken from the database can tell them apart.
+     */
+    count(args: any): Promise<number>;
+}
+
+/** Per-rail counters, plus the sum the caller actually gates on. */
+export interface PayLinkRailCounts {
+    milestone: number;
+    progressBilling: number;
+    total: number;
 }
 
 export interface PayLinkSweepDb {
@@ -467,6 +494,24 @@ export interface PayLinkSweepResult {
      */
     truncated?: boolean;
     reason?: string;
+    /**
+     * Rows that were eligible when this run started and that it never reached.
+     *
+     * The run's own bookkeeping — eligible-at-start minus rows it actually
+     * decided — so it counts everything the pages did not cover as well as
+     * everything the budget cut short. Nonzero means the sweep did NOT look at
+     * the whole set, whatever else it reports.
+     */
+    unvisited: PayLinkRailCounts;
+    /**
+     * Rows still carrying the pending marker when the run ended, counted from
+     * the database rather than inferred. Nonzero means there is a milestone or
+     * a progress billing whose client still has no pay link — the condition
+     * this sweep exists to remove, so a run that leaves any is not clean.
+     */
+    unresolved: PayLinkRailCounts;
+    /** Which rail this run processed first (alternates run to run). */
+    railFirst: "milestone" | "progressBilling";
 }
 
 /** How many pending rows one sweep will look at, per rail. */
@@ -493,6 +538,17 @@ export const PAYLINK_CURSOR_KEYS = {
 } as const;
 
 /**
+ * Which rail this sweep works FIRST, flipped every run.
+ *
+ * Milestones used to be processed first, always. Under repeated budget
+ * exhaustion — the normal state of a backlog — the run died inside the
+ * milestone rail every time and progress billings were never reached at all:
+ * not a slow rail, a starved one. Alternating is the same fix, and the same
+ * key shape, as PAYMENTS_ORDER_KEY on the payments sync.
+ */
+export const PAYLINK_ORDER_KEY = "qbo-paylink-sweep.order";
+
+/**
  * Finish the work a pay-link timeout left behind, on BOTH rails.
  *
  * `pushMilestoneToQuickBooks` and `stageProgressBillingToQuickBooksCore` link
@@ -517,43 +573,72 @@ export async function sweepPendingPayLinks(
     const db: PayLinkSweepDb = deps?.db ?? prisma;
     const readPayLink = deps?.readPayLink ?? getQBInvoicePaymentLink;
     const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
-    const result: PayLinkSweepResult = { checked: 0, repaired: 0, noLink: 0, skipped: 0 };
+    const zero = (): PayLinkRailCounts => ({ milestone: 0, progressBilling: 0, total: 0 });
+    const result: PayLinkSweepResult = {
+        checked: 0, repaired: 0, noLink: 0, skipped: 0,
+        unvisited: zero(), unresolved: zero(), railFirst: "milestone",
+    };
 
     const where = { qbSyncError: PAYLINK_PENDING_MARKER, qbInvoiceId: { not: null } };
 
     /**
-     * One rail's page, resumed from its cursor.
+     * One rail's rows for this run: the tail after its cursor, and — only when
+     * that tail drained AND there is budget left in the page — a BOUNDED wrap
+     * back to the head.
      *
-     * A short page means we reached the end of the collection, so the cursor is
-     * dropped and the run continues from the top in the SAME pass — otherwise a
-     * cursor parked near the end would spend a whole run on a handful of rows
-     * while the head of the collection waited for the next one.
+     * The wrap used to happen only when the post-cursor page came back EMPTY. A
+     * nonempty short tail was processed and then `saveCursors` reset the cursor
+     * to the top, reporting a clean run: the head of the collection had not
+     * been visited, and the next run started there only if nothing pushed the
+     * cursor forward again first. The wrap is now part of the SAME run, capped
+     * at `id < cursorId` so it can never re-walk the tail it just did, and the
+     * cursor is only reset when the head was genuinely reached (`covered`).
      */
     const fetchRail = async (
         delegate: PayLinkSweepDelegate,
         select: Record<string, unknown>,
         key: string,
-    ): Promise<{ rows: any[]; startedFromCursor: boolean }> => {
+    ): Promise<{ rows: any[]; cursorId: string | null; covered: boolean }> => {
         const stored = await cursorStore.get(key);
         const cursorId = stored && stored.length > 0 ? stored : null;
-        const page = async (after: string | null) => delegate.findMany({
-            where: after ? { ...where, id: { gt: after } } : where,
+        const page = async (rowWhere: any, take: number) => delegate.findMany({
+            where: rowWhere,
             select,
             // Stable key: without it Postgres may hand back the same first page
             // every run and starve everything behind it.
             orderBy: { id: "asc" },
-            take: PAYLINK_SWEEP_LIMIT,
+            take,
         });
-        const rows = await page(cursorId);
-        if (rows.length === 0 && cursorId) {
-            // Drained past the cursor: wrap now rather than burning the run.
-            await cursorStore.set(key, "");
-            return { rows: await page(null), startedFromCursor: false };
+        const tail = await page(
+            cursorId ? { ...where, id: { gt: cursorId } } : where,
+            PAYLINK_SWEEP_LIMIT,
+        );
+        if (!cursorId) {
+            // Started at the top: a short page IS the whole collection.
+            return { rows: tail, cursorId: null, covered: tail.length < PAYLINK_SWEEP_LIMIT };
         }
-        return { rows, startedFromCursor: cursorId !== null };
+        if (tail.length >= PAYLINK_SWEEP_LIMIT) {
+            // The page is full of tail; the head waits for a later run.
+            return { rows: tail, cursorId, covered: false };
+        }
+        const room = PAYLINK_SWEEP_LIMIT - tail.length;
+        const head = await page({ ...where, id: { lt: cursorId } }, room);
+        // A short head means the wrap reached back to the cursor with nothing
+        // left in between: every eligible row is in this run's pages.
+        return { rows: [...tail, ...head], cursorId, covered: head.length < room };
     };
 
-    const [milestonePage, billingPage] = await Promise.all([
+    // Which rail goes first, flipped every run so a budget that always dies
+    // inside the first rail cannot starve the second one forever.
+    // Unset reads as "milestone last time" is deliberately NOT the rule: an
+    // unset key means nothing has run, so the first run keeps the historical
+    // milestone-first order and every run after it alternates.
+    const lastOrder = await cursorStore.get(PAYLINK_ORDER_KEY);
+    const railFirst: "milestone" | "progressBilling" =
+        lastOrder === "milestone" ? "progressBilling" : "milestone";
+    result.railFirst = railFirst;
+
+    const [milestonePage, billingPage, milestonesEligible, billingsEligible] = await Promise.all([
         fetchRail(
             db.paymentSchedule,
             { id: true, qbInvoiceId: true, invoice: { select: { code: true } } },
@@ -564,9 +649,17 @@ export async function sweepPendingPayLinks(
             { id: true, qbInvoiceId: true, code: true },
             PAYLINK_CURSOR_KEYS.billings,
         ),
+        // Eligible-at-start, per rail. `unvisited` is measured against this, so
+        // it counts rows beyond the pages as well as rows the budget cut short.
+        db.paymentSchedule.count({ where }),
+        db.progressBilling.count({ where }),
     ]);
     const milestones = milestonePage.rows;
     const billings = billingPage.rows;
+    const eligibleAtStart: Record<"milestone" | "progressBilling", number> = {
+        milestone: milestonesEligible,
+        progressBilling: billingsEligible,
+    };
 
     /**
      * The furthest each rail's cursor may move: the last row this run actually
@@ -580,6 +673,15 @@ export async function sweepPendingPayLinks(
         milestone: null,
         progressBilling: null,
     };
+    /** How many rows on each rail this run reached a decision on. */
+    const visited: Record<"milestone" | "progressBilling", number> = {
+        milestone: 0,
+        progressBilling: 0,
+    };
+    const decided = (kind: "milestone" | "progressBilling", id: string) => {
+        lastDecided[kind] = id;
+        visited[kind]++;
+    };
     const saveCursors = async () => {
         const rails = [
             { kind: "milestone" as const, key: PAYLINK_CURSOR_KEYS.milestones, page: milestonePage },
@@ -587,29 +689,38 @@ export async function sweepPendingPayLinks(
         ];
         for (const rail of rails) {
             const last = lastDecided[rail.kind];
-            const drained = rail.page.rows.length < PAYLINK_SWEEP_LIMIT
-                && last !== null
-                && last === rail.page.rows[rail.page.rows.length - 1]?.id;
-            // A fully-worked short page IS the end of the collection: reset so
-            // the next run starts at the top instead of finding nothing.
-            if (drained) await cursorStore.set(rail.key, "");
+            const rows = rail.page.rows;
+            // Everything this run fetched was worked through.
+            const allWorked = rows.length === 0 || (last !== null && last === rows[rows.length - 1]?.id);
+            // Reset ONLY when the head was actually visited in this run — that
+            // is what `covered` means. A short tail alone is not enough: it says
+            // the tail ended, not that anything before the cursor was looked at.
+            if (rail.page.covered && allWorked) await cursorStore.set(rail.key, "");
+            // Otherwise persist the position reached. After a wrap this moves
+            // the cursor BACKWARDS, which is right: the run stopped part-way
+            // through the head, and the next one must resume there.
             else if (last !== null) await cursorStore.set(rail.key, last);
         }
+        await cursorStore.set(PAYLINK_ORDER_KEY, railFirst);
     };
 
-    const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] = [
-        ...milestones.map((m: any) => ({
-            kind: "milestone" as const,
-            row: { id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id },
-        })),
-        ...billings.map((b: any) => ({
-            kind: "progressBilling" as const,
-            row: { id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code },
-        })),
-    ];
+    const milestoneEntries = milestones.map((m: any) => ({
+        kind: "milestone" as const,
+        row: { id: m.id, qbInvoiceId: m.qbInvoiceId as string, code: m.invoice?.code ?? m.id },
+    }));
+    const billingEntries = billings.map((b: any) => ({
+        kind: "progressBilling" as const,
+        row: { id: b.id, qbInvoiceId: b.qbInvoiceId as string, code: b.code },
+    }));
+    const rows: { kind: "milestone" | "progressBilling"; row: PayLinkPendingRow }[] =
+        railFirst === "milestone"
+            ? [...milestoneEntries, ...billingEntries]
+            : [...billingEntries, ...milestoneEntries];
 
-    // A full page on either rail means there may be more behind it.
-    if (milestones.length >= PAYLINK_SWEEP_LIMIT || billings.length >= PAYLINK_SWEEP_LIMIT) {
+    // A rail whose pages did not cover its whole eligible set has more behind
+    // them. `covered` replaces the old "the page came back full" test, which
+    // could not tell a full tail from a tail plus a wrap that finished.
+    if (!milestonePage.covered || !billingPage.covered) {
         result.truncated = true;
     }
 
@@ -651,7 +762,7 @@ export async function sweepPendingPayLinks(
             // The cursor still advances past it. This is THE starvation case:
             // the row keeps its marker, so a fixed page would refetch it (and
             // its 99 friends) forever and never reach anything behind them.
-            lastDecided[entry.kind] = entry.row.id;
+            decided(entry.kind, entry.row.id);
             result.skipped++;
             continue;
         }
@@ -665,7 +776,7 @@ export async function sweepPendingPayLinks(
         });
         // Decided either way: a lost CAS means someone else moved this row on,
         // so it is no longer this sweep's work.
-        lastDecided[entry.kind] = entry.row.id;
+        decided(entry.kind, entry.row.id);
         if (cleared.count !== 1) {
             result.skipped++;
             continue;
@@ -677,6 +788,28 @@ export async function sweepPendingPayLinks(
     // Every exit above falls through to here, so the resume point is recorded
     // whether the run finished its pages or stopped on an outage.
     await saveCursors();
+
+    // What the run did NOT finish. Both are reported per rail and summed,
+    // because "the handler returned" is not "the work is done" — a refused head
+    // row that keeps its marker used to sit inside an `ok: true` maintenance
+    // response indefinitely, and nobody was told.
+    result.unvisited = {
+        milestone: Math.max(0, eligibleAtStart.milestone - visited.milestone),
+        progressBilling: Math.max(0, eligibleAtStart.progressBilling - visited.progressBilling),
+        total: 0,
+    };
+    result.unvisited.total = result.unvisited.milestone + result.unvisited.progressBilling;
+    // Counted from the database AFTER the loop: rows this run repaired no
+    // longer match, rows it refused (or never reached) still do.
+    const [milestoneLeft, billingLeft] = await Promise.all([
+        db.paymentSchedule.count({ where }),
+        db.progressBilling.count({ where }),
+    ]);
+    result.unresolved = {
+        milestone: milestoneLeft,
+        progressBilling: billingLeft,
+        total: milestoneLeft + billingLeft,
+    };
     return result;
 }
 
