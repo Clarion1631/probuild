@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
+import { displayEndDate, storedEndDate } from "@/lib/schedule-dates";
 import { CLIENT_STAGE_LABELS } from "@/lib/client-stages";
 import DependencyPicker from "./DependencyPicker";
 import ColorPicker from "./ColorPicker";
@@ -327,7 +328,7 @@ export default function TaskDetailPanel({
                                     <>
                                         <div className="grid grid-cols-2 gap-3">
                                             <div><label className={SECTION_LABEL}>Start</label><input type="date" value={task.startDate} disabled={datesReadOnly} onChange={e => onDateChange(task.id, "startDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" /></div>
-                                            <div><label className={SECTION_LABEL}>End</label><input type="date" value={task.endDate} disabled={datesReadOnly} onChange={e => onDateChange(task.id, "endDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" /></div>
+                                            <div><label className={SECTION_LABEL}>End</label><input type="date" value={displayEndDate(task.startDate, task.endDate, task.type)} min={task.startDate} disabled={datesReadOnly} onChange={e => { const v = e.target.value; if (!v) return; onDateChange(task.id, "endDate", storedEndDate(task.startDate, v, task.type)); }} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" /></div>
                                         </div>
                                         {task.type === "appointment" && (
                                             <div className="grid grid-cols-2 gap-3">
