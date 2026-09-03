@@ -293,12 +293,20 @@ test("A LIVE LEASE SURVIVES A RECOVERABLE RETRY — same path, same version, no 
         reuse < body.indexOf("start-rearmed-repath"),
         "and before anything is deleted",
     );
-    // The identity writes a recovery needs still happen — they just land on the
-    // SAME path and lease version, so a corrected hash is not a reason to
-    // repath.
+    // The recovery's OWN state writes still happen -- they just land on the
+    // SAME path and lease version. Its IDENTITY writes no longer ride along:
+    // `expectedSha256` and the declared mime are part of a live lease's
+    // identity, and writing them through an extension is how two callers came
+    // to hold one generation for two different documents. The hash is passed
+    // as the rule's own argument now, and COMPARED.
     const patch = body.slice(reuse, body.indexOf("if (keptRecovery)"));
-    assert.match(patch, /expectedSha256,/);
     assert.match(patch, /fileSha256: "",/);
+    assert.ok(
+        !/expectedSha256,\s*$/m.test(patch),
+        "the announced hash is not written through the extension",
+    );
+    assert.match(patch, /\}, expectedSha256\);/, "it is handed to the rule to check");
+    assert.ok(!/mimeType,/.test(patch), "nor the declared mime");
     assert.ok(!/uploadLeaseVersion/.test(patch), "the version is NOT touched");
     assert.ok(!/storagePath/.test(patch), "and neither is the path");
 });

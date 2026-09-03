@@ -1166,7 +1166,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         const answers = await Promise.all([a, b].map(async r => ({ status: r.status(), json: await r.json() })));
         for (const { status } of answers) expect([200, 409]).toContain(status);
         const ok = answers.filter(x => x.status === 200);
-        expect(ok.length).toBeGreaterThan(0, "at least one retry must succeed");
+        expect(ok.length, "at least one retry must succeed").toBeGreaterThan(0);
 
         const ids = new Set(ok.map(x => x.json.id));
         expect(ids.size).toBe(1, "one sourceRef, one row");
@@ -1243,8 +1243,8 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         expect(body.alreadyReceived).toBe(true);
         expect(body.id).toBe(id);
         expect(body.state).toBeTruthy();
-        expect(body.uploadUrl).toBeUndefined("there is nothing to upload");
-        expect(body.uploadLease).toBeUndefined("and so no lease to echo");
+        expect(body.uploadUrl, "there is nothing to upload").toBeUndefined();
+        expect(body.uploadLease, "and so no lease to echo").toBeUndefined();
     });
 
     test("the UPLOAD union member carries the whole contract", async ({ request }) => {
@@ -1258,7 +1258,7 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         minted.push(body.id);
         expect(body.kind).toBe("upload");
         for (const field of ["id", "uploadUrl", "token", "storagePath", "uploadLease", "maxBytes"]) {
-            expect(body[field]).toBeTruthy(`an upload response carries ${field}`);
+            expect(body[field], `an upload response carries ${field}`).toBeTruthy();
         }
         expect(body.alreadyReceived).toBeUndefined();
     });

@@ -16,7 +16,14 @@
 import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
 import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
-import { backoffMs, MAX_BOOK_ATTEMPTS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
+import {
+    backoffMs,
+    MAX_BOOK_ATTEMPTS,
+    routeState,
+    TAX_IMPLAUSIBLE_REASON,
+    type DedupHits,
+    type ReceiptIntakeState,
+} from "./route-state";
 import {
     appliedTaxCents,
     buildGroups,
@@ -449,7 +456,13 @@ export interface WorkerDependencies {
      * cannot express that, because the zombie and the live worker hold
      * identical row ids.
      */
-    finishRouting: (rowId: string, claimToken: string | null, stateReason: string | null) => Promise<void>;
+    finishRouting: (
+        rowId: string,
+        claimToken: string | null,
+        stateReason: string | null,
+        /** The durable tax marker. READ is reached with no patch of its own. */
+        taxWarning: string | null,
+    ) => Promise<void>;
     now: () => Date;
     /** Elapsed-time source for the soft deadline. */
     monotonicMs: () => number;
@@ -480,6 +493,12 @@ export interface StrongOwner {
 export interface ReadPatch {
     state: ReceiptIntakeState;
     stateReason: string | null;
+    /**
+     * The dropped-tax-reading marker, in its DURABLE column. `stateReason`
+     * carries a copy for the queue to display, but every deferred booking
+     * and every park overwrites that column -- see preservedTaxWarning.
+     */
+    taxWarning: string | null;
     vendor: string | null;
     txnDate: Date | null;
     totalCents: number | null;
@@ -1016,6 +1035,11 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const taxImplausible = tax.implausible || (tax.taxCents !== null && taxCents === null);
 
     const base = {
+        // WRITTEN ONCE, HERE, and never touched again. The copy `note()`
+        // appends to `stateReason` is for the queue to show; this is the
+        // one the BOOKED transition reads, because stateReason is
+        // overwritten by every deferred booking and every park.
+        taxWarning: taxImplausible ? TAX_IMPLAUSIBLE_REASON : null,
         vendor: read.vendor || null,
         txnDate: dateOnly(keys.dateStr, timeZone),
         totalCents,
@@ -1182,7 +1206,12 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     // Routing is complete. This is the ONLY path to READ, and the only place
     // the claim lease is released.
-    await deps.finishRouting(row.id, row.claimToken, note(null));
+    await deps.finishRouting(
+        row.id,
+        row.claimToken,
+        note(null),
+        taxImplausible ? TAX_IMPLAUSIBLE_REASON : null,
+    );
     return "READ";
 }
 

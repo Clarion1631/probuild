@@ -147,23 +147,105 @@ test("CONCURRENT RETRY on a recoverable row: same path, same lease version, no d
     assert.deepEqual(store.deleted, [], "nothing was deleted");
 });
 
-test("the recovery's identity writes still land — on the SAME lease", async () => {
+test("the recovery's own state writes land; its ANNOUNCED HASH may not change", async () => {
     // A recoverable park can legitimately come back with a CORRECTED hash (a
-    // re-scanned Drive file, a recomputed digest). Reusing the lease must not
-    // cost it that, or /finalize would verify the new bytes against the old
-    // promise and park the row again.
-    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png") });
-    const { store, deps } = client([{ ...row, expectedSha256: "old", fileSha256: "stale", nextRetryAt: new Date() }]);
+    // re-scanned Drive file, a recomputed digest) -- but NOT while a lease is
+    // live. The announced hash is part of the live lease's identity: writing
+    // it through an extension kept the same generation, so two callers held
+    // ONE lease for two different documents and only whichever hash landed
+    // last could finalize. The correction lands on a NEW lease once this one
+    // lapses (see the control below).
+    const SHA = "b".repeat(64);
+    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png"), expectedSha256: SHA });
+    const { store, deps } = client([
+        { ...row, fileSha256: "stale", nextRetryAt: new Date() },
+    ]);
+
+    // AGREEING on the hash: the recovery's own state writes still land.
     const outcome = await reuseLiveLease(row, "png", deps, {
-        expectedSha256: "b".repeat(64),
         fileSha256: "",
         nextRetryAt: null,
-    });
+    }, SHA);
     assert.equal(outcome!.kind, "signed");
-    assert.equal(store.rows[0].expectedSha256, "b".repeat(64));
+    assert.equal(store.rows[0].expectedSha256, SHA);
     assert.equal(store.rows[0].fileSha256, "");
     assert.equal(store.rows[0].nextRetryAt, null);
     assert.equal(store.rows[0].uploadLeaseVersion, 2, "still not a new lease");
+});
+
+test("TWO CALLERS, TWO HASHES: the second is refused and the first still finalizes", async () => {
+    // The finding, exactly. The second caller used to overwrite
+    // expectedSha256 while keeping the generation, so the first caller's 200
+    // -- same lease, same URL -- could no longer be finalized against the
+    // hash it had announced.
+    const FIRST = "a".repeat(64);
+    const SECOND = "b".repeat(64);
+    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png"), expectedSha256: FIRST });
+    const { store, deps } = client([row]);
+
+    const held = await reuseLiveLease(row, "png", deps, { fileSha256: "" }, FIRST);
+    assert.equal(held!.kind, "signed", "the first caller holds the lease");
+
+    const other = await reuseLiveLease(row, "png", deps, { fileSha256: "" }, SECOND);
+    assert.equal(other!.kind, "identity-conflict");
+    assert.equal((other as { field: string }).field, "sha256");
+    // THE EXPIRY IT OBSERVED, which is what this caller read in this request.
+    // The winner has since extended it, so a client that waits exactly this
+    // long may be refused once more and wait again -- under-reporting the wait
+    // is safe, and re-reading the row purely to quote a longer one would be a
+    // round trip spent on a refusal.
+    assert.equal(
+        (other as { expiresAt: Date }).expiresAt.getTime(),
+        row.uploadUrlExpiresAt!.getTime(),
+        "the refusal says when the lease it lost to expires",
+    );
+    assert.ok(
+        (store.rows[0].uploadUrlExpiresAt as Date).getTime() >= row.uploadUrlExpiresAt!.getTime(),
+        "and the live lease only ever runs longer than that, never shorter",
+    );
+
+    // THE PROPERTY: the first caller's announced hash is untouched, so the
+    // 200 it is holding is still finalizable.
+    assert.equal(store.rows[0].expectedSha256, FIRST);
+    assert.equal(
+        store.rows[0].uploadLeaseNonce,
+        (held as { signed: { uploadLease: string } }).signed.uploadLease,
+    );
+    assert.deepEqual(store.signed, [row.storagePath], "and no URL was issued to the loser");
+});
+
+test("PRE-FIX CONTROL: writing the hash through an extension strands the first", async () => {
+    // The old shape, reproduced: the identity rode along in `rearm`.
+    const FIRST = "a".repeat(64);
+    const SECOND = "b".repeat(64);
+    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png"), expectedSha256: FIRST });
+    const { store, deps } = client([row]);
+
+    const held = await reuseLiveLease(row, "png", deps, { fileSha256: "" }, FIRST);
+    const firstLease = (held as { signed: { uploadLease: string } }).signed.uploadLease;
+
+    // What the second caller used to do, straight to the store.
+    await deps.db.updateMany({
+        where: { id: row.id },
+        data: { expectedSha256: SECOND },
+    });
+
+    assert.equal(store.rows[0].uploadLeaseNonce, firstLease, "same generation, still");
+    assert.notEqual(
+        store.rows[0].expectedSha256,
+        FIRST,
+        "...but the hash the first caller announced is gone, so its upload cannot verify",
+    );
+});
+
+test("a legacy lease that announced NO hash adopts this request's", async () => {
+    // Nothing to disagree with. Without this, the guard would refuse every
+    // retry against a row written before the field existed.
+    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png"), expectedSha256: null });
+    const { store, deps } = client([row]);
+    const outcome = await reuseLiveLease(row, "png", deps, {}, "c".repeat(64));
+    assert.equal(outcome!.kind, "signed");
+    assert.equal(store.rows[0].expectedSha256, "c".repeat(64));
 });
 
 test("the lease EXPIRY moves with the URL it reissues", async () => {
@@ -209,15 +291,40 @@ test("a row that never had a lease is not reused", async () => {
     assert.equal(await reuseLiveLease(row, "png", deps), null);
 });
 
-test("a CHANGED extension takes a new lease rather than reusing a mismatched path", async () => {
-    // The path is derived from (id, leaseVersion, ext). Reusing it for a caller
-    // that changed its declared type would leave the row pointing at an object
-    // whose name disagrees with its type.
+test("a CHANGED extension on a LIVE lease is REFUSED, never a repath", async () => {
+    // The path is derived from (id, leaseVersion, ext), so a caller that
+    // changed its declared type cannot reuse it -- and it used to fall
+    // through to the destructive resume, which bumped the version, repathed
+    // the row and rotated the generation WHILE THE PREVIOUS URL WAS STILL
+    // LIVE. The first caller was left holding a working signed URL for an
+    // object about to be orphaned, under a lease /finalize would refuse.
     const row = parked();
     const { store, deps } = client([row]);
-    assert.equal(await reuseLiveLease(row, "pdf", deps), null);
+
+    const outcome = await reuseLiveLease(row, "pdf", deps, {}, "a".repeat(64));
+
+    assert.equal(outcome!.kind, "identity-conflict");
+    assert.equal((outcome as { field: string }).field, "mime");
+    assert.equal(
+        (outcome as { expiresAt: Date }).expiresAt.getTime(),
+        row.uploadUrlExpiresAt!.getTime(),
+        "and it says when the live lease expires, so the caller can wait",
+    );
+    assert.deepEqual(store.signed, [], "no URL for a type this lease was not issued for");
+    assert.equal(store.rows[0].storagePath, row.storagePath, "the row is untouched");
+    assert.equal(store.rows[0].uploadLeaseVersion, 2, "and so is the lease");
+    assert.equal(store.rows[0].uploadLeaseNonce, CREATED_NONCE, "and its generation");
+});
+
+test("CONTROL: once the lease has EXPIRED, a changed extension takes a new one", async () => {
+    // The refusal above is about a LIVE lease. Nothing relies on a lapsed
+    // one, so the destructive branch is safe -- which is what makes the
+    // refusal a wait rather than a dead end.
+    const row = parked({ uploadUrlExpiresAt: new Date(Date.now() - 1) });
+    const { store, deps } = client([row]);
+    assert.equal(await reuseLiveLease(row, "pdf", deps, {}, "a".repeat(64)), null);
     assert.deepEqual(store.signed, []);
-    assert.equal(store.rows[0].storagePath, row.storagePath, "and the row is untouched");
+    assert.equal(store.rows[0].storagePath, row.storagePath, "and this rule changed nothing");
 });
 
 test("liveLeasePath answers the same three questions on its own", () => {
@@ -663,5 +770,27 @@ test("issuedLeaseIsCurrent: only the generation the row STILL holds is current",
             async () => ({ ...row, uploadLeaseNonce: null }) as unknown as LeaseRow,
         ),
         false,
+    );
+});
+
+test("an extension never REWRITES the announced hash, only adopts a missing one", async () => {
+    // sha256Agrees compares case-insensitively, because a client that
+    // upper-cases its digest is announcing the same document. That agreement
+    // must not become a WRITE: the stored value is what /finalize compares the
+    // computed digest against, and the row's own canonical form is the one it
+    // was published with. An extension is not a place to restate identity --
+    // its whole job is to leave identity alone.
+    const CANONICAL = "a".repeat(64);
+    const SHOUTED = CANONICAL.toUpperCase();
+    const row = parked({ storagePath: uploadPathFor("row-1", 2, "png"), expectedSha256: CANONICAL });
+    const { store, deps } = client([row]);
+
+    const outcome = await reuseLiveLease(row, "png", deps, {}, SHOUTED);
+
+    assert.equal(outcome!.kind, "signed", "the same document, differently spelled, still agrees");
+    assert.equal(
+        store.rows[0].expectedSha256,
+        CANONICAL,
+        "and the stored hash is untouched -- the row keeps the form it published",
     );
 });

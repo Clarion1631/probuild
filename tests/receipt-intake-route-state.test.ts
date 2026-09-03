@@ -131,18 +131,52 @@ test("a clean document with a job and no hits is READ", () => {
     });
 });
 
-test("preservedTaxWarning keeps only the tax-implausible marker", () => {
-    assert.equal(preservedTaxWarning("tax-implausible"), "tax-implausible");
-    // A compound reason (a park reason plus the warning, joined by ";" the
-    // same way worker.ts's note() builds it) still yields the marker alone —
-    // the other half of the reason is a park explanation, not a fact worth
-    // carrying into BOOKED.
-    assert.equal(preservedTaxWarning("weak-dup:row-a;tax-implausible"), "tax-implausible");
-    // Anything else — a defer reason, a park reason with no warning, absence —
-    // must NOT be mistaken for the marker and ride along into BOOKED.
-    assert.equal(preservedTaxWarning("push-paused"), null);
-    assert.equal(preservedTaxWarning(null), null);
-    assert.equal(preservedTaxWarning(undefined), null);
+test("the tax warning is read from its OWN column, not from stateReason", () => {
+    // THE ROUND-20 FINDING. Routing wrote the marker into `stateReason`, and
+    // a deferred booking then replaced that column with `push-disabled` or
+    // `push-paused` -- which is EVERY row during the disabled-push cutover.
+    // The BOOKED transition read the marker out of whatever the column held at
+    // that moment, so the evidence was already gone. It has its own column
+    // now, written once by routing and touched by nothing else.
+    assert.equal(
+        preservedTaxWarning({ taxWarning: "tax-implausible", stateReason: "push-disabled" }),
+        "tax-implausible",
+        "a deferred booking cannot erase it",
+    );
+    assert.equal(
+        preservedTaxWarning({ taxWarning: "tax-implausible", stateReason: null }),
+        "tax-implausible",
+    );
+    assert.equal(
+        preservedTaxWarning({ taxWarning: null, stateReason: "push-paused" }),
+        null,
+        "and a defer reason is still not a warning",
+    );
+
+    // PRE-FIX CONTROL: reading `stateReason` alone loses it the moment a
+    // defer reason lands there. This is the shipped behaviour, restated.
+    assert.equal(
+        preservedTaxWarning({ stateReason: "push-disabled" }),
+        null,
+        "the old source of truth says the receipt had a clean tax read",
+    );
+
+    // THE FALLBACK, for rows already mid-flight when the column was added: one
+    // sitting in BOOKING with the marker in the old place must not lose it at
+    // deploy time.
+    assert.equal(
+        preservedTaxWarning({ stateReason: "tax-implausible" }),
+        "tax-implausible",
+    );
+    assert.equal(
+        preservedTaxWarning({ stateReason: "weak-dup:row-a;tax-implausible" }),
+        "tax-implausible",
+        "including a compound reason, the way note() builds one",
+    );
+    assert.equal(preservedTaxWarning({}), null);
+    assert.equal(preservedTaxWarning({ taxWarning: null, stateReason: null }), null);
+    // A column carrying something ELSE is not the marker.
+    assert.equal(preservedTaxWarning({ taxWarning: "something-else" }), null);
 });
 
 test("backoff is 5m / 15m / 1h / 6h and then stays at 6h", () => {

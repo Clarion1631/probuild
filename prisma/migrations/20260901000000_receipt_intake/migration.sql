@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
     "state" TEXT NOT NULL DEFAULT 'STAGING',
     "dryRun" BOOLEAN NOT NULL DEFAULT true,
     "stateReason" TEXT,
+    "taxWarning" TEXT,
     "projectId" TEXT,
     "costCodeId" TEXT,
     "suggestedCostCodeId" TEXT,
@@ -74,6 +75,10 @@ ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "sendAttempted" BOOLEAN NOT
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3);
+-- The dropped-tax-reading marker's DURABLE home. It lived in stateReason,
+-- which every deferred booking and every park overwrites, so the evidence
+-- was gone by the time the row reached BOOKED.
+ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxWarning" TEXT;
 
 -- THE STATE DEFAULT IS REPAIRED, not merely declared on a fresh table.
 -- CREATE TABLE above carries DEFAULT 'STAGING'; a table an earlier Phase-1

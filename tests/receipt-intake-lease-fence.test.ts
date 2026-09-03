@@ -22,7 +22,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(__dirname, "..");
@@ -409,4 +409,34 @@ test("the DB-gated proof builds its OWN client, never the singleton", () => {
     assert.match(db, /const shortTx = /, "it builds the short transaction over its own client");
     assert.match(db, /db!\.\$transaction\(tx => body\(tx\), \{ maxWait: 5_000, timeout: 5_000 \}\)/,
         "with the SAME options as the shipped helper, so the protocol is what is measured");
+});
+
+// -- A MESSAGE PASSED TO A NO-ARGUMENT MATCHER IS NOT AN ASSERTION ---------
+//
+// `expect(x).toBeUndefined("why")` does not check anything: Playwright
+// refuses it with `Matcher error: this matcher must not have an expected
+// argument`, so the test fails on the CALL rather than on the value -- and
+// while it is failing it is telling you nothing about the value at all. It
+// cost a red CI run on the round-19 /start union specs, where three
+// assertions about the response shape had never once been evaluated. The
+// message belongs on expect(): `expect(x, "why").toBeUndefined()`.
+//
+// tsc does not catch it (Playwright types these matchers as `(...args: any)`),
+// so a source check is the only thing that can.
+
+test("no e2e spec passes a message to a matcher that takes no argument", () => {
+    const dir = path.join(ROOT, "e2e");
+    const specs = readdirSync(dir).filter(name => name.endsWith(".spec.ts"));
+    assert.ok(specs.length > 10, "the spec folder was found");
+
+    const noArgMatchers = /\.(toBeTruthy|toBeFalsy|toBeUndefined|toBeDefined|toBeNull|toBeNaN)\(\s*[^)\s]/g;
+    const offenders: string[] = [];
+    for (const name of specs) {
+        const body = readFileSync(path.join(dir, name), "utf8");
+        body.split(/\r?\n/).forEach((line, i) => {
+            noArgMatchers.lastIndex = 0;
+            if (noArgMatchers.test(line)) offenders.push(`${name}:${i + 1} ${line.trim()}`);
+        });
+    }
+    assert.deepEqual(offenders, [], `pass the message to expect() instead:\n${offenders.join("\n")}`);
 });

@@ -3064,6 +3064,10 @@ model ReceiptIntake {
   /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |
   /// push-disabled | push-paused
   stateReason String?
+  /// tax-implausible, and nothing else. A DURABLE marker: `stateReason` is
+  /// overwritten by every deferred booking and every park, so a warning left
+  /// there did not survive to BOOKED. Written once by routing.
+  taxWarning  String?
 
   projectId           String?
   project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)

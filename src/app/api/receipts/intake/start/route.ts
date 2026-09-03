@@ -361,16 +361,29 @@ export async function POST(req: Request) {
                 // The re-arm's identity writes still happen, because a recovery
                 // may legitimately arrive with a CORRECTED expected hash — they
                 // just land on the SAME path and the SAME lease version.
+                // THE IDENTITY WRITES NO LONGER RIDE ALONG. `expectedSha256`
+                // and `mimeType` are part of a LIVE lease's identity, and
+                // passing them here is how a second caller came to overwrite
+                // the announced hash while keeping the same generation: two
+                // callers, one lease, two documents, and only the last hash
+                // could finalize. They are now compared instead (a
+                // disagreement is a 409), and only the recovery's own state
+                // writes are extended through.
                 const keptRecovery = await reuseLiveLease(existing, ext, leaseDepsFor(deadline), {
-                    expectedSha256,
                     fileSha256: "",
-                    mimeType,
                     fileSize: 0,
                     nextRetryAt: null,
-                });
+                }, expectedSha256);
                 if (keptRecovery) {
                     if (keptRecovery.kind === "storage-unavailable") {
                         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                    }
+                    if (keptRecovery.kind === "identity-conflict") {
+                        return leaseIdentityConflict(
+                            existing.id,
+                            keptRecovery.field,
+                            keptRecovery.expiresAt,
+                        );
                     }
                     if (keptRecovery.kind === "conflict") return leaseConflict(existing.id);
                     return startOk({
@@ -584,10 +597,19 @@ export async function POST(req: Request) {
             }
             // A LIVE LEASE IS NOT INVALIDATED BY A RETRY. Same rule, same
             // helper, as the recoverable re-arm above.
-            const kept = await reuseLiveLease(existing, ext, leaseDepsFor(deadline));
+            const kept = await reuseLiveLease(
+                existing,
+                ext,
+                leaseDepsFor(deadline),
+                {},
+                expectedSha256,
+            );
             if (kept) {
                 if (kept.kind === "storage-unavailable") {
                     return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                }
+                if (kept.kind === "identity-conflict") {
+                    return leaseIdentityConflict(existing.id, kept.field, kept.expiresAt);
                 }
                 if (kept.kind === "conflict") return leaseConflict(existing.id);
                 return startOk({
@@ -794,6 +816,33 @@ async function repathWithCleanup(
     }
 }
 
+/**
+ * A LIVE LEASE THIS REQUEST DISAGREES WITH.
+ *
+ * Distinct from `leaseConflict` on purpose: that one means "the row moved
+ * while your URL was being issued, try again" and a retry usually works.
+ * This one means "somebody else holds a live lease for a DIFFERENT document
+ * or a different file type", and retrying changes nothing until that lease
+ * lapses -- so the expiry is in the body, and the caller can wait for it or
+ * start a separate intake under its own sourceRef.
+ */
+function leaseIdentityConflict(existingId: string, field: string, expiresAt: Date) {
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "lease-conflict",
+            reason: field === "sha256"
+                ? "a live upload lease for this row was issued for different bytes; wait for it to expire or start a separate intake"
+                : "a live upload lease for this row was issued for a different file type; wait for it to expire or start a separate intake",
+            field,
+            retryable: true,
+            leaseExpiresAt: expiresAt.toISOString(),
+            existingId,
+        },
+        { status: 409 },
+    );
+}
+
 function leaseConflict(existingId: string) {
     return NextResponse.json(
         {
@@ -820,6 +869,10 @@ async function reloadLeaseRow(id: string) {
         select: {
             id: true, state: true, stateReason: true, storagePath: true,
             uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
+            // Part of a LIVE lease's identity, so the re-read has to carry it:
+            // an undefined here would let a retry ADOPT a hash the row already
+            // announced, which is the disagreement the guard exists to catch.
+            expectedSha256: true,
         },
     });
 }

@@ -27,6 +27,11 @@ export interface LeaseRow extends ObservedRow {
     storagePath: string;
     /** Null on rows that never had a signed URL (the single-shot path). */
     uploadUrlExpiresAt: Date | null;
+    /**
+     * The hash the LIVE lease was issued for. Part of the lease's identity:
+     * see reuseLiveLease. Empty on a row that never announced one.
+     */
+    expectedSha256?: string | null;
 }
 
 export interface SignedUpload {
@@ -98,9 +103,34 @@ export function newLeaseNonce(): string {
     return randomUUID();
 }
 
+/**
+ * A LIVE LEASE'S IDENTITY IS IMMUTABLE FOR ITS LIFETIME.
+ *
+ * Path, declared MIME (which the path's extension encodes) and announced
+ * sha256 are fixed when the lease is issued. A retry that agrees with all
+ * three may extend it; one that disagrees may not have it, because both
+ * outcomes of allowing it are broken:
+ *
+ *   - a DIFFERENT extension made liveLeasePath refuse the path, and the
+ *     caller then fell through to the destructive resume: a new version, a
+ *     new path and a new generation, while the first caller's signed URL was
+ *     still live and still pointed at the object that was about to be
+ *     orphaned.
+ *   - a DIFFERENT expectedSha256 was written straight through the extension,
+ *     keeping the same generation, so two callers held ONE lease for two
+ *     different documents and only whichever hash landed last could
+ *     finalize.
+ *
+ * So it is a refusal, and it carries the live lease's expiry: the caller can
+ * wait for it to lapse (after which the destructive branch is safe, because
+ * nothing live relies on it any more) or start a separate intake.
+ */
+export type LeaseIdentityField = "mime" | "sha256";
+
 export type LeaseReuse =
     | { kind: "signed"; signed: IssuedLease }
     | { kind: "storage-unavailable" }
+    | { kind: "identity-conflict"; field: LeaseIdentityField; expiresAt: Date }
     | { kind: "conflict" };
 
 /**
@@ -115,9 +145,32 @@ export type LeaseReuse =
  *     pointing at an object whose name disagrees with its type.
  */
 export function liveLeasePath(row: LeaseRow, ext: string, now: number = Date.now()): string | null {
-    if (!row.uploadUrlExpiresAt || row.uploadUrlExpiresAt.getTime() <= now) return null;
+    if (!hasLiveLease(row, now)) return null;
     const named = uploadPathFor(row.id, row.uploadLeaseVersion, ext);
     return named === row.storagePath ? named : null;
+}
+
+/**
+ * Is there a lease at all, whatever this request's extension says?
+ *
+ * liveLeasePath collapses two very different answers into null -- "nothing
+ * live here, go take a new lease" and "there IS a live lease, but you are
+ * asking about a different file type". The second is a refusal, not an
+ * invitation to repath: the previous caller's URL still works.
+ */
+export function hasLiveLease(row: LeaseRow, now: number = Date.now()): boolean {
+    return !!row.uploadUrlExpiresAt && row.uploadUrlExpiresAt.getTime() > now;
+}
+
+/**
+ * Does this request agree with the live lease's announced hash?
+ *
+ * An empty stored value is adopted rather than compared -- a legacy row, or
+ * one whose lease predates the field, has announced nothing to disagree with.
+ */
+export function sha256Agrees(row: LeaseRow, expectedSha256: string): boolean {
+    const held = (row.expectedSha256 ?? "").toLowerCase();
+    return !held || held === expectedSha256.toLowerCase();
 }
 
 /**
@@ -215,17 +268,42 @@ export async function reuseLiveLease(
     ext: string,
     deps: LeaseDeps,
     rearm: Record<string, unknown> = {},
+    /**
+     * The hash THIS request announced. A live lease's is immutable, so a
+     * disagreement is a refusal rather than an overwrite -- see LeaseReuse.
+     */
+    expectedSha256 = "",
 ): Promise<LeaseReuse | null> {
     const now = () => (deps.now ? deps.now() : Date.now());
     let observed: LeaseRow = row;
 
     for (let attempt = 0; attempt < MAX_LEASE_ADOPTION_ATTEMPTS; attempt++) {
-        const path = liveLeasePath(observed, ext, now());
-        // No live lease to reuse. The caller falls through to its destructive
-        // branch, which is safe precisely because nothing live relies on this
-        // row any more. On a re-read this can also mean the winner took a NEW
-        // lease at a new path, which is equally a "not my business" answer.
-        if (!path) return null;
+        const at = now();
+        const path = liveLeasePath(observed, ext, at);
+        if (!path) {
+            // A LIVE LEASE THIS REQUEST DISAGREES WITH IS A REFUSAL, never a
+            // fall-through: the destructive branch would repath and rotate a
+            // lease whose signed URL is still in somebody's hands.
+            if (hasLiveLease(observed, at)) {
+                return {
+                    kind: "identity-conflict",
+                    field: "mime",
+                    expiresAt: observed.uploadUrlExpiresAt as Date,
+                };
+            }
+            // Nothing live relies on this row any more, so the caller's
+            // destructive branch is safe. On a re-read this can also mean the
+            // winner took a NEW lease at a new path, which is equally a
+            // "not my business" answer.
+            return null;
+        }
+        if (!sha256Agrees(observed, expectedSha256)) {
+            return {
+                kind: "identity-conflict",
+                field: "sha256",
+                expiresAt: observed.uploadUrlExpiresAt as Date,
+            };
+        }
 
         // The generation this adoption will hand back. A row that already has
         // one keeps it; a legacy row that never had one (null) gets a fresh
@@ -235,7 +313,16 @@ export async function reuseLiveLease(
         const { count } = await deps.db.updateMany({
             where: { id: observed.id, storagePath: observed.storagePath, ...leaseFence(observed) },
             data: {
+                // `rearm` carries a recovery's own state writes (clearing the
+                // verified hash, cancelling a retry). It must NOT carry the
+                // lease's identity -- see the guards above: a live lease's
+                // expectedSha256 and mime are fixed, and writing them here is
+                // exactly how two callers came to share one generation for two
+                // different documents.
                 ...rearm,
+                // ADOPTED, not overwritten: a legacy lease that announced no
+                // hash takes this request's, which sha256Agrees just allowed.
+                expectedSha256: observed.expectedSha256 || expectedSha256 || null,
                 uploadUrlExpiresAt: extendedExpiry(observed.uploadUrlExpiresAt, deps.expiresAt()),
                 uploadLeaseNonce: uploadLease,
             },

@@ -40,6 +40,9 @@ import {
     resolveTargetUrl,
     targetLine,
     verifyProdIdentity,
+    looksLikeSupabase,
+    projectRefOf,
+    PROJECT_REF_ENV,
 } from "../scripts/apply-receipt-intake.mjs";
 import { RECEIPT_INTAKE_STATES as RUNTIME_STATES } from "../src/lib/receipt-intake/route-state";
 
@@ -757,7 +760,7 @@ test("an ambient DATABASE_URL is NOT a target: no flag, no run", () => {
     // A wrong target is refused too, rather than silently meaning prod.
     const staging = chooseTarget(["node", "s.mjs", "--target", "staging", "--yes"]);
     assert.equal(staging.ok, false);
-    assert.match(String((staging as { reason?: string }).reason), /only target is prod/);
+    assert.match(String((staging as { reason?: string }).reason), /Targets are prod and ci/);
 
     // ...and a bare `--target` with nothing after it.
     assert.equal(chooseTarget(["node", "s.mjs", "--target"]).ok, false);
@@ -767,6 +770,73 @@ test("an ambient DATABASE_URL is NOT a target: no flag, no run", () => {
         ok: true,
         target: "prod",
     });
+    // ...and so is the CI one, which is a different database entirely.
+    assert.deepEqual(chooseTarget(["node", "s.mjs", "--target", "ci", "--yes"]), {
+        ok: true,
+        target: "ci",
+    });
+});
+
+test("--target ci takes the ambient URL, and REFUSES a Supabase one", () => {
+    // The CI driver builds a throwaway database and runs the real script
+    // against it, so this target has to read the ambient URL -- and it must
+    // never be able to reach a real project through that door.
+    const before = process.env.DATABASE_URL;
+    try {
+        process.env.DATABASE_URL = "postgresql://probuild:probuild@localhost:5432/probuild_apply";
+        const ci = resolveTargetUrl("ci");
+        assert.match(ci.url, /localhost/);
+        assert.match(ci.from, /--target ci/);
+
+        // A pooler URL, a direct URL -- both refused.
+        for (const url of [
+            "postgresql://postgres.abc:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres",
+            "postgresql://postgres:pw@db.ghzdbzdnwjxazvmcefbh.supabase.co:5432/postgres",
+        ]) {
+            process.env.DATABASE_URL = url;
+            assert.throws(() => resolveTargetUrl("ci"), /REFUSING/, url);
+            assert.equal(looksLikeSupabase(url), true);
+        }
+
+        delete process.env.DATABASE_URL;
+        assert.throws(() => resolveTargetUrl("ci"), /DATABASE_URL is required/);
+    } finally {
+        if (before === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = before;
+    }
+
+    // And a local URL is NOT mistaken for Supabase.
+    assert.equal(looksLikeSupabase("postgresql://u:p@localhost:5432/db"), false);
+});
+
+test("the ci identity check proves the target is NOT production", async () => {
+    const query = async () => [{ db: "probuild_apply", host: "" }] as unknown[];
+
+    const ok = await verifyProdIdentity(
+        query,
+        "localhost",
+        "",
+        undefined,
+        "ci",
+    );
+    assert.deepEqual(
+        ok.problems,
+        [],
+        "no baseline row and no project ref are required of a throwaway database",
+    );
+    assert.match(ok.line, /project=\(ci\)/);
+    assert.match(ok.line, /database=probuild_apply/);
+
+    // Pointed at Supabase it refuses, even though every other fact checks out.
+    const wrong = await verifyProdIdentity(
+        query,
+        "aws-0-us-west-2.pooler.supabase.com",
+        "",
+        undefined,
+        "ci",
+    );
+    assert.equal(wrong.problems.length, 1);
+    assert.match(wrong.problems[0], /REFUSING: --target ci was pointed at/);
 });
 
 test("--target prod reads .env.production.local, and IGNORES the environment", () => {
@@ -800,26 +870,48 @@ test("--target prod reads .env.production.local, and IGNORES the environment", (
     );
 });
 
-test("the identity check needs the POOLER host and the production BASELINE", async () => {
+test("the identity check needs the POOLER host, the PROJECT and the BASELINE", async () => {
+    const PROD = "ghzdbzdnwjxazvmcefbh";
     const rows = {
         identity: [{ db: "postgres", host: "10.0.0.5" }],
         baseline: [{ migration_name: PROD_BASELINE_MIGRATION }],
     };
     const query = async (sql: string) =>
         (/current_database/.test(sql) ? rows.identity : rows.baseline) as unknown[];
+    const host = `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`;
 
-    const good = await verifyProdIdentity(query, `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`);
-    assert.deepEqual(good.problems, [], "a pooler host with the baseline row IS production");
+    const good = await verifyProdIdentity(query, host, PROD, PROD);
+    assert.deepEqual(good.problems, [], "right host, right project, baseline present");
+    assert.match(good.line, new RegExp(`project=${PROD}`));
+
+    // THE CASE HOST + DATABASE + BASELINE CANNOT SEE. Supabase's pooler
+    // hostnames are shared regionally and every Supabase database is called
+    // `postgres`, so a staging clone migrated off the same baseline presents
+    // an IDENTICAL host, name and migration row. Only the project ref differs.
+    const clone = await verifyProdIdentity(query, host, "stagingclone123456ab", PROD);
+    assert.equal(clone.problems.length, 1);
+    assert.match(clone.problems[0], /is not ghzdbzdnwjxazvmcefbh: same pooler host, different project/);
+
+    // An UNSET variable is a refusal, not a skip: a check that turns itself
+    // off when its input is missing is the check not existing.
+    const unset = await verifyProdIdentity(query, host, PROD, undefined);
+    assert.equal(unset.problems.length, 1);
+    assert.match(unset.problems[0], new RegExp(`${PROJECT_REF_ENV} is not set`));
+
+    // A URL whose username carries no ref cannot satisfy it either.
+    const noRef = await verifyProdIdentity(query, host, "", PROD);
+    assert.equal(noRef.problems.length, 1);
+    assert.match(noRef.problems[0], /no project ref/);
 
     // A local host is refused even when the database is called `postgres`.
-    const local = await verifyProdIdentity(query, "localhost");
+    const local = await verifyProdIdentity(query, "localhost", PROD, PROD);
     assert.equal(local.problems.length, 1);
     assert.match(local.problems[0], /not a \.pooler\.supabase\.com pooler host/);
 
     // And a pooler host WITHOUT the baseline row is refused: migration history
     // is the fact a look-alike database cannot fake.
     rows.baseline = [];
-    const noBaseline = await verifyProdIdentity(query, `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`);
+    const noBaseline = await verifyProdIdentity(query, host, PROD, PROD);
     assert.equal(noBaseline.problems.length, 1);
     assert.match(noBaseline.problems[0], /no 20260814000000_baseline_production row/);
 
@@ -830,30 +922,60 @@ test("the identity check needs the POOLER host and the production BASELINE", asy
             if (/current_database/.test(sql)) return rows.identity as unknown[];
             throw new Error('relation "_prisma_migrations" does not exist');
         },
-        `aws-0-us-west-2${PROD_POOLER_HOST_SUFFIX}`,
+        host,
+        PROD,
+        PROD,
     );
     assert.equal(noTable.problems.length, 1);
     assert.match(noTable.problems[0], /this is not production/);
+});
+
+test("the project ref comes out of the URL USERNAME, which is where it lives", () => {
+    assert.equal(
+        projectRefOf("postgresql://postgres.ghzdbzdnwjxazvmcefbh:pw@aws-0-us-west-2.pooler.supabase.com:6543/postgres"),
+        "ghzdbzdnwjxazvmcefbh",
+    );
+    // Percent-encoding in the userinfo is normal and must not hide the ref.
+    assert.equal(
+        projectRefOf("postgresql://postgres.abc123:p%40ss%3Aword@aws-0-us-west-2.pooler.supabase.com:6543/postgres"),
+        "abc123",
+    );
+    // A direct (non-pooler) URL has a bare username and so carries no ref.
+    assert.equal(projectRefOf("postgresql://postgres:pw@db.example.supabase.co:5432/postgres"), "");
+    // Nothing parseable, nothing claimed.
+    assert.equal(projectRefOf("not a url"), "");
+    assert.equal(projectRefOf(""), "");
 });
 
 test("the TARGET LINE names host, database and baseline -- and no credentials", async () => {
     const line = targetLine({
         host: "aws-0-us-west-2.pooler.supabase.com",
         database: "postgres",
+        projectRef: "ghzdbzdnwjxazvmcefbh",
         baseline: true,
     });
     assert.equal(
         line,
-        "TARGET host=aws-0-us-west-2.pooler.supabase.com database=postgres baseline=present",
+        "TARGET host=aws-0-us-west-2.pooler.supabase.com project=ghzdbzdnwjxazvmcefbh"
+        + " database=postgres baseline=present",
     );
     // It is built from a PARSED hostname and the name the SERVER reported, so
     // there is no path by which a password reaches it. (The URL log line's own
     // redaction is covered by the maskUrl tests above.)
-    const secretish = "postgresql://user:pa:ss@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
+    const secretish = "postgresql://postgres.abc123:pa:ss@aws-0-us-west-2.pooler.supabase.com:6543/postgres";
     assert.equal(hostOf(secretish), "aws-0-us-west-2.pooler.supabase.com");
-    const built = targetLine({ host: hostOf(secretish), database: "postgres", baseline: false });
+    const built = targetLine({
+        host: hostOf(secretish),
+        database: "postgres",
+        projectRef: projectRefOf(secretish),
+        baseline: false,
+    });
     assert.ok(!built.includes("pa:ss"), "no credential can ride in on the host");
-    assert.ok(!built.includes("user"), "nor a username");
+    // The PROJECT REF is published on purpose -- it is a public identifier,
+    // the same one that appears in the Supabase URL -- but the password half
+    // of the userinfo never is.
+    assert.match(built, /project=abc123/);
+    assert.ok(!built.includes("postgres.abc123:"), "the username is not echoed verbatim");
     assert.match(built, /baseline=MISSING/);
     assert.equal(hostOf("not a url at all"), "", "an unparseable URL yields no host, never a fragment");
 });
@@ -881,11 +1003,22 @@ test("main() refuses BEFORE it builds a client, and prints the target BEFORE any
 
     // The old ambient resolver is GONE, not merely unused.
     assert.ok(!script.includes("resolveDatabaseUrl"), "no ambient-first resolver survives");
-    // A CALL, not a mention: the doc comment above the resolver names the
-    // ambient variable it stopped reading, so comment lines are stripped first.
+    // A CALL, not a mention: the doc comments name the ambient variable they
+    // stopped reading, so comment lines are stripped first.
     const code = script
         .split(/\r?\n/)
         .filter(line => !line.trim().startsWith("*") && !line.trim().startsWith("//"))
         .join("\n");
-    assert.ok(!code.includes("process.env.DATABASE_URL"), "and nothing reads the ambient URL");
+    // EXACTLY ONE reader, and it is inside the `--target ci` branch -- a
+    // throwaway database the caller had to name, on a URL that is refused if
+    // it looks like Supabase. The prod path reads .env.production.local and
+    // nothing else.
+    const ambient = code.split("process.env.DATABASE_URL").length - 1;
+    assert.equal(ambient, 1, "one ambient read, in the ci branch");
+    const ciBranch = code.slice(
+        code.indexOf('if (target === "ci")'),
+        code.indexOf('if (target !== "prod")'),
+    );
+    assert.match(ciBranch, /const url = process\.env\.DATABASE_URL;/);
+    assert.match(ciBranch, /looksLikeSupabase\(url\)/, "and it refuses a Supabase URL");
 });

@@ -87,6 +87,12 @@ export interface BookableRow {
      */
     stateReason: string | null;
     /**
+     * The durable dropped-tax-reading marker, written once by routing.
+     * `stateReason` cannot carry it: every deferred booking overwrites that
+     * column with its own reason. See preservedTaxWarning.
+     */
+    taxWarning?: string | null;
+    /**
      * True once a QBO create has been ATTEMPTED for this row. It is the only
      * honest answer to "could a Purchase exist?", and it is what decides whether
      * a park may release the strong key.
@@ -894,7 +900,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // transient and must not survive into BOOKED — but a
                     // dropped-tax-reading warning is a fact about the
                     // DOCUMENT, not about why booking was delayed, and must.
-                    stateReason: preservedTaxWarning(row.stateReason),
+                    stateReason: preservedTaxWarning(row),
                     qbPurchaseId: result.qbPurchaseId,
                     expenseId: expense.id,
                     bookedAt: now,

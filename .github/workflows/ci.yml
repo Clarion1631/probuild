@@ -75,6 +75,24 @@ jobs:
         env:
           RECEIPT_INTAKE_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # THE APPLY SCRIPT ITSELF, run end to end the way production will run it.
+      # Its exported helpers are unit-tested and its statement list is replayed
+      # by the DB-gated suite, but main() is executed by nothing else: not the
+      # flag parsing, not the identity gate, not the statements running in order
+      # against a real server, not the second run being a genuine no-op. It
+      # builds two databases -- one pre-Phase-1, and one carrying the OLD
+      # Phase-1 table with DEFAULT 'RECEIVED' so the additive upgrade and the
+      # state-default repair are exercised -- and asserts both end up matching
+      # what the committed migration produces.
+      #
+      # `--target ci` inside the driver: the ambient URL, no production baseline
+      # or project-ref check, and a refusal if that URL looks like Supabase.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-receipt-intake-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply_fresh
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

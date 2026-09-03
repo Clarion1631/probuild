@@ -38,6 +38,7 @@ import {
     DRYRUN_PARK_RETRY_MS,
     QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
+import { preservedTaxWarning } from "../src/lib/receipt-intake/route-state";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
@@ -119,7 +120,13 @@ interface Harness {
         patch?: Partial<ReadPatch>; ownership?: { state: string; claimToken: string | null };
     }[];
     promoted: string[];
-    finished: { id: string; claimToken: string | null; stateReason: string | null }[];
+    finished: {
+        id: string;
+        claimToken: string | null;
+        stateReason: string | null;
+        /** The DURABLE marker routing wrote, distinct from the display copy. */
+        taxWarning: string | null;
+    }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
     releasedClaims: { id: string; nextRetryAt: Date }[];
@@ -178,8 +185,8 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
             h.states.push({ id, state, reason, patch, ownership });
             return true;
         },
-        finishRouting: async (id, claimToken, stateReason) => {
-            h.finished.push({ id, claimToken, stateReason });
+        finishRouting: async (id, claimToken, stateReason, taxWarning) => {
+            h.finished.push({ id, claimToken, stateReason, taxWarning });
         },
         companyTimeZone: async () => "America/Los_Angeles",
         promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
@@ -214,7 +221,7 @@ test("DRY RUN: a received row is read, deduped and routed — and never booked",
     // The claim leaves the row RECEIVED and holding its lease; finishRouting is
     // the only thing that publishes READ, after every dedup net has answered.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
     assert.equal(h.applied[0].vendor, "Lowes");
     assert.equal(h.applied[0].totalCents, 36498);
     assert.equal(h.applied[0].taxCents, 2920);
@@ -838,7 +845,7 @@ test("the strong claim is attempted with the key, before any weak lookup", async
     // The claim writes the KEYS but leaves the row RECEIVED and holding its
     // lease. READ is reached only by finishRouting, once every net has spoken.
     assert.equal(h.applied[0].state, "RECEIVED");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("the lease is held through routing and released only at the end", async () => {
@@ -943,7 +950,7 @@ test("a plausible tax is stored and the row carries no note", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, 2920, "29.20 of 364.98 is ~8%");
     assert.equal(h.applied[0].stateReason, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("an implausible tax nulls taxCents, notes the row, and does NOT park it", async () => {
@@ -957,7 +964,14 @@ test("an implausible tax nulls taxCents, notes the row, and does NOT park it", a
     assert.equal(h.applied[0].taxCents, null, "the bad reading is dropped, not booked");
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
     assert.deepEqual(summary.byState, { READ: 1 }, "READ, not NEEDS_REVIEW");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{
+        id: "row-1",
+        claimToken: "claim-1",
+        stateReason: "tax-implausible",
+        // AND IN ITS OWN COLUMN. `stateReason` is a display copy that every
+        // deferred booking and every park overwrites; this one is durable.
+        taxWarning: "tax-implausible",
+    }]);
 });
 
 test("the tax note survives alongside a dedup reason", async () => {
@@ -982,7 +996,7 @@ test("the row stores only the tax BOOKING accepted, never a rejected reading", a
     await runIntakeWorker(h.deps);
     // buildGroups refuses to split tax on a check, so nothing was accepted.
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible", taxWarning: "tax-implausible" }]);
 });
 
 test("a check with no tax reading books clean, with no note", async () => {
@@ -994,7 +1008,7 @@ test("a check with no tax reading books clean, with no note", async () => {
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("a tax equal to the total is refused end to end", async () => {
@@ -1004,7 +1018,7 @@ test("a tax equal to the total is refused end to end", async () => {
     await runIntakeWorker(h.deps);
     assert.equal(h.applied[0].taxCents, null);
     assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible" }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: "tax-implausible", taxWarning: "tax-implausible" }]);
 });
 
 // ── Fail-closed classifier (round-5 item 4) ────────────────────────────────
@@ -1071,7 +1085,7 @@ test("INTERLEAVING: a job assigned after the claim is honoured, not parked NEEDS
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { READ: 1 }, "routed, not parked");
     assert.deepEqual(h.states, [], "no NEEDS_JOB park was written");
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "claim-1", stateReason: null, taxWarning: null }]);
 });
 
 test("a row with no job at claim time AND none at routing time still parks", async () => {
@@ -1288,7 +1302,7 @@ test("finishRouting is handed the token the pass claimed with", async () => {
     // actually holds.
     const h = harness([workerRow({ claimToken: "token-abc" })]);
     await runIntakeWorker(h.deps);
-    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null }]);
+    assert.deepEqual(h.finished, [{ id: "row-1", claimToken: "token-abc", stateReason: null, taxWarning: null }]);
 });
 
 // ── A successor reclaiming mid-flight (Phase 2 gate) ───────────────────────
@@ -1569,10 +1583,25 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
         /await deps\.sign\(path, \{ upsert: true \}\)/,
         "the shared rule signs the path it kept, with the overwrite capability it needs",
     );
+    // The liveness test is its OWN predicate now, because two different
+    // answers used to collapse into liveLeasePath's null: "nothing live here,
+    // take a new lease" and "there IS a live lease, but for a different file
+    // type". The second is a refusal -- repathing it orphans an object whose
+    // URL is still in somebody's hands.
     assert.match(
         lease,
-        /if \(!row\.uploadUrlExpiresAt \|\| row\.uploadUrlExpiresAt\.getTime\(\) <= now\) return null;/,
+        /export function hasLiveLease\(row: LeaseRow, now: number = Date\.now\(\)\): boolean \{/,
         "the live-lease retry is gated on the lease still being live",
+    );
+    assert.match(
+        lease,
+        /return !!row\.uploadUrlExpiresAt && row\.uploadUrlExpiresAt\.getTime\(\) > now;/,
+        "and the gate is an expiry comparison, not a proxy for one",
+    );
+    assert.match(
+        lease,
+        /if \(hasLiveLease\(observed, at\)\) \{[\s\S]{0,300}?kind: \"identity-conflict\"/,
+        "a live lease this request disagrees with is refused, never repathed",
     );
 });
 
@@ -2106,5 +2135,86 @@ test("the deadline reaches storage, not just QuickBooks", () => {
         (cron.match(/downloadVerified\(storagePath, expectedSha256, undefined, invocationDeadline\)/g) ?? []).length,
         2,
         "both the worker's read and the booking's read",
+    );
+});
+
+// -- The tax warning survives every route to BOOKED (round-20 finding 2) ----
+//
+// Routing recorded the marker in `stateReason`, and applyBookResult then
+// replaced that column with its own reason on the deferred path -- which is
+// EVERY row during the disabled-push cutover, because a disabled push is
+// exactly a defer. The BOOKED transition read the marker out of whatever the
+// column held by then, so an automatically booked receipt with a bad tax read
+// became indistinguishable from one with a clean read. The evidence has its
+// own column now.
+
+test("tax-implausible -> DEFERRED -> BOOKED keeps the marker", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+
+    // What routing durably wrote.
+    const routed = h.finished[0];
+    assert.equal(routed.taxWarning, "tax-implausible");
+
+    // The deferred booking, exactly as applyBookResult performs it: the
+    // stateReason column is replaced with the defer reason. Nothing writes
+    // taxWarning.
+    const afterDefer = {
+        taxWarning: routed.taxWarning,
+        stateReason: "push-disabled",
+    };
+
+    // ...and the BOOKED transition still finds it.
+    assert.equal(preservedTaxWarning(afterDefer), "tax-implausible");
+
+    // PRE-FIX CONTROL: reading the display copy alone, which is what shipped.
+    assert.equal(
+        preservedTaxWarning({ stateReason: afterDefer.stateReason }),
+        null,
+        "the old source of truth reports a clean tax read on a receipt that had none",
+    );
+});
+
+test("tax-implausible -> QBO REVIEW park keeps the marker too", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    const routed = h.finished[0];
+
+    // A park writes its own reason into stateReason, the same way.
+    const parked = {
+        taxWarning: routed.taxWarning,
+        stateReason: "qbo-fault:6240",
+    };
+    assert.equal(preservedTaxWarning(parked), "tax-implausible");
+    assert.equal(preservedTaxWarning({ stateReason: parked.stateReason }), null, "the control");
+
+    // And a receipt whose tax read was CLEAN never acquires one.
+    const clean = harness([workerRow()]);
+    await runIntakeWorker(clean.deps);
+    assert.equal(clean.finished[0].taxWarning, null);
+    assert.equal(
+        preservedTaxWarning({ taxWarning: clean.finished[0].taxWarning, stateReason: "push-disabled" }),
+        null,
+    );
+});
+
+test("every routing exit carries the durable marker, not just the READ one", async () => {
+    // The gated and dedup exits go through applyState with the read patch, so
+    // the marker rides in `base` rather than being added per branch -- one
+    // place, and a new exit gets it for free.
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "292.00" } } as ReadOutcome),
+        findWeakHit: async () => ({ id: "row-twin" }),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible", "the display copy");
+    assert.equal(
+        (h.states[0].patch as { taxWarning?: string | null }).taxWarning,
+        "tax-implausible",
+        "and the durable one, in the same write",
     );
 });

@@ -104,6 +104,7 @@ const WORKER_ROW_SELECT = {
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true, lastError: true,
     suggestedConfidence: true, sendAttempted: true, claimToken: true, fileSha256: true,
     createdAt: true, dedupWeakKey: true, busyPasses: true, stateReason: true,
+    taxWarning: true,
 } as const;
 
 /**
@@ -735,7 +736,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         },
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
-        finishRouting: async (rowId, claimToken, stateReason) => {
+        finishRouting: async (rowId, claimToken, stateReason, taxWarning) => {
             // FENCED on state AND token, and it clears both claim fields.
             //
             // The state alone is not enough: a worker whose invocation was
@@ -749,6 +750,9 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 data: {
                     state: "READ",
                     stateReason,
+                    // The DURABLE copy. Nothing downstream writes this column,
+                    // so it is still there when the row reaches BOOKED.
+                    taxWarning,
                     nextRetryAt: null,
                     claimToken: null,
                     claimedAt: null,

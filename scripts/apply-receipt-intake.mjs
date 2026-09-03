@@ -33,6 +33,14 @@
 // .env.production.local and nothing else -- an ambient DATABASE_URL is
 // ignored, not preferred.
 //
+// APPLY_EXPECT_PROJECT_REF must also be exported, and it is what actually
+// pins the DATABASE. Supabase's pooler hostnames are shared regionally and
+// every Supabase database is called `postgres`, so host + name + migration
+// history cannot tell production from a staging clone migrated off the same
+// baseline. The project ref lives in the connection URL's USERNAME
+// (`postgres.<project-ref>`); this script parses it, compares it, prints it,
+// and refuses when the variable is unset.
+//
 // --expect-db and --expect-host are BOTH required alongside --yes, matching
 // scripts/apply-bank-image.mjs: "--yes" alone only proves you meant to run
 // something, and a database NAME alone doesn't prove which SERVER it's on.
@@ -53,6 +61,34 @@ export const PROD_BASELINE_MIGRATION = "20260814000000_baseline_production";
 
 /** Production reaches Postgres through Supabase's pooler, never directly. */
 export const PROD_POOLER_HOST_SUFFIX = ".pooler.supabase.com";
+
+/**
+ * THE ENV VAR THAT NAMES THE PROJECT. Shared by every apply-*.mjs, so one
+ * export covers them all and none of them can drift to its own spelling.
+ */
+export const PROJECT_REF_ENV = "APPLY_EXPECT_PROJECT_REF";
+
+/**
+ * WHICH SUPABASE PROJECT IS THIS URL FOR?
+ *
+ * Host, database name and migration history are NOT enough to tell
+ * production from a staging clone that was migrated from the same
+ * baseline: pooler hosts are shared regionally, so two projects in
+ * us-west-2 present the SAME hostname, and every Supabase database is
+ * called `postgres`. The only thing in the connection string that names the
+ * project is the USERNAME, which the pooler requires in the form
+ * `postgres.<project-ref>`.
+ */
+export function projectRefOf(url) {
+    let username;
+    try {
+        username = decodeURIComponent(new URL(url).username);
+    } catch {
+        return "";
+    }
+    const dot = username.indexOf(".");
+    return dot > 0 ? username.slice(dot + 1) : "";
+}
 
 /**
  * WHICH DATABASE IS THIS RUN FOR? Decided from argv alone, never from the
@@ -76,10 +112,10 @@ export function chooseTarget(argv) {
             reason: "Refusing to run without --target prod. An ambient DATABASE_URL is NOT a target.",
         };
     }
-    if (value !== "prod") {
-        return { ok: false, reason: `Unknown --target ${value}. The only target is prod.` };
+    if (value !== "prod" && value !== "ci") {
+        return { ok: false, reason: `Unknown --target ${value}. Targets are prod and ci.` };
     }
-    return { ok: true, target: "prod" };
+    return { ok: true, target: value };
 }
 
 /**
@@ -92,6 +128,21 @@ export function chooseTarget(argv) {
  * @returns {{ url: string, from: string }}
  */
 export function resolveTargetUrl(target, readFile = fs.readFileSync, exists = fs.existsSync) {
+    if (target === "ci") {
+        // THE ONE PLACE THE AMBIENT URL IS READ, and it is fenced two ways:
+        // the caller had to ask for `--target ci` by name, and a URL that
+        // looks like Supabase is refused outright. The prod guard cannot be
+        // satisfied through this path even by accident -- `ci` never checks
+        // the baseline row or the project ref, so it could not stand in for
+        // it, and this refusal means it cannot reach a Supabase database at
+        // all.
+        const url = process.env.DATABASE_URL;
+        if (!url) throw new Error("DATABASE_URL is required for --target ci");
+        if (looksLikeSupabase(url)) {
+            throw new Error(`REFUSING: --target ci was given a Supabase URL (${hostOf(url)})`);
+        }
+        return { url, from: "the ambient environment (--target ci)" };
+    }
     if (target !== "prod") throw new Error(`no URL source for target ${target}`);
     if (!exists(PROD_ENV_FILE)) {
         throw new Error(`${PROD_ENV_FILE} not found. Run \`vercel env pull ${PROD_ENV_FILE} --environment=production\` first.`);
@@ -99,6 +150,15 @@ export function resolveTargetUrl(target, readFile = fs.readFileSync, exists = fs
     const match = String(readFile(PROD_ENV_FILE, "utf8")).match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
     if (!match) throw new Error(`DATABASE_URL not found in ${PROD_ENV_FILE}`);
     return { url: match[1], from: PROD_ENV_FILE };
+}
+
+/**
+ * Does this URL point at Supabase? Used only to REFUSE -- `--target ci` is
+ * for a throwaway container and must never be able to reach a real project,
+ * pooler or direct.
+ */
+export function looksLikeSupabase(url) {
+    return /supabase\.(co|com)/i.test(String(url));
 }
 
 /** The URL's hostname, or an empty string if it will not parse. */
@@ -117,8 +177,13 @@ export function hostOf(url) {
  * and nothing else. No credentials pass through here: the caller hands it
  * the hostname it parsed and the name the SERVER reported, never the URL.
  */
-export function targetLine({ host, database, baseline }) {
-    return `TARGET host=${host} database=${database} baseline=${baseline ? "present" : "MISSING"}`;
+export function targetLine({ host, database, projectRef, baseline }) {
+    return [
+        `TARGET host=${host}`,
+        `project=${projectRef || "(none)"}`,
+        `database=${database}`,
+        `baseline=${baseline ? "present" : "MISSING"}`,
+    ].join(" ");
 }
 
 /**
@@ -129,10 +194,49 @@ export function targetLine({ host, database, baseline }) {
  * database carries the baseline migration row. A local Postgres can be
  * called anything; it cannot have prod's migration history.
  */
-export async function verifyProdIdentity(query, urlHost) {
+/**
+ * @param {(sql: string, ...args: unknown[]) => Promise<unknown>} query
+ * @param {string} urlHost
+ * @param {string} projectRef  parsed from the URL username
+ * @param {string | undefined} expectRef  APPLY_EXPECT_PROJECT_REF
+ */
+export async function verifyProdIdentity(query, urlHost, projectRef, expectRef, target = "prod") {
     const problems = [];
+    const [row0] = target === "ci"
+        ? await query("SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host")
+        : [null];
+    if (target === "ci") {
+        // The mirror image of the prod checks: this one proves the target is
+        // NOT production. No baseline row is required (the point is to build
+        // the schema from nothing) and no project ref exists.
+        if (looksLikeSupabase(urlHost)) {
+            problems.push(`REFUSING: --target ci was pointed at ${urlHost}`);
+        }
+        const db = String(row0?.db ?? "");
+        if (!db) problems.push("the server did not report a database name");
+        return {
+            problems,
+            actual: row0,
+            line: targetLine({
+                host: urlHost,
+                database: db,
+                projectRef: "(ci)",
+                baseline: false,
+            }),
+        };
+    }
     if (!urlHost.endsWith(PROD_POOLER_HOST_SUFFIX)) {
         problems.push(`host ${urlHost || "(unparseable)"} is not a ${PROD_POOLER_HOST_SUFFIX} pooler host`);
+    }
+    // THE PROJECT REF IS THE ONLY THING THAT SEPARATES PRODUCTION FROM A
+    // MIGRATED CLONE. Unset is a refusal, never a skip: a check that turns
+    // itself off when a variable is missing is the check not existing.
+    if (!expectRef) {
+        problems.push(`${PROJECT_REF_ENV} is not set: nothing identifies WHICH Supabase project this is`);
+    } else if (!projectRef) {
+        problems.push("the URL username carries no project ref (expected postgres.<project-ref>)");
+    } else if (projectRef !== expectRef) {
+        problems.push(`project ${projectRef} is not ${expectRef}: same pooler host, different project`);
     }
     const [row] = await query("SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host");
     const database = String(row?.db ?? "");
@@ -145,7 +249,11 @@ export async function verifyProdIdentity(query, urlHost) {
     if (!baseline) {
         problems.push(`_prisma_migrations has no ${PROD_BASELINE_MIGRATION} row: this is not production`);
     }
-    return { problems, actual: row, line: targetLine({ host: urlHost, database, baseline }) };
+    return {
+        problems,
+        actual: row,
+        line: targetLine({ host: urlHost, database, projectRef, baseline }),
+    };
 }
 
 /**
@@ -228,6 +336,7 @@ export const statements = [
        "state"               TEXT NOT NULL DEFAULT 'STAGING',
        "dryRun"              BOOLEAN NOT NULL DEFAULT true,
        "stateReason"         TEXT,
+       "taxWarning"          TEXT,
        "projectId"           TEXT,
        "costCodeId"          TEXT,
        "suggestedCostCodeId" TEXT,
@@ -284,6 +393,13 @@ export const statements = [
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "archivedByV1" BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimToken" TEXT`,
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "claimedAt" TIMESTAMP(3)`,
+
+    // The dropped-tax-reading marker's DURABLE home. It used to live in
+    // `stateReason`, which every deferred booking and every park overwrites,
+    // so a receipt that booked through the deferred path -- which is every
+    // receipt during the disabled-push cutover -- reached BOOKED with the
+    // warning already erased.
+    `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxWarning" TEXT`,
 
     // THE STATE DEFAULT IS REPAIRED, not just declared on a fresh table.
     //
@@ -425,7 +541,7 @@ export const statements = [
 
 export const expectedColumns = {
     ReceiptIntake: [
-        "id", "source", "sourceRef", "state", "dryRun", "stateReason",
+        "id", "source", "sourceRef", "state", "dryRun", "stateReason", "taxWarning",
         "projectId", "costCodeId", "suggestedCostCodeId", "suggestedConfidence",
         "createdById", "storagePath", "fileName", "mimeType", "fileSize",
         "fileSha256", "expectedSha256", "uploadUrlExpiresAt", "uploadLeaseVersion",
@@ -812,6 +928,9 @@ async function main() {
         const identity = await verifyProdIdentity(
             (sql, ...args) => prisma.$queryRawUnsafe(sql, ...args),
             hostOf(url),
+            projectRefOf(url),
+            process.env[PROJECT_REF_ENV],
+            chosen.target,
         );
         console.log(identity.line);
         if (identity.problems.length) {
