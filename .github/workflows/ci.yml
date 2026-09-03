@@ -224,6 +224,16 @@ jobs:
           PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # Project.name and CostCode.code are columns of the detail CSV, so they are
+      # inputs to the frozen hash - and neither row was held by anything, so a
+      # rename could land between the export read and the lock COMMIT. Two real
+      # connections, both renames, each with a pre-fix control.
+      - name: Prove a rename cannot land while a pay period is being frozen
+        run: npx tsx --test tests/payroll-label-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

@@ -16,7 +16,7 @@
 // mapping write and the export can never disagree about who may act.
 
 import { NextResponse } from "next/server";
-import { getCurrentUserWithPermissions, hasPermission } from "./permissions";
+import { canAccessIntegrations, requireIntegrationAccess } from "./integration-access";
 
 export type GustoViewer = { id: string; role: string };
 
@@ -27,21 +27,16 @@ export type GustoViewer = { id: string; role: string };
  *   if ("response" in gate) return gate.response;
  */
 export async function requireGustoAccess(): Promise<{ viewer: GustoViewer } | { response: NextResponse }> {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) {
-        return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
-    }
-    if (user.role !== "ADMIN" && !hasPermission(user, "financialReports")) {
-        return { response: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
-    }
-    return { viewer: { id: user.id, role: user.role } };
+    // ONE expression, shared with the QuickBooks half of the integration
+    // settings (src/lib/integration-access.ts). It was written here first; the
+    // QuickBooks routes had no gate at all, and giving them a second copy of
+    // this rule is how the two would come to disagree about who may act.
+    return requireIntegrationAccess();
 }
 
 /** True when this viewer may see or change the Gusto integration. For server components. */
 export async function canAccessGusto(): Promise<boolean> {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) return false;
-    return user.role === "ADMIN" || hasPermission(user, "financialReports");
+    return canAccessIntegrations();
 }
 
 /**

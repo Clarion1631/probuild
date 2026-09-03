@@ -19,6 +19,8 @@ import {
   submissionMarker,
   SUBMISSION_KEY_CONFLICT,
   SUBMISSION_KEY_CONFLICT_MESSAGE,
+  publicGithubIssue,
+  toPublicHelpRequest,
 } from "@/lib/help-chat/submission-guard";
 import { findIssueByMarker } from "@/lib/help-chat/github";
 
@@ -133,7 +135,10 @@ export async function POST(req: NextRequest) {
       // draft whose issue had never been created, which is how a report gets
       // lost quietly.
       return helpChatResponse({
-        body: { request: prior, githubIssue: null, duplicate: true },
+        // The ORIGINAL issue, from the stored row, through the channel the
+        // client already reads. It used to arrive as request.externalIssueRef,
+        // i.e. by returning the whole row (round 10, finding 5).
+        body: { request: toPublicHelpRequest(prior), githubIssue: publicGithubIssue(prior), duplicate: true },
         filed: reserved.providerState === "created",
         submissionId: effectiveSubmissionId,
       });
@@ -160,7 +165,7 @@ export async function POST(req: NextRequest) {
       // does not know the outcome, so it must not report one — 202 unless the
       // holder has already finished.
       return helpChatResponse({
-        body: { request: inFlight, duplicate: true, inFlight: true },
+        body: { request: toPublicHelpRequest(inFlight), duplicate: true, inFlight: true },
         filed: inFlight?.providerState === "created",
         submissionId: effectiveSubmissionId,
       });
@@ -178,7 +183,7 @@ export async function POST(req: NextRequest) {
     if (reserved.resume && !alreadyFiled && !(await renewProviderLease(requestId, leaseToken))) {
         const lost = await prisma.helpRequest.findUnique({ where: { id: requestId } });
         return helpChatResponse({
-            body: { request: lost, duplicate: true, inFlight: true, superseded: true },
+            body: { request: toPublicHelpRequest(lost), duplicate: true, inFlight: true, superseded: true },
             filed: lost?.providerState === "created",
             submissionId: effectiveSubmissionId,
         });
@@ -217,7 +222,7 @@ export async function POST(req: NextRequest) {
     const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
     return helpChatResponse({
       body: {
-        request,
+        request: toPublicHelpRequest(request),
         githubIssue: ghIssue ? { number: ghIssue.number, url: ghIssue.url } : null,
         // Somebody else finished this submission while we were filing. The
         // report is real either way; this attempt just is not the one that

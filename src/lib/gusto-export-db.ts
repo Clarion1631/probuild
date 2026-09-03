@@ -138,6 +138,52 @@ async function readExportUsersForShare(
     )) as Array<{ id: string; name: string | null; email: string; payType: string | null }>;
 }
 
+/**
+ * Re-read the referenced Project names FOR SHARE, and use THOSE values.
+ *
+ * `Project.name` and `CostCode.code` are printed in the DETAIL csv, so they are
+ * inputs to the frozen hash exactly like a member's name is - and neither row
+ * was held by anything. A rename committed between the entry read and
+ * lockPayrollPeriod's COMMIT left the period frozen around a file that no
+ * longer described the database at the instant it was frozen (round 10,
+ * finding 3).
+ *
+ * Same technique as readExportUsersForShare: FOR SHARE re-reads rather than
+ * reusing the values the entry query joined, because under READ COMMITTED that
+ * earlier read can already be stale and the point of the lock is to hash what
+ * is committed while it is held.
+ *
+ * LOCK ORDER: after the payroll advisory lock, after the settings rows, after
+ * the TimeEntry read, and in the order Project -> CostCode -> User, each sorted
+ * by id. One order, taken by every path, so two exports cannot deadlock on each
+ * other and a renamer cannot hold one of these while waiting for the payroll
+ * lock (it takes no payroll lock at all).
+ */
+async function readProjectNamesForShare(
+    client: Prisma.TransactionClient,
+    ids: string[]
+): Promise<Map<string, string | null>> {
+    if (ids.length === 0) return new Map();
+    const rows = (await client.$queryRawUnsafe(
+        `SELECT "id", "name" FROM "Project" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE`,
+        ids
+    )) as Array<{ id: string; name: string | null }>;
+    return new Map(rows.map((row) => [row.id, row.name]));
+}
+
+/** The same, for the cost codes whose `code` reaches the detail csv. */
+async function readCostCodesForShare(
+    client: Prisma.TransactionClient,
+    ids: string[]
+): Promise<Map<string, string | null>> {
+    if (ids.length === 0) return new Map();
+    const rows = (await client.$queryRawUnsafe(
+        `SELECT "id", "code" FROM "CostCode" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE`,
+        ids
+    )) as Array<{ id: string; code: string | null }>;
+    return new Map(rows.map((row) => [row.id, row.code]));
+}
+
 export type LoadedGustoExport = GustoExport & {
     periodStart: Date;
     periodEnd: Date;
@@ -382,6 +428,44 @@ export async function findOverlappingLockedPeriods(
     });
 }
 
+/**
+ * THE FROZEN FILE, and nothing else.
+ *
+ * Downloading a locked period used to go through loadGustoExport, which reads
+ * the integration settings, every time entry in the envelope and the whole
+ * roster BEFORE it assembles the snapshot - and any of those can refuse. A
+ * missing Integration row, or a non-employee account with hours, threw before
+ * the endpoint ever reached its snapshot branch, so a file that was already
+ * frozen and already paid became undownloadable because of something that
+ * happened afterwards (round 10, finding 4).
+ *
+ * A locked period does not depend on live payroll. This reads ONE row and
+ * returns what was stored, or null when the period is not locked. It still
+ * fails CLOSED on a locked row whose snapshot is incomplete (round 6): there is
+ * no correct file to serve there either, and a recomputed one is not what was
+ * paid.
+ *
+ * The live comparison the review page shows - "the data has moved since the
+ * lock" - is a separate, best-effort call. It may fail; the download may not.
+ */
+export async function loadLockedSnapshot(
+    startKey: string,
+    endKey: string,
+    client: ExportDbClient = prisma
+): Promise<{ summaryCsv: string; detailCsv: string; exportHash: string; period: PayrollPeriodRow } | null> {
+    const period = await findPayrollPeriod(startKey, endKey, client);
+    if (!period?.lockedAt) return null;
+    if (!lockedSnapshotIsComplete(period)) {
+        throw new LockedSnapshotMissingError(period.periodStartKey ?? startKey, period.periodEndKey ?? endKey);
+    }
+    return {
+        summaryCsv: period.summaryCsvSnapshot as string,
+        detailCsv: period.detailCsvSnapshot as string,
+        exportHash: period.exportHash as string,
+        period,
+    };
+}
+
 export async function loadGustoExport(
     periodStart: Date,
     periodEnd: Date,
@@ -501,6 +585,11 @@ export async function loadGustoExport(
         select: {
             id: true,
             userId: true,
+            // The FOREIGN KEYS, not just the joined labels: the labels are
+            // re-read under FOR SHARE below and these are what identifies the
+            // rows to lock (round 10, finding 3).
+            projectId: true,
+            costCodeId: true,
             startTime: true,
             endTime: true,
             durationHours: true,
@@ -517,6 +606,19 @@ export async function loadGustoExport(
         orderBy: [{ startTime: "asc" }, { id: "asc" }],
     });
 
+    // PIN the two remaining mutable label inputs, in the global order
+    // Project -> CostCode (see readProjectNamesForShare). Outside a transaction
+    // the lock would be released before the next statement, so the joined values
+    // stand - the same rule the settings rows and the roster follow.
+    const projectIds = [...new Set(rows.map((row) => row.projectId).filter((id): id is string => !!id))].sort();
+    const costCodeIds = [...new Set(rows.map((row) => row.costCodeId).filter((id): id is string => !!id))].sort();
+    const lockedProjectNames = isTransactionClient(client)
+        ? await readProjectNamesForShare(client as Prisma.TransactionClient, projectIds)
+        : new Map<string, string | null>();
+    const lockedCostCodes = isTransactionClient(client)
+        ? await readCostCodesForShare(client as Prisma.TransactionClient, costCodeIds)
+        : new Map<string, string | null>();
+
     const entries: ExportEntry[] = rows.map((row) => ({
         id: row.id,
         userId: row.userId,
@@ -528,8 +630,13 @@ export async function loadGustoExport(
         mealOutcome: row.mealOutcome ?? null,
         needsReview: row.needsReview,
         isEdited: row.isEdited,
-        projectName: row.project?.name ?? null,
-        costCodeLabel: row.costCode ? row.costCode.code : null,
+        // The LOCKED value wins. `??` on the map lookup rather than `has`: a row
+        // that is genuinely absent falls back to the joined label instead of
+        // blanking a column, and TimeEntry.projectId is RESTRICT so a project
+        // with hours cannot disappear underneath this anyway.
+        projectName: (row.projectId ? lockedProjectNames.get(row.projectId) : undefined) ?? row.project?.name ?? null,
+        costCodeLabel:
+            (row.costCodeId ? lockedCostCodes.get(row.costCodeId) : undefined) ?? (row.costCode ? row.costCode.code : null),
     }));
 
     // Everyone paid by the hour appears even with no hours (Gusto still wants a

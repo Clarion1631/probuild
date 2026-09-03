@@ -415,10 +415,13 @@ test("a retry after a LOST response replays onto the original report — one iss
         assert.equal(retry.body.duplicate, true);
         assert.equal(retry.body.status, "filed");
         assert.equal(retry.body.request.id, first.body.request.id, "same row, not a second report");
-        assert.equal(
-            retry.body.request.externalIssueRef,
-            `github-issue:${issue.number}`,
-            "the ORIGINAL issue comes back"
+        // The ORIGINAL issue still comes back — through `githubIssue`, the
+        // channel the widget reads, rather than by returning the stored row
+        // with its provider lease token attached (round 10, finding 5).
+        assert.equal(retry.body.githubIssue?.number, issue.number, "the ORIGINAL issue comes back");
+        assert.ok(
+            !("externalIssueRef" in retry.body.request),
+            "and the raw workflow columns do not come with it"
         );
         assert.equal(store.rows.length, 1, "no second HelpRequest row");
         assert.equal(issueCounter, 1, "no second GitHub issue");

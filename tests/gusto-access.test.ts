@@ -33,12 +33,23 @@ test("every Gusto route is gated on ADMIN or financialReports", () => {
 });
 
 test("the gate is EXACTLY the payroll gate used everywhere else in this phase", () => {
-    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-access.ts"), "utf8");
-    // Same expression as the export endpoint, the review page and
-    // requirePayrollAccess — so they cannot disagree about who may act.
-    assert.match(source, /user\.role !== "ADMIN" && !hasPermission\(user, "financialReports"\)/);
-    assert.match(source, /status: 401/);
-    assert.match(source, /status: 403/);
+    // Round 10: the expression moved to src/lib/integration-access.ts and the
+    // Gusto module now DELEGATES to it, because the QuickBooks half of the
+    // integration settings had no gate at all and giving it a second copy of
+    // this rule is how the two would come to disagree about who may act.
+    const gusto = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-access.ts"), "utf8");
+    assert.match(gusto, /return requireIntegrationAccess\(\);/);
+    assert.match(gusto, /return canAccessIntegrations\(\);/);
+    assert.ok(
+        !/hasPermission\(user, "financialReports"\)/.test(gusto),
+        "no second copy of the rule may survive here"
+    );
+
+    // ...and the shared one is still that same expression.
+    const shared = readFileSync(path.join(__dirname, "..", "src", "lib", "integration-access.ts"), "utf8");
+    assert.match(shared, /user\.role !== "ADMIN" && !hasPermission\(user, "financialReports"\)/);
+    assert.match(shared, /status: 401/);
+    assert.match(shared, /status: 403/);
 });
 
 test("the settings page is gated too, not just the routes", () => {

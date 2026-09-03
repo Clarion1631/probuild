@@ -53,6 +53,9 @@ function deps(overrides: {
     return {
         authenticate: async () => (overrides.viewer === undefined ? { role: "ADMIN", canReadFinancialReports: false } : overrides.viewer),
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async () => {
             overrides.onLoad?.();
             return overrides.result ?? loaded();
@@ -188,6 +191,9 @@ test("a lock is found by its STABLE day keys, not by reconstructed timestamps", 
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         // The company zone has CHANGED since the lock was taken.
         resolveTimeZone: async () => "America/New_York",
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async (periodStart, _periodEnd, keys) => {
             seen.push({ start: periodStart, keys });
             return loaded([], snapshot);
@@ -218,6 +224,9 @@ test("the loader is always given the request's day keys, on the live path too", 
     const handler = createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async (_s, _e, keys) => {
             seen.push(keys);
             return loaded();
@@ -254,6 +263,9 @@ test("the zone the boundaries were built from is the zone the loader is given", 
             // there is only one resolution, so the value cannot drift.
             return resolves === 1 ? "America/Los_Angeles" : "Pacific/Honolulu";
         },
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async (periodStart, periodEnd, keys) => {
             seen.push({ start: periodStart, end: periodEnd, timeZone: keys.timeZone });
             return loaded();
@@ -287,6 +299,9 @@ test("a locked period whose frozen CSVs are missing is a 409, never live data", 
     const handler = createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async () => {
             throw new LockedSnapshotMissingError("2026-08-17", "2026-08-31");
         },
@@ -307,6 +322,9 @@ test("an unrelated loader failure is NOT swallowed into that 409", async () => {
     const handler = createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => "America/Los_Angeles",
+        // The frozen-file read (round 10, finding 4). These cases are about the
+        // LIVE path; a snapshot short-circuits before it, so there is none here.
+        loadSnapshot: async () => null,
         load: async () => {
             throw new Error("connection terminated");
         },

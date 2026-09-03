@@ -168,6 +168,72 @@ export function isThrottled(recentCount: number): boolean {
  * submission later; that retry resumes the existing row (reserveHelpRequest's
  * `resume`) and finishes it rather than filing a second report.
  */
+/**
+ * Everything a HelpRequest row may say to the client that submitted it.
+ *
+ * Every help-chat response returned the WHOLE row (round 10, finding 5). That
+ * row carries the provider lease - `providerLeaseToken` is the fencing token
+ * that decides which concurrent attempt is allowed to call GitHub, and
+ * `providerLeaseExpiresAt` is when it can be stolen - plus `providerState`,
+ * `providerIssueRef`, `externalIssueRef` and `slackMessageTs`. None of that is
+ * the reporter's business, and the lease token in particular is a capability:
+ * anything holding it can complete a submission it does not own.
+ *
+ * An ALLOWLIST. The alternative - deleting the five names we happen to know
+ * about - is wrong the moment a sixth workflow column is added, and this row
+ * has grown one in nearly every round of this review.
+ *
+ * What the client actually needs is here: what they reported, where from, and
+ * where it got to. Whether the GitHub issue exists is already answered by
+ * helpChatResponse below, which sets `status` to "filed" or "pending" from the
+ * stored providerState - so nothing is lost by keeping the raw column out.
+ */
+export const PUBLIC_HELP_REQUEST_FIELDS = [
+    "id",
+    "type",
+    "question",
+    "response",
+    "currentPage",
+    "status",
+    "conversationId",
+    "submissionId",
+    "changeDescription",
+    "createdAt",
+    "completedAt",
+    "verifiedAt",
+] as const;
+
+export function toPublicHelpRequest<T extends Record<string, unknown>>(
+    request: T | null | undefined
+): Record<string, unknown> | null {
+    if (!request) return null;
+    const out: Record<string, unknown> = {};
+    for (const field of PUBLIC_HELP_REQUEST_FIELDS) {
+        if (field in request) out[field] = request[field];
+    }
+    return out;
+}
+
+/**
+ * The GitHub issue a stored report points at, in the shape the client already
+ * consumes, or null.
+ *
+ * The provider columns themselves stay out of the response (see
+ * toPublicHelpRequest) - but a REPLAY still has to be able to say which issue
+ * the original attempt filed, and it used to say it by leaking the whole row.
+ * `githubIssue` is the deliberate channel: the widget already reads it, and it
+ * carries the two facts a human wants without the lease token beside them.
+ */
+export function publicGithubIssue(
+    request: { providerIssueRef?: string | null; changeLocation?: string | null } | null | undefined
+): { number: number; url: string | null } | null {
+    const raw = request?.providerIssueRef;
+    if (!raw) return null;
+    const number = Number(raw);
+    if (!Number.isInteger(number) || number <= 0) return null;
+    return { number, url: request?.changeLocation ?? null };
+}
+
 export function helpChatResponse(options: {
   body: Record<string, unknown>;
   filed: boolean;
@@ -362,6 +428,15 @@ export async function completeUnderLease(
     /** Injected so the superseded-attempt branch can be exercised without racing two real requests. */
     client: { $executeRaw: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<number> } = prisma as never
 ): Promise<boolean> {
+    // THE LEASE IS RELEASED HERE. It is a capability - whoever holds the token
+    // may complete this submission - and an attempt that has finished has no
+    // further use for one. Clearing it in the same statement is safe: the WHERE
+    // is evaluated against the pre-update row, so the fencing still holds.
+    //
+    // On the filed branch `providerState = 'created'` is what stops a re-claim
+    // (claimProviderLease refuses a created row); on the pending branch
+    // releasing the lease is the point, because a later retry has to be able to
+    // resume the report.
     const updated = outcome.filed
         ? await client.$executeRaw`
             UPDATE "HelpRequest"
@@ -369,12 +444,16 @@ export async function completeUnderLease(
                 "changeLocation" = ${outcome.issueUrl},
                 "externalIssueRef" = ${`github-issue:${outcome.issueNumber}`},
                 "providerIssueRef" = ${String(outcome.issueNumber)},
-                "providerState" = 'created'
+                "providerState" = 'created',
+                "providerLeaseToken" = NULL,
+                "providerLeaseExpiresAt" = NULL
             WHERE "id" = ${requestId} AND "providerLeaseToken" = ${leaseToken}
         `
         : await client.$executeRaw`
             UPDATE "HelpRequest"
-            SET "status" = ${outcome.status}, "providerState" = 'pending'
+            SET "status" = ${outcome.status}, "providerState" = 'pending',
+                "providerLeaseToken" = NULL,
+                "providerLeaseExpiresAt" = NULL
             WHERE "id" = ${requestId} AND "providerLeaseToken" = ${leaseToken}
         `;
     return updated === 1;

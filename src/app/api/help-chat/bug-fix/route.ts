@@ -18,6 +18,7 @@ import {
   submissionMarker,
   SUBMISSION_KEY_CONFLICT,
   SUBMISSION_KEY_CONFLICT_MESSAGE,
+  toPublicHelpRequest,
 } from "@/lib/help-chat/submission-guard";
 import { findIssueByMarker } from "@/lib/help-chat/github";
 
@@ -116,7 +117,7 @@ export async function POST(req: NextRequest) {
       const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
       // Same rule as /request: a replay is only terminal once the issue exists.
       return helpChatResponse({
-        body: { request: prior, duplicate: true },
+        body: { request: toPublicHelpRequest(prior), duplicate: true },
         filed: reserved.providerState === "created",
         submissionId,
       });
@@ -140,7 +141,7 @@ export async function POST(req: NextRequest) {
     if (!leaseToken) {
       const inFlight = await prisma.helpRequest.findUnique({ where: { id: requestId } });
       return helpChatResponse({
-        body: { request: inFlight, duplicate: true, inFlight: true },
+        body: { request: toPublicHelpRequest(inFlight), duplicate: true, inFlight: true },
         filed: inFlight?.providerState === "created",
         submissionId,
       });
@@ -158,7 +159,7 @@ export async function POST(req: NextRequest) {
     if (reserved.resume && !alreadyFiled && !(await renewProviderLease(requestId, leaseToken))) {
         const lost = await prisma.helpRequest.findUnique({ where: { id: requestId } });
         return helpChatResponse({
-            body: { request: lost, duplicate: true, inFlight: true, superseded: true },
+            body: { request: toPublicHelpRequest(lost), duplicate: true, inFlight: true, superseded: true },
             filed: lost?.providerState === "created",
             submissionId,
         });
@@ -207,7 +208,7 @@ export async function POST(req: NextRequest) {
       // what actually happened: we have it, GitHub does not have it yet.
       return helpChatResponse({
         body: {
-          request: saved,
+          request: toPublicHelpRequest(saved),
           githubIssue: null,
           ...(held ? {} : { superseded: true }),
         },
@@ -229,7 +230,7 @@ export async function POST(req: NextRequest) {
     const request = await prisma.helpRequest.findUnique({ where: { id: requestId } });
 
     return NextResponse.json({
-      request,
+      request: toPublicHelpRequest(request),
       issueNumber: ghIssue.number,
       issueUrl: ghIssue.url,
       ...(held ? {} : { superseded: true }),

@@ -8,6 +8,7 @@ import {
     isLockedSnapshotMissingError,
     isNonStaffOnPayrollError,
     loadGustoExport,
+    loadLockedSnapshot,
     type LoadedGustoExport,
 } from "@/lib/gusto-export-db";
 
@@ -58,6 +59,20 @@ export interface GustoExportDependencies {
         periodEnd: Date,
         keys: { startKey: string; endKey: string; timeZone: string }
     ): Promise<LoadedGustoExport>;
+    /**
+     * The frozen file for an exactly-locked period, read from ONE row and
+     * touching no live input. Null when the period is not locked.
+     *
+     * Separate from `load` on purpose. A locked period has already been paid;
+     * whether it can be downloaded must not depend on the integration settings
+     * being readable or on today's roster being sane, both of which `load`
+     * reads and either of which can refuse (round 10, finding 4).
+     */
+    loadSnapshot(keys: { startKey: string; endKey: string }): Promise<{
+        summaryCsv: string;
+        detailCsv: string;
+        exportHash: string;
+    } | null>;
 }
 
 export function createGustoExportHandler(dependencies: GustoExportDependencies) {
@@ -84,6 +99,38 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             const timeZone = await dependencies.resolveTimeZone();
             const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
             const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+
+            // THE FROZEN FILE FIRST. One row, no live inputs, so a period that
+            // was locked and paid stays downloadable no matter what has
+            // happened to the integration settings or the roster since.
+            const lastDayKey = addDaysToKey(range.endKey, -1);
+            try {
+                const snapshot = await dependencies.loadSnapshot({
+                    startKey: range.startKey,
+                    endKey: range.endKey,
+                });
+                if (snapshot) {
+                    return new NextResponse(format === "detail" ? snapshot.detailCsv : snapshot.summaryCsv, {
+                        headers: {
+                            "Content-Type": "text/csv; charset=utf-8",
+                            "Content-Disposition": `attachment; filename="gusto-${format}-${range.startKey}_to_${lastDayKey}.csv"`,
+                            "X-Export-Hash": snapshot.exportHash,
+                            "X-Export-Source": "snapshot",
+                        },
+                    });
+                }
+            } catch (error) {
+                // A locked row whose frozen CSVs are not all there. Still fails
+                // closed (round 6) - but now it is the ONLY thing that can stop
+                // a locked download.
+                if (isLockedSnapshotMissingError(error)) {
+                    return NextResponse.json(
+                        { error: error.message, code: "LOCKED_SNAPSHOT_MISSING" },
+                        { status: 409 }
+                    );
+                }
+                throw error;
+            }
 
             let result: LoadedGustoExport;
             try {
@@ -119,11 +166,12 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
                 throw error;
             }
 
-            // A LOCKED period is served from its snapshot, verbatim. No
-            // readiness check and no recompute: this is the file that was sent
-            // to payroll, and re-deriving it from today's data could differ.
+            // Belt and braces. The snapshot-first read above already served
+            // every exactly-locked period, so reaching here with a snapshot in
+            // hand means the two reads disagreed - which is a bug, not a state.
+            // Serving the frozen file is still the right answer to it.
             if (result.snapshot) {
-                const lastDay = addDaysToKey(range.endKey, -1);
+                const lastDay = lastDayKey;
                 return new NextResponse(
                     format === "detail" ? result.snapshot.detailCsv : result.snapshot.summaryCsv,
                     {
@@ -171,7 +219,6 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             }
 
             const csv = format === "detail" ? result.detailCsv : result.summaryCsv;
-            const lastDayKey = addDaysToKey(range.endKey, -1);
             const filename = `gusto-${format}-${range.startKey}_to_${lastDayKey}.csv`;
 
             return new NextResponse(csv, {
@@ -198,6 +245,7 @@ const handler = createGustoExportHandler({
     // `keys` carries startKey, endKey AND the resolved timeZone, so the loader
     // is computed in the same zone the boundaries were built in.
     load: (periodStart, periodEnd, keys) => loadGustoExport(periodStart, periodEnd, keys),
+    loadSnapshot: (keys) => loadLockedSnapshot(keys.startKey, keys.endKey),
 });
 
 export async function GET(req: Request) {

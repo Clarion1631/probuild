@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getQBSettings, saveQBSettings } from "@/lib/integration-store";
+import { requireIntegrationAccess } from "@/lib/integration-access";
 import { syncEstimateToQB, syncInvoiceToQB, ensureQBCustomer, ensureQBServiceItem, type QBTokens } from "@/lib/quickbooks";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { prisma } from "@/lib/prisma";
@@ -23,6 +24,12 @@ async function resolveCustomerAndItem(
 }
 
 export async function POST(req: NextRequest) {
+    // Pushes an estimate or invoice into the company books, and can write
+    // serviceItemId back into the integration settings. Open to any signed-in
+    // account until review round 10.
+    const gate = await requireIntegrationAccess();
+    if ("response" in gate) return gate.response;
+
     try {
         const { type, id } = await req.json();
 

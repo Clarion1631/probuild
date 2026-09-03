@@ -151,10 +151,13 @@ async function seed(db: PrismaClient, suffix: string) {
 /** The real endpoint, wired to the real loader against this database. */
 async function handlerFor(db: PrismaClient) {
     const { createGustoExportHandler } = await import("../src/app/api/time-entries/export/gusto/route");
-    const { loadGustoExport } = await import("../src/lib/gusto-export-db");
+    const { loadGustoExport, loadLockedSnapshot } = await import("../src/lib/gusto-export-db");
     return createGustoExportHandler({
         authenticate: async () => ({ role: "ADMIN", canReadFinancialReports: true }),
         resolveTimeZone: async () => TZ,
+        // The real frozen-file read, against this database — the endpoint tries
+        // it before it touches any live input (round 10, finding 4).
+        loadSnapshot: (keys) => loadLockedSnapshot(keys.startKey, keys.endKey, db),
         load: (periodStart, periodEnd, keys) =>
             loadGustoExport(periodStart, periodEnd, { ...keys, client: db }),
     });
@@ -323,6 +326,177 @@ test("a WELL-FORMED locked period still serves its snapshot — the refusal is a
     } finally {
         await db.$executeRawUnsafe(`DELETE FROM "PayrollPeriod" WHERE "id" = $1`, periodId).catch(() => {});
         await restore();
+        await db.$disconnect().catch(() => {});
+    }
+});
+
+// ── A locked download does not depend on LIVE payroll (round 10, finding 4) ──
+//
+// Serving a locked period used to go through loadGustoExport, which reads the
+// integration settings, every entry in the envelope and the whole roster BEFORE
+// it assembles the snapshot. Any of those can refuse: a missing Integration row
+// is a hard error, and a non-employee with hours throws NonStaffOnPayrollError.
+// Either one threw before the endpoint reached its snapshot branch, so a file
+// that had already been frozen AND ALREADY PAID became undownloadable because
+// of something that happened to the company afterwards.
+//
+// The endpoint now reads the frozen row FIRST and returns it. Each case below
+// breaks one live input, downloads anyway, and carries the pre-fix control: the
+// live path, on the same broken state, still throws.
+
+/** A locked period whose frozen CSVs are present and correct. */
+async function seedLockedPeriod(db: PrismaClient, periodId: string) {
+    await db.$executeRawUnsafe(
+        `INSERT INTO "PayrollPeriod"
+           ("id","periodStart","periodEnd","periodStartKey","periodEndKey","lockedAt","timeZone",
+            "exportHash","summaryCsvSnapshot","detailCsvSnapshot")
+         VALUES ($1,$2::timestamptz,$3::timestamptz,$4,$5,now(),$6,'frozen-hash','FROZEN-SUMMARY','FROZEN-DETAIL')`,
+        periodId,
+        PERIOD_START.toISOString(),
+        PERIOD_END.toISOString(),
+        START_KEY,
+        END_KEY,
+        TZ
+    );
+}
+
+test("the frozen file downloads without consulting the integration settings", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db, "no-settings");
+    const prior = await db.integration.findUnique({ where: { id: "system_settings" } });
+    try {
+        await seedLockedPeriod(db, seeded.periodId);
+        // The integration row is GONE — the state a fresh install, or a wiped
+        // credential, leaves behind.
+        await db.integration.delete({ where: { id: "system_settings" } }).catch(() => {});
+
+        const res = await (await handlerFor(db)).GET(request());
+        assert.equal(res.status, 200, "a period that was already paid stays downloadable");
+        assert.equal(res.headers.get("x-export-source"), "snapshot");
+        assert.equal(await res.text(), "FROZEN-SUMMARY");
+
+        // NO PRE-FIX CONTROL ON THIS ONE, deliberately, and worth saying so: a
+        // MISSING Integration row is tolerated by readSettings (it answers `{}`
+        // and only a database FAILURE propagates), so the live path would have
+        // survived this too. What this case guards is that the download does
+        // not read the settings at all. The control lives in the next test,
+        // where the live path genuinely refuses.
+    } finally {
+        if (prior) {
+            await db.integration
+                .upsert({
+                    where: { id: "system_settings" },
+                    create: { id: "system_settings", settings: prior.settings },
+                    update: { settings: prior.settings },
+                })
+                .catch(() => {});
+        }
+        await seeded.restore();
+        await db.$disconnect().catch(() => {});
+    }
+});
+
+test("the frozen file downloads with a NON-STAFF account on the live roster", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db, "non-staff");
+    const customerEmail = "locked-snapshot-customer@example.test";
+    try {
+        await seedLockedPeriod(db, seeded.periodId);
+        // A portal account with hours in the period: the live path refuses this
+        // outright (round 8), and it used to take the frozen file with it.
+        await db.user.deleteMany({ where: { email: customerEmail } });
+        const customer = await db.user.create({
+            data: { name: "Dana Customer", email: customerEmail, role: "CLIENT", status: "ACTIVATED" },
+            select: { id: true },
+        });
+        await db.$executeRawUnsafe(
+            `UPDATE "TimeEntry" SET "userId" = $1 WHERE "id" = $2`,
+            customer.id,
+            `locked-snap-entry-non-staff`
+        );
+
+        const res = await (await handlerFor(db)).GET(request());
+        assert.equal(res.status, 200, "the frozen file does not care who is on the roster today");
+        assert.equal(res.headers.get("x-export-source"), "snapshot");
+        assert.equal(await res.text(), "FROZEN-SUMMARY");
+
+        // THE PRE-FIX CONTROL: the live path, on this exact state, still throws
+        // — which is what used to happen before the endpoint reached its
+        // snapshot branch.
+        const { loadGustoExport, isNonStaffOnPayrollError } = await import("../src/lib/gusto-export-db");
+        await assert.rejects(
+            () =>
+                loadGustoExport(PERIOD_START, PERIOD_END, {
+                    startKey: START_KEY,
+                    endKey: END_KEY,
+                    timeZone: TZ,
+                    client: db,
+                }),
+            (error: Error) => isNonStaffOnPayrollError(error)
+        );
+    } finally {
+        await db.user.deleteMany({ where: { email: customerEmail } }).catch(() => {});
+        await seeded.restore();
+        await db.$disconnect().catch(() => {});
+    }
+});
+
+test("the frozen file is served VERBATIM after the project is renamed", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db, "renamed");
+    try {
+        await seedLockedPeriod(db, seeded.periodId);
+        await db.$executeRawUnsafe(
+            `UPDATE "Project" SET "name" = 'RENAMED AFTER THE LOCK' WHERE "id" = $1`,
+            `locked-snap-project-renamed`
+        );
+
+        const res = await (await handlerFor(db)).GET(request());
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("x-export-source"), "snapshot");
+        const csv = await res.text();
+        assert.equal(csv, "FROZEN-SUMMARY");
+        assert.ok(!csv.includes("RENAMED AFTER THE LOCK"), "a rename cannot rewrite a file that was already sent");
+    } finally {
+        await seeded.restore();
+        await db.$disconnect().catch(() => {});
+    }
+});
+
+test("loadLockedSnapshot reads ONE row — it is null for an unlocked period and never touches live inputs", { skip }, async () => {
+    const { loadLockedSnapshot } = await import("../src/lib/gusto-export-db");
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const seeded = await seed(db, "one-row");
+    try {
+        // No period row at all.
+        assert.equal(await loadLockedSnapshot(START_KEY, END_KEY, db), null);
+
+        // An UNLOCKED row is not a snapshot either — the live path owns that case.
+        await db.$executeRawUnsafe(
+            `INSERT INTO "PayrollPeriod" ("id","periodStart","periodEnd","periodStartKey","periodEndKey","timeZone")
+             VALUES ($1,$2::timestamptz,$3::timestamptz,$4,$5,$6)`,
+            seeded.periodId,
+            PERIOD_START.toISOString(),
+            PERIOD_END.toISOString(),
+            START_KEY,
+            END_KEY,
+            TZ
+        );
+        assert.equal(await loadLockedSnapshot(START_KEY, END_KEY, db), null);
+
+        // Locked and complete: the frozen values, verbatim.
+        await db.$executeRawUnsafe(
+            `UPDATE "PayrollPeriod"
+                SET "lockedAt" = now(), "exportHash" = 'h', "summaryCsvSnapshot" = 'S', "detailCsvSnapshot" = 'D'
+              WHERE "id" = $1`,
+            seeded.periodId
+        );
+        const snapshot = await loadLockedSnapshot(START_KEY, END_KEY, db);
+        assert.equal(snapshot?.summaryCsv, "S");
+        assert.equal(snapshot?.detailCsv, "D");
+        assert.equal(snapshot?.exportHash, "h");
+    } finally {
+        await seeded.restore();
         await db.$disconnect().catch(() => {});
     }
 });
