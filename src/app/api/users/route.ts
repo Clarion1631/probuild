@@ -5,6 +5,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { Resend } from "resend";
 import bcrypt from "bcryptjs";
+import { toSafeUser } from "@/lib/user-safe";
 
 const resend = new Resend(process.env.RESEND_API_KEY || "re_dummy");
 
@@ -32,7 +33,7 @@ export async function GET(req: NextRequest) {
         });
 
         // Never expose PIN hash to clients; replace with a boolean indicator
-        const safeUsers = users.map(({ pinCode, ...u }) => ({ ...u, hasPin: !!pinCode }));
+        const safeUsers = users.map(toSafeUser);
         return NextResponse.json(safeUsers);
     } catch (error: any) {
         console.error("GET /api/users error:", error);
@@ -116,7 +117,7 @@ export async function POST(req: Request) {
             }
         }
 
-        return NextResponse.json(newUser, { status: 201 });
+        return NextResponse.json(toSafeUser(newUser), { status: 201 });
     } catch (error: any) {
         console.error("POST /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
@@ -147,7 +148,7 @@ export async function PATCH(req: Request) {
         if (burdenRate !== undefined) data.burdenRate = Number(burdenRate);
         if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
 
-        const { pinCode: _pin, ...user } = await prisma.user.update({
+        const user = await prisma.user.update({
             where: { id },
             data,
             include: { permissions: true, projectAccess: { select: { projectId: true } } },
@@ -158,7 +159,7 @@ export async function PATCH(req: Request) {
         const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
         after(() => autoAssignProjectsOnUserChange(id, { role, status }));
 
-        return NextResponse.json({ ...user, hasPin: !!_pin });
+        return NextResponse.json(toSafeUser(user));
     } catch (error: any) {
         console.error("PATCH /api/users error:", error);
         return NextResponse.json({ error: "Internal server error" }, { status: 500 });
