@@ -551,6 +551,19 @@ export async function postSweep(baseUrl, secret, day, opts = {}) {
     return { status: res.status, body };
 }
 
+/** One log line for a credit a human has to look at: reference, money, why. */
+export function sweepCreditLine(credit, amount) {
+    const money = typeof amount === "number" ? `$${amount.toFixed(2)}` : "unknown amount";
+    return `${credit?.bankReference} ${money}: ${credit?.status} — ${credit?.reason ?? ""}`;
+}
+
+/** True when this credit needs to appear in the job log: everything that is
+ *  not finished with, PLUS `unmatched` (a clean batch outcome, but the one a
+ *  human is being asked to act on). */
+export function sweepCreditNeedsAttention(credit) {
+    return credit?.status === "unmatched" || !CLEAN_SWEEP_STATUSES.includes(credit?.status);
+}
+
 /** The statuses that mean a credit is finished with. Mirrors
  *  CLEAN_SWEEP_STATUSES in src/lib/deposit-sweep.ts — this runner is plain
  *  .mjs and cannot import the TypeScript module. */
@@ -667,12 +680,14 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
     const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
     const failed = sweepBatchFailed(body, submitted);
     (failed ? console.error : console.log)(summary);
-    // Anything that is not a clean outcome gets named, including a status this
-    // runner has never heard of — the catch-all is the point.
+    // Every credit a human has to look at gets its own line, with the money on
+    // it. `unmatched` is a CLEAN batch outcome, so it would otherwise never be
+    // printed — and then the only trace of "the sweep could not place $13,447"
+    // would be a count in a summary nobody reads twice.
+    const amountByReference = new Map(statement.credits.map(c => [c.bankReference, c.amount]));
     for (const credit of body.credits ?? []) {
-        if (!CLEAN_SWEEP_STATUSES.includes(credit?.status)) {
-            console.log(`    ${credit.bankReference}: ${credit.status} — ${credit.reason ?? ""}`);
-        }
+        if (!sweepCreditNeedsAttention(credit)) continue;
+        console.log(`    ${sweepCreditLine(credit, amountByReference.get(credit?.bankReference))}`);
     }
     if (!failed) return true;
 

@@ -17,7 +17,35 @@
  */
 
 import { COMPANY_TIME_ZONE } from "./company-day";
-import { dayKeyInTimeZone } from "./tz-date";
+import { dayKeyInTimeZone, endOfDateInTimeZone } from "./tz-date";
+
+/**
+ * LIVE AUTO-APPLY OF PAYER-LESS CREDITS IS A PRODUCT DECISION, AND IT IS OFF.
+ *
+ * A branch-deposited check never names its payer (docs/WTB-CHECK-IMAGES.md), so
+ * for most credits the strongest evidence the sweep will ever have is "exactly
+ * one requested milestone is owed exactly this amount" — attributeDeposit's
+ * `amount_only`. Every guard in this module narrows that risk; none removes it.
+ * Whether to book real money on it is Justin's call (DEPOSIT-SWEEP-PLAN.md,
+ * Decision 2), not a default.
+ *
+ * So the switch is explicit, environment-level, and fails CLOSED: anything but
+ * the exact string "true" leaves the sweep in suggest-only mode, where a
+ * perfect match is recorded as `proposed` for a human to confirm. A credit that
+ * DOES carry payer corroboration (`verified` / `recorded`) is not gated by
+ * this — that is evidence, not an amount coincidence.
+ */
+export const LIVE_APPLY_ENV_VAR = "DEPOSIT_SWEEP_LIVE_APPLY";
+
+export function liveApplyEnabled(env: Record<string, string | undefined> = process.env): boolean {
+    return env[LIVE_APPLY_ENV_VAR] === "true";
+}
+
+/** Attribution confidences that carry actual payer corroboration, and so may
+ *  book without the switch above. */
+export function hasPayerCorroboration(confidence: string): boolean {
+    return confidence === "verified" || confidence === "recorded";
+}
 
 /** DepositIngest.source for a swept bank credit (null means the photo path). */
 export const BANK_DEPOSIT_SOURCE = "bank";
@@ -229,6 +257,26 @@ export function bankCreditIsOldEnough(postDate: string, now: Date): boolean {
     const today = dayKeyInTimeZone(now, COMPANY_TIME_ZONE);
     if (!today) return false; // an unreadable clock never unlocks a money write
     return isoDayDiff(postDate, today) >= BANK_APPLY_MIN_AGE_DAYS;
+}
+
+/**
+ * The instant by which a milestone must ALREADY have been requested to be a
+ * candidate for this credit: the end of the credit's post date, in the
+ * company's timezone.
+ *
+ * Money cannot pay a bill that had not been sent when it arrived. Without this
+ * bound, invoicing a NEW milestone for the same amount today would retroactively
+ * make it a candidate for a deposit that landed a week ago and belonged to
+ * something else.
+ *
+ * NOTE: `qbInvoiceSentAt` is a LAST-send timestamp, not a first-send one, so a
+ * re-send after the deposit pushes the milestone outside this bound and it
+ * stops being auto-appliable — the credit goes to a human instead. That is the
+ * safe direction: the alternative is booking money against a row whose request
+ * history we cannot actually reconstruct.
+ */
+export function requestedByInstant(postDate: string): Date {
+    return endOfDateInTimeZone(postDate, COMPANY_TIME_ZONE);
 }
 
 /** `fileId` for a bank credit — fits the existing @unique column and keeps the

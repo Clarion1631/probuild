@@ -7,6 +7,8 @@ import {
     postSweep,
     resolveSweepSecret,
     sweepBatchFailed,
+    sweepCreditLine,
+    sweepCreditNeedsAttention,
     sweepSummaryLine,
     REPOST_FLOOR,
     DAILY_CANONICAL_FROM,
@@ -620,5 +622,31 @@ test("sweep: a non-deposit credit is SENT, with the class fields the endpoint ju
         description: "INTEREST PAID",
         transactionDetail: "INTEREST",
         customerReference: null,
+    });
+});
+
+test("sweep: every credit a human must look at gets its own line, with the money on it", async t => {
+    await t.test("unmatched is printed even though the batch is clean", () => {
+        // `unmatched` is a clean batch outcome, so it is not a failure — but it
+        // IS the thing a human is being asked to act on, and a count in a
+        // summary line is not a worklist.
+        assert.equal(sweepCreditNeedsAttention({ status: "unmatched" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "reconcile" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "failed" }), true);
+        assert.equal(sweepCreditNeedsAttention({ status: "qbo_created" }), true, "and anything unknown");
+        assert.equal(sweepCreditNeedsAttention({ status: "applied" }), false);
+        assert.equal(sweepCreditNeedsAttention({ status: "proposed" }), false);
+    });
+
+    await t.test("the line carries reference, amount and reason", () => {
+        assert.equal(
+            sweepCreditLine({ bankReference: "26236015002406", status: "unmatched", reason: "3 milestones match" }, 13447.68),
+            "26236015002406 $13447.68: unmatched — 3 milestones match",
+        );
+        // A reference the batch cannot price is still named, not dropped.
+        assert.equal(
+            sweepCreditLine({ bankReference: "REF-X", status: "reconcile", reason: null }, undefined),
+            "REF-X unknown amount: reconcile — ",
+        );
     });
 });

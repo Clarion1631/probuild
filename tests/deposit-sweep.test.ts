@@ -46,6 +46,10 @@ import {
     CLAIMING_STATUSES,
     MONEY_BOUNDARY_CLAIM_STATUSES,
     RESERVATION_RETAINING_STATUSES,
+    LIVE_APPLY_ENV_VAR,
+    hasPayerCorroboration,
+    liveApplyEnabled,
+    requestedByInstant,
     parseBankBatch,
     qboGuardNote,
     reservationLostNote,
@@ -379,7 +383,10 @@ function seedMilestone(opts: {
         amount: opts.amount,
         invoiceId: `inv-${scheduleSeq}`,
         qbInvoiceId: opts.qbInvoiceId === undefined ? `qb-inv-${scheduleSeq}` : opts.qbInvoiceId,
-        qbInvoiceSentAt: opts.requested === false ? null : new Date(),
+        // Requested well BEFORE the credit posts — the realistic order, and the
+        // one the chronology rule requires. Tests that care about the boundary
+        // set this explicitly.
+        qbInvoiceSentAt: opts.requested === false ? null : new Date(TODAY.getTime() - 30 * 86_400_000),
         paymentDate: opts.paymentDate ?? null,
         invoice: {
             id: `inv-${scheduleSeq}`,
@@ -439,6 +446,10 @@ beforeEach(() => {
     scheduleSeq = 0;
     tables.officeBoardColumn.rows.push({ id: "col-1", name: "To Do", position: 0, createdAt: new Date() });
     process.env.DEPOSIT_INGEST_SECRET = SECRET;
+    // Most cases are about the MATCHING rules, so they run with live apply
+    // switched on — the state Justin has to opt into. The switch's own
+    // behaviour (and its default) is covered by its own tests below.
+    process.env[LIVE_APPLY_ENV_VAR] = "true";
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -583,6 +594,35 @@ test("messages name the row on the other side of the collision", () => {
         /already being applied by the deposit sweep \(bank ref 262/,
     );
     assert.equal(reservationLostNote(null), "milestone already being applied by another deposit");
+});
+
+test("live apply is a DECISION: the switch fails closed on anything but \"true\"", () => {
+    for (const value of [undefined, "", "false", "1", "yes", "TRUE", "true ", "on"]) {
+        assert.equal(
+            liveApplyEnabled(value === undefined ? {} : { [LIVE_APPLY_ENV_VAR]: value }),
+            false,
+            `${JSON.stringify(value)} must NOT enable live money writes`,
+        );
+    }
+    assert.equal(liveApplyEnabled({ [LIVE_APPLY_ENV_VAR]: "true" }), true);
+});
+
+test("payer corroboration is what the switch exempts", () => {
+    // Evidence, not an amount coincidence.
+    assert.equal(hasPayerCorroboration("verified"), true);
+    assert.equal(hasPayerCorroboration("recorded"), true);
+    assert.equal(hasPayerCorroboration("amount_only"), false);
+    assert.equal(hasPayerCorroboration("unknown"), false);
+    assert.equal(hasPayerCorroboration("conflict"), false);
+});
+
+test("chronology: the bound is the END of the post date, in the company's day", () => {
+    // A milestone requested at 4pm Pacific on the deposit's own day still
+    // counts; one requested the next morning does not.
+    const bound = requestedByInstant("2026-08-24");
+    assert.equal(new Date("2026-08-24T23:00:00Z") <= bound, true, "4pm Pacific on the day");
+    assert.equal(new Date("2026-08-25T06:59:00Z") <= bound, true, "11:59pm Pacific on the day");
+    assert.equal(new Date("2026-08-25T16:00:00Z") <= bound, false, "9am Pacific the next day");
 });
 
 test("claim sets: every state that can still HOLD a milestone counts as a claim", () => {
@@ -759,7 +799,11 @@ test("the Hoppe case: three Pending milestones at the same amount, only one REQU
 
     // The candidate query itself must carry the requested filter — this is the
     // rule, and it lives in SQL.
-    assert.deepEqual(queries.paymentSchedule[0].where.qbInvoiceSentAt, { not: null });
+    assert.deepEqual(
+        queries.paymentSchedule[0].where.qbInvoiceSentAt,
+        { not: null, lte: requestedByInstant(SETTLED_DAY) },
+        'requested, AND requested before the money arrived',
+    );
     assert.equal(tables.paymentSchedule.rows.find(r => r.id === requested)!.status, "Paid");
 });
 
@@ -1477,6 +1521,168 @@ test("P1: a `proposed` row survives a long shadow run without inventing a reconc
     assert.equal(row.status, "proposed");
     assert.equal(row.attempts, 1, "twelve re-evaluations consumed no retry budget");
     assert.equal(tables.officeTask.rows.length, 0, "and filed no incident");
+});
+
+test("P0: with the live-apply switch OFF, a perfect amount-only match is SUGGESTED, not booked", async () => {
+    delete process.env[LIVE_APPLY_ENV_VAR];
+    const milestone = seedMilestone({ amount: 6161.61 });
+
+    const { body } = await post(bankBatch([{ ref: "REF-SUGGEST", amount: 6161.61 }]));
+    const result = creditResult(body, "REF-SUGGEST");
+    assert.equal(result.status, "proposed", `expected suggest-only, got ${result.status}: ${result.reason}`);
+    assert.match(String(result.reason), /suggest-only/);
+    assert.match(String(result.reason), new RegExp(LIVE_APPLY_ENV_VAR));
+    assert.equal(calls.buildQBPaymentRequest.length, 0, "no money boundary is touched at all");
+    assert.equal(depositRow("REF-SUGGEST")!.paymentScheduleId, milestone, "the suggestion is recorded");
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("P0: with the switch ON, the same credit books", async () => {
+    process.env[LIVE_APPLY_ENV_VAR] = "true";
+    const milestone = seedMilestone({ amount: 6161.61 });
+
+    const { body } = await post(bankBatch([{ ref: "REF-LIVE", amount: 6161.61 }]));
+    const result = creditResult(body, "REF-LIVE");
+    assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+    assert.equal(result.scheduleId, milestone);
+});
+
+test("P0: payer corroboration books even with the switch OFF", async () => {
+    // A check image naming the customer is evidence, not an amount
+    // coincidence, so it is not what the switch is guarding against.
+    delete process.env[LIVE_APPLY_ENV_VAR];
+    const milestone = seedMilestone({ amount: 6262.62, projectName: "Mesplay Kitchen", clientName: "Sandi Mesplay" });
+    tables.bankImage.rows.push({
+        id: "img-corroborated", source: "WTB_ONLINE", sourceExternalId: "REF-CORROBORATED:front", kind: "CHECK_FRONT",
+        payerName: "Sandi Mesplay", memoText: "kitchen", normalizedCheckNumber: "1099",
+        amountCents: 626_262, documentDate: utc(SETTLED_DAY),
+    });
+
+    const { body } = await post(bankBatch([{ ref: "REF-CORROBORATED", amount: 6262.62 }]));
+    const result = creditResult(body, "REF-CORROBORATED");
+    assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+    assert.equal(result.scheduleId, milestone);
+});
+
+test("P0: a wrong-payer check image is a conflict even with the switch ON", async () => {
+    // Same deposit class, same amount, everything else valid — only the payer
+    // disagrees. The switch must not be able to override that.
+    process.env[LIVE_APPLY_ENV_VAR] = "true";
+    const milestone = seedMilestone({ amount: 6363.63, projectName: "Mesplay Kitchen", clientName: "Sandi Mesplay" });
+    tables.bankImage.rows.push({
+        id: "img-wrong-payer", source: "WTB_ONLINE", sourceExternalId: "REF-WRONGPAYER:front", kind: "CHECK_FRONT",
+        payerName: "Sandi Christensen", memoText: null, normalizedCheckNumber: "1100",
+        amountCents: 636_363, documentDate: utc(SETTLED_DAY),
+    });
+
+    const { body } = await post(bankBatch([{ ref: "REF-WRONGPAYER", amount: 6363.63 }]));
+    const result = creditResult(body, "REF-WRONGPAYER");
+    assert.equal(result.status, "unmatched", "a named payer from another family must never book");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+});
+
+test("P0: chronology — a milestone requested AFTER the deposit is not a candidate", async t => {
+    await t.test("requested the day after the credit posted", async () => {
+        const milestone = seedMilestone({ amount: 7171.71 });
+        // Requested at 9am Pacific the day AFTER the money arrived.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceSentAt =
+            new Date(`${isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS)}T16:00:00.000Z`);
+
+        const { body } = await post(bankBatch([{ ref: "REF-LATE", amount: 7171.71 }]));
+        const result = creditResult(body, "REF-LATE");
+        assert.equal(result.status, "unmatched");
+        assert.match(String(result.reason), /milestone requested after the deposit/);
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+        assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+    });
+
+    await t.test("requested late on the credit's own day still counts", async () => {
+        const milestone = seedMilestone({ amount: 7272.72 });
+        // 4pm Pacific on the deposit's own day — before the day ends.
+        tables.paymentSchedule.rows.find(r => r.id === milestone)!.qbInvoiceSentAt =
+            new Date(`${SETTLED_DAY}T23:00:00.000Z`);
+
+        const { body } = await post(bankBatch([{ ref: "REF-SAMEDAY", amount: 7272.72 }]));
+        const result = creditResult(body, "REF-SAMEDAY");
+        assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+    });
+});
+
+test("P0: a swept credit that needs a human but gets NO task is unresolved, not clean", async t => {
+    await t.test("the task create throws", async () => {
+        seedMilestone({ amount: 8181.81 });
+        seedMilestone({ amount: 8181.81 }); // ambiguous → needs a human
+        const realCreate = tables.officeTask.create;
+        (tables.officeTask as Row).create = async () => { throw new Error("office board is on fire"); };
+        try {
+            const { body } = await post(bankBatch([{ ref: "REF-NOTASK", amount: 8181.81 }]));
+            const result = creditResult(body, "REF-NOTASK");
+            assert.equal(result.status, "reconcile", "an invisible review is not a finished one");
+            assert.match(String(result.reason), /review task could not be filed/);
+            assert.equal(body.counts.reconcile, 1);
+            assert.equal(body.ok, false, "the runner must fail on it");
+        } finally {
+            (tables.officeTask as Row).create = realCreate;
+        }
+    });
+
+    await t.test("no office board column is configured at all", async () => {
+        tables.officeBoardColumn.rows = [];
+        seedMilestone({ amount: 8282.82 });
+        seedMilestone({ amount: 8282.82 });
+
+        const { body } = await post(bankBatch([{ ref: "REF-NOBOARD", amount: 8282.82 }]));
+        const result = creditResult(body, "REF-NOBOARD");
+        assert.equal(result.status, "reconcile");
+        assert.equal(body.ok, false);
+        assert.equal(depositRow("REF-NOBOARD")!.status, "reconcile");
+    });
+});
+
+test("P1: the preflight leaves an ACTIVE worker alone, and a cancelled one stops before QuickBooks", async t => {
+    await t.test("a fresh processing row is not cancelled; the other credit carries the reason", async () => {
+        seedMilestone({ amount: 8383.83 });
+        tables.depositIngest.rows.push({
+            id: "row-busy", fileId: bankFileId("REF-BUSY"), status: "processing", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-BUSY", extracted: JSON.stringify({ fileId: bankFileId("REF-BUSY") }),
+            attempts: 1, amountCents: 838_383, postDate: utc(SETTLED_DAY),
+            processingStartedAt: new Date(), updatedAt: new Date(), // lease is FRESH
+        });
+
+        const { body } = await post(bankBatch([
+            { ref: "REF-BUSY", amount: 8383.83 },
+            { ref: "REF-OTHER", amount: 8383.83 },
+        ]));
+
+        assert.equal(depositRow("REF-BUSY")!.status, "processing", "an in-flight worker is never yanked out from under");
+        const other = creditResult(body, "REF-OTHER");
+        assert.equal(other.status, "unmatched");
+        assert.match(String(other.reason), /REF-BUSY is being processed right now and was left to finish/);
+    });
+
+    await t.test("a row cancelled mid-flight stops at the money boundary with no QuickBooks call", async () => {
+        const milestone = seedMilestone({ amount: 8484.84 });
+        // The preflight of a LATER credit cancels this row while it is between
+        // matching and the QuickBooks create.
+        const realBuild = fakeQuickbooks.buildQBPaymentRequest;
+        fakeQuickbooks.buildQBPaymentRequest = async (...args: unknown[]) => {
+            const row = depositRow("REF-CANCELLED");
+            if (row) row.status = "unmatched"; // someone else re-classified it
+            return (realBuild as (...a: unknown[]) => unknown)(...args) as never;
+        };
+        try {
+            const { body } = await post(bankBatch([{ ref: "REF-CANCELLED", amount: 8484.84 }]));
+            assert.equal(calls.buildQBPaymentRequest.length, 1, "it got as far as building the request");
+            assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "…and stopped before creating the payment");
+            assert.notEqual(creditResult(body, "REF-CANCELLED").status, "applied");
+            assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
+            assert.equal(depositRow("REF-CANCELLED")!.qbRequestPayload ?? null, null, "no request body was persisted");
+        } finally {
+            fakeQuickbooks.buildQBPaymentRequest = realBuild;
+        }
+    });
 });
 
 test("the batch response carries the counts the Bot Health line is built from", async () => {

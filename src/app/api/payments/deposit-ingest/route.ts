@@ -29,10 +29,14 @@ import {
     crossSourceClaimNote,
     describeCandidates,
     findCollisions,
+    hasPayerCorroboration,
     isCustomerDepositClass,
     isDeterministicQboGuardFailure,
     isNotCustomerDepositReason,
+    liveApplyEnabled,
+    LIVE_APPLY_ENV_VAR,
     notCustomerDepositNote,
+    requestedByInstant,
     isoDateToUtc,
     isoDaysAfter,
     isoDaysBefore,
@@ -590,10 +594,22 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
 
     // Persist the EXACT bytes BEFORE the network call fires — a crash/timeout on the
     // send still leaves the row able to replay byte-identically with the same requestid.
-    await prisma.depositIngest.update({
-        where: { id: row.id },
+    //
+    // CONDITIONAL on the row still being ours: the batch preflight can cancel a
+    // row (a collision found on a later credit) while this one is mid-flight.
+    // Zero rows updated means we no longer own this deposit, and the correct
+    // response is to stop BEFORE QuickBooks is touched at all.
+    const claimed = await prisma.depositIngest.updateMany({
+        where: { id: row.id, status: "processing" },
         data: { status: "qbo_unknown", qbRequestPayload: built.requestBody },
     });
+    if (claimed.count === 0) {
+        const fresh = await prisma.depositIngest.findUnique({ where: { id: row.id } });
+        return NextResponse.json({
+            ok: true, status: fresh?.status ?? "unknown",
+            reason: fresh?.lastError ?? "this deposit was re-classified while it was being applied — no payment was created",
+        });
+    }
 
     const requestId = depositRequestId(payload.fileId);
     return await sendAndSettle(row.id, schedule, {
@@ -675,10 +691,23 @@ async function sendAndSettle(
         return NextResponse.json({ ok: false, status: "qbo_unknown", reason: message });
     }
 
-    await prisma.depositIngest.update({
-        where: { id: rowId },
+    // Same CAS, on the far side of the money boundary — but the payment NOW
+    // EXISTS, so a lost claim is not a quiet stop: it is a real QuickBooks
+    // payment whose row someone else has taken, which only a human can untangle.
+    const created = await prisma.depositIngest.updateMany({
+        where: { id: rowId, status: "qbo_unknown" },
         data: { status: "qbo_created", qbPaymentId: paymentId, lastError: null },
     });
+    if (created.count === 0) {
+        const fresh = await prisma.depositIngest.findUnique({ where: { id: rowId } });
+        if (!fresh) throw new Error("DepositIngest row vanished mid-send");
+        return await finalizeReconcile(
+            fresh,
+            `QuickBooks payment ${paymentId} was created, but this deposit was re-classified mid-flight ` +
+            `(status ${fresh.status}) — link or void that payment by hand`,
+            {},
+        );
+    }
 
     return await settleAndFinalize(rowId, schedule, {
         checkDate: ctx.checkDate, checkNumber: ctx.checkNumber, qbPaymentId: paymentId,
@@ -713,7 +742,24 @@ async function settleAndFinalize(
         }
     }
 
-    await prisma.depositIngest.update({ where: { id: rowId }, data: { status: "applied", lastError: null } });
+    const finished = await prisma.depositIngest.updateMany({
+        where: { id: rowId, status: { in: ["qbo_created", "processing"] } },
+        data: { status: "applied", lastError: null },
+    });
+    if (finished.count === 0) {
+        // The settle DID commit, so this money is applied — but the row moved
+        // under us and must not be silently stamped applied over whatever a
+        // concurrent path decided. A human reconciles the two.
+        const fresh = await prisma.depositIngest.findUnique({ where: { id: rowId } });
+        if (fresh) {
+            return await finalizeReconcile(
+                fresh,
+                `the milestone was settled with QuickBooks payment ${ctx.qbPaymentId}, but this deposit row had already ` +
+                `been moved to ${fresh.status} — confirm the milestone and close this out by hand`,
+                {},
+            );
+        }
+    }
     return NextResponse.json({ ok: true, status: "applied", scheduleId: schedule.id, invoiceCode: schedule.invoiceCode, qbPaymentId: ctx.qbPaymentId });
 }
 
@@ -858,9 +904,20 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
     // Persist every collision verdict BEFORE any matching runs, so the batch can
     // die at any point from here on without a colliding credit ever being
     // eligible to book money.
+    const inFlight = new Set<string>();
     for (const credit of credits) {
         const others = collisions.get(credit.bankReference);
-        if (others) await persistCollisionVerdict(credit, postDate, others);
+        if (!others) continue;
+        const verdict = await persistCollisionVerdict(credit, postDate, others);
+        if (verdict === "in-flight") inFlight.add(credit.bankReference);
+    }
+    // A credit whose twin is actively being worked right now still gets its own
+    // verdict, and its reason names the row that was left alone.
+    for (const credit of credits) {
+        const others = collisions.get(credit.bankReference);
+        if (!others || inFlight.has(credit.bankReference)) continue;
+        const busy = others.filter(ref => inFlight.has(ref));
+        if (busy.length > 0) await noteInFlightTwin(credit, postDate, others, busy);
     }
 
     const results: BankCreditResult[] = [];
@@ -918,7 +975,11 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
  * persisted FIRST and a missing task self-heals on the next POST, whereas the
  * reverse order can file duplicate tasks.
  */
-async function persistCollisionVerdict(credit: BankCredit, postDate: string, others: string[]): Promise<void> {
+async function persistCollisionVerdict(
+    credit: BankCredit,
+    postDate: string,
+    others: string[],
+): Promise<"recorded" | "in-flight"> {
     const payload = bankPayloadFor(credit, postDate);
     const reason = collisionNote(credit, postDate, others);
     const existing = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
@@ -939,10 +1000,20 @@ async function persistCollisionVerdict(credit: BankCredit, postDate: string, oth
             // row is handled by the branch below on the next pass.
             if (e?.code !== "P2002") throw e;
         }
-        return;
+        return "recorded";
     }
 
-    if (["applied", "unmatched", "reconcile"].includes(existing.status)) return;
+    if (["applied", "unmatched", "reconcile"].includes(existing.status)) return "recorded";
+
+    // NEVER yank a row out from under a worker that is actively holding it. A
+    // fresh `processing` lease means another request is mid-flight on this exact
+    // credit — possibly between building a QuickBooks payment and sending it —
+    // and cancelling it here would race that money write rather than prevent it.
+    // Let it finish (its own boundary CAS below is what stops it if it must
+    // stop) and record the collision on the other credit instead.
+    const leaseIsFresh = existing.processingStartedAt != null
+        && existing.processingStartedAt.getTime() > Date.now() - STALE_PROCESSING_MS;
+    if (existing.status === "processing" && leaseIsFresh) return "in-flight";
 
     const boundaryMarked = !!(existing.qbPaymentId || existing.qbRequestPayload || existing.settleStartedAt);
     const status = boundaryMarked ? "reconcile" : "unmatched";
@@ -955,9 +1026,25 @@ async function persistCollisionVerdict(credit: BankCredit, postDate: string, oth
             ...(boundaryMarked ? {} : { paymentScheduleId: null }),
         },
     });
-    if (claimed.count === 0) return; // another worker moved it; its own path decides
+    if (claimed.count === 0) return "recorded"; // another worker moved it; its own path decides
     const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
     if (fresh && !fresh.officeTaskId) await ensureReviewTask(fresh, reason, status === "reconcile" ? "reconcile" : "unmatched");
+    return "recorded";
+}
+
+/** Re-file a colliding credit's reason so it names the twin that was left
+ *  running, rather than implying both were stopped. */
+async function noteInFlightTwin(
+    credit: BankCredit,
+    postDate: string,
+    others: string[],
+    busy: string[],
+): Promise<void> {
+    const reason = `${collisionNote(credit, postDate, others)}; ${busy.join(", ")} is being processed right now and was left to finish`;
+    await prisma.depositIngest.updateMany({
+        where: { fileId: bankFileId(credit.bankReference), status: { in: ["unmatched", "reconcile"] } },
+        data: { lastError: reason.slice(0, 1000) },
+    });
 }
 
 async function processBankCredit(
@@ -1165,10 +1252,15 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
         return await finalizeUnmatched(row, reason, { fileTask: lookalikes > 0 });
     }
 
+    // Chronology: the milestone must already have been REQUESTED when the money
+    // arrived. Money cannot pay a bill that had not been sent yet, and without
+    // this bound, invoicing a new milestone for the same amount today would
+    // retroactively make it a candidate for last week's deposit.
+    const requestedBy = requestedByInstant(payload.postDate);
     const requested: BankCandidate[] = await prisma.paymentSchedule.findMany({
         where: {
             status: "Pending",
-            qbInvoiceSentAt: { not: null },
+            qbInvoiceSentAt: { not: null, lte: requestedBy },
             invoice: { status: { in: OPEN_INVOICE_STATUSES } },
         },
         select: BANK_CANDIDATE_SELECT,
@@ -1188,7 +1280,7 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
     ];
 
     if (union.length !== 1 || union[0].status !== "Pending") {
-        return await finalizeUnmatched(row, await bankNoMatchReason(row, payload, union, amountLabel));
+        return await finalizeUnmatched(row, await bankNoMatchReason(row, payload, union, amountLabel, requestedBy));
     }
     const picked = union[0];
 
@@ -1247,6 +1339,16 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
             `photo path first) — would apply to ${describeCandidates([describeOne(picked)])}`);
     }
 
+    // Suggest-only unless a human has turned live apply on, OR this credit
+    // actually carries payer corroboration. An amount-only match is the weakest
+    // tier there is; whether it may move money by itself is a decision, not a
+    // default (see LIVE_APPLY_ENV_VAR).
+    if (!hasPayerCorroboration(attribution.confidence) && !liveApplyEnabled()) {
+        return await finalizeProposed(row, picked.id,
+            `suggest-only: this is an amount-only match (${attribution.confidence}) with no payer corroboration, and ` +
+            `${LIVE_APPLY_ENV_VAR} is not "true" — would apply to ${describeCandidates([describeOne(picked)])}`);
+    }
+
     const reserved = await reserveMilestone(row, picked.id, { amountCents: payload.amountCents, postDate: payload.postDate });
     if (!reserved.ok) return await finalizeUnmatched(row, reserved.reason);
 
@@ -1276,10 +1378,29 @@ async function bankNoMatchReason(
     payload: BankPayload,
     union: BankCandidate[],
     amountLabel: string,
+    requestedBy: Date,
 ): Promise<string> {
     if (union.length > 1) {
         return `${amountLabel} matches ${union.length} milestones: ${describeCandidates(union.map(describeOne))} — ` +
             `a bank line carries nothing but an amount, so a human must say which one this deposit settles`;
+    }
+    // Say WHY when the only thing at this amount was requested too late: a bare
+    // "no milestone matches" would send a human hunting for a row that is
+    // sitting right there, looking like a perfect match.
+    if (union.length === 0) {
+        const late: BankCandidate[] = await prisma.paymentSchedule.findMany({
+            where: {
+                status: "Pending",
+                qbInvoiceSentAt: { gt: requestedBy },
+                invoice: { status: { in: OPEN_INVOICE_STATUSES } },
+            },
+            select: BANK_CANDIDATE_SELECT,
+        });
+        const lateMatches = late.filter(c => centsOf(c.amount) === payload.amountCents);
+        if (lateMatches.length > 0) {
+            return `milestone requested after the deposit — ${describeCandidates(lateMatches.map(describeOne))} ` +
+                `matches ${amountLabel} but was not requested until after ${payload.postDate}, so this money cannot be paying it`;
+        }
     }
     // Before the generic zero-match message: the photo path may already have
     // applied this same check, which makes the milestone Paid and therefore
@@ -1424,6 +1545,21 @@ async function finalizeUnmatched(
     // /tasks board.
     const fileTask = opts.fileTask ?? true;
     const officeTaskId = fileTask ? (row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched")) : row.officeTaskId;
+
+    // A SWEPT credit that needs a human but has no task is invisible: the bot is
+    // unattended, the row is terminal, and nothing would ever surface it. Record
+    // it as `reconcile` instead, which the batch tallies as unresolved and the
+    // runner turns into a non-zero exit — a noisy failure beats a silent one.
+    // (The photo path is unchanged: its files also park in Drive's _Needs
+    // Review, so a missing task there is not the same dead end.)
+    if (fileTask && !officeTaskId && row.source === BANK_DEPOSIT_SOURCE) {
+        const escalated = `${reason} — AND the review task could not be filed, so nothing would have surfaced this`;
+        await prisma.depositIngest.update({
+            where: { id: row.id },
+            data: { status: "reconcile", lastError: escalated.slice(0, 1000) },
+        });
+        return NextResponse.json({ ok: true, status: "reconcile", reason: escalated, officeTaskId: null });
+    }
     return NextResponse.json({ ok: true, status: "unmatched", reason, officeTaskId });
 }
 
