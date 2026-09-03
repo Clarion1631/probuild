@@ -165,16 +165,41 @@ const EXPENSE_WRITE = /(?:prisma|tx|transaction|client|db)\.expense\.(?:create|u
  * Written as literal regexes rather than built from a template, because a
  * template literal eats the backslashes these need.
  */
+/**
+ * The BALANCED `data: { ... }` payload of a write, or null.
+ *
+ * A fixed `[\s\S]{0,1500}?` window after `data:` walks straight out of the
+ * object and into the NEXT statement's `where` — which is how round 42's pair
+ * tripwire first reported `billing-core` (writing `{ invoiceId, invoicedAt }`)
+ * and `book.ts` (writing `{ needsTaxReview: true }`) as moving a project. Brace
+ * matching cannot make that mistake.
+ */
+function dataPayload(window: string): string | null {
+    const at = window.search(/\bdata:\s*\{/);
+    if (at < 0) return null;
+    const open = window.indexOf("{", at);
+    let depth = 0;
+    for (let i = open; i < window.length; i++) {
+        if (window[i] === "{") depth++;
+        else if (window[i] === "}") {
+            depth--;
+            if (depth === 0) return window.slice(open, i + 1);
+        }
+    }
+    return null;
+}
+
 const ASSIGNS_FK = {
-    projectId: /data:\s*\{[\s\S]{0,1500}?\bprojectId\s*(?:([,}])|:\s*([^,}\s]+))/,
-    estimateId: /data:\s*\{[\s\S]{0,1500}?\bestimateId\s*(?:([,}])|:\s*([^,}\s]+))/,
+    projectId: /\bprojectId\s*(?:([,}])|:\s*([^,}\s]+))/,
+    estimateId: /\bestimateId\s*(?:([,}])|:\s*([^,}\s]+))/,
 };
 
 function fkWritePosition(body: string, column: "projectId" | "estimateId"): number | undefined {
     const writes = new RegExp(EXPENSE_WRITE.source, "g");
     for (let match = writes.exec(body); match; match = writes.exec(body)) {
-        const window = body.slice(match.index, match.index + 2000);
-        const assigned = ASSIGNS_FK[column].exec(window);
+        const payload = dataPayload(body.slice(match.index, match.index + 2000));
+        if (!payload) continue;
+        const assigned = ASSIGNS_FK[column].exec(payload);
         if (!assigned) continue;
         const [, shorthand, value] = assigned;
         // `true` is a `select`, not a value. Everything else — a variable, a
@@ -182,6 +207,12 @@ function fkWritePosition(body: string, column: "projectId" | "estimateId"): numb
         if (shorthand || value !== "true") return match.index;
     }
     return undefined;
+}
+
+/** Does this write's payload SPREAD another object into itself? */
+function payloadSpreads(window: string): boolean {
+    const payload = dataPayload(window);
+    return !!payload && /\{\s*\.\.\./.test(payload);
 }
 
 /**
@@ -392,4 +423,60 @@ test("the writers that lock only ONE of the tables are left alone", () => {
         estimateOnly.every(body => !body.includes("lockAttributionParents(")),
         "an estimate-only transaction does not need the whole set",
     );
+});
+
+// ── the attribution PAIR moves together, or not at all (round 42, item 4a) ──
+
+/** `where: { ... projectId: null ... }` — the shape of a FIRST attribution. */
+const PINS_UNATTRIBUTED = /where:\s*\{[\s\S]{0,1200}?\bprojectId:\s*null\b/;
+
+test("no expense write moves projectId without moving estimateId with it", () => {
+    // `projectId` and `estimateId` are the same fact said twice: the job is the
+    // answer, the estimate is where it came from. A write that moves one and
+    // leaves the other is the split-job row this whole phase exists to prevent
+    // — every reader that trusts the estimate reports the OLD job while
+    // `resolveExpenseProjectId` reports the new one.
+    //
+    // A FIRST attribution is exempt and is recognised by its predicate: a
+    // statement pinned to `projectId: null` is filling a hole, not moving a
+    // row, and the estimate it derives from is already what the row carries.
+    // Anything else must go through `reattributeExpense`, which moves both.
+    const offenders: string[] = [];
+    let checked = 0;
+    for (const file of walk(path.join(ROOT, "src"))) {
+        const relative = path.relative(ROOT, file).replace(/\\/g, "/");
+        const source = readFileSync(file, "utf8");
+        const writes = new RegExp(EXPENSE_WRITE.source, "g");
+        for (let match = writes.exec(source); match; match = writes.exec(source)) {
+            const window = source.slice(match.index, match.index + 2000);
+            if (fkWritePosition(window, "projectId") === undefined) continue;
+            checked += 1;
+            if (fkWritePosition(window, "estimateId") !== undefined) continue;
+            // `{ ...write, projectId }` — the spread carries the estimate.
+            if (payloadSpreads(window)) continue;
+            if (PINS_UNATTRIBUTED.test(window)) continue;
+            const line = source.slice(0, match.index).split("\n").length;
+            offenders.push(`${relative}:${line} moves projectId without estimateId`);
+        }
+    }
+    assert.deepEqual(offenders, [], offenders.join("\n  "));
+    assert.ok(checked >= 4, `only ${checked} expense writes set projectId — has the scan stopped reaching them?`);
+});
+
+test("the ONE re-attribution helper moves both halves under the canonical locks", () => {
+    // The tripwire above says what must not happen; this says where the thing
+    // that MAY happen lives, so the next writer copies it instead of inventing
+    // a third shape.
+    const source = readFileSync(path.join(ROOT, "src/lib/expense-attribution.ts"), "utf8");
+    const helper = source.slice(source.indexOf("export async function reattributeExpense"));
+    const body = helper.slice(0, helper.indexOf("\n}\n"));
+    assert.match(body, /lockAttributionParents\(/, "the parents are locked first");
+    assert.match(
+        body,
+        /data:\s*\{\s*projectId:[^,]+,\s*estimateId:[^}]+\}/,
+        "both halves land in one statement",
+    );
+    // ...and the write is a CAS on the attribution it decided from, so a
+    // concurrent move loses rather than interleaving.
+    assert.match(body, /where:\s*\{[\s\S]{0,400}?projectId: before\.projectId,\s*estimateId: before\.estimateId,/);
 });

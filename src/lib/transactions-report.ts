@@ -182,7 +182,7 @@ export async function queryTransactionsData(filters: TransactionsFilters): Promi
             description: exp.description ?? exp.vendor ?? "Expense",
             type: "Expense",
             amount: Number(exp.amount),
-            projectName: exp.project?.name ?? exp.estimate.project?.name ?? "No Project",
+            projectName: exp.project?.name ?? exp.estimate?.project?.name ?? "No Project",
             projectId: resolveExpenseProjectId(exp),
             category: "Expense",
         });

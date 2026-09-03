@@ -829,6 +829,37 @@ test("a gross that SHRINKS below the recorded tax clears it too", async () => {
     assertClassificationCleared(updateArgs?.data);
 });
 
+test("a gross that invalidates the tax AND the base is accepted, not refused", async () => {
+    // ROUND 42, ITEM 1. 207.74 with 16.55 of tax and a 50 base, edited to 10.
+    // The base cannot fit (10 - 16.55 is negative) and neither can the tax, so
+    // the plan clears BOTH and the row lands valid. The pre-transaction check
+    // used to run before the plan and refuse it on the base alone, which left
+    // the receipt uncorrectable through the only handler that can correct it.
+    storedExpense = {
+        ...(storedExpense as object), taxDeductibleBase: 50,
+        taxSource: "manual", taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    const res = await call({ amount: "10.00" });
+    assert.equal(res.status, 200, "the edit is legitimate work");
+    assert.equal(updateArgs?.data.amount, 10);
+    assertClassificationCleared(updateArgs?.data);
+});
+
+test("...but a base-ONLY misfit is still a 400", async () => {
+    // The control. 207.74 with NO tax and a 200 base, edited to 100: the base
+    // does not fit and there is no tax problem to clear it alongside, so the
+    // route refuses and names the remedy rather than throwing the person's
+    // allocation away.
+    storedExpense = {
+        ...(storedExpense as object), taxAmount: null, taxAtSource: false,
+        taxDeductibleBase: 200, taxSource: null, taxDeductibleBaseSource: "manual",
+    } as Record<string, unknown>;
+    const res = await call({ amount: "100.00" });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /deduction base/);
+    assert.equal(updateArgs, null, "nothing is written");
+});
+
 test("...and a gross that STILL carries the tax clears nothing", async () => {
     // The control for all three. $16.55 on $150 is inside every rule, so the
     // figures stay and only the review flag is raised — clearing here would

@@ -606,8 +606,23 @@ model EstimateItem {
 
 model Expense {
   id            String        @id @default(cuid())
-  estimateId    String
-  estimate      Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  /// NULLABLE, AND SET NULL ON DELETE (Codex round 42, item 4b).
+  ///
+  /// It was NOT NULL with onDelete: Cascade, so deleting an estimate DELETED
+  /// the spend booked through it -- including spend a bookkeeper had since
+  /// re-attributed to another job, which is reported under that job and has a
+  /// QuickBooks Purchase behind it. Destroying money history to tidy up a
+  /// superseded estimate is never the right trade.
+  ///
+  /// SET NULL rather than RESTRICT: the row keeps its `projectId`, which is the
+  /// primary attribution every reader already prefers, so the spend simply
+  /// stays on its job with no estimate behind it -- a shape
+  /// `resolveExpenseProjectId` has always handled. RESTRICT would preserve the
+  /// cost too, but it would also block deleting a PROJECT (Project cascades to
+  /// its Estimates, which would then be refused), and `Invoice.estimateId` and
+  /// `Takeoff.estimateId` already take the SET NULL stance in this schema.
+  estimateId    String?
+  estimate      Estimate?     @relation(fields: [estimateId], references: [id], onDelete: SetNull)
   itemId        String?
   item          EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
   costCodeId    String?

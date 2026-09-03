@@ -919,6 +919,44 @@ END $$`,
     // merge order: if Phase 1 has not landed in the target database yet, these
     // two columns are skipped, and re-running this script after Phase 1 lands
     // adds them.
+    // AN ESTIMATE MAY NOT DELETE SPEND (round 42, item 4b).
+    //
+    // `Expense_estimateId_fkey` was NOT NULL + ON DELETE CASCADE, so deleting
+    // an estimate DELETED every expense booked through it. Phase 3 makes that
+    // strictly worse: a re-attributed row is reported under a DIFFERENT job
+    // (its own `projectId`) while still hanging off the estimate it left, so
+    // tidying up a superseded estimate silently destroys another job's cost --
+    // money with a QuickBooks Purchase behind it.
+    //
+    // SET NULL, not RESTRICT. The row keeps `projectId`, which is the primary
+    // attribution every reader already prefers, so the spend simply stays on
+    // its job with no estimate behind it -- a shape `resolveExpenseProjectId`
+    // has always handled. RESTRICT would preserve the cost too, but it would
+    // also block deleting a PROJECT, because Project cascades to its Estimates
+    // and those deletes would then be refused; and `Invoice.estimateId` and
+    // `Takeoff.estimateId` already take the SET NULL stance in this schema.
+    //
+    // The column has to become nullable first, or the SET NULL is unenforceable
+    // and Postgres refuses the constraint. `DROP NOT NULL` is idempotent.
+    `ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL`,
+    `DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_estimateId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+  ELSIF existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+    ALTER TABLE "Expense" DROP CONSTRAINT "Expense_estimateId_fkey";
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END $$`,
     `DO $$ BEGIN
        IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
          ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;
@@ -1006,6 +1044,33 @@ export const expectedConstraints = [
             /ON DELETE SET NULL/,
         ],
     },
+    {
+        // ROUND 42, ITEM 4b. Verified by DEFINITION like the one above, and
+        // for a sharper reason: this constraint ALREADY EXISTED, with ON
+        // DELETE CASCADE. A run that failed to replace it leaves a database
+        // where deleting an estimate still deletes spend, and every other
+        // check in this script would pass.
+        name: "Expense_estimateId_fkey",
+        table: "Expense",
+        mustMatch: [
+            /FOREIGN KEY \("estimateId"\)/,
+            /REFERENCES "?Estimate"?\(id\)/,
+            /ON UPDATE CASCADE/,
+            /ON DELETE SET NULL/,
+        ],
+        // ...and the column it protects has to be nullable, or SET NULL can
+        // never fire. `confdeltype = 'n'` is the catalog's own word for it.
+        mustNotMatch: [/ON DELETE CASCADE/],
+    },
+];
+
+/**
+ * Columns this migration makes NULLABLE, checked from the catalog rather than
+ * inferred from the DDL having run. A SET NULL foreign key on a NOT NULL
+ * column is a constraint that can only ever raise an error.
+ */
+export const expectedNullableColumns = [
+    { table: "Expense", column: "estimateId" },
 ];
 
 export const expectedCheckConstraints = [
@@ -1234,7 +1299,7 @@ async function main() {
             }
             console.log(`verified ${table}: ${columns.length} columns`);
         }
-        for (const { name, table, mustMatch } of expectedConstraints) {
+        for (const { name, table, mustMatch, mustNotMatch } of expectedConstraints) {
             const [row] = await prisma.$queryRawUnsafe(
                 `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
                   WHERE conname = $1 AND conrelid = $2::regclass`,
@@ -1251,7 +1316,29 @@ async function main() {
                     process.exit(1);
                 }
             }
+            for (const pattern of mustNotMatch ?? []) {
+                if (pattern.test(row.def)) {
+                    console.error(`VERIFY FAILED: ${name} still matches ${pattern}
+  actual: ${row.def}`);
+                    process.exit(1);
+                }
+            }
             console.log(`verified constraint ${name}: ${row.def}`);
+        }
+        // NULLABILITY, FROM THE CATALOG (round 42, item 4b). A SET NULL foreign
+        // key on a NOT NULL column is a constraint that can only ever raise an
+        // error, and nothing above would notice.
+        for (const { table, column } of expectedNullableColumns) {
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT is_nullable FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+                table, column,
+            );
+            if (!row || row.is_nullable !== "YES") {
+                console.error(`VERIFY FAILED: ${table}.${column} must be NULLABLE for its SET NULL foreign key (found ${row?.is_nullable ?? "no such column"})`);
+                process.exit(1);
+            }
+            console.log(`verified nullable: ${table}.${column}`);
         }
         for (const { name, table, mustMatch } of expectedCheckConstraints) {
             const [row] = await prisma.$queryRawUnsafe(

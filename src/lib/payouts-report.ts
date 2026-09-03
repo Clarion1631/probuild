@@ -111,7 +111,7 @@ export async function queryPayoutsData(filters: PayoutsFilters): Promise<{
             vendorName: exp.vendor ?? "Unknown Vendor",
             type: "Expense",
             amount: Number(exp.amount),
-            projectName: exp.project?.name ?? exp.estimate.project?.name ?? "No Project",
+            projectName: exp.project?.name ?? exp.estimate?.project?.name ?? "No Project",
             projectId: resolveExpenseProjectId(exp),
             reference: exp.purchaseOrder?.code ?? null,
         });

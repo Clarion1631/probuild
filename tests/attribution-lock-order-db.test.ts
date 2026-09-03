@@ -793,3 +793,65 @@ test("the project lock covers exactly the jobs the fill will touch", { skip }, a
 after(async () => {
     await Promise.all([writerDb?.$disconnect(), editorDb?.$disconnect()]);
 });
+
+// ── an estimate may not delete spend (round 42, item 4b) ────────────────────
+
+test("deleting an ESTIMATE leaves the expense, with a null estimateId", { skip }, async () => {
+    // `Expense_estimateId_fkey` was NOT NULL + ON DELETE CASCADE, so deleting
+    // an estimate DELETED every expense booked through it. Phase 3 makes that
+    // worse: a re-attributed row is reported under a DIFFERENT job (its own
+    // projectId) while still hanging off the estimate it left, so tidying up a
+    // superseded estimate silently destroyed another job's cost — money with a
+    // QuickBooks Purchase behind it.
+    await seed();
+    // The fixture is fallback-attributed on purpose (the QBO suggester case),
+    // so pin the job first: this test is about a row that HAS one.
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: PROJECT } });
+    try {
+        await writerDb!.estimate.delete({ where: { id: ESTIMATE } });
+        const survivor = await writerDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { estimateId: true, projectId: true, amount: true },
+        });
+        assert.ok(survivor, "the spend is still there");
+        assert.equal(survivor!.estimateId, null, "with no estimate behind it");
+        assert.equal(survivor!.projectId, PROJECT, "and still on its job");
+        assert.equal(Number(survivor!.amount), 250);
+    } finally {
+        await cleanup();
+    }
+});
+
+test("...and the FK carries SET NULL on a NULLABLE column, per the catalog", { skip }, async () => {
+    // Both halves, read from the catalog rather than inferred from the DDL
+    // having run: a SET NULL rule on a NOT NULL column is a constraint that can
+    // only ever raise an error.
+    const [fk] = (await writerDb!.$queryRawUnsafe(
+        `SELECT confdeltype::text AS rule FROM pg_constraint
+          WHERE conname = 'Expense_estimateId_fkey' AND conrelid = '"Expense"'::regclass`,
+    )) as { rule: string }[];
+    assert.equal(fk?.rule, "n", "confdeltype 'n' is SET NULL");
+    const [column] = (await writerDb!.$queryRawUnsafe(
+        `SELECT is_nullable FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'Expense' AND column_name = 'estimateId'`,
+    )) as { is_nullable: string }[];
+    assert.equal(column?.is_nullable, "YES");
+});
+
+test("a fallback-attributed row whose estimate is deleted keeps NOTHING it should not", { skip }, async () => {
+    // The other shape: `projectId` NULL, so the job lives on the estimate. With
+    // the estimate gone the row is genuinely unattributed — which is honest and
+    // reportable, and strictly better than the row being deleted outright.
+    await seed();
+    await writerDb!.expense.updateMany({ where: { id: EXPENSE }, data: { projectId: null } });
+    try {
+        await writerDb!.estimate.delete({ where: { id: ESTIMATE } });
+        const survivor = await writerDb!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { estimateId: true, projectId: true },
+        });
+        assert.deepEqual(survivor, { estimateId: null, projectId: null }, "the cost survives, unattributed");
+    } finally {
+        await cleanup();
+    }
+});

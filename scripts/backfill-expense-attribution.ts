@@ -147,7 +147,14 @@ export function measureCoverage(rows, itemCostCodeById = new Map()) {
         // the variance report itself does with it.
         const key = coverageKey(resolveExpenseProjectId(row), row.itemId ?? null);
         const resolved = resolveExpenseCostCodeId(
-            { costCodeId: row.costCodeId ?? null, itemId: key },
+            {
+                costCodeId: row.costCodeId ?? null,
+                itemId: key,
+                // A person's explicit "no phase" suppresses the item fallback
+                // (round 42, item 2), so the coverage table counts the row as
+                // unattributed -- which is what the variance report now says.
+                costCodeSource: row.costCodeSource ?? null,
+            },
             itemCostCodeById,
         );
         if (resolved) {

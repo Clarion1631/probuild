@@ -101,6 +101,44 @@ test("resolveExpenseCostCodeId: explicit code, item fallback, then null", () => 
     assert.equal(resolveExpenseCostCodeId({ costCodeId: null, itemId: null }, ITEM_CODES), null);
 });
 
+test("a person's CLEARED phase suppresses the item fallback", () => {
+    // ROUND 42, ITEM 2. Clearing the phase writes `costCodeId: null` with
+    // `costCodeSource: "manual-none"` and deliberately KEEPS the item link —
+    // it is real history and billing reads it. The fallback then read the
+    // code off that item, so the variance report, the margin digest and the
+    // backfill's coverage table all went on charging the phase the bookkeeper
+    // had just removed. The clear held in the column and did nothing anywhere
+    // it mattered.
+    assert.equal(
+        resolveExpenseCostCodeId(
+            { costCodeId: null, itemId: "item-coded", costCodeSource: "manual-none" },
+            ITEM_CODES,
+        ),
+        null,
+        "a person said there is no phase here",
+    );
+    // ...and ONLY for that value. A null source is "nobody has spoken", which
+    // is the legacy majority and the whole reason the fallback exists.
+    for (const source of [null, undefined, "ai", "backfill", "capture", "manual"]) {
+        assert.equal(
+            resolveExpenseCostCodeId(
+                { costCodeId: null, itemId: "item-coded", costCodeSource: source },
+                ITEM_CODES,
+            ),
+            "cc-framing",
+            `source ${String(source)} must keep the fallback`,
+        );
+    }
+    // An EXPLICIT code always wins, whatever the source says.
+    assert.equal(
+        resolveExpenseCostCodeId(
+            { costCodeId: "cc-paint", itemId: "item-coded", costCodeSource: "manual-none" },
+            ITEM_CODES,
+        ),
+        "cc-paint",
+    );
+});
+
 test("resolveExpenseCostCodeId matches the inline fallback job-variance used", () => {
     const legacyReconcile = (
         explicitCostCodeId: string | null,
@@ -410,4 +448,20 @@ test("the register drill-down resolves the job through the shared resolver", () 
     );
     assert.match(select, /projectId: true/, "the denormalized column is selected");
     assert.match(select, /project: \{ select: \{ id: true, name: true \} \}/);
+});
+
+test("every reader of the phase fallback actually SELECTS the provenance", () => {
+    // A rule that depends on a column nobody selected is a rule that does not
+    // exist (round 42, item 2). These three are the readers that resolve a
+    // phase through the item fallback; each must ask the database for
+    // `costCodeSource` and hand it to the resolver.
+    const ROOT = path.resolve(__dirname, "..");
+    for (const [rel, needle] of [
+        ["src/lib/job-variance-db.ts", /select: \{ costCodeId: true, costCodeSource: true, itemId: true, amount: true \}/],
+        ["src/lib/margin-digest.ts", /resolveActualCostCodeId\(row\.costCodeId, row\.item\?\.costCodeId, row\.costCodeSource\)/],
+        ["scripts/backfill-expense-attribution.ts", /costCodeSource: row\.costCodeSource \?\? null/],
+    ] as [string, RegExp][]) {
+        const source = readFileSync(path.join(ROOT, rel), "utf8");
+        assert.match(source, needle, `${rel} does not pass costCodeSource to the resolver`);
+    }
 });

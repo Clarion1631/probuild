@@ -204,7 +204,7 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
 
     // ...and the post-run verification asserts the same thing against the live
     // catalog, rather than only asserting the constraint's NAME exists.
-    assert.equal(expectedConstraints.length, 1);
+    assert.equal(expectedConstraints.length, 2, "projectId's FK and estimateId's");
     const [constraint] = expectedConstraints as { name: string; table: string; mustMatch: RegExp[] }[];
     assert.equal(constraint.name, "Expense_projectId_fkey");
     assert.equal(constraint.table, "Expense");
@@ -261,10 +261,19 @@ test("every statement is additive — nothing drops, renames, or rewrites data",
         // or index.
         const isConstraintReplace =
             /DROP CONSTRAINT IF EXISTS "Expense_(taxAmount|taxDeductibleBase|taxAtSource)_check"/.test(statement);
+        // ROUND 42, ITEM 4b. `DROP NOT NULL` widens a column — it destroys no
+        // row and refuses no existing value — and the FK swap replaces a
+        // CASCADE rule with SET NULL, which is the whole point. Both are named
+        // explicitly rather than admitted by a loose pattern.
+        const isNullabilityWidening =
+            /^ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL$/.test(statement.trim());
+        const isEstimateFkReplace =
+            statement.includes("Expense_estimateId_fkey") &&
+            statement.includes("ON DELETE SET NULL");
         const isGuardTriggerReplace =
             /^DROP TRIGGER IF EXISTS probuild_expense_(estimate_pair|amount_tax)_(guard|ack) ON "Expense"$/.test(statement.trim());
         assert.ok(
-            isConstraintReplace || isGuardTriggerReplace || !/\bDROP\b/i.test(statement),
+            isConstraintReplace || isGuardTriggerReplace || isNullabilityWidening || isEstimateFkReplace || !/\bDROP\b/i.test(statement),
             `destructive statement: ${statement}`,
         );
         assert.ok(!/DROP (TABLE|COLUMN|INDEX)/i.test(statement), `destructive: ${statement}`);

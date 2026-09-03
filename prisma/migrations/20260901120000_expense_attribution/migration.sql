@@ -228,8 +228,20 @@ ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxAtSource_check"
 -- the row on job A by projectId and job B by estimate.
 --
 -- It fires ONLY when the UPDATE leaves `projectId` untouched, which is exactly
--- the old build and exactly nothing in the new one. A bookkeeper deliberately
--- re-attributing an expense keeps the estimate of the job it left, on purpose,
+-- the old build and exactly nothing in the new one.
+--
+-- CORRECTION (round 42, item 4a): an earlier version of this note said a
+-- bookkeeper re-attributing an expense KEEPS the estimate of the job it left,
+-- "on purpose". That was never a defensible resting state -- it is the
+-- split-job row this whole migration exists to prevent, entered deliberately,
+-- and until round 42 the abandoned estimate could also DELETE the spend on its
+-- way out (Expense_estimateId_fkey was ON DELETE CASCADE). Re-attribution moves
+-- BOTH halves, through `reattributeExpense` in src/lib/expense-attribution.ts,
+-- which resolves the target job's own estimate or leaves `estimateId` NULL when
+-- that job has none. No handler offers re-attribution today; the helper and the
+-- tripwire in tests/attribution-lock-order.test.ts exist so the path that gets
+-- built next is the correct one. What this trigger still protects is the OLD
+-- BUILD's `estimateId`-only rewrite, which is a different thing entirely,
 -- and this must never revert that.
 --
 -- Dropped again at the end of this file: it is compatibility scaffolding for
@@ -472,6 +484,44 @@ UPDATE "Expense" e SET "projectId" = locked."projectId"
 -- merge order: if Phase 1 has not landed in the target database yet, these two
 -- columns are skipped and Phase 1's own migration creates the table without
 -- them, at which point re-running this script adds them.
+-- AN ESTIMATE MAY NOT DELETE SPEND (round 42, item 4b).
+--
+-- `Expense_estimateId_fkey` was NOT NULL + ON DELETE CASCADE, so deleting an
+-- estimate DELETED every expense booked through it. Phase 3 makes that worse:
+-- a re-attributed row is reported under a DIFFERENT job (its own projectId)
+-- while still hanging off the estimate it left, so tidying up a superseded
+-- estimate silently destroys another job's cost -- money with a QuickBooks
+-- Purchase behind it.
+--
+-- SET NULL, not RESTRICT: the row keeps projectId, which is the primary
+-- attribution every reader already prefers, so the spend stays on its job with
+-- no estimate behind it. RESTRICT would preserve the cost too, but it would
+-- block deleting a PROJECT (Project cascades to its Estimates, and those
+-- deletes would then be refused); Invoice.estimateId and Takeoff.estimateId
+-- already take the SET NULL stance in this schema.
+--
+-- The column has to become nullable first, or SET NULL is unenforceable.
+ALTER TABLE "Expense" ALTER COLUMN "estimateId" DROP NOT NULL;
+
+DO $$
+DECLARE existing_def TEXT;
+BEGIN
+  SELECT pg_get_constraintdef(oid) INTO existing_def
+    FROM pg_constraint
+   WHERE conname = 'Expense_estimateId_fkey'
+     AND conrelid = '"Expense"'::regclass;
+  IF existing_def IS NULL THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+  ELSIF existing_def NOT LIKE '%ON DELETE SET NULL%' THEN
+    ALTER TABLE "Expense" DROP CONSTRAINT "Expense_estimateId_fkey";
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_estimateId_fkey"
+      FOREIGN KEY ("estimateId") REFERENCES "Estimate"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END $$;
+
 DO $$ BEGIN
   IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
     ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;

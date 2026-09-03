@@ -193,7 +193,10 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 // phase or in the unattributed bucket — visible, not silently
                 // dropped.
                 where: expenseForProjectWhere(project.id),
-                select: { costCodeId: true, itemId: true, amount: true },
+                // costCodeSource: a person's explicit "no phase" suppresses the
+                // item fallback (round 42, item 2). A rule that depends on a
+                // column nobody selected is a rule that does not exist.
+                select: { costCodeId: true, costCodeSource: true, itemId: true, amount: true },
             }),
         ]);
 

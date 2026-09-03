@@ -18,6 +18,7 @@
 // and resolves in-memory rows; the callers own the queries.
 import type { Prisma } from "@prisma/client";
 import { lockMoneyParentsMany } from "./tx-retry";
+import { lockAttributionParents } from "./phase-invariant";
 
 /** The two ways a row can know its project. Both optional at the type level. */
 export interface ExpenseProjectFacts {
@@ -39,10 +40,16 @@ export function resolveExpenseProjectId(expense: ExpenseProjectFacts): string | 
     return expense.projectId ?? expense.estimate?.projectId ?? null;
 }
 
-/** The two ways a row can know its phase. */
+/** The two ways a row can know its phase, and who decided the first one. */
 export interface ExpenseCostCodeFacts {
     costCodeId: string | null;
     itemId: string | null;
+    /**
+     * `manual-none` here means a person cleared the phase, which is a decision
+     * ABOUT THE ROW and not merely an empty column — see
+     * `resolveActualCostCodeId`.
+     */
+    costCodeSource?: string | null;
 }
 
 /**
@@ -67,6 +74,7 @@ export function resolveExpenseCostCodeId(
     return resolveActualCostCodeId(
         expense.costCodeId,
         expense.itemId ? itemCostCodeById.get(expense.itemId) : null,
+        expense.costCodeSource ?? null,
     );
 }
 
@@ -82,8 +90,30 @@ export function resolveExpenseCostCodeId(
 export function resolveActualCostCodeId(
     explicitCostCodeId: string | null | undefined,
     linkedItemCostCodeId: string | null | undefined,
+    costCodeSource?: string | null,
 ): string | null {
-    return explicitCostCodeId ?? linkedItemCostCodeId ?? null;
+    if (explicitCostCodeId) return explicitCostCodeId;
+    // "CLEAR THE PHASE" HAS TO CLEAR THE RESOLVED PHASE (round 42, item 2).
+    //
+    // A bookkeeper who clears the phase leaves `costCodeId: null` with
+    // `costCodeSource: "manual-none"` — a decision, which every automated pass
+    // is then forbidden to overwrite. But the ROW usually still carries the
+    // `itemId` it was linked to, and this fallback happily read that item's
+    // code instead: the variance report, the margin digest and the backfill's
+    // coverage table all went on charging the phase the person had just
+    // removed. The clear held in the column and did nothing anywhere it
+    // mattered.
+    //
+    // `manual-none` therefore suppresses the fallback. The item LINK is kept on
+    // purpose — it is real history, it is what billing and the estimate view
+    // read, and dropping it would lose the connection between the spend and the
+    // line it was bought for — but it no longer IMPLIES a phase, because a
+    // person has said there is none.
+    //
+    // Only `manual-none`. A null source is "nobody has spoken", which is the
+    // legacy majority and exactly the case the fallback exists for.
+    if (costCodeSource === "manual-none") return null;
+    return linkedItemCostCodeId ?? null;
 }
 
 /**
@@ -678,9 +708,14 @@ export interface ExpenseTxClient {
  */
 export async function resolveExpenseProjectUnderLock(
     tx: ExpenseTxClient,
-    expense: { projectId: string | null; estimateId: string },
+    expense: { projectId: string | null; estimateId: string | null },
 ): Promise<string | null> {
     if (expense.projectId) return expense.projectId;
+    // NO ESTIMATE LEFT TO ASK (round 42, item 4b). `Expense.estimateId` is
+    // nullable now and SET NULL on delete, so a row whose estimate is gone
+    // answers through its own `projectId` or not at all — there is nothing to
+    // lock and nothing to re-read.
+    if (!expense.estimateId) return null;
     await tx.$queryRawUnsafe(
         `SELECT id FROM "Estimate" WHERE id = $1 FOR SHARE`,
         expense.estimateId,
@@ -770,6 +805,120 @@ export async function lockEstimateAttribution(
     )) as { projectId: string | null }[];
     const projectId = rows?.[0]?.projectId ?? null;
     return projectId ? { estimateId, projectId } : null;
+}
+
+/** What a re-attribution did, or why it did nothing. */
+export type ReattributionOutcome =
+    | { moved: true; projectId: string; estimateId: string | null }
+    | { moved: false; reason: "no-such-expense" | "already-there" | "lost-the-race" };
+
+/** The transaction-client subset `reattributeExpense` needs. */
+export interface ReattributeTxClient extends ExpenseTxClient {
+    expense: {
+        findUnique(args: {
+            where: { id: string };
+            select: Record<string, unknown>;
+        }): Promise<{ projectId: string | null; estimateId: string | null } | null>;
+        updateMany(args: {
+            where: Record<string, unknown>;
+            data: Record<string, unknown>;
+        }): Promise<{ count: number }>;
+    };
+    estimate: {
+        findFirst(args: {
+            where: Record<string, unknown>;
+            orderBy?: Record<string, unknown>;
+            select: Record<string, unknown>;
+        }): Promise<{ id: string } | null>;
+    };
+}
+
+/**
+ * MOVE AN EXPENSE TO ANOTHER JOB — BOTH HALVES, OR NEITHER
+ * (Codex round 42, item 4a).
+ *
+ * `projectId` and `estimateId` are the same fact said twice: the job is the
+ * answer, the estimate is where it came from. The migration's own note used to
+ * say a human re-attribution deliberately KEEPS the estimate of the job it
+ * left, and that is not a defensible resting state — it is the split-job row
+ * this whole phase exists to prevent, entered on purpose. Every reader that
+ * trusts the estimate (billing, the estimate view, `job-variance`'s
+ * attribution-only pool) then reports the OLD job while `resolveExpenseProjectId`
+ * reports the new one, and until round 42 the old estimate could also DELETE
+ * the row outright.
+ *
+ * So there is one way to do it, and it moves both:
+ *
+ *   * `lockAttributionParents` first, in the canonical order, for BOTH the job
+ *     the row is leaving and the job it is joining — the target's Project row
+ *     is what the new `estimateId`'s foreign key will touch, and the source's
+ *     is what the current one holds.
+ *   * the target estimate is RESOLVED, not supplied: the caller names a job,
+ *     and this picks that job's most recent eligible estimate. When the job has
+ *     none, `estimateId` becomes NULL rather than staying on the old job's —
+ *     which is exactly the shape `Expense.estimateId` now supports (round 42,
+ *     item 4b) and which `resolveExpenseProjectId` answers from `projectId`.
+ *   * the write is a compare-and-set on the attribution it was decided from, so
+ *     a concurrent move loses rather than interleaving.
+ *
+ * NO CALLER TODAY. Stated plainly because it matters: no handler currently
+ * offers re-attribution — the PUT and PATCH allowlists do not accept
+ * `projectId`, and the QBO suggester, the receipt approve and the backfill all
+ * write a phase or a first attribution rather than moving one. This exists so
+ * the path that gets built next is the correct one rather than the obvious one,
+ * and `tests/attribution-lock-order.test.ts` fails any write that moves
+ * `projectId` on an already-attributed row without moving `estimateId` with it.
+ */
+export async function reattributeExpense(
+    tx: ReattributeTxClient,
+    input: {
+        expenseId: string;
+        toProjectId: string;
+        /** Which estimate statuses may carry the money. Caller's policy. */
+        eligibleEstimateStatuses?: readonly string[];
+    },
+): Promise<ReattributionOutcome> {
+    const before = await tx.expense.findUnique({
+        where: { id: input.expenseId },
+        select: { projectId: true, estimateId: true },
+    });
+    if (!before) return { moved: false, reason: "no-such-expense" };
+    if (before.projectId === input.toProjectId) return { moved: false, reason: "already-there" };
+
+    // BOTH jobs, in the canonical order, before anything is read for the
+    // decision. The estimate this row is on now is locked with the job it is
+    // leaving; the target job is locked because the new estimate's foreign key
+    // will take FOR KEY SHARE on it.
+    for (const projectId of [before.projectId, input.toProjectId].filter(Boolean).sort()) {
+        await lockAttributionParents(tx, { projectId: projectId as string });
+    }
+    if (before.estimateId) {
+        await lockAttributionParents(tx, { estimateId: before.estimateId });
+    }
+
+    const statuses = input.eligibleEstimateStatuses;
+    const target = await tx.estimate.findFirst({
+        where: {
+            projectId: input.toProjectId,
+            archivedAt: null,
+            ...(statuses?.length ? { status: { in: [...statuses] } } : {}),
+        },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+    });
+
+    const written = await tx.expense.updateMany({
+        // The attribution this decision was MADE on, both halves. A row that
+        // moved underneath matches nothing rather than being moved twice.
+        where: {
+            id: input.expenseId,
+            projectId: before.projectId,
+            estimateId: before.estimateId,
+        },
+        data: { projectId: input.toProjectId, estimateId: target?.id ?? null },
+    });
+    if (written.count === 0) return { moved: false, reason: "lost-the-race" };
+    return { moved: true, projectId: input.toProjectId, estimateId: target?.id ?? null };
 }
 
 /** One job an estimate's expenses are already pinned to, and how many. */

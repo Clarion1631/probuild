@@ -293,6 +293,24 @@ backfill > null. Nothing but a human edit may change a row whose `costCodeSource
    authorized atomic action that re-points `projectId` and `estimateId`
    together (the same two-column, same-fact guarantee the writers keep) is
    deferred to a follow-up rather than bolted on here under review pressure.
+   **AS BUILT (Codex round 42, item 4).** Two things landed early because the
+   alternative was a documented hazard rather than a missing feature. (1) The
+   move itself has ONE implementation, `reattributeExpense` in
+   `src/lib/expense-attribution.ts`: it locks both jobs' parents in the
+   canonical order, RESOLVES the target job's own estimate (or writes
+   `estimateId: null` when that job has none), and compare-and-sets on the
+   attribution it decided from — so the pair can never be half-moved. It has no
+   caller yet; `tests/attribution-lock-order.test.ts` fails any expense write
+   that moves `projectId` on an already-attributed row without moving
+   `estimateId` with it, so the path built next has to be this one. (2)
+   `Expense.estimateId` is now NULLABLE with `ON DELETE SET NULL` rather than
+   NOT NULL with `ON DELETE CASCADE`: with re-attribution keeping a row on an
+   estimate belonging to a job it has left, deleting that estimate DELETED
+   another job's spend. SET NULL over RESTRICT because the row keeps its
+   `projectId` — the primary attribution every reader already prefers — and
+   RESTRICT would block deleting a PROJECT, since Project cascades to its
+   Estimates. `Invoice.estimateId` and `Takeoff.estimateId` already take the
+   SET NULL stance in this schema.
    Until it exists, a bad match is corrected one of two ways: (1) fix the
    customer/job field on the purchase in QBO and let it re-sync — this only
    reaches the row if `projectId` is STILL null, since that is the guard's own

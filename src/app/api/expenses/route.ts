@@ -49,6 +49,21 @@ export async function POST(req: NextRequest) {
         }
         const requestedCostCodeId: string | null =
             costCodeEdit.kind === "set" ? costCodeEdit.costCodeId : null;
+        // AN EXPLICIT "NO PHASE" ON CREATE IS A DECISION TOO (round 42, item 3).
+        //
+        // The parser keeps `clear` and `untouched` apart precisely because they
+        // are different facts, and this route threw the distinction away: both
+        // became a null code with a null source, which is the state every
+        // automated pass reads as "no human has spoken, a machine may write".
+        // So a crew member who deliberately picked NO phase on the phone had
+        // the QBO suggester put its regex guess on the row minutes later —
+        // the same clear-then-overwrite failure round 36 fixed for the edit
+        // path, on the create path.
+        //
+        // An OMITTED key stays unclassified: this route serves legacy mobile
+        // builds and the no-photo path, where silence means "nobody was asked",
+        // not "somebody said none".
+        const clearsCostCode = costCodeEdit.kind === "clear";
 
         if (!estimateId && !projectId) {
             return NextResponse.json(
@@ -233,8 +248,12 @@ export async function POST(req: NextRequest) {
                 costCodeId,
                 costTypeId,
                 // A person picked this on a phone or in a form, so it is
-                // "capture" and no automated pass may ever overwrite it.
-                costCodeSource: costCodeId ? "capture" : null,
+                // "capture" and no automated pass may ever overwrite it — and
+                // an explicit `costCodeId: null` is the same person saying
+                // there is NO phase, recorded as "manual-none" so nothing
+                // overwrites that either (round 42, item 3). An omitted key is
+                // neither: it stays unclassified and machine-writable.
+                costCodeSource: costCodeId ? "capture" : clearsCostCode ? "manual-none" : null,
                 amount: numericAmount,
                 vendor: vendor || null,
                 date: parsedDate,

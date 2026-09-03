@@ -377,17 +377,40 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const resultingAmount = nextAmount ?? Number(expense.amount);
         const existingBase =
             expense.taxDeductibleBase === null ? null : Number(expense.taxDeductibleBase);
-        // THE FAST FAIL ASKS THE SAME QUESTION THE DATABASE DOES, SIGNED.
+        // THE FAST FAIL ASKS THE SAME QUESTION THE DATABASE DOES, SIGNED —
+        // AND IT ASKS IT IN THE SAME ORDER (round 42, item 1).
         //
         // It used to compare `existingBase > ceiling`, unsigned. On a credit
         // that is backwards: a valid row (amount -50, tax -4, base -40) has
         // `-40 > -46` and was refused — so a request that merely edited the
         // VENDOR of a legitimate credit got a 400 naming a deduction base it
-        // never mentioned, and the row became permanently uneditable through
-        // this route. The locked re-check further down already used the signed
-        // rule, so the two disagreed about the same row; both now read
-        // `taxDeductibleBaseFits`.
-        if (!taxDeductibleBaseFits(existingBase, resultingAmount, Number(expense.taxAmount ?? 0))) {
+        // never mentioned.
+        //
+        // The signed rule fixed that and left a second, subtler version of the
+        // same shape: this check ran BEFORE the tax was re-validated, so a row
+        // whose TAX is also invalidated by the new gross (207.74 / 16.55 tax /
+        // 50 base, edited to 10) was refused here for its base, even though the
+        // plan under the lock would have cleared BOTH stale figures and
+        // accepted the edit. The receipt stayed uncorrectable through the only
+        // handler that can correct it — the exact failure round 41 fixed one
+        // branch of.
+        //
+        // So the fast fail runs the SAME plan the locked path runs and refuses
+        // only what the plan itself calls a base-only misfit. `grossMoved` is
+        // false because this pass is not deciding the review flag — only
+        // whether there is a base problem the clears cannot resolve.
+        const fastPlan = planTaxRevalidation(
+            {
+                taxAmount: expense.taxAmount === null ? null : Number(expense.taxAmount),
+                taxDeductibleBase: existingBase,
+                installedAtCustomer: null,
+                taxSource: null,
+                taxDeductibleBaseSource: null,
+            },
+            resultingAmount,
+            { grossMoved: false },
+        );
+        if (fastPlan.reason === "base-cannot-fit") {
             const ceiling = deductionCeiling(resultingAmount, Number(expense.taxAmount ?? 0));
             return NextResponse.json(
                 {

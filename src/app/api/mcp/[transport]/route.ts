@@ -1373,7 +1373,7 @@ function createHandler(actor: RouteMcpActor) {
                 }
                 try {
                     const expense = await createExpenseCore({ changeOrderId, estimateId, amount, vendor, date, description, receiptFileId, isBillable: Boolean(changeOrderId) }, "ChatGPT connector");
-                    const estimate = await prisma.estimate.findUnique({ where: { id: expense.estimateId }, select: { projectId: true } });
+                    const estimate = await prisma.estimate.findUnique({ where: { id: expense.estimateId ?? "" }, select: { projectId: true } });
                     return textResult({ id: expense.id, changeOrderId: expense.changeOrderId, amount: Number(expense.amount), receiptUrl: expense.receiptUrl, url: estimate?.projectId ? `https://probuild.goldentouchremodeling.com/projects/${estimate.projectId}/time-expenses` : null });
                 } catch (err: any) {
                     return { ...textResult({ error: err?.message || "Expense could not be logged" }), isError: true };

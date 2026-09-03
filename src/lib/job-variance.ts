@@ -49,6 +49,12 @@ export interface VarianceTimeEntry {
 export interface VarianceExpense {
     costCodeId: string | null;
     itemId: string | null;
+    /**
+     * "manual-none" means a person cleared the phase. Optional so the pure
+     * fixtures in tests stay small, and absent reads as "nobody has spoken" —
+     * which is the legacy majority and the case the item fallback exists for.
+     */
+    costCodeSource?: string | null;
     amount: number;
 }
 
@@ -304,7 +310,12 @@ export function computeProjectVariance(input: {
      */
     const reconcileAttribution = (
         explicitCostCodeId: string | null | undefined,
-        itemId: string | null | undefined
+        itemId: string | null | undefined,
+        // A person's explicit "no phase" (round 42, item 2). Threaded through
+        // so this report cannot keep charging a phase the bookkeeper cleared:
+        // the row still carries its item link, and the fallback below used to
+        // read the code off it regardless.
+        costCodeSource?: string | null,
     ): { costCodeId: string | null; item: (ItemVariance & { costCodeId: string | null }) | undefined } => {
         const linkedItem = itemId ? itemsById.get(itemId) : undefined;
         // The "own code, else the linked item's code" fallback lives in
@@ -313,7 +324,11 @@ export function computeProjectVariance(input: {
         // disagree about which phase a posting lands on. `resolveActualCostCodeId`
         // above is the same rule by its older name and delegates to it.
         const costCodeId = resolveExpenseCostCodeId(
-            { costCodeId: explicitCostCodeId ?? null, itemId: itemId ?? null },
+            {
+                costCodeId: explicitCostCodeId ?? null,
+                itemId: itemId ?? null,
+                costCodeSource: costCodeSource ?? null,
+            },
             itemCostCodeById,
         );
         if (!costCodeId) return { costCodeId: null, item: undefined };
@@ -369,7 +384,8 @@ export function computeProjectVariance(input: {
 
         const { costCodeId, item: linkedItem } = reconcileAttribution(
             expense.costCodeId,
-            expense.itemId
+            expense.itemId,
+            expense.costCodeSource
         );
 
         if (!costCodeId) {
