@@ -175,6 +175,32 @@ test("publishing STAGING -> RECEIVED is fenced on the exact state", () => {
     assert.match(body, /publish-conflict/);
 });
 
+test("a losing publish cleans up its own object when the winner published a different path", () => {
+    // Two concurrent replays of the same bytes each upload to their OWN random
+    // path (see /start), then both call publishStagedRow. Whichever loses the
+    // CAS must not just report the winner's RECEIVED outcome and walk away —
+    // its own upload is now unreferenced by any row, and nothing else will
+    // ever find it to clean it up.
+    const fn = intake.slice(intake.indexOf("async function publishStagedRow"));
+    const body = fn.slice(0, fn.indexOf("\n/**"));
+    const conflictBranch = body.slice(body.indexOf("if (count === 0)"));
+    assert.match(conflictBranch, /storagePath: true/, "re-reads the winner's actual storagePath, not just state");
+    assert.match(
+        conflictBranch,
+        /current\?\.storagePath && current\.storagePath !== expectStoragePath/,
+        "only cleans up when the winner published somewhere else",
+    );
+    assert.match(conflictBranch, /deleteObjectOrRecord\(expectStoragePath, "orphaned-by-concurrent-publish"\)/);
+    // Cleanup must happen BEFORE the idempotent success is returned — the
+    // finding was specifically that the loser reported success and never
+    // cleaned up its own path.
+    assert.ok(
+        conflictBranch.indexOf("deleteObjectOrRecord(expectStoragePath") <
+            conflictBranch.indexOf("alreadyPublished: true"),
+        "cleanup runs before the idempotent success is returned",
+    );
+});
+
 test("recovery is restricted to the two reasons a re-upload can actually fix", () => {
     // "Any NEEDS_REVIEW row" would drag a row parked for a vendor mismatch, a
     // zero total, or a QBO fault back to RECEIVED and re-read it, discarding a

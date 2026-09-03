@@ -1416,9 +1416,20 @@ test.describe("round-10 finalize authorization and recovery", () => {
         expect(created.res.status()).toBe(200);
         minted.push(created.body.id);
 
+        // MUST be a Buffer, not a plain string. Playwright's APIRequestContext
+        // treats a STRING `data` sent under an `application/json` content-type
+        // specially: if the string is not itself valid JSON, it silently
+        // re-wraps it with `JSON.stringify()` — turning this truncated body
+        // into a well-formed JSON payload whose value is the truncated text as
+        // a STRING, not the object it looks like. The route's `JSON.parse` then
+        // succeeds (on a string, not an object), every field reads as
+        // `undefined`, and the request looks exactly like a genuinely empty
+        // body — silently defeating the very truncation this test exists to
+        // catch. A Buffer bypasses that re-wrap and puts these exact bytes on
+        // the wire.
         const res = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
             headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
-            data: '{"costCodeId": "e2e-mob-cc-demo"', // truncated: missing closing brace
+            data: Buffer.from('{"costCodeId": "e2e-mob-cc-demo"', "utf8"), // truncated: missing closing brace
             maxRedirects: 0,
         });
         expect(res.status()).toBe(400);

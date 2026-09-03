@@ -38,6 +38,31 @@ test("the setting key is stable — an operator writes this row at the flip", ()
     assert.equal(CUTOVER_SETTING_KEY, "cutoverV1StoppedAt");
 });
 
+test("ambiguous or naive timestamps are rejected, not silently shifted", () => {
+    // Each of these parses fine under plain `new Date()`/`Date.parse()`, but
+    // none of them names one unambiguous instant: a date-only value reads as
+    // UTC midnight, a naive local value reads in the SERVER's zone, and a
+    // slash-separated value is locale-ambiguous (US vs. day-first). Any of
+    // those can shift the boundary by hours, which either retires rows v1
+    // never booked or lets a v1-booked row slip through to be double-booked.
+    for (const ambiguous of [
+        "2026-09-01",              // date-only — UTC midnight
+        "2026-09-01T10:00:00",     // naive local time, no offset
+        "2026-09-01T10:00:00.123", // naive local time with fractional seconds
+        "9/1/2026",                // locale-ambiguous
+        "2026-09-01 10:00:00Z",    // space instead of T
+        "2026-09-01T10:00",        // missing seconds
+    ]) {
+        assert.equal(parseCutoverBoundary(ambiguous), null, ambiguous);
+    }
+});
+
+test("an explicit ±HH:MM offset is accepted and converted to the right instant", () => {
+    const at = parseCutoverBoundary("2026-08-25T10:30:00-07:00");
+    assert.ok(at);
+    assert.equal(at.toISOString(), "2026-08-25T17:30:00.000Z");
+});
+
 // ── The three-way split: evidence outranks the timestamp ───────────────────
 
 const BOUNDARY = new Date("2026-08-25T00:00:00.000Z");

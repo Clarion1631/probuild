@@ -422,8 +422,18 @@ async function publishStagedRow(id: string, expectStoragePath: string, expectSta
         if (count === 0) {
             const current = await prisma.receiptIntake.findUnique({
                 where: { id },
-                select: { state: true },
+                select: { state: true, storagePath: true },
             });
+            // Somebody else won the publish race. If the winner's row now
+            // points somewhere OTHER than the path THIS call expected, the
+            // object THIS call verified/uploaded is unreferenced by any row —
+            // concurrent same-byte replays each upload to their own random
+            // path (see /start), so nothing else will ever find this one to
+            // clean it up. Do it now, before reporting the idempotent outcome
+            // the loser is about to return.
+            if (current?.storagePath && current.storagePath !== expectStoragePath) {
+                await deleteObjectOrRecord(expectStoragePath, "orphaned-by-concurrent-publish");
+            }
             // Somebody else published it; that is the outcome the caller wanted.
             if (current?.state === "RECEIVED") {
                 return NextResponse.json({ ok: true, id, state: "RECEIVED", alreadyPublished: true });
