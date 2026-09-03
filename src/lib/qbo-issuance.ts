@@ -194,3 +194,68 @@ export function progressBillingIssuanceHash(row: ProgressBillingIssuanceState): 
         row.customerId ?? "",
     ]);
 }
+
+/**
+ * The DOCUMENT rail (POST /api/quickbooks/sync): a whole estimate or invoice,
+ * not one milestone of it.
+ *
+ * Same job as the two states above and a wider net, because this rail sends a
+ * whole document: every line, the totals, the text QuickBooks displays, and the
+ * customer it is billed to. The claim used to pin only "id, unlinked,
+ * unclaimed", so an edit landing between the read and the link — a line added,
+ * a price changed, the title rewritten, the client re-pointed — left the record
+ * linked to a QuickBooks document describing something else entirely.
+ *
+ * `itemsRevision` is in here deliberately even though the line digest below
+ * would catch most edits on its own: it is the canonical optimistic-concurrency
+ * token for estimate items (#327), it moves on ANY item write including ones
+ * that happen to preserve every field this hashes, and it is the value the
+ * finalize CAS pins. Hashing it too means the marker and the CAS are asking the
+ * same question.
+ */
+export interface DocumentIssuanceState {
+    kind: "estimate" | "invoice";
+    /** The ProBuild code, which is also the QuickBooks DocNumber. */
+    code: string;
+    /** Estimate: `itemsRevision`. Invoice: null (it has no such column). */
+    itemsRevision: number | null;
+    total: unknown;
+    /** Invoice only; estimates carry no separate tax column on the document. */
+    taxAmount: unknown;
+    /** The PrivateNote / display text the payload carries. */
+    title: string | null;
+    projectName: string | null;
+    /** The QuickBooks CustomerRef the payload bills. */
+    customerId: string | null;
+    /**
+     * One entry per line the payload will carry, already flattened. Hashed in
+     * order: reordering lines reorders the QuickBooks document, so it is a
+     * different document.
+     */
+    lines: Array<{ id?: string; name?: string | null; quantity?: unknown; unitCost?: unknown; total?: unknown }>;
+}
+
+export function documentIssuanceHash(row: DocumentIssuanceState): string {
+    // Each line contributes its own length-prefixed group, so two lines cannot
+    // be re-cut into one another the way a plain join would allow.
+    const lines = row.lines.map((l) => hashFields([
+        l.id ?? "",
+        l.name ?? "",
+        money(l.quantity),
+        money(l.unitCost),
+        money(l.total),
+    ])).join("");
+    return hashFields([
+        "document",
+        row.kind,
+        row.code,
+        row.itemsRevision == null ? "" : String(row.itemsRevision),
+        money(row.total),
+        money(row.taxAmount),
+        row.title ?? "",
+        row.projectName ?? "",
+        row.customerId ?? "",
+        String(row.lines.length),
+        lines,
+    ]);
+}

@@ -1577,13 +1577,21 @@ test("a parked row refuses the next send, and unlinking releases it", async () =
     assert.equal(refuseIfParked("voided", "INV-1"), "proceeds");
 });
 
-test("the unlink write clears the marker", async () => {
+test("the unlink write clears the marker, and PINS the one it observed", async () => {
     // The documented release path: unlink already nulls qbSyncError, so no new
     // column or UI is needed to un-park a milestone.
     const src = await import("node:fs").then(fs =>
         fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
-    const unlinkWrite = src.slice(src.indexOf("export async function claimQBInvoiceUnlink"));
-    assert.match(unlinkWrite.slice(0, 1600), /qbSyncError: null/);
+    const start = src.indexOf("export async function claimQBInvoiceUnlink");
+    const unlinkWrite = src.slice(start, src.indexOf("\nexport ", start + 10));
+    assert.match(unlinkWrite, /qbSyncError: null/);
+
+    // Round 40 gate, finding 1: it also pins the marker the CALLER observed.
+    // Pinning the link alone let a local-only unlink clear a row that a
+    // concurrent deleteInQBO had just marked `pending-deletion` — and if that
+    // remote delete then failed, the live invoice was unlinked and re-sendable.
+    assert.match(unlinkWrite, /expectedQbSyncError: string \| null/);
+    assert.match(unlinkWrite, /qbSyncError: expectedQbSyncError/);
 });
 
 // --- The in-flight marker survives a crash ---

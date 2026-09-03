@@ -7,6 +7,13 @@
  * maintenance sweep, which walks records nobody has come back to. A second copy
  * of "is this document actually in QuickBooks?" is a second place for the two to
  * disagree about whether a record may be re-created.
+ *
+ * The marker vocabulary is the one the milestone rail already uses
+ * (`qbo-create-markers.ts`) rather than a private format. That module already
+ * carries every field a recovery has to prove ownership with — realm, customer,
+ * DocNumber, PrivateNote, expected total, issuance hash — and the first cut of
+ * this rail stored a bare nonce and re-derived everything else from CURRENT
+ * local state, which is exactly how a recovery adopts the wrong document.
  */
 import { createHash } from "node:crypto";
 
@@ -18,29 +25,41 @@ import {
     type QBTokens,
     type RouteDeadline,
 } from "./quickbooks";
-import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER } from "./qbo-create-markers";
-
-const MARKER_NONCE_SEP = ":";
+import {
+    AMBIGUOUS_CREATE_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    composeCreateMarker,
+    parseCreateMarker,
+    type CreateIdentity,
+} from "./qbo-create-markers";
 
 /** The two kinds a document-sync marker can carry. */
 export const DOCUMENT_SYNC_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER];
 
-/** `create-in-flight:<nonce>` — the nonce is what makes the requestid stable. */
-export function composeSyncMarker(kind: string, nonce: string): string {
-    return `${kind}${MARKER_NONCE_SEP}${nonce}`;
-}
-
 export function syncMarkerKind(marker: string | null | undefined): string | null {
-    if (!marker) return null;
-    for (const kind of DOCUMENT_SYNC_MARKERS) {
-        if (marker === kind || marker.startsWith(kind + MARKER_NONCE_SEP)) return kind;
-    }
-    return null;
+    return parseCreateMarker(marker)?.kind ?? null;
 }
 
-export function syncMarkerNonce(marker: string): string {
-    const at = marker.indexOf(MARKER_NONCE_SEP);
-    return at === -1 ? "" : marker.slice(at + 1);
+/** The identity a document-sync claim recorded, or null if it carries none. */
+export function syncMarkerIdentity(marker: string | null | undefined): CreateIdentity | null {
+    return parseCreateMarker(marker)?.identity ?? null;
+}
+
+/**
+ * The PrivateNote every document this rail creates carries.
+ *
+ * ONE definition, written by the create and recorded in the marker, so the
+ * recovery can prove a QuickBooks document is OURS rather than merely sharing a
+ * DocNumber. QuickBooks does not enforce DocNumber uniqueness, so a
+ * hand-created estimate or an import can collide with ours by accident; the
+ * estimate rail used to send the bare title, which any document could carry,
+ * and the invoice rail sent no note at all.
+ *
+ * Same shape as the milestone and progress-billing notes so the three read
+ * alike in QuickBooks: `ProBuild EST-00001 · Kitchen remodel`.
+ */
+export function documentPrivateNote(code: string, label: string | null): string {
+    return canonicalPrivateNote(label ? `ProBuild ${code} · ${label}` : `ProBuild ${code}`);
 }
 
 /**
@@ -54,22 +73,19 @@ export const QB_REQUEST_ID_MAX_LEN = 36;
 /**
  * The QuickBooks idempotency key for one create attempt.
  *
- * HASHED, not concatenated. The obvious form — `${recordId}:${nonce}` — is a
- * CUID (25 chars) joined to a UUID (36) and runs to about 62, well past the
- * limit above; the tests hid it by using `est-1` as an id. A SHA-256 over the
- * same two values, truncated, is bounded by construction and still
- * deterministic: the SAME record and the SAME claim nonce always produce the
- * same key, which is the whole property a replay depends on, and two different
- * records can never collide into one.
+ * HASHED, not concatenated. The obvious form — the record id joined to the
+ * claim — runs well past the limit above (a CUID is 25 characters and the
+ * marker is far longer), and the tests hid that by using `est-1` as an id. A
+ * SHA-256 over the record and the WHOLE marker is bounded by construction and
+ * still deterministic: the same record and the same claim always produce the
+ * same key, which is the property a replay depends on, while a NEW claim
+ * produces a new one.
  *
- * 32 hex characters (128 bits) of it: comfortably inside 36, and an accidental
+ * 32 hex characters (128 bits): comfortably inside 36, and an accidental
  * collision between two attempts is not a thing that happens.
  */
 export function syncRequestId(recordId: string, marker: string): string {
-    const digest = createHash("sha256")
-        .update(`${recordId}${MARKER_NONCE_SEP}${syncMarkerNonce(marker)}`)
-        .digest("hex")
-        .slice(0, 32);
+    const digest = createHash("sha256").update(`${recordId}:${marker}`).digest("hex").slice(0, 32);
     // Asserted rather than assumed: this is a constant-length digest today, and
     // the assertion is what stops a future "let us prefix it with the code"
     // from quietly disabling Intuit's dedupe.
@@ -79,17 +95,27 @@ export function syncRequestId(recordId: string, marker: string): string {
     return digest;
 }
 
+/** Compose a document-sync claim. Thin wrapper so callers share one shape. */
+export function composeSyncMarker(
+    kind: typeof CREATE_IN_FLIGHT_MARKER | typeof AMBIGUOUS_CREATE_MARKER,
+    identity: CreateIdentity,
+    at?: Date,
+): string {
+    return composeCreateMarker(kind, identity, at);
+}
+
 /** What a recovery probe concluded about a claimed record. */
 export type DocumentSyncRecovery =
-    /** QuickBooks holds exactly one document that is ours. Adopt it. */
+    /** QuickBooks holds exactly one document that is PROVABLY ours. Adopt it. */
     | { state: "found"; qbId: string }
     /**
-     * QuickBooks authoritatively holds none. The claim is KEPT and the caller
-     * may create — reusing this marker's nonce, so the create carries the same
-     * requestid and Intuit dedupes if the document existed but had not indexed.
+     * QuickBooks authoritatively holds no document with this DocNumber. The
+     * claim is KEPT and the caller may create — reusing this marker, so the
+     * create carries the same requestid and Intuit dedupes if the document
+     * existed but had not indexed.
      */
     | { state: "absent" }
-    /** Could not be established (outage, truncated result set, several matches). */
+    /** Could not be established, or could not be proved ours. Stays parked. */
     | { state: "unknown"; reason: string };
 
 export interface DocumentSyncProbeDeps {
@@ -97,33 +123,67 @@ export interface DocumentSyncProbeDeps {
     findInvoices?: typeof findQBInvoicesByDocNumber;
 }
 
+/** Money equality at QuickBooks' cent precision. */
+function sameMoney(a: number | null | undefined, b: number | null | undefined): boolean {
+    if (a == null || b == null) return false;
+    return Math.abs(a - b) <= 0.005;
+}
+
 /**
- * Ask QuickBooks whether the create this record was claimed for actually landed.
+ * Ask QuickBooks whether the create this record was claimed for actually landed
+ * — and whether what it found is OURS.
  *
- * Identity is the DocNumber, which on this rail is the record's OWN ProBuild
- * code (`EST-00001` / `INV-00001`) — one code, one record, unlike the milestone
- * rail where the DocNumber is derived from a position and needs a PrivateNote
- * beside it to be safe. The estimate's note is checked as well when the record
- * has one, because it costs nothing and a hand-created QuickBooks document that
- * happened to reuse the code should not be adopted.
+ * Everything it compares comes from the MARKER, never from current local state.
+ * That distinction is the whole point: the record may have been edited since the
+ * create, and re-deriving the identity from how it looks now would ask about a
+ * document we never sent.
  *
- * Everything that is not a confident single match is `unknown`, including TWO
- * matches: adopting one of a pair, or declaring absence because the answer was
- * confusing, are both worse than asking a human.
+ * A document is adopted only when ALL of these agree with the claim:
+ *   • the realm — the connection can legitimately point at another company now,
+ *     and against the wrong books the lookup finds nothing, which would read as
+ *     "no document exists" while ours sits collectible in the original company;
+ *   • the QuickBooks customer it bills;
+ *   • the DocNumber;
+ *   • the canonical PrivateNote marker the create wrote — QuickBooks does not
+ *     enforce DocNumber uniqueness, so this is what separates our document from
+ *     a hand-created or imported one that happens to share a code;
+ *   • the total the create expected to produce.
+ *
+ * Anything else is `unknown` and stays parked, including TWO matches and
+ * "documents exist under this code but none is ours". Adopting one of a pair,
+ * or declaring absence because the answer was confusing, are both worse than
+ * asking a human.
  */
 export async function probeDocumentSync(
     tokens: QBTokens,
-    input: { kind: "estimate" | "invoice"; code: string; privateNote?: string | null },
+    input: { kind: "estimate" | "invoice"; marker: string },
     deadline?: RouteDeadline,
     deps?: DocumentSyncProbeDeps,
 ): Promise<DocumentSyncRecovery> {
     const findEstimates = deps?.findEstimates ?? findQBEstimatesByDocNumber;
     const findInvoices = deps?.findInvoices ?? findQBInvoicesByDocNumber;
-    // The create truncates its DocNumber to Intuit's cap, so the lookup has to
-    // ask about the value QuickBooks actually stored, not the untruncated code.
-    const docNumber = input.code.slice(0, QB_DOC_NUMBER_MAX_LEN);
 
-    let matches: Array<{ id: string; privateNote: string | null }>;
+    const identity = syncMarkerIdentity(input.marker);
+    if (!identity?.docNumber || !identity.privateNote) {
+        return { state: "unknown", reason: "the claim does not record which QuickBooks document to look for" };
+    }
+    if (!identity.realmId || !identity.customerId) {
+        // Never "probably fine". An unverifiable claim is refused, exactly as
+        // the milestone resolver refuses a marker with no realm.
+        return { state: "unknown", reason: "the claim does not record which QuickBooks company or customer it billed" };
+    }
+    if (identity.realmId !== tokens.realmId) {
+        return {
+            state: "unknown",
+            reason: `the claim was made against QuickBooks company ${identity.realmId}, but ${tokens.realmId} is connected now`,
+        };
+    }
+
+    // The create truncates its DocNumber to Intuit's cap, so the lookup has to
+    // ask about the value QuickBooks actually stored.
+    const docNumber = identity.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN);
+
+    let matches: Array<{ id: string; privateNote: string | null; total: number; customerId: string | null }>;
     try {
         matches = input.kind === "estimate"
             ? await findEstimates(tokens, docNumber, deadline)
@@ -135,20 +195,19 @@ export async function probeDocumentSync(
         return { state: "unknown", reason: error instanceof Error ? error.message : "QuickBooks lookup failed" };
     }
 
-    const wanted = input.privateNote ? canonicalPrivateNote(input.privateNote) : null;
-    const ours = wanted
-        ? matches.filter((m) => (m.privateNote ? canonicalPrivateNote(m.privateNote) : null) === wanted)
-        : matches;
+    const ours = matches.filter((m) =>
+        canonicalPrivateNote(m.privateNote) === identity.privateNote
+        && m.customerId === identity.customerId
+        && (identity.expectedTotal == null || sameMoney(m.total, identity.expectedTotal)));
 
     if (ours.length === 1) return { state: "found", qbId: ours[0].id };
     if (matches.length === 0) return { state: "absent" };
     if (ours.length === 0) {
-        // Documents carry this code but none is ours. That is a human's call —
-        // creating another one alongside them is exactly the duplicate this
-        // whole mechanism exists to prevent.
         return {
             state: "unknown",
-            reason: `${matches.length} QuickBooks document(s) already use ${docNumber}, and none carries this record's note`,
+            reason:
+                `${matches.length} QuickBooks document(s) already use ${docNumber}, and none matches this claim's ` +
+                `customer, note and total — reconcile it by hand`,
         };
     }
     return { state: "unknown", reason: `${ours.length} QuickBooks documents match ${docNumber}` };
@@ -161,18 +220,48 @@ export interface DocumentSyncSweepResult {
     recovered: number;
     /** Still claimed afterwards, for any reason. Counted from the database. */
     stillParked: number;
+    /** Rows eligible at the start that this run never reached. */
+    unvisited: number;
     reason: string | null;
 }
 
+/** One record this sweep may act on. */
+export interface ParkedDocumentRow {
+    id: string;
+    marker: string;
+    kind: "estimate" | "invoice";
+}
+
 export interface DocumentSyncSweepDeps {
-    /** Rows carrying a marker, oldest first. */
-    listParked?: () => Promise<Array<{ id: string; code: string; privateNote: string | null; marker: string; kind: "estimate" | "invoice" }>>;
+    /**
+     * One PAGE of parked rows per rail, after that rail's cursor, plus a bounded
+     * wrap back to the head once the tail drains. The caller owns the Prisma
+     * shape (two tables, two id columns); this owns the fairness.
+     */
+    listParked?: (rail: "estimate" | "invoice", after: string | null, take: number) => Promise<ParkedDocumentRow[]>;
     /** Adopt one: CAS the id in and clear the marker. Returns rows written. */
-    adopt?: (row: { id: string; kind: "estimate" | "invoice"; marker: string }, qbId: string) => Promise<number>;
+    adopt?: (row: ParkedDocumentRow, qbId: string) => Promise<number>;
     countParked?: () => Promise<number>;
     probe?: typeof probeDocumentSync;
     isExhausted?: (deadline?: RouteDeadline) => boolean;
+    /** Where each rail resumes. Same KV the milestone sweeps use. */
+    cursors?: {
+        get(key: string): Promise<string | null>;
+        set(key: string, value: string): Promise<void>;
+    };
+    /** Which rail goes first this run. Defaults to alternating by clock. */
+    railFirst?: "estimate" | "invoice";
+    /** Rows one rail may visit per RUN. Overridable so a test can make it 1. */
+    pageSize?: number;
 }
+
+export const DOCUMENT_SYNC_CURSOR_KEYS = {
+    estimate: "qbo-maintenance.document-sync.estimate.cursor",
+    invoice: "qbo-maintenance.document-sync.invoice.cursor",
+} as const;
+
+/** How many rows one rail may look at per run. */
+export const DOCUMENT_SYNC_PAGE_SIZE = 25;
 
 /**
  * Finish the document syncs nobody came back to.
@@ -180,12 +269,21 @@ export interface DocumentSyncSweepDeps {
  * A record claimed by a create whose outcome was never learned is invisible
  * until somebody happens to press Sync again. That is not a work queue, and it
  * is exactly the state a duplicate would be hiding in, so the maintenance pass
- * walks them: probe by DocNumber, adopt an authoritative single match, and
- * leave everything else alone.
+ * walks them: probe by the claim's own identity, adopt an authoritative match,
+ * and leave everything else alone.
  *
  * It NEVER creates. An absent document here means the next user-initiated sync
  * may go ahead (it reuses the same requestid), and deciding that unattended,
  * against a query index that can lag a create by seconds, is not this job.
+ *
+ * FAIRNESS. The first cut took the first 25 rows of each rail every run. Rows
+ * that cannot be resolved stay eligible forever, so a permanently-unresolvable
+ * head row was re-probed every run and everything behind it was never reached —
+ * head-of-line starvation, in a queue whose whole purpose is to find rows nobody
+ * is looking at. Each rail now keeps a persisted keyset cursor, wraps ONCE back
+ * to the head when its tail drains, and the rails alternate which goes first so
+ * a run that runs out of budget does not always starve the same one. Identical
+ * shape to `sweepPendingPayLinks`.
  *
  * Whatever is still parked when it finishes is REPORTED, so it makes the
  * maintenance run ok:false rather than sitting quietly for another day.
@@ -195,42 +293,98 @@ export async function sweepPendingDocumentSyncs(
     deadline?: RouteDeadline,
     deps?: DocumentSyncSweepDeps,
 ): Promise<DocumentSyncSweepResult> {
-    const result: DocumentSyncSweepResult = { checked: 0, recovered: 0, stillParked: 0, reason: null };
+    const result: DocumentSyncSweepResult = {
+        checked: 0, recovered: 0, stillParked: 0, unvisited: 0, reason: null,
+    };
     if (!deps?.listParked || !deps?.adopt || !deps?.countParked) {
-        // The caller owns the Prisma shape (two different tables, two different
-        // id columns), so it supplies the reads and the write. No default: a
-        // silent no-op sweep is the failure mode this whole thing is about.
+        // The caller owns the reads and the write. No default: a silent no-op
+        // sweep is the failure mode this whole thing is about.
         throw new Error("sweepPendingDocumentSyncs requires listParked, adopt and countParked");
     }
     const probe = deps.probe ?? probeDocumentSync;
     const isExhausted = deps.isExhausted ?? (() => false);
+    const cursors = deps.cursors;
+    const pageSize = deps.pageSize ?? DOCUMENT_SYNC_PAGE_SIZE;
 
-    const rows = await deps.listParked();
-    for (const row of rows) {
-        // Checked before EVERY row: each is a QuickBooks query, and this sweep
-        // runs after the other maintenance passes have already spent the route.
-        if (isExhausted(deadline)) {
-            result.reason = "budget-exhausted";
-            break;
+    // Alternate by clock when the caller does not say. A fixed order means the
+    // second rail is always the one that loses a short run.
+    const first = deps.railFirst ?? (Date.now() % 2 === 0 ? "estimate" : "invoice");
+    const rails: Array<"estimate" | "invoice"> = first === "estimate"
+        ? ["estimate", "invoice"]
+        : ["invoice", "estimate"];
+
+    for (const rail of rails) {
+        if (result.reason) break;
+        const key = DOCUMENT_SYNC_CURSOR_KEYS[rail];
+        const stored = (await cursors?.get(key).catch(() => null)) || null;
+        // "" is how "start from the top" is stored; it is never a real id.
+        let cursor: string | null = stored && stored.length > 0 ? stored : null;
+        // Seeded with what this run INHERITED, never null: an abort before the
+        // first row completes must leave the cursor where it was, or the next
+        // run restarts from the top and the tail starves again.
+        let checkpoint: string | null = cursor;
+        let wrapped = false;
+        let exhausted = false;
+        let visited = 0;
+
+        while (visited < pageSize) {
+            if (isExhausted(deadline)) {
+                result.reason = "budget-exhausted";
+                break;
+            }
+            const page = await deps.listParked(rail, cursor, pageSize - visited);
+            if (page.length === 0) {
+                // Nothing at all, walking from the top: the rail is empty, so the
+                // next run should start from the top too.
+                if (cursor === null) {
+                    exhausted = true;
+                    break;
+                }
+                // Already wrapped: this run has seen the head portion as well.
+                // Keep the checkpoint so the next run continues AFTER the last
+                // row visited, rather than re-walking what was just done.
+                if (wrapped) break;
+                // Tail drained. Wrap ONCE back to the head so rows before the
+                // cursor are not stranded until somebody resets it by hand —
+                // and only once, or a run could walk the collection forever.
+                wrapped = true;
+                cursor = null;
+                continue;
+            }
+            for (const row of page) {
+                if (isExhausted(deadline)) {
+                    result.reason = "budget-exhausted";
+                    break;
+                }
+                visited++;
+                result.checked++;
+                const found = await probe(tokens, { kind: row.kind, marker: row.marker }, deadline);
+                // The cursor advances PAST every row this run looked at,
+                // resolved or not. That is the whole fix: a row that can never
+                // be resolved must not be re-probed ahead of everything else on
+                // the next run.
+                checkpoint = row.id;
+                cursor = row.id;
+                if (found.state !== "found") {
+                    // `absent` is left for a real sync to act on; `unknown` is
+                    // left for the next run. Either way the claim stands, so
+                    // nothing can create a second document meanwhile.
+                    if (found.state === "unknown") result.reason = result.reason ?? found.reason;
+                    continue;
+                }
+                if (await deps.adopt(row, found.qbId) === 1) result.recovered++;
+            }
+            if (result.reason === "budget-exhausted") break;
         }
-        result.checked++;
-        const found = await probe(
-            tokens,
-            { kind: row.kind, code: row.code, privateNote: row.privateNote },
-            deadline,
-        );
-        if (found.state !== "found") {
-            // `absent` is left for a real sync to act on; `unknown` is left for
-            // the next run. Either way the claim stands, so nothing can create
-            // a second document in the meantime.
-            if (found.state === "unknown") result.reason = result.reason ?? found.reason;
-            continue;
-        }
-        if (await deps.adopt(row, found.qbId) === 1) result.recovered++;
+
+        // Never throws — a lost cursor costs one restart from the top, never
+        // correctness.
+        await cursors?.set(key, exhausted ? "" : (checkpoint ?? "")).catch(() => {});
     }
 
     // Counted from the database AFTER the loop, so it includes rows this run
     // never reached as well as the ones it could not finish.
-    result.stillParked = await deps.countParked().catch(() => rows.length - result.recovered);
+    result.stillParked = await deps.countParked().catch(() => result.checked - result.recovered);
+    result.unvisited = Math.max(0, result.stillParked - (result.checked - result.recovered));
     return result;
 }

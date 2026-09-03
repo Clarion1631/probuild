@@ -4,20 +4,24 @@ import {
     syncEstimateToQB, syncInvoiceToQB,
     createRouteDeadline, isQBBudgetExhaustedError, isQBTimeoutError, isQboConnectionFailure,
     isQBAmbiguousDocumentCreateError,
+    QB_DOC_NUMBER_MAX_LEN,
     type QBTokens,
     type RouteDeadline,
 } from "@/lib/quickbooks";
 import { getFreshQBTokens, resolveCustomerAndItem } from "@/lib/quickbooks-payments";
-import { randomUUID } from "node:crypto";
-import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER } from "@/lib/qbo-create-markers";
+import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER, parseCreateMarker } from "@/lib/qbo-create-markers";
 import {
     composeSyncMarker,
+    documentPrivateNote,
     probeDocumentSync,
+    syncMarkerIdentity,
     syncMarkerKind,
-    syncMarkerNonce,
     syncRequestId,
 } from "@/lib/qbo-document-sync";
+import { documentIssuanceHash } from "@/lib/qbo-issuance";
+import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { prisma } from "@/lib/prisma";
+import type { Prisma } from "@prisma/client";
 import { toNum } from "@/lib/prisma-helpers";
 import { currentStaffUserOrNull, hasPermission, canAccessProject, canAccessEstimate } from "@/lib/permissions";
 
@@ -88,6 +92,91 @@ export const maxDuration = 60;
  *   • unknown — still refuse, with a retry-later status, and leave the marker
  *              for the maintenance sweep to try again.
  */
+/**
+ * PAYLOAD IDENTITY, and why the claim had to grow one.
+ *
+ * The claim used to pin `(id, qbId null, marker null)` and nothing else, and
+ * the finalize write pinned only the marker. Between them sit a token refresh,
+ * a customer resolve and the document create — seconds of remote calls. An
+ * edit landing in that window (a line added or repriced, the title rewritten,
+ * the project renamed, the client re-pointed at another QuickBooks customer)
+ * left the record LINKED to a QuickBooks document describing something else,
+ * with nothing anywhere recording the divergence.
+ *
+ * So the claim now records a fingerprint of the exact payload it is about to
+ * send (`documentIssuanceHash`), taken under the canonical
+ * Estimate → Invoice → Client locks so the customer it reads cannot be remapped
+ * mid-decision, and the finalize CAS re-reads and re-computes it. Same shape as
+ * the milestone rail, whose marker has carried an issuance hash since round 33.
+ */
+interface DocumentPayloadIdentity {
+    hash: string;
+    docNumber: string;
+    privateNote: string;
+    total: number;
+    customerId: string;
+    /** Estimates only: the canonical optimistic-concurrency token for items. */
+    itemsRevision: number | null;
+}
+
+/**
+ * Take a fresh claim under the canonical money locks.
+ *
+ * The lock order is the documented one (tx-retry.ts): Estimate → Invoice → Client.
+ * The Client is taken FOR SHARE — this only READS the mapping — but it must not
+ * straddle the FOR UPDATE remap in `resolveCustomerAndItem`, which may have run
+ * moments ago on this very request. Re-reading `qbCustomerId` inside the lock is
+ * what makes "the customer this payload bills" a fact rather than a guess.
+ *
+ * The CAS the caller supplies pins the payload snapshot as well as the link and
+ * the marker, so an edit landing between the handler's read and this write loses
+ * rather than being silently sent to QuickBooks.
+ */
+async function claimDocumentSync(args: {
+    estimateId?: string;
+    invoiceId?: string;
+    clientId: string;
+    payload: DocumentPayloadIdentity;
+    tokens: QBTokens;
+    claimedAt: Date;
+    claim: (tx: Prisma.TransactionClient, marker: string) => Promise<{ count: number }>;
+}): Promise<{ ok: true; marker: string } | { ok: false; reason: string }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(
+            tx,
+            { estimateId: args.estimateId ?? null, invoiceId: args.invoiceId ?? null, clientId: args.clientId },
+            { clientLock: "share" },
+        );
+        const client = await tx.client.findUnique({
+            where: { id: args.clientId },
+            select: { qbCustomerId: true },
+        });
+        if (client?.qbCustomerId !== args.payload.customerId) {
+            return {
+                ok: false as const,
+                reason: "its QuickBooks customer changed while this was being prepared",
+            };
+        }
+        const marker = composeSyncMarker(
+            CREATE_IN_FLIGHT_MARKER,
+            {
+                docNumber: args.payload.docNumber,
+                privateNote: args.payload.privateNote,
+                issuanceHash: args.payload.hash,
+                expectedTotal: args.payload.total,
+                realmId: args.tokens.realmId,
+                customerId: args.payload.customerId,
+            },
+            args.claimedAt,
+        );
+        const claimed = await args.claim(tx, marker);
+        if (claimed.count !== 1) {
+            return { ok: false as const, reason: "another sync claimed it first, or it changed while being prepared" };
+        }
+        return { ok: true as const, marker };
+    }));
+}
+
 type RecoveryOutcome =
     | { kind: "adopted"; response: NextResponse }
     | { kind: "create"; marker: string }
@@ -110,7 +199,6 @@ async function recoverClaimedRecord(args: {
     kind: "estimate" | "invoice";
     id: string;
     code: string;
-    privateNote: string | null;
     marker: string;
     tokens: QBTokens;
     deadline: RouteDeadline;
@@ -119,10 +207,16 @@ async function recoverClaimedRecord(args: {
     /** Re-claim: put the marker back to create-in-flight, same nonce. */
     reclaim: (next: string) => Promise<{ count: number }>;
     urlFor: (qbId: string) => string;
+    /** The original claim time, preserved so the marker keeps one identity. */
+    claimedAt: Date;
 }): Promise<RecoveryOutcome> {
+    // Everything the probe compares comes from the MARKER, not from how the
+    // record looks now: the record may well have been edited since the create,
+    // and re-deriving the identity from current state would ask QuickBooks
+    // about a document we never sent.
     const probe = await probeDocumentSync(
         args.tokens,
-        { kind: args.kind, code: args.code, privateNote: args.privateNote },
+        { kind: args.kind, marker: args.marker },
         args.deadline,
     );
 
@@ -148,9 +242,16 @@ async function recoverClaimedRecord(args: {
         };
     }
 
-    // Absent. Re-claim under the SAME nonce, so the create below replays the
-    // requestid the previous attempt would have sent.
-    const next = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, syncMarkerNonce(args.marker));
+    // Absent. Re-claim carrying the SAME identity, so the create below replays
+    // the requestid the previous attempt would have sent: if the document did
+    // exist but the query index had not caught up, Intuit returns the original
+    // rather than making a second. A fresh identity would have thrown that
+    // protection away at the exact moment it counts.
+    const identity = syncMarkerIdentity(args.marker);
+    if (!identity) {
+        return { kind: "refused", response: retryLater(args.code, "its claim could not be read") };
+    }
+    const next = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, identity, args.claimedAt);
     const reclaimed = await args.reclaim(next);
     if (reclaimed.count !== 1) {
         return { kind: "refused", response: retryLater(args.code, "it was being updated concurrently") };
@@ -181,10 +282,16 @@ async function settleSyncMarker(
     error: unknown,
 ): Promise<void> {
     const ambiguous = isQBAmbiguousDocumentCreateError(error);
+    const parsed = parseCreateMarker(marker);
+    const identity = parsed?.identity ?? null;
+    const claimedAt = new Date(parsed?.atMs ?? Date.now());
     try {
         await write({
-            qbSyncMarker: ambiguous
-                ? composeSyncMarker(AMBIGUOUS_CREATE_MARKER, syncMarkerNonce(marker))
+            // Promoted, not re-derived: the SAME identity and the SAME claim
+            // time, so the recovery still knows exactly which document to ask
+            // about and the replayed requestid stays the one that was sent.
+            qbSyncMarker: ambiguous && identity
+                ? composeSyncMarker(AMBIGUOUS_CREATE_MARKER, identity, claimedAt)
                 : null,
         });
     } catch {
@@ -225,7 +332,7 @@ export async function POST(req: NextRequest) {
                 where: { id },
                 select: {
                     id: true, code: true, title: true, status: true,
-                    qbEstimateId: true, qbSyncMarker: true,
+                    qbEstimateId: true, qbSyncMarker: true, itemsRevision: true,
                     totalAmount: true, balanceDue: true, createdAt: true, projectId: true, leadId: true,
                     // id/parentId feed the section-header detection in `buildQBEstimateLines`.
                     // orderBy keeps QB LineNum in the estimate's own row order rather than
@@ -275,14 +382,39 @@ export async function POST(req: NextRequest) {
             //    one into two documents. Failing to WRITE it aborts — an
             //    unwritten marker is exactly the invisible-crash case it guards.
             const estimateUrl = (qbId: string) => `https://app.qbo.intuit.com/app/estimate?txnId=${qbId}`;
+            // The PrivateNote the create will write, and what proves the document
+            // is ours at recovery time. It carries the code as well as the title,
+            // because a title alone is something any document could have.
+            const estimateNote = documentPrivateNote(estimate.code, estimate.title);
+            const estimatePayload: DocumentPayloadIdentity = {
+                hash: documentIssuanceHash({
+                    kind: "estimate",
+                    code: estimate.code,
+                    itemsRevision: estimate.itemsRevision,
+                    total: estimate.totalAmount,
+                    taxAmount: null,
+                    title: estimate.title,
+                    projectName: estimate.project?.name ?? null,
+                    customerId,
+                    lines: estimate.items.map((i) => ({
+                        id: i.id, name: i.name, quantity: i.quantity,
+                        unitCost: i.unitCost, total: i.total,
+                    })),
+                }),
+                docNumber: estimate.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+                privateNote: estimateNote,
+                total: toNum(estimate.totalAmount),
+                customerId,
+                itemsRevision: estimate.itemsRevision,
+            };
             let estimateMarker: string;
+            let estimateClaimedAt = new Date();
             if (syncMarkerKind(estimate.qbSyncMarker)) {
                 const stored = estimate.qbSyncMarker as string;
+                estimateClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());
                 const recovery = await recoverClaimedRecord({
                     kind: "estimate", id: estimate.id, code: estimate.code,
-                    // The estimate create sends the title as its PrivateNote, so
-                    // that is the second half of "is this document ours".
-                    privateNote: estimate.title, marker: stored, tokens, deadline,
+                    marker: stored, tokens, deadline, claimedAt: estimateClaimedAt,
                     adopt: (qbId) => prisma.estimate.updateMany({
                         where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: stored },
                         data: { qbEstimateId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
@@ -296,14 +428,34 @@ export async function POST(req: NextRequest) {
                 if (recovery.kind !== "create") return recovery.response;
                 estimateMarker = recovery.marker;
             } else {
-                estimateMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
-                const estimateClaim = await prisma.estimate.updateMany({
-                    where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: null },
-                    data: { qbSyncMarker: estimateMarker },
+                //    Claimed UNDER the money locks (Estimate → Invoice → Client), with
+                //    the customer re-read inside them. `resolveCustomerAndItem` may
+                //    have REMAPPED Client.qbCustomerId moments ago, and the payload
+                //    identity has to describe the mapping that actually stands — not
+                //    one read before a write that was still in flight.
+                const claimed = await claimDocumentSync({
+                    estimateId: estimate.id,
+                    clientId: client.id,
+                    payload: estimatePayload,
+                    tokens,
+                    claimedAt: estimateClaimedAt,
+                    claim: (tx, marker) => tx.estimate.updateMany({
+                        where: {
+                            id: estimate.id,
+                            qbEstimateId: null,
+                            qbSyncMarker: null,
+                            // The payload snapshot this claim describes. Pinned so a
+                            // concurrent edit between the read at the top of this
+                            // handler and the claim loses instead of being sent.
+                            itemsRevision: estimate.itemsRevision,
+                            totalAmount: estimate.totalAmount,
+                            title: estimate.title,
+                        },
+                        data: { qbSyncMarker: marker },
+                    }),
                 });
-                if (estimateClaim.count !== 1) {
-                    return retryLater(estimate.code, "another sync claimed it first");
-                }
+                if (!claimed.ok) return retryLater(estimate.code, claimed.reason);
+                estimateMarker = claimed.marker;
             }
 
             const result = await syncEstimateToQB(tokens, {
@@ -325,6 +477,9 @@ export async function POST(req: NextRequest) {
                 customerId,
                 itemId,
                 project: estimate.project ? { name: estimate.project.name } : null,
+                // The canonical marker note, not the bare title: this is what a
+                // recovery matches on to prove the document is ours.
+                privateNote: estimateNote,
             }, qb.glMappings || {}, deadline, syncRequestId(estimate.id, estimateMarker))
                 .catch(async (error) => {
                     await settleSyncMarker(
@@ -337,8 +492,20 @@ export async function POST(req: NextRequest) {
 
             // 3. PERSIST in the same write that clears the claim, pinned to it,
             //    so the id and the marker can never disagree.
+            //    Pinned to the PAYLOAD as well as the marker. `itemsRevision` is
+            //    the canonical optimistic-concurrency token for estimate items
+            //    (#327) and moves on ANY item write, so an edit that landed while
+            //    the create was in flight loses this CAS and the document is not
+            //    linked — it is left for the recovery path, which will find it by
+            //    the claim identity and refuse to adopt it against a changed row.
             const estimatePersisted = await prisma.estimate.updateMany({
-                where: { id: estimate.id, qbSyncMarker: estimateMarker },
+                where: {
+                    id: estimate.id,
+                    qbSyncMarker: estimateMarker,
+                    itemsRevision: estimate.itemsRevision,
+                    totalAmount: estimate.totalAmount,
+                    title: estimate.title,
+                },
                 data: { qbEstimateId: result.qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
             });
             if (estimatePersisted.count !== 1) {
@@ -391,14 +558,38 @@ export async function POST(req: NextRequest) {
         const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.client.id, deadline);
 
         const invoiceUrl = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
+        // The invoice create used to send NO PrivateNote at all, which left its
+        // recovery matching on DocNumber alone — and QuickBooks does not enforce
+        // DocNumber uniqueness, so a hand-created or imported invoice sharing the
+        // code would have been adopted. It now carries the same canonical marker
+        // note the estimate rail does.
+        const invoiceNote = documentPrivateNote(invoice.code, invoice.project?.name ?? null);
+        const invoicePayload: DocumentPayloadIdentity = {
+            hash: documentIssuanceHash({
+                kind: "invoice",
+                code: invoice.code,
+                itemsRevision: null,
+                total: invoice.totalAmount,
+                taxAmount: invoice.taxAmount,
+                title: null,
+                projectName: invoice.project?.name ?? null,
+                customerId,
+                lines: [],
+            }),
+            docNumber: invoice.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+            privateNote: invoiceNote,
+            total: toNum(invoice.totalAmount),
+            customerId,
+            itemsRevision: null,
+        };
         let invoiceMarker: string;
+        let invoiceClaimedAt = new Date();
         if (syncMarkerKind(invoice.qbSyncMarker)) {
             const stored = invoice.qbSyncMarker as string;
+            invoiceClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());
             const recovery = await recoverClaimedRecord({
                 kind: "invoice", id: invoice.id, code: invoice.code,
-                // The invoice create sends no PrivateNote, so the DocNumber —
-                // this invoice own sequential code — is the whole identity.
-                privateNote: null, marker: stored, tokens, deadline,
+                marker: stored, tokens, deadline, claimedAt: invoiceClaimedAt,
                 adopt: (qbId) => prisma.invoice.updateMany({
                     where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: stored },
                     data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
@@ -412,14 +603,26 @@ export async function POST(req: NextRequest) {
             if (recovery.kind !== "create") return recovery.response;
             invoiceMarker = recovery.marker;
         } else {
-            invoiceMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, randomUUID());
-            const invoiceClaim = await prisma.invoice.updateMany({
-                where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: null },
-                data: { qbSyncMarker: invoiceMarker },
+            const claimed = await claimDocumentSync({
+                invoiceId: invoice.id,
+                clientId: invoice.client.id,
+                payload: invoicePayload,
+                tokens,
+                claimedAt: invoiceClaimedAt,
+                claim: (tx, marker) => tx.invoice.updateMany({
+                    where: {
+                        id: invoice.id,
+                        qbInvoiceId: null,
+                        qbSyncMarker: null,
+                        totalAmount: invoice.totalAmount,
+                        balanceDue: invoice.balanceDue,
+                        taxAmount: invoice.taxAmount,
+                    },
+                    data: { qbSyncMarker: marker },
+                }),
             });
-            if (invoiceClaim.count !== 1) {
-                return retryLater(invoice.code, "another sync claimed it first");
-            }
+            if (!claimed.ok) return retryLater(invoice.code, claimed.reason);
+            invoiceMarker = claimed.marker;
         }
 
         const result = await syncInvoiceToQB(tokens, {
@@ -429,6 +632,7 @@ export async function POST(req: NextRequest) {
             customerId,
             itemId,
             project: invoice.project ? { name: invoice.project.name } : null,
+            privateNote: invoiceNote,
         }, deadline, syncRequestId(invoice.id, invoiceMarker))
             .catch(async (error) => {
                 await settleSyncMarker(
@@ -439,8 +643,17 @@ export async function POST(req: NextRequest) {
                 throw error;
             });
 
+        // Pinned to the payload as well as the marker, same reasoning as the
+        // estimate rail: an edit that landed while the create was in flight must
+        // not link a document describing the old numbers.
         const invoicePersisted = await prisma.invoice.updateMany({
-            where: { id: invoice.id, qbSyncMarker: invoiceMarker },
+            where: {
+                id: invoice.id,
+                qbSyncMarker: invoiceMarker,
+                totalAmount: invoice.totalAmount,
+                balanceDue: invoice.balanceDue,
+                taxAmount: invoice.taxAmount,
+            },
             data: { qbInvoiceId: result.qbId, qbSyncedAt: new Date(), qbSyncMarker: null },
         });
         if (invoicePersisted.count !== 1) {

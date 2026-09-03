@@ -34,9 +34,17 @@ const state: {
     createThrows: unknown;
     /** What a DocNumber lookup finds, and what it costs. */
     lookup: { estimates: any[]; invoices: any[]; throws: unknown; calls: string[] };
+    /** What `Client.qbCustomerId` says when the claim re-reads it under the lock. */
+    clientQbCustomerId: string | null;
+    locksTaken: number;
+    /** Fired inside the create, to model a concurrent edit mid-flight. */
+    onCreate: (() => void) | null;
+    /** The PrivateNote each create actually sent. */
+    sentNotes: Array<string | undefined>;
 } = {
     user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
     lookup: { estimates: [], invoices: [], throws: null, calls: [] },
+    clientQbCustomerId: "42", locksTaken: 0, onCreate: null, sentNotes: [],
 };
 
 function resetState() {
@@ -46,6 +54,10 @@ function resetState() {
     state.posts = [];
     state.createThrows = null;
     state.lookup = { estimates: [], invoices: [], throws: null, calls: [] };
+    state.clientQbCustomerId = "42";
+    state.locksTaken = 0;
+    state.onCreate = null;
+    state.sentNotes = [];
 }
 
 const fakePermissions = {
@@ -58,7 +70,12 @@ const fakePermissions = {
 /** Real WHERE matching and real count semantics — a CAS the fake cannot fake. */
 function table(rows: Record<string, any>) {
     return {
-        findUnique: async (args: { where: { id: string } }) => rows[args.where.id] ?? null,
+        // A DETACHED copy, like real Prisma. Returning the live object made the
+        // route snapshot move with a concurrent edit, so a CAS pinned to that
+        // snapshot could never fail - which would have made the interleaving
+        // tests below pass against no guard at all.
+        findUnique: async (args: { where: { id: string } }) =>
+            rows[args.where.id] ? { ...rows[args.where.id] } : null,
         updateMany: async (args: { where: Record<string, any>; data: Record<string, any> }) => {
             const row = rows[args.where.id];
             if (!row) return { count: 0 };
@@ -73,6 +90,21 @@ function table(rows: Record<string, any>) {
 const fakePrisma = {
     get estimate() { return table(state.estimates); },
     get invoice() { return table(state.invoices); },
+    // Round 40: the fresh claim is taken inside a transaction that holds the
+    // canonical Estimate → Invoice → Client locks and RE-READS the customer
+    // mapping under them. The fake runs the callback directly — it cannot model
+    // Postgres blocking, which is what the DB-gated tests are for — but it does
+    // model the re-read, which is the part the route decides on.
+    get client() {
+        return {
+            findUnique: async () => ({ qbCustomerId: state.clientQbCustomerId }),
+        };
+    },
+    $queryRaw: async () => {
+        state.locksTaken++;
+        return [];
+    },
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(fakePrisma),
 };
 
 const fakeQbPayments = {
@@ -130,13 +162,17 @@ before(async () => {
             const real = originalRequire.apply(this, arguments as unknown as [string]) as Record<string, unknown>;
             return {
                 ...real,
-                syncEstimateToQB: async (_t: unknown, _e: unknown, _gl: unknown, _d: unknown, requestId?: string) => {
+                syncEstimateToQB: async (_t: unknown, e: any, _gl: unknown, _d: unknown, requestId?: string) => {
                     state.posts.push({ kind: "estimate", requestId });
+                    state.sentNotes.push(e?.privateNote);
+                    state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
                     return { qbId: "qb-est-1", qbUrl: "https://qbo/est/1" };
                 },
-                syncInvoiceToQB: async (_t: unknown, _i: unknown, _d: unknown, requestId?: string) => {
+                syncInvoiceToQB: async (_t: unknown, i: any, _d: unknown, requestId?: string) => {
                     state.posts.push({ kind: "invoice", requestId });
+                    state.sentNotes.push(i?.privateNote);
+                    state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
                     return { qbId: "qb-inv-1", qbUrl: "https://qbo/inv/1" };
                 },
@@ -174,6 +210,7 @@ before(async () => {
         );
     }
     POST = routeModule.POST as any;
+    ({ documentPrivateNote } = await import("../src/lib/qbo-document-sync"));
 });
 
 beforeEach(() => {
@@ -249,11 +286,15 @@ test("unknown type: 400, before any auth check spends a session lookup", async (
  */
 const ADMIN = { id: "u1", role: "ADMIN", permissions: null };
 
+/** The note the create writes and the recovery matches on. */
+let documentPrivateNote: (code: string, label: string | null) => string;
+
 function seedEstimate(overrides: Record<string, any> = {}) {
     state.estimates["est-1"] = {
         id: "est-1", code: "EST-00001", title: "Kitchen", status: "Sent",
         qbEstimateId: null, qbSyncMarker: null, qbSyncedAt: null,
         totalAmount: 1000, balanceDue: 1000, createdAt: new Date(),
+        itemsRevision: 7,
         projectId: "proj-1", leadId: null, items: [],
         project: { name: "Kitchen", client: { id: "cli-1" } },
         ...overrides,
@@ -265,7 +306,7 @@ function seedInvoice(overrides: Record<string, any> = {}) {
     state.invoices["inv-1"] = {
         id: "inv-1", code: "INV-00001", projectId: "proj-1",
         qbInvoiceId: null, qbSyncMarker: null, qbSyncedAt: null,
-        totalAmount: 1000, balanceDue: 1000,
+        totalAmount: 1000, balanceDue: 1000, taxAmount: 0,
         client: { id: "cli-1" }, project: { name: "Kitchen" },
         ...overrides,
     };
@@ -347,7 +388,13 @@ test("round 38: an unconfirmed create parks the record, and the replay refuses",
     // refuse forever either. It asks QuickBooks. Here the document is there,
     // so it is adopted.
     state.createThrows = null;
-    state.lookup.estimates = [{ id: "qb-est-real", docNumber: "EST-00001", privateNote: "Kitchen", total: 1000 }];
+    // Provably ours: the canonical marker note the create wrote, the customer
+    // it billed, and the total it expected. Anything less is not adopted.
+    state.lookup.estimates = [{
+        id: "qb-est-real", docNumber: "EST-00001",
+        privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+        total: 1000, customerId: "42",
+    }];
     const replay = await POST(postRequest({ type: "estimate", id: "est-1" }));
     const body = await replay.json();
     assert.equal(replay.status, 200);
@@ -401,7 +448,11 @@ test("round 38: the invoice rail behaves identically", async () => {
     assert.ok(String(parked.qbSyncMarker).startsWith("ambiguous-create:"));
 
     state.createThrows = null;
-    state.lookup.invoices = [{ id: "qb-inv-real", docNumber: "INV-00001", privateNote: null, total: 1000 }];
+    state.lookup.invoices = [{
+        id: "qb-inv-real", docNumber: "INV-00001",
+        privateNote: documentPrivateNote("INV-00001", "Kitchen"),
+        total: 1000, customerId: "42",
+    }];
     const recovered = await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal((await recovered.json()).qbId, "qb-inv-real");
     assert.equal(parked.qbInvoiceId, "qb-inv-real");
@@ -476,9 +527,99 @@ test("round 39: documents under our code that are NOT ours are never adopted", a
     await POST(postRequest({ type: "estimate", id: "est-1" }));
 
     state.createThrows = null;
-    state.lookup.estimates = [{ id: "qb-someone-else", docNumber: "EST-00001", privateNote: "Not ours", total: 1000 }];
+    state.lookup.estimates = [{
+        id: "qb-someone-else", docNumber: "EST-00001", privateNote: "Not ours",
+        total: 1000, customerId: "42",
+    }];
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 503);
     assert.equal(row.qbEstimateId, null, "not adopted");
     assert.equal(state.posts.length, 1, "and not duplicated either");
+});
+
+// ─── Round 40 gate, finding 2: the claim must protect the PAYLOAD ───
+
+/**
+ * Between the read at the top of the handler and the link write sit a token
+ * refresh, a customer resolve and the document create — seconds of remote calls.
+ * The claim pinned only `(id, unlinked, unclaimed)` and the finalize pinned only
+ * the marker, so an edit landing in that window left the record LINKED to a
+ * QuickBooks document describing something else, with nothing recording it.
+ */
+test("round 40: an item edit between claim and finalize does NOT link the document", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+
+    // Somebody edits the estimate while the create is in flight. itemsRevision
+    // is the canonical optimistic-concurrency token for items (#327) and moves
+    // on ANY item write, which is why the finalize CAS pins it. Mutating the
+    // row from inside the create is exactly when a concurrent editor would.
+    state.onCreate = () => { row.itemsRevision = 99; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+
+    assert.equal(res.status, 409, "the document exists but must not be linked");
+    assert.equal(body.qbId, "qb-est-1", "and the caller is told what was created");
+    assert.equal(row.qbEstimateId, null, "the record is NOT linked to a stale document");
+    assert.equal(state.posts.length, 1);
+});
+
+test("round 40: an UNEDITED estimate still links (the control)", async () => {
+    // Without this, the test above would pass just as happily against a
+    // finalize CAS that never matched anything.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+});
+
+test("round 40: a customer remap between resolve and claim refuses BEFORE any create", async () => {
+    // `resolveCustomerAndItem` answers, and then the mapping moves. The claim
+    // re-reads Client.qbCustomerId under the money locks and refuses, so the
+    // payload identity can never describe a customer the database disagrees
+    // with — and nothing is sent at all.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.clientQbCustomerId = "99";   // remapped since the resolve returned 42
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 503);
+    assert.equal(body.retry, true);
+    assert.match(String(body.error), /customer changed/);
+    assert.equal(state.posts.length, 0, "nothing reached QuickBooks");
+    assert.equal(row.qbSyncMarker, null, "and no claim was left behind");
+    assert.ok(state.locksTaken > 0, "the decision was taken under the money locks");
+});
+
+test("round 40: the claim records the realm, customer, note and total that were SENT", async () => {
+    // Finding 3 depends on this: recovery can only prove ownership from what
+    // the claim recorded, so the claim has to record it.
+    const { parseCreateMarker } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createThrows = new (await import("../src/lib/quickbooks")).QBAmbiguousDocumentCreateError("x");
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    const identity = parseCreateMarker(row.qbSyncMarker)?.identity;
+    assert.equal(identity?.docNumber, "EST-00001");
+    assert.equal(identity?.privateNote, documentPrivateNote("EST-00001", "Kitchen"));
+    assert.equal(identity?.realmId, "realm-1");
+    assert.equal(identity?.customerId, "42");
+    assert.equal(identity?.expectedTotal, 1000);
+    assert.ok(identity?.issuanceHash, "and a fingerprint of the payload it built");
+});
+
+test("round 40: the create sends the canonical marker note on BOTH rails", async () => {
+    // The invoice rail used to send no PrivateNote at all, which left its
+    // recovery matching on DocNumber alone.
+    state.user = ADMIN;
+    seedEstimate();
+    seedInvoice();
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+    await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal(state.sentNotes[0], documentPrivateNote("EST-00001", "Kitchen"));
+    assert.equal(state.sentNotes[1], documentPrivateNote("INV-00001", "Kitchen"));
 });

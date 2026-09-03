@@ -2417,7 +2417,13 @@ export async function updatePendingMilestoneAmountsCore(
         }
     }
 
-    type QBAffected = { scheduleId: string; name: string; oldQbInvoiceId: string };
+    type QBAffected = {
+        scheduleId: string;
+        name: string;
+        oldQbInvoiceId: string;
+        /** The marker the row carried when the rebalance read it; pinned by the unlink. */
+        oldQbSyncError: string | null;
+    };
 
     const qbAffected = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. The mirror sync
@@ -2492,7 +2498,10 @@ export async function updatePendingMilestoneAmountsCore(
             // confirmed still payment-free and actually deleted, so a payment that
             // landed in QBO can never be orphaned behind a cleared link.
             if (row.qbInvoiceId && contentChanged(row, r)) {
-                affected.push({ scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId });
+                affected.push({
+                    scheduleId: row.id, name: r.name, oldQbInvoiceId: row.qbInvoiceId,
+                    oldQbSyncError: row.qbSyncError ?? null,
+                });
             }
 
             await tx.paymentSchedule.update({
@@ -2573,7 +2582,12 @@ export async function updatePendingMilestoneAmountsCore(
                     }
                     // Old QBO invoice is confirmed gone — now clear the link, atomically
                     // (a concurrent settle still wins the claim and we stop here).
-                    if (!(await claimQBInvoiceUnlink(prisma, row.scheduleId, row.oldQbInvoiceId))) {
+                    // Pinned to the marker this row carried when the rebalance read
+                    // it, so a create claim or a pending-deletion landing during the
+                    // probe/delete above loses this write instead of being erased.
+                    if (!(await claimQBInvoiceUnlink(
+                        prisma, row.scheduleId, row.oldQbInvoiceId, row.oldQbSyncError,
+                    ))) {
                         warnings.push(`"${row.name}": milestone changed while replacing its QuickBooks invoice — refresh and review before re-staging.`);
                         continue;
                     }

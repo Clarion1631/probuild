@@ -204,6 +204,24 @@ export async function claimQBInvoiceUnlink(
     client: Prisma.TransactionClient,
     scheduleId: string,
     expectedQbInvoiceId: string,
+    /**
+     * The `qbSyncError` this caller OBSERVED before it decided to unlink.
+     *
+     * Required, and `null` is a real value meaning "there was no marker": a
+     * Prisma `null` here compiles to `IS NULL`, so the two cases stay distinct
+     * rather than one of them matching everything.
+     *
+     * Without it this CAS pinned the LINK but not the STATE around it, and
+     * those are different questions. A `deleteInQBO` unlink writes
+     * `pending-deletion` and then spends seconds on a remote delete; a
+     * concurrent local-only unlink read the row before that marker landed, saw
+     * the same qbInvoiceId, and cleared the link anyway. If the remote delete
+     * then failed or timed out, the invoice was still live in QuickBooks and
+     * the milestone was unlinked and freely re-sendable — two collectible
+     * invoices for one milestone, which is the exact outcome the
+     * pending-deletion state exists to prevent.
+     */
+    expectedQbSyncError: string | null,
 ): Promise<boolean> {
     const cleared = await client.paymentSchedule.updateMany({
         where: {
@@ -211,6 +229,7 @@ export async function claimQBInvoiceUnlink(
             status: { not: "Paid" },
             qbPaymentId: null,
             qbInvoiceId: expectedQbInvoiceId,
+            qbSyncError: expectedQbSyncError,
         },
         data: {
             qbInvoiceId: null,
@@ -635,14 +654,24 @@ export interface PendingDeletionSweepResult {
     finished: number;
     /** Still linked: QuickBooks refused, or the sweep ran out of budget. */
     stillPending: number;
+    /** Rows eligible at the start that this run never reached. */
+    unvisited: number;
     reason: string | null;
 }
+
+/** Where the pending-deletion sweep resumes, run to run. */
+export const PENDING_DELETION_CURSOR_KEY = "qbo-maintenance.pending-deletions.cursor";
+
+/** How many rows one run of the deletion sweep may look at. */
+export const PENDING_DELETION_PAGE_SIZE = 50;
 
 /** The two calls this sweep needs; injectable so a test can drive the real loop. */
 export interface PendingDeletionSweepDeps {
     db?: { paymentSchedule: { findMany(args: any): Promise<any[]>; count(args: any): Promise<number> } };
     deleteInvoice?: (tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) => Promise<boolean>;
     unlink?: (scheduleId: string, qbInvoiceId: string) => Promise<boolean>;
+    /** Where this sweep resumes; defaults to the shared AutomationSetting store. */
+    cursorStore?: PaymentsSyncCursorStore;
 }
 
 /**
@@ -671,16 +700,47 @@ export async function sweepPendingDeletions(
     const db = deps?.db ?? prisma;
     const remove = deps?.deleteInvoice ?? deleteQBInvoice;
     const unlink = deps?.unlink
-        ?? ((scheduleId: string, qbInvoiceId: string) => claimQBInvoiceUnlink(prisma, scheduleId, qbInvoiceId));
-    const result: PendingDeletionSweepResult = { checked: 0, finished: 0, stillPending: 0, reason: null };
+        ?? ((scheduleId: string, qbInvoiceId: string) =>
+            // These rows are, by definition, the ones carrying the marker: it is
+            // what the sweep selected them by, so it is what the unlink pins.
+            claimQBInvoiceUnlink(prisma, scheduleId, qbInvoiceId, PENDING_DELETION_MARKER));
+    const cursorStore = deps?.cursorStore ?? automationSettingCursorStore;
+    const result: PendingDeletionSweepResult = {
+        checked: 0, finished: 0, stillPending: 0, unvisited: 0, reason: null,
+    };
 
     const where = { qbSyncError: PENDING_DELETION_MARKER, qbInvoiceId: { not: null } };
-    const rows = await db.paymentSchedule.findMany({
-        where,
+
+    // KEYSET CURSOR, not "the first 50 every time".
+    //
+    // A row this sweep cannot finish stays eligible: QuickBooks refuses to
+    // delete an invoice with a payment attached, and that row keeps its marker
+    // by design. Taking the first 50 by id meant such a row was re-probed at
+    // the head of every run forever and everything behind it was never reached
+    // — head-of-line starvation, in a queue whose entire purpose is to finish
+    // work nobody is watching. Same cursor/wrap shape as sweepPendingPayLinks.
+    const stored = await cursorStore.get(PENDING_DELETION_CURSOR_KEY);
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursor: string | null = stored && stored.length > 0 ? stored : null;
+    // Seeded with what this run INHERITED, never null: an abort before the
+    // first row completes must leave the cursor where it was, or the next run
+    // restarts from the top and the tail starves again.
+    let checkpoint: string | null = cursor;
+
+    const page = async (after: string | null, take: number) => db.paymentSchedule.findMany({
+        where: after ? { ...where, id: { gt: after } } : where,
         select: { id: true, qbInvoiceId: true },
         orderBy: { id: "asc" },
-        take: 50,
+        take,
     });
+
+    let rows = await page(cursor, PENDING_DELETION_PAGE_SIZE);
+    if (rows.length === 0 && cursor !== null) {
+        // Tail drained. Wrap ONCE back to the head so the rows before the
+        // cursor are not stranded until somebody resets it by hand.
+        rows = await page(null, PENDING_DELETION_PAGE_SIZE);
+        checkpoint = null;
+    }
 
     for (const row of rows) {
         // Checked before EVERY row: the delete is a real round trip, and this
@@ -691,6 +751,10 @@ export async function sweepPendingDeletions(
             break;
         }
         result.checked++;
+        // Advanced past every row this run looked at, resolved or not. That is
+        // the whole fix: a row that can never be resolved must not be retried
+        // ahead of everything else on the next run.
+        checkpoint = row.id;
         try {
             // `false` is CONFIRMED ABSENCE, not a refusal — see deleteQBInvoice.
             // Reading it as "still there" was what left a manually-deleted
@@ -717,9 +781,18 @@ export async function sweepPendingDeletions(
         }
     }
 
+    // Persist where to resume. A run that walked its whole page keeps its
+    // place; a wrap resets to the top. Never throws — a lost cursor costs one
+    // restart from the top, never correctness.
+    await cursorStore.set(PENDING_DELETION_CURSOR_KEY, checkpoint ?? "").catch(() => {});
+
     // Counted from the database AFTER the loop, so it includes rows this run
     // never reached as well as the ones it could not finish.
     result.stillPending = await db.paymentSchedule.count({ where }).catch(() => result.stillPending);
+    // What is left over and above the ones this run actually failed on — i.e.
+    // rows it never got to. Reported so a permanently-blocked queue is visible
+    // rather than looking like a clean pass that simply had nothing to do.
+    result.unvisited = Math.max(0, result.stillPending - (result.checked - result.finished));
     return result;
 }
 

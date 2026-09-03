@@ -583,7 +583,7 @@ test("round 38: Break QB Link deletes BEFORE it unlinks, under one shared deadli
 
     const marks = fn.indexOf("PENDING_DELETION_MARKER");
     const del = fn.indexOf("deleteQBInvoice(tokens");
-    const unlink = fn.indexOf("claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId)");
+    const unlink = fn.indexOf("claimQBInvoiceUnlink(");
     assert.ok(marks > -1, "the intent must be recorded durably before the remote call");
     assert.ok(del > -1 && unlink > -1);
     assert.ok(marks < del, "mark the row BEFORE touching QuickBooks");
@@ -617,41 +617,101 @@ test("round 38: a resumed run that aborts before finishing a row keeps the store
 
 // ─── Round 39 gate, finding 4: parked document syncs are a work queue ───
 
-test("round 39: the maintenance pass recovers an estimate left claimed by an unfinished sync", async () => {
-    // Until this existed, a record claimed by a create whose outcome was never
-    // learned was invisible: nothing read the column, so it sat until somebody
-    // happened to press Sync again. That is precisely where a duplicate hides.
-    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
-    const parked = [
-        { id: "est-1", code: "EST-00001", privateNote: "Kitchen", marker: "ambiguous-create:n1", kind: "estimate" as const },
-        { id: "est-2", code: "EST-00002", privateNote: "Bath", marker: "ambiguous-create:n2", kind: "estimate" as const },
+test("round 40: the document sweep pages by cursor, so an unresolvable head row cannot starve the rest", async () => {
+    // The first cut took the first 25 rows of each rail every run. A row that
+    // cannot be resolved stays eligible, so it was re-probed at the head of
+    // every run forever and everything behind it was never reached —
+    // head-of-line starvation, in a queue whose whole purpose is to finish work
+    // nobody is watching.
+    const { sweepPendingDocumentSyncs, DOCUMENT_SYNC_CURSOR_KEYS } =
+        await import("../src/lib/qbo-document-sync");
+
+    // Three estimates. The FIRST can never be resolved (QuickBooks will not
+    // answer about it); the other two are sitting in QuickBooks.
+    const rows = [
+        { id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const },
+        { id: "est-2", marker: "ambiguous-create:@1|EST-2|note", kind: "estimate" as const },
+        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const },
     ];
-    const adopted: Array<[string, string]> = [];
-    let remaining = 2;
+    const live = new Map(rows.map((r) => [r.id, r]));
+    const kv = new Map<string, string>();
+    const cursors = {
+        get: async (k: string) => kv.get(k) ?? null,
+        set: async (k: string, v: string) => { kv.set(k, v); },
+    };
+    const adopted: string[] = [];
+
+    const run = (take: number) => sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            cursors,
+            railFirst: "estimate",
+            // ONE row per run, so "did the cursor move" is the only thing that
+            // decides whether row 2 is ever seen.
+            pageSize: take,
+            listParked: async (rail, after) => {
+                if (rail !== "estimate") return [];
+                const remaining = [...live.values()].filter((r) => !after || r.id > after);
+                return remaining.slice(0, take);
+            },
+            probe: (async (_t: unknown, input: { marker: string }) =>
+                input.marker.includes("EST-1")
+                    ? { state: "unknown", reason: "QuickBooks is unavailable" }
+                    : { state: "found", qbId: `qb-${input.marker}` }) as any,
+            adopt: async (row) => { adopted.push(row.id); live.delete(row.id); return 1; },
+            countParked: async () => live.size,
+        },
+    );
+
+    await run(1);
+    assert.deepEqual(adopted, [], "the head row could not be resolved");
+    assert.equal(kv.get(DOCUMENT_SYNC_CURSOR_KEYS.estimate), "est-1",
+        "and the cursor still advanced PAST it — that is the whole fix");
+
+    await run(1);
+    assert.deepEqual(adopted, ["est-2"], "the second run reaches the row behind the blocked one");
+
+    await run(1);
+    assert.deepEqual(adopted, ["est-2", "est-3"]);
+});
+
+test("round 40: the document sweep wraps back to the head once its tail drains", async () => {
+    // Without a bounded wrap the rows BEFORE the cursor are stranded until
+    // somebody resets it by hand — the mirror image of the starvation above.
+    const { sweepPendingDocumentSyncs, DOCUMENT_SYNC_CURSOR_KEYS } =
+        await import("../src/lib/qbo-document-sync");
+    const kv = new Map<string, string>([[DOCUMENT_SYNC_CURSOR_KEYS.estimate, "est-9"]]);
+    const seen: string[] = [];
 
     const res = await sweepPendingDocumentSyncs(
         { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
         undefined,
         {
-            listParked: async () => parked,
-            // EST-00001 is in QuickBooks; EST-00002 is not, and the sweep must
-            // leave that one alone rather than creating it unattended.
-            probe: (async (_t: unknown, input: { code: string }) =>
-                input.code === "EST-00001"
-                    ? { state: "found", qbId: "qb-est-real" }
-                    : { state: "absent" }) as any,
-            adopt: async (row, qbId) => { adopted.push([row.id, qbId]); remaining--; return 1; },
-            countParked: async () => remaining,
+            cursors: {
+                get: async (k: string) => kv.get(k) ?? null,
+                set: async (k: string, v: string) => { kv.set(k, v); },
+            },
+            railFirst: "estimate",
+            listParked: async (rail, after) => {
+                if (rail !== "estimate") return [];
+                // Nothing after est-9; one row at the head.
+                if (after) return [];
+                return seen.length
+                    ? []
+                    : [{ id: "est-1", marker: "ambiguous-create:@1|EST-1|note", kind: "estimate" as const }];
+            },
+            probe: (async () => ({ state: "absent" })) as any,
+            adopt: async () => 1,
+            countParked: async () => 1,
         },
     );
-
-    assert.equal(res.checked, 2);
-    assert.equal(res.recovered, 1);
-    assert.deepEqual(adopted, [["est-1", "qb-est-real"]]);
-    assert.equal(res.stillParked, 1, "the absent one is still claimed, and is reported");
+    void seen;
+    assert.equal(res.checked, 1, "the wrap really did reach the head row");
+    assert.equal(kv.get(DOCUMENT_SYNC_CURSOR_KEYS.estimate), "est-1");
 });
 
-test("round 39: the sweep NEVER adopts on an unanswered question", async () => {
+test("round 40: the sweep NEVER adopts on an unanswered question", async () => {
     // The mutation control. "Could not ask" must not read as "there is none",
     // and it must certainly not adopt: either would be a guess about a document
     // that decides whether a client gets billed twice.
@@ -661,9 +721,11 @@ test("round 39: the sweep NEVER adopts on an unanswered question", async () => {
         { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
         undefined,
         {
-            listParked: async () => [
-                { id: "inv-1", code: "INV-00001", privateNote: null, marker: "create-in-flight:n1", kind: "invoice" as const },
-            ],
+            railFirst: "invoice",
+            listParked: async (rail, after) =>
+                rail === "invoice" && !after
+                    ? [{ id: "inv-1", marker: "create-in-flight:@1|INV-1|note", kind: "invoice" as const }]
+                    : [],
             probe: (async () => ({ state: "unknown", reason: "QuickBooks is unavailable" })) as any,
             adopt: async () => { adopts++; return 1; },
             countParked: async () => 1,
@@ -673,6 +735,59 @@ test("round 39: the sweep NEVER adopts on an unanswered question", async () => {
     assert.equal(res.recovered, 0);
     assert.equal(res.stillParked, 1);
     assert.match(String(res.reason), /unavailable/);
+});
+
+test("round 40: the deletion sweep pages by cursor too", async () => {
+    // Same failure, same fix. QuickBooks refuses to delete an invoice with a
+    // payment attached, and that row keeps its marker by design — so under a
+    // fixed "first 50" it was retried at the head of every run and the rows
+    // behind it were never touched.
+    const { sweepPendingDeletions, PENDING_DELETION_CURSOR_KEY } =
+        await import("../src/lib/quickbooks-payments");
+    const live = [
+        { id: "ps-1", qbInvoiceId: "qb-1" },   // QuickBooks always refuses this one
+        { id: "ps-2", qbInvoiceId: "qb-2" },
+    ];
+    const kv = new Map<string, string>();
+    const cursorStore = {
+        get: async (k: string) => kv.get(k) ?? null,
+        set: async (k: string, v: string) => { kv.set(k, v); },
+    };
+    const unlinked: string[] = [];
+    const db = {
+        paymentSchedule: {
+            async findMany(args: any) {
+                const after = args?.where?.id?.gt as string | undefined;
+                return live.filter((r) => !after || r.id > after).slice(0, args.take);
+            },
+            async count() { return live.length; },
+        },
+    };
+    const opts = {
+        db: db as any,
+        cursorStore: cursorStore as any,
+        deleteInvoice: async (_t: unknown, qbId: string) => {
+            if (qbId === "qb-1") throw new Error("QuickBooks refused: payment attached");
+            return true;
+        },
+        unlink: async (id: string) => {
+            unlinked.push(id);
+            live.splice(live.findIndex((r) => r.id === id), 1);
+            return true;
+        },
+    };
+    const tokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
+
+    const first = await sweepPendingDeletions(tokens, undefined, opts);
+    assert.deepEqual(unlinked, ["ps-2"], "the blocked head row does not stop the one behind it");
+    assert.equal(kv.get(PENDING_DELETION_CURSOR_KEY), "ps-2", "the cursor advanced past BOTH");
+    assert.equal(first.stillPending, 1);
+
+    // Next run: the tail is empty, so it wraps and re-tries the blocked row
+    // rather than stranding it behind its own cursor forever.
+    const second = await sweepPendingDeletions(tokens, undefined, opts);
+    assert.equal(second.checked, 1, "the wrap brought the head row back into view");
+    assert.equal(second.stillPending, 1, "and it is still reported, so the run is not clean");
 });
 
 // ─── Round 39 gate, finding 2: Break QB Link had no project scope ───
@@ -703,7 +818,7 @@ test("round 39: breakQBInvoiceLink checks project scope before ANY mutation", as
         "resolveAmbiguousInvoiceCreateCore(",   // writes: adopts or releases the row
         "PENDING_DELETION_MARKER",              // writes: claims the delete intent
         "deleteQBInvoice(tokens",               // remote destructive write
-        "claimQBInvoiceUnlink(prisma",          // local unlink
+        "claimQBInvoiceUnlink(",                // local unlink
     ]) {
         const at = fn.indexOf(mutation);
         assert.ok(at > -1, `${mutation} not found — has the action been restructured?`);
@@ -759,4 +874,138 @@ test("round 39: every deleteQBInvoice caller treats `false` as confirmed absence
     const breakFn = actions.slice(breakStart, actions.indexOf("\nexport ", breakStart + 10));
     assert.doesNotMatch(breakFn, /if \(!deleted\)/, "a false-branch is the bug this closes");
     assert.doesNotMatch(breakFn, /let deleted/, "and the boolean is not captured at all any more");
+
+    // Round 40 gate, finding 1: a local-only unlink must REFUSE while somebody
+    // else has a remote delete in flight, and every unlink must pin the marker
+    // it observed rather than only the link.
+    assert.match(breakFn, /isPendingDeletion\(schedule\.qbSyncError\)/,
+        "the local-only path must refuse a row already being deleted remotely");
+    assert.match(breakFn, /schedule\.qbInvoiceId, schedule\.qbSyncError/,
+        "and pin the marker it read");
+    assert.match(breakFn, /schedule\.qbInvoiceId, PENDING_DELETION_MARKER/,
+        "while the post-delete unlink pins the one it wrote");
+});
+
+// ─── Round 40 gate, finding 3: adoption must be PROVABLE ───
+
+/**
+ * The durable claim used to store a bare nonce, and recovery accepted a single
+ * DocNumber match (plus, on the estimate rail, the record CURRENT title). But
+ * QuickBooks does not enforce DocNumber uniqueness, the invoice rail sent no
+ * PrivateNote at all, and neither rail looked at the customer or the total it
+ * already had in hand. A hand-created document sharing the code, or one in
+ * another company entirely, would have been adopted and linked.
+ *
+ * The claim now records what was SENT — realm, customer, DocNumber, the canonical
+ * PrivateNote marker and the expected total — and every one has to agree.
+ */
+async function probeWith(opts: {
+    marker: string;
+    realmId?: string;
+    found?: Array<{ id: string; privateNote: string | null; total: number; customerId: string | null }>;
+}) {
+    const { probeDocumentSync } = await import("../src/lib/qbo-document-sync");
+    return probeDocumentSync(
+        { accessToken: "a", refreshToken: "r", realmId: opts.realmId ?? "realm-1" },
+        { kind: "estimate", marker: opts.marker },
+        undefined,
+        { findEstimates: (async () => opts.found ?? []) as any },
+    );
+}
+
+async function claimMarker(over: Record<string, unknown> = {}) {
+    const { composeSyncMarker, documentPrivateNote } = await import("../src/lib/qbo-document-sync");
+    const { CREATE_IN_FLIGHT_MARKER } = await import("../src/lib/qbo-create-markers");
+    return composeSyncMarker(CREATE_IN_FLIGHT_MARKER, {
+        docNumber: "EST-00001",
+        privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+        expectedTotal: 1000,
+        realmId: "realm-1",
+        customerId: "42",
+        ...over,
+    } as any);
+}
+
+test("round 40: an exact match IS adopted (the control)", async () => {
+    const { documentPrivateNote } = await import("../src/lib/qbo-document-sync");
+    const res = await probeWith({
+        marker: await claimMarker(),
+        found: [{
+            id: "qb-9", privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+            total: 1000, customerId: "42",
+        }],
+    });
+    assert.deepEqual(res, { state: "found", qbId: "qb-9" });
+});
+
+test("round 40: a hand-created document sharing the DocNumber is NOT adopted", async () => {
+    const res = await probeWith({
+        marker: await claimMarker(),
+        // Same code, no ProBuild note. Somebody typed it in QuickBooks.
+        found: [{ id: "qb-theirs", privateNote: null, total: 1000, customerId: "42" }],
+    });
+    assert.equal(res.state, "unknown");
+    assert.match(String((res as any).reason), /none matches this claim/);
+});
+
+test("round 40: a document billed to another customer is NOT adopted", async () => {
+    const { documentPrivateNote } = await import("../src/lib/qbo-document-sync");
+    const res = await probeWith({
+        marker: await claimMarker(),
+        found: [{
+            id: "qb-9", privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+            total: 1000, customerId: "99",
+        }],
+    });
+    assert.equal(res.state, "unknown");
+});
+
+test("round 40: a document whose total differs is NOT adopted", async () => {
+    const { documentPrivateNote } = await import("../src/lib/qbo-document-sync");
+    const res = await probeWith({
+        marker: await claimMarker(),
+        found: [{
+            id: "qb-9", privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+            total: 1250, customerId: "42",
+        }],
+    });
+    assert.equal(res.state, "unknown");
+});
+
+test("round 40: a claim made against ANOTHER QuickBooks company is never queried", async () => {
+    // The connection can legitimately point somewhere else now. Against the
+    // wrong books the lookup finds nothing, which would read as "no document
+    // exists" — while ours sits collectible in the original company.
+    const { documentPrivateNote } = await import("../src/lib/qbo-document-sync");
+    const res = await probeWith({
+        marker: await claimMarker({ realmId: "realm-OTHER" }),
+        realmId: "realm-1",
+        found: [{
+            id: "qb-9", privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+            total: 1000, customerId: "42",
+        }],
+    });
+    assert.equal(res.state, "unknown");
+    assert.match(String((res as any).reason), /realm-OTHER/);
+});
+
+test("round 40: a claim recording no realm or customer is refused, not guessed", async () => {
+    const { composeSyncMarker } = await import("../src/lib/qbo-document-sync");
+    const { CREATE_IN_FLIGHT_MARKER } = await import("../src/lib/qbo-create-markers");
+    const res = await probeWith({
+        marker: composeSyncMarker(CREATE_IN_FLIGHT_MARKER, {
+            docNumber: "EST-00001", privateNote: "ProBuild EST-00001",
+        } as any),
+        found: [{ id: "qb-9", privateNote: "ProBuild EST-00001", total: 1000, customerId: "42" }],
+    });
+    assert.equal(res.state, "unknown");
+    assert.match(String((res as any).reason), /company or customer/);
+});
+
+test("round 40: no document under that code at all is ABSENT, so a create may proceed", async () => {
+    // The distinction that makes the recovery usable rather than a permanent
+    // refusal: an authoritative empty answer means the claim can go on to
+    // create, reusing its own requestid.
+    const res = await probeWith({ marker: await claimMarker(), found: [] });
+    assert.deepEqual(res, { state: "absent" });
 });

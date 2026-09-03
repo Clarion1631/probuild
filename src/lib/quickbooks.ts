@@ -1308,6 +1308,13 @@ export interface QBEstimateMatch {
     docNumber: string | null;
     privateNote: string | null;
     total: number;
+    /**
+     * WHO QuickBooks is billing. The recovery compares it against the claim,
+     * so an absent or blank value must read as `null` (unverifiable) and never
+     * as a match: `String(undefined)` would produce the literal "undefined"
+     * and compare unequal by luck rather than by rule.
+     */
+    customerId: string | null;
 }
 
 export async function findQBEstimatesByDocNumber(
@@ -1333,6 +1340,9 @@ export async function findQBEstimatesByDocNumber(
             docNumber: e.DocNumber != null ? String(e.DocNumber) : null,
             privateNote: e.PrivateNote != null ? String(e.PrivateNote) : null,
             total: Number(e.TotalAmt ?? 0),
+            customerId: e.CustomerRef?.value != null && String(e.CustomerRef.value) !== ""
+                ? String(e.CustomerRef.value)
+                : null,
         }));
 }
 
@@ -2040,6 +2050,13 @@ export async function syncEstimateToQB(
         customerId: string;
         itemId: string;
         project: { name: string } | null;
+        /**
+         * The PrivateNote to write. Defaults to the bare title for callers that
+         * predate the document-sync marker note, but every current caller passes
+         * the canonical one: it is what proves the document is ours at recovery
+         * time, and a title alone is something any document could carry.
+         */
+        privateNote?: string;
     },
     glMappings: Record<string, string> = {},
     deadline?: RouteDeadline,
@@ -2064,7 +2081,7 @@ export async function syncEstimateToQB(
     const payload = {
         TxnDate: new Date().toISOString().split("T")[0],
         DocNumber: estimate.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
-        PrivateNote: estimate.title,
+        PrivateNote: canonicalPrivateNote(estimate.privateNote ?? estimate.title),
         CustomerRef: { value: estimate.customerId },
         Line: lines,
     };
@@ -2138,6 +2155,8 @@ export async function syncInvoiceToQB(
         itemId: string;
         project: { name: string } | null;
         items?: Array<{ description: string; amount: number }>;
+        /** See syncEstimateToQB. The invoice rail used to send none at all. */
+        privateNote?: string;
     },
     deadline?: RouteDeadline,
     /** See syncEstimateToQB requestId. */
@@ -2165,6 +2184,10 @@ export async function syncInvoiceToQB(
         DocNumber: invoice.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
         TxnDate: new Date().toISOString().split("T")[0],
         CustomerRef: { value: invoice.customerId },
+        // Omitted when absent, so a caller that passes none is unchanged.
+        ...(canonicalPrivateNote(invoice.privateNote)
+            ? { PrivateNote: canonicalPrivateNote(invoice.privateNote) }
+            : {}),
         Line: lines,
     };
 

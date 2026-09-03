@@ -336,33 +336,35 @@ export async function POST(req: Request) {
             const markerWhere = { qbSyncMarker: { not: null } } as const;
             docSyncs = await sweepPendingDocumentSyncs(tokens, deadline, {
                 isExhausted: isBudgetExhausted,
-                listParked: async () => {
-                    const [estimates, invoices] = await Promise.all([
-                        prisma.estimate.findMany({
-                            where: { ...markerWhere, qbEstimateId: null },
-                            select: { id: true, code: true, title: true, qbSyncMarker: true },
-                            orderBy: { id: "asc" }, take: 25,
-                        }),
-                        prisma.invoice.findMany({
-                            where: { ...markerWhere, qbInvoiceId: null },
-                            select: { id: true, code: true, qbSyncMarker: true },
-                            orderBy: { id: "asc" }, take: 25,
-                        }),
-                    ]);
-                    return [
-                        // Only rows carrying a marker this rail understands. A value
-                        // the vocabulary does not recognise is somebody else data,
-                        // and adopting a QuickBooks document on the strength of it
-                        // would be a guess.
-                        ...estimates.filter((e) => syncMarkerKind(e.qbSyncMarker)).map((e) => ({
-                            id: e.id, code: e.code, privateNote: e.title,
-                            marker: e.qbSyncMarker as string, kind: "estimate" as const,
-                        })),
-                        ...invoices.filter((i) => syncMarkerKind(i.qbSyncMarker)).map((i) => ({
-                            id: i.id, code: i.code, privateNote: null,
-                            marker: i.qbSyncMarker as string, kind: "invoice" as const,
-                        })),
-                    ];
+                // ONE page of ONE rail, after that rail cursor. The sweep owns the
+                // fairness (cursor, bounded wrap, rail alternation); this owns the
+                // Prisma shape, because the two tables have different id columns.
+                cursors: automationSettingCursorStore,
+                listParked: async (rail, after, take) => {
+                    const rows = rail === "estimate"
+                        ? await prisma.estimate.findMany({
+                            where: {
+                                ...markerWhere, qbEstimateId: null,
+                                ...(after ? { id: { gt: after } } : {}),
+                            },
+                            select: { id: true, qbSyncMarker: true },
+                            orderBy: { id: "asc" }, take,
+                        })
+                        : await prisma.invoice.findMany({
+                            where: {
+                                ...markerWhere, qbInvoiceId: null,
+                                ...(after ? { id: { gt: after } } : {}),
+                            },
+                            select: { id: true, qbSyncMarker: true },
+                            orderBy: { id: "asc" }, take,
+                        });
+                    // Only rows carrying a marker this rail understands. A value the
+                    // vocabulary does not recognise is somebody else data, and
+                    // adopting a QuickBooks document on the strength of it would be
+                    // a guess.
+                    return rows
+                        .filter((r) => syncMarkerKind(r.qbSyncMarker))
+                        .map((r) => ({ id: r.id, marker: r.qbSyncMarker as string, kind: rail }));
                 },
                 // CAS-pinned to the exact marker the probe was run against, so a row
                 // that moved in between keeps whatever replaced it.
@@ -392,13 +394,15 @@ export async function POST(req: Request) {
         }
     }
     const docSyncsParked = docSyncs?.stillParked ?? 0;
+    const docSyncsUnvisited = docSyncs?.unvisited ?? 0;
 
     // Work left undone, by any route: the options loop stopped early, the
     // pay-link sweep hit its per-rail cap, rows were skipped inside it, or it
     // never reached rows that were eligible when it started.
     const truncated = abortedReason !== null || !!payLinks?.truncated
         || (payLinks?.skipped ?? 0) > 0 || payLinkUnvisited > 0 || deletionsPending > 0
-        || docSyncsParked > 0 || docSyncsFailed !== null;
+        || docSyncsParked > 0 || docSyncsUnvisited > 0 || docSyncsFailed !== null
+        || (deletions?.unvisited ?? 0) > 0;
 
     // `ok` reflects the RUN, not the fact that the handler returned. A run that
     // stopped early, left rows unvisited, or failed on a row has work

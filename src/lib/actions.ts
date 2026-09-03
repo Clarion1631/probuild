@@ -3849,6 +3849,7 @@ export async function breakQBInvoiceLink(
 
     const {
         claimQBInvoiceUnlink, getFreshQBTokens, BREAK_QB_LINK_BUDGET_MS, PENDING_DELETION_MARKER,
+        isPendingDeletion,
     } = await import("./quickbooks-payments");
 
     // ORDER MATTERS, and it used to be backwards.
@@ -3912,7 +3913,11 @@ export async function breakQBInvoiceLink(
 
         // Confirmed gone. NOW the link may go — through the same shared claim
         // the local-only path uses, so both unlinks obey one set of rules.
-        const clearedAfterDelete = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+        // Pinned to the marker THIS call wrote, so a row somebody else has
+        // since re-claimed keeps whatever replaced it.
+        const clearedAfterDelete = await claimQBInvoiceUnlink(
+            prisma, schedule.id, schedule.qbInvoiceId, PENDING_DELETION_MARKER,
+        );
         revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
         revalidatePath(`/invoices`);
         revalidatePath(`/portal`);
@@ -3925,10 +3930,28 @@ export async function breakQBInvoiceLink(
             };
     }
 
-    // Local-only unlink: no QuickBooks write, so nothing to confirm first.
+    // Local-only unlink: no QuickBooks write of its own — which is exactly why
+    // it must not run while somebody ELSE has a remote delete in flight.
+    // Clearing the link there would leave a live QuickBooks invoice with nothing
+    // pointing at it and the milestone free to be sent again, so one milestone
+    // could be billed twice. Refuse, and name the thing that finishes it.
+    if (isPendingDeletion(schedule.qbSyncError)) {
+        return {
+            success: false,
+            error:
+                "A QuickBooks deletion is already in progress for this milestone, so its link cannot be cleared yet. " +
+                "Wait for the maintenance sweep to confirm the invoice is gone, or retry Break QB Link with the " +
+                "QuickBooks delete option.",
+        };
+    }
     // Claimed atomically via the shared helper (also used by
-    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
-    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it
+    // closes. Pinned to the marker READ above, so a pending-deletion (or any
+    // other claim) landing in the gap between that read and this write loses
+    // instead of being silently overwritten.
+    const cleared = await claimQBInvoiceUnlink(
+        prisma, schedule.id, schedule.qbInvoiceId, schedule.qbSyncError,
+    );
     if (!cleared) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
