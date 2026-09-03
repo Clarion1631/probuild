@@ -84,6 +84,13 @@ export interface AttributionLockTargets {
     estimateIds?: readonly (string | null | undefined)[];
     /** A SPECIFIC line item the caller links the expense to. */
     itemId?: string | null;
+    /**
+     * SEVERAL specific line items (round 46, item 2). The backfill plans a
+     * whole run before it writes and can name items belonging to estimates
+     * outside the job it scanned; locking those in a second call after this
+     * one walked EstimateItem would be EstimateItem -> Estimate.
+     */
+    itemIds?: readonly (string | null | undefined)[];
     /** The cost code being proposed. */
     costCodeId?: string | null;
 }
@@ -162,6 +169,7 @@ export async function lockAttributionParents(
     // statement per TABLE, never one pass per target (round 43, item 2).
     const projectIds = idSet(projectId, targets.projectIds);
     const estimateIds = idSet(estimateId, targets.estimateIds);
+    const itemIds = idSet(itemId, targets.itemIds);
 
     // 1. The jobs, ascending.
     if (projectIds.length) {
@@ -199,9 +207,9 @@ export async function lockAttributionParents(
         itemParams.push(projectIds);
         itemClauses.push(`e."projectId" = ANY($${itemParams.length}::text[])`);
     }
-    if (itemId) {
-        itemParams.push(itemId);
-        itemClauses.push(`ei.id = $${itemParams.length}`);
+    if (itemIds.length) {
+        itemParams.push(itemIds);
+        itemClauses.push(`ei.id = ANY($${itemParams.length}::text[])`);
     }
     if (itemClauses.length) {
         await tx.$queryRawUnsafe(

@@ -9,6 +9,7 @@ import {
     resolveExpenseProjectId,
     resolveExpenseProjectUnderLock,
 } from "@/lib/expense-attribution";
+import { lockAttributionParents } from "@/lib/phase-invariant";
 import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import {
@@ -260,6 +261,14 @@ export async function deleteExpenses(
 
     const expenses = await prisma.expense.findMany({
         where: { id: { in: ids } },
+        // ASCENDING ID, because this is a BATCH (round 46, item 3). Two users
+        // deleting overlapping selections take the same Expense row locks; in
+        // an unordered `findMany` the server may hand them back in different
+        // orders and the two transactions then lock the shared rows in
+        // opposite ones, which is a deadlock with no parent table involved at
+        // all. Ordering the batch is the whole fix, and it has to be here —
+        // the loop below preserves this order.
+        orderBy: { id: "asc" },
         select: {
             id: true,
             qbPurchaseId: true,
@@ -297,6 +306,24 @@ export async function deleteExpenses(
     let deletedCount = 0;
     await prisma.$transaction(async tx => {
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // EVERY PARENT FIRST, THEN THE ROWS (round 46, item 3).
+        //
+        // The loop below locks row 1's parents, deletes row 1 — which takes an
+        // exclusive lock on that Expense and, through the foreign keys, a
+        // KEY SHARE on its Project and Estimate — and only then reaches for
+        // row 2's parents. That is Expense -> Estimate inside one transaction,
+        // the declared order backwards, and against anything holding an
+        // estimate while touching an expense it is a cycle.
+        //
+        // Naming the complete parent set up front collapses the whole batch to
+        // one Project/Estimate acquisition in the canonical order, before any
+        // Expense is touched. The per-row `resolveExpenseProjectUnderLock`
+        // stays: re-acquiring a share lock this transaction already holds is
+        // free, so it becomes the assertion it reads as.
+        await lockAttributionParents(raw, {
+            projectIds: allowed.flatMap(e => [e.projectId, e.resolvedProjectId]),
+            estimateIds: allowed.map(e => e.estimateId),
+        });
         for (const expense of allowed) {
             const locked = await resolveExpenseProjectUnderLock(raw, {
                 projectId: expense.projectId,

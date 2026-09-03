@@ -309,6 +309,13 @@ export async function tagExpensesToChangeOrderCore(
     const changeOrder = await resolveChangeOrder(input.changeOrderId);
     const rows = await prisma.expense.findMany({
         where: { id: { in: input.ids } },
+        // ASCENDING ID, because this is a BATCH (round 46, item 3). Two tag
+        // requests over overlapping selections lock the same Expense rows; an
+        // unordered `findMany` lets the server hand them back in different
+        // orders, and two transactions locking shared rows in opposite orders
+        // deadlock with no parent table involved. The loop below preserves
+        // this order.
+        orderBy: { id: "asc" },
         select: {
             id: true,
             qbPurchaseId: true,
@@ -341,6 +348,19 @@ export async function tagExpensesToChangeOrderCore(
     let updated = 0;
     await prisma.$transaction(async tx => {
         const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+        // EVERY PARENT FIRST, THEN THE ROWS (round 46, item 3). The loop below
+        // locked row 1's parents, updated row 1 — taking that Expense
+        // exclusively and, through the foreign keys, a KEY SHARE on its
+        // Project and Estimate — and only then reached for row 2's parents:
+        // Expense -> Estimate, the declared order backwards. One call up front
+        // takes the batch's whole parent set in the canonical order before any
+        // Expense is touched; the per-row re-resolve below then re-acquires
+        // share locks this transaction already holds, which is free.
+        await lockAttributionParents(raw, {
+            projectId: changeOrder.projectId,
+            projectIds: rows.map(row => row.projectId),
+            estimateIds: rows.map(row => row.estimateId),
+        });
         for (const row of rows) {
             const locked = await resolveExpenseProjectUnderLock(raw, {
                 projectId: row.projectId,

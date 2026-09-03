@@ -1372,38 +1372,78 @@ export const expectedNullableColumns = [
     { table: "Expense", column: "estimateId" },
 ];
 
+/**
+ * COMPARE CHECK CONSTRAINTS BY THEIR WHOLE NORMALIZED DEFINITION, NOT BY
+ * SUBSTRINGS (Codex round 46, item 0 — a DEPLOY BLOCKER).
+ *
+ * The old form was a list of regexes run against `pg_get_constraintdef`, and it
+ * did not survive contact with Postgres 16. PG renders a CHECK with its own
+ * parenthesisation and its own casts:
+ *
+ *   CHECK (("taxAtSource" = (("taxAmount" IS NOT NULL) AND ("taxAmount" <> (0)::numeric))))
+ *
+ * `/"taxAtSource" = \(?"taxAmount" IS NOT NULL/` allows ONE optional paren and
+ * PG writes TWO, so the pattern never matched and `main()` exited 1 on a
+ * database that was in fact correct. Nothing caught it because CI has never run
+ * `main()` — every test in this repo imports the constants and checks their
+ * TEXT. The verifier was the one part of this script no test exercised, and it
+ * was broken.
+ *
+ * So the comparison is now equality between the constraint PG reports and the
+ * expression this script asked for, after normalising away the three things PG
+ * is free to change and we do not care about:
+ *
+ *   * the outer `CHECK ( ... )` wrapper,
+ *   * casts it adds to literals (`(0)::numeric`, `'x'::text`), and
+ *   * whitespace and parenthesisation.
+ *
+ * REMOVING PARENS IS DELIBERATE, AND IT IS THE ONE THING THIS CANNOT SEE: two
+ * expressions that differ only in grouping normalise the same. Every column
+ * name, operator, function and their ORDER still has to match exactly, which is
+ * far more than the substring form checked — and the constraints' actual
+ * BEHAVIOUR (which rows they refuse) is proved separately against a real
+ * Postgres in tests/expense-attribution-triggers-db.test.ts. Grouping is the
+ * cheap half to lose; identity is the half that was missing.
+ */
+export function normalizeCheckDefinition(definition) {
+    return String(definition ?? "")
+        .toLowerCase()
+        // The wrapper PG always prints, and only the outermost one.
+        .replace(/^\s*check\s*/, "")
+        // Casts PG synthesises on literals. `(0)::numeric` and a bare `0` are
+        // the same constant; the script never writes a cast itself.
+        .replace(/::\s*[a-z_][a-z0-9_ ]*/g, "")
+        .replace(/[()\s]/g, "");
+}
+
+/**
+ * The expression each CHECK must be, written the way this script writes it.
+ * Compared through `normalizeCheckDefinition`, so parenthesisation and casts do
+ * not matter and every token does.
+ */
 export const expectedCheckConstraints = [
     {
         name: "Expense_taxAtSource_check",
         table: "Expense",
-        mustMatch: [
-            /"taxAtSource" = \(?"taxAmount" IS NOT NULL/,
-            /"taxAmount" <> \(?0/,
-        ],
+        definition: `"taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)`,
     },
     {
         name: "Expense_taxAmount_check",
         table: "Expense",
-        mustMatch: [
-            /"taxAmount" IS NULL/,
-            /"taxAmount" = \(?0/,
-            // pg_get_constraintdef renders `amount` unquoted (all-lowercase,
-            // not a keyword) while the mixed-case column keeps its quotes.
-            /sign\("taxAmount"\) = sign\(amount\)/,
-            /abs\("taxAmount"\) <= abs\(amount\)/,
-        ],
+        // `amount` is unquoted because it is all-lowercase and not a keyword;
+        // the mixed-case columns keep their quotes. Normalisation does not
+        // touch quoting, so this has to be written the way PG renders it.
+        definition:
+            `"taxAmount" IS NULL OR "taxAmount" = 0 ` +
+            `OR (sign("taxAmount") = sign(amount) AND abs("taxAmount") <= abs(amount))`,
     },
     {
         name: "Expense_taxDeductibleBase_check",
         table: "Expense",
-        mustMatch: [
-            /"taxDeductibleBase" IS NULL/,
-            /"taxDeductibleBase" = \(?0/,
-            /sign\("taxDeductibleBase"\) = sign\(amount\)/,
-            // pg_get_constraintdef renders `amount` UNQUOTED (all-lowercase,
-            // not a keyword) while the mixed-case columns keep their quotes.
-            /abs\("taxDeductibleBase"\) <= abs\(\(?amount - COALESCE\("taxAmount"/,
-        ],
+        definition:
+            `"taxDeductibleBase" IS NULL OR "taxDeductibleBase" = 0 ` +
+            `OR (sign("taxDeductibleBase") = sign(amount) ` +
+            `AND abs("taxDeductibleBase") <= abs(amount - COALESCE("taxAmount", 0)))`,
     },
 ];
 
@@ -1679,7 +1719,7 @@ async function main() {
             }
             console.log(`verified nullable: ${table}.${column}`);
         }
-        for (const { name, table, mustMatch } of expectedCheckConstraints) {
+        for (const { name, table, definition } of expectedCheckConstraints) {
             const [row] = await prisma.$queryRawUnsafe(
                 `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
                   WHERE conname = $1 AND conrelid = $2::regclass`,
@@ -1689,12 +1729,14 @@ async function main() {
                 console.error(`VERIFY FAILED: check constraint ${name} missing on ${table}`);
                 process.exit(1);
             }
-            for (const pattern of mustMatch) {
-                if (!pattern.test(row.def)) {
-                    console.error(`VERIFY FAILED: ${name} does not match ${pattern}
-  actual: ${row.def}`);
-                    process.exit(1);
-                }
+            const found = normalizeCheckDefinition(row.def);
+            const wanted = normalizeCheckDefinition(definition);
+            if (found !== wanted) {
+                console.error(`VERIFY FAILED: ${name} is not the constraint this script asks for.
+  expected: ${definition}
+  actual:   ${row.def}
+  (compared after lowercasing, dropping casts, and removing whitespace and parens)`);
+                process.exit(1);
             }
             console.log(`verified check constraint ${name}: ${row.def}`);
         }
@@ -1708,6 +1750,11 @@ async function main() {
             const [row] = await prisma.$queryRawUnsafe(
                 `SELECT c.relname                              AS table_name,
                         i.indisunique                          AS is_unique,
+                        -- A CONCURRENTLY build that fails or is interrupted
+                        -- leaves the index BEHIND, with the expected name and
+                        -- indisvalid = false (round 46, item 1).
+                        i.indisvalid                           AS is_valid,
+                        i.indisready                           AS is_ready,
                         pg_get_expr(i.indpred, i.indrelid)     AS predicate,
                         pg_get_indexdef(i.indexrelid)          AS def,
                         (SELECT array_agg(a.attname ORDER BY k.ord)
@@ -1725,6 +1772,32 @@ async function main() {
             if (!row) {
                 console.error(`VERIFY FAILED: index ${name} missing on ${table}`);
                 process.exit(1);
+            }
+            // AN INDEX CAN EXIST AND ENFORCE NOTHING (round 46, item 1).
+            //
+            // `CREATE INDEX CONCURRENTLY` builds in three phases and can fail
+            // in any of them — a deadlock, a uniqueness violation found during
+            // the second scan, a cancelled session. What it leaves behind is an
+            // index with the RIGHT NAME and `indisvalid = false`: the planner
+            // ignores it, and for a UNIQUE index it enforces nothing. Then
+            // `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` matches the name
+            // on the next run and skips, and every shape check below passes,
+            // because the shape IS right. The script printed "verified" over a
+            // duplicate-receipt guard that was not guarding.
+            //
+            // So the flags are checked, and an invalid index is REBUILT rather
+            // than reported: `IF NOT EXISTS` can never repair it, and leaving a
+            // human to notice a line of output is how it stayed invisible.
+            // Bounded to one attempt — a rebuild that fails the same way twice
+            // is a data problem (an actual duplicate), and a loop would only
+            // delay saying so.
+            if (row.is_valid !== true || row.is_ready !== true) {
+                const repair = await rebuildInvalidIndex(prisma, name, row);
+                if (!repair.ok) {
+                    console.error(repair.error);
+                    process.exit(1);
+                }
+                console.log(repair.message);
             }
             // The mismatch reports the SAME remedy whatever it is, because it
             // is the only one that works: `CREATE INDEX IF NOT EXISTS` matched
@@ -1853,6 +1926,72 @@ async function main() {
     } finally {
         await prisma.$disconnect();
     }
+}
+
+/**
+ * AN INDEX CAN EXIST AND ENFORCE NOTHING (Codex round 46, item 1).
+ *
+ * `CREATE INDEX CONCURRENTLY` builds in three phases and can fail in any of
+ * them — a deadlock, a uniqueness violation found during the second scan, a
+ * cancelled session. What it leaves behind is an index with the RIGHT NAME and
+ * `indisvalid = false`: the planner ignores it, and for a UNIQUE index it
+ * enforces nothing. `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` then
+ * matches the name on the next run and skips, and every shape check passes,
+ * because the shape IS right. The script printed "verified" over a
+ * duplicate-receipt guard that was not guarding.
+ *
+ * So an invalid index is REBUILT rather than reported: `IF NOT EXISTS` can
+ * never repair it, and leaving a human to notice a line of output is how it
+ * stayed invisible. Bounded to ONE attempt — a rebuild that fails is a data
+ * problem (an actual duplicate), and a loop would only delay saying so.
+ *
+ * Exported so a real Postgres can be pointed at every branch of it
+ * (tests/apply-script-index-db.test.ts); `main()` only decides what to do with
+ * the answer.
+ */
+export async function rebuildInvalidIndex(prisma, name, state) {
+    const preamble =
+        `index ${name} is present but NOT USABLE ` +
+        `(indisvalid=${state?.is_valid}, indisready=${state?.is_ready}) — ` +
+        `a CONCURRENTLY build must have failed. Dropping and rebuilding.`;
+    console.warn(preamble);
+    const rebuild = INDEX_STATEMENTS.find(sql => sql.includes(`"${name}"`));
+    if (!rebuild) {
+        return { ok: false, error: `VERIFY FAILED: no CREATE statement for index ${name} to rebuild from` };
+    }
+    await prisma.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${name}"`);
+    try {
+        await prisma.$executeRawUnsafe(toConcurrentIndexSql(rebuild));
+    } catch (error) {
+        // The rebuild failing is the INTERESTING outcome, not a crash: for a
+        // UNIQUE index it means the table holds rows the index would forbid,
+        // and a stack trace buries the one sentence that says so.
+        return {
+            ok: false,
+            error:
+                `VERIFY FAILED: index ${name} could not be rebuilt — ${error?.meta?.message ?? error?.message ?? error}\r\n` +
+                `  For a UNIQUE index this means the table holds rows it would refuse.\r\n` +
+                `  Find and resolve them, then re-run this script; it will rebuild the index.`,
+        };
+    }
+    const [rebuilt] = await prisma.$queryRawUnsafe(
+        `SELECT i.indisvalid AS is_valid, i.indisready AS is_ready
+           FROM pg_index i
+           JOIN pg_class ic ON ic.oid = i.indexrelid
+           JOIN pg_namespace n ON n.oid = ic.relnamespace
+          WHERE ic.relname = $1 AND n.nspname = 'public'`,
+        name,
+    );
+    if (!rebuilt || rebuilt.is_valid !== true || rebuilt.is_ready !== true) {
+        return {
+            ok: false,
+            error:
+                `VERIFY FAILED: index ${name} is STILL invalid after a rebuild. ` +
+                `For a UNIQUE index that usually means the table holds duplicates — ` +
+                `find them before re-running.`,
+        };
+    }
+    return { ok: true, message: `rebuilt index ${name} (it was invalid)` };
 }
 
 const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

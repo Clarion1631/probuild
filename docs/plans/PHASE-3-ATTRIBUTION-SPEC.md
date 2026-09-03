@@ -507,17 +507,23 @@ return. As built:
   as the whole pre-tax total; nothing new is added to them.
 * **`Expense.needsTaxReview` is cleared only by an explicit acknowledgement.** A re-sync
   that moves the gross on a classified row raises it, and the report skips flagged rows.
-  Clearing it requires `taxReviewAck: true` AND, on a flagged row, BOTH the `taxAmount`
-  AND `taxDeductibleBase` keys in the same request — each either a coherent figure (→
-  `"manual"` for `taxAmount`) or an explicit `null` (→ `"manual-none"` for `taxAmount`; for
-  `taxDeductibleBase`, null means "the whole pre-tax total", as above). The flag means the
-  WHOLE classification is in doubt, and the two figures are the whole classification, so
-  certifying one while staying silent about the other is the half-answer the flag exists to
-  prevent — a request that omits either key on a flagged row is a 400: it has nothing to
-  certify. On an UNFLAGGED row (an ack sent alongside an ordinary edit, with nothing to
-  clear), only `taxAmount` is required. `installedAtCustomer` is always optional (a null
-  reads as "unanswered" and cannot overstate a deduction). A partial correction without the
-  ack is still accepted; it just leaves the flag standing.
+  Clearing it requires `taxReviewAck: true` AND, on a flagged row, ALL THREE of the
+  `taxAmount`, `taxDeductibleBase` and `installedAtCustomer` keys in the same request —
+  each either a coherent figure/answer (→ `"manual"` for `taxAmount`) or an explicit `null`
+  (→ `"manual-none"` for `taxAmount`; for `taxDeductibleBase`, null means "the whole pre-tax
+  total", as above; for `installedAtCustomer`, null means "I do not know whether this was
+  resold", which the report reads as not deductible). The flag means the WHOLE
+  classification is in doubt, and those three fields are the whole classification, so
+  certifying part of it while staying silent about the rest is the half-answer the flag
+  exists to prevent — a request that omits any of the three on a flagged row is a 400
+  (`TAX_REVIEW_ACK_MALFORMED`): it has nothing to certify. `installedAtCustomer` is NOT the
+  optional one it looks like: it is the single field the excise report keys on, so omitting
+  it preserves a stored `true` and silently re-admits the receipt (round 43, item 1). On an
+  UNFLAGGED row (an ack sent alongside an ordinary edit, with nothing to clear), only
+  `taxAmount` is required. A partial correction without the ack is still accepted; it just
+  leaves the flag standing. Enforced by `taxReviewAckIsComplete`
+  (`src/lib/expense-attribution.ts`), which the route calls only when
+  `expense.needsTaxReview` is true.
 * **`ReceiptIntake.costCodeSource` records WHO captured a phase**: `"user"` (a signed-in
   person, through the app or the mobile capture screen) or `"machine"` (a shared-secret
   forwarder resolving it from a Drive folder or a mail rule). Booking copies the
@@ -554,10 +560,17 @@ return. As built:
   guarded by `assertExpenseMutableOutsideQbo`, and every expense the pipeline books carries a
   `qbPurchaseId` — so PUT cannot reach a single row the tax report is made of, and it now
   rejects these fields outright rather than appearing to accept them. PATCH edits ONLY
-  `installedAtCustomer`, `taxDeductibleBase`, `taxAmount`, `taxAtSource` and `costCodeId`
-  (all ProBuild-only: nothing syncs them to QuickBooks), requires the `financialReports`
-  permission on top of project access, and validates `0 ≤ base ≤ amount − taxAmount` plus
-  `0 ≤ taxAmount ≤ 12% of amount` against the ROW the request leaves behind. The invariant is
+  `installedAtCustomer`, `taxDeductibleBase`, `taxAmount` and `costCodeId` (all
+  ProBuild-only: nothing syncs them to QuickBooks) and requires the `financialReports`
+  permission on top of project access. **`taxAtSource` is DERIVED, never supplied** — it is
+  exactly "`taxAmount` is present and non-zero", the database CHECK
+  `Expense_taxAtSource_check` says so, and a request carrying the key is a 400 rather than
+  a silent no-op (round 20, item 1). The figures are validated SIGNED against the ROW the
+  request leaves behind, because a vendor credit is a NEGATIVE expense carrying negative
+  tax: each of `taxAmount` and `taxDeductibleBase` is either zero or of the SAME SIGN as
+  `amount`, `|taxAmount| ≤ 12% of |amount|` (`MAX_PLAUSIBLE_TAX_RATE`), and
+  `|taxDeductibleBase| ≤ |amount − taxAmount|`. Written as `0 ≤ base ≤ amount − taxAmount`
+  those bounds would reject every legitimate refund. The invariant is
   ALSO a database CHECK (`Expense_taxDeductibleBase_check`), because a concurrent QBO sync
   could otherwise strand it between the handler's read and its write.
 * booking persists only the tax `buildGroups` accepted, so a check or a nonsense
@@ -641,8 +654,16 @@ so named imports fail outright from a `.mjs` wrapper.
 - Gate: the `financialReports` permission (`src/lib/permissions.ts:110,173`) — same check
   pattern as the sibling reports pages.
 - Data: expenses where `taxAtSource = true AND installedAtCustomer = true AND
-  taxAmount > 0` (all three POSITIVE — a NULL `installedAtCustomer` is "nobody said" and is
-  never claimed), grouped by month (from `date`, company timezone) × project.
+  taxAmount != 0 AND needsTaxReview = false` (the first two POSITIVE — a NULL
+  `installedAtCustomer` is "nobody said" and is never claimed), grouped by month (from
+  `date`, company timezone) × project. **`taxAmount != 0`, not `> 0`:** a return or vendor
+  credit is a negative expense carrying negative tax and belongs on the filing as a
+  SUBTRACTION; excluding it would claim a deduction for tax that was refunded. A zero is an
+  answer ("no tax"), not an absence, so it is excluded. `needsTaxReview = false` is the one
+  NEGATIVE condition and it is about lifecycle rather than content: a QBO re-sync that
+  moves the gross under a recorded tax retires the classification, and until a human
+  answers again the row is not a deduction — in particular the "a null `taxDeductibleBase`
+  means the whole pre-tax total" rule must not fire on it.
   **DEPENDENCY ON PHASE 1:** the report treats `Expense.date` as a COMPANY-TIMEZONE calendar
   day — it filters on company-midnight bounds and buckets with `dayKeyInTimeZone`. That is
   only correct if the value was stored as company-local midnight for the receipt's calendar

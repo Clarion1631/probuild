@@ -46,7 +46,7 @@ import {
     type QboExpensePersistenceClient,
 } from "../src/lib/qbo-expense-sync";
 import { createParsedReceiptExpense } from "../src/lib/receipt-parse-expense";
-import { runBackfill } from "../scripts/backfill-expense-attribution";
+import { runBackfill, writeUnderAttributionLocks } from "../scripts/backfill-expense-attribution";
 import {
     backfillStatements,
     DDL_STATEMENTS,
@@ -876,6 +876,7 @@ test("a fallback-attributed row whose estimate is deleted keeps NOTHING it shoul
 const TARGET_PROJECT = `${PFX}-project-2`;
 const TARGET_ESTIMATE = `${PFX}-estimate-2`;
 const NEWER_ESTIMATE = `${PFX}-estimate-3`;
+const CROSS_ITEM = `${PFX}-item-2`;
 
 async function seedTwoJobs() {
     await seed();
@@ -1682,5 +1683,315 @@ test("the SHIPPED pair guard's estimate read blocks behind an in-flight estimate
     } finally {
         for (const sql of SPLIT_JOB_GUARD_DROP_SQL) await writerDb!.$executeRawUnsafe(sql);
         await cleanupTwoJobs();
+    }
+});
+
+/**
+ * THE BACKFILL'S OWN CROSS-JOB HOLE (Codex round 46, item 2).
+ *
+ * `writeUnderAttributionLocks` was fixed in round 36 by hoisting the
+ * job-scoped scan to the FRONT, and that fixed the tables it covers. It left a
+ * hole exactly the width of the rows it does NOT cover: the planner names
+ * estimates and items belonging to another job (or to none), which the
+ * project-scoped scan never sees, and those were locked in two further calls
+ * AFTERWARDS. So the sequence was
+ *
+ *     Items(job A) ... then Estimate(job B)
+ *
+ * — EstimateItem before Estimate, the declared order inverted, one job over
+ * from where the round-36 test was looking. The other side of the cycle is
+ * ordinary: anything holding job B's estimate and reaching for a line item.
+ */
+function itemEditor(held: ReturnType<typeof gate>, holdEstimate: string, wantItem: string) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, holdEstimate);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 750));
+                await tx.$executeRawUnsafe(`SELECT id FROM "EstimateItem" WHERE id = $1 FOR UPDATE`, wantItem);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+async function seedCrossJobItem() {
+    await seedTwoJobs();
+    await writerDb!.estimateItem.create({
+        data: { id: CROSS_ITEM, estimateId: TARGET_ESTIMATE, name: "other job rough-in", costCodeId: CODE },
+    });
+}
+
+async function cleanupCrossJobItem() {
+    await writerDb!.estimateItem.deleteMany({ where: { id: CROSS_ITEM } });
+    await cleanupTwoJobs();
+}
+
+test("CONTROL: the backfill's post-scan Estimate lock really does invert the order", { skip }, async () => {
+    // The pre-fix sequence, verbatim: the job-scoped scan, then the named
+    // estimates, then the named items. The writer ends up holding job A's LINE
+    // ITEMS while still reaching for job B's ESTIMATE.
+    await seedCrossJobItem();
+    try {
+        const held = gate();
+        const editor = itemEditor(held, TARGET_ESTIMATE, ITEM);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            await lockAttributionParents(raw, { projectId: PROJECT });
+            await raw.$queryRawUnsafe(
+                `SELECT id FROM "Estimate" WHERE id IN ($1) ORDER BY id FOR SHARE`, TARGET_ESTIMATE,
+            );
+            await raw.$queryRawUnsafe(
+                `SELECT id FROM "EstimateItem" WHERE id IN ($1) ORDER BY id FOR SHARE`, CROSS_ITEM,
+            );
+        }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from the post-scan estimate lock; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanupCrossJobItem();
+    }
+});
+
+test("the backfill takes the WHOLE union in one call, and simply waits", { skip }, async () => {
+    // The fix, through the real function rather than a reconstruction of it:
+    // one `lockAttributionParents` call carrying the project, the cross-job
+    // estimate and the cross-job item, so every Estimate is reached before
+    // every EstimateItem. The writer blocks on the editor's estimate holding
+    // no items at all, the editor finishes, and the write still happens.
+    await seedCrossJobItem();
+    try {
+        const held = gate();
+        const editor = itemEditor(held, TARGET_ESTIMATE, ITEM);
+        await held.reached;
+
+        let writerError: unknown = null;
+        let wrote: unknown = null;
+        await writeUnderAttributionLocks(
+            writerDb,
+            {
+                expenseId: EXPENSE,
+                phaseProjectId: PROJECT,
+                estimateIds: [TARGET_ESTIMATE],
+                estimateItemIds: [CROSS_ITEM],
+                costCodeId: CODE,
+            },
+            async () => { wrote = "written"; return wrote; },
+        ).catch((caught: unknown) => { writerError = caught; });
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the backfill was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the backfill failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        // Waiting is only the right answer if the work still happened.
+        assert.equal(wrote, "written", "the guarded write still ran");
+    } finally {
+        await cleanupCrossJobItem();
+    }
+});
+
+/**
+ * A BATCH INTERLEAVES ITS PARENT AND EXPENSE LOCKS (Codex round 46, item 3).
+ *
+ * `deleteExpenses` and `tagExpensesToChangeOrderCore` walk their batch one row
+ * at a time: re-resolve row 1's job from its share-locked estimate, write row
+ * 1 — which takes that Expense exclusively and, through the foreign keys, a
+ * KEY SHARE on its Project and Estimate — and only THEN reach for row 2's
+ * estimate. That is Expense -> Estimate inside one transaction, the declared
+ * order backwards, and it needs no exotic other side: anything holding an
+ * estimate while touching one of the batch's expenses closes the cycle.
+ *
+ * The second hazard is Expense against Expense, with no parent involved at
+ * all: two people acting on overlapping selections take the same rows
+ * exclusively, and an UNORDERED `findMany` lets the server hand them back in
+ * different orders. That half is pinned in tests/expense-delete-scope.test.ts,
+ * which can see the `orderBy` the shipped query carries; here the CONTROL
+ * shows what it buys — two transactions taking the same two expense rows in
+ * opposite orders really do deadlock.
+ */
+const BATCH_ESTIMATE = `${PFX}-estimate-batch`;
+const BATCH_A = `${PFX}-expense-a`;
+const BATCH_B = `${PFX}-expense-b`;
+const BATCH_CO = `${PFX}-changeorder`;
+
+async function seedBatch() {
+    await seed();
+    // A SECOND estimate on the SAME job: the batch's rows have to resolve to
+    // the change order's project, so the two parents that get interleaved are
+    // two estimates rather than two jobs.
+    await writerDb!.estimate.create({
+        data: {
+            id: BATCH_ESTIMATE, title: "Batch", code: `EST-${PFX}-batch`, projectId: PROJECT,
+            status: "Approved", totalAmount: 400, balanceDue: 400,
+        },
+    });
+    await writerDb!.changeOrder.create({
+        data: {
+            id: BATCH_CO, projectId: PROJECT, estimateId: ESTIMATE, code: `CO-${PFX}`,
+            title: "Batch CO", status: "Approved", pricingType: "COST_PLUS", markupPercent: 10,
+        },
+    });
+    // FALLBACK-ATTRIBUTED, both of them: `projectId` NULL, so each row's job is
+    // re-read from its OWN estimate under lock. A pinned projectId would skip
+    // that read entirely and the interleaving would not exist to measure.
+    for (const [id, estimateId] of [[BATCH_A, ESTIMATE], [BATCH_B, BATCH_ESTIMATE]] as const) {
+        await writerDb!.expense.create({
+            data: { id, estimateId, projectId: null, amount: 100, status: "Pending", vendor: "Batch" },
+        });
+    }
+}
+
+async function cleanupBatch() {
+    await writerDb!.expense.deleteMany({ where: { id: { in: [BATCH_A, BATCH_B] } } });
+    await writerDb!.changeOrder.deleteMany({ where: { id: BATCH_CO } });
+    await writerDb!.estimate.deleteMany({ where: { id: BATCH_ESTIMATE } });
+    await cleanup();
+}
+
+/** Holds the SECOND row's estimate, then reaches for the FIRST row's expense. */
+function estimateThenExpenseEditor(held: ReturnType<typeof gate>, holdEstimate: string, wantExpense: string) {
+    let error: unknown = null;
+    const done = (async () => {
+        try {
+            await editorDb!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                await tx.$executeRawUnsafe(`SELECT id FROM "Estimate" WHERE id = $1 FOR UPDATE`, holdEstimate);
+                held.open();
+                await new Promise(resolve => setTimeout(resolve, 750));
+                await tx.$executeRawUnsafe(`SELECT id FROM "Expense" WHERE id = $1 FOR UPDATE`, wantExpense);
+            });
+        } catch (caught) {
+            error = caught;
+        }
+    })();
+    return { done, get error() { return error; } };
+}
+
+test("CONTROL: a row-at-a-time batch deadlocks against an estimate holder", { skip }, async () => {
+    // The pre-fix sequence, verbatim: resolve row A's parent, write row A,
+    // then resolve row B's parent.
+    await seedBatch();
+    try {
+        const held = gate();
+        const editor = estimateThenExpenseEditor(held, BATCH_ESTIMATE, BATCH_A);
+        await held.reached;
+
+        let writerError: unknown = null;
+        await writerDb!.$transaction(async tx => {
+            const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
+            await raw.$queryRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+            for (const [id, estimateId] of [[BATCH_A, ESTIMATE], [BATCH_B, BATCH_ESTIMATE]] as const) {
+                await resolveExpenseProjectUnderLock(raw, { projectId: null, estimateId });
+                await tx.expense.updateMany({ where: { id }, data: { changeOrderId: BATCH_CO } });
+            }
+        }).catch(caught => { writerError = caught; });
+
+        await editor.done;
+
+        assert.ok(
+            deadlocked(writerError) || deadlocked(editor.error),
+            `expected 40P01 from the interleaved batch; writer=${writerError} editor=${editor.error}`,
+        );
+    } finally {
+        await cleanupBatch();
+    }
+});
+
+test("the SHIPPED tag-to-change-order takes every parent first, and waits", { skip }, async () => {
+    // The real function this time, not a reconstruction: it locks the job and
+    // both estimates in one call before it touches an Expense, so it blocks on
+    // the editor's estimate holding nothing, the editor commits, and the batch
+    // then does its work.
+    await seedBatch();
+    try {
+        const held = gate();
+        const editor = estimateThenExpenseEditor(held, BATCH_ESTIMATE, BATCH_A);
+        await held.reached;
+
+        // The singleton builds its client on FIRST USE and insists on the
+        // pooler flag, so the URL is set before the module is loaded.
+        process.env.DATABASE_URL = url!.includes("?") ? `${url}&pgbouncer=true` : `${url}?pgbouncer=true`;
+        const { tagExpensesToChangeOrderCore } = await import("../src/lib/time-expense-core");
+
+        let writerError: unknown = null;
+        let updated = 0;
+        try {
+            ({ updated } = await tagExpensesToChangeOrderCore(
+                { ids: [BATCH_B, BATCH_A], changeOrderId: BATCH_CO },
+                "batch-test",
+            ));
+        } catch (caught) {
+            writerError = caught;
+        }
+
+        await editor.done;
+
+        assert.equal(deadlocked(writerError), false, `the batch was killed by a deadlock: ${writerError}`);
+        assert.equal(deadlocked(editor.error), false, `the editor was killed by a deadlock: ${editor.error}`);
+        assert.equal(writerError, null, `the batch failed: ${writerError}`);
+        assert.equal(editor.error, null, `the editor failed: ${editor.error}`);
+        // Waiting is only the right answer if the work still happened — and it
+        // happened for BOTH rows, in ascending id order, whatever order the
+        // caller listed them in.
+        assert.equal(updated, 2, "both rows were tagged");
+        const rows = await writerDb!.expense.findMany({
+            where: { id: { in: [BATCH_A, BATCH_B] } },
+            select: { id: true, changeOrderId: true },
+            orderBy: { id: "asc" },
+        });
+        assert.deepEqual(rows.map(row => row.changeOrderId), [BATCH_CO, BATCH_CO]);
+    } finally {
+        await cleanupBatch();
+    }
+});
+
+test("CONTROL: two batches taking the same rows in opposite orders deadlock", { skip }, async () => {
+    // Why the shipped query carries `orderBy: { id: "asc" }`. No parent table
+    // is involved here at all — this is Expense against Expense, and the only
+    // thing that prevents it is both batches walking the rows the same way.
+    await seedBatch();
+    try {
+        const first = gate();
+        const second = gate();
+        const walk = async (db: typeof writerDb, order: readonly string[], reached: ReturnType<typeof gate>, other: Promise<void>) => {
+            try {
+                await db!.$transaction(async tx => {
+                    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '15s'`);
+                    await tx.$executeRawUnsafe(`SELECT id FROM "Expense" WHERE id = $1 FOR UPDATE`, order[0]);
+                    reached.open();
+                    await other;
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                    await tx.$executeRawUnsafe(`SELECT id FROM "Expense" WHERE id = $1 FOR UPDATE`, order[1]);
+                });
+                return null;
+            } catch (caught) {
+                return caught;
+            }
+        };
+        const ascending = walk(writerDb, [BATCH_A, BATCH_B], first, second.reached);
+        const descending = walk(editorDb, [BATCH_B, BATCH_A], second, first.reached);
+        const [ascError, descError] = await Promise.all([ascending, descending]);
+
+        assert.ok(
+            deadlocked(ascError) || deadlocked(descError),
+            `expected 40P01 from opposite row orders; asc=${ascError} desc=${descError}`,
+        );
+    } finally {
+        await cleanupBatch();
     }
 });

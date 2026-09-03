@@ -88,7 +88,7 @@ test("a named line item joins the job's ORDERED item scan, and locks only the it
     const rec = recorder();
     await lockAttributionParents(rec.tx, { projectId: "job-1", itemId: "item-1" });
     const item = rec.queries.find(query => /"EstimateItem"/.test(query))!;
-    assert.match(item, /e\."projectId" = ANY\(\$1::text\[\]\) OR ei\.id = \$2/);
+    assert.match(item, /e\."projectId" = ANY\(\$1::text\[\]\) OR ei\.id = ANY\(\$2::text\[\]\)/);
     assert.match(item, /ORDER BY ei\.id/);
     // `FOR SHARE OF ei` and not a bare `FOR SHARE`: the joined Estimate rows
     // are held by the scan before this one, and locking them again here would

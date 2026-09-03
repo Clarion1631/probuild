@@ -892,8 +892,15 @@ test("the cost fill share-locks the estimate, the item and the phase rows BEFORE
     assert.ok(expenseLockAt >= 0, "the per-expense lock is still taken");
     const before = kinds.slice(0, expenseLockAt);
     assert.ok(before.includes("estimate-share"), "the estimate is held");
-    assert.ok(before.includes("item-share"), "so is the item the code is copied from");
     assert.ok(before.includes("phase-share"), "and the job's phase rows");
+    // ONE STATEMENT PER TABLE (round 46, item 2). The named line item used to
+    // be locked by a second, separate `FROM "EstimateItem"` scan AFTER the
+    // job's — which is what put an Estimate acquisition after an EstimateItem
+    // one for anything the job-scoped scan had not seen. It now rides in the
+    // job's own item statement, so the id is what to look for, not a second
+    // query.
+    const items = trace.filter(entry => entry.kind === "phase-share").flatMap(entry => entry.args.flat(2));
+    assert.ok(items.includes("i1"), `the item the code is copied from is named: ${JSON.stringify(items)}`);
     // FOR SHARE, not FOR UPDATE: two readers must not block each other.
     assert.ok(trace.every(entry => !String(entry.kind).includes("update")));
 });
@@ -927,7 +934,8 @@ test("the project fill takes PROJECT, estimate, then the row — the canonical o
         "the estimate the project was read off is held, after the Project and before the row",
     );
     assert.ok(
-        trace.some(entry => entry.kind === "estimate-share" && (entry.args as string[])[0] === "est-job-1"),
+        trace.some(entry =>
+            entry.kind === "estimate-share" && entry.args.flat(2).includes("est-job-1")),
         "the estimate the project was read off",
     );
     // FOR SHARE throughout: two readers must not block each other.

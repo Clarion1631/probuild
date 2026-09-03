@@ -25,11 +25,28 @@ let currentUser: FakeUser | null;
 let storedExpense: Record<string, unknown> | null;
 let deleteArgs: unknown;
 
+/**
+ * The ORDER of everything the batch does, one entry per statement — the only
+ * way to see that every parent is reached before the first Expense row is
+ * touched, which is what round 46 item 3 is about.
+ */
+let opLog: string[] = [];
+let batchRows: Record<string, unknown>[] = [];
+let findManyArgs: any = null;
+
 const fakePrisma: any = {
     // The delete now runs in a transaction that re-resolves a fallback-
     // attributed row's job from the LOCKED estimate (round 20, item 4).
     $transaction: async (fn: any) => fn(fakePrisma),
-    $queryRawUnsafe: async (query: string) => {
+    $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+        const table = query.match(/FROM "(\w+)"/)?.[1];
+        if (/^SELECT "projectId" FROM "Estimate"/.test(query)) {
+            opLog.push(`resolve:${values[0]}`);
+            const known = batchRows.find(row => (row as any).estimateId === values[0]) as any;
+            const row = storedExpense as Record<string, any> | null;
+            return [{ projectId: known ? known.estimate?.projectId ?? null : row?.estimate?.projectId ?? null }];
+        }
+        if (/FOR SHARE/.test(query)) opLog.push(`lock:${table}[${values.flat(2).map(String).join(",")}]`);
         if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
             const row = storedExpense as Record<string, any> | null;
             return [{ projectId: row?.estimate?.projectId ?? null }];
@@ -38,14 +55,20 @@ const fakePrisma: any = {
     },
     expense: {
         findUnique: async () => storedExpense,
+        findMany: async (args: unknown) => {
+            findManyArgs = args;
+            return batchRows;
+        },
         deleteMany: async (args: unknown) => {
             deleteArgs = args;
+            opLog.push(`delete:${(args as any)?.where?.id}`);
             return { count: 1 };
         },
     },
 };
 
 let deleteExpense: (id: string, projectId: string) => Promise<void>;
+let deleteExpenses: (ids: string[]) => Promise<{ deleted: number }>;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -80,6 +103,7 @@ before(async () => {
         throw new Error(`expense-delete-scope: mocks did not apply (require patch ${hit ? "WAS" : "was NOT"} hit)`);
     }
     deleteExpense = mod.deleteExpense;
+    deleteExpenses = mod.deleteExpenses;
 });
 
 beforeEach(() => {
@@ -94,6 +118,9 @@ beforeEach(() => {
         estimate: { projectId: "job-2" },
     };
     deleteArgs = null;
+    opLog = [];
+    findManyArgs = null;
+    batchRows = [];
 });
 
 async function attempt(projectId: string): Promise<string | null> {
@@ -168,4 +195,88 @@ test("a row with no job at all cannot be deleted here", async () => {
 test("the timeClock permission is still required", async () => {
     currentUser = { id: "u6", role: "FIELD_CREW", permissions: {}, projectIds: ["job-1"] };
     assert.equal(await attempt("job-1"), "Forbidden");
+});
+
+// ── the BATCH (Codex round 46, item 3) ─────────────────────────────────────
+
+/**
+ * TWO ROWS, TWO ESTIMATES — the shape that makes the interleaving visible.
+ * Both are fallback-attributed, so each one's job is re-resolved from its own
+ * estimate under lock, which is the parent acquisition that used to sit
+ * BETWEEN the deletes.
+ */
+function twoRowBatch() {
+    batchRows = [
+        { id: "e-a", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+          projectId: null, estimateId: "est-a", estimate: { projectId: "job-1" } },
+        { id: "e-b", qbPurchaseId: null, invoiceId: null, invoicedAt: null,
+          projectId: null, estimateId: "est-b", estimate: { projectId: "job-1" } },
+    ];
+}
+
+test("the batch takes EVERY parent before it touches any expense", async () => {
+    // The bug: lock row A's parents, delete row A — which takes that Expense
+    // exclusively and, through the foreign keys, a KEY SHARE on its Project
+    // and Estimate — and only THEN reach for row B's parents. That is
+    // Expense -> Estimate inside one transaction, the declared order
+    // backwards, and against anything holding an estimate while touching an
+    // expense it is a cycle. tests/attribution-lock-order-db.test.ts drives
+    // the same sequence against a real Postgres and shows the 40P01.
+    twoRowBatch();
+    currentUser = { id: "u8", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    const result = await deleteExpenses(["e-a", "e-b"]);
+
+    assert.equal(result.deleted, 2);
+    const firstDelete = opLog.findIndex(entry => entry.startsWith("delete:"));
+    assert.ok(firstDelete > 0, `something has to be locked first: ${opLog.join(" ")}`);
+    const idsIn = (entries: string[]) =>
+        new Set(entries.flatMap(entry => (entry.match(/\[(.*)\]/)?.[1] ?? "").split(",").filter(Boolean)));
+    const before = idsIn(opLog.slice(0, firstDelete).filter(entry => entry.startsWith("lock:")));
+    const after = opLog.slice(firstDelete).filter(entry => entry.startsWith("lock:"));
+
+    // A NEW parent may not be reached after an Expense has been written. The
+    // per-row `resolveExpenseProjectUnderLock` still re-locks each estimate as
+    // it goes and that is fine — re-acquiring a share lock this transaction
+    // already holds takes no new lock at all, which is exactly why the ids are
+    // checked rather than the statements.
+    const fresh = [...idsIn(after)].filter(id => !before.has(id));
+    assert.deepEqual(fresh, [], `these parents were first reached AFTER a delete: ${opLog.join(" ")}`);
+    assert.deepEqual(
+        after.filter(entry => entry.startsWith("lock:Project")),
+        [],
+        `and no Project row may be reached after a delete: ${opLog.join(" ")}`,
+    );
+});
+
+test("...and both rows' estimates are named in that ONE acquisition", async () => {
+    // Locking only the first row's parents would satisfy the ordering check
+    // above while leaving the second row's estimate to be reached after the
+    // first delete, so the ids matter as much as the position.
+    twoRowBatch();
+    currentUser = { id: "u9", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    await deleteExpenses(["e-a", "e-b"]);
+    // BEFORE the first delete, not merely somewhere in the transaction: the
+    // per-row re-resolve reaches every estimate eventually, so a check that
+    // only asks "was it locked at all" passes against the un-fixed code.
+    const firstDelete = opLog.findIndex(entry => entry.startsWith("delete:"));
+    const upfront = opLog.slice(0, firstDelete).join(" ");
+    assert.match(upfront, /est-a/, `est-a is locked up front: ${opLog.join(" ")}`);
+    assert.match(upfront, /est-b/, `est-b is locked up front: ${opLog.join(" ")}`);
+});
+
+test("the batch is read in ASCENDING id order, so two of them cannot invert", async () => {
+    // Expense-vs-Expense, with no parent table involved: two people deleting
+    // overlapping selections take the same rows exclusively, and an unordered
+    // `findMany` lets the server hand them back in different orders. Pinning
+    // the read order is the whole fix — the loop preserves it.
+    twoRowBatch();
+    currentUser = { id: "u10", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    await deleteExpenses(["e-b", "e-a"]);
+
+    assert.deepEqual(findManyArgs?.orderBy, { id: "asc" }, "the read is ordered");
+    assert.deepEqual(
+        opLog.filter(entry => entry.startsWith("delete:")),
+        ["delete:e-a", "delete:e-b"],
+        "and the writes follow that order, not the caller's argument order",
+    );
 });

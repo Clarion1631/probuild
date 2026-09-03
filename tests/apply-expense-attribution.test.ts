@@ -23,6 +23,7 @@ import {
     expectedConstraints,
     expectedIndexes,
     expectedReceiptIntakeColumns,
+    normalizeCheckDefinition,
     backfillStatements,
     DDL_STATEMENTS,
     INDEX_STATEMENTS,
@@ -1323,4 +1324,86 @@ test("the amount/tax guard and its teardown are BOTH in the committed migration"
     assert.ok(create > -1 && fill > -1 && drop > -1);
     assert.ok(create < fill, "the guard has to exist before the fill gives the columns values");
     assert.ok(fill < drop, "and it comes out only after the fill is done");
+});
+
+// ── the CHECK comparison survives Postgres's own rendering (round 46, item 0) ─
+
+test("normalizeCheckDefinition sees through PG's parens, casts and whitespace", () => {
+    // THE DEPLOY BLOCKER. The old form was a list of regexes against
+    // `pg_get_constraintdef`, and Postgres 16 renders a CHECK with its own
+    // parenthesisation and casts:
+    //
+    //   CHECK (("taxAtSource" = (("taxAmount" IS NOT NULL) AND ("taxAmount" <> (0)::numeric))))
+    //
+    // `/"taxAtSource" = \(?"taxAmount" IS NOT NULL/` allows ONE optional paren
+    // and PG writes TWO, so the script exited 1 on a database it had just built
+    // correctly. Nothing caught it because CI never ran `main()`.
+    const pg16 = `CHECK (("taxAtSource" = (("taxAmount" IS NOT NULL) AND ("taxAmount" <> (0)::numeric))))`;
+    const ours = `"taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 0)`;
+    assert.equal(normalizeCheckDefinition(pg16), normalizeCheckDefinition(ours));
+
+    // ...and it still says NO to a real difference. Every column name,
+    // operator, function and their order has to match.
+    for (const drifted of [
+        `"taxAtSource" = ("taxAmount" IS NULL AND "taxAmount" <> 0)`,
+        `"taxAtSource" = ("taxAmount" IS NOT NULL OR "taxAmount" <> 0)`,
+        `"taxAtSource" = ("taxAmount" IS NOT NULL AND "taxAmount" <> 1)`,
+        `"taxAtSource" = ("taxAmount" IS NOT NULL AND "amount" <> 0)`,
+    ]) {
+        assert.notEqual(
+            normalizeCheckDefinition(pg16),
+            normalizeCheckDefinition(drifted),
+            drifted,
+        );
+    }
+});
+
+test("every expected CHECK is written the way this script writes it", () => {
+    // Each definition is compared against the live catalog by the end-to-end CI
+    // step; this pins the SHAPE so a typo fails here first. The renderings are
+    // Postgres 16's own, captured from a real database.
+    const rendered: Record<string, string> = {
+        Expense_taxAtSource_check:
+            `CHECK (("taxAtSource" = (("taxAmount" IS NOT NULL) AND ("taxAmount" <> (0)::numeric))))`,
+        Expense_taxAmount_check:
+            `CHECK ((("taxAmount" IS NULL) OR ("taxAmount" = (0)::numeric) OR ((sign("taxAmount") = sign(amount)) AND (abs("taxAmount") <= abs(amount)))))`,
+        Expense_taxDeductibleBase_check:
+            `CHECK ((("taxDeductibleBase" IS NULL) OR ("taxDeductibleBase" = (0)::numeric) OR ((sign("taxDeductibleBase") = sign(amount)) AND (abs("taxDeductibleBase") <= abs((amount - COALESCE("taxAmount", (0)::numeric)))))))`,
+    };
+    assert.equal(expectedCheckConstraints.length, 3);
+    for (const { name, table, definition } of expectedCheckConstraints as {
+        name: string; table: string; definition: string;
+    }[]) {
+        assert.equal(table, "Expense");
+        assert.ok(rendered[name], `no captured PG rendering for ${name}`);
+        assert.equal(
+            normalizeCheckDefinition(definition),
+            normalizeCheckDefinition(rendered[name]),
+            `${name} does not match what Postgres renders`,
+        );
+        // No regexes left: the comparison is definition equality now.
+        assert.equal(
+            (expectedCheckConstraints as { mustMatch?: unknown }[]).some(c => c.mustMatch),
+            false,
+            "the substring form is gone, not merely accompanied",
+        );
+    }
+});
+
+test("the index verifier checks that an index is USABLE, not just present", () => {
+    // ROUND 46, ITEM 1. A failed `CREATE INDEX CONCURRENTLY` leaves an index
+    // with the right NAME and `indisvalid = false`: the planner ignores it and
+    // a UNIQUE one enforces nothing, while `IF NOT EXISTS` skips it forever.
+    const script = readFileSync(
+        path.join(__dirname, "..", "scripts", "apply-expense-attribution.mjs"),
+        "utf8",
+    );
+    assert.match(script, /i\.indisvalid\s+AS is_valid/, "the catalog read asks for validity");
+    assert.match(script, /i\.indisready\s+AS is_ready/);
+    assert.match(script, /row\.is_valid !== true \|\| row\.is_ready !== true/, "and the verifier acts on it");
+    // ...and REBUILDS rather than merely reporting: IF NOT EXISTS can never
+    // repair it, so telling a human is how it stayed invisible.
+    assert.match(script, /DROP INDEX CONCURRENTLY IF EXISTS/);
+    assert.match(script, /toConcurrentIndexSql\(rebuild\)/);
+    assert.match(script, /is STILL invalid after a rebuild/, "and gives up loudly rather than looping");
 });

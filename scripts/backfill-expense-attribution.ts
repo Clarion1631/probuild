@@ -64,7 +64,7 @@ import {
 } from "../src/lib/expense-attribution";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
 import { lockExpense } from "../src/lib/expense-lock";
-import { lockPhaseRowsForShare, provePhaseMembershipTx } from "../src/lib/phase-invariant";
+import { lockAttributionParents, provePhaseMembershipTx } from "../src/lib/phase-invariant";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
 import { csvCell, csvNumber } from "../src/lib/csv-safe";
 
@@ -416,27 +416,19 @@ export async function writeUnderExpenseLock(db, expenseId, run) {
  * transaction commits, while letting other readers through. That is exactly the
  * shape of the hazard: the expense's own row is protected by the per-expense
  * advisory lock and by compare-and-set predicates, but the FACTS the write is
- * derived from live on OTHER rows — the estimate whose `projectId` supplies the
- * attribution, the estimate item whose `costCodeId` is copied, and the job's
- * phase rows that decide whether a code is even allowed. A predicate can catch
- * a row that moved BEFORE the write; it cannot stop it moving DURING the read
- * sequence that decides what to write.
+ * derived from live on OTHER rows — the estimate whose `projectId` supplies
+ * the attribution, the estimate item whose `costCodeId` is copied, and the
+ * job's phase rows that decide whether a code is even allowed. A predicate can
+ * catch a row that moved BEFORE the write; it cannot stop it moving DURING the
+ * read sequence that decides what to write.
  *
- * Order is fixed and ids are sorted, so two runs of this script can never take
- * the same locks in opposite orders. They are SHARED locks, so concurrent
- * readers (including another backfill) do not block each other at all — only a
- * writer of those exact rows waits, briefly.
+ * The acquisition itself is `lockAttributionParents` in
+ * src/lib/phase-invariant.ts — the ONE definition of the order, shared with
+ * every live writer, so this script and a bookkeeper's save cannot walk these
+ * tables in opposite directions. This file deliberately owns NO scan of its
+ * own: a local one would be a second definition of the order, which is how the
+ * inversion below got written in the first place.
  */
-async function lockRowsForShare(tx, table, ids) {
-    const unique = [...new Set(ids.filter(Boolean))].sort();
-    if (!unique.length) return;
-    const params = unique.map((_, index) => `$${index + 1}`).join(", ");
-    await tx.$queryRawUnsafe(
-        `SELECT id FROM ${table} WHERE id IN (${params}) ORDER BY id FOR SHARE`,
-        ...unique,
-    );
-}
-
 // The job's phase rows are held by the SHARED helper in expense-lock.ts, which
 // the receipt booking takes too — one statement, one lock order, so the two
 // writers of a cost code cannot deadlock against each other.
@@ -461,30 +453,34 @@ export async function writeUnderAttributionLocks(db, locks, run) {
     } = locks;
     if (typeof db.$transaction !== "function") return run(db);
     return db.$transaction(async tx => {
-        // THE JOB FIRST (round 36, item 4). The canonical order every other
-        // holder of these rows uses is the one inside lockPhaseRowsForShare:
-        // Project, then Estimate, then EstimateItem, then CostCode. This
-        // function used to call that helper THIRD, after taking Estimate and
-        // EstimateItem itself — so it reached Project last while a live writer
-        // reached it first. Two transactions taking the same tables in
-        // opposite orders is the textbook deadlock, and the loser is a
-        // bookkeeper saving an expense, not a script somebody is watching.
+        // THE WHOLE UNION, IN ONE CALL (round 46, item 2).
         //
-        // Hoisting the helper to the front makes the WHOLE set acquire in that
-        // one order, because the two calls below are the same two tables the
-        // helper has already reached: Estimate then EstimateItem. Re-locking a
-        // row this transaction already holds is a no-op, and the ids these two
-        // add (an expense whose estimate belongs to no job, or to another one)
-        // are rows the helper never saw, so nothing is lost by ordering them
-        // after it.
-        await lockPhaseRowsForShare(tx, phaseProjectId);
-        await lockRowsForShare(tx, '"Estimate"', estimateIds);
-        await lockRowsForShare(tx, '"EstimateItem"', estimateItemIds);
-        // THE CANDIDATE CODE ITSELF (round 20, item 5). `isActive` is a
-        // company-wide switch with nothing to do with this job's phase rows, so
-        // locking those did not hold it: a code retired while this pass ran was
-        // still written, by the one writer with no human behind it.
-        await lockRowsForShare(tx, '"CostCode"', [costCodeId]);
+        // This used to be four calls: the job's phase rows through
+        // `lockPhaseRowsForShare`, then the named Estimates, then the named
+        // EstimateItems, then the CostCode. Hoisting the job-scoped scan to
+        // the front fixed the ordering of the tables it covers and left a
+        // hole one row wide behind it: the planner names estimates and items
+        // the project-scoped scan never saw — an expense whose estimate
+        // belongs to no job, or to a DIFFERENT job (that is what
+        // `estimateIds` is for). For those, statement 2 locked an Estimate
+        // AFTER statement 3 had already locked EstimateItems of the scanned
+        // job — EstimateItem -> Estimate, the inversion, one job over from
+        // where anyone was looking.
+        //
+        // Passing the complete set to `lockAttributionParents` makes it emit
+        // exactly ONE statement per table, in the global order, with every id
+        // ascending inside it. There is no second scan left to get wrong.
+        await lockAttributionParents(tx, {
+            projectId: phaseProjectId,
+            estimateIds,
+            itemIds: estimateItemIds,
+            // THE CANDIDATE CODE ITSELF (round 20, item 5). `isActive` is a
+            // company-wide switch with nothing to do with this job's phase
+            // rows, so locking those did not hold it: a code retired while
+            // this pass ran was still written, by the one writer with no
+            // human behind it.
+            costCodeId,
+        });
         await lockExpense(tx, expenseId);
         return run(tx);
     });

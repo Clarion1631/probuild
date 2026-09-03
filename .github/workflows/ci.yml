@@ -101,6 +101,17 @@ jobs:
         env:
           PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
 
+      # An index can EXIST and enforce nothing. A failed CREATE INDEX
+      # CONCURRENTLY leaves the index behind with the right name and
+      # `indisvalid = false`; the planner ignores it, a UNIQUE one guards
+      # nothing, and `IF NOT EXISTS` then matches the name forever. Only a real
+      # server can produce that state, so only a real server can prove the
+      # verifier notices it and rebuilds it.
+      - name: Apply-script index validity against real Postgres
+        run: npx tsx --test tests/apply-script-index-db.test.ts
+        env:
+          PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       # The excise deduction's FILTER, against the real planner. A relation
       # filter like `{ estimate: { projectId: null } }` compiles to an EXISTS,
       # so it silently excludes rows with no estimate at all -- the shape
@@ -109,6 +120,24 @@ jobs:
         run: npx tsx --test tests/tax-at-source-report-db.test.ts
         env:
           PHASE_INVARIANT_DB_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # THE APPLY SCRIPT, RUN FOR REAL (round 46, item 0).
+      #
+      # Every other test in this repo imports the script's CONSTANTS and checks
+      # their text. `main()` -- the part that connects, runs the phases and
+      # VERIFIES the result -- had never executed in CI, and it was broken: the
+      # CHECK-constraint comparison used regexes that do not match Postgres 16's
+      # rendering, so the script exited 1 on a database it had just built
+      # correctly. A deploy blocker no amount of source-text testing could see.
+      #
+      # The driver builds a PRE-PHASE-3 database (the phase-3 migration is moved
+      # aside), so this is a genuine from-scratch apply, then runs pre-deploy,
+      # post-deploy, and pre-deploy again for idempotency.
+      - name: Apply script end-to-end against real Postgres
+        run: node scripts/ci-apply-expense-attribution-e2e.mjs
+        env:
+          APPLY_E2E_SERVER_URL: postgresql://probuild:probuild@localhost:5432/postgres
+          APPLY_E2E_DB: probuild_apply
 
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts

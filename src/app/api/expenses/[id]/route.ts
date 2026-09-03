@@ -934,10 +934,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // never looked at, and the row went straight back into the excise
         // report.
         //
-        // So clearing it takes an explicit acknowledgement AND the two figures
-        // the report actually reads. `installedAtCustomer` is optional: it is
-        // the one field whose absence cannot overstate a deduction (a null
-        // reads as "unanswered" and the report skips the row).
+        // So clearing it takes an explicit acknowledgement AND all three of the
+        // fields the report actually reads — `taxAmount`, `taxDeductibleBase`
+        // and `installedAtCustomer`. That last one is NOT optional, whatever an
+        // earlier draft of this comment said: it is the single field the excise
+        // report keys on, so omitting it preserves a stored `true` and
+        // re-admits the receipt on an eligibility nobody re-checked (round 43,
+        // item 1). A null answer IS an answer; what is refused is silence.
         //
         // A tax edit WITHOUT the ack is still accepted — a partial correction
         // is normal work — it simply leaves the flag standing.
