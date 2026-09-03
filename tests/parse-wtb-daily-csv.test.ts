@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDayStatements, REPOST_FLOOR, DAILY_CANONICAL_FROM } from "../scripts/parse-wtb-daily-csv.mjs";
+import {
+    buildDayStatements,
+    buildSweepPayload,
+    postSweep,
+    resolveSweepSecret,
+    sweepSummaryLine,
+    REPOST_FLOOR,
+    DAILY_CANONICAL_FROM,
+} from "../scripts/parse-wtb-daily-csv.mjs";
 
 // Fixture note: none of this is real Golden Touch financial data. These are
 // synthetic "Balances and Transactions" CSV rows built to the same column
@@ -21,8 +29,9 @@ function row(
     status = "",
     custRef = "",
     detail = "",
+    bankRef = "",
 ) {
-    return `${date},${ACCT},${desc},${bai},${amount},${status},,,${custRef},${detail},,`;
+    return `${date},${ACCT},${desc},${bai},${amount},${status},,${bankRef},${custRef},${detail},,`;
 }
 
 function build(lines: string[]) {
@@ -269,4 +278,146 @@ test("the hash-format epoch is separate from the source-of-truth boundary", () =
     // exists to prevent.
     assert.notEqual(REPOST_FLOOR, DAILY_CANONICAL_FROM);
     assert.ok(REPOST_FLOOR > DAILY_CANONICAL_FROM);
+});
+
+// ── Deposit sweep (--sweep): the trigger this script carries for the daily
+//    bank-credit auto-apply. See docs/plans/DEPOSIT-SWEEP-PLAN.md.
+
+const CREDIT = (d: string, amt: string, bankRef: string, detail = "DEPOSIT - DDA/MMKT") =>
+    row(d, "OTHER DEPOSITS", "165", amt, "Cleared", "", detail, bankRef);
+
+test("sweep: a day carries its CREDIT rows, keyed by the bank reference", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "100.00"),
+        CLOSE("08/24/2026", "13537.68"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "13447.68"),
+        row("08/24/2026", "TOTAL DEBITS", "400", "-10.00"),
+        CREDIT("08/24/2026", "13447.68", "26236015002406"),
+        row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+    ]);
+
+    assert.equal(complete.length, 1);
+    const day = complete[0];
+    assert.equal(day.credits.length, 1, "only money IN is a credit");
+    assert.deepEqual(day.credits[0], {
+        bankReference: "26236015002406",
+        amount: 13447.68,
+        amountCents: 1344768,
+        transactionDetail: "OTHER DEPOSITS DEPOSIT - DDA/MMKT",
+        customerReference: null,
+    });
+    assert.equal(day.totalCreditsCents, 1344768);
+
+    // The sweep fields must never ride along on a LEDGER line: the statement
+    // route content-addresses those objects, so an extra key would re-hash
+    // every stored day and 409 the whole pipeline.
+    for (const line of day.lines) {
+        assert.deepEqual(Object.keys(line).sort(), ["amountCents", "checkNumber", "postedDate", "rawDescriptor"]);
+    }
+});
+
+test("sweep: the payload carries the BANK's own control totals", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1500.00"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1500.00"),
+        CREDIT("08/24/2026", "500.00", "REF-A"),
+        CREDIT("08/24/2026", "1000.00", "REF-B"),
+    ]);
+
+    const payload = buildSweepPayload(complete[0]);
+    assert.equal(payload.source, "bank");
+    assert.equal(payload.postDate, "2026-08-24");
+    assert.equal(payload.creditCount, 2);
+    assert.equal(payload.creditSum, 1500);
+    assert.deepEqual(payload.credits.map((c: any) => c.bankReference), ["REF-A", "REF-B"]);
+    // Only the four fields the endpoint reads — amountCents stays internal.
+    assert.deepEqual(
+        Object.keys(payload.credits[0]).sort(),
+        ["amount", "bankReference", "customerReference", "transactionDetail"],
+    );
+    assert.equal("dryRun" in payload, false, "a live sweep sends no dryRun flag at all");
+    assert.equal(buildSweepPayload(complete[0], { dryRun: true }).dryRun, true);
+});
+
+test("sweep: with no TOTAL CREDITS row the payload falls back to the summed rows", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "750.25"),
+        CREDIT("08/24/2026", "750.25", "REF-SOLO"),
+    ]);
+    const payload = buildSweepPayload(complete[0]);
+    assert.equal(payload.creditSum, 750.25);
+    assert.equal(payload.creditCount, 1);
+});
+
+test("sweep: a debit-only day has nothing to sweep", () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "100.00"),
+        CLOSE("08/24/2026", "90.00"),
+        row("08/24/2026", "MISCELLANEOUS DEBIT", "699", "-10.00", "Cleared"),
+    ]);
+    assert.deepEqual(complete[0].credits, []);
+});
+
+test("sweep: the secret comes from the environment, and its absence fails BEFORE any network call", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => { fetches += 1; return new Response("{}"); }) as typeof fetch;
+    try {
+        assert.throws(() => resolveSweepSecret({} as unknown as NodeJS.ProcessEnv), /DEPOSIT_INGEST_SECRET/);
+        assert.throws(() => resolveSweepSecret({ DEPOSIT_INGEST_SECRET: "" } as unknown as NodeJS.ProcessEnv), /DEPOSIT_INGEST_SECRET/);
+        assert.equal(resolveSweepSecret({ DEPOSIT_INGEST_SECRET: "s3cret" } as unknown as NodeJS.ProcessEnv), "s3cret");
+        assert.equal(fetches, 0, "an unconfigured sweep must not have talked to the network");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's batch as its body", async () => {
+    const { complete } = build([
+        OPEN("08/24/2026", "0.00"),
+        CLOSE("08/24/2026", "1500.00"),
+        row("08/24/2026", "TOTAL CREDITS", "100", "1500.00"),
+        CREDIT("08/24/2026", "1500.00", "REF-POST"),
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; init: any }> = [];
+    globalThis.fetch = (async (url: any, init: any) => {
+        seen.push({ url: String(url), init });
+        return new Response(JSON.stringify({
+            ok: true, source: "bank", postDate: "2026-08-24",
+            counts: { credits: 1, applied: 1, needsHuman: 0, proposed: 0, replay: 0 },
+            credits: [{ bankReference: "REF-POST", status: "applied", replay: false }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+        const result = await postSweep("https://probuild.example", "s3cret", complete[0], { dryRun: true });
+        assert.equal(result.status, 200);
+        assert.equal(result.body.counts.applied, 1);
+
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].url, "https://probuild.example/api/payments/deposit-ingest");
+        assert.equal(seen[0].init.headers.authorization, "Bearer s3cret");
+        const sent = JSON.parse(seen[0].init.body);
+        assert.equal(sent.source, "bank");
+        assert.equal(sent.postDate, "2026-08-24");
+        assert.equal(sent.creditCount, 1);
+        assert.equal(sent.creditSum, 1500);
+        assert.equal(sent.dryRun, true);
+        assert.deepEqual(sent.credits[0].bankReference, "REF-POST");
+        // The secret travels in the header only — never in the URL or the body.
+        assert.equal(seen[0].url.includes("s3cret"), false);
+        assert.equal(seen[0].init.body.includes("s3cret"), false);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("sweep: the Bot Health line reports every outcome bucket", () => {
+    assert.equal(
+        sweepSummaryLine("2026-08-24", { credits: 4, applied: 1, needsHuman: 2, proposed: 1, replay: 3 }),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay",
+    );
 });

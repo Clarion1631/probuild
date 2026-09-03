@@ -59,9 +59,31 @@
 // are therefore sorted into a total order (sortLines) before the payload is
 // built, so the hash is addressed by CONTENT, not by transport order.
 //
+// DEPOSIT SWEEP (--sweep): this script is also the production TRIGGER for the
+// daily bank-credit auto-apply (docs/plans/DEPOSIT-SWEEP-PLAN.md). After a
+// day's STATEMENT post succeeds (a replay no-op counts), --sweep POSTs that
+// same day's CREDIT rows to /api/payments/deposit-ingest as ONE batch:
+// source "bank", the postDate, the credits, and the control totals — where
+// creditSum is the bank's OWN per-day TOTAL CREDITS figure (BAI 100). The
+// endpoint refuses the whole batch if it does not tie to the rows posted.
+// Rules that matter for an unattended cron:
+//   - only COMPLETE days are swept, and a day skipped for any reason
+//     (REPOST_FLOOR, a missing ledger row, a quiet day) is never swept
+//     either — a partial day is exactly the state that makes an amount look
+//     unique when it is not;
+//   - a failed sweep POST is a non-zero exit, so the Hermes watchdog fires;
+//   - the bearer secret is read from DEPOSIT_INGEST_SECRET in the
+//     environment, never from argv, and its absence fails BEFORE any network
+//     call rather than half way through the day;
+//   - --sweep-dry-run posts the same batch with dryRun true (the Phase A
+//     shadow week): the endpoint runs the whole match and stops before any
+//     money boundary.
+//
 // Usage:
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> [--dry-run]
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url>
+//   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url> --sweep
+//   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --post <base-url> --sweep-dry-run
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> --account WTB-0723
 //
 // --post takes the SITE BASE URL (e.g. https://probuild.goldentouchremodeling.com);
@@ -71,6 +93,7 @@ import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 const INGEST_PATH = "/api/integrations/bank-ledger/ingest";
+const DEPOSIT_SWEEP_PATH = "/api/payments/deposit-ingest";
 const DEFAULT_ACCOUNT = "WTB-0723";
 // First calendar date the daily-CSV path owns (the first day ingested from a
 // daily export in prod, 2026-08-18). The monthly PDF parser must only cover
@@ -125,6 +148,14 @@ function collapseWs(value) { return value.trim().replace(/\s+/g, " "); }
  * the 7-day window re-posts each completed day up to ~5 times, an unsorted
  * payload turns a cosmetic re-order into a 409 that stalls every later day.
  */
+/** Deterministic order for the sweep batch. No hash depends on it; a stable
+ *  order just makes the log and any diff readable. */
+function sortCredits(credits) {
+    return [...credits].sort((a, b) =>
+        a.bankReference.localeCompare(b.bankReference)
+        || a.amountCents - b.amountCents);
+}
+
 function sortLines(lines) {
     return [...lines].sort((a, b) =>
         a.postedDate.localeCompare(b.postedDate)
@@ -134,10 +165,14 @@ function sortLines(lines) {
 }
 
 function parseArgs(argv) {
-    const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT };
+    const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT, sweep: false, sweepDryRun: false };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
         if (arg === "--dry-run") args.dryRun = true;
+        // --sweep-dry-run implies --sweep: it is the SAME batch, posted with
+        // dryRun true so the endpoint stops before any money boundary.
+        else if (arg === "--sweep") args.sweep = true;
+        else if (arg === "--sweep-dry-run") { args.sweep = true; args.sweepDryRun = true; }
         else if (arg === "--post") {
             const value = argv[++i];
             if (value === undefined || value.startsWith("--")) throw new Error("--post requires a base URL argument");
@@ -227,6 +262,12 @@ export function buildDayStatements(csvText, account) {
     const iDate = col("Post Date"), iAcct = col("Account Number"), iDesc = col("Description"),
         iBai = col("BAI Code"), iAmt = col("Amount"), iStatus = col("Status"),
         iCustRef = col("Customer Reference"), iDetail = col("Transaction Detail");
+    // Bank Reference is the stable per-deposit id the sweep keys on
+    // (docs/WTB-CHECK-IMAGES.md). Looked up OPTIONALLY so a historical export
+    // without the column still parses for the ledger: a credit then carries an
+    // empty reference, and the sweep endpoint refuses that batch rather than
+    // inventing an identity for it.
+    const iBankRef = header.indexOf("Bank Reference");
 
     /** day → { openingCents, closingCents, lines: [], pending: n } */
     const days = new Map();
@@ -247,7 +288,7 @@ export function buildDayStatements(csvText, account) {
         const acctNum = (rec[iAcct] ?? "").trim();
         if (acctNum !== EXPECTED_ACCOUNT_NUMBER) { problems.push(`row ${r + 1}: unexpected account "${acctNum}"`); continue; }
 
-        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], pending: 0, totalCreditsCents: null, totalDebitsCents: null });
+        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], credits: [], pending: 0, totalCreditsCents: null, totalDebitsCents: null });
         const day = days.get(isoDate);
 
         const desc = (rec[iDesc] ?? "").trim();
@@ -309,6 +350,20 @@ export function buildDayStatements(csvText, account) {
             : null;
 
         day.lines.push({ postedDate: isoDate, amountCents: cents, rawDescriptor, checkNumber });
+        // Money IN, for the deposit sweep. Kept in a SEPARATE list and never on
+        // the ledger line, because the statement route content-addresses those
+        // line objects: an extra field there would re-hash every stored day.
+        if (cents > 0) {
+            day.credits.push({
+                bankReference: iBankRef === -1 ? "" : (rec[iBankRef] ?? "").trim(),
+                amount: cents / 100,
+                amountCents: cents,
+                // The combined Description + Transaction Detail text, i.e. the
+                // same string the ledger stores as rawDescriptor.
+                transactionDetail: rawDescriptor || null,
+                customerReference: custRef || null,
+            });
+        }
     }
 
     if (problems.length > 0) throw new Error(`CSV problems:\n  ${problems.join("\n  ")}`);
@@ -364,6 +419,9 @@ export function buildDayStatements(csvText, account) {
             closingCents: day.closingCents,
             lines: sortLines(day.lines), // B-2: content-addressed, not transport-order-addressed
             pending: day.pending,
+            // Sweep-only, stripped before the ledger POST (see postStatement).
+            credits: sortCredits(day.credits),
+            totalCreditsCents: day.totalCreditsCents,
         });
     }
 
@@ -378,17 +436,115 @@ export function buildDayStatements(csvText, account) {
 }
 
 async function postStatement(baseUrl, secret, statement) {
-    const { pending, ...payload } = statement;
+    const { account, periodStart, periodEnd, openingCents, closingCents, lines } = statement;
+    // Built by WHITELIST, in this exact key order: the route content-addresses
+    // a statement, so a stray field (pending, credits, totalCreditsCents) would
+    // change the hash and 409 every day already stored.
+    const payload = { source: "STATEMENT", account, periodStart, periodEnd, openingCents, closingCents, lines };
     // NIT (round 2): a hung fetch would stall the nightly cron indefinitely.
     const res = await fetch(new URL(INGEST_PATH, baseUrl), {
         method: "POST",
         headers: { "content-type": "application/json", "x-ingest-key": secret },
-        body: JSON.stringify({ source: "STATEMENT", ...payload }),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
     let body = null;
     try { body = await res.json(); } catch { /* non-JSON error body */ }
     return { status: res.status, body };
+}
+
+/**
+ * The deposit-sweep batch for ONE complete day. Pure, so the payload shape is
+ * unit-testable without a network.
+ *
+ * creditSum is the BANK's own TOTAL CREDITS figure when the export published
+ * one (buildDayStatements has already refused the file if the cleared credits
+ * disagree with it), falling back to the summed rows for a day the bank left
+ * the row off. The endpoint re-checks both totals and refuses the whole batch
+ * on a mismatch — nothing is written for a day that cannot be vouched for.
+ */
+export function buildSweepPayload(day, opts = {}) {
+    const credits = day.credits.map(c => ({
+        bankReference: c.bankReference,
+        amount: c.amount,
+        transactionDetail: c.transactionDetail,
+        customerReference: c.customerReference,
+    }));
+    const creditSumCents = day.totalCreditsCents ?? credits.reduce((sum, c) => sum + Math.round(c.amount * 100), 0);
+    return {
+        source: "bank",
+        postDate: day.periodStart,
+        credits,
+        creditCount: credits.length,
+        creditSum: creditSumCents / 100,
+        ...(opts.dryRun ? { dryRun: true } : {}),
+    };
+}
+
+/**
+ * The sweep bearer secret. Resolved from the environment ONLY — a secret on
+ * the command line lands in argv, shell history and any agent transcript — and
+ * resolved BEFORE the first POST of the run, so an unconfigured cron fails
+ * loudly and immediately instead of half way through a day.
+ */
+export function resolveSweepSecret(env = process.env) {
+    const secret = env.DEPOSIT_INGEST_SECRET;
+    if (!secret) {
+        throw new Error("--sweep requires DEPOSIT_INGEST_SECRET in the environment (never on the command line)");
+    }
+    return secret;
+}
+
+export async function postSweep(baseUrl, secret, day, opts = {}) {
+    const res = await fetch(new URL(DEPOSIT_SWEEP_PATH, baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${secret}` },
+        body: JSON.stringify(buildSweepPayload(day, opts)),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+    });
+    let body = null;
+    try { body = await res.json(); } catch { /* non-JSON error body */ }
+    return { status: res.status, body };
+}
+
+/** The one line the Hermes job copies into its Bot Health report. */
+export function sweepSummaryLine(postDate, counts) {
+    return `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
+        `${counts.needsHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
+}
+
+/**
+ * POST one complete day's credits and report the outcome. Returns false when
+ * the caller must stop and exit non-zero — which, under the Hermes cron, is
+ * what makes the daily-job watchdog fire.
+ */
+async function sweepDay(args, sweepSecret, statement, stalled) {
+    const postDate = statement.periodStart;
+    if (statement.credits.length === 0) {
+        console.log(`  sweep ${postDate}: 0 credits — nothing to apply`);
+        return true;
+    }
+    const missingRef = statement.credits.filter(c => !c.bankReference);
+    if (missingRef.length > 0) {
+        // Refused here rather than posted: without the bank reference there is
+        // no idempotency key, and the endpoint would (correctly) 400 the batch.
+        console.error(`  sweep ${postDate}: ${missingRef.length} credit(s) carry no Bank Reference — refusing to post a batch with no idempotency key`);
+        stalled();
+        return false;
+    }
+    const { status, body } = await postSweep(args.post, sweepSecret, statement, { dryRun: args.sweepDryRun });
+    if (status === 200 && body?.ok) {
+        console.log(`  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`);
+        for (const credit of body.credits ?? []) {
+            if (credit.status === "unmatched" || credit.status === "reconcile") {
+                console.log(`    ${credit.bankReference}: ${credit.status} — ${credit.reason ?? ""}`);
+            }
+        }
+        return true;
+    }
+    console.error(`  sweep ${postDate}: HTTP ${status} ${JSON.stringify(body)}`);
+    stalled();
+    return false;
 }
 
 async function main() {
@@ -418,6 +574,10 @@ async function main() {
 
     if (args.dryRun || !args.post) {
         if (!args.post) console.log("(no --post; dry run only)");
+        // --sweep is an action taken against a live site; without --post there
+        // is nowhere to take it, and silently ignoring the flag would let a
+        // mis-wired cron look healthy while sweeping nothing.
+        if (args.sweep) fail("--sweep requires --post <base-url>");
         return;
     }
 
@@ -425,6 +585,17 @@ async function main() {
     if (!secret) {
         fail("--post requires BANK_LEDGER_INGEST_SECRET or INGEST_KEY in the environment");
         return;
+    }
+    // Resolved up front, before ANY network call: an unconfigured sweep must
+    // not post half the day's statements and then discover it has no secret.
+    let sweepSecret = null;
+    if (args.sweep) {
+        try {
+            sweepSecret = resolveSweepSecret();
+        } catch (error) {
+            fail(error.message);
+            return;
+        }
     }
 
     let hadError = false;
@@ -450,6 +621,13 @@ async function main() {
         if (status === 200 && body?.ok) {
             const tag = body.replay ? "replay (no-op)" : `inserted ${body.inserted}`;
             console.log(`  POST ${statement.periodStart}: OK — ${tag}`);
+            // The sweep runs ONLY after this day's statement is safely stored
+            // (a replay no-op counts): the ledger is the record, the sweep is
+            // the action taken on it.
+            if (args.sweep && !(await sweepDay(args, sweepSecret, statement, stalled))) {
+                hadError = true;
+                break;
+            }
         } else if (status === 409) {
             hadError = true;
             console.error(`  POST ${statement.periodStart}: 409 CONFLICT — the stored day differs from this file. Bank-side restatement? A HUMAN SHOULD LOOK. ${JSON.stringify(body)}`);
