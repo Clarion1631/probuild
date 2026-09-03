@@ -211,10 +211,10 @@ async function resolveCrewNames(
 }
 
 function validatePlannedTask(task: PlanScheduleTaskInput): void {
-    if (!task.name.trim()) throw new Error("Task name is required");
+    if (!task.name.trim()) throw new ScheduleTaskValidationError("Task name is required");
     const type = task.type ?? "task";
     if (!(SCHEDULE_TASK_TYPES as readonly string[]).includes(type)) {
-        throw new Error(`Invalid schedule task type "${type}"`);
+        throw new ScheduleTaskValidationError(`Invalid schedule task type "${type}"`);
     }
     const startDate = parseStartDateInput(task.startDate);
     const endDate = parseStartDateInput(task.endDate);
@@ -222,7 +222,7 @@ function validatePlannedTask(task: PlanScheduleTaskInput): void {
         throw new ScheduleTaskValidationError("Task end date must be after its start date (the end date is the day after the last day of work)");
     }
     if (task.estimatedHours != null && (!Number.isFinite(task.estimatedHours) || task.estimatedHours < 0)) {
-        throw new Error("Estimated hours must be zero or greater");
+        throw new ScheduleTaskValidationError("Estimated hours must be zero or greater");
     }
     if (task.scheduledTime !== undefined) {
         if (type !== "appointment") throw new Error("Scheduled time is only available for appointments");

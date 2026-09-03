@@ -70,6 +70,17 @@ test("an end date before the start date is still rejected", async () => {
     assert.equal(updates.length, 0);
 });
 
+test("changing type without dates keeps the stored dates valid", async () => {
+    // task -> milestone collapses end onto start
+    const a = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    await updateScheduleTaskInTransaction(a.tx, TASK_ID, { type: "milestone" }, actor, PROJECT_ID);
+    assert.equal(a.updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-03");
+    // milestone -> task gets a one-day exclusive end
+    const b = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-03T00:00:00Z"), type: "milestone" });
+    await updateScheduleTaskInTransaction(b.tx, TASK_ID, { type: "task" }, actor, PROJECT_ID);
+    assert.equal(b.updates[0].data.endDate.toISOString().slice(0, 10), "2026-09-04");
+});
+
 test("a milestone patch stores end === start regardless of the requested endDate", async () => {
     const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-03T00:00:00Z"), type: "milestone" });
     await updateScheduleTaskInTransaction(tx, TASK_ID, { startDate: "2026-09-10", endDate: "2026-09-20" }, actor, PROJECT_ID);

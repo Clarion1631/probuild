@@ -378,6 +378,15 @@ export async function updateScheduleTaskInTransaction(
         }
         updateData.startDate = startDate;
         updateData.endDate = endDate;
+    } else if (data.type !== undefined && data.type !== persisted.type) {
+        // A type change without a date patch must keep the stored dates valid:
+        // milestones store end == start, everything else stores end > start
+        // (exclusive end, see schedule-dates.ts).
+        if (data.type === "milestone") {
+            updateData.endDate = persisted.startDate;
+        } else if (persisted.endDate <= persisted.startDate) {
+            updateData.endDate = new Date(persisted.startDate.getTime() + 24 * 60 * 60 * 1000);
+        }
     }
 
     const saved = await tx.scheduleTask.update({
