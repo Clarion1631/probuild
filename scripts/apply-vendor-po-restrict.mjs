@@ -18,6 +18,7 @@
 //
 // Usage: node scripts/apply-vendor-po-restrict.mjs
 import { PrismaClient } from "@prisma/client";
+import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 
 // DATABASE_URL (the pooler) on purpose, matching every sibling apply-*.mjs.
@@ -37,8 +38,8 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in env or .env files");
 }
 
-const url = resolveDatabaseUrl();
-const prisma = new PrismaClient({ datasources: { db: { url } } });
+let url;
+let prisma;
 
 // Resolve the FK from pg_catalog rather than information_schema: constraint
 // names are only unique per-schema, and information_schema joins on name alone,
@@ -160,9 +161,14 @@ async function main() {
     console.log(`${final.name} verified: ON DELETE RESTRICT, ON UPDATE ${final.updateAction}, validated.`);
 }
 
-main()
-    .catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    })
-    .finally(() => prisma.$disconnect());
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma.$disconnect());
+}

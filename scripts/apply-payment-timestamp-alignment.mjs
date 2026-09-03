@@ -24,6 +24,7 @@
 // Run BEFORE deploying the build that ships the matching schema.prisma.
 // Usage: node scripts/apply-payment-timestamp-alignment.mjs
 import { PrismaClient } from "@prisma/client";
+import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 
 // Same resolution the sibling apply-*.mjs scripts use: env first, then the checked-out .env
@@ -38,8 +39,8 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in env or .env files");
 }
 
-const url = resolveDatabaseUrl();
-const prisma = new PrismaClient({ datasources: { db: { url } } });
+let url;
+let prisma;
 
 // Both columns are mirrored between the estimate and invoice sides.
 const TARGETS = [
@@ -139,9 +140,14 @@ async function main() {
     console.log("\nAll 4 mirrored columns are timestamptz(6). Done.");
 }
 
-main()
-    .catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    })
-    .finally(() => prisma.$disconnect());
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma.$disconnect());
+}
