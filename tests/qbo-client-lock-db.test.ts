@@ -445,3 +445,82 @@ test("progress-billing link: the CAS now pins taxAmount too", { skip }, async ()
         await db.$disconnect();
     }
 });
+
+// --- Round 46: the finalizer locks the client the INVOICE points at ---
+
+/**
+ * The finding: this locked `args.clientId` — a value the caller read before the
+ * transaction opened — and then read the QuickBooks customer through
+ * `progressBilling.invoice.client`, a relation that takes no lock at all. The
+ * locked row and the read row could be two different clients.
+ *
+ * Now the invoice is locked first, its `clientId` scalar is read under that
+ * lock, and THAT row is the one locked and read. Two connections, because the
+ * only proof that a lock is real is that a writer holding it makes this WAIT.
+ */
+test("progress-billing link: it waits on the client the INVOICE points at", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    const other = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        // The holder takes FOR UPDATE on that client and remaps it. If the
+        // finalizer did not lock this row it would read the OLD customer,
+        // recompute a hash that still matched, and link.
+        const res = await whileHolding(
+            other,
+            async (tx) => {
+                await lockClientRow(tx, ID.client, "update");
+                await tx.client.update({ where: { id: ID.client }, data: { qbCustomerId: REMAPPED_CUSTOMER } });
+            },
+            () => linkBilling(db, billingHash(ORIGINAL_CUSTOMER)),
+        );
+        assert.equal(res.outcome, "mismatch", "it saw the remap, so it must have waited for it");
+        const row = await db.progressBilling.findUnique({ where: { id: ID.billing } });
+        assert.equal(row?.qbInvoiceId, null);
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+        await other.$disconnect();
+    }
+});
+
+test("progress-billing link: a caller naming the WRONG client is refused", { skip }, async () => {
+    // The caller resolved its QuickBooks customer against some client. If the
+    // invoice does not bill that client, the create and the record disagree
+    // about who is being billed, and the pre-fix code simply locked whichever
+    // one the caller named and carried on.
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        const other = await db.client.create({
+            data: { id: "cli-locktest-other", name: "Someone Else", initials: "SE", qbCustomerId: "7777" },
+        });
+        const res = await withPrisma(db, () => finalizeProgressBillingLinkUnderLock({
+            billingId: ID.billing, invoiceId: ID.invoice, clientId: other.id,
+            qbId: "qb-created-2", inFlightMarker: IN_FLIGHT, issuanceHash: billingHash(ORIGINAL_CUSTOMER),
+            pinned: { subtotal: 1000, total: 1089, taxAmount: 89, description: "Rough-in complete" },
+        }));
+        assert.equal(res.outcome, "mismatch");
+        assert.match(String((res as any).detail), /different client/);
+        const row = await db.progressBilling.findUnique({ where: { id: ID.billing } });
+        assert.equal(row?.qbInvoiceId, null, "nothing was linked against a client it does not bill");
+        await db.client.delete({ where: { id: other.id } }).catch(() => {});
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+    }
+});
+
+test("progress-billing link: the control still links under the right client", { skip }, async () => {
+    const db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
+    try {
+        await seed(db);
+        const res = await linkBilling(db, billingHash(ORIGINAL_CUSTOMER));
+        assert.equal(res.outcome, "linked");
+        const row = await db.progressBilling.findUnique({ where: { id: ID.billing } });
+        assert.equal(row?.qbInvoiceId, "qb-created-2");
+    } finally {
+        await teardown(db);
+        await db.$disconnect();
+    }
+});

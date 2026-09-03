@@ -58,11 +58,37 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // Play specifically requires a public account-deletion URL.
 const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/health\/pipeline\/?$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
-// The legal pages are static server components that define no Server Actions.
-// Next's action IDs are global, so a bypassed path is a place an anonymous caller
-// could POST a `next-action` header for someone else's action; the portal routes
-// accept that tradeoff because they genuinely have anonymous actions, these don't.
-const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
+/**
+ * The ONLY bypassed paths allowed to dispatch an anonymous Server Action.
+ *
+ * Next's action IDs are GLOBAL: a `next-action` POST to any path that reaches
+ * the app can invoke any action in the app. The proxy bypass runs BEFORE the
+ * route handler, so a route that authenticates inside itself — the ops health
+ * reads with their Bearer/staff-session check, the machine-to-machine ingest
+ * endpoints — is not the boundary for an action dispatch: its handler never
+ * runs at all. This used to be scoped to the four legal pages, which left every
+ * other bypassed path (health included) as an open action dispatcher.
+ *
+ * `portal` and `sub-portal` are the two trees that genuinely serve anonymous
+ * actions (25 and 1 files importing actions respectively); those actions
+ * authorize through their own client/token checks. `share` imports none, and
+ * `login` is a client component that posts to NextAuth, so neither needs it.
+ */
+const ANONYMOUS_ACTION_PATTERN = /^\/(?:portal|sub-portal)(?:\/|$)/;
+
+/**
+ * Is this an action dispatch?
+ *
+ * The header is what Next actually routes on. The content-type is
+ * belt-and-braces: no legitimate client sends `text/x-component` on a REQUEST,
+ * so treating it as an action keeps a future dispatch shape from arriving
+ * through a path that only ever inspected the header.
+ */
+export function isServerActionRequest(req: any): boolean {
+    if (typeof req?.headers?.get?.("next-action") === "string") return true;
+    const contentType = req?.headers?.get?.("content-type");
+    return typeof contentType === "string" && contentType.toLowerCase().includes("text/x-component");
+}
 
 // Test-only action dispatchers that get the proxy bypass below. Explicit, not a
 // prefix match: the proxy checks only the environment gates, never the route's
@@ -102,7 +128,7 @@ export default async function proxy(req: any, event: any) {
     }
 
     const pathname = req.nextUrl?.pathname;
-    const isServerAction = typeof req.headers?.get?.("next-action") === "string";
+    const isServerAction = isServerActionRequest(req);
 
     // Public portal routes must remain reachable without a staff session, but a
     // stale staff cookie must never use those routes to bypass the production
@@ -153,8 +179,18 @@ export default async function proxy(req: any, event: any) {
         return NextResponse.next();
     }
 
-    // Legal pages are readable by anyone but are not an action endpoint.
-    if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
+    // A bypassed path is readable by anyone; that is not the same as being an
+    // action endpoint. Refused BEFORE the bypass below, for every bypassed path
+    // except the two trees that genuinely serve anonymous actions — otherwise
+    // the ops health reads, the webhook and ingest endpoints, the PDF routes and
+    // the static legal pages all double as anonymous dispatchers for every
+    // action in the app.
+    if (
+        isServerAction
+        && typeof pathname === "string"
+        && isPublicProxyBypass(pathname)
+        && !ANONYMOUS_ACTION_PATTERN.test(pathname)
+    ) {
         return new NextResponse("Forbidden", { status: 403 });
     }
 

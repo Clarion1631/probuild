@@ -23,6 +23,7 @@ import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
 import { hasPermission, canAccessProject, canAccessEstimate } from "../src/lib/access-rules";
+import { qboTxnDate } from "../src/lib/quickbooks";
 
 const state: {
     user: any | null;
@@ -36,7 +37,17 @@ const state: {
     lookup: { estimates: any[]; invoices: any[]; throws: unknown; calls: string[] };
     /** What `Client.qbCustomerId` says when the claim re-reads it under the lock. */
     clientQbCustomerId: string | null;
+    /** Bend one field of what QuickBooks says it booked. */
+    createdDocumentPatch: Record<string, unknown> | null;
+    /** A create response that describes no document at all. */
+    createdDocumentNull: boolean;
+    /** Every TxnDate the route actually sent, in order. */
+    sentTxnDates: Array<string | undefined>;
+    /** Which client the document CURRENTLY hangs off, as read under its lock. */
+    projectClientId: string;
     locksTaken: number;
+    /** Every row lock taken, in order, as `SQL|values`. */
+    locks: string[];
     /** Fired inside the create, to model a concurrent edit mid-flight. */
     onCreate: (() => void) | null;
     /**
@@ -54,6 +65,7 @@ const state: {
     user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
     lookup: { estimates: [], invoices: [], throws: null, calls: [] },
     clientQbCustomerId: "42", locksTaken: 0, onCreate: null, onFirstRead: null, sentNotes: [], sentItems: [], sentTotals: [],
+    createdDocumentPatch: null, createdDocumentNull: false, sentTxnDates: [], projectClientId: "cli-1", locks: [],
 };
 
 function resetState() {
@@ -65,11 +77,16 @@ function resetState() {
     state.lookup = { estimates: [], invoices: [], throws: null, calls: [] };
     state.clientQbCustomerId = "42";
     state.locksTaken = 0;
+    state.locks = [];
     state.onCreate = null;
     state.onFirstRead = null;
     state.sentNotes = [];
     state.sentItems = [];
     state.sentTotals = [];
+    state.sentTxnDates = [];
+    state.createdDocumentPatch = null;
+    state.createdDocumentNull = false;
+    state.projectClientId = "cli-1";
 }
 
 const fakePermissions = {
@@ -123,12 +140,45 @@ const fakePrisma = {
             findUnique: async () => ({ qbCustomerId: state.clientQbCustomerId }),
         };
     },
-    $queryRaw: async () => {
+    // Records the STATEMENT, not just a count: round 46 is about which rows
+    // get locked and in what order, and a counter cannot tell
+    // "locked the client the caller named" from "locked the client the
+    // document actually hangs off".
+    $queryRaw: async (strings?: TemplateStringsArray, ...values: any[]) => {
         state.locksTaken++;
+        if (strings) state.locks.push(`${strings.join("?")}|${values.join(",")}`);
         return [];
     },
     $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(fakePrisma),
 };
+
+/**
+ * What QuickBooks says it booked.
+ *
+ * A REAL create response echoes the document back, and the route now holds
+ * that answer to the same rule a recovery holds a candidate to. The fake used
+ * to return an id and nothing else, which described a QuickBooks that cannot
+ * exist and left the direct path's new check with nothing to check.
+ *
+ * By default it echoes exactly what the payload sent, so a create matches its
+ * own claim. `state.createdDocumentPatch` bends one field (what Automated
+ * Sales Tax, a QuickBooks-side item edit, or a cross-midnight replay does in
+ * production); `state.createdDocumentNull` models a response that describes
+ * nothing at all.
+ */
+function createdDocument(id: string, sent: any) {
+    if (state.createdDocumentNull) return null;
+    return {
+        id,
+        docNumber: sent?.code ?? null,
+        privateNote: sent?.privateNote ?? null,
+        total: sent?.totalAmount ?? null,
+        customerId: sent?.customerId ?? null,
+        txnDate: sent?.txnDate ?? null,
+        itemIds: sent?.itemId ? [sent.itemId] : [],
+        ...(state.createdDocumentPatch ?? {}),
+    };
+}
 
 const fakeQbPayments = {
     getFreshQBTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: "realm-1" }),
@@ -201,16 +251,26 @@ before(async () => {
                     state.sentNotes.push(e?.privateNote);
                     state.sentItems.push(e?.items ?? []);
                     state.sentTotals.push(e?.totalAmount);
+                    state.sentTxnDates.push(e?.txnDate);
                     state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
-                    return { qbId: "qb-est-1", qbUrl: "https://qbo/est/1" };
+                    return {
+                        qbId: "qb-est-1",
+                        qbUrl: "https://qbo/est/1",
+                        document: createdDocument("qb-est-1", e),
+                    };
                 },
                 syncInvoiceToQB: async (_t: unknown, i: any, _d: unknown, requestId?: string) => {
                     state.posts.push({ kind: "invoice", requestId });
                     state.sentNotes.push(i?.privateNote);
+                    state.sentTxnDates.push(i?.txnDate);
                     state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
-                    return { qbId: "qb-inv-1", qbUrl: "https://qbo/inv/1" };
+                    return {
+                        qbId: "qb-inv-1",
+                        qbUrl: "https://qbo/inv/1",
+                        document: createdDocument("qb-inv-1", i),
+                    };
                 },
                 // The recovery probe. A THROW here is "QuickBooks did not
                 // answer", which must never read as absence.
@@ -335,7 +395,15 @@ function seedEstimate(overrides: Record<string, any> = {}) {
         // `loadDocumentIdentity` reads the customer from the nested Client under
         // the lock, so the remap knob has to live there — not only on the
         // separate client.findUnique the claim used to consult.
-        project: { name: "Kitchen", client: { id: "cli-1", get qbCustomerId() { return state.clientQbCustomerId; } } },
+        // `projectId`/`project.clientId` are SCALARS the decision reads under the
+        // document's own lock, to find out which project and client rows to lock
+        // next (round 46). Reading them through relations took no lock at all.
+        project: {
+            id: "proj-1",
+            get clientId() { return state.projectClientId; },
+            name: "Kitchen",
+            client: { id: "cli-1", get qbCustomerId() { return state.clientQbCustomerId; } },
+        },
         ...overrides,
     };
     return state.estimates["est-1"];
@@ -344,6 +412,8 @@ function seedEstimate(overrides: Record<string, any> = {}) {
 function seedInvoice(overrides: Record<string, any> = {}) {
     state.invoices["inv-1"] = {
         id: "inv-1", code: "INV-00001", projectId: "proj-1",
+        // The SCALAR the decision reads under the invoice's lock — see seedEstimate.
+        get clientId() { return state.projectClientId; },
         qbInvoiceId: null, qbSyncMarker: null, qbSyncedAt: null,
         totalAmount: 1000, balanceDue: 1000, taxAmount: 0,
         client: { id: "cli-1", get qbCustomerId() { return state.clientQbCustomerId; } },
@@ -433,7 +503,7 @@ test("round 38: an unconfirmed create parks the record, and the replay refuses",
     state.lookup.estimates = [{
         id: "qb-est-real", docNumber: "EST-00001",
         privateNote: documentPrivateNote("EST-00001", "Kitchen"),
-        total: 1000, customerId: "42",
+        total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
     const replay = await POST(postRequest({ type: "estimate", id: "est-1" }));
     const body = await replay.json();
@@ -491,7 +561,7 @@ test("round 38: the invoice rail behaves identically", async () => {
     state.lookup.invoices = [{
         id: "qb-inv-real", docNumber: "INV-00001",
         privateNote: documentPrivateNote("INV-00001", "Kitchen"),
-        total: 1000, customerId: "42",
+        total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
     const recovered = await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal((await recovered.json()).qbId, "qb-inv-real");
@@ -569,7 +639,7 @@ test("round 39: documents under our code that are NOT ours are never adopted", a
     state.createThrows = null;
     state.lookup.estimates = [{
         id: "qb-someone-else", docNumber: "EST-00001", privateNote: "Not ours",
-        total: 1000, customerId: "42",
+        total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 503);
@@ -691,7 +761,7 @@ test("round 41: an edit after an ambiguous create is NOT adopted", async () => {
     state.lookup.estimates = [{
         id: "qb-est-real", docNumber: "EST-00001",
         privateNote: documentPrivateNote("EST-00001", "Kitchen"),
-        total: 1000, customerId: "42",
+        total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
     row.itemsRevision = 99;
 
@@ -712,7 +782,7 @@ test("round 41: an UNEDITED record is still adopted (the control)", async () => 
     state.lookup.estimates = [{
         id: "qb-est-real", docNumber: "EST-00001",
         privateNote: documentPrivateNote("EST-00001", "Kitchen"),
-        total: 1000, customerId: "42",
+        total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 200);
@@ -767,7 +837,7 @@ test("round 41: a legacy claim carrying no payload hash is parked, never adopted
     } as any);
     state.lookup.estimates = [{
         id: "qb-est-real", docNumber: "EST-00001",
-        privateNote: note("EST-00001", "Kitchen"), total: 1000, customerId: "42",
+        privateNote: note("EST-00001", "Kitchen"), total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
     }];
 
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
@@ -875,6 +945,228 @@ test("round 43: a CLEAN row still syncs (the control)", async () => {
     // above and break the product.
     state.user = ADMIN;
     const row = seedEstimate();
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+});
+
+// --- Round 46: what QuickBooks BOOKED is judged, not just its id ---
+
+/**
+ * The finding: recovery validated a candidate's total before adopting it, but
+ * a create whose response arrived was linked on its `Id` alone. So the
+ * identical QuickBooks document was accepted or refused depending only on
+ * whether the first response came back — a property of the network, not of the
+ * document. Automated Sales Tax recomputing the tax line is the everyday way
+ * the two diverge.
+ */
+test("round 46: a created document whose TOTAL differs is parked, never linked", async () => {
+    const { markerKind, parseCreateMarker, AMBIGUOUS_CREATE_MARKER } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { total: 1200 };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+
+    assert.equal(res.status, 409);
+    assert.equal(body.reason, "created-document-mismatch");
+    assert.equal(body.qbId, "qb-est-1");
+    assert.match(body.error, /total is \$1200\.00/);
+    assert.equal(row.qbEstimateId, null, "a document for the wrong money is never linked");
+    assert.equal(markerKind(row.qbSyncMarker), AMBIGUOUS_CREATE_MARKER, "the row is parked");
+    assert.equal(
+        parseCreateMarker(row.qbSyncMarker)?.identity?.qbId,
+        "qb-est-1",
+        "and the marker names the document a human has to go and fix",
+    );
+});
+
+test("round 46: a created document dated into another period is parked", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { txnDate: "2019-01-01" };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /different accounting period/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 46: a created document booked to another ITEM is parked", async () => {
+    // The item decides the income account. Note, customer, total and date can
+    // all agree while the money books somewhere else entirely.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { itemIds: ["7", "99"] };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /QuickBooks item 99/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 46: a create response that describes nothing is parked, not linked", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentNull = true;
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /did not describe the document it created/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 46: the invoice rail is judged identically", async () => {
+    const { markerKind, AMBIGUOUS_CREATE_MARKER } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedInvoice();
+    state.createdDocumentPatch = { total: 999 };
+
+    const res = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).reason, "created-document-mismatch");
+    assert.equal(row.qbInvoiceId, null);
+    assert.equal(markerKind(row.qbSyncMarker), AMBIGUOUS_CREATE_MARKER);
+});
+
+test("round 46: a document that MATCHES its claim still links (the control)", async () => {
+    // Without this the four tests above would also pass against a route that
+    // refused every create.
+    state.user = ADMIN;
+    const row = seedEstimate();
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+    assert.equal(row.qbSyncMarker, null);
+});
+
+// --- Round 46: the claim records the date and the item, and a replay reuses them ---
+
+test("round 46: the claim records the TxnDate and the ItemRef that were sent", async () => {
+    const { parseCreateMarker } = await import("../src/lib/qbo-create-markers");
+    const { qboTxnDate } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    // Parked, so the marker survives the call and can be read back.
+    await parkEstimate();
+
+    const identity = parseCreateMarker(row.qbSyncMarker)?.identity;
+    assert.equal(identity?.txnDate, qboTxnDate(), "the accounting date the payload carried");
+    assert.equal(identity?.itemId, "7", "the service item every line carried");
+});
+
+test("round 46: a REPLAY re-sends the original accounting date, not todays", async () => {
+    // The whole point of a replay is to re-send the SAME document. Deriving the
+    // date at send time meant a retry after midnight, or after a period close,
+    // quietly produced a different one — and recovery, which never looked at a
+    // date, adopted it.
+    const { parseCreateMarker, AMBIGUOUS_CREATE_MARKER } = await import("../src/lib/qbo-create-markers");
+    const { composeSyncMarker } = await import("../src/lib/qbo-document-sync");
+    const { qboTxnDate } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+
+    // Re-date the claim to model one taken before midnight: same identity, same
+    // claim time, only the recorded TxnDate differs from today.
+    const parsed = parseCreateMarker(row.qbSyncMarker);
+    const originalDate = "2020-02-02";
+    row.qbSyncMarker = composeSyncMarker(
+        AMBIGUOUS_CREATE_MARKER,
+        { ...(parsed?.identity as any), txnDate: originalDate },
+        new Date(parsed?.atMs ?? Date.now()),
+    );
+    // QuickBooks holds nothing under that DocNumber, so the claim replays...
+    state.lookup.estimates = [];
+    // ...and the document it books carries the replayed date, so it matches.
+    state.createdDocumentPatch = { txnDate: originalDate };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 200);
+    assert.equal(
+        state.sentTxnDates[state.sentTxnDates.length - 1],
+        originalDate,
+        "the replay re-sent the ORIGINAL accounting date",
+    );
+    assert.notEqual(originalDate, qboTxnDate(), "and that is not simply today");
+});
+
+// --- Round 46: the decision locks the rows it reads ---
+
+/**
+ * The finding: `decideUnderIdentity` locked the `clientId` the CALLER passed —
+ * read before the transaction opened — and then read the project, the
+ * project's client and `Project.name` through relations, which take no lock at
+ * all. A rename or a re-point committing in between was invisible to it.
+ *
+ * So the order has to be: lock the document, read from IT which project and
+ * client it currently hangs off, lock those, and only then read the identity.
+ */
+test("round 46: the decision locks Estimate then Project then Client, in that order", async () => {
+    state.user = ADMIN;
+    seedEstimate();
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+
+    // The claim's transaction (the first three locks) — document, project,
+    // client, in the canonical direction.
+    assert.match(state.locks[0], /"Estimate"[\s\S]*FOR UPDATE[\s\S]*est-1/);
+    assert.match(state.locks[1], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    assert.match(state.locks[2], /"Client"[\s\S]*FOR SHARE[\s\S]*cli-1/);
+});
+
+test("round 46: the invoice rail locks Invoice then Project then Client", async () => {
+    state.user = ADMIN;
+    seedInvoice();
+
+    const res = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    assert.equal(res.status, 200);
+
+    assert.match(state.locks[0], /"Invoice"[\s\S]*FOR UPDATE[\s\S]*inv-1/);
+    assert.match(state.locks[1], /"Project"[\s\S]*FOR SHARE[\s\S]*proj-1/);
+    assert.match(state.locks[2], /"Client"[\s\S]*FOR SHARE[\s\S]*cli-1/);
+});
+
+test("round 46: a document re-pointed at another client is refused, never synced", async () => {
+    // The caller resolved its QuickBooks customer against the client it read
+    // before the transaction. If the document now hangs off a different one,
+    // the payload and the record disagree about who is being billed.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.projectClientId = "cli-2";
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 503, JSON.stringify(await res.clone().json()));
+    assert.match((await res.json()).error, /different client/);
+    assert.equal(state.posts.length, 0, "refused BEFORE any QuickBooks call");
+    assert.equal(row.qbSyncMarker, null, "and nothing was claimed");
+});
+
+test("round 46: a project RENAMED between the claim and the link does not link", async () => {
+    // `Project.name` rides in the PrivateNote QuickBooks stores, so a rename
+    // makes the document already sent describe a project that no longer exists
+    // under that name. The finalize recomputes the identity under the locks and
+    // must see it.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    // Fires during the create: after the claim, before the finalize.
+    state.onCreate = () => { row.project.name = "Kitchen Remodel v2"; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 409);
+    assert.equal(row.qbEstimateId, null, "the document is not linked to a record that moved");
+});
+
+test("round 46: an UNTOUCHED project still syncs (the control)", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 200);
     assert.equal(row.qbEstimateId, "qb-est-1");

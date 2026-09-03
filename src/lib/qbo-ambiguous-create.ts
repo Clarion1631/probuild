@@ -87,7 +87,7 @@ export type AmbiguousCreateRefusal =
 export type ResolveAmbiguousCreateResult =
     | { ok: true; outcome: "linked"; qbInvoiceId: string; message: string }
     | { ok: true; outcome: "cleared"; message: string }
-    | { ok: false; refusal: AmbiguousCreateRefusal; message: string; candidates?: { qbInvoiceId: string; total: number }[] };
+    | { ok: false; refusal: AmbiguousCreateRefusal; message: string; candidates?: { qbInvoiceId: string; total: number | null }[] };
 
 /**
  * Extends `ProjectScopedUser` (role + permissions + project scope) so the
@@ -541,15 +541,28 @@ export async function resolveAmbiguousInvoiceCreateCore(
                     `in QuickBooks before doing anything else with this row. Nothing was changed here.`,
             };
         }
+        // An UNREADABLE total is not a matching one. The lookup now reports it as
+        // null rather than coercing it to 0 (which compared unequal by luck), so
+        // the "we could not check" case has to refuse on its own.
+        if (parked.identity.expectedTotal != null && matches[0].total == null) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but QuickBooks did not report a ` +
+                    `readable total for it, so ProBuild cannot confirm it matches ${parked.code} — check it in QuickBooks ` +
+                    `before doing anything else with this row. Nothing was changed here.`,
+            };
+        }
         if (
             parked.identity.expectedTotal != null
-            && Math.abs(matches[0].total - parked.identity.expectedTotal) > 0.005
+            && Math.abs((matches[0].total as number) - parked.identity.expectedTotal) > 0.005
         ) {
             return {
                 ok: false,
                 refusal: "mismatch",
                 message:
-                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but its total ($${matches[0].total.toFixed(2)}) ` +
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but its total ($${(matches[0].total as number).toFixed(2)}) ` +
                     `does not match what ${parked.code} expected ($${parked.identity.expectedTotal.toFixed(2)}) — check invoice ${parked.identity.docNumber} ` +
                     `in QuickBooks before doing anything else with this row. Nothing was changed here.`,
             };

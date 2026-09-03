@@ -114,6 +114,30 @@ export async function lockMoneyParents(
 export type ClientLockMode = "share" | "update";
 
 /**
+ * The PROJECT a money document hangs off, locked between the document and the
+ * Client — so the canonical order is Estimate → Invoice → Project → Client.
+ *
+ * It sits there because that is the direction of the foreign keys: an estimate
+ * points at a project, and the project points at the client it bills. Taking
+ * it after the document and before the client means a reader walking
+ * document → project → client never takes a lock it has already passed.
+ *
+ * Needed because `Project.name` is part of what a document-sync claim
+ * fingerprints (it is in the PrivateNote QuickBooks stores), and the project's
+ * `clientId` decides WHO is billed. Both were read through unlocked relations:
+ * a rename, or a re-point to another client, could commit between the identity
+ * read and the write that trusted it. `FOR SHARE`, like the Client lock, for
+ * the same reason — these transactions READ the project, several may run at
+ * once, and only a writer needs to exclude them.
+ */
+export async function lockProjectRow(
+    tx: Prisma.TransactionClient,
+    projectId: string,
+): Promise<void> {
+    await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR SHARE`;
+}
+
+/**
  * Third and last of the canonical money parents (see the header): the Client
  * row a money document bills, taken AFTER Estimate and Invoice.
  *

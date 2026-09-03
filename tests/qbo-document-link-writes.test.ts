@@ -69,6 +69,17 @@ const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
             "when the record may have moved, so gating it on the identity matching would " +
             "leave a claim stranded exactly when the marker matters most.",
     },
+    {
+        file: "src/app/api/quickbooks/sync/route.ts",
+        contains: "parkMismatchedDocument",
+        why:
+            "Round 46. Promotes the CLAIM (create-in-flight -> ambiguous-create, now " +
+            "carrying the QuickBooks id) when the document QuickBooks actually booked " +
+            "does not match the claim it was created for. Same shape as settleSyncMarker: " +
+            "it LINKS NOTHING — it is the refusal to link — and it has to run precisely " +
+            "when the create and the claim disagree, which is when an identity gate would " +
+            "refuse and strand the row with an in-flight marker and no id recorded.",
+    },
 ];
 
 function sourceFiles(dir: string): string[] {

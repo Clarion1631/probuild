@@ -1221,12 +1221,67 @@ export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: str
 }
 
 /** One QuickBooks invoice as the ambiguous-create resolver needs to see it. */
-export interface QBInvoiceMatch {
+/**
+ * The accounting-significant fields of a QuickBooks document, however we came
+ * to be holding it: parsed straight off a CREATE response, or read back by a
+ * DocNumber lookup during recovery.
+ *
+ * One shape, because the direct-success path and the recovery path have to
+ * answer the SAME question about the SAME document. They used not to: recovery
+ * verified the total (and now the date and the item), while a create whose
+ * response arrived was linked on its Id alone. The identical QuickBooks result
+ * was accepted or refused purely on whether the first response came back.
+ */
+export interface RemoteDocumentFacts {
+    id: string;
+    docNumber: string | null;
+    privateNote: string | null;
+    /** `TotalAmt`. Null when QuickBooks did not give a readable one — never 0. */
+    total: number | null;
+    customerId: string | null;
+    /** `TxnDate`, the accounting period this document lands in. */
+    txnDate: string | null;
+    /**
+     * Every line's `ItemRef`, in payload order. The item decides the INCOME
+     * ACCOUNT the money books to, so a document built from a different item is
+     * a different document however well its note and total match.
+     */
+    itemIds: string[];
+}
+
+/**
+ * A raw QuickBooks Estimate/Invoice object — from a create response or a
+ * query row — reduced to the facts above.
+ *
+ * Absent values stay `null`/empty rather than being coerced: `Number(null)` is
+ * 0 and `String(undefined)` is "undefined", and both would compare by luck
+ * instead of by rule.
+ */
+export function remoteDocumentFacts(raw: any): RemoteDocumentFacts | null {
+    if (!raw?.Id) return null;
+    const lines: any[] = Array.isArray(raw.Line) ? raw.Line : [];
+    return {
+        id: String(raw.Id),
+        docNumber: raw.DocNumber != null ? String(raw.DocNumber) : null,
+        privateNote: raw.PrivateNote != null ? String(raw.PrivateNote) : null,
+        total: raw.TotalAmt != null && Number.isFinite(Number(raw.TotalAmt)) ? Number(raw.TotalAmt) : null,
+        customerId: raw.CustomerRef?.value != null && String(raw.CustomerRef.value) !== ""
+            ? String(raw.CustomerRef.value)
+            : null,
+        txnDate: raw.TxnDate != null && String(raw.TxnDate) !== "" ? String(raw.TxnDate) : null,
+        itemIds: lines
+            .map((l) => l?.SalesItemLineDetail?.ItemRef?.value)
+            .filter((v) => v != null && String(v) !== "")
+            .map((v) => String(v)),
+    };
+}
+
+export interface QBInvoiceMatch extends RemoteDocumentFacts {
     id: string;
     docNumber: string | null;
     /** ProBuild writes its own marker here on create; this is what proves it is ours. */
     privateNote: string | null;
-    total: number;
+    total: number | null;
     balance: number;
     /**
      * `CustomerRef.value` — WHO QuickBooks is actually billing for this
@@ -1303,11 +1358,11 @@ export function isQBResultSetTruncatedError(error: unknown): error is QBResultSe
  * identifier for exactly one record, so that plus the PrivateNote is the whole
  * identity there is to check.
  */
-export interface QBEstimateMatch {
+export interface QBEstimateMatch extends RemoteDocumentFacts {
     id: string;
     docNumber: string | null;
     privateNote: string | null;
-    total: number;
+    total: number | null;
     /**
      * WHO QuickBooks is billing. The recovery compares it against the claim,
      * so an absent or blank value must read as `null` (unverifiable) and never
@@ -1333,17 +1388,13 @@ export async function findQBEstimatesByDocNumber(
     if (rows.length === FIND_INVOICES_BY_DOC_NUMBER_LIMIT) {
         throw new QBResultSetTruncatedError(docNumber, FIND_INVOICES_BY_DOC_NUMBER_LIMIT);
     }
+    // Mapped through the SAME reducer the create path uses, so the candidate a
+    // recovery judges and the document a create just made are described
+    // identically — including the TxnDate and the line items, which this lookup
+    // used to drop on the floor.
     return rows
-        .filter((e) => e?.Id)
-        .map((e) => ({
-            id: String(e.Id),
-            docNumber: e.DocNumber != null ? String(e.DocNumber) : null,
-            privateNote: e.PrivateNote != null ? String(e.PrivateNote) : null,
-            total: Number(e.TotalAmt ?? 0),
-            customerId: e.CustomerRef?.value != null && String(e.CustomerRef.value) !== ""
-                ? String(e.CustomerRef.value)
-                : null,
-        }));
+        .map((e) => remoteDocumentFacts(e))
+        .filter((e): e is RemoteDocumentFacts => e !== null);
 }
 
 export async function findQBInvoicesByDocNumber(
@@ -1365,10 +1416,9 @@ export async function findQBInvoicesByDocNumber(
     return rows
         .filter((inv) => inv?.Id)
         .map((inv) => ({
-            id: String(inv.Id),
-            docNumber: inv.DocNumber != null ? String(inv.DocNumber) : null,
-            privateNote: inv.PrivateNote != null ? String(inv.PrivateNote) : null,
-            total: Number(inv.TotalAmt ?? 0),
+            // Same reducer as the create path and the estimate lookup; the
+            // invoice-only fields are added on top of it.
+            ...(remoteDocumentFacts(inv) as RemoteDocumentFacts),
             balance: Number(inv.Balance ?? 0),
             // Absent/blank reads as `null` (unverifiable), never as a match:
             // `String(undefined)` would have produced the literal "undefined"
@@ -2035,6 +2085,20 @@ export function buildQBEstimateLines(items: readonly QBEstimateItem[], itemId: s
  * response rather than creating a second document. Omitted when no key is
  * supplied, so callers that have nothing durable to key off are unchanged.
  */
+/**
+ * The `TxnDate` a create sends, as QuickBooks wants it.
+ *
+ * One definition because the value is now RECORDED in the create marker and
+ * REUSED on a replay: an unconfirmed create that is re-sent must send the same
+ * date it sent the first time, or the replay books the document into a
+ * different accounting period than the one the claim describes. Both payload
+ * builders used to compute this inline from `new Date()` at send time, so
+ * every replay across midnight silently produced a different document.
+ */
+export function qboTxnDate(at: Date = new Date()): string {
+    return at.toISOString().split("T")[0];
+}
+
 function qboCreatePath(path: string, requestId?: string): string {
     return requestId ? path + "?requestid=" + encodeURIComponent(requestId) : path;
 }
@@ -2057,6 +2121,12 @@ export async function syncEstimateToQB(
          * time, and a title alone is something any document could carry.
          */
         privateNote?: string;
+        /**
+         * The `TxnDate` to send. Defaults to today for callers with nothing
+         * durable to reuse; the document-sync rail passes the value its create
+         * marker recorded, so a replay re-sends the same accounting date.
+         */
+        txnDate?: string;
     },
     glMappings: Record<string, string> = {},
     deadline?: RouteDeadline,
@@ -2068,7 +2138,7 @@ export async function syncEstimateToQB(
      * receipt push already use.
      */
     requestId?: string,
-): Promise<{ qbId: string; qbUrl: string }> {
+): Promise<{ qbId: string; qbUrl: string; document: RemoteDocumentFacts | null }> {
     const lines = buildQBEstimateLines(estimate.items, estimate.itemId);
 
     // QBO rejects a transaction with no lines (error 2020, "Required param missing"). An
@@ -2079,7 +2149,7 @@ export async function syncEstimateToQB(
     }
 
     const payload = {
-        TxnDate: new Date().toISOString().split("T")[0],
+        TxnDate: estimate.txnDate ?? qboTxnDate(),
         DocNumber: estimate.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
         PrivateNote: canonicalPrivateNote(estimate.privateNote ?? estimate.title),
         CustomerRef: { value: estimate.customerId },
@@ -2123,9 +2193,15 @@ export async function syncEstimateToQB(
     // retry:true for what may already be a created estimate. Everything from
     // here on is the same "outcome unknown" case as the dispatch catch above.
     let qbId: string | undefined;
+    let document: RemoteDocumentFacts | null = null;
     try {
         const data = await res.json();
         qbId = data.Estimate?.Id;
+        // QuickBooks returns the document it actually booked. Reduced to the
+        // shared facts so the caller can hold it to the SAME rule a recovery
+        // holds a candidate to — it used to be thrown away and the id linked on
+        // its own.
+        document = remoteDocumentFacts(data.Estimate);
     } catch (error) {
         // A caller-originated abort must propagate as itself, same rule as
         // qboResponseError/parseJsonOrNull — everything else (a timeout mid
@@ -2141,7 +2217,7 @@ export async function syncEstimateToQB(
     }
     const qbUrl = `https://app.qbo.intuit.com/app/estimate?txnId=${qbId}`;
 
-    return { qbId, qbUrl };
+    return { qbId, qbUrl, document };
 }
 
 /** Push an invoice to QB. Returns the QB invoice ID. */
@@ -2157,11 +2233,13 @@ export async function syncInvoiceToQB(
         items?: Array<{ description: string; amount: number }>;
         /** See syncEstimateToQB. The invoice rail used to send none at all. */
         privateNote?: string;
+        /** See syncEstimateToQB. */
+        txnDate?: string;
     },
     deadline?: RouteDeadline,
     /** See syncEstimateToQB requestId. */
     requestId?: string,
-): Promise<{ qbId: string; qbUrl: string }> {
+): Promise<{ qbId: string; qbUrl: string; document: RemoteDocumentFacts | null }> {
     const lines: object[] = (invoice.items || []).map((item, i) => ({
         LineNum: i + 1,
         Description: item.description,
@@ -2182,7 +2260,7 @@ export async function syncInvoiceToQB(
 
     const payload = {
         DocNumber: invoice.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
-        TxnDate: new Date().toISOString().split("T")[0],
+        TxnDate: invoice.txnDate ?? qboTxnDate(),
         CustomerRef: { value: invoice.customerId },
         // Omitted when absent, so a caller that passes none is unchanged.
         ...(canonicalPrivateNote(invoice.privateNote)
@@ -2212,9 +2290,12 @@ export async function syncInvoiceToQB(
     // the same "outcome unknown" case as a dispatch-time timeout, not a plain
     // retryable error.
     let qbId: string | undefined;
+    let document: RemoteDocumentFacts | null = null;
     try {
         const data = await res.json();
         qbId = data.Invoice?.Id;
+        // Same as the estimate create above.
+        document = remoteDocumentFacts(data.Invoice);
     } catch (error) {
         if (isAbortError(error)) throw error;
         throw new QBAmbiguousDocumentCreateError("QB invoice sync");
@@ -2225,7 +2306,7 @@ export async function syncInvoiceToQB(
         throw new QBAmbiguousDocumentCreateError("QB invoice sync");
     }
     const qbUrl = `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
-    return { qbId, qbUrl };
+    return { qbId, qbUrl, document };
 }
 
 /** Send a QBO invoice email to a client. */

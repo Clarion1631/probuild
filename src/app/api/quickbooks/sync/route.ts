@@ -4,14 +4,17 @@ import {
     syncEstimateToQB, syncInvoiceToQB,
     createRouteDeadline, isQBBudgetExhaustedError, isQBTimeoutError, isQboConnectionFailure,
     isQBAmbiguousDocumentCreateError,
+    qboTxnDate,
     type QBTokens,
     type RouteDeadline,
+    type RemoteDocumentFacts,
 } from "@/lib/quickbooks";
 import { getFreshQBTokens, resolveCustomerAndItem } from "@/lib/quickbooks-payments";
 import { AMBIGUOUS_CREATE_MARKER, CREATE_IN_FLIGHT_MARKER, parseCreateMarker } from "@/lib/qbo-create-markers";
 import {
     composeSyncMarker,
     decideUnderIdentity,
+    documentMatchesClaim,
     probeDocumentSync,
     syncMarkerIdentity,
     syncMarkerKind,
@@ -111,7 +114,7 @@ export const maxDuration = 60;
  */
 
 /** Compose the claim marker for a set of freshly computed facts. */
-function markerFor(facts: DocumentIdentityFacts, tokens: QBTokens, at: Date): string {
+function markerFor(facts: DocumentIdentityFacts, tokens: QBTokens, at: Date, itemId: string): string {
     return composeSyncMarker(
         CREATE_IN_FLIGHT_MARKER,
         {
@@ -121,9 +124,75 @@ function markerFor(facts: DocumentIdentityFacts, tokens: QBTokens, at: Date): st
             expectedTotal: facts.total,
             realmId: tokens.realmId,
             customerId: facts.customerId,
+            // The accounting period the payload books to, fixed at CLAIM time and
+            // read back out of the marker by the create below — so a replay of an
+            // unconfirmed create re-sends the date it sent the first time instead
+            // of today's. Both payload builders used to compute it themselves at
+            // send time, which made every cross-midnight replay a different
+            // document that recovery then adopted without ever looking at a date.
+            txnDate: qboTxnDate(at),
+            // The service item every line carries, which is what decides the
+            // INCOME ACCOUNT the money books to. `resolveCustomerAndItem` can
+            // return a different one after a QuickBooks-side edit, and nothing
+            // in the fingerprint noticed.
+            itemId,
         },
         at,
     );
+}
+
+/**
+ * Park a document QuickBooks DID create but that does not match the claim it
+ * was created for.
+ *
+ * Deliberately not a delete. Unlike the progress-billing stage — which carves a
+ * compensation budget out of its route deadline for exactly this — this route
+ * has no reserved window, and the document may already have been mailed or
+ * viewed. So the row keeps a durable claim carrying the QuickBooks id: the
+ * next sync refuses rather than creating a second document, the recovery
+ * refuses to adopt it (the marker records the total, date and item it should
+ * have had), and an operator is told exactly which document to look at.
+ */
+async function parkMismatchedDocument(
+    write: (data: { qbSyncMarker: string | null }) => Promise<{ count: number }>,
+    marker: string,
+    qbId: string,
+): Promise<void> {
+    const parsed = parseCreateMarker(marker);
+    const identity = parsed?.identity ?? null;
+    if (!identity) return;
+    try {
+        await write({
+            qbSyncMarker: composeSyncMarker(
+                AMBIGUOUS_CREATE_MARKER,
+                { ...identity, qbId },
+                new Date(parsed?.atMs ?? Date.now()),
+            ),
+        });
+    } catch {
+        // Best effort, same as settleSyncMarker: a lost promotion leaves the
+        // in-flight marker, which recovers down the same path.
+    }
+}
+
+/**
+ * The one place a freshly-created document is judged.
+ *
+ * `documentMatchesClaim` is the SAME rule the recovery probe applies to a
+ * candidate it finds by DocNumber. Applying it here too is the whole point:
+ * the direct path used to link on the returned `Id` alone, so the identical
+ * QuickBooks result was accepted or refused purely on whether the first
+ * response came back.
+ */
+function createdDocumentRefusal(
+    document: RemoteDocumentFacts | null,
+    marker: string,
+): string | null {
+    const identity = parseCreateMarker(marker)?.identity;
+    if (!identity) return null;
+    if (!document) return "QuickBooks did not describe the document it created";
+    const verdict = documentMatchesClaim(document, identity);
+    return verdict.ok ? null : verdict.reason;
 }
 
 type RecoveryOutcome =
@@ -442,7 +511,7 @@ export async function POST(req: NextRequest) {
                 const claimed = await decideUnderIdentity({
                     kind: "estimate", id: estimate.id, clientId: client.id, expectCustomerId: customerId,
                     decide: async (tx, facts) => {
-                        const marker = markerFor(facts, tokens, estimateClaimedAt);
+                        const marker = markerFor(facts, tokens, estimateClaimedAt, itemId);
                         const written = await tx.estimate.updateMany({
                             where: { id: estimate.id, qbEstimateId: null, qbSyncMarker: null },
                             data: { qbSyncMarker: marker },
@@ -494,6 +563,10 @@ export async function POST(req: NextRequest) {
                 // The canonical marker note, not the bare title: this is what a
                 // recovery matches on to prove the document is ours.
                 privateNote: estimateFacts.privateNote,
+                // FROM THE MARKER, for both a fresh claim and a replay. On a replay
+                // this is the date the first attempt sent; deriving it here would
+                // book the retry into whatever period today happens to be.
+                txnDate: syncMarkerIdentity(estimateMarker)?.txnDate,
             }, qb.glMappings || {}, deadline, syncRequestId(estimate.id, estimateMarker))
                 .catch(async (error) => {
                     await settleSyncMarker(
@@ -503,6 +576,30 @@ export async function POST(req: NextRequest) {
                     );
                     throw error;
                 });
+
+            // 2b. JUDGE WHAT QUICKBOOKS ACTUALLY BOOKED, before linking anything.
+            //     Automated Sales Tax recomputes totals, a QuickBooks-side item
+            //     edit changes the income account, and a replay can land on a
+            //     different date — none of which this path used to look at.
+            const estimateRefusal = createdDocumentRefusal(result.document, estimateMarker);
+            if (estimateRefusal) {
+                await parkMismatchedDocument(
+                    (data) => prisma.estimate.updateMany({ where: { id: estimate.id, qbSyncMarker: estimateMarker }, data }),
+                    estimateMarker,
+                    result.qbId,
+                );
+                return NextResponse.json(
+                    {
+                        error:
+                            `QuickBooks created ${estimate.code} (id ${result.qbId}), but ${estimateRefusal}. ` +
+                            `It was NOT linked. Check that document in QuickBooks and either correct it or delete it.`,
+                        retry: false,
+                        reason: "created-document-mismatch",
+                        qbId: result.qbId,
+                    },
+                    { status: 409 },
+                );
+            }
 
             // 3. PERSIST in the same write that clears the claim, pinned to it,
             //    so the id and the marker can never disagree.
@@ -604,7 +701,7 @@ export async function POST(req: NextRequest) {
             const claimed = await decideUnderIdentity({
                 kind: "invoice", id: invoice.id, clientId: invoice.client.id, expectCustomerId: customerId,
                 decide: async (tx, facts) => {
-                    const marker = markerFor(facts, tokens, invoiceClaimedAt);
+                    const marker = markerFor(facts, tokens, invoiceClaimedAt, itemId);
                     const written = await tx.invoice.updateMany({
                         where: { id: invoice.id, qbInvoiceId: null, qbSyncMarker: null },
                         data: { qbSyncMarker: marker },
@@ -641,6 +738,9 @@ export async function POST(req: NextRequest) {
             itemId,
             project: invoiceOut.projectName ? { name: invoiceOut.projectName } : null,
             privateNote: invoiceFacts.privateNote,
+            // See the estimate rail: from the marker, so a replay re-sends the
+            // original accounting date.
+            txnDate: syncMarkerIdentity(invoiceMarker)?.txnDate,
         }, deadline, syncRequestId(invoice.id, invoiceMarker))
             .catch(async (error) => {
                 await settleSyncMarker(
@@ -650,6 +750,27 @@ export async function POST(req: NextRequest) {
                 );
                 throw error;
             });
+
+        // Same judgement as the estimate rail, through the same validator.
+        const invoiceRefusal = createdDocumentRefusal(result.document, invoiceMarker);
+        if (invoiceRefusal) {
+            await parkMismatchedDocument(
+                (data) => prisma.invoice.updateMany({ where: { id: invoice.id, qbSyncMarker: invoiceMarker }, data }),
+                invoiceMarker,
+                result.qbId,
+            );
+            return NextResponse.json(
+                {
+                    error:
+                        `QuickBooks created ${invoice.code} (id ${result.qbId}), but ${invoiceRefusal}. ` +
+                        `It was NOT linked. Check that document in QuickBooks and either correct it or delete it.`,
+                    retry: false,
+                    reason: "created-document-mismatch",
+                    qbId: result.qbId,
+                },
+                { status: 409 },
+            );
+        }
 
         // The same identity decision as the estimate rail, through the same
         // helper: locks, recompute the whole payload identity, compare it to the

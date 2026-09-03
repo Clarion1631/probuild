@@ -289,6 +289,30 @@ export interface CreateIdentity {
      * `undefined` is the normal case: nothing was left behind.
      */
     qbId?: string;
+    /**
+     * The `TxnDate` the create sent, as `YYYY-MM-DD`.
+     *
+     * The date decides which ACCOUNTING PERIOD the document books to, and the
+     * payload builders computed it from `new Date()` at send time. So a replay
+     * of an unconfirmed create — which exists precisely to re-send the SAME
+     * document — silently sent a different one whenever it crossed midnight or
+     * a period close, and recovery, which never looked at the date, adopted it.
+     * Captured here so a replay reuses it and a candidate can be checked
+     * against it.
+     */
+    txnDate?: string;
+    /**
+     * The QuickBooks `ItemRef` every line of the create carried.
+     *
+     * A single value because both payload builders put the SAME resolved
+     * service item on every line (`buildQBEstimateLines`, and the invoice
+     * builder's `ItemRef: { value: invoice.itemId }`). The item decides the
+     * INCOME ACCOUNT the money books to, so a document built from another item
+     * is a different document even when its note, customer and total all
+     * agree. If the builders ever emit per-line items, this must become a
+     * digest of them rather than one id.
+     */
+    itemId?: string;
 }
 
 /** Separates the marker kind from its identity payload. */
@@ -360,6 +384,18 @@ const MARKER_CUSTOMER_PREFIX = "%";
  * same positional-safety reason as the prefixes above.
  */
 const MARKER_QBID_PREFIX = "!";
+/**
+ * Prefixes the `TxnDate` the create sent, e.g.
+ * `create-in-flight:+2026-09-03|EST-00237|ProBuild ...`.
+ */
+const MARKER_TXNDATE_PREFIX = "+";
+/**
+ * Prefixes the QuickBooks service `ItemRef` the create's lines carried, e.g.
+ * `create-in-flight:+2026-09-03|&7|EST-00237|ProBuild ...`.
+ *
+ * Last of the optional fields, immediately before the docNumber.
+ */
+const MARKER_ITEM_PREFIX = "&";
 
 /** Every optional field prefix, in the order composeCreateMarker emits them. */
 const MARKER_OPTIONAL_PREFIXES = [
@@ -369,6 +405,8 @@ const MARKER_OPTIONAL_PREFIXES = [
     MARKER_REALM_PREFIX,
     MARKER_CUSTOMER_PREFIX,
     MARKER_QBID_PREFIX,
+    MARKER_TXNDATE_PREFIX,
+    MARKER_ITEM_PREFIX,
 ] as const;
 
 /**
@@ -413,7 +451,7 @@ export function composeCreateMarker(
     // separator in the DocNumber would, and an EMPTY one would compose a field
     // that parses back as absent -- i.e. silently downgrade to "unknown realm".
     // Both are invariants of the ids QuickBooks issues, not input validation.
-    for (const [label, value] of [["realmId", identity.realmId], ["customerId", identity.customerId], ["qbId", identity.qbId]] as const) {
+    for (const [label, value] of [["realmId", identity.realmId], ["customerId", identity.customerId], ["qbId", identity.qbId], ["txnDate", identity.txnDate], ["itemId", identity.itemId]] as const) {
         if (value == null) continue;
         if (value === "" || value.includes(MARKER_FIELD_SEP)) {
             throw new Error(`${label} must be non-empty and must not contain "${MARKER_FIELD_SEP}": ${value}`);
@@ -444,7 +482,13 @@ export function composeCreateMarker(
     const qbIdPart = identity.qbId
         ? `${MARKER_QBID_PREFIX}${identity.qbId}${MARKER_FIELD_SEP}`
         : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${qbIdPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const txnDatePart = identity.txnDate
+        ? `${MARKER_TXNDATE_PREFIX}${identity.txnDate}${MARKER_FIELD_SEP}`
+        : "";
+    const itemPart = identity.itemId
+        ? `${MARKER_ITEM_PREFIX}${identity.itemId}${MARKER_FIELD_SEP}`
+        : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${realmPart}${customerPart}${qbIdPart}${txnDatePart}${itemPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -543,6 +587,26 @@ export function parseCreateMarker(
         }
         // Same fall-through as `%...` above.
     }
+    let txnDate: string | undefined;
+    if (payload.startsWith(MARKER_TXNDATE_PREFIX)) {
+        const end = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = end > 0 ? payload.slice(MARKER_TXNDATE_PREFIX.length, end) : "";
+        if (raw) {
+            txnDate = raw;
+            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        }
+        // Same fall-through as `!...` above.
+    }
+    let itemId: string | undefined;
+    if (payload.startsWith(MARKER_ITEM_PREFIX)) {
+        const end = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = end > 0 ? payload.slice(MARKER_ITEM_PREFIX.length, end) : "";
+        if (raw) {
+            itemId = raw;
+            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        }
+        // Same fall-through as `+...` above.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
@@ -563,6 +627,8 @@ export function parseCreateMarker(
             ...(realmId ? { realmId } : {}),
             ...(customerId ? { customerId } : {}),
             ...(qbId ? { qbId } : {}),
+            ...(txnDate ? { txnDate } : {}),
+            ...(itemId ? { itemId } : {}),
         },
         atMs,
     };

@@ -19,7 +19,7 @@ import { createHash } from "node:crypto";
 
 import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./tx-retry";
 
 import { toNum } from "./prisma-helpers";
 import { documentIssuanceHash } from "./qbo-issuance";
@@ -30,6 +30,7 @@ import {
     QB_DOC_NUMBER_MAX_LEN,
     type QBTokens,
     type RouteDeadline,
+    type RemoteDocumentFacts,
 } from "./quickbooks";
 import {
     AMBIGUOUS_CREATE_MARKER,
@@ -205,7 +206,7 @@ export async function probeDocumentSync(
     // ask about the value QuickBooks actually stored.
     const docNumber = identity.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN);
 
-    let matches: Array<{ id: string; privateNote: string | null; total: number; customerId: string | null }>;
+    let matches: RemoteDocumentFacts[];
     try {
         matches = input.kind === "estimate"
             ? await findEstimates(tokens, docNumber, deadline)
@@ -217,10 +218,7 @@ export async function probeDocumentSync(
         return { state: "unknown", reason: error instanceof Error ? error.message : "QuickBooks lookup failed" };
     }
 
-    const ours = matches.filter((m) =>
-        canonicalPrivateNote(m.privateNote) === identity.privateNote
-        && m.customerId === identity.customerId
-        && (identity.expectedTotal == null || sameMoney(m.total, identity.expectedTotal)));
+    const ours = matches.filter((m) => documentMatchesClaim(m, identity).ok);
 
     if (ours.length === 1) return { state: "found", qbId: ours[0].id };
     if (matches.length === 0) return { state: "absent" };
@@ -233,6 +231,86 @@ export async function probeDocumentSync(
         };
     }
     return { state: "unknown", reason: `${ours.length} QuickBooks documents match ${docNumber}` };
+}
+
+/**
+ * THE acceptance rule for "is this QuickBooks document the one our claim
+ * describes?" — used by the recovery probe, by the sweep, and by the direct
+ * success path of a create.
+ *
+ * One function because the two paths used to disagree by construction. A
+ * recovery verified note, customer and total before adopting; a create whose
+ * response arrived was linked on its `Id` alone. The identical QuickBooks
+ * result was therefore accepted or refused depending only on whether the first
+ * response came back — which is a property of the network, not of the document.
+ *
+ * What it checks, and why each field is here:
+ *  - PrivateNote: proves the document is OURS (DocNumber is not unique in
+ *    QuickBooks, so a hand-created document can collide by accident).
+ *  - CustomerRef: proves it bills the party the claim addressed.
+ *  - TotalAmt: proves it is for the money the claim issued. QuickBooks
+ *    recomputes tax with Automated Sales Tax, so this genuinely moves.
+ *  - TxnDate: proves it lands in the ACCOUNTING PERIOD the claim recorded. A
+ *    replay after midnight, or after a period close, otherwise books to a
+ *    different month and was adopted silently.
+ *  - ItemRef: proves every line carries the service item the claim recorded,
+ *    which is what decides the INCOME ACCOUNT the money books to.
+ *
+ * A field the marker does not carry is skipped, not guessed: legacy markers
+ * predate the newer fields, and refusing them outright would strand rows that
+ * are otherwise perfectly identifiable. A field QuickBooks did not report
+ * (null/absent) while the marker DOES carry it is a refusal — "we could not
+ * check" is never "it matched".
+ */
+export function documentMatchesClaim(
+    doc: Pick<RemoteDocumentFacts, "privateNote" | "customerId" | "total" | "txnDate" | "itemIds">,
+    identity: CreateIdentity,
+): { ok: true } | { ok: false; reason: string } {
+    if (canonicalPrivateNote(doc.privateNote) !== identity.privateNote) {
+        return { ok: false, reason: "its private note is not the one this claim wrote" };
+    }
+    if (doc.customerId !== identity.customerId) {
+        return {
+            ok: false,
+            reason: `it bills QuickBooks customer ${doc.customerId ?? "nobody"} instead of ${identity.customerId ?? "the recorded customer"}`,
+        };
+    }
+    if (identity.expectedTotal != null) {
+        if (doc.total == null) {
+            return { ok: false, reason: "QuickBooks reported no readable total for it" };
+        }
+        if (!sameMoney(doc.total, identity.expectedTotal)) {
+            return {
+                ok: false,
+                reason: `its total is $${doc.total.toFixed(2)}, not the $${identity.expectedTotal.toFixed(2)} this claim issued`,
+            };
+        }
+    }
+    if (identity.txnDate) {
+        if (!doc.txnDate) {
+            return { ok: false, reason: "QuickBooks reported no transaction date for it" };
+        }
+        if (doc.txnDate !== identity.txnDate) {
+            return {
+                ok: false,
+                reason: `it is dated ${doc.txnDate}, not the ${identity.txnDate} this claim sent (a different accounting period)`,
+            };
+        }
+    }
+    if (identity.itemId) {
+        const items = doc.itemIds ?? [];
+        if (items.length === 0) {
+            return { ok: false, reason: "QuickBooks reported no line items for it" };
+        }
+        const wrong = items.find((id) => id !== identity.itemId);
+        if (wrong !== undefined) {
+            return {
+                ok: false,
+                reason: `one of its lines books to QuickBooks item ${wrong}, not the ${identity.itemId} this claim sent`,
+            };
+        }
+    }
+    return { ok: true };
 }
 
 /** What one rail did this run. */
@@ -695,6 +773,39 @@ export async function loadDocumentIdentity(
 }
 
 /**
+ * WHICH project and client this document hangs off, right now.
+ *
+ * Scalar ids only, and read while the document row is locked, so the rows this
+ * transaction is about to lock are the ones it is actually about — a relation
+ * read (`estimate.project.client`) takes no lock on either and can be answered
+ * from state that moves a moment later.
+ *
+ * The estimate rail reaches its client THROUGH the project (an estimate has no
+ * `clientId` of its own); the invoice rail carries both.
+ */
+async function currentDocumentOwner(
+    tx: Prisma.TransactionClient,
+    kind: "estimate" | "invoice",
+    id: string,
+): Promise<{ projectId: string | null; clientId: string } | null> {
+    if (kind === "estimate") {
+        const row = await tx.estimate.findUnique({
+            where: { id },
+            select: { projectId: true, project: { select: { id: true, clientId: true } } },
+        });
+        const clientId = row?.project?.clientId;
+        if (!row?.project?.id || !clientId) return null;
+        return { projectId: row.project.id, clientId };
+    }
+    const row = await tx.invoice.findUnique({
+        where: { id },
+        select: { projectId: true, clientId: true },
+    });
+    if (!row?.clientId) return null;
+    return { projectId: row.projectId ?? null, clientId: row.clientId };
+}
+
+/**
  * THE decision primitive. Every adopt, replay, finalize and fresh claim on
  * this rail goes through it, and none of them re-derives its own subset of
  * columns.
@@ -710,6 +821,21 @@ export async function loadDocumentIdentity(
  * The Client lock is FOR SHARE: this reads the mapping, but must not straddle
  * the FOR UPDATE remap in `resolveCustomerAndItem`, which may have run moments
  * ago on this very request.
+ *
+ * WHICH client, though, is not the caller's to say. Round 46: this locked the
+ * `clientId` the CALLER passed — read before the transaction opened, and
+ * therefore possibly stale — and then read the project, the project's client
+ * and `Project.name` through UNLOCKED relations inside `loadDocumentIdentity`.
+ * A project rename (`renameProject` in actions.ts) or a re-point to a different
+ * client could commit in between, and the write went ahead against an identity
+ * that had already moved.
+ *
+ * So the order is now: lock the DOCUMENT, read from it which project and which
+ * client it CURRENTLY hangs off, lock those actual rows, and only then read the
+ * identity. The caller's `clientId` is still checked — if the document now
+ * bills someone else, that is a refusal, not something to quietly follow.
+ *
+ * Canonical order: Estimate → Invoice → Project → Client.
  */
 export async function decideUnderIdentity<T>(args: {
     kind: "estimate" | "invoice";
@@ -730,15 +856,37 @@ export async function decideUnderIdentity<T>(args: {
     decide: (tx: Prisma.TransactionClient, facts: DocumentIdentityFacts) => Promise<T>;
 }): Promise<{ ok: true; value: T; facts: DocumentIdentityFacts } | { ok: false; reason: string }> {
     return withTxRetry(() => prisma.$transaction(async (tx) => {
+        // 1. The document itself. Everything else is reached THROUGH it, so
+        //    nothing below can be read before this lock is held.
         await lockMoneyParents(
             tx,
             {
                 estimateId: args.kind === "estimate" ? args.id : null,
                 invoiceId: args.kind === "invoice" ? args.id : null,
-                clientId: args.clientId,
             },
-            { clientLock: "share" },
         );
+        // 2. Which project and client does it hang off RIGHT NOW? Scalars, read
+        //    under the document's lock — not relations, which take no lock of
+        //    their own, and not the caller's pre-transaction copy.
+        const owner = await currentDocumentOwner(tx, args.kind, args.id);
+        if (!owner) {
+            return { ok: false as const, reason: "it no longer has a client and project to bill" };
+        }
+        // 3. Those ACTUAL rows, in the canonical direction. `Project.name` rides
+        //    in the PrivateNote QuickBooks stores and the project's client is who
+        //    gets billed, so both have to be stable across the read below.
+        if (owner.projectId) await lockProjectRow(tx, owner.projectId);
+        await lockClientRow(tx, owner.clientId, "share");
+        // The caller resolved its customer against a client it read earlier. If
+        // the document has since been re-pointed at a different one, the payload
+        // and the record disagree about who is being billed: refuse.
+        if (owner.clientId !== args.clientId) {
+            return {
+                ok: false as const,
+                reason: "it now bills a different client than the one this sync was prepared for",
+            };
+        }
+        // 4. Only now is the identity read meaningful.
         const facts = await loadDocumentIdentity(tx, args.kind, args.id);
         if (!facts) {
             return { ok: false as const, reason: "it no longer has a client and project to bill" };

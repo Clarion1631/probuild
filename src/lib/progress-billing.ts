@@ -30,7 +30,7 @@
  *     are created without relying on Intuit's own invoice-email flow).
  */
 import { prisma } from "@/lib/prisma";
-import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { withTxRetry, lockMoneyParents, lockClientRow } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { Prisma, ProgressBilling, ProgressBillingLine } from "@prisma/client";
 import { createRouteDeadline, remainingBudgetMs, QB_DOC_NUMBER_MAX_LEN, canonicalPrivateNote, type RouteDeadline, type QBTokens } from "./quickbooks";
@@ -834,21 +834,51 @@ function currentBillingIssuanceHash(row: {
  */
 export async function finalizeProgressBillingLinkUnderLock(args: ProgressBillingLinkArgs): Promise<ProgressBillingLinkVerdict> {
     return withTxRetry(() => prisma.$transaction(async (tx): Promise<ProgressBillingLinkVerdict> => {
-        // Estimate → Invoice → Client (tx-retry.ts). FOR SHARE on the Client:
-        // this only reads the mapping, but it must not straddle the FOR UPDATE
-        // remap in resolveCustomerAndItem.
-        await lockMoneyParents(tx, { invoiceId: args.invoiceId, clientId: args.clientId }, { clientLock: "share" });
+        // Estimate → Invoice → Project → Client (tx-retry.ts). The INVOICE first,
+        // because which client this bills is a fact ABOUT the invoice and is read
+        // from it below — round 46: this used to lock `args.clientId`, a value the
+        // caller read before the transaction opened, and then read the real
+        // customer through `invoice.client`, a relation that takes no lock at all.
+        // A client re-pointed on the invoice in between left the locked row and
+        // the read row as two different clients.
+        await lockMoneyParents(tx, { invoiceId: args.invoiceId });
+        const parent = await tx.invoice.findUnique({
+            where: { id: args.invoiceId },
+            // The SCALAR, under the invoice's lock.
+            select: { clientId: true },
+        });
+        if (!parent?.clientId) return { outcome: "mismatch", detail: "its invoice no longer has a client" };
+        // FOR SHARE on the Client: this only reads the mapping, but it must not
+        // straddle the FOR UPDATE remap in resolveCustomerAndItem.
+        await lockClientRow(tx, parent.clientId, "share");
+        if (parent.clientId !== args.clientId) {
+            return {
+                outcome: "mismatch",
+                detail: "its invoice now bills a different client than the one this create was prepared for",
+            };
+        }
         const current = await tx.progressBilling.findUnique({
             where: { id: args.billingId },
             select: {
                 status: true, subtotal: true, total: true, taxAmount: true, description: true,
-                invoice: { select: { client: { select: { qbCustomerId: true } } } },
+                invoiceId: true,
             },
         });
         if (!current) return { outcome: "mismatch", detail: "the billing no longer exists" };
+        // And it still hangs off the invoice whose client was just locked. A
+        // billing moved to another invoice would otherwise be judged against a
+        // customer that is no longer its own.
+        if (current.invoiceId !== args.invoiceId) {
+            return { outcome: "mismatch", detail: "it now belongs to a different invoice" };
+        }
+        // Read from the LOCKED client row, not through the billing's relations.
+        const client = await tx.client.findUnique({
+            where: { id: parent.clientId },
+            select: { qbCustomerId: true },
+        });
         const hashNow = currentBillingIssuanceHash({
             ...current,
-            qbCustomerId: current.invoice?.client?.qbCustomerId ?? null,
+            qbCustomerId: client?.qbCustomerId ?? null,
         });
         if (hashNow !== args.issuanceHash) {
             return {

@@ -323,6 +323,10 @@ const invoice = (
     privateNote,
     total,
     balance: total,
+    // Present because the lookup now reports them; the milestone resolver does
+    // not read them, but the shape it consumes is the shared one.
+    txnDate: null,
+    itemIds: [],
     customerId: CUSTOMER_ID,
     totalTax: MILESTONE_TAX.taxAmount,
     ...overrides,
@@ -759,7 +763,7 @@ test("a progress billing resolves the same way, and comes back Staged", async ()
         },
         deps([{
             id: "qb-7", docNumber: "INV-00171-P1", privateNote: BILLING_NOTE, total: 1089, balance: 1089,
-            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount,
+            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount, txnDate: null, itemIds: [],
         }], db),
     );
 
@@ -1296,7 +1300,7 @@ test("round 36 gate: the progress-billing rail is guarded too", async () => {
         },
         deps([{
             id: "qb-7", docNumber: "INV-00171-P1", privateNote: BILLING_NOTE, total: 1089, balance: 1089,
-            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount,
+            customerId: CUSTOMER_ID, totalTax: BILLING_STATE.taxAmount, txnDate: null, itemIds: [],
         }], db),
     );
 
