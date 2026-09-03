@@ -1348,3 +1348,64 @@ test("round 47: a FRESH create still resolves, and sends what it resolved (contr
     assert.equal(state.resolves, 1, "a fresh create is the one path that may resolve");
     assert.equal(state.sentItemIds[0], "12");
 });
+
+// --- Round 48: the acceptance rule covers the number and every sales line ---
+
+/**
+ * `documentMatchesClaim` is what the direct create path decides on, and it did
+ * not look at the DOCUMENT NUMBER at all. A create whose response carried an
+ * absent or different one was linked anyway — and then no recovery could ever
+ * find that document again, because recovery searches by the number the claim
+ * recorded.
+ */
+test("round 48: a created document with the WRONG number is parked, never linked", async () => {
+    const { markerKind, AMBIGUOUS_CREATE_MARKER } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { docNumber: "EST-99999" };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /document number is EST-99999/);
+    assert.equal(row.qbEstimateId, null);
+    assert.equal(markerKind(row.qbSyncMarker), AMBIGUOUS_CREATE_MARKER, "parked with the id");
+});
+
+test("round 48: a created document with NO number is parked too", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { docNumber: null };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /no document number/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+/**
+ * `remoteDocumentFacts` used to DROP sales lines whose ItemRef could not be
+ * read, so one good line plus one unreadable line became a one-element array
+ * that validated as "every line is correct". The item decides the income
+ * account; a line whose item cannot be named is not a line that can be accepted.
+ */
+test("round 48: one unreadable sales line among correct ones is parked", async () => {
+    const { UNREADABLE_ITEM_REF } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.createdDocumentPatch = { itemIds: ["7", UNREADABLE_ITEM_REF] };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /could not be read/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 48: the matching control still links", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+});

@@ -32,6 +32,7 @@ import {
     isQboConnectionFailure,
     isQboReconnectRequired,
     isQBTimeoutError,
+    UNREADABLE_ITEM_REF,
     type QBTokens,
     type RouteDeadline,
     type RemoteDocumentFacts,
@@ -288,6 +289,12 @@ export async function probeDocumentSync(
  * response came back — which is a property of the network, not of the document.
  *
  * What it checks, and why each field is here:
+ *  - DocNumber: the number the claim was made under, and the ONLY thing a
+ *    later recovery can search by. A create whose response carried an absent
+ *    or different DocNumber used to be linked anyway — and then no recovery
+ *    could ever find that document again, because it looks for the number the
+ *    claim recorded. Compared against the TRUNCATED value, because that is
+ *    what QuickBooks stores and what the lookup asks for.
  *  - PrivateNote: proves the document is OURS (DocNumber is not unique in
  *    QuickBooks, so a hand-created document can collide by accident).
  *  - CustomerRef: proves it bills the party the claim addressed.
@@ -306,9 +313,19 @@ export async function probeDocumentSync(
  * check" is never "it matched".
  */
 export function documentMatchesClaim(
-    doc: Pick<RemoteDocumentFacts, "privateNote" | "customerId" | "total" | "txnDate" | "itemIds">,
+    doc: Pick<RemoteDocumentFacts, "docNumber" | "privateNote" | "customerId" | "total" | "txnDate" | "itemIds">,
     identity: CreateIdentity,
 ): { ok: true } | { ok: false; reason: string } {
+    const expectedDocNumber = identity.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN);
+    if (!doc.docNumber) {
+        return { ok: false, reason: `QuickBooks reported no document number for it, and this claim was made under ${expectedDocNumber}` };
+    }
+    if (doc.docNumber !== expectedDocNumber) {
+        return {
+            ok: false,
+            reason: `its document number is ${doc.docNumber}, not the ${expectedDocNumber} this claim was made under (no recovery could find it again)`,
+        };
+    }
     if (canonicalPrivateNote(doc.privateNote) !== identity.privateNote) {
         return { ok: false, reason: "its private note is not the one this claim wrote" };
     }
@@ -345,7 +362,17 @@ export function documentMatchesClaim(
         if (items.length === 0) {
             return { ok: false, reason: "QuickBooks reported no line items for it" };
         }
+        // Every SALES line, including any whose ItemRef could not be read —
+        // `remoteDocumentFacts` keeps those as UNREADABLE_ITEM_REF rather than
+        // dropping them, because a line whose income account cannot be named is
+        // not a line that can be accepted.
         const wrong = items.find((id) => id !== identity.itemId);
+        if (wrong === UNREADABLE_ITEM_REF) {
+            return {
+                ok: false,
+                reason: "one of its lines carries a QuickBooks item that could not be read, so its income account cannot be verified",
+            };
+        }
         if (wrong !== undefined) {
             return {
                 ok: false,

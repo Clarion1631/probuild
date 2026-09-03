@@ -929,7 +929,10 @@ test("round 39: every deleteQBInvoice caller treats `false` as confirmed absence
 async function probeWith(opts: {
     marker: string;
     realmId?: string;
-    found?: Array<{ id: string; privateNote: string | null; total: number; customerId: string | null }>;
+    // The shape the DocNumber lookup really returns. `docNumber` is part of
+    // the acceptance rule as of round 48, so a fixture that cannot express it
+    // could not describe a candidate the probe would accept.
+    found?: Array<Partial<import("../src/lib/quickbooks").RemoteDocumentFacts> & { id: string }>;
 }) {
     const { probeDocumentSync } = await import("../src/lib/qbo-document-sync");
     return probeDocumentSync(
@@ -958,7 +961,11 @@ test("round 40: an exact match IS adopted (the control)", async () => {
     const res = await probeWith({
         marker: await claimMarker(),
         found: [{
-            id: "qb-9", privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+            // The DOCUMENT NUMBER is part of the acceptance rule now (round 48):
+            // a candidate that does not carry the number the claim was made
+            // under is not a document any later recovery could find again.
+            id: "qb-9", docNumber: "EST-00001",
+            privateNote: documentPrivateNote("EST-00001", "Kitchen"),
             total: 1000, customerId: "42",
         }],
     });
@@ -1569,4 +1576,55 @@ test("round 47: three consecutive runs alternate the starting rail", async () =>
     // is not evidence. The order having been PERSISTED is.
     const { DOCUMENT_SYNC_ORDER_KEY } = await import("../src/lib/qbo-document-sync");
     assert.equal(kv.get(DOCUMENT_SYNC_ORDER_KEY), "estimate", "the run recorded which rail it started with");
+});
+
+// --- Round 48: the connection classification survives the route ---
+
+/**
+ * The sweep classifies a connection failure precisely (`qbo-auth` /
+ * `qbo-timeout` / `qbo-unavailable`) and the maintenance route threw that away,
+ * propagating only `budget-exhausted`. So an expired credential was reported as
+ * `document-sync-parked`, the cron logged an automation event under THAT
+ * reason, and pipeline-health — which counts events reasoned `qbo-auth` toward
+ * the reconnect alert — never saw it. The one failure that cannot fix itself
+ * was the one the digest could not name.
+ */
+test("round 48: every document-sweep stop reason reaches the route response", async () => {
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
+    assert.match(
+        src,
+        /if \(docSyncs\.reason\) abortedReason = docSyncs\.reason;/,
+        "every run-wide reason must propagate, not just budget-exhausted",
+    );
+    assert.ok(
+        !/docSyncs\.reason === "budget-exhausted"/.test(src),
+        "the budget-only filter must be gone",
+    );
+    // `abortedReason` heads the reason chain, so the propagated value is what
+    // the response reports — ahead of the generic document-sync-parked.
+    const chain = src.slice(src.indexOf("const reason ="));
+    assert.ok(
+        chain.indexOf("abortedReason") < chain.indexOf("document-sync-parked"),
+        "the classified reason must outrank the generic parked one",
+    );
+});
+
+test("round 48: qbo-auth is a reason pipeline-health counts toward the reconnect alert", async () => {
+    // The other half of the path: the cron logs an automation event under the
+    // body's reason, and health only raises `quickbooks-reconnect-needed` for
+    // reasons on this list. A sweep reason that is not on it is invisible.
+    const { QBO_RECONNECT_EVENT_REASONS, QBO_AUTH_EVENT_REASON } = await import("../src/lib/pipeline-health");
+    const { classifyDocumentSyncFailure } = await import("../src/lib/qbo-document-sync");
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+
+    const classified = classifyDocumentSyncFailure(new QboHttpError("unauthorized", 401));
+    assert.equal(classified, QBO_AUTH_EVENT_REASON);
+    assert.ok(
+        QBO_RECONNECT_EVENT_REASONS.includes(classified as string),
+        "the sweep's credential reason must be one health acts on",
+    );
+
+    // The cron files the event under the body's reason verbatim.
+    const cron = await import("node:fs").then((fs) => fs.readFileSync("src/app/api/cron/qbo-maintenance/route.ts", "utf8"));
+    assert.match(cron, /reason: ok \? undefined : String\(\(body as \{ reason\?: string \} \| null\)\?\.reason \?\? "maintenance-incomplete"\)/);
 });

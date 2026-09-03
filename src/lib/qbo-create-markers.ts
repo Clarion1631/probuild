@@ -417,6 +417,34 @@ const MARKER_OPTIONAL_PREFIXES = [
  * SAME CAS as the claim. It has to be one write: a marker without its identity
  * is a row we can block but never resolve.
  */
+/**
+ * Could `composeCreateMarker` have WRITTEN this DocNumber?
+ *
+ * The one place the composition invariants are stated as a predicate, so the
+ * parser can hold a value to the same rules the composer enforces. A DocNumber
+ * that fails this did not come out of `composeCreateMarker`, which means the
+ * marker is corrupt — and a corrupt marker must be unresolvable rather than
+ * resolvable as some other document.
+ */
+/**
+ * Intuit's DocNumber cap, mirrored here.
+ *
+ * The canonical constant is `QB_DOC_NUMBER_MAX_LEN` in quickbooks.ts, which
+ * this module cannot import: it is loaded by a client component and that file
+ * pulls in node:crypto, fetch and Prisma. `tests/qbo-marker-grammar.test.ts`
+ * asserts the two stay equal, so the duplication cannot drift silently.
+ */
+export const MARKER_DOC_NUMBER_MAX_LEN = 21;
+
+export function isComposableDocNumber(value: string): boolean {
+    if (!value) return false;
+    if (value.includes(MARKER_FIELD_SEP)) return false;
+    if (MARKER_OPTIONAL_PREFIXES.some((prefix) => value.startsWith(prefix))) return false;
+    // Intuit's cap. The composer is always handed an already-truncated value,
+    // so anything longer is not something this rail wrote.
+    return value.length <= MARKER_DOC_NUMBER_MAX_LEN;
+}
+
 export function composeCreateMarker(
     kind: typeof CREATE_IN_FLIGHT_MARKER | typeof AMBIGUOUS_CREATE_MARKER,
     identity: CreateIdentity,
@@ -444,6 +472,22 @@ export function composeCreateMarker(
     if (MARKER_OPTIONAL_PREFIXES.some((prefix) => identity.docNumber.startsWith(prefix))) {
         throw new Error(
             `DocNumber must not start with ${MARKER_OPTIONAL_PREFIXES.map((p) => `"${p}"`).join(", ")}: ${identity.docNumber}`,
+        );
+    }
+    // The note is the LAST field, and the same invariant applies to it for a
+    // subtler reason: it is what the parser is left holding when a field
+    // boundary shifts. Corrupt any optional prefix in the middle of a marker
+    // and that field's value becomes the docNumber while every field after it
+    // slides into the note — which then starts with a prefix character. Ours
+    // never do (`documentPrivateNote` writes "ProBuild <code> - <label>"), so
+    // this is an invariant, not input validation, and the parser rejecting it
+    // is what makes that whole class of corruption unresolvable.
+    if (identity.privateNote.includes(MARKER_FIELD_SEP)) {
+        throw new Error(`PrivateNote must not contain "${MARKER_FIELD_SEP}": ${identity.privateNote}`);
+    }
+    if (MARKER_OPTIONAL_PREFIXES.some((prefix) => identity.privateNote.startsWith(prefix))) {
+        throw new Error(
+            `PrivateNote must not start with ${MARKER_OPTIONAL_PREFIXES.map((p) => `"${p}"`).join(", ")}: ${identity.privateNote}`,
         );
     }
     // The realm and the customer are QuickBooks-generated numeric ids. A
@@ -520,100 +564,88 @@ export function parseCreateMarker(
     const marker = qbSyncError as string;
     if (marker === kind) return { kind, identity: null, atMs: null };
     let payload = marker.slice(kind.length + MARKER_KIND_SEP.length);
+    /** Any recognized field that did not parse. The whole marker is then unusable. */
+    let corrupt = false;
+    const unusable = () => ({ kind, identity: null, atMs });
     let atMs: number | null = null;
-    if (payload.startsWith(MARKER_TIME_PREFIX)) {
-        const tsEnd = payload.indexOf(MARKER_FIELD_SEP);
-        const tsRaw = tsEnd > 0 ? payload.slice(MARKER_TIME_PREFIX.length, tsEnd) : "";
-        const parsed = tsRaw ? Number(tsRaw) : NaN;
-        if (tsEnd > 0 && Number.isFinite(parsed)) {
-            atMs = parsed;
-            payload = payload.slice(tsEnd + MARKER_FIELD_SEP.length);
-        }
-        // An unparseable `@...` prefix falls through unstripped -- the doc/note
-        // split below will most likely find it as a bogus docNumber and refuse
-        // as corrupt, which is the same fail-closed handling as any other
-        // corrupt marker.
-    }
-    let issuanceHash: string | undefined;
-    if (payload.startsWith(MARKER_HASH_PREFIX)) {
-        const hashEnd = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = hashEnd > 0 ? payload.slice(MARKER_HASH_PREFIX.length, hashEnd) : "";
-        if (raw && /^[0-9a-f]+$/.test(raw)) {
-            issuanceHash = raw;
-            payload = payload.slice(hashEnd + MARKER_FIELD_SEP.length);
-        }
-        // A malformed `#...` field falls through unstripped for the same reason
-        // as a malformed `@...` one: it lands in docNumber and reads as corrupt.
-    }
-    let expectedTotal: number | undefined;
-    if (payload.startsWith(MARKER_TOTAL_PREFIX)) {
-        const totalEnd = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = totalEnd > 0 ? payload.slice(MARKER_TOTAL_PREFIX.length, totalEnd) : "";
-        const parsed = raw ? Number(raw) : NaN;
-        if (totalEnd > 0 && Number.isFinite(parsed)) {
-            expectedTotal = parsed;
-            payload = payload.slice(totalEnd + MARKER_FIELD_SEP.length);
-        }
-        // A malformed `$...` field falls through unstripped, same as `@...`/`#...`.
-    }
-    let realmId: string | undefined;
-    if (payload.startsWith(MARKER_REALM_PREFIX)) {
+
+    /**
+     * Strict: a field whose prefix is present must parse COMPLETELY or the
+     * marker is corrupt.
+     *
+     * These used to \"fall through unstripped\", on the theory that the leftover
+     * text would land in docNumber and read as corrupt anyway. It does not
+     * always: a malformed `&|...` field leaves a payload whose first separator
+     * comes immediately, so the marker parses as docNumber `&` while keeping a
+     * perfectly valid realm, customer and hash. A lookup for document `&` finds
+     * nothing, and `confirmed-none` then clears the claim for a real invoice
+     * sitting in QuickBooks under the number the claim was actually made with.
+     * A corrupt marker must be UNRESOLVABLE, not resolvable-as-something-else.
+     */
+    const field = (prefix: string, valid: (raw: string) => boolean): string | undefined => {
+        if (corrupt || !payload.startsWith(prefix)) return undefined;
         const end = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = end > 0 ? payload.slice(MARKER_REALM_PREFIX.length, end) : "";
-        if (raw) {
-            realmId = raw;
-            payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        const raw = end > 0 ? payload.slice(prefix.length, end) : "";
+        if (end <= 0 || !raw || !valid(raw)) {
+            corrupt = true;
+            return undefined;
         }
-        // A malformed `~...` field falls through unstripped, same as the rest:
-        // it lands in docNumber and the marker reads as corrupt (fail-closed).
-    }
-    let customerId: string | undefined;
-    if (payload.startsWith(MARKER_CUSTOMER_PREFIX)) {
-        const end = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = end > 0 ? payload.slice(MARKER_CUSTOMER_PREFIX.length, end) : "";
-        if (raw) {
-            customerId = raw;
-            payload = payload.slice(end + MARKER_FIELD_SEP.length);
-        }
-        // Same fall-through as `~...` above.
-    }
-    let qbId: string | undefined;
-    if (payload.startsWith(MARKER_QBID_PREFIX)) {
-        const end = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = end > 0 ? payload.slice(MARKER_QBID_PREFIX.length, end) : "";
-        if (raw) {
-            qbId = raw;
-            payload = payload.slice(end + MARKER_FIELD_SEP.length);
-        }
-        // Same fall-through as `%...` above.
-    }
-    let txnDate: string | undefined;
-    if (payload.startsWith(MARKER_TXNDATE_PREFIX)) {
-        const end = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = end > 0 ? payload.slice(MARKER_TXNDATE_PREFIX.length, end) : "";
-        if (raw) {
-            txnDate = raw;
-            payload = payload.slice(end + MARKER_FIELD_SEP.length);
-        }
-        // Same fall-through as `!...` above.
-    }
-    let itemId: string | undefined;
-    if (payload.startsWith(MARKER_ITEM_PREFIX)) {
-        const end = payload.indexOf(MARKER_FIELD_SEP);
-        const raw = end > 0 ? payload.slice(MARKER_ITEM_PREFIX.length, end) : "";
-        if (raw) {
-            itemId = raw;
-            payload = payload.slice(end + MARKER_FIELD_SEP.length);
-        }
-        // Same fall-through as `+...` above.
-    }
+        payload = payload.slice(end + MARKER_FIELD_SEP.length);
+        return raw;
+    };
+
+    const time = field(MARKER_TIME_PREFIX, (raw) => Number.isFinite(Number(raw)));
+    if (time !== undefined) atMs = Number(time);
+    // REQUIRED, not optional. `composeCreateMarker` emits the timestamp
+    // unconditionally for both kinds, so a payload that does not start with one
+    // was not written by it. Without this check the leading `@` is the only
+    // thing standing between a corrupted marker and a plausible-looking
+    // identity: flip it to any other character and the timestamp itself parses
+    // as the document number, with the rest of the fields trailing into the
+    // note. A lookup for that number finds nothing, and `confirmed-none` then
+    // clears the claim for a real document.
+    //
+    // A marker predating the timestamp field is therefore unresolvable rather
+    // than adoptable. That is a deliberate narrowing: its age cannot be read
+    // either, so the resolver already refused to CLEAR it
+    // (CREATE_IN_FLIGHT_STALE_MS needs a readable claim time), and "link it
+    // anyway" was the only thing it could still do with a string nothing in
+    // this codebase can prove it wrote.
+    if (atMs === null) return unusable();
+    const issuanceHash = field(MARKER_HASH_PREFIX, (raw) => /^[0-9a-f]+$/.test(raw));
+    const totalRaw = field(MARKER_TOTAL_PREFIX, (raw) => Number.isFinite(Number(raw)));
+    const expectedTotal = totalRaw === undefined ? undefined : Number(totalRaw);
+    // The three id fields carry QuickBooks-generated values. Composition refuses
+    // an empty one or one containing the separator, so anything else here is a
+    // marker that was not written by `composeCreateMarker`.
+    const idField = (raw: string) => raw.length > 0 && !raw.includes(MARKER_FIELD_SEP);
+    const realmId = field(MARKER_REALM_PREFIX, idField);
+    const customerId = field(MARKER_CUSTOMER_PREFIX, idField);
+    const qbId = field(MARKER_QBID_PREFIX, idField);
+    const txnDate = field(MARKER_TXNDATE_PREFIX, (raw) => /^\d{4}-\d{2}-\d{2}$/.test(raw));
+    const itemId = field(MARKER_ITEM_PREFIX, idField);
+    if (corrupt) return unusable();
+
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
-    if (sep <= 0) return { kind, identity: null, atMs };
+    if (sep <= 0) return unusable();
     const docNumber = payload.slice(0, sep);
     const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
-    if (!docNumber || !privateNote) return { kind, identity: null, atMs };
+    if (!docNumber || !privateNote) return unusable();
+    // The DocNumber has to satisfy the SAME invariants composition enforces.
+    // Without this, leftovers from a field this parser did not recognise read as
+    // a document number and the marker resolves against the wrong document.
+    if (!isComposableDocNumber(docNumber)) return unusable();
+    // See composeCreateMarker: a note beginning with a field prefix means a
+    // field boundary moved, so the docNumber above is some other field's value.
+    if (MARKER_OPTIONAL_PREFIXES.some((prefix) => privateNote.startsWith(prefix))) return unusable();
+    // And it is the LAST field, so it contains no separator either
+    // (`canonicalPrivateNote` strips them before composition). A note carrying
+    // one means a field boundary moved and the document number above is some
+    // other field's value — the corruption class this whole grammar exists to
+    // make unresolvable rather than mis-resolvable.
+    if (privateNote.includes(MARKER_FIELD_SEP)) return unusable();
     // Each optional key is OMITTED, not set to undefined, when the marker
     // carries no hash / total / realm / customer: a deep-equality check against
     // a two-field identity has to keep reading as equal for a legacy marker.

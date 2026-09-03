@@ -17,7 +17,7 @@ import {
     resolveAmbiguousInvoiceCreateCore,
     ambiguousCreateFingerprint,
 } from "../src/lib/qbo-ambiguous-create";
-import { QBTimeoutError, type QBInvoiceMatch, type QBTokens } from "../src/lib/quickbooks";
+import { QBTimeoutError, canonicalPrivateNote, type QBInvoiceMatch, type QBTokens } from "../src/lib/quickbooks";
 import { milestonePrivateNote, milestoneDocNumber } from "../src/lib/quickbooks-payments";
 import { progressBillingPrivateNote, deleteProgressBillingCore } from "../src/lib/progress-billing";
 import {
@@ -547,6 +547,15 @@ test("round 29 gate: a create-in-flight marker with NO readable timestamp (legac
     // Neither table carries updatedAt, so a marker written before this claim
     // timestamp existed has no age at all — unreadable age must fail closed,
     // exactly like a young one, not like a stale one.
+    //
+    // Round 48 narrowed WHY it fails closed, not WHETHER. The strict grammar
+    // requires the timestamp `composeCreateMarker` has always written, so a
+    // marker without one is now unresolvable outright (`identity-unknown`)
+    // rather than merely un-clearable (`create-still-active`). That is
+    // deliberate: the leading `@` is what stops a corrupted marker parsing as a
+    // DIFFERENT document, and a string this codebase cannot prove it wrote
+    // should not be adoptable either. Both answers refuse to clear, which is
+    // what this test is really about.
     const legacyMarker = `${CREATE_IN_FLIGHT_MARKER}:${MILESTONE_IDENTITY.docNumber}|${MILESTONE_IDENTITY.privateNote}`;
     const row = milestoneRow({ qbSyncError: legacyMarker });
     const db = makeDb(row, null);
@@ -554,7 +563,7 @@ test("round 29 gate: a create-in-flight marker with NO readable timestamp (legac
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         deps([], db),
     );
-    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(!res.ok && res.refusal, "identity-unknown");
     assert.equal(row.qbSyncError, legacyMarker, "still parked — nothing was cleared");
 });
 
@@ -597,7 +606,7 @@ test("round 30 gate: an ambiguous-create marker with NO readable timestamp (lega
         { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
         deps([], db),
     );
-    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(!res.ok && res.refusal, "identity-unknown");
     assert.equal(row.qbSyncError, legacyMarker, "still parked — nothing was cleared");
 });
 
@@ -835,16 +844,35 @@ test("compose/parse round-trips, and a legacy or corrupt marker yields NO identi
     assert.equal(marker, "create-in-flight:@1700000000000|INV-00171-2|ProBuild INV-00171 · Rough-in · Mesplay Kitchen");
     assert.deepEqual(parseCreateMarker(marker), { kind: CREATE_IN_FLIGHT_MARKER, identity, atMs: 1_700_000_000_000 });
 
-    // A note containing the field separator survives: the FIRST one splits.
-    // AMBIGUOUS_CREATE_MARKER carries a timestamp too — a promotion from
+    // A note may NOT contain the field separator (round 48). It used to: the
+    // first separator split, and the rest stayed in the note. That ambiguity is
+    // exactly what let a corrupted marker parse as a different document — the
+    // note is the last field, so any boundary that shifts leaves the real
+    // document number sitting inside it. `canonicalPrivateNote` now strips
+    // separators before composition, so no real caller can produce one, and
+    // composing one directly is refused as the invariant violation it is.
+    const pipedAt = new Date(1_700_000_001_000);
+    assert.throws(
+        () => composeCreateMarker(
+            AMBIGUOUS_CREATE_MARKER,
+            { docNumber: "INV-9-1", privateNote: "ProBuild INV-9 · A|B · Job" },
+            pipedAt,
+        ),
+        /PrivateNote must not contain/,
+    );
+    // The path a real caller takes: the separator is gone before it gets here,
+    // and AMBIGUOUS_CREATE_MARKER carries a timestamp too — a promotion from
     // create-in-flight must preserve that marker's ORIGINAL claim time (round
     // 30: cooldown gap), not reset it, so the resolver's liveness cooldown
     // still protects the request the promoted marker actually describes.
-    const pipedAt = new Date(1_700_000_001_000);
-    const piped = { docNumber: "INV-9-1", privateNote: "ProBuild INV-9 · A|B · Job" };
-    assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, piped, pipedAt)), {
+    const cleaned = {
+        docNumber: "INV-9-1",
+        privateNote: canonicalPrivateNote("ProBuild INV-9 · A|B · Job"),
+    };
+    assert.equal(cleaned.privateNote.includes("|"), false, "the separator is stripped, not escaped");
+    assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, cleaned, pipedAt)), {
         kind: AMBIGUOUS_CREATE_MARKER,
-        identity: piped,
+        identity: cleaned,
         atMs: 1_700_000_001_000,
     });
 

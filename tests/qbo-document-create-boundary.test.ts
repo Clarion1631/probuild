@@ -249,3 +249,68 @@ test("the milestone create shares the boundary, and the money rail parks on it",
     assert.equal(isQBAmbiguousDocumentCreateError(refused), false);
     assert.equal(isAmbiguousCreateFailure(refused), false);
 });
+
+// --- Round 48: sales-line completeness in the facts reducer ---
+
+/**
+ * `remoteDocumentFacts` reduces a raw QuickBooks document to what the
+ * acceptance rule compares. It used to DROP sales lines whose `ItemRef` could
+ * not be read, so a document with one correct line and one unreadable line
+ * collapsed to a one-element array and then validated as "every line books to
+ * the right item". The item decides the INCOME ACCOUNT; a line whose item
+ * cannot be named is not a line that can be accepted.
+ */
+test("round 48: an unreadable ItemRef is KEPT as an unverifiable line, not dropped", async () => {
+    const { remoteDocumentFacts, UNREADABLE_ITEM_REF } = await import("../src/lib/quickbooks");
+    const facts = remoteDocumentFacts({
+        Id: "42",
+        DocNumber: "EST-1",
+        TotalAmt: 100,
+        Line: [
+            { DetailType: "SalesItemLineDetail", SalesItemLineDetail: { ItemRef: { value: "7" } } },
+            // The line the old reducer threw away.
+            { DetailType: "SalesItemLineDetail", SalesItemLineDetail: { ItemRef: {} } },
+        ],
+    });
+    assert.deepEqual(facts?.itemIds, ["7", UNREADABLE_ITEM_REF]);
+});
+
+test("round 48: non-sales lines carry no item and are not counted", async () => {
+    // A SubTotalLine legitimately has no ItemRef. Demanding one would refuse
+    // documents QuickBooks built correctly.
+    const { remoteDocumentFacts } = await import("../src/lib/quickbooks");
+    const facts = remoteDocumentFacts({
+        Id: "42",
+        DocNumber: "EST-1",
+        Line: [
+            { DetailType: "SalesItemLineDetail", SalesItemLineDetail: { ItemRef: { value: "7" } } },
+            { DetailType: "SubTotalLine", SubTotalLineDetail: {} },
+        ],
+    });
+    assert.deepEqual(facts?.itemIds, ["7"]);
+});
+
+test("round 48: the acceptance rule refuses a document carrying an unverifiable line", async () => {
+    const { documentMatchesClaim } = await import("../src/lib/qbo-document-sync");
+    const { UNREADABLE_ITEM_REF } = await import("../src/lib/quickbooks");
+    const identity = {
+        docNumber: "EST-1",
+        privateNote: "ProBuild EST-1 - Job",
+        customerId: "58",
+        itemId: "7",
+    };
+    const doc = {
+        docNumber: "EST-1",
+        privateNote: "ProBuild EST-1 - Job",
+        total: null,
+        customerId: "58",
+        txnDate: null,
+        itemIds: ["7", UNREADABLE_ITEM_REF],
+    };
+    const verdict = documentMatchesClaim(doc, identity as any);
+    assert.equal(verdict.ok, false);
+    assert.match((verdict as { reason: string }).reason, /could not be read/);
+
+    // The control: every line readable and correct.
+    assert.equal(documentMatchesClaim({ ...doc, itemIds: ["7", "7"] }, identity as any).ok, true);
+});

@@ -92,3 +92,33 @@ test("a valid secret with no ingest secret configured says so, rather than repor
         if (prevIngest !== undefined) process.env.RECEIPT_INGEST_SECRET = prevIngest;
     }
 });
+
+// --- Round 48: the cron's status code tells the truth about the run ---
+
+/**
+ * The delegate answers 200 with `{ ok: false, reason: ... }` whenever repair
+ * work failed or is still outstanding — that is its normal shape, not an
+ * error. This route passed that 200 straight through, so Vercel recorded a
+ * SUCCESSFUL cron invocation: the one signal an operator sees without opening
+ * the logs said everything was fine while the queue was not moving.
+ *
+ * Source-level, because the branch is one expression and reaching it through
+ * the real handler means standing up the whole maintenance POST. The behaviour
+ * either side of it — the 401 and the missing-secret 503 — is covered above by
+ * real requests.
+ */
+test("round 48: a run that is not ok:true is reported as 503, keeping its body", () => {
+    const src = readFileSync("src/app/api/cron/qbo-maintenance/route.ts", "utf8");
+    const returnAt = src.indexOf("return NextResponse.json(");
+    assert.ok(returnAt > 0, "the route must return a JSON response");
+    const tail = src.slice(returnAt);
+    assert.match(
+        tail,
+        /status:\s*ok\s*\?\s*status\s*:\s*\(status\s*>=\s*400\s*\?\s*status\s*:\s*503\)/,
+        "a not-ok run must not be able to return the delegate's 200",
+    );
+    // The body is passed through unchanged: only the status is corrected.
+    assert.match(tail, /body \?\? \{ ok: false, reason: "no-response" \}/);
+    // And `ok` is still computed from the delegate's own answer, not assumed.
+    assert.match(src, /const ok = status === 200 && !!\(body as \{ ok\?: boolean \} \| null\)\?\.ok;/);
+});

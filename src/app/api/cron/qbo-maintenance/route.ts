@@ -72,5 +72,14 @@ export async function GET(request: Request) {
         detail: (body ?? {}) as Record<string, unknown>,
     });
 
-    return NextResponse.json(body ?? { ok: false, reason: "no-response" }, { status });
+    // 503 whenever the run was not genuinely clean, whatever the delegate
+    // answered. Returning the delegate's 200 for an `ok:false` body recorded a
+    // SUCCESSFUL cron invocation in Vercel while repair work had failed or was
+    // still outstanding — so the one signal an operator sees without opening the
+    // logs said everything was fine. The body is passed through unchanged; only
+    // the status tells the truth about it.
+    return NextResponse.json(
+        body ?? { ok: false, reason: "no-response" },
+        { status: ok ? status : (status >= 400 ? status : 503) },
+    );
 }

@@ -52,7 +52,14 @@ export const QB_PRIVATE_NOTE_MAX_LEN = 4000;
  */
 export function canonicalPrivateNote(value: string | null | undefined): string {
     if (!value) return "";
-    return value.replace(/\s+/g, " ").trim().slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+    // The marker's field separator is stripped, not escaped. The note is the
+    // LAST field of a create marker, so a `|` inside it is indistinguishable
+    // from a field boundary: corrupt one prefix character in the middle of a
+    // marker and that field's value becomes the document number while the real
+    // one slides into the note, which the parser can only detect if a genuine
+    // note never contains a separator. Ours never do in practice (project and
+    // milestone names), and a space reads identically in QuickBooks.
+    return value.replace(/\|/g, " ").replace(/\s+/g, " ").trim().slice(0, QB_PRIVATE_NOTE_MAX_LEN);
 }
 
 /**
@@ -1257,6 +1264,16 @@ export interface RemoteDocumentFacts {
  * 0 and `String(undefined)` is "undefined", and both would compare by luck
  * instead of by rule.
  */
+/**
+ * What `itemIds` carries for a sales line whose `ItemRef` could not be read.
+ *
+ * A real QuickBooks item id is a positive integer as a string, so this can
+ * never collide with one. It exists so an unverifiable line stays COUNTED:
+ * every acceptance rule compares each entry against the item the claim
+ * recorded, and this one matches nothing.
+ */
+export const UNREADABLE_ITEM_REF = "?unreadable";
+
 export function remoteDocumentFacts(raw: any): RemoteDocumentFacts | null {
     if (!raw?.Id) return null;
     const lines: any[] = Array.isArray(raw.Line) ? raw.Line : [];
@@ -1269,10 +1286,22 @@ export function remoteDocumentFacts(raw: any): RemoteDocumentFacts | null {
             ? String(raw.CustomerRef.value)
             : null,
         txnDate: raw.TxnDate != null && String(raw.TxnDate) !== "" ? String(raw.TxnDate) : null,
+        // ONE ENTRY PER SALES LINE, including the ones whose ItemRef cannot be
+        // read. Dropping those was fail-open: a document with one correct line
+        // and one line whose item is missing or unreadable collapsed to a
+        // one-element array that then validated as "every line is correct". An
+        // unreadable item is not an absent line — it is a line booking money to an
+        // account nobody can name.
+        //
+        // Only SalesItemLineDetail lines count: a SubTotalLine or DiscountLine
+        // legitimately carries no ItemRef, and requiring one of those would
+        // refuse documents QuickBooks built correctly.
         itemIds: lines
-            .map((l) => l?.SalesItemLineDetail?.ItemRef?.value)
-            .filter((v) => v != null && String(v) !== "")
-            .map((v) => String(v)),
+            .filter((l) => l?.DetailType === "SalesItemLineDetail" || l?.SalesItemLineDetail != null)
+            .map((l) => {
+                const value = l?.SalesItemLineDetail?.ItemRef?.value;
+                return value != null && String(value) !== "" ? String(value) : UNREADABLE_ITEM_REF;
+            }),
     };
 }
 

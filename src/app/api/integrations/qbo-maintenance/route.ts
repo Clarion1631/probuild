@@ -419,7 +419,14 @@ export async function POST(req: Request) {
                     return e + i;
                 },
             });
-            if (docSyncs.reason === "budget-exhausted") abortedReason = docSyncs.reason;
+            // EVERY run-wide stop, not just the budget. A connection failure
+            // (qbo-auth / qbo-timeout / qbo-unavailable) used to be dropped here,
+            // so a broken credential was reported as `document-sync-parked` and
+            // pipeline-health — which counts events reasoned `qbo-auth` toward the
+            // reconnect alert — never saw it. The sweep classifies these precisely
+            // so that the classification can travel; discarding it here threw
+            // away the whole point.
+            if (docSyncs.reason) abortedReason = docSyncs.reason;
         } catch (e) {
             docSyncsFailed = e instanceof Error ? e.message.slice(0, 200) : "document-sync sweep failed";
         }
