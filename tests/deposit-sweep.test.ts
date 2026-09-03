@@ -37,10 +37,13 @@ import {
     bankFileId,
     bankImageKeyPrefix,
     crossSourceClaimNote,
-    findBatchCollisions,
+    findCollisions,
+    isDeterministicQboGuardFailure,
     parseBankBatch,
+    qboGuardNote,
     reservationLostNote,
     selectPayerBearingImage,
+    sweepBatchOk,
 } from "../src/lib/deposit-sweep";
 
 // ── Fake Prisma ──────────────────────────────────────────────────────────────
@@ -180,12 +183,25 @@ const tables = {
     officeTask: new Table("officeTask"),
     officeBoardColumn: new Table("officeBoardColumn"),
     project: new Table("project"),
+    // Only the real settle path (M3) reaches these.
+    invoice: new Table("invoice"),
+    estimatePaymentSchedule: new Table("estimatePaymentSchedule"),
+    estimate: new Table("estimate"),
+    paymentNotification: new Table("paymentNotification"),
 };
 
 const queries: { paymentSchedule: Row[]; bankImage: Row[] } = { paymentSchedule: [], bankImage: [] };
+/** fileId → the status its DepositIngest row was CREATED with. */
+const createdStatus = new Map<string, string>();
 
 const fakePrisma: Row = {
-    depositIngest: tables.depositIngest,
+    depositIngest: Object.assign(Object.create(tables.depositIngest), {
+        create: async (args: { data: Row }) => {
+            const row = await tables.depositIngest.create(args);
+            createdStatus.set(String(row.fileId), String(row.status));
+            return row;
+        },
+    }),
     bankImage: {
         findMany: async (args: Row) => {
             queries.bankImage.push(args);
@@ -193,16 +209,30 @@ const fakePrisma: Row = {
         },
     },
     paymentSchedule: {
+        // Wrapped only so the candidate query can be asserted; every other
+        // method delegates straight through to the table.
         findMany: async (args: Row) => {
             queries.paymentSchedule.push(args);
             return tables.paymentSchedule.findMany(args);
         },
         findUnique: (args: { where: Row }) => tables.paymentSchedule.findUnique(args),
+        findFirst: (args: { where?: Row }) => tables.paymentSchedule.findFirst(args),
+        create: (args: { data: Row }) => tables.paymentSchedule.create(args),
+        update: (args: { where: Row; data: Row }) => tables.paymentSchedule.update(args),
+        updateMany: (args: { where: Row; data: Row }) => tables.paymentSchedule.updateMany(args),
     },
     officeTask: tables.officeTask,
     officeBoardColumn: tables.officeBoardColumn,
     project: tables.project,
+    invoice: tables.invoice,
+    estimatePaymentSchedule: tables.estimatePaymentSchedule,
+    estimate: tables.estimate,
+    paymentNotification: tables.paymentNotification,
     $transaction: async (fn: (tx: Row) => Promise<unknown>) => fn(fakePrisma),
+    // lockMoneyParents' SELECT ... FOR UPDATE. Nothing to lock in memory.
+    $queryRaw: async () => [],
+    $executeRaw: async () => 0,
+    $executeRawUnsafe: async () => 0,
 };
 
 // ── Fake money-write modules ─────────────────────────────────────────────────
@@ -258,6 +288,10 @@ const fakePaymentRecordCore = {
 // ── Load the route under the patch ───────────────────────────────────────────
 
 let POST: (req: Request) => Promise<Response>;
+/** The REAL settleMilestoneFromQBPayment (not the route's stub) — M3 is about
+ *  what that shared function decides on its own, for the caller that passes no
+ *  options at all: the hourly QuickBooks sync. */
+let settleMilestoneFromQBPayment: (input: Row) => Promise<boolean>;
 const SECRET = "deposit-sweep-test-secret";
 
 before(async () => {
@@ -283,6 +317,23 @@ before(async () => {
         if (!patched.has(id)) throw new Error(`deposit-sweep.test.ts: the mock of "${id}" never applied — the route would hit the real module`);
     }
     POST = mod.POST;
+
+    // Second load, different target: the real settle module, with only Prisma
+    // faked (it reaches it as "./prisma", a relative specifier).
+    let relativePrismaPatched = false;
+    (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (this: NodeModule, id: string) {
+        if (id === "./prisma" || id === "@/lib/prisma") { relativePrismaPatched = true; return { prisma: fakePrisma }; }
+        // eslint-disable-next-line prefer-rest-params
+        return originalRequire.apply(this, arguments as unknown as [string]);
+    } as typeof Module.prototype.require;
+    let settleMod: Row;
+    try {
+        settleMod = await import("../src/lib/quickbooks-payments");
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+    if (!relativePrismaPatched) throw new Error('deposit-sweep.test.ts: the mock of "./prisma" never applied to the settle module');
+    settleMilestoneFromQBPayment = settleMod.settleMilestoneFromQBPayment as never;
 });
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -365,6 +416,7 @@ beforeEach(() => {
     for (const table of Object.values(tables)) table.rows = [];
     queries.paymentSchedule = [];
     queries.bankImage = [];
+    createdStatus.clear();
     for (const key of Object.keys(calls) as Array<keyof typeof calls>) calls[key] = [];
     qboBalanceByInvoice = new Map();
     scheduleSeq = 0;
@@ -418,16 +470,29 @@ test("batch gate: sub-cent and non-positive amounts are refused", () => {
     }
 });
 
+const credit = (ref: string, amount: number) => ({
+    bankReference: ref, amount, amountCents: Math.round(amount * 100),
+    transactionDetail: null, customerReference: null,
+});
+
 test("collisions: two DIFFERENT references at the same amount flag each other", () => {
-    const credits = [
-        { bankReference: "A1", amount: 500, amountCents: 50_000, transactionDetail: null, customerReference: null },
-        { bankReference: "B2", amount: 500, amountCents: 50_000, transactionDetail: null, customerReference: null },
-        { bankReference: "C3", amount: 900, amountCents: 90_000, transactionDetail: null, customerReference: null },
-    ];
-    const collisions = findBatchCollisions(credits);
+    const collisions = findCollisions([credit("A1", 500), credit("B2", 500), credit("C3", 900)]);
     assert.deepEqual(collisions.get("A1"), ["B2"]);
     assert.deepEqual(collisions.get("B2"), ["A1"]);
     assert.equal(collisions.get("C3"), undefined);
+});
+
+test("collisions: a stored same-day row counts, whatever state a previous run left it in", () => {
+    // C2: the verdict must not depend on how far an earlier run got. Every one
+    // of these is a row a crash could have left behind.
+    for (const status of ["processing", "failed", "proposed", "applied", "unmatched"]) {
+        const collisions = findCollisions([credit("A1", 500)], [{ bankReference: "B2", amountCents: 50_000, status } as any]);
+        assert.deepEqual(collisions.get("A1"), ["B2"], `a stored ${status} twin must still collide`);
+    }
+    // A stored row at a different amount is not a twin.
+    assert.equal(findCollisions([credit("A1", 500)], [{ bankReference: "B2", amountCents: 90_000 }]).get("A1"), undefined);
+    // Only batch references get a verdict; a stored row is evidence, not a target.
+    assert.equal(findCollisions([credit("A1", 500)], [{ bankReference: "B2", amountCents: 50_000 }]).get("B2"), undefined);
 });
 
 test("wait rule: a credit posted yesterday is too young; two days old is eligible", () => {
@@ -473,6 +538,29 @@ test("messages name the row on the other side of the collision", () => {
     assert.equal(reservationLostNote(null), "milestone already being applied by another deposit");
 });
 
+test("M1: a deterministic QuickBooks guard failure is explained, not retried", () => {
+    assert.equal(isDeterministicQboGuardFailure("balance-mismatch"), true);
+    assert.equal(isDeterministicQboGuardFailure("invoice-not-found"), true);
+    assert.equal(isDeterministicQboGuardFailure("missing-customer"), true);
+    assert.equal(isDeterministicQboGuardFailure("some-transient-thing"), false);
+
+    const note = qboGuardNote({ reason: "balance-mismatch", qbBalance: 0, expected: 13447.68 }, "INV-00173");
+    assert.match(note, /QuickBooks shows \$0\.00 owed on INV-00173, not \$13447\.68/);
+    assert.match(note, /probably already booked\. Verify and archive\./);
+    assert.match(qboGuardNote({ reason: "invoice-not-found" }, "INV-1"), /no longer exists/);
+    assert.match(qboGuardNote({ reason: "missing-customer" }, "INV-1"), /no customer/);
+});
+
+test("M2: `ok` means the batch finished cleanly, not that everything booked", () => {
+    const base = { credits: 3, applied: 1, proposed: 1, unmatched: 1, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0 };
+    // Asking a human is the sweep working as designed.
+    assert.equal(sweepBatchOk(base), true);
+    // Unresolved money is not.
+    assert.equal(sweepBatchOk({ ...base, failed: 1 }), false);
+    assert.equal(sweepBatchOk({ ...base, qboUnknown: 1 }), false);
+    assert.equal(sweepBatchOk({ ...base, reconcile: 1 }), false);
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 2. The route
 // ═════════════════════════════════════════════════════════════════════════════
@@ -514,7 +602,9 @@ test("the Hoppe case: three Pending milestones at the same amount, only one REQU
     const result = creditResult(body, "26236015002406");
     assert.equal(result.status, "applied", `expected applied, got ${result.status}: ${result.reason}`);
     assert.equal(result.scheduleId, requested);
-    assert.deepEqual(body.counts, { credits: 1, applied: 1, needsHuman: 0, proposed: 0, replay: 0 });
+    assert.deepEqual(body.counts, {
+        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0,
+    });
 
     // The candidate query itself must carry the requested filter — this is the
     // rule, and it lives in SQL.
@@ -614,7 +704,7 @@ test("two same-day same-amount credits in ONE batch → both go to a human", asy
         assert.equal(result.status, "unmatched", `${ref} must go to a human`);
         assert.match(String(result.reason), /different bank credits/);
     }
-    assert.equal(body.counts.needsHuman, 2);
+    assert.equal(body.counts.unmatched, 2);
     assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
 });
 
@@ -844,14 +934,199 @@ test("two payer-bearing images under one reference is a conflict — one deposit
 });
 
 test("a QuickBooks balance mismatch (Marge already booked it) creates no payment", async () => {
-    seedMilestone({ amount: 1500, qbInvoiceId: "qb-inv-prebooked" });
+    seedMilestone({ amount: 1500, qbInvoiceId: "qb-inv-prebooked", invoiceCode: "INV-PREBOOKED" });
     qboBalanceByInvoice.set("qb-inv-prebooked", 0);
 
     const { body } = await post(bankBatch([{ ref: "REF-PREBOOKED", amount: 1500 }]));
     const result = creditResult(body, "REF-PREBOOKED");
-    assert.equal(result.status, "failed", `expected a retryable guard failure, got ${result.status}`);
+    // M1: terminal and explained, rather than eight retries of a request that
+    // can never succeed.
+    assert.equal(result.status, "unmatched", `expected a terminal guard rejection, got ${result.status}`);
     assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "the guard rejects BEFORE the create");
-    assert.match(String(depositRow("REF-PREBOOKED")!.lastError), /balance-mismatch/);
+    assert.match(String(depositRow("REF-PREBOOKED")!.lastError), /probably already booked/);
+});
+
+test("C1: a PROPOSED bank row does not block the photo path — that window is the photo's", async () => {
+    // The wait rule exists to give the evidence-rich photo first dibs on a fresh
+    // check. A `proposed` bank row holding that window must not then be treated
+    // as a claim against the photo, or the rule inverts itself.
+    tables.project.rows.push({ id: "project-1", name: "Hoppe Hall Bath", client: { name: "Hoppe" } });
+    const milestone = seedMilestone({ amount: 4321.55, projectName: "Hoppe Hall Bath", clientName: "Hoppe" });
+
+    // A young credit lands as `proposed`, reserving nothing but recording intent.
+    const yesterday = isoDaysAgo(1);
+    const held = await post(bankBatch([{ ref: "REF-HELD", amount: 4321.55 }], { postDate: yesterday }));
+    assert.equal(creditResult(held.body, "REF-HELD").status, "proposed");
+    assert.equal(depositRow("REF-HELD")!.paymentScheduleId, milestone);
+
+    // The photo of that same check arrives and must apply.
+    const photo = await post({
+        fileId: "drive-photo-vs-proposed", projectName: "Hoppe Hall Bath", amount: 4321.55,
+        checkDate: yesterday, checkNumber: "6001", payerName: "Hoppe",
+    });
+    assert.equal(photo.body.status, "applied", `the photo must win its own window: ${photo.body.reason}`);
+    assert.equal(photo.body.scheduleId, milestone);
+    const paymentsAfterPhoto = calls.sendQBPaymentCreateRequest.length;
+
+    // …and tomorrow's replay of the held credit resolves to a human, told why.
+    const replay = await post(bankBatch([{ ref: "REF-HELD", amount: 4321.55 }], { postDate: yesterday }));
+    const result = creditResult(replay.body, "REF-HELD");
+    assert.equal(result.status, "unmatched");
+    assert.match(String(result.reason), /already applied from a deposit photo \(file drive-photo-vs-proposed\)/);
+    assert.equal(calls.sendQBPaymentCreateRequest.length, paymentsAfterPhoto, "the sweep books nothing on top of the photo");
+});
+
+test("C2: a collision survives a crash — the replay re-classifies and never books", async () => {
+    seedMilestone({ amount: 6543.21 });
+    // The crash: a previous run detected the collision, created this row as
+    // `processing`, and died before filing it. Under the first cut of the
+    // preflight the replay would see a row and drop it from classification.
+    tables.depositIngest.rows.push({
+        id: "crashed-row", fileId: bankFileId("REF-CRASH-A"), status: "processing", source: BANK_DEPOSIT_SOURCE,
+        bankReference: "REF-CRASH-A", extracted: JSON.stringify({ fileId: bankFileId("REF-CRASH-A"), amount: 6543.21 }),
+        attempts: 1, amountCents: 654_321, postDate: utc(SETTLED_DAY),
+        processingStartedAt: new Date(Date.now() - 60 * 60_000), updatedAt: new Date(),
+    });
+
+    const { body } = await post(bankBatch([
+        { ref: "REF-CRASH-A", amount: 6543.21 },
+        { ref: "REF-CRASH-B", amount: 6543.21 },
+    ]));
+
+    for (const ref of ["REF-CRASH-A", "REF-CRASH-B"]) {
+        const result = creditResult(body, ref);
+        assert.equal(result.status, "unmatched", `${ref}: ${result.reason}`);
+        assert.match(String(result.reason), /different bank credits/);
+        assert.equal(depositRow(ref)!.status, "unmatched");
+    }
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0, "a collision never books money");
+    assert.equal(calls.buildQBPaymentRequest.length, 0);
+});
+
+test("C2: the collision verdict is persisted BEFORE any matching runs", async () => {
+    seedMilestone({ amount: 7654.32 });
+    let statusesWhenMatchingStarted: string[] | null = null;
+    const realFindMany = fakePrisma.paymentSchedule.findMany;
+    // The candidate query is the first thing matching does; snapshot the deposit
+    // rows at that moment.
+    fakePrisma.paymentSchedule.findMany = async (args: Row) => {
+        statusesWhenMatchingStarted ??= tables.depositIngest.rows.map(r => String(r.status));
+        return realFindMany(args);
+    };
+    try {
+        await post(bankBatch([{ ref: "REF-ORDER-A", amount: 7654.32 }, { ref: "REF-ORDER-B", amount: 7654.32 }]));
+    } finally {
+        fakePrisma.paymentSchedule.findMany = realFindMany;
+    }
+
+    // The rows are BORN terminal. This is the crash-safety property: a process
+    // that dies immediately after the insert still leaves a filed collision,
+    // whereas a row born `processing` and finalized later can be lost.
+    for (const ref of ["REF-ORDER-A", "REF-ORDER-B"]) {
+        assert.equal(
+            createdStatus.get(bankFileId(ref)), "unmatched",
+            `${ref}'s row must be created already unmatched, never created as processing and finalized afterwards`,
+        );
+    }
+    assert.equal(statusesWhenMatchingStarted, null, "matching must never run at all for a fully-colliding batch");
+    assert.equal(tables.depositIngest.rows.length, 2);
+    for (const row of tables.depositIngest.rows) assert.equal(row.status, "unmatched");
+});
+
+test("M1: a QuickBooks balance mismatch files for a human instead of burning retries", async () => {
+    seedMilestone({ amount: 8765.43, qbInvoiceId: "qb-inv-already-booked", invoiceCode: "INV-00173" });
+    qboBalanceByInvoice.set("qb-inv-already-booked", 0);
+
+    const { body } = await post(bankBatch([{ ref: "REF-ALREADY-BOOKED", amount: 8765.43 }]));
+    const result = creditResult(body, "REF-ALREADY-BOOKED");
+    assert.equal(result.status, "unmatched", "deterministic guard failures are terminal, not retryable");
+    assert.match(String(result.reason), /QuickBooks shows \$0\.00 owed on INV-00173, not \$8765\.43/);
+    assert.match(String(result.reason), /probably already booked/);
+    assert.ok(result.officeTaskId, "a human is asked to verify and archive");
+    assert.equal(calls.sendQBPaymentCreateRequest.length, 0);
+    assert.equal(body.counts.failed, 0);
+    assert.equal(body.ok, true, "an unmatched credit is a clean finish");
+});
+
+test("M2: a batch with unresolved credits answers ok:false with the full counts", async () => {
+    // A QuickBooks outage: tokens resolve, the guard call throws. Every credit
+    // lands in `failed`, which the runner must be able to see.
+    seedMilestone({ amount: 9876.54 });
+    const realBuild = fakeQuickbooks.buildQBPaymentRequest;
+    fakeQuickbooks.buildQBPaymentRequest = async () => { throw new Error("QuickBooks is down"); };
+    try {
+        const { res, body } = await post(bankBatch([{ ref: "REF-OUTAGE", amount: 9876.54 }]));
+        assert.equal(res.status, 200, "the batch WAS processed — 400 is for a payload we cannot trust");
+        assert.equal(body.ok, false, "an unattended runner must be able to tell this went wrong");
+        assert.equal(creditResult(body, "REF-OUTAGE").status, "failed");
+        assert.deepEqual(body.counts, {
+            credits: 1, applied: 0, proposed: 0, unmatched: 0, reconcile: 0, failed: 1, qboUnknown: 0, replay: 0,
+        });
+    } finally {
+        fakeQuickbooks.buildQBPaymentRequest = realBuild;
+    }
+});
+
+test("M3: the SYNC path suppresses the client receipt on its own when a bank deposit owns the milestone", async t => {
+    // The sweep persists qbo_created BEFORE it settles. If it dies in that gap,
+    // the hourly QuickBooks sync finds the payment the sweep just created and
+    // settles the milestone itself — passing no options at all. Relying on the
+    // caller to say "suppress" loses the flag exactly there, and the client gets
+    // a receipt for money nobody has looked at. So the shared settle derives it.
+    const seedSettleFixture = (scheduleId: string) => {
+        tables.invoice.rows.push({
+            id: "inv-settle", code: "INV-SETTLE", projectId: "project-1", estimateId: null,
+            status: "Issued", totalAmount: 100, balanceDue: 100,
+        });
+        tables.paymentSchedule.rows.push({
+            id: scheduleId, invoiceId: "inv-settle", name: "Swept milestone", amount: 100,
+            status: "Pending", sourceScheduleId: null,
+        });
+    };
+
+    await t.test("a bank row in qbo_created suppresses, with no opt from the caller", async () => {
+        seedSettleFixture("sched-swept");
+        tables.depositIngest.rows.push({
+            id: "bank-inflight", fileId: bankFileId("REF-M3"), status: "qbo_created", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-M3", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-swept", updatedAt: new Date(),
+        });
+
+        const settled = await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-swept", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-from-sync", paidAt: new Date(), referenceNumber: "REF-M3",
+        });
+        assert.equal(settled, true);
+
+        const notes = tables.paymentNotification.rows;
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0].suppressClientReceipt, true, "the sync path must not email a receipt for a swept credit");
+    });
+
+    await t.test("an ordinary milestone still notifies normally", async () => {
+        seedSettleFixture("sched-ordinary");
+        const settled = await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-ordinary", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-ordinary", paidAt: new Date(), referenceNumber: "1234",
+        });
+        assert.equal(settled, true);
+        assert.equal(tables.paymentNotification.rows.length, 1);
+        assert.notEqual(tables.paymentNotification.rows[0].suppressClientReceipt, true);
+    });
+
+    await t.test("a TERMINAL-but-unmatched bank row does not suppress — it owns nothing", async () => {
+        seedSettleFixture("sched-released");
+        tables.depositIngest.rows.push({
+            id: "bank-released", fileId: bankFileId("REF-M3-RELEASED"), status: "unmatched", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-M3-RELEASED", extracted: "{}", attempts: 1, amountCents: 10_000,
+            postDate: utc(SETTLED_DAY), paymentScheduleId: "sched-released", updatedAt: new Date(),
+        });
+        await settleMilestoneFromQBPayment({
+            paymentScheduleId: "sched-released", invoiceId: "inv-settle",
+            qbPaymentId: "qb-payment-released", paidAt: new Date(), referenceNumber: "1234",
+        });
+        assert.notEqual(tables.paymentNotification.rows[0].suppressClientReceipt, true);
+    });
 });
 
 test("the batch response carries the counts the Bot Health line is built from", async () => {
@@ -864,5 +1139,8 @@ test("the batch response carries the counts the Bot Health line is built from", 
         { ref: "R-DUP-1", amount: 250 },
         { ref: "R-DUP-2", amount: 250 },
     ]));
-    assert.deepEqual(body.counts, { credits: 3, applied: 1, needsHuman: 2, proposed: 0, replay: 0 });
+    assert.deepEqual(body.counts, {
+        credits: 3, applied: 1, proposed: 0, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0,
+    });
+    assert.equal(body.ok, true, "two credits sent to a human is still a clean batch");
 });

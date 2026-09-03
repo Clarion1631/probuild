@@ -37,11 +37,24 @@ export const CROSS_SOURCE_CLAIM_WINDOW_DAYS = 14;
  *  only stops a malformed or merged export from becoming a huge batch. */
 export const MAX_BANK_CREDITS_PER_BATCH = 500;
 
-/** DepositIngest statuses that mean "this row is working, or has already
- *  taken, this money" — the cross-source claim check's predicate. `proposed`
- *  is in the list: it holds no reservation, but it does record an intent that
- *  the other path must not cut across. */
+/**
+ * The cross-source claim check is DIRECTIONAL, so it has two status lists.
+ *
+ * CLAIMING_STATUSES — what the BANK side treats as a claim by the photo path:
+ * everything, because any live photo row is closer to the money than a bank
+ * credit is (it carries a project name; the sweep has only an amount).
+ *
+ * MONEY_BOUNDARY_CLAIM_STATUSES — what the PHOTO side treats as a claim by the
+ * sweep: only rows at or past the money boundary. `proposed` is deliberately
+ * ABSENT. A proposed row is a bank credit that matched but was held back — by a
+ * dry run, or by the 2-day wait whose entire purpose is to give the
+ * evidence-rich photo first dibs. Counting it as a claim would invert that: the
+ * photo would stand down during exactly the window reserved for it. When the
+ * proposed row is re-evaluated after the photo settles, the 14-day Paid union
+ * and the applied-row lookup route it to a human with the right explanation.
+ */
 export const CLAIMING_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied", "proposed"] as const;
+export const MONEY_BOUNDARY_CLAIM_STATUSES = ["processing", "qbo_unknown", "qbo_created", "applied"] as const;
 
 /** BankImage.source that scripts/post-bank-images.mjs writes for WTB documents. */
 export const BANK_IMAGE_SOURCE = "WTB_ONLINE";
@@ -204,24 +217,54 @@ function boundedString(value: unknown, max: number): string | null {
 }
 
 /**
- * In-batch collisions: two DIFFERENT bank references on the same day for the
- * same amount. Neither can be told apart by amount, which is all a bank credit
- * carries, so both go to a human. Replays are resolved before this runs and
- * never reach it (Codex round 2, R3).
+ * Collisions: two DIFFERENT bank references on the same day for the same
+ * amount. Neither can be told apart by amount, which is all a bank credit
+ * carries, so both go to a human.
  *
- * Returns bankReference → the OTHER references it collides with.
+ * Classified over the WHOLE batch — replays included — plus any same-day row
+ * already stored, in ANY status. Excluding replays (the first cut of this
+ * feature) made the verdict crash-sensitive: a run that created a colliding row
+ * as `processing` and died before filing it would, on the next day's replay, no
+ * longer see a collision at all and could auto-apply the money. A credit that
+ * ever collided must go on colliding for as long as its twin is visible, which
+ * means classification cannot depend on how far a previous run got.
+ *
+ * `stored` must exclude the batch's own rows (same reference = same credit, not
+ * a collision with itself).
+ *
+ * Returns bankReference → the OTHER references it collides with. Only
+ * references present in `credits` get an entry; a stored row is evidence, not
+ * something this batch can act on.
  */
-export function findBatchCollisions(credits: BankCredit[]): Map<string, string[]> {
-    const byAmount = new Map<number, string[]>();
-    for (const c of credits) {
-        byAmount.set(c.amountCents, [...(byAmount.get(c.amountCents) ?? []), c.bankReference]);
+export function findCollisions(
+    credits: BankCredit[],
+    stored: Array<{ bankReference: string | null; amountCents: number | null }> = [],
+): Map<string, string[]> {
+    const byAmount = new Map<number, Set<string>>();
+    const add = (amountCents: number, ref: string) => {
+        const refs = byAmount.get(amountCents) ?? new Set<string>();
+        refs.add(ref);
+        byAmount.set(amountCents, refs);
+    };
+    for (const c of credits) add(c.amountCents, c.bankReference);
+    for (const row of stored) {
+        if (row.bankReference && row.amountCents != null) add(row.amountCents, row.bankReference);
     }
+
     const collisions = new Map<string, string[]>();
-    for (const refs of byAmount.values()) {
-        if (refs.length < 2) continue;
-        for (const ref of refs) collisions.set(ref, refs.filter(r => r !== ref));
+    for (const credit of credits) {
+        const refs = byAmount.get(credit.amountCents);
+        if (!refs || refs.size < 2) continue;
+        collisions.set(credit.bankReference, [...refs].filter(r => r !== credit.bankReference).sort());
     }
     return collisions;
+}
+
+/** The reason a colliding credit gives its human. */
+export function collisionNote(credit: BankCredit, postDate: string, others: string[]): string {
+    return `${others.length + 1} different bank credits on ${postDate} are for exactly $${credit.amount.toFixed(2)} ` +
+        `(this one is ${credit.bankReference}; the other(s) are ${others.join(", ")}) — a bank line carries ` +
+        `nothing but an amount, so a human must say which milestone each one settles`;
 }
 
 export interface PayerBearingImage {
@@ -310,4 +353,66 @@ export function reservationLostNote(winner: ClaimingRow | null): string {
     return winner.source === BANK_DEPOSIT_SOURCE
         ? `milestone already being applied by the deposit sweep (bank ref ${winner.bankReference ?? "unknown"}, status ${winner.status})`
         : `milestone already being applied by a deposit photo (file ${winner.fileId}, status ${winner.status})`;
+}
+
+/**
+ * M1: the three QuickBooks guard failures buildQBPaymentRequest can return are
+ * DETERMINISTIC — the same request will fail the same way forever, so the
+ * generic retry loop only burns attempts and then reconciles with a stack-trace
+ * of a reason. Each one is really a message to a human, and the balance case is
+ * the most important one in the whole sweep: it means somebody already booked
+ * this payment in QuickBooks, which is exactly the state the guard exists to
+ * protect and exactly what a bookkeeper needs told plainly.
+ */
+export function qboGuardNote(
+    failure: { reason: string; qbBalance?: number; expected?: number },
+    invoiceCode: string,
+): string {
+    const money = (n: number | undefined) => (typeof n === "number" ? `$${n.toFixed(2)}` : "an unknown amount");
+    switch (failure.reason) {
+        case "balance-mismatch":
+            return `QuickBooks shows ${money(failure.qbBalance)} owed on ${invoiceCode}, not ${money(failure.expected)}; ` +
+                `probably already booked. Verify and archive.`;
+        case "invoice-not-found":
+            return `the QuickBooks invoice linked to ${invoiceCode} no longer exists — it was deleted or the link is stale. ` +
+                `Re-push the invoice, then record this payment by hand.`;
+        case "missing-customer":
+            return `the QuickBooks invoice for ${invoiceCode} has no customer on it, so a payment cannot be applied to it. ` +
+                `Fix the invoice in QuickBooks, then record this payment by hand.`;
+        default:
+            return `QuickBooks refused this payment for ${invoiceCode} (${failure.reason}).`;
+    }
+}
+
+/** Is this guard failure deterministic (a human's problem) rather than a
+ *  transient one worth retrying? */
+export function isDeterministicQboGuardFailure(reason: string): boolean {
+    return reason === "balance-mismatch" || reason === "invoice-not-found" || reason === "missing-customer";
+}
+
+/**
+ * M2: every outcome a day's credits can land in. Reported in full because the
+ * Hermes job is unattended: a batch whose credits all failed with a QuickBooks
+ * outage used to answer `ok: true` with counts that mentioned none of it, so
+ * the runner logged a healthy day and the watchdog never fired.
+ */
+export interface SweepCounts {
+    credits: number;
+    applied: number;
+    proposed: number;
+    unmatched: number;
+    reconcile: number;
+    failed: number;
+    qboUnknown: number;
+    replay: number;
+}
+
+/**
+ * `ok` answers "did this batch finish cleanly?", NOT "did every credit get
+ * booked?". `unmatched` is a clean finish — the sweep did its job and asked a
+ * human. `failed` / `qbo_unknown` / `reconcile` are not: they mean the run hit
+ * something it could not resolve, and a human (or the next run) must look.
+ */
+export function sweepBatchOk(counts: SweepCounts): boolean {
+    return counts.failed === 0 && counts.qboUnknown === 0 && counts.reconcile === 0;
 }

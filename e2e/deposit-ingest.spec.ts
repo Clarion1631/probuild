@@ -1155,12 +1155,17 @@ test.describe.serial("Deposit sweep — bank source", () => {
       credits: [{ bankReference: B.prebooked.bankReference, amount: B.prebooked.amount }],
     });
     const credit = bankCredit(body, B.prebooked.bankReference);
-    expect(credit.status, "a guard rejection is retryable, never a duplicate").toBe("failed");
+    // Deterministic guard: terminal and explained, not eight retries of a
+    // request that can never succeed.
+    expect(credit.status, "a balance mismatch means a human already booked it").toBe("unmatched");
+    expect(credit.reason).toContain("probably already booked");
+    expect(credit.officeTaskId).toBeTruthy();
+    expect(body.ok, "asking a human is still a clean batch").toBe(true);
     expect((await getQboMockState(request)).calls.paymentCreate).toBe(0);
 
     const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: `bank:${B.prebooked.bankReference}` } });
     expect(row.qbPaymentId).toBeNull();
-    expect(row.lastError).toContain("balance-mismatch");
+    expect(row.lastError).toContain("probably already booked");
     expect((await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: B.prebooked.schedule } })).status).toBe("Pending");
   });
 

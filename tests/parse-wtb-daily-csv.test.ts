@@ -5,6 +5,7 @@ import {
     buildSweepPayload,
     postSweep,
     resolveSweepSecret,
+    sweepBatchFailed,
     sweepSummaryLine,
     REPOST_FLOOR,
     DAILY_CANONICAL_FROM,
@@ -416,8 +417,52 @@ test("sweep: the POST goes to the deposit endpoint as a bearer, with the day's b
 });
 
 test("sweep: the Bot Health line reports every outcome bucket", () => {
+    const clean = { credits: 4, applied: 1, proposed: 1, unmatched: 2, reconcile: 0, failed: 0, qboUnknown: 0, replay: 3 };
     assert.equal(
-        sweepSummaryLine("2026-08-24", { credits: 4, applied: 1, needsHuman: 2, proposed: 1, replay: 3 }),
+        sweepSummaryLine("2026-08-24", clean),
         "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay",
     );
+    // A day that hit a QuickBooks outage must not read like a quiet day.
+    assert.equal(
+        sweepSummaryLine("2026-08-24", { ...clean, failed: 2, qboUnknown: 1 }),
+        "sweep 2026-08-24: 4 credits, 1 applied, 2 need-human, 1 proposed, 3 replay, 2 failed, 1 qbo-unknown",
+    );
+});
+
+test("sweep: unresolved credits are a JOB FAILURE, so the watchdog fires", async t => {
+    const counts = (over: Record<string, number> = {}) => ({
+        credits: 1, applied: 1, proposed: 0, unmatched: 0, reconcile: 0, failed: 0, qboUnknown: 0, replay: 0, ...over,
+    });
+
+    await t.test("a clean day is not a failure", () => {
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts() }), false);
+    });
+
+    await t.test("credits sent to a HUMAN are not a failure — that is the sweep working", () => {
+        assert.equal(sweepBatchFailed({ ok: true, counts: counts({ applied: 0, unmatched: 1 }) }), false);
+    });
+
+    await t.test("failed / qbo_unknown / reconcile are", () => {
+        for (const bucket of ["failed", "qboUnknown", "reconcile"]) {
+            assert.equal(
+                sweepBatchFailed({ ok: false, counts: counts({ applied: 0, [bucket]: 1 }) }),
+                true,
+                `${bucket} must fail the run`,
+            );
+        }
+    });
+
+    await t.test("the endpoint's own ok:false is authority, whatever the counts say", () => {
+        assert.equal(sweepBatchFailed({ ok: false, counts: counts() }), true);
+    });
+
+    await t.test("counts alone still catch it if a deployment answers without the flag", () => {
+        assert.equal(sweepBatchFailed({ counts: counts({ applied: 0, failed: 1 }) }), true);
+    });
+
+    await t.test("a missing or non-object body is a failure, never a silent pass", () => {
+        assert.equal(sweepBatchFailed(null), true);
+        assert.equal(sweepBatchFailed(undefined), true);
+        assert.equal(sweepBatchFailed("nope"), true);
+    });
 });

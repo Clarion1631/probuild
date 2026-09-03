@@ -507,10 +507,30 @@ export async function postSweep(baseUrl, secret, day, opts = {}) {
     return { status: res.status, body };
 }
 
-/** The one line the Hermes job copies into its Bot Health report. */
+/** The one line the Hermes job copies into its Bot Health report. Reports every
+ *  bucket: a day whose credits all failed on a QuickBooks outage must not read
+ *  the same as a quiet day. */
 export function sweepSummaryLine(postDate, counts) {
-    return `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
-        `${counts.needsHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
+    const needHuman = (counts.unmatched ?? 0) + (counts.reconcile ?? 0);
+    const line = `sweep ${postDate}: ${counts.credits} credits, ${counts.applied} applied, ` +
+        `${needHuman} need-human, ${counts.proposed} proposed, ${counts.replay} replay`;
+    const unresolved = (counts.failed ?? 0) + (counts.qboUnknown ?? 0);
+    return unresolved > 0
+        ? `${line}, ${counts.failed ?? 0} failed, ${counts.qboUnknown ?? 0} qbo-unknown`
+        : line;
+}
+
+/**
+ * Did this day's sweep finish cleanly? The endpoint already answers that in
+ * `ok`, and that is the authority; the count check below is a second reading
+ * for the case where an older deployment answers without the flag. `unmatched`
+ * is NOT a failure — asking a human is the sweep working as designed.
+ */
+export function sweepBatchFailed(body) {
+    if (!body || typeof body !== "object") return true;
+    if (body.ok === false) return true;
+    const counts = body.counts ?? {};
+    return ((counts.failed ?? 0) + (counts.qboUnknown ?? 0) + (counts.reconcile ?? 0)) > 0;
 }
 
 /**
@@ -533,16 +553,27 @@ async function sweepDay(args, sweepSecret, statement, stalled) {
         return false;
     }
     const { status, body } = await postSweep(args.post, sweepSecret, statement, { dryRun: args.sweepDryRun });
-    if (status === 200 && body?.ok) {
-        console.log(`  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`);
-        for (const credit of body.credits ?? []) {
-            if (credit.status === "unmatched" || credit.status === "reconcile") {
-                console.log(`    ${credit.bankReference}: ${credit.status} — ${credit.reason ?? ""}`);
-            }
-        }
-        return true;
+    if (status !== 200 || !body?.counts) {
+        console.error(`  sweep ${postDate}: HTTP ${status} ${JSON.stringify(body)}`);
+        stalled();
+        return false;
     }
-    console.error(`  sweep ${postDate}: HTTP ${status} ${JSON.stringify(body)}`);
+
+    // Always report the whole day, whichever way it went.
+    const summary = `  ${sweepSummaryLine(postDate, body.counts)}${args.sweepDryRun ? " (dry run)" : ""}`;
+    const failed = sweepBatchFailed(body);
+    (failed ? console.error : console.log)(summary);
+    for (const credit of body.credits ?? []) {
+        if (["unmatched", "reconcile", "failed", "qbo_unknown"].includes(credit.status)) {
+            console.log(`    ${credit.bankReference}: ${credit.status} — ${credit.reason ?? ""}`);
+        }
+    }
+    if (!failed) return true;
+
+    // A credit left failed / qbo_unknown / reconcile is unresolved money: exit
+    // non-zero so the Hermes daily-job watchdog fires instead of the run
+    // logging a healthy day through a QuickBooks outage.
+    console.error(`  sweep ${postDate}: unresolved credits — a human (or the next run) must resolve them`);
     stalled();
     return false;
 }

@@ -18,21 +18,27 @@ import {
     BANK_IMAGE_SOURCE,
     CLAIMING_STATUSES,
     CROSS_SOURCE_CLAIM_WINDOW_DAYS,
+    MONEY_BOUNDARY_CLAIM_STATUSES,
     PAID_UNION_WINDOW_DAYS,
     appliedTwinNote,
     bankCreditIsOldEnough,
     bankFileId,
     bankImageKeyPrefix,
+    collisionNote,
     crossSourceClaimNote,
     describeCandidates,
-    findBatchCollisions,
+    findCollisions,
+    isDeterministicQboGuardFailure,
     isoDateToUtc,
     isoDaysAfter,
     isoDaysBefore,
     parseBankBatch,
+    qboGuardNote,
     reservationLostNote,
     selectPayerBearingImage,
+    sweepBatchOk,
     type BankCredit,
+    type SweepCounts,
 } from "@/lib/deposit-sweep";
 
 export const dynamic = "force-dynamic";
@@ -561,6 +567,15 @@ async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, pay
         ...(opts.depositToAccountId ? { depositToAccountId: opts.depositToAccountId } : {}),
     });
     if (!built.ok) {
+        // Deterministic guards (balance-mismatch, invoice-not-found,
+        // missing-customer) never come good on a retry: the same request fails
+        // the same way forever, so the generic loop just burns eight attempts
+        // and reconciles with an opaque reason. Balance-mismatch in particular
+        // is not an error at all — it means a human already booked this payment,
+        // which is exactly what the guard is for. Say so, in words, once.
+        if (isDeterministicQboGuardFailure(built.reason)) {
+            return await finalizeUnmatched(row, qboGuardNote(built, schedule.invoiceCode));
+        }
         throw new Error(`QuickBooks guard failed (${built.reason}) for invoice ${schedule.invoiceCode}`);
     }
 
@@ -808,28 +823,29 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
         select: { fileId: true },
     });
     const replays = new Set(existing.map(r => r.fileId));
-    const fresh = credits.filter(c => !replays.has(bankFileId(c.bankReference)));
 
-    const collisions = findBatchCollisions(fresh);
-    const storedSameDay = fresh.length > 0
-        ? await prisma.depositIngest.findMany({
-            where: {
-                source: BANK_DEPOSIT_SOURCE,
-                postDate: isoDateToUtc(postDate),
-                amountCents: { in: [...new Set(fresh.map(c => c.amountCents))] },
-                fileId: { notIn: fileIds },
-            },
-            select: { bankReference: true, amountCents: true },
-        })
-        : [];
-    for (const stored of storedSameDay) {
-        if (!stored.bankReference) continue;
-        for (const credit of fresh) {
-            if (credit.amountCents !== stored.amountCents) continue;
-            const others = collisions.get(credit.bankReference) ?? [];
-            if (!others.includes(stored.bankReference)) others.push(stored.bankReference);
-            collisions.set(credit.bankReference, others);
-        }
+    // Collision classification runs over the WHOLE batch (replays included) and
+    // every stored same-day row in ANY status. It must not depend on how far a
+    // previous run got: a crash between "created as processing" and "filed as
+    // unmatched" would otherwise erase the verdict and let the money auto-apply
+    // on the next day's replay.
+    const storedSameDay = await prisma.depositIngest.findMany({
+        where: {
+            source: BANK_DEPOSIT_SOURCE,
+            postDate: isoDateToUtc(postDate),
+            amountCents: { in: [...new Set(credits.map(c => c.amountCents))] },
+            fileId: { notIn: fileIds },
+        },
+        select: { bankReference: true, amountCents: true },
+    });
+    const collisions = findCollisions(credits, storedSameDay);
+
+    // Persist every collision verdict BEFORE any matching runs, so the batch can
+    // die at any point from here on without a colliding credit ever being
+    // eligible to book money.
+    for (const credit of credits) {
+        const others = collisions.get(credit.bankReference);
+        if (others) await persistCollisionVerdict(credit, postDate, others);
     }
 
     const results: BankCreditResult[] = [];
@@ -841,18 +857,87 @@ async function handleBankBatch(raw: Record<string, unknown>): Promise<NextRespon
         }));
     }
 
-    // The counts the Hermes job turns into its one Bot Health line. `replay` is
-    // orthogonal to the others (a replay still has an outcome) and is reported
-    // so "ran but did nothing new" is distinguishable from "ran but saw
-    // nothing" — the failure mode a browser-automated CSV export actually has.
-    const counts = {
+    // Every outcome, terminal and not. `replay` is orthogonal (a replay still has
+    // an outcome) and is reported so "ran but did nothing new" is
+    // distinguishable from "ran but saw nothing" — the failure mode a
+    // browser-automated CSV export actually has.
+    const tally = (status: string) => results.filter(r => r.status === status).length;
+    const counts: SweepCounts = {
         credits: credits.length,
-        applied: results.filter(r => r.status === "applied").length,
-        needsHuman: results.filter(r => r.status === "unmatched" || r.status === "reconcile").length,
-        proposed: results.filter(r => r.status === "proposed").length,
+        applied: tally("applied"),
+        proposed: tally("proposed"),
+        unmatched: tally("unmatched"),
+        reconcile: tally("reconcile"),
+        failed: tally("failed"),
+        qboUnknown: tally("qbo_unknown"),
         replay: results.filter(r => r.replay).length,
     };
-    return NextResponse.json({ ok: true, source: BANK_DEPOSIT_SOURCE, postDate, dryRun, counts, credits: results });
+    // HTTP is still 200 — the batch WAS processed; 400 is reserved for a payload
+    // that could not be trusted at all. `ok` is what tells the unattended runner
+    // whether the day finished cleanly.
+    return NextResponse.json({
+        ok: sweepBatchOk(counts),
+        source: BANK_DEPOSIT_SOURCE, postDate, dryRun, counts, credits: results,
+    });
+}
+
+/**
+ * Write a colliding credit's verdict, atomically, before any matching runs.
+ *
+ *  - no row yet          → INSERT it already terminal (`unmatched`), so the
+ *                          verdict exists even if this process dies next line;
+ *  - non-terminal row    → CAS it to `unmatched` (or `reconcile` when it already
+ *                          crossed a money boundary: releasing a reservation
+ *                          that may correspond to a real QuickBooks payment
+ *                          would strand it);
+ *  - terminal row        → leave it; the per-credit loop reports its stored
+ *                          outcome and heals a missing task.
+ *
+ * The OfficeTask is created after the row, not inside its transaction — the
+ * file-wide invariant (see finalizeUnmatched) is that terminal state is
+ * persisted FIRST and a missing task self-heals on the next POST, whereas the
+ * reverse order can file duplicate tasks.
+ */
+async function persistCollisionVerdict(credit: BankCredit, postDate: string, others: string[]): Promise<void> {
+    const payload = bankPayloadFor(credit, postDate);
+    const reason = collisionNote(credit, postDate, others);
+    const existing = await prisma.depositIngest.findUnique({ where: { fileId: payload.fileId } });
+
+    if (!existing) {
+        try {
+            const created = await prisma.depositIngest.create({
+                data: {
+                    fileId: payload.fileId, status: "unmatched", extracted: JSON.stringify(payload),
+                    attempts: 1, processingStartedAt: new Date(), lastError: reason.slice(0, 1000),
+                    source: BANK_DEPOSIT_SOURCE, bankReference: credit.bankReference,
+                    postDate: isoDateToUtc(postDate), amountCents: credit.amountCents,
+                },
+            });
+            await ensureReviewTask(created, reason, "unmatched");
+        } catch (e: any) {
+            // Lost the create race to a concurrent POST of the same day; that
+            // row is handled by the branch below on the next pass.
+            if (e?.code !== "P2002") throw e;
+        }
+        return;
+    }
+
+    if (["applied", "unmatched", "reconcile"].includes(existing.status)) return;
+
+    const boundaryMarked = !!(existing.qbPaymentId || existing.qbRequestPayload || existing.settleStartedAt);
+    const status = boundaryMarked ? "reconcile" : "unmatched";
+    const claimed = await prisma.depositIngest.updateMany({
+        where: { id: existing.id, status: existing.status },
+        data: {
+            status, lastError: reason.slice(0, 1000),
+            // Only an unmarked row releases its reservation — a boundary-marked
+            // one keeps it so the human can see which milestone is at stake.
+            ...(boundaryMarked ? {} : { paymentScheduleId: null }),
+        },
+    });
+    if (claimed.count === 0) return; // another worker moved it; its own path decides
+    const fresh = await prisma.depositIngest.findUnique({ where: { id: existing.id } });
+    if (fresh && !fresh.officeTaskId) await ensureReviewTask(fresh, reason, status === "reconcile" ? "reconcile" : "unmatched");
 }
 
 async function processBankCredit(
@@ -865,11 +950,11 @@ async function processBankCredit(
     if (claim.kind === "settled") return await bankResult(credit.bankReference, opts.replay, claim.response);
     const row = claim.row;
 
+    // Belt and braces: the verdict was already persisted by
+    // persistCollisionVerdict, so this only fires if that CAS lost a race.
     if (opts.collidesWith.length > 0) {
-        return await bankResult(credit.bankReference, opts.replay, await finalizeUnmatched(row,
-            `${opts.collidesWith.length + 1} different bank credits on ${postDate} are for exactly $${credit.amount.toFixed(2)} ` +
-            `(this one is ${credit.bankReference}; the other(s) are ${opts.collidesWith.join(", ")}) — a bank line carries ` +
-            `nothing but an amount, so a human must say which milestone each one settles`));
+        return await bankResult(credit.bankReference, opts.replay,
+            await finalizeUnmatched(row, collisionNote(credit, postDate, opts.collidesWith)));
     }
     if (row.attempts > MAX_ATTEMPTS) {
         const crossedAnyBoundary = !!row.qbPaymentId || !!row.qbRequestPayload || !!row.settleStartedAt;
@@ -1190,6 +1275,12 @@ async function reserveMilestone(
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
     // null source = the photo path, the same normalisation findAppliedTwin uses.
     const otherSource = row.source === BANK_DEPOSIT_SOURCE ? null : BANK_DEPOSIT_SOURCE;
+    // …and DIRECTIONAL statuses (see the two lists in deposit-sweep.ts): from the
+    // photo side a `proposed` bank row is NOT a claim, because that state exists
+    // precisely to hold the sweep back while the photo path gets first dibs.
+    const claimStatuses = otherSource === BANK_DEPOSIT_SOURCE
+        ? [...MONEY_BOUNDARY_CLAIM_STATUSES]
+        : [...CLAIMING_STATUSES];
     try {
         await prisma.$transaction(async (tx) => {
             if (claim.amountCents != null && claim.postDate) {
@@ -1202,7 +1293,7 @@ async function reserveMilestone(
                             gte: isoDateToUtc(isoDaysBefore(claim.postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
                             lte: isoDateToUtc(isoDaysAfter(claim.postDate, CROSS_SOURCE_CLAIM_WINDOW_DAYS)),
                         },
-                        status: { in: [...CLAIMING_STATUSES] },
+                        status: { in: claimStatuses },
                     },
                     select: { fileId: true, source: true, bankReference: true, status: true, paymentScheduleId: true, postDate: true },
                 });
