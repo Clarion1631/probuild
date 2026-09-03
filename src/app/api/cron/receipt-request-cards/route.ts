@@ -659,41 +659,76 @@ export async function GET(request: Request) {
      * consumed this way.
      */
     const drainedOwners = new Set<string>();
-    const queued = await prisma.receiptRequestCard.findMany({
-        where: {
-            status: "PENDING",
-            postedAt: null,
-            // THE COLUMN, not the diagnostic text (round-41 gate, finding 3):
-            // a rejection overwrites `lastError` and used to make the row
-            // invisible to this query for ever.
-            resendQueuedAt: { not: null },
-            pacificDate: { lt: date },
-        },
-        orderBy: [{ resendQueuedAt: "asc" }, { pacificDate: "asc" }, { owner: "asc" }],
-        take: QUEUED_RESEND_DRAIN_LIMIT,
-        select: { id: true, owner: true, pacificDate: true, itemsJson: true, overflow: true, overflowExact: true },
-    });
+    /**
+     * ONE ROW PER OWNER, CHOSEN IN THE DATABASE (Codex PR #443 gate round 44,
+     * finding 3).
+     *
+     * The previous shape took the N oldest rows and THEN reduced to one per
+     * owner, which is a starvation bug: if the three oldest queued rows are all
+     * CJ's, Richard's resend never enters the candidate set at all. Reduce to
+     * one row per owner first — `DISTINCT ON (owner)` — and apply the global
+     * cap to that, so the cap bounds OWNERS rather than silently bounding which
+     * owners are eligible. A CJ resend that fails every night can then no
+     * longer hide Richard's indefinitely.
+     *
+     * Raw SQL because Prisma has no `DISTINCT ON`. `ORDER BY "owner"` first is
+     * required by Postgres for DISTINCT ON; the per-owner winner is decided by
+     * the columns after it, which are the same ones the old `orderBy` used.
+     */
+    const queued = await prisma.$queryRaw<Array<{
+        id: string; owner: string; pacificDate: string; itemsJson: string;
+        overflow: number; overflowExact: boolean;
+    }>>`
+        SELECT * FROM (
+            SELECT DISTINCT ON ("owner")
+                   "id", "owner", "pacificDate", "itemsJson", "overflow", "overflowExact",
+                   "resendQueuedAt"
+              FROM "ReceiptRequestCard"
+             WHERE "status" = 'PENDING'
+               AND "postedAt" IS NULL
+               -- THE COLUMN, not the diagnostic text (round-41 gate, finding
+               -- 3): a rejection overwrites "lastError" and used to make the
+               -- row invisible to this query for ever.
+               AND "resendQueuedAt" IS NOT NULL
+               AND "pacificDate" < ${date}
+             ORDER BY "owner", "resendQueuedAt" ASC, "pacificDate" ASC
+        ) AS per_owner
+         ORDER BY "resendQueuedAt" ASC, "pacificDate" ASC, "owner" ASC
+         LIMIT ${QUEUED_RESEND_DRAIN_LIMIT}`;
     /**
      * ONE PER OWNER, AND ONLY IF TODAY IS STILL FREE (Codex PR #443 gate round
      * 42, finding 4).
      *
-     * The query above can return several queued days for one owner, and it says
-     * nothing about whether that owner already had today's card. Both break the
-     * one-message-per-owner-per-day rule the whole (owner, pacificDate) key
-     * exists to keep — from a direction that key cannot see, because a resend
-     * carries an OLD date.
+     * The query now returns at most one row per owner (round-44 gate, finding
+     * 3), but it still says nothing about whether that owner already had
+     * today's card. That breaks the one-message-per-owner-per-day rule the
+     * whole (owner, pacificDate) key exists to keep — from a direction that key
+     * cannot see, because a resend carries an OLD date.
      *
-     * So: the oldest queued row per owner is taken, and the delivery-day claim
-     * below (`deliveredOn`, unique per owner and day) is what actually enforces
-     * it — a check here alone would be a race between two invocations.
+     * The map is kept as a belt-and-braces reduction over the query's result,
+     * and the delivery-day reservation below (an immutable
+     * `ReceiptRequestCardDelivery` row, unique per owner and day) is what
+     * actually enforces it — a check here alone would be a race between two
+     * invocations.
      */
     const queuedByOwner = new Map<string, typeof queued[number]>();
     for (const row of queued) {
         if (!queuedByOwner.has(row.owner)) queuedByOwner.set(row.owner, row);
     }
+    /**
+     * WHO HAS ALREADY HAD A MESSAGE TODAY — read from the immutable delivery
+     * records, not from `ReceiptRequestCard.deliveredOn` (round-44 gate,
+     * finding 2).
+     *
+     * The card column is on a mutable row and survives being flipped back to
+     * PENDING, so it could not be trusted either way: it lied by omission when
+     * a row was rewritten, and it is not what the constraint is on. The
+     * delivery row is the record of an ATTEMPT, and it is what the unique index
+     * protects.
+     */
     const deliveredToday = new Set(
-        (await prisma.receiptRequestCard.findMany({
-            where: { deliveredOn: date },
+        (await prisma.receiptRequestCardDelivery.findMany({
+            where: { deliveryDay: date },
             select: { owner: true },
         })).map(row => row.owner),
     );
@@ -737,6 +772,16 @@ export async function GET(request: Request) {
         // second from the same open issues would ask twice (round-41 gate,
         // finding 1).
         if (drainedOwners.has(owner)) continue;
+        /**
+         * AND THEIR DAY MAY ALREADY BE SPENT (round-44 gate, finding 2). This
+         * branch never asked. An uncertain card resolved back to PENDING by an
+         * operator is a PENDING row for TODAY, so the queued path skips it (it
+         * excludes `pacificDate === today`) and this branch picked it up and
+         * posted it a second time. The reservation would now refuse the send
+         * anyway, but refusing here costs nothing and keeps the run's report
+         * honest rather than filling it with lost-day noise.
+         */
+        if (deliveredToday.has(owner)) continue;
         const existing = await prisma.receiptRequestCard.findUnique({
             where: { owner_pacificDate: { owner, pacificDate: date } },
             select: { id: true, itemsJson: true, overflow: true, overflowExact: true, postedAt: true, status: true, claimedAt: true },
@@ -1044,7 +1089,30 @@ export async function GET(request: Request) {
         // from a crash before it, so the next run knows not to repost.
         let marked: { count: number };
         try {
-            marked = await prisma.receiptRequestCard.updateMany({
+            marked = await prisma.$transaction(async tx => {
+                /**
+                 * THE RESERVATION IS ITS OWN IMMUTABLE ROW (round-44 gate,
+                 * finding 2).
+                 *
+                 * `deliveredOn` on the card could not enforce one message per
+                 * owner per day, because the reservation lived on the very row
+                 * being reserved: `resolveUncertainCard` flips today's
+                 * uncertain card back to PENDING and KEEPS `deliveredOn`, and
+                 * re-writing `deliveredOn = today` onto the SAME row cannot
+                 * violate that row's own unique key. POSTING -> UNCERTAIN ->
+                 * PENDING -> POSTING therefore posted twice, in one day, to one
+                 * person.
+                 *
+                 * A separate row cannot be talked out of existing. It is
+                 * INSERTED here, in the same transaction as the POSTING write
+                 * and before the webhook, so a second attempt on the same day —
+                 * a resend, a concurrent invocation, a resumed uncertain card —
+                 * loses on the insert while losing is still free.
+                 */
+                await tx.receiptRequestCardDelivery.create({
+                    data: { owner: card.owner, deliveryDay: date, cardId: rowId },
+                });
+                return tx.receiptRequestCard.updateMany({
                 where: { id: rowId, claimToken: token, status: { in: ["PENDING", "POSTED"] } },
                 // The snapshot is rewritten to WHAT IS ABOUT TO GO OUT. The row is
                 // the record of the card that was posted; leaving the pre-rebuild
@@ -1071,15 +1139,19 @@ export async function GET(request: Request) {
                  * delivery keeps it, because the card may be in the space and a
                  * second one is the outcome this whole mechanism exists to avoid.
                  */
-                data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date },
+                    data: { status: "POSTING", itemsJson: JSON.stringify(card.items), deliveredOn: date },
                 });
+            });
         } catch (error) {
             /**
-             * LOST THE DAY, NOT THE ROW (round-43 gate, finding 1). Another
-             * invocation claimed `(owner, date)` first — its message is going
-             * out, or already has. This one sends nothing and releases its
-             * claim token so the row is free for tomorrow's pass; the card
-             * itself is untouched, so a queued resend keeps its marker.
+             * LOST THE DAY, NOT THE ROW (round-43 gate, finding 1; widened by
+             * round 44, finding 2). Someone already holds `(owner, date)` in
+             * `ReceiptRequestCardDelivery` — another invocation, or an EARLIER
+             * ATTEMPT BY THIS CARD that Chat may already have taken. Either way
+             * a message to this owner today is accounted for. This one sends
+             * nothing and releases its claim token so the row is free for the
+             * next delivery day; the card itself is untouched, so a queued
+             * resend keeps its marker.
              *
              * P2002 only. Anything else is a real failure and is rethrown, so a
              * broken write cannot be silently read as "someone beat me to it".
@@ -1112,11 +1184,21 @@ export async function GET(request: Request) {
                     // finding 1). Chat provably did not take it, so nothing is
                     // in the space and this owner's day is genuinely still
                     // free. Every other outcome — posted, or uncertain — keeps
-                    // the claim.
+                    // the claim. The immutable delivery row is retracted in the
+                    // same breath, below: this is the one path allowed to
+                    // delete one, because it is the one path that can prove
+                    // nothing was sent.
                     deliveredOn: null,
                     claimedAt: null,
                     claimToken: null,
                 },
+            });
+            // AND RETRACT THE RESERVATION. Chat provably did not take this
+            // message, so the day is genuinely free and holding it would burn
+            // the owner's only slot on a message nobody received. Deleting a
+            // delivery row is legal here and nowhere else.
+            await prisma.receiptRequestCardDelivery.deleteMany({
+                where: { owner: card.owner, deliveryDay: date },
             });
             failures.push(card.owner);
             continue;

@@ -423,12 +423,12 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     // competition set is what let one receipt close two charges.
     // A resume only happens when the cursor's epoch still matches this run's
     // (round-42 gate, finding 2); anything else restarts the cycle.
-    assert.match(source, /const cursorEpochMatches = cursorUsableAt\(parsedCursor, snapshotEpoch\);/);
+    assert.match(source, /const cursorEpochMatches = cursorUsableAt\(parsedCursor, snapshotEpoch, snapshotEvidenceEpoch\);/);
     assert.match(source, /const resumeFrom = cursorEpochMatches && isComponentKey\(/);
     assert.match(source, /components\.filter\(component => component\.key > resumeFrom\)/);
     assert.doesNotMatch(source, /cursor: \{ id: cursor \}, skip: 1/, "id paging is gone");
     // Checkpointed after EVERY page, so a run that dies loses one page.
-    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch \}\)\);/);
+    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\);/);
 });
 
 // ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────

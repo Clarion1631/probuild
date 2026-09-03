@@ -341,7 +341,18 @@ function cardMatches(row: Record<string, unknown>, where: Record<string, unknown
 }
 
 const cardsPrisma: Record<string, unknown> = {
-    $queryRaw: async () => [{ locked: true }],
+    // The lease probe. These tests seed no queued resends, so the round-44
+    // DISTINCT ON drain query (finding 3) legitimately returns nothing here.
+    $queryRaw: async (strings: TemplateStringsArray) =>
+        (Array.isArray(strings) && /ReceiptRequestCard/.test(strings.join("?")) ? [] : [{ locked: true }]),
+    // The immutable delivery reservation (round-44 gate, finding 2). Nothing is
+    // delivered before these tests run, and the send paths under test either
+    // stop short of the reservation or take it exactly once.
+    receiptRequestCardDelivery: {
+        findMany: async () => [],
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: "del-1", ...data }),
+        deleteMany: async () => ({ count: 0 }),
+    },
     $transaction: async (arg: unknown) =>
         (typeof arg === "function" ? await (arg as (tx: unknown) => Promise<unknown>)(cardsPrisma) : arg),
     automationSetting: settingStore,

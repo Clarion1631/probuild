@@ -267,12 +267,19 @@ test("the cron drains queued resends by their own date, oldest first and bounded
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     // The query: PENDING, unposted, carrying the marker, for a date BEFORE
     // today — the rows today's (owner, pacificDate) lookup can never reach.
+    // Raw SQL since round 44 (finding 3): the per-owner reduction is DISTINCT
+    // ON, which Prisma cannot express, so the same predicate is written out.
     assert.match(
         cron,
-        /const queued = await prisma\.receiptRequestCard\.findMany\(\{[\s\S]{0,400}status: "PENDING",[\s\S]{0,300}resendQueuedAt: \{ not: null \},[\s\S]{0,200}pacificDate: \{ lt: date \}/,
+        /SELECT DISTINCT ON \("owner"\)[\s\S]{0,900}?"status" = 'PENDING'[\s\S]{0,400}?"resendQueuedAt" IS NOT NULL[\s\S]{0,300}?"pacificDate" < \$\{date}/,
     );
-    assert.match(cron, /orderBy: \[\{ resendQueuedAt: "asc" \}, \{ pacificDate: "asc" \}, \{ owner: "asc" \}\],[\s\S]{0,80}take: QUEUED_RESEND_DRAIN_LIMIT/,
+    assert.match(cron, /ORDER BY "resendQueuedAt" ASC, "pacificDate" ASC, "owner" ASC[\s\S]{0,80}LIMIT \$\{QUEUED_RESEND_DRAIN_LIMIT}/,
         "oldest first, and bounded so a backlog cannot crowd out today");
+    // AND the cap comes AFTER the per-owner reduction (round-44 gate, finding
+    // 3) — capping first is what starved the fourth owner.
+    const distinctAt = cron.indexOf('SELECT DISTINCT ON ("owner")');
+    const capAt = cron.indexOf("LIMIT ${QUEUED_RESEND_DRAIN_LIMIT}", distinctAt);
+    assert.ok(distinctAt > 0 && capAt > distinctAt, "one row per owner first, then the global cap");
     // Posted under ITS OWN date, so the request id — and the Chat thread —
     // stay the ones the operator was looking at.
     assert.match(cron, /buildCardFromItems\(row\.owner, row\.pacificDate, items, row\.overflow, row\.overflowExact\)/);

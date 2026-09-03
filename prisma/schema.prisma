@@ -2872,6 +2872,40 @@ model ReceiptRequestCard {
 /// The route checks both first and returns typed answers; these exist because a
 /// check is a statement about the moment it ran and a constraint is a statement
 /// about the row.
+/// ONE DELIVERY PER OWNER PER DAY — AN IMMUTABLE RECORD OF AN ATTEMPT
+/// (Codex PR #443 gate round 44, finding 2).
+///
+/// `ReceiptRequestCard.deliveredOn` could not do this job. It is a column on a
+/// MUTABLE row, so the reservation and the thing being reserved shared a
+/// lifetime: `resolveUncertainCard` flips today's uncertain card back to
+/// PENDING and keeps `deliveredOn`, and re-writing `deliveredOn = today` onto
+/// the SAME row cannot violate that row's own unique key. The card posted
+/// twice, on the same day, to the same person.
+///
+/// A separate row cannot be talked out of existing. It is INSERTED inside the
+/// posting transaction and never updated, so a second attempt on the same day
+/// — a resend, a concurrent invocation, a resumed uncertain card — fails the
+/// insert and is deferred to the next delivery day.
+///
+/// The one retraction is a DEFINITE rejection: Chat provably did not take the
+/// message, so nothing is in the space and the day is genuinely still free.
+/// That deletes the row rather than updating it, and it is the only path that
+/// may. An uncertain delivery keeps it, because the card may be in the space.
+model ReceiptRequestCardDelivery {
+  id    String @id @default(cuid())
+  owner String
+  /// The Pacific day the message was SENT (YYYY-MM-DD) — not the day the card
+  /// was selected for, which is `ReceiptRequestCard.pacificDate` and which a
+  /// resend deliberately keeps so its Chat thread id stays stable.
+  deliveryDay String
+  /// The card this attempt was for. Diagnostic: the claim is (owner, day).
+  cardId    String?
+  createdAt DateTime @default(now())
+
+  @@unique([owner, deliveryDay])
+  @@index([cardId])
+}
+
 model ReceiptMemoArtifact {
   id String @id @default(cuid())
   /// The affidavit app's Drive file id — the memo's durable identity.

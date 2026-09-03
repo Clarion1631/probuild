@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { fenceAndWritePhase } from "../src/app/api/cron/receipt-requests/route";
+import { cursorUsableAt, fenceAndWritePhase, formatSweepCursor, parseSweepCursor } from "../src/app/api/cron/receipt-requests/route";
 import { pullContinuationPending } from "../src/app/api/cron/bank-register-pull/route";
 import { RECEIPT_EVIDENCE_EPOCH_KEY, RECEIPT_EVIDENCE_EPOCH_ZERO } from "../src/lib/receipt-evidence-lock";
 
@@ -57,12 +57,21 @@ test("the delivery-day claim is taken in the POSTING write, before the webhook",
 test("only a DEFINITE rejection gives the day back", () => {
     const cards = read("src/app/api/cron/receipt-request-cards/route.ts");
 
-    // The rejection branch releases it...
+    // The rejection branch releases it — BOTH the card column and, since round
+    // 44's finding 2, the immutable delivery row that actually enforces the
+    // rule. Deleting one is legal on this path and nowhere else.
     assert.match(
         cards,
-        /lastError: `rejected:\$\{result\.reason\}`,[\s\S]{0,400}?deliveredOn: null,/,
+        /lastError: `rejected:\$\{result\.reason\}`,[\s\S]{0,900}?deliveredOn: null,/,
         "Chat provably did not take it, so the owner's day is genuinely free",
     );
+    assert.match(
+        cards,
+        /await prisma\.receiptRequestCardDelivery\.deleteMany\([\s\S]{0,200}?deliveryDay: date/,
+        "and the reservation is retracted with it",
+    );
+    assert.equal((cards.match(/receiptRequestCardDelivery\.deleteMany/g) ?? []).length, 1,
+        "exactly one path may delete a delivery record");
 
     // ...and the uncertain branch does NOT. This is the asymmetry the whole
     // mechanism rests on: a card that MIGHT be in the space must not be
@@ -194,6 +203,90 @@ test("the evidence epoch is read under the evidence lock, and bumped by every wr
     const sweep = read("src/app/api/cron/receipt-requests/route.ts");
     assert.match(sweep, /const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch\(prisma\);/);
     assert.doesNotMatch(sweep, /bumpReceiptEvidenceEpoch/);
+});
+
+// ═══ Round 44, finding 1: the snapshot must cover the WHOLE cycle ══════════
+
+test("the epochs are captured BEFORE the open-issue pass, not after it", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+
+    const runSweepAt = sweep.indexOf("async function runSweep(");
+    const ledgerAt = sweep.indexOf("const snapshotEpoch = await readBankLedgerEpoch(prisma);", runSweepAt);
+    const evidenceAt = sweep.indexOf("const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);", runSweepAt);
+    const openPassAt = sweep.indexOf('while (startPhase !== "lines" && Date.now() - startedAt < RUN_BUDGET_MS)', runSweepAt);
+
+    assert.ok(runSweepAt > 0 && ledgerAt > runSweepAt && evidenceAt > runSweepAt);
+    assert.ok(openPassAt > ledgerAt && openPassAt > evidenceAt,
+        "both epochs are read before the open-issue pass — reading them after made them blind to it");
+
+    // Exactly one capture of each, so a second one cannot quietly re-snapshot
+    // mid-cycle and hand the fence a moving target.
+    assert.equal((sweep.match(/await readBankLedgerEpoch\(prisma\)/g) ?? []).length, 1);
+    assert.equal((sweep.match(/await readReceiptEvidenceEpoch\(prisma\)/g) ?? []).length, 1);
+});
+
+test("a continuation whose stored epochs disagree restarts from the open-issue pass", () => {
+    const sweep = read("src/app/api/cron/receipt-requests/route.ts");
+
+    // Both cursors are read, both are checked against BOTH epochs, and a
+    // mismatch discards both and forces the open-issue pass — the only pass
+    // that re-checks an issue the 60-day line window cannot even see.
+    assert.match(sweep, /const stale = stored\.some\(cursor => !cursorUsableAt\(cursor, snapshotEpoch, snapshotEvidenceEpoch\)\);/);
+    const staleAt = sweep.indexOf("const stale = stored.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));");
+    const clearAt = sweep.indexOf("await Promise.all([writeCursor(null), writeOpenCursor(null)]);", staleAt);
+    const restartAt = sweep.indexOf('effectiveStartPhase = "open-issues";', clearAt);
+    assert.ok(staleAt > 0 && clearAt > staleAt && restartAt > clearAt,
+        "a stale pair discards BOTH cursors and forces the open-issue pass");
+
+    // And the OPEN cursor carries the pair too — a resume into that pass has to
+    // prove the same thing the line pass does.
+    assert.match(sweep, /await writeOpenCursor\(formatSweepCursor\(\{ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\)/);
+});
+
+test("MULTI-INVOCATION: evidence landing behind both cursors withholds certification", async () => {
+    /**
+     * Codex PR #443 gate round 44, finding 1, as a sequence rather than a
+     * shape.
+     *
+     * Invocation 1 finishes the open-issue pass and parks a line cursor.
+     * Between then and invocation 2 a receipt is booked for an issue the first
+     * pass already decided — and that issue is OLDER than the 60-day line
+     * window, so the line pass cannot look at it either. Under round 43 the
+     * `"lines"` continuation skipped the open-issue pass, matched the only
+     * epoch it stored, finished, and stamped the cycle complete. The 14:30
+     * cards then asked somebody for a receipt they had already filed.
+     */
+    const CYCLE = { epoch: "5", evidence: "11" };
+
+    // Invocation 1's checkpoints, written against the cycle's snapshot.
+    const lineCursor = formatSweepCursor({ key: "2026-06-01|old", epoch: CYCLE.epoch, evidenceEpoch: CYCLE.evidence });
+    const openCursor = formatSweepCursor({ key: "issue-42", epoch: CYCLE.epoch, evidenceEpoch: CYCLE.evidence });
+    assert.ok(lineCursor && openCursor);
+
+    // Invocation 2 starts. The ledger has not moved; a receipt has landed.
+    const nowEvidence = "12";
+    const stored = [parseSweepCursor(lineCursor), parseSweepCursor(openCursor)];
+    const stale = stored.some(cursor => !cursorUsableAt(cursor, CYCLE.epoch, nowEvidence));
+    assert.equal(stale, true, "the cycle restarts from the open-issue pass instead of resuming into the lines");
+
+    // And certification is refused on the same fact, so nothing can stamp even
+    // if a resumed pass got that far.
+    const f = fence({ epochNow: CYCLE.epoch, evidenceEpochNow: nowEvidence, appeared: 0 });
+    const decision = await f.run(CYCLE.epoch, CYCLE.evidence);
+    assert.equal(decision.complete, false, "no certification");
+    assert.equal(f.written[0].completedAt, undefined, "no stamp — so the cards cron sends nothing today");
+
+    /**
+     * PRE-FIX CONTROL: the round-43 cursor, which stored only the ledger epoch.
+     * The ledger did not move, so it resumes happily — straight past the
+     * open-issue pass and into a completion it has not earned.
+     */
+    const roundFortyThree = `e${CYCLE.epoch}|2026-06-01|old`;
+    const legacy = parseSweepCursor(roundFortyThree);
+    assert.equal(legacy.evidenceEpoch, null, "there was nothing to disagree with");
+    const oldStyleUsable = legacy.key !== null && legacy.epoch === CYCLE.epoch;
+    assert.equal(oldStyleUsable, false,
+        "and because the two-part format is now required, that cursor no longer resumes at all");
 });
 
 // ═══ 5. Ambiguity leaves a continuation obligation ══════════════════════════

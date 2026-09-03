@@ -47,6 +47,10 @@ let queue: ScanRow[];
 let cards: Map<string, Record<string, unknown>>;
 /** Every card that actually reached the webhook. */
 let postCalls: OwnerCard[];
+/** The ReceiptRequestCardDelivery table. */
+let deliveries: Array<Record<string, string | null>>;
+/** How many times the (owner, deliveryDay) index refused an insert. */
+let deliveryConflicts: number;
 
 const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
 const yesterday = new Date(Date.parse(`${today}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
@@ -93,7 +97,36 @@ const settingStore = {
 };
 
 const cardsPrisma: Record<string, unknown> = {
-    $queryRaw: async () => [{ locked: true }],
+    /**
+     * The lease probe, and the queued-resend DISTINCT ON query (round-44 gate,
+     * finding 3). The real query reduces to one row per owner IN THE DATABASE
+     * and only then applies the global cap; the fake does the same thing over
+     * the in-memory table, so a starvation regression is visible here.
+     */
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        // The lease probe passes a Prisma.sql value, not a template array.
+        const sql = Array.isArray(strings) ? strings.join("?") : "";
+        if (!/ReceiptRequestCard/.test(sql)) return [{ locked: true }];
+        const before = String(values[0]);
+        const limit = Number(values[1]);
+        const eligible = [...cards.values()].filter(row =>
+            row.status === "PENDING"
+            && row.postedAt === null
+            && row.resendQueuedAt != null
+            && String(row.pacificDate) < before);
+        const order = (a: Record<string, unknown>, c: Record<string, unknown>) =>
+            Number(a.resendQueuedAt as Date) - Number(c.resendQueuedAt as Date)
+            || String(a.pacificDate).localeCompare(String(c.pacificDate));
+        // DISTINCT ON ("owner") ... ORDER BY "owner", "resendQueuedAt", "pacificDate"
+        const perOwner = new Map<string, Record<string, unknown>>();
+        for (const row of [...eligible].sort((a, c) => String(a.owner).localeCompare(String(c.owner)) || order(a, c))) {
+            if (!perOwner.has(row.owner as string)) perOwner.set(row.owner as string, row);
+        }
+        // ... then the global cap, applied to OWNERS.
+        return [...perOwner.values()]
+            .sort((a, c) => order(a, c) || String(a.owner).localeCompare(String(c.owner)))
+            .slice(0, limit);
+    },
     $transaction: async (arg: unknown) =>
         (typeof arg === "function" ? await (arg as (tx: unknown) => Promise<unknown>)(cardsPrisma) : arg),
     automationSetting: settingStore,
@@ -108,6 +141,35 @@ const cardsPrisma: Record<string, unknown> = {
             const from = args.cursor ? at + (args.skip ?? 0) : 0;
             if (args.cursor && at < 0) return [];
             return queue.slice(Math.max(from, 0), Math.max(from, 0) + (args.take ?? queue.length));
+        },
+    },
+    /**
+     * The immutable delivery reservation (round-44 gate, finding 2), with its
+     * UNIQUE (owner, deliveryDay) enforced — without that the fake would let a
+     * second attempt through and the regression would prove nothing.
+     */
+    receiptRequestCardDelivery: {
+        findMany: async ({ where }: { where: { deliveryDay?: string } }) =>
+            deliveries.filter(row => where.deliveryDay === undefined || row.deliveryDay === where.deliveryDay),
+        create: async ({ data }: { data: { owner: string; deliveryDay: string; cardId?: string | null } }) => {
+            if (deliveries.some(row => row.owner === data.owner && row.deliveryDay === data.deliveryDay)) {
+                deliveryConflicts++;
+                throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
+            }
+            const row = { id: `del-${deliveries.length + 1}`, cardId: data.cardId ?? null, ...data };
+            deliveries.push(row);
+            return row;
+        },
+        deleteMany: async ({ where }: { where: { owner?: string; deliveryDay?: string } }) => {
+            let count = 0;
+            for (let i = deliveries.length - 1; i >= 0; i--) {
+                const row = deliveries[i];
+                if (where.owner !== undefined && row.owner !== where.owner) continue;
+                if (where.deliveryDay !== undefined && row.deliveryDay !== where.deliveryDay) continue;
+                deliveries.splice(i, 1);
+                count++;
+            }
+            return { count };
         },
     },
     receiptRequestCard: {
@@ -193,6 +255,8 @@ function reset() {
     queue = [];
     cards = new Map();
     postCalls = [];
+    deliveries = [];
+    deliveryConflicts = 0;
     settings.clear();
     // The cards cron refuses to send until TODAY'S chase has finished a clean
     // cycle — that gate is round 32's, and every test here is about what
@@ -320,7 +384,10 @@ test("a queued resend Chat rejected is still drained, and still counted", async 
 
 test("the drain and the probes read the column, and only a POST discharges it", () => {
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    assert.match(cron, /resendQueuedAt: \{ not: null \},/, "the drain selects on the column");
+    // Raw SQL since round 44 (finding 3): the per-owner reduction is DISTINCT ON,
+    // which Prisma cannot express. The column is still what it selects on.
+    assert.match(cron, /AND "resendQueuedAt" IS NOT NULL/, "the drain selects on the column");
+    assert.match(cron, /SELECT DISTINCT ON \("owner"\)/, "one row per owner, chosen in the database");
     assert.match(cron, /status: "POSTED",[\s\S]{0,1500}resendQueuedAt: null,/, "and only a successful post clears it");
     assert.doesNotMatch(cron, /lastError: CARD_RESEND_QUEUED_REASON,\s*\n\s*pacificDate/, "the text is no longer the query");
     assert.match(cron, /if \(drainedOwners\.has\(owner\)\) continue;/);

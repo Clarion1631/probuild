@@ -513,47 +513,64 @@ async function writePhase(
  * different epoch restarts the cycle from the top rather than trusting a
  * position measured against a ledger that has since moved.
  *
- * Stored as `e<epoch>|<component key>`. The `e` prefix is load bearing: a
- * component key is ITSELF `<date>|<id>`, so a bare `<epoch>|<key>` cannot be
- * told apart from a legacy cursor whose date happened to look like an epoch.
- * Anything without the prefix is a value from an older build and reads as "no
- * epoch", which restarts — the safe direction.
+ * Stored as `e<ledger epoch>.<evidence epoch>|<component key>`. The `e` prefix
+ * is load bearing: a component key is ITSELF `<date>|<id>`, so a bare
+ * `<epoch>|<key>` cannot be told apart from a legacy cursor whose date happened
+ * to look like an epoch. Anything that does not parse is a value from an older
+ * build and reads as "no epoch", which restarts — the safe direction.
+ *
+ * BOTH EPOCHS, NOT JUST THE LEDGER'S (Codex PR #443 gate round 44, finding 1).
+ * A cursor said "everything up to here is judged", and only proved it against
+ * the ledger. Evidence arriving between two invocations — a receipt booked for
+ * an issue an earlier pass already decided — moved nothing the cursor could
+ * see, so the cycle resumed, skipped the open-issue pass, and stamped itself
+ * complete over a chase that was already answered. A card went out for a
+ * receipt somebody had filed. Both counters travel with the position now, and
+ * either one moving restarts the cycle from the open-issue pass.
  */
 interface SweepCursor {
     key: string | null;
     epoch: string | null;
+    evidenceEpoch: string | null;
 }
 
 /** The prefix that tells an epoch-carrying cursor from a legacy bare key. */
 const CURSOR_EPOCH_PREFIX = "e";
 
 export function parseSweepCursor(value: string | null): SweepCursor {
-    if (!value) return { key: null, epoch: null };
-    if (!value.startsWith(CURSOR_EPOCH_PREFIX)) return { key: value, epoch: null };
+    const bare = (key: string | null): SweepCursor => ({ key, epoch: null, evidenceEpoch: null });
+    if (!value) return bare(null);
+    if (!value.startsWith(CURSOR_EPOCH_PREFIX)) return bare(value);
     const at = value.indexOf("|");
-    if (at < 0) return { key: value, epoch: null };
-    const epoch = value.slice(CURSOR_EPOCH_PREFIX.length, at);
-    // An epoch is a counter. Anything else came from somewhere this format
-    // does not describe, and is not a position worth trusting.
-    if (!/^[0-9]+$/.test(epoch)) return { key: value, epoch: null };
-    return { epoch, key: value.slice(at + 1) || null };
+    if (at < 0) return bare(value);
+    // `<ledger>.<evidence>` — BOTH required. A one-part value is a round-43
+    // cursor, which proved only half of what a resume needs, so it reads as no
+    // epoch at all and restarts rather than resuming on a partial guarantee.
+    const parts = value.slice(CURSOR_EPOCH_PREFIX.length, at).split(".");
+    if (parts.length !== 2) return bare(value);
+    const [epoch, evidenceEpoch] = parts;
+    // Epochs are counters. Anything else came from somewhere this format does
+    // not describe, and is not a position worth trusting.
+    if (!/^[0-9]+$/.test(epoch) || !/^[0-9]+$/.test(evidenceEpoch)) return bare(value);
+    return { epoch, evidenceEpoch, key: value.slice(at + 1) || null };
 }
 
 export function formatSweepCursor(cursor: SweepCursor): string | null {
     if (!cursor.key) return null;
-    if (cursor.epoch === null) return cursor.key;
-    return `${CURSOR_EPOCH_PREFIX}${cursor.epoch}|${cursor.key}`;
+    if (cursor.epoch === null || cursor.evidenceEpoch === null) return cursor.key;
+    return `${CURSOR_EPOCH_PREFIX}${cursor.epoch}.${cursor.evidenceEpoch}|${cursor.key}`;
 }
 
 /**
  * Is a persisted cursor still usable against the ledger this run sees?
  *
- * Only when it was taken against the SAME epoch. Anything else — a different
- * epoch, a cursor from a build that stored no epoch — means the ledger moved
- * under the cycle, and the honest answer is to start it again.
+ * Only when BOTH epochs match. Anything else — a different ledger epoch, a
+ * different evidence epoch, or a cursor from a build that stored neither —
+ * means the world moved under the cycle, and the honest answer is to start it
+ * again (round-44 gate, finding 1).
  */
-export function cursorUsableAt(cursor: SweepCursor, epoch: string): boolean {
-    return cursor.key !== null && cursor.epoch === epoch;
+export function cursorUsableAt(cursor: SweepCursor, epoch: string, evidenceEpoch: string): boolean {
+    return cursor.key !== null && cursor.epoch === epoch && cursor.evidenceEpoch === evidenceEpoch;
 }
 
 async function readCursor(): Promise<string | null> {
@@ -1727,6 +1744,54 @@ export async function GET(request: Request) {
 async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     const windowStart = registerWindowStartYmd(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
+
+    /**
+     * THE CYCLE'S SNAPSHOT, TAKEN AT THE CYCLE'S START (Codex PR #443 gate
+     * round 44, finding 1).
+     *
+     * Both epochs used to be read AFTER the open-issue pass, which made them
+     * blind to exactly the window that pass runs in — and worse across
+     * invocations: a `"lines"` continuation SKIPS the open-issue pass entirely,
+     * so a receipt booked for an already-decided issue moved nothing either
+     * cursor could see. The cycle resumed, finished the line pass, and stamped
+     * completion over a chase that had been answered. The 14:30 cards then
+     * asked somebody for a receipt they had already filed.
+     *
+     * An issue older than the 60-day line window makes it worse still: the line
+     * pass cannot even look at it, so nothing downstream could have noticed.
+     *
+     * Read here, before anything is judged, and carried on every checkpoint
+     * this cycle writes.
+     */
+    const snapshotEpoch = await readBankLedgerEpoch(prisma);
+    const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);
+
+    /**
+     * A CONTINUATION MUST BE MEASURED AGAINST THE SAME WORLD.
+     *
+     * Any stored cursor whose epochs disagree with the pair just read is a
+     * position taken against a ledger or an evidence store that has since
+     * moved. Both cursors are dropped and the cycle restarts from the
+     * open-issue pass — the only pass that re-checks issues the line window
+     * cannot reach.
+     */
+    let effectiveStartPhase = startPhase;
+    if (startPhase === "lines" || (await readOpenCursor()) !== null) {
+        const stored = [parseSweepCursor(await readCursor()), parseSweepCursor(await readOpenCursor())]
+            .filter(cursor => cursor.key !== null);
+        const stale = stored.some(cursor => !cursorUsableAt(cursor, snapshotEpoch, snapshotEvidenceEpoch));
+        if (stale) {
+            console.log("[cron/receipt-requests] ledger or evidence moved between invocations; restarting the cycle", {
+                snapshotEpoch,
+                snapshotEvidenceEpoch,
+                stored: stored.map(cursor => ({ epoch: cursor.epoch, evidenceEpoch: cursor.evidenceEpoch })),
+            });
+            await Promise.all([writeCursor(null), writeOpenCursor(null)]);
+            effectiveStartPhase = "open-issues";
+        }
+    }
+    startPhase = effectiveStartPhase;
+
     // The cycle is unfinished from here until the line pass exhausts.
     if (startPhase !== "lines") await writePhase("open-issues");
 
@@ -1769,7 +1834,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // Batches this pass could not reconcile at all (replans exhausted). Unlike
     // `openUndecided` this BLOCKS the completion stamp — see sweepPhaseAfter.
     let openContended = 0;
-    let openCursor = await readOpenCursor();
+    let openCursor = parseSweepCursor(await readOpenCursor()).key;
     // A resume that already completed this pass goes straight to the lines:
     // re-running it would be correct but would eat the budget the line pass has
     // been waiting for.
@@ -1861,7 +1926,10 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         if (pageErrors > 0 || pageContended > 0) break;
 
         openCursor = page[page.length - 1].id;
-        await writeOpenCursor(openCursor);
+        // The open-issue checkpoint carries the same pair as the line one — a
+        // resume into THIS pass has to prove the same thing (round-44 gate,
+        // finding 1).
+        await writeOpenCursor(formatSweepCursor({ key: openCursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
         if (page.length < OPEN_ISSUE_BATCH_SIZE) { openExhausted = true; break; }
     }
     // A finished pass starts over next run — that is what re-checks everything.
@@ -1896,13 +1964,13 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
     // below judges this one list; a line that arrives after this point is one
     // this cycle cannot have chased, and the completion stamp has to know.
     const linePassFrom = new Date();
-    // AND THE LEDGER EPOCH AT THAT SAME INSTANT (round-37 gate, finding 3).
-    // `createdAt` sees inserts only; the epoch is bumped by every BankLine
-    // writer, so a descriptor rewritten under this pass — which changes who owns
-    // the charge, and therefore who is asked — moves it too.
-    const snapshotEpoch = await readBankLedgerEpoch(prisma);
-    // The evidence side of the same snapshot (round-43 gate, finding 4).
-    const snapshotEvidenceEpoch = await readReceiptEvidenceEpoch(prisma);
+    // THE LEDGER AND EVIDENCE EPOCHS were taken at the top of the cycle, not
+    // here (round-44 gate, finding 1). `createdAt` sees inserts only; the
+    // epochs are bumped by every BankLine and every evidence writer, so a
+    // descriptor rewritten under this pass — which changes who owns the charge,
+    // and therefore who is asked — moves one of them too. Reading them here
+    // made them blind to the open-issue pass that runs before this point, and
+    // to everything that happened while a `"lines"` continuation skipped it.
     const windowLines = await prisma.bankLine.findMany({
         where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
         orderBy: [{ postedDate: "asc" }, { id: "asc" }],
@@ -1949,10 +2017,10 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
      * cursor before this point rather than resuming into it.
      */
     const parsedCursor = parseSweepCursor(cursor);
-    const cursorEpochMatches = cursorUsableAt(parsedCursor, snapshotEpoch);
+    const cursorEpochMatches = cursorUsableAt(parsedCursor, snapshotEpoch, snapshotEvidenceEpoch);
     if (!cursorEpochMatches && parsedCursor.key !== null) {
-        console.log("[cron/receipt-requests] ledger moved between invocations; restarting the cycle",
-            { cursorEpoch: parsedCursor.epoch, snapshotEpoch });
+        console.log("[cron/receipt-requests] ledger or evidence moved between invocations; restarting the cycle",
+            { cursorEpoch: parsedCursor.epoch, cursorEvidenceEpoch: parsedCursor.evidenceEpoch, snapshotEpoch, snapshotEvidenceEpoch });
     }
     const resumeFrom = cursorEpochMatches && isComponentKey(parsedCursor.key ?? "") ? parsedCursor.key : null;
     const pages = pageComponents(
@@ -1974,7 +2042,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // judge, but the checkpoint still has to move past it.
         if (batch.length === 0) {
             cursor = page[page.length - 1].key;
-            await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch }));
+            await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
             if (pageIndex >= pages.length) exhausted = true;
             continue;
         }
@@ -2023,7 +2091,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // The checkpoint is the last COMPONENT this page finished, so a resume
         // can never land in the middle of a competition set.
         cursor = page[page.length - 1].key;
-        await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch }));
+        await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch }));
         if (pageIndex >= pages.length) { exhausted = true; break; }
     }
 

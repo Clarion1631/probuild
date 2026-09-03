@@ -267,6 +267,23 @@ export const statements = [
     // could be unbound by a later one and replayed against a second charge with
     // nothing on record to catch it. A check is a statement about the moment it
     // ran; these are statements about the row.
+    // ONE DELIVERY PER OWNER PER DAY, as an immutable row (round-44 gate,
+    // finding 2). `ReceiptRequestCard.deliveredOn` could not enforce it: it is
+    // a column on a MUTABLE row, and re-writing it onto the same row never
+    // violates that row's own unique key, so a resumed uncertain card posted
+    // twice in one day.
+    `CREATE TABLE IF NOT EXISTS "ReceiptRequestCardDelivery" (
+        "id" TEXT NOT NULL,
+        "owner" TEXT NOT NULL,
+        "deliveryDay" TEXT NOT NULL,
+        "cardId" TEXT,
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "ReceiptRequestCardDelivery_pkey" PRIMARY KEY ("id")
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_owner_deliveryDay_key"
+       ON "ReceiptRequestCardDelivery"("owner", "deliveryDay")`,
+    `CREATE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_cardId_idx"
+       ON "ReceiptRequestCardDelivery"("cardId")`,
     `CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
        "id"         TEXT NOT NULL,
        "pdfId"      TEXT NOT NULL,
@@ -355,6 +372,7 @@ export const statements = [
 
     // Same RLS class as ReceiptRequestCard: this row names a real charge and the
     // Drive file that answers it.
+    `ALTER TABLE "ReceiptRequestCardDelivery" ENABLE ROW LEVEL SECURITY`,
     `ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY`,
 ];
 
@@ -412,6 +430,13 @@ export const expectedColumns = {
     // weaker binding, it is a row the unique indexes cannot enforce anything
     // about. `createdAt` carries the DEFAULT so the backfill's COALESCE and a
     // live insert agree.
+    ReceiptRequestCardDelivery: [
+        { name: "id", type: "text", nullable: false, default: null },
+        { name: "owner", type: "text", nullable: false, default: null },
+        { name: "deliveryDay", type: "text", nullable: false, default: null },
+        { name: "cardId", type: "text", nullable: true, default: null },
+        { name: "createdAt", type: "timestamp without time zone", nullable: false, default: "CURRENT_TIMESTAMP" },
+    ],
     ReceiptMemoArtifact: [
         { name: "id", type: "text", nullable: false, default: null },
         { name: "pdfId", type: "text", nullable: false, default: null },
@@ -422,7 +447,7 @@ export const expectedColumns = {
     ],
 };
 
-const expectedRlsTables = ["ReceiptRequestCard", "ReceiptMemoArtifact"];
+const expectedRlsTables = ["ReceiptRequestCard", "ReceiptRequestCardDelivery", "ReceiptMemoArtifact"];
 
 const expectedConstraints = [
     { name: "BankLine_sourceOfRecord_check", table: "BankLine" },
@@ -455,6 +480,13 @@ const expectedUniqueIndexes = [{
     // so undelivered cards never collide.
     name: "ReceiptRequestCard_owner_deliveredOn_key",
     mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "deliveredOn"\)/],
+    mustNotMatch: [/ WHERE /],
+}, {
+    // The reservation itself (round-44 gate, finding 2). A non-unique index
+    // here would let two invocations both insert a delivery row for the same
+    // owner and day, which is the whole thing this table exists to stop.
+    name: "ReceiptRequestCardDelivery_owner_deliveryDay_key",
+    mustMatch: [/CREATE UNIQUE INDEX/, /\("owner", "deliveryDay"\)/],
     mustNotMatch: [/ WHERE /],
 }, {
     name: "ReceiptMemoArtifact_pdfId_key",

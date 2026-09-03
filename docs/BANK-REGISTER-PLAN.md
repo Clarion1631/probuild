@@ -7,7 +7,9 @@ below are incorporated. QBO = accounting system & bank mirror; ProBuild = contro
 The page is a **"QuickBooks WTB account register"**: posted QuickBooks entries affecting account 154,
 fetched at [time]. It CANNOT see WTB transactions that are pending, excluded, unmatched, or absent from
 QuickBooks, and does not prove bank clearance. No "In QuickBooks ✓" column (circular). True bank-side
-completeness = monthly WTB CSV compare (phase 5 — Marge already exports bank CSVs today).
+completeness = DAILY WTB CSV compare (decision 3 as amended 2026-09-02: the export runs daily and
+is also the money-IN trigger for the deposit sweep, because the QBO API cannot see an unbooked
+customer deposit — see `docs/plans/DEPOSIT-SWEEP-PLAN.md`). Marge already exports bank CSVs today.
 
 ## Phase 1 — /automation/bank (BUILD NOW)
 Fetch: QBO **GeneralLedger report** (spiked OK 2026-08-01: account=154 param works; rows carry txn type +

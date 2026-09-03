@@ -186,6 +186,25 @@ END $$;
 -- by a later one and then replayed against a second charge with nothing on
 -- record to catch it. A check is a statement about the moment it ran; these are
 -- statements about the row.
+-- ONE DELIVERY PER OWNER PER DAY, as an immutable row (round-44 gate, finding
+-- 2). A column on the mutable card row could not enforce it: re-writing
+-- `deliveredOn = today` onto the SAME row never violates that row's own unique
+-- key, so a resumed uncertain card posted twice in one day.
+CREATE TABLE IF NOT EXISTS "ReceiptRequestCardDelivery" (
+    "id" TEXT NOT NULL,
+    "owner" TEXT NOT NULL,
+    "deliveryDay" TEXT NOT NULL,
+    "cardId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ReceiptRequestCardDelivery_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_owner_deliveryDay_key"
+  ON "ReceiptRequestCardDelivery"("owner", "deliveryDay");
+
+CREATE INDEX IF NOT EXISTS "ReceiptRequestCardDelivery_cardId_idx"
+  ON "ReceiptRequestCardDelivery"("cardId");
+
 CREATE TABLE IF NOT EXISTS "ReceiptMemoArtifact" (
     "id" TEXT NOT NULL,
     "pdfId" TEXT NOT NULL,
@@ -274,4 +293,5 @@ UPDATE "ReviewIssue" i
 -- RLS, matching ReceiptRequestCard: ENABLE without FORCE, so the owner/service
 -- role the app connects as is unaffected while anon and authenticated get
 -- nothing.
+ALTER TABLE "ReceiptRequestCardDelivery" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ReceiptMemoArtifact" ENABLE ROW LEVEL SECURITY;

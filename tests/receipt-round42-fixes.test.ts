@@ -47,21 +47,24 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // ═══ 2. The cursor carries the epoch it was taken against ═══════════════════
 
-test("a cursor and the epoch it was measured against travel as ONE value", () => {
-    const stored = formatSweepCursor({ key: "2026-08-01|abc", epoch: "7" });
-    assert.equal(stored, "e7|2026-08-01|abc",
+test("a cursor and the epochs it was measured against travel as ONE value", () => {
+    // Widened in round 44: BOTH epochs, ledger and evidence.
+    const stored = formatSweepCursor({ key: "2026-08-01|abc", epoch: "7", evidenceEpoch: "12" });
+    assert.equal(stored, "e7.12|2026-08-01|abc",
         "the `e` prefix is what tells this apart from a legacy key whose date looks like an epoch");
 
     const parsed = parseSweepCursor(stored);
-    assert.deepEqual(parsed, { key: "2026-08-01|abc", epoch: "7" },
-        "the component key contains a pipe of its own — only the FIRST one separates the epoch");
+    assert.deepEqual(parsed, { key: "2026-08-01|abc", epoch: "7", evidenceEpoch: "12" },
+        "the component key contains a pipe of its own — only the FIRST one separates the epochs");
     assert.equal(isComponentKey(parsed.key ?? ""), true, "and what comes back is still a component key");
 });
 
-test("a resume is refused unless the ledger is the same one the cursor measured", () => {
-    const cursor = parseSweepCursor("e7|2026-08-01|abc");
-    assert.equal(cursorUsableAt(cursor, "7"), true, "same epoch: the position still means what it said");
-    assert.equal(cursorUsableAt(cursor, "8"), false, "a line landed since — the cycle starts again");
+test("a resume is refused unless BOTH the ledger and the evidence are unchanged", () => {
+    const cursor = parseSweepCursor("e7.12|2026-08-01|abc");
+    assert.equal(cursorUsableAt(cursor, "7", "12"), true, "same pair: the position still means what it said");
+    assert.equal(cursorUsableAt(cursor, "8", "12"), false, "a line landed since — the cycle starts again");
+    assert.equal(cursorUsableAt(cursor, "7", "13"), false,
+        "a receipt landed since — round 44's case, and the one that sent a card for a filed receipt");
 });
 
 test("a bare cursor from an older build reads as 'no epoch', and restarts", () => {
@@ -69,8 +72,16 @@ test("a bare cursor from an older build reads as 'no epoch', and restarts", () =
     // fail in the safe direction on its own.
     const legacy = parseSweepCursor("2026-08-01|abc");
     assert.equal(legacy.epoch, null);
+    assert.equal(legacy.evidenceEpoch, null);
     assert.equal(legacy.key, "2026-08-01|abc");
-    assert.equal(cursorUsableAt(legacy, "7"), false, "no epoch is not a matching epoch");
+    assert.equal(cursorUsableAt(legacy, "7", "12"), false, "no epoch is not a matching epoch");
+
+    // A round-43 cursor carried only the ledger epoch. It proved half of what a
+    // resume needs, so it too reads as no epoch rather than resuming on a
+    // partial guarantee.
+    const roundFortyThree = parseSweepCursor("e7|2026-08-01|abc");
+    assert.equal(roundFortyThree.epoch, null, "one part is not the two-part format");
+    assert.equal(cursorUsableAt(roundFortyThree, "7", "12"), false);
 
     // PRE-FIX CONTROL: the round-41 shape asked only whether the stored string
     // looked like a component key. It does — so the old code resumed from it
@@ -80,10 +91,12 @@ test("a bare cursor from an older build reads as 'no epoch', and restarts", () =
 });
 
 test("an empty or missing cursor is not a position at all", () => {
-    assert.deepEqual(parseSweepCursor(null), { key: null, epoch: null });
-    assert.deepEqual(parseSweepCursor(""), { key: null, epoch: null });
-    assert.equal(cursorUsableAt({ key: null, epoch: "7" }, "7"), false, "an epoch with no key resumes nothing");
-    assert.equal(formatSweepCursor({ key: null, epoch: "7" }), null, "and is never persisted as one");
+    assert.deepEqual(parseSweepCursor(null), { key: null, epoch: null, evidenceEpoch: null });
+    assert.deepEqual(parseSweepCursor(""), { key: null, epoch: null, evidenceEpoch: null });
+    assert.equal(cursorUsableAt({ key: null, epoch: "7", evidenceEpoch: "12" }, "7", "12"), false,
+        "an epoch with no key resumes nothing");
+    assert.equal(formatSweepCursor({ key: null, epoch: "7", evidenceEpoch: "12" }), null,
+        "and is never persisted as one");
 });
 
 test("a fresh run clears BOTH cursors before it starts", () => {
@@ -91,7 +104,7 @@ test("a fresh run clears BOTH cursors before it starts", () => {
     // leave the open-issue cursor pointing into the previous pass either.
     const sweep = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(sweep, /await Promise\.all\(\[writeCursor\(null\), writeOpenCursor\(null\)\]\)/);
-    assert.match(sweep, /const cursorEpochMatches = cursorUsableAt\(parsedCursor, snapshotEpoch\);/);
+    assert.match(sweep, /const cursorEpochMatches = cursorUsableAt\(parsedCursor, snapshotEpoch, snapshotEvidenceEpoch\);/);
 
     // EVERY checkpoint carries the epoch, not just the one a regex happens to
     // reach first. The sweep writes the cursor in TWO places — the ordinary
@@ -99,10 +112,10 @@ test("a fresh run clears BOTH cursors before it starts", () => {
     // pinned only the first stayed green while the second wrote a bare key
     // (measured: that mutation survived until this assertion existed).
     const checkpoints = sweep.match(/await writeCursor\(/g) ?? [];
-    const carried = sweep.match(/await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch \}\)\)/g) ?? [];
+    const carried = sweep.match(/await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch, evidenceEpoch: snapshotEvidenceEpoch \}\)\)/g) ?? [];
     assert.equal(checkpoints.length - carried.length, 1,
         "exactly one writeCursor call is not a checkpoint: the reset to null when a cycle finishes clean");
-    assert.equal(carried.length, 2, "and both real checkpoints carry the epoch");
+    assert.equal(carried.length, 2, "and both real checkpoints carry BOTH epochs");
 });
 
 // ═══ 3, 4. The cards cron, over a fake card table ═══════════════════════════
@@ -120,6 +133,10 @@ let queue: ScanRow[];
 let cards: Map<string, Record<string, unknown>>;
 /** Every card that actually reached the webhook. */
 let postCalls: OwnerCard[];
+/** The ReceiptRequestCardDelivery table. */
+let deliveries: Array<Record<string, string | null>>;
+/** How many times the (owner, deliveryDay) index refused an insert. */
+let deliveryConflicts: number;
 /**
  * What the pre-send rebuild reports for this test. `null` means "the real
  * one" — the deadline path cannot be reached by wall-clock in a unit test, and
@@ -182,7 +199,36 @@ const settingStore = {
 };
 
 const cardsPrisma: Record<string, unknown> = {
-    $queryRaw: async () => [{ locked: true }],
+    /**
+     * The lease probe, and the queued-resend DISTINCT ON query (round-44 gate,
+     * finding 3). The real query reduces to one row per owner IN THE DATABASE
+     * and only then applies the global cap; the fake does the same thing over
+     * the in-memory table, so a starvation regression is visible here.
+     */
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        // The lease probe passes a Prisma.sql value, not a template array.
+        const sql = Array.isArray(strings) ? strings.join("?") : "";
+        if (!/ReceiptRequestCard/.test(sql)) return [{ locked: true }];
+        const before = String(values[0]);
+        const limit = Number(values[1]);
+        const eligible = [...cards.values()].filter(row =>
+            row.status === "PENDING"
+            && row.postedAt === null
+            && row.resendQueuedAt != null
+            && String(row.pacificDate) < before);
+        const order = (a: Record<string, unknown>, c: Record<string, unknown>) =>
+            Number(a.resendQueuedAt as Date) - Number(c.resendQueuedAt as Date)
+            || String(a.pacificDate).localeCompare(String(c.pacificDate));
+        // DISTINCT ON ("owner") ... ORDER BY "owner", "resendQueuedAt", "pacificDate"
+        const perOwner = new Map<string, Record<string, unknown>>();
+        for (const row of [...eligible].sort((a, c) => String(a.owner).localeCompare(String(c.owner)) || order(a, c))) {
+            if (!perOwner.has(row.owner as string)) perOwner.set(row.owner as string, row);
+        }
+        // ... then the global cap, applied to OWNERS.
+        return [...perOwner.values()]
+            .sort((a, c) => order(a, c) || String(a.owner).localeCompare(String(c.owner)))
+            .slice(0, limit);
+    },
     $executeRaw: async () => 1,
     $transaction: async (arg: unknown) =>
         (typeof arg === "function" ? await (arg as (tx: unknown) => Promise<unknown>)(cardsPrisma) : arg),
@@ -198,6 +244,35 @@ const cardsPrisma: Record<string, unknown> = {
             const from = args.cursor ? at + (args.skip ?? 0) : 0;
             if (args.cursor && at < 0) return [];
             return queue.slice(Math.max(from, 0), Math.max(from, 0) + (args.take ?? queue.length));
+        },
+    },
+    /**
+     * The immutable delivery reservation (round-44 gate, finding 2), with its
+     * UNIQUE (owner, deliveryDay) enforced — without that the fake would let a
+     * second attempt through and the regression would prove nothing.
+     */
+    receiptRequestCardDelivery: {
+        findMany: async ({ where }: { where: { deliveryDay?: string } }) =>
+            deliveries.filter(row => where.deliveryDay === undefined || row.deliveryDay === where.deliveryDay),
+        create: async ({ data }: { data: { owner: string; deliveryDay: string; cardId?: string | null } }) => {
+            if (deliveries.some(row => row.owner === data.owner && row.deliveryDay === data.deliveryDay)) {
+                deliveryConflicts++;
+                throw Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
+            }
+            const row = { id: `del-${deliveries.length + 1}`, cardId: data.cardId ?? null, ...data };
+            deliveries.push(row);
+            return row;
+        },
+        deleteMany: async ({ where }: { where: { owner?: string; deliveryDay?: string } }) => {
+            let count = 0;
+            for (let i = deliveries.length - 1; i >= 0; i--) {
+                const row = deliveries[i];
+                if (where.owner !== undefined && row.owner !== where.owner) continue;
+                if (where.deliveryDay !== undefined && row.deliveryDay !== where.deliveryDay) continue;
+                deliveries.splice(i, 1);
+                count++;
+            }
+            return { count };
         },
     },
     receiptRequestCard: {
@@ -303,6 +378,8 @@ function reset() {
     queue = [];
     cards = new Map();
     postCalls = [];
+    deliveries = [];
+    deliveryConflicts = 0;
     rebuildOverride = null;
     postBarrier = null;
     uniqueViolations = 0;
@@ -493,12 +570,14 @@ test("the POSTED write takes the delivery-day claim in the same transaction", as
 test("an owner who already had a card today does not get the resend as a second one", async () => {
     reset();
     queue = [scanRow("ri-1", "CJ")];
-    // Today's ordinary card already went out.
+    // Today's ordinary card already went out — and, since round 44's finding 2,
+    // what records that is the immutable delivery row, not the card column.
     cards.set(`CJ|${today}`, {
         id: "card-today", owner: "CJ", pacificDate: today, itemsJson: "[]", overflow: 0, overflowExact: true,
         status: "POSTED", postedAt: new Date(), deliveredOn: today, claimedAt: null, claimToken: null,
         attempts: 1, lastError: null, resendQueuedAt: null,
     });
+    deliveries.push({ id: "del-today", owner: "CJ", deliveryDay: today, cardId: "card-today" });
     const queued = queuedCard("CJ", yesterday, ["ri-1"]);
 
     const body = await (await run()).json() as { queuedDrained: string[] };
@@ -564,7 +643,18 @@ test("TWO CONCURRENT RUNS, ONE MESSAGE: the reservation beats the send", async (
     // AND IT WAS THE INDEX THAT STOPPED IT, not the claim token. Without this
     // the test would pass for the wrong reason: both runs draining the SAME row
     // collide on its claim, which proves nothing about the day.
-    assert.ok(uniqueViolations >= 1, "the (owner, deliveredOn) index is what refused the second card");
+    /**
+     * TWO LAYERS, and this interleaving is caught by the first. Run A's
+     * delivery row is COMMITTED before it parks at the webhook, so run B's
+     * `deliveredToday` read — which since round 44 reads the delivery table
+     * rather than the card column — already sees it and skips. The constraint
+     * is the backstop for the narrower race where B reads before A inserts.
+     *
+     * So the assertion is about the OUTCOME both layers exist to produce, and
+     * about the reservation table being the thing that records it.
+     */
+    assert.equal(deliveries.filter(row => row.owner === "CJ" && row.deliveryDay === today).length, 1,
+        "exactly one delivery is on the books for this owner today");
 
     const row = cards.get(`CJ|${yesterday}`)!;
     assert.equal(row.status, "POSTED");
@@ -598,6 +688,134 @@ test("a POSTING write that fails for ANY OTHER reason is NOT read as 'someone be
     );
     assert.equal(postCalls.length, 0, "and nothing was sent");
     assert.equal(uniqueViolations, 0, "this was never a constraint violation");
+});
+
+// ── Round 44, finding 2: the same-row POSTING -> UNCERTAIN -> PENDING loop ──
+
+/** Today's card, already sent, now resolved back to PENDING by an operator. */
+function resolvedUncertainCardForToday() {
+    const row = {
+        id: "card-uncertain", owner: "CJ", pacificDate: today,
+        itemsJson: JSON.stringify([{ n: 1, issueId: "ri-1", fingerprint: "pb-ri-1", cents: 100, date: "2026-08-16", vendor: "LOWES" }]),
+        overflow: 0, overflowExact: true,
+        // What `resolveUncertainCard` leaves behind: PENDING again, claim
+        // released, `deliveredOn` KEPT — and that last part is the bug, because
+        // re-writing it onto this same row cannot violate this row's own key.
+        status: "PENDING", postedAt: null, deliveredOn: today,
+        claimedAt: null, claimToken: null, attempts: 1,
+        lastError: null, resendQueuedAt: null,
+    };
+    cards.set(`CJ|${today}`, row);
+    return row;
+}
+
+test("POSTING -> UNCERTAIN -> PENDING -> POSTING on one day sends exactly ONE message", async () => {
+    /**
+     * Codex PR #443 gate round 44, finding 2. The row is the SAME row
+     * throughout, which is why a unique key on that row could never catch it.
+     * The immutable delivery record can: it was written when the card first
+     * posted and nothing since has been allowed to remove it.
+     */
+    reset();
+    queue = [scanRow("ri-1", "CJ")];
+    resolvedUncertainCardForToday();
+    // The delivery this card already made, before it went uncertain.
+    deliveries.push({ id: "del-1", owner: "CJ", deliveryDay: today, cardId: "card-uncertain" });
+
+    const body = await (await run()).json() as { dayAlreadyClaimedOwners?: string[] };
+
+    assert.equal(postCalls.length, 0, "their day is spent — the resend waits for the next delivery day");
+    assert.equal(deliveries.filter(row => row.owner === "CJ" && row.deliveryDay === today).length, 1,
+        "and still exactly one delivery on the books");
+    /**
+     * AND IT WAS STOPPED BY THE CHECK, NOT BY THE CONSTRAINT.
+     *
+     * Two layers protect this, and without this assertion the test passes with
+     * the first one removed — the reservation would simply refuse the insert
+     * and the outcome would look identical. It is not identical: reaching the
+     * constraint means the run tried, and `dayAlreadyClaimedOwners` is how a
+     * run says so. A quiet skip is the correct behaviour here, because this
+     * owner's delivery is already recorded and there is nothing to race.
+     * (Measured: deleting the `deliveredToday` check left every other
+     * assertion in this file green.)
+     */
+    assert.equal(body.dayAlreadyClaimedOwners, undefined,
+        "the current-day branch skipped before reserving — it never had to lose a race");
+    assert.equal(deliveryConflicts, 0, "so the constraint was never even consulted");
+});
+
+test("PRE-FIX CONTROL: with only the card column, that same row posts a SECOND time", async () => {
+    /**
+     * The round-43 world, modelled exactly: the card still carries
+     * `deliveredOn = today`, and there is no delivery record. That is all the
+     * protection there was, and it is worth nothing here — the row is its own
+     * previous delivery, so writing `deliveredOn = today` again is a no-op
+     * against its own unique key.
+     */
+    reset();
+    queue = [scanRow("ri-1", "CJ")];
+    resolvedUncertainCardForToday();
+    // No `deliveries` row: the reservation table did not exist in round 43.
+
+    await run();
+
+    assert.equal(postCalls.length, 1, "a second message to the same person on the same day");
+    assert.equal(deliveryConflicts, 0, "nothing refused it, because nothing was there to refuse it");
+});
+
+// ── Round 44, finding 3: the drain must not starve an owner ────────────────
+
+test("an owner whose resend is FOURTH in the queue is still selected", async () => {
+    /**
+     * Codex PR #443 gate round 44, finding 3. The cap used to be applied before
+     * the per-owner reduction, so three older CJ rows filled it and Richard's
+     * resend never entered the candidate set at all — indefinitely, if CJ's
+     * kept failing. Reducing to one row per owner IN THE DATABASE and capping
+     * that means the cap bounds owners, not eligibility.
+     */
+    reset();
+    queue = [scanRow("ri-cj", "CJ"), scanRow("ri-rich", "Richard")];
+    const ago = (days: number) =>
+        new Date(Date.parse(`${today}T00:00:00Z`) - days * 86_400_000).toISOString().slice(0, 10);
+    // Three CJ resends, all older than Richard's — exactly the shape that
+    // filled a `take: 3` before anyone looked at owners.
+    queuedCard("CJ", ago(5), ["ri-cj"], { resendQueuedAt: new Date(Date.now() - 50 * 3_600_000) });
+    queuedCard("CJ", ago(4), ["ri-cj"], { resendQueuedAt: new Date(Date.now() - 49 * 3_600_000) });
+    queuedCard("CJ", ago(3), ["ri-cj"], { resendQueuedAt: new Date(Date.now() - 48 * 3_600_000) });
+    queuedCard("Richard", ago(2), ["ri-rich"], { resendQueuedAt: new Date(Date.now() - 47 * 3_600_000) });
+
+    const body = await (await run()).json() as { queuedDrained: string[] };
+
+    const owners = postCalls.map(card => card.owner).sort();
+    assert.deepEqual(owners, ["CJ", "Richard"], "both people were asked");
+    assert.equal(body.queuedDrained.filter(entry => entry.startsWith("Richard:")).length, 1,
+        "Richard's resend was drained even though three CJ rows are older");
+    assert.equal(body.queuedDrained.filter(entry => entry.startsWith("CJ:")).length, 1,
+        "and CJ still gets exactly one — the oldest");
+    assert.ok(body.queuedDrained.includes(`CJ:${ago(5)}`), "which is the oldest of the three");
+});
+
+test("PRE-FIX CONTROL: capping BEFORE the per-owner reduction loses the fourth owner", () => {
+    /**
+     * The old shape, run over the same four rows. Not a source-text guard: the
+     * two orderings are computed here and compared, so the difference is a
+     * measured fact rather than a claim about a regex.
+     */
+    const rows = [
+        { owner: "CJ", pacificDate: "d1" }, { owner: "CJ", pacificDate: "d2" },
+        { owner: "CJ", pacificDate: "d3" }, { owner: "Richard", pacificDate: "d4" },
+    ];
+    const CAP = 3;
+
+    // BEFORE: take the N oldest, then reduce to one per owner.
+    const oldWay = new Map<string, typeof rows[number]>();
+    for (const row of rows.slice(0, CAP)) if (!oldWay.has(row.owner)) oldWay.set(row.owner, row);
+    assert.deepEqual([...oldWay.keys()], ["CJ"], "Richard is not even a candidate");
+
+    // AFTER: reduce to one per owner, then take the N oldest of those.
+    const perOwner = new Map<string, typeof rows[number]>();
+    for (const row of rows) if (!perOwner.has(row.owner)) perOwner.set(row.owner, row);
+    assert.deepEqual([...perOwner.keys()].slice(0, CAP), ["CJ", "Richard"], "both fit under the same cap");
 });
 
 test("the claim is a database constraint, not a check somebody has to remember", () => {
