@@ -24,6 +24,7 @@
  *                                     (Gusto + QuickBooks auth/callback/sync/mappings)
  *   5. src/lib/pay-rate-write.ts      canWriteRates (the ONE rate writer)
  *   6. .../time-entries + .../[id]    canSeePay (labor/burden cost on a punch)
+ *   7. /manager/payroll-export     the review page itself (round 17, P0)
  *
  * ...and the GRANTING end is closed too: checkUserMutation refuses putting a
  * privileged permission on a non-staff account at all, so the row cannot exist.
@@ -67,6 +68,26 @@ test("staff still pass — the gate is not a blanket refusal", () => {
     assert.equal(canActOnFinancials(undefined), false);
 });
 
+test("a PENDING or DISABLED account is refused, whatever it holds", () => {
+    // getUserWithPermissionsByEmail drops a DISABLED user, so nothing on this
+    // surface ever asked about status again — which left PENDING, the status
+    // EVERY create produces and the one an admin uses to revoke access, holding
+    // every financial capability (round 17, P1).
+    for (const status of ["PENDING", "DISABLED", "SUSPENDED"]) {
+        assert.equal(canActOnFinancials({ role: "ADMIN", status, permissions: null }), false, status);
+        assert.equal(canActOnFinancials({ role: "FINANCE", status, permissions: WITH }), false, status);
+        assert.equal(canActOnFinancialsResolved("ADMIN", true, status), false, status);
+    }
+    // ACTIVATED is the only one that passes.
+    assert.equal(canActOnFinancials({ role: "ADMIN", status: "ACTIVATED", permissions: null }), true);
+    // A caller with no status to give is not silently downgraded: the DI'd
+    // export handler resolves a verdict rather than a row, and a few internal
+    // callers build `{ role, permissions }` after a gate that already dropped
+    // non-live accounts.
+    assert.equal(canActOnFinancialsResolved("ADMIN", true), true);
+    assert.equal(canActOnFinancials({ role: "ADMIN", permissions: null }), true);
+});
+
 test("the staff half is an ALLOWLIST — a future non-staff role is refused by default", () => {
     // `role !== "CLIENT"` would be correct only until the next non-staff login
     // exists, and the failure would be silent.
@@ -93,6 +114,9 @@ test("every gate on the surface composes the shared predicate", () => {
         ["src/lib/pay-rate-write.ts", "canWriteRates"],
         ["src/app/api/time-entries/route.ts", "canSeePay on the list endpoint"],
         ["src/app/api/time-entries/[id]/route.ts", "canSeePay on the detail endpoint"],
+        // The review PAGE, added in round 17: it hand-rolled the old expression
+        // and so kept the hole every route had already lost.
+        ["src/app/manager/payroll-export/page.tsx", "the payroll review page"],
     ] as const;
 
     for (const [file, what] of GATES) {

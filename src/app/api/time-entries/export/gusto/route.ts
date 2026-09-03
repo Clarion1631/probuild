@@ -42,7 +42,7 @@ import {
  * (tests/gusto-export-route.test.ts) — a source-string check would not prove a
  * FIELD_CREW actually gets a 403.
  */
-export type GustoExportViewer = { role: string; canReadFinancialReports: boolean };
+export type GustoExportViewer = { role: string; status?: string | null; canReadFinancialReports: boolean };
 
 export interface GustoExportDependencies {
     /** Resolved staff viewer, or null when there is no session. */
@@ -106,7 +106,7 @@ export function createGustoExportHandler(dependencies: GustoExportDependencies) 
             // the SAME predicate the other gates use. It used to be the
             // permission alone, and `financialReports` is assignable to a portal
             // CLIENT (round 15, finding 1).
-            if (!canActOnFinancialsResolved(viewer.role, viewer.canReadFinancialReports)) {
+            if (!canActOnFinancialsResolved(viewer.role, viewer.canReadFinancialReports, viewer.status)) {
                 return NextResponse.json({ error: "Forbidden" }, { status: 403 });
             }
 
@@ -305,7 +305,12 @@ const handler = createGustoExportHandler({
     authenticate: async () => {
         const user = await getCurrentUserWithPermissions();
         if (!user) return null;
-        return { role: user.role, canReadFinancialReports: hasPermission(user, "financialReports") };
+        // status too: a PENDING account is not a live one (round 17, P1).
+        return {
+            role: user.role,
+            status: user.status,
+            canReadFinancialReports: hasPermission(user, "financialReports"),
+        };
     },
     resolveTimeZone: resolveCompanyTimeZone,
     // `keys` carries startKey, endKey AND the resolved timeZone, so the loader

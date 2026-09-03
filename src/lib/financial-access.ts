@@ -36,20 +36,44 @@ export const FINANCIAL_PERMISSION = "financialReports" as const;
  * calls this, which IS the row-shaped version's body — one rule, two entry
  * points, no chance of the endpoint and the panel disagreeing.
  */
-export function canActOnFinancialsResolved(role: string | null | undefined, hasFinancialPermission: boolean): boolean {
+export function canActOnFinancialsResolved(
+    role: string | null | undefined,
+    hasFinancialPermission: boolean,
+    status?: string | null
+): boolean {
     // STAFF FIRST. A CLIENT holding the permission fails here, which is the
     // whole point: the permission grants authority WITHIN the company, it does
     // not make a customer an employee.
     if (!isPayrollEligibleRole(role)) return false;
+    // ...and the account has to be LIVE. getUserWithPermissionsByEmail drops a
+    // DISABLED user, so nothing on this surface ever asked about status again —
+    // which left PENDING, the status every create in this app produces and the
+    // one an admin revoking access by resetting somebody produces too, holding
+    // every financial capability it had (round 17, P1).
+    //
+    // POSITIVE, and `undefined` passes: the DI'd export handler resolves a
+    // verdict rather than a row and has no status to give, so the two entry
+    // points below supply it and a caller that genuinely cannot is not silently
+    // downgraded. Every real caller supplies it.
+    if (status !== undefined && status !== null && status !== "ACTIVATED") return false;
     return role === "ADMIN" || hasFinancialPermission;
 }
 
 /** THE decision, over a user row with its permissions loaded. */
 export function canActOnFinancials(
-    user: { role: string; permissions?: unknown } | null | undefined
+    user: { role: string; status?: string | null; permissions?: unknown } | null | undefined
 ): boolean {
     if (!user) return false;
-    return canActOnFinancialsResolved(user.role, hasPermission(user as never, FINANCIAL_PERMISSION));
+    return canActOnFinancialsResolved(
+        user.role,
+        hasPermission(user as never, FINANCIAL_PERMISSION),
+        // A row always has one. `?? "ACTIVATED"` is NOT a default for the real
+        // thing — Prisma's User.status is non-null — it is for the hand-built
+        // objects a few callers pass (`{ role, permissions }` for a pay-visibility
+        // decision), which have already been through a gate that dropped
+        // non-live accounts.
+        user.status ?? "ACTIVATED"
+    );
 }
 
 /**

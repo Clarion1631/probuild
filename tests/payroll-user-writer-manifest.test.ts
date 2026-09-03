@@ -80,7 +80,7 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: string }> = {
     // ---- activation and profile edits: the round-34 hole --------------------
-    "app/api/users/[id]/route.ts:201::update": {
+    "app/api/users/[id]/route.ts:208::update": {
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
@@ -110,15 +110,15 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "guarded",
         why: "THE rate/payType writer — takes acquirePayrollWriteLock and then the owner row lock, in the global order",
     },
-    "lib/actions.ts:15567::updateMany": {
+    "lib/actions.ts:15626::updateMany": {
         kind: "guarded",
         why: "applyGustoRateImport, inside a transaction that takes acquirePayrollWriteLock before any row lock",
     },
-    "lib/actions.ts:15654::updateMany": {
+    "lib/actions.ts:15713::updateMany": {
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
-    "app/api/users/[id]/route.ts:365::delete": {
+    "app/api/users/[id]/route.ts:372::delete": {
         kind: "guarded",
         why: "runs through deleteParentWithTimeEntries, which takes acquirePayrollWriteLock and refuses while any of the member's hours sit in a locked period",
     },
@@ -132,7 +132,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "a CLIENT-role portal account: no payType, and User.status defaults to PENDING, so it cannot be on an hourly roster and it has no punches",
     },
-    "app/api/users/[id]/route.ts:257::update": {
+    "app/api/users/[id]/route.ts:264::update": {
         kind: "exempt",
         why: "connect/disconnect on assignedProjects only — dispatch crew assignment reaches no column the export reads",
     },
@@ -140,11 +140,11 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "connects In-Progress projects to a just-activated member; it touches assignedProjects and nothing else",
     },
-    "lib/actions.ts:7809::update": {
+    "lib/actions.ts:7865::update": {
         kind: "exempt",
         why: "markFieldUpdatesSeen writes fieldUpdatesSeenAt, a per-user UI timestamp that reaches no export",
     },
-    "lib/actions.ts:15228::update": {
+    "lib/actions.ts:15287::update": {
         kind: "exempt",
         why: "the WA meal-waiver signature stamp — it changes what settlement owes, which is a TimeEntry write, not a roster or CSV column",
     },

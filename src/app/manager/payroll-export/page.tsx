@@ -15,8 +15,9 @@ export const dynamic = "force-dynamic";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { canActOnFinancials } from "@/lib/financial-access";
+import { canUseDevAuthFallback } from "@/lib/permissions";
 import { getSessionOrDev } from "@/lib/auth";
-import { hasPermission } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
 import {
@@ -48,13 +49,25 @@ export default async function PayrollExportPage({ searchParams }: Props) {
         where: { email: session.user.email },
         include: { permissions: true },
     });
-    // Same gate as GET /api/time-entries/export/gusto — the page must never show
-    // totals to someone the download would refuse.
-    if (viewer && viewer.role !== "ADMIN" && !hasPermission(viewer, "financialReports")) {
-        return <div className="p-8 text-red-500">Access Denied. Payroll access required.</div>;
-    }
-    if (!viewer && process.env.NODE_ENV !== "development") {
-        return <div className="p-8 text-red-500">Access Denied. Payroll access required.</div>;
+    // THE SHARED PREDICATE — staff role, ACTIVATED, and then the permission.
+    //
+    // This page reimplemented `ADMIN || financialReports` by hand, so it kept
+    // the exact hole round 15 closed everywhere else: an activated portal CLIENT
+    // holding that assignable permission passed the proxy and rendered the whole
+    // company's payroll — every rate, every name, the lot (round 17, P0). The
+    // page must never show totals the download would refuse, and the only way to
+    // guarantee that is to ask the same question the download asks.
+    //
+    // Positive, and stated once: a viewer is allowed, or the dev fallback
+    // applies, or it is denied. The old shape had two negative branches and a
+    // `viewer &&` in front of the first, so a null viewer skipped the real check
+    // entirely and landed on a NODE_ENV test.
+    const allowed = canActOnFinancials(viewer);
+    if (!allowed) {
+        const devFallback = !viewer && (await canUseDevAuthFallback());
+        if (!devFallback) {
+            return <div className="p-8 text-red-500">Access Denied. Payroll access required.</div>;
+        }
     }
 
     const params = await searchParams;

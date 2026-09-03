@@ -420,6 +420,35 @@ test("PUT: a payType-only body writes too, and an EMPTY body still writes nothin
     assert.deepEqual(permissionWrites, []);
 });
 
+test("PUT: a showOnDispatch-only body writes — it was a silent 200 too", async () => {
+    // `showOnDispatch` is written INSIDE the guarded closure, because it is
+    // derived from the LOCKED target role (a FINANCE account may never be
+    // offered as dispatch crew). But a body carrying only that field produced an
+    // empty `data`, no permissions and no rate fields — so the transaction never
+    // opened and the route answered 200 having changed nothing (round 17, P2):
+    // the same silent no-op the rate-only body had in round 13.
+    resetDb();
+    sessionEmail = "admin@example.test";
+    const res = await PUT(...request("u-crew", { userInfo: { showOnDispatch: true } }));
+    assert.equal(res.status, 200);
+    const write = userWrites.find((entry) => "showOnDispatch" in entry);
+    assert.ok(write, "the flag never reached a writer — this is the no-op");
+    assert.equal(write!.showOnDispatch, true);
+});
+
+test("PUT: showOnDispatch is FORCED false for a FINANCE target, under the lock", async () => {
+    // The reason it lives inside the closure: the decision reads the role this
+    // transaction locked, not the one the request claimed.
+    resetDb();
+    sessionEmail = "admin@example.test";
+    USERS["u-crew"].role = "FINANCE";
+    const res = await PUT(...request("u-crew", { userInfo: { showOnDispatch: true } }));
+    assert.equal(res.status, 200);
+    const write = userWrites.find((entry) => "showOnDispatch" in entry);
+    assert.ok(write);
+    assert.equal(write!.showOnDispatch, false, "a FINANCE account is never dispatch crew");
+});
+
 test("every user-mutating writer routes through the shared guard", () => {
     // The pure tests above prove the RULES; this proves they are the ones every
     // surface asks. A route that grows its own copy is how the four disagreed in

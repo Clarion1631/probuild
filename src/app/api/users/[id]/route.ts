@@ -151,7 +151,14 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             Object.keys(data).length > 0 ||
             Object.keys(sanitizedPermissions).length > 0 ||
             touchesPayrollRateState(rateChange) ||
-            projectIds !== undefined
+            projectIds !== undefined ||
+            // `showOnDispatch` is written INSIDE the guarded closure (it is
+            // derived from the locked target role, because FINANCE may never be
+            // offered as dispatch crew). A body carrying only that field
+            // therefore never opened the transaction and answered 200 having
+            // changed nothing (round 17, P2) — the same silent no-op as the
+            // rate-only body in round 13.
+            userInfo?.showOnDispatch !== undefined
         ) {
             try {
                 await prisma.$transaction(async (tx) => {
