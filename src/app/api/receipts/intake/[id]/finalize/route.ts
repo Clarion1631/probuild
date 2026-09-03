@@ -158,11 +158,22 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     let body: { sha256?: unknown; costCodeId?: unknown; projectId?: unknown } = {};
     const rawBody = await req.text();
     if (rawBody.trim()) {
+        let parsed: unknown;
         try {
-            body = JSON.parse(rawBody);
+            parsed = JSON.parse(rawBody);
         } catch {
             return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
         }
+        // Parsing can SUCCEED on a value that is not "no fields" either: a bare
+        // string, number, boolean, or array is valid JSON, but every field read
+        // off it (body.sha256, body.costCodeId, ...) comes back undefined —
+        // indistinguishable from a genuinely empty body, so it fell through to
+        // the same 200 with nothing applied. Only a plain object can carry late
+        // fields; anything else is refused the same as malformed JSON.
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+        }
+        body = parsed as typeof body;
     }
     const declaredSha = typeof body.sha256 === "string" ? body.sha256.trim().toLowerCase() : null;
 

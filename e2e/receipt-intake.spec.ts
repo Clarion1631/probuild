@@ -1441,6 +1441,38 @@ test.describe("round-10 finalize authorization and recovery", () => {
         expect(row?.costCodeId).toBeNull();
     });
 
+    test("a JSON body that parses to a non-object is a 400, not silently treated as empty", async ({ request }) => {
+        // `"just a string"` is perfectly valid JSON — JSON.parse succeeds — but
+        // it is not an OBJECT, so body.sha256 / body.costCodeId / body.projectId
+        // all read as undefined off it, identical to a genuinely empty body.
+        // Without an explicit object check this fell through to 200 with
+        // nothing applied — the same silent-no-op shape as the truncated-JSON
+        // case above. A number, boolean, or bare array parses just as cleanly
+        // and would hit the same gap.
+        const created = await postIntake(request, intakeBody({ sourceRef: `${REF_PREFIX}nonobjjson` }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        // Buffer for the same reason as the truncated-JSON case above: a raw
+        // STRING `data` under an application/json content-type gets re-wrapped
+        // by Playwright when it isn't already valid JSON. This payload IS
+        // already valid JSON (a quoted string), so Playwright would send it
+        // as-is either way — the Buffer just keeps this test explicit about
+        // what bytes actually go on the wire.
+        const res = await request.post(`${INTAKE_PATH}/${created.body.id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: Buffer.from('"just a string"', "utf8"),
+            maxRedirects: 0,
+        });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).reason).toBe("invalid-json");
+
+        // Nothing was written: no late field applied and no state change.
+        const row = await prisma.receiptIntake.findUnique({ where: { id: created.body.id } });
+        expect(row?.state).toBe("RECEIVED");
+        expect(row?.costCodeId).toBeNull();
+    });
+
     test("a session caller cannot attach a project it may not reach", async ({ playwright, request }) => {
         // Without this any authenticated user could file a receipt against any
         // project by id.
