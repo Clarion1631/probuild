@@ -18,6 +18,7 @@ import type {
 } from "@/lib/dispatch-intent";
 import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getDaysBetween, getMonday, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { displayEndDate } from "@/lib/schedule-dates";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
@@ -2107,7 +2108,7 @@ export function ScheduleBoard({
                     clientY: drag.latestClientY,
                     deltaX,
                     sourceOffsetX: drag.originX - drag.startX,
-                    label: candidate ? `UTC ${candidate.startDate} to ${candidate.endDate}` : null,
+                    label: candidate ? `UTC ${candidate.startDate} to ${displayEndDate(candidate.startDate, candidate.endDate, canonicalTask.type)}` : null,
                     targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
                 });
             }

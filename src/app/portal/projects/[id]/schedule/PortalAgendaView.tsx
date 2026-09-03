@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { addTaskCommentAsSub, updateTaskStatusAsSub } from "@/lib/actions";
+import { displayEndDate } from "@/lib/schedule-dates";
 import type { PortalTask, PortalViewMode } from "./PortalScheduleView";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -34,7 +35,7 @@ function fmtDay(d: Date) {
 }
 function fmtRange(task: PortalTask) {
     const start = parseUTCDate(task.startDate);
-    const end = parseUTCDate(task.endDate);
+    const end = parseUTCDate(displayEndDate(task.startDate, task.endDate, task.type));
     if (task.type === "milestone" || start.getTime() === end.getTime()) return fmtDay(start);
     return `${fmtDay(start)} – ${fmtDay(end)}`;
 }
@@ -85,7 +86,7 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
     // when the whole schedule is in the past, land on the final week.
     let anchorIdx = groups.findIndex(g =>
         g.monday.getTime() >= currentMonday.getTime()
-        || g.tasks.some(t => parseUTCDate(t.endDate).getTime() >= today.getTime()));
+        || g.tasks.some(t => parseUTCDate(displayEndDate(t.startDate, t.endDate, t.type)).getTime() >= today.getTime()));
     if (anchorIdx === -1) anchorIdx = groups.length - 1;
     const anchorTime = groups[anchorIdx]?.monday.getTime();
 
