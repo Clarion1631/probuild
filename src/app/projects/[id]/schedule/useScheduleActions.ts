@@ -13,6 +13,7 @@ import {
 import { toast } from "sonner";
 import type { Task, EstimateItemSummary, PunchItem, Comment } from "./schedule-types";
 import { getDaysBetween, addDays, formatDate, computeCriticalPath } from "./schedule-utils";
+import { storedEndDate } from "@/lib/schedule-dates";
 
 export function useScheduleActions(
     projectId: string,
@@ -66,14 +67,24 @@ export function useScheduleActions(
     }, [selectedTaskId]);
 
     // --- Cascade dependents (recursive) ---
-    async function cascadeDependents(taskId: string, dayDelta: number) {
+    async function cascadeDependents(taskId: string, dayDelta: number, visited: Set<string> = new Set()) {
+        if (visited.has(taskId)) return;
+        visited.add(taskId);
         const deps = tasksRef.current.filter(t => t.dependencies.some(d => d.predecessorId === taskId));
         for (const dep of deps) {
+            if (visited.has(dep.id)) continue;
+            const prevStart = dep.startDate;
+            const prevEnd = dep.endDate;
             const ns = formatDate(addDays(new Date(dep.startDate), dayDelta));
             const ne = dep.type === "milestone" ? ns : formatDate(addDays(new Date(dep.endDate), dayDelta));
             setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: ns, endDate: ne } : t));
-            await updateScheduleTask(dep.id, { startDate: ns, endDate: ne });
-            await cascadeDependents(dep.id, dayDelta);
+            const res = await updateScheduleTask(dep.id, { startDate: ns, endDate: ne });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === dep.id ? { ...t, startDate: prevStart, endDate: prevEnd } : t));
+                toast.error(res.error);
+                continue;
+            }
+            await cascadeDependents(dep.id, dayDelta, visited);
         }
     }
 
@@ -82,7 +93,7 @@ export function useScheduleActions(
         setNewTaskType(type);
         setNewTaskName(type === "milestone" ? "New Milestone" : "New Task");
         setNewTaskStart(formatDate(today));
-        setNewTaskEnd(type === "milestone" ? formatDate(today) : formatDate(addDays(today, 5)));
+        setNewTaskEnd(type === "milestone" ? formatDate(today) : formatDate(addDays(today, 4)));
         setShowNewTaskForm(true);
     }
 
@@ -93,34 +104,53 @@ export function useScheduleActions(
         setIsAdding(true);
         try {
             const start = newTaskStart;
-            const end = newTaskType === "milestone" ? start : newTaskEnd;
-            const task = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
-            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            const displayEnd = newTaskType === "milestone" ? start : newTaskEnd;
+            const end = storedEndDate(start, displayEnd, newTaskType);
+            const res = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
+            if (!res.ok) { toast.error(res.error); return; }
+            const created = res.task as any;
+            const createdStart = created.startDate instanceof Date ? created.startDate.toISOString().slice(0, 10) : created.startDate;
+            const createdEnd = created.endDate instanceof Date ? created.endDate.toISOString().slice(0, 10) : created.endDate;
+            setTasks(prev => [...prev, { ...created, startDate: createdStart, endDate: createdEnd, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
             toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
             setShowNewTaskForm(false);
         } finally { setIsAdding(false); }
     }
 
     // --- Task CRUD ---
+    // `value` arriving here is already a STORED date — TaskDetailPanel and
+    // TableView convert from the displayed inclusive date before calling.
     async function handleDateChange(taskId: string, field: "startDate" | "endDate", value: string) {
         if (!value) return;
         const task = tasksRef.current.find(t => t.id === taskId);
         if (!task) return;
         if (task.type === "milestone") {
             const oldStart = task.startDate;
+            const oldEnd = task.endDate;
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: value, endDate: value } : t));
-            await updateScheduleTask(taskId, { startDate: value, endDate: value });
+            const res = await updateScheduleTask(taskId, { startDate: value, endDate: value });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: oldStart, endDate: oldEnd } : t));
+                toast.error(res.error);
+                return;
+            }
             if (value !== oldStart) {
                 const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
                 if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
             }
             return;
         }
-        if (field === "startDate" && value > task.endDate) { toast.error("Start date must be on or before end date"); return; }
-        if (field === "endDate" && value < task.startDate) { toast.error("End date must be on or after start date"); return; }
+        if (field === "startDate" && value >= task.endDate) { toast.error("Start date must be on or before the end date"); return; }
+        if (field === "endDate" && value <= task.startDate) { toast.error("End date must be on or after the start date"); return; }
         const oldStart = task.startDate;
+        const oldEnd = task.endDate;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, [field]: value } : t));
-        await updateScheduleTask(taskId, { [field]: value });
+        const res = await updateScheduleTask(taskId, { [field]: value });
+        if (!res.ok) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: oldStart, endDate: oldEnd } : t));
+            toast.error(res.error);
+            return;
+        }
         if (field === "startDate" && value !== oldStart) {
             const dayDelta = getDaysBetween(new Date(oldStart), new Date(value));
             if (dayDelta !== 0) await cascadeDependents(taskId, dayDelta);
@@ -136,7 +166,11 @@ export function useScheduleActions(
         const previous = tasksRef.current.find(t => t.id === taskId);
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status, blockedReason: status === "Blocked" ? (blockedReason ?? t.blockedReason) : null } : t));
         try {
-            await updateScheduleTask(taskId, { status, blockedReason: status === "Blocked" ? blockedReason : null });
+            const res = await updateScheduleTask(taskId, { status, blockedReason: status === "Blocked" ? blockedReason : null });
+            if (!res.ok) {
+                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                toast.error(res.error);
+            }
         } catch (error) {
             if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
             toast.error(error instanceof Error ? error.message : "Failed to update status");
@@ -147,7 +181,11 @@ export function useScheduleActions(
         const previous = tasksRef.current.find(t => t.id === taskId)?.doneWhen ?? null;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen } : t));
         try {
-            await updateScheduleTask(taskId, { doneWhen });
+            const res = await updateScheduleTask(taskId, { doneWhen });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
+                toast.error(res.error);
+            }
         } catch (error) {
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
             toast.error(error instanceof Error ? error.message : "Failed to update completion criteria");
@@ -158,7 +196,11 @@ export function useScheduleActions(
         const previous = tasksRef.current.find(t => t.id === taskId)?.clientStage ?? null;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage } : t));
         try {
-            await updateScheduleTask(taskId, { clientStage });
+            const res = await updateScheduleTask(taskId, { clientStage });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage: previous } : t));
+                toast.error(res.error);
+            }
         } catch (error) {
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage: previous } : t));
             toast.error(error instanceof Error ? error.message : "Failed to update client stage");
@@ -169,7 +211,11 @@ export function useScheduleActions(
         const previous = tasksRef.current.find(t => t.id === taskId);
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...data } : t));
         try {
-            await updateScheduleTask(taskId, data);
+            const res = await updateScheduleTask(taskId, data);
+            if (!res.ok) {
+                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                toast.error(res.error);
+            }
         } catch (error) {
             if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
             toast.error(error instanceof Error ? error.message : "Failed to update appointment");
@@ -177,30 +223,84 @@ export function useScheduleActions(
     }
 
     async function handleColorChange(taskId: string, color: string) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.color;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color } : t));
-        await updateScheduleTask(taskId, { color });
+        try {
+            const res = await updateScheduleTask(taskId, { color });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color: previous ?? t.color } : t));
+                toast.error(res.error);
+            }
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, color: previous ?? t.color } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to update color");
+        }
     }
 
     async function handleDelete(taskId: string) {
+        const previousTasks = tasksRef.current;
+        const wasSelected = selectedTaskId === taskId;
         setTasks(prev => prev.filter(t => t.id !== taskId));
-        if (selectedTaskId === taskId) setSelectedTaskId(null);
-        await deleteScheduleTask(taskId);
-        toast.success("Task deleted");
+        if (wasSelected) setSelectedTaskId(null);
+        try {
+            const res = await deleteScheduleTask(taskId);
+            if (!res.ok) {
+                setTasks(previousTasks);
+                if (wasSelected) setSelectedTaskId(taskId);
+                toast.error(res.error);
+                return;
+            }
+            toast.success("Task deleted");
+        } catch (error) {
+            setTasks(previousTasks);
+            if (wasSelected) setSelectedTaskId(taskId);
+            toast.error(error instanceof Error ? error.message : "Failed to delete task");
+        }
     }
 
     async function handleNameSave(taskId: string, name: string) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.name;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name } : t));
-        await updateScheduleTask(taskId, { name });
+        try {
+            const res = await updateScheduleTask(taskId, { name });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: previous ?? t.name } : t));
+                toast.error(res.error);
+            }
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, name: previous ?? t.name } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to save name");
+        }
     }
 
     async function handleEstimatedHoursSave(taskId: string, hours: number) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.estimatedHours ?? null;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: hours } : t));
-        await updateScheduleTask(taskId, { estimatedHours: hours });
+        try {
+            const res = await updateScheduleTask(taskId, { estimatedHours: hours });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: previous } : t));
+                toast.error(res.error);
+            }
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimatedHours: previous } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to save estimated hours");
+        }
     }
 
     async function handleProgressChange(taskId: string, progress: number) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.progress;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress } : t));
-        await updateScheduleTask(taskId, { progress });
+        try {
+            const res = await updateScheduleTask(taskId, { progress });
+            if (!res.ok) {
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress: previous ?? t.progress } : t));
+                toast.error(res.error);
+            }
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, progress: previous ?? t.progress } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to save progress");
+        }
     }
 
     // --- Linking ---
@@ -341,24 +441,47 @@ export function useScheduleActions(
     async function handleLinkEstimateItem(taskId: string, item: EstimateItemSummary) {
         const autoHours = (item.type === "Labor" || item.budgetUnit === "hours") ? (item.quantity ?? null) : null;
         const taskName = tasks.find(t => t.id === taskId)?.name ?? "";
+        const previous = tasksRef.current.find(t => t.id === taskId);
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: item.id, estimateItem: item, ...(autoHours != null ? { estimatedHours: autoHours } : {}) } : t));
         setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: taskId, linkedTaskName: taskName } : ei));
         try {
-            await updateScheduleTask(taskId, { estimateItemId: item.id });
+            const res = await updateScheduleTask(taskId, { estimateItemId: item.id });
+            if (!res.ok) {
+                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
+                toast.error(res.error);
+                return;
+            }
             toast.success(autoHours != null ? `Linked — ${autoHours}h estimated` : "Linked to estimate item");
-        } catch (e: any) {
-            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
+        } catch (error) {
+            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
             setEstimateItems(prev => prev.map(ei => ei.id === item.id ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
-            toast.error(e.message || "Failed to link estimate item");
+            toast.error(error instanceof Error ? error.message : "Failed to link estimate item");
         }
     }
 
     async function handleUnlinkEstimateItem(taskId: string) {
         const itemId = tasks.find(t => t.id === taskId)?.estimateItemId;
+        const previous = tasksRef.current.find(t => t.id === taskId);
+        const previousItem = itemId ? estimateItems.find(ei => ei.id === itemId) : undefined;
+        const previousLinkedTaskId = previousItem?.linkedTaskId ?? null;
+        const previousLinkedTaskName = previousItem?.linkedTaskName ?? null;
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, estimateItemId: null, estimateItem: null } : t));
         if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: null, linkedTaskName: null } : ei));
-        await updateScheduleTask(taskId, { estimateItemId: null });
-        toast.success("Estimate link removed");
+        try {
+            const res = await updateScheduleTask(taskId, { estimateItemId: null });
+            if (!res.ok) {
+                if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+                if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: previousLinkedTaskId, linkedTaskName: previousLinkedTaskName } : ei));
+                toast.error(res.error);
+                return;
+            }
+            toast.success("Estimate link removed");
+        } catch (error) {
+            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+            if (itemId) setEstimateItems(prev => prev.map(ei => ei.id === itemId ? { ...ei, linkedTaskId: previousLinkedTaskId, linkedTaskName: previousLinkedTaskName } : ei));
+            toast.error(error instanceof Error ? error.message : "Failed to remove estimate link");
+        }
     }
 
     function fetchEstimateItems() {

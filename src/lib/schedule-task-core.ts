@@ -10,6 +10,7 @@ import {
     touchTaskAssignmentRevision,
     type ScheduleActor,
 } from "./schedule-core";
+import { ScheduleTaskValidationError } from "./schedule-task-result";
 
 export const SCHEDULE_TASK_TYPES = ["task", "milestone", "appointment"] as const;
 export const SCHEDULE_CONFIRMATION_STATUSES = ["planned", "requested", "confirmed"] as const;
@@ -66,27 +67,27 @@ export interface UpdateScheduleTaskInput {
 
 function assertScheduleTaskType(type: string): asserts type is ScheduleTaskType {
     if (!(SCHEDULE_TASK_TYPES as readonly string[]).includes(type)) {
-        throw new Error("Invalid schedule task type");
+        throw new ScheduleTaskValidationError("Invalid schedule task type");
     }
 }
 
 function assertScheduleTaskStatus(status: string): asserts status is ScheduleTaskStatus {
     if (!(SCHEDULE_TASK_STATUSES as readonly string[]).includes(status)) {
-        throw new Error(`Invalid schedule task status "${status}"`);
+        throw new ScheduleTaskValidationError(`Invalid schedule task status "${status}"`);
     }
 }
 
 function normalizeScheduledTime(value: string | null | undefined): string | null {
     const normalized = value?.trim() || null;
     if (normalized && !SCHEDULE_TIME_PATTERN.test(normalized)) {
-        throw new Error("Scheduled time must use 24-hour HH:MM format");
+        throw new ScheduleTaskValidationError("Scheduled time must use 24-hour HH:MM format");
     }
     return normalized;
 }
 
 function assertConfirmationStatus(value: string): asserts value is ScheduleConfirmationStatus {
     if (!(SCHEDULE_CONFIRMATION_STATUSES as readonly string[]).includes(value)) {
-        throw new Error("Invalid appointment confirmation status");
+        throw new ScheduleTaskValidationError("Invalid appointment confirmation status");
     }
 }
 
@@ -111,39 +112,39 @@ export async function createScheduleTaskInTransaction(
     commentAuthor?: ScheduleTaskCommentAuthor | null,
 ) {
     const name = data.name.trim();
-    if (!name) throw new Error("Task name is required");
+    if (!name) throw new ScheduleTaskValidationError("Task name is required");
     const type = data.type ?? "task";
     assertScheduleTaskType(type);
     if (data.status !== undefined) assertScheduleTaskStatus(data.status);
-    if (data.status === "Blocked") throw new Error("Blocked tasks require a reason");
+    if (data.status === "Blocked") throw new ScheduleTaskValidationError("Blocked tasks require a reason");
 
     const startDate = parseStartDateInput(data.startDate);
     const requestedEndDate = parseStartDateInput(data.endDate);
     const endDate = type === "milestone" ? startDate : requestedEndDate;
-    if (type !== "milestone" && endDate < startDate) {
-        throw new Error("Task end date cannot be before its start date");
+    if (type !== "milestone" && endDate <= startDate) {
+        throw new ScheduleTaskValidationError("Task end date must be after its start date (the end date is the day after the last day of work)");
     }
     if (data.estimatedHours != null && (!Number.isFinite(data.estimatedHours) || data.estimatedHours < 0)) {
-        throw new Error("Estimated hours must be zero or greater");
+        throw new ScheduleTaskValidationError("Estimated hours must be zero or greater");
     }
 
     const scheduledTime = normalizeScheduledTime(data.scheduledTime);
     if (data.confirmationStatus) assertConfirmationStatus(data.confirmationStatus);
     if (type !== "appointment" && (scheduledTime || data.confirmationStatus)) {
-        throw new Error("Scheduled time and confirmation status are appointment-only fields");
+        throw new ScheduleTaskValidationError("Scheduled time and confirmation status are appointment-only fields");
     }
     const confirmationStatus = type === "appointment" ? (data.confirmationStatus ?? "planned") : null;
     const estimateItemId = data.estimateItemId?.trim() || null;
     const crewIds = [...new Set((data.crewIds ?? []).filter(Boolean))];
     const leadUserId = data.leadUserId ?? null;
     if (leadUserId && !crewIds.includes(leadUserId)) {
-        throw new Error("Task lead must be assigned to the crew");
+        throw new ScheduleTaskValidationError("Task lead must be assigned to the crew");
     }
     const note = data.note?.trim() || null;
 
     await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
     const project = await tx.project.findUnique({ where: { id: projectId }, select: { id: true } });
-    if (!project) throw new Error("Project not found");
+    if (!project) throw new ScheduleTaskValidationError("Project not found");
 
     const estimateItem = estimateItemId
         ? await tx.estimateItem.findUnique({
@@ -161,13 +162,13 @@ export async function createScheduleTaskInTransaction(
         : null;
     if (estimateItemId) {
         if (!estimateItem || estimateItem.estimate.projectId !== projectId) {
-            throw new Error("Estimate item does not belong to this project");
+            throw new ScheduleTaskValidationError("Estimate item does not belong to this project");
         }
         if (estimateItem.type === "Section") {
-            throw new Error("Estimate sections cannot be scheduled as tasks");
+            throw new ScheduleTaskValidationError("Estimate sections cannot be scheduled as tasks");
         }
         if (estimateItem.scheduleTask) {
-            throw new Error(`Already linked to "${estimateItem.scheduleTask.name}"`);
+            throw new ScheduleTaskValidationError(`Already linked to "${estimateItem.scheduleTask.name}"`);
         }
     }
 
@@ -181,7 +182,7 @@ export async function createScheduleTaskInTransaction(
             select: { id: true },
         });
         if (activeCrew.length !== crewIds.length) {
-            throw new Error("Task crew members must be ACTIVATED users");
+            throw new ScheduleTaskValidationError("Task crew members must be ACTIVATED users");
         }
     }
 
@@ -275,7 +276,7 @@ export async function updateScheduleTaskInTransaction(
             project: { select: { status: true } },
         },
     });
-    if (!persisted || persisted.projectId !== locked.projectId) throw new Error("Task not found");
+    if (!persisted || persisted.projectId !== locked.projectId) throw new ScheduleTaskValidationError("Task not found");
 
     if (data.type !== undefined) assertScheduleTaskType(data.type);
     if (data.status !== undefined) assertScheduleTaskStatus(data.status);
@@ -285,12 +286,12 @@ export async function updateScheduleTaskInTransaction(
 
     if (data.name !== undefined) {
         const name = data.name.trim();
-        if (!name) throw new Error("Task name is required");
+        if (!name) throw new ScheduleTaskValidationError("Task name is required");
         updateData.name = name;
     }
     if (data.color !== undefined) updateData.color = data.color;
     if (data.progress !== undefined) {
-        if (!Number.isFinite(data.progress)) throw new Error("Progress must be a number");
+        if (!Number.isFinite(data.progress)) throw new ScheduleTaskValidationError("Progress must be a number");
         updateData.progress = Math.min(100, Math.max(0, Math.round(data.progress)));
     }
     if (data.status !== undefined) updateData.status = data.status;
@@ -298,7 +299,7 @@ export async function updateScheduleTaskInTransaction(
     if (data.order !== undefined) updateData.order = data.order;
     if (data.estimatedHours !== undefined) {
         if (data.estimatedHours != null && (!Number.isFinite(data.estimatedHours) || data.estimatedHours < 0)) {
-            throw new Error("Estimated hours must be zero or greater");
+            throw new ScheduleTaskValidationError("Estimated hours must be zero or greater");
         }
         updateData.estimatedHours = data.estimatedHours;
     }
@@ -307,7 +308,7 @@ export async function updateScheduleTaskInTransaction(
     if (data.clientStage !== undefined) {
         const label = data.clientStage?.trim() || null;
         if (label !== null && clientStageIndex(label) === null) {
-            throw new Error(`Unknown client stage "${label}"`);
+            throw new ScheduleTaskValidationError(`Unknown client stage "${label}"`);
         }
         // Store the canonical label so the tracker's lookup can stay exact.
         updateData.clientStage = label === null
@@ -318,7 +319,7 @@ export async function updateScheduleTaskInTransaction(
         if (nextStatus === "Blocked") {
             const reasonSource = data.blockedReason !== undefined ? data.blockedReason : persisted.blockedReason;
             const reason = reasonSource?.trim();
-            if (!reason) throw new Error("Blocked tasks require a reason");
+            if (!reason) throw new ScheduleTaskValidationError("Blocked tasks require a reason");
             updateData.blockedReason = reason;
         } else {
             updateData.blockedReason = null;
@@ -327,14 +328,14 @@ export async function updateScheduleTaskInTransaction(
     if (data.scheduledTime !== undefined) {
         const scheduledTime = normalizeScheduledTime(data.scheduledTime);
         if (nextType !== "appointment" && scheduledTime) {
-            throw new Error("Scheduled time is only available for appointments");
+            throw new ScheduleTaskValidationError("Scheduled time is only available for appointments");
         }
         updateData.scheduledTime = scheduledTime;
     }
     if (data.confirmationStatus !== undefined) {
         if (data.confirmationStatus) assertConfirmationStatus(data.confirmationStatus);
         if (nextType !== "appointment" && data.confirmationStatus) {
-            throw new Error("Confirmation status is only available for appointments");
+            throw new ScheduleTaskValidationError("Confirmation status is only available for appointments");
         }
         updateData.confirmationStatus = data.confirmationStatus;
     }
@@ -349,7 +350,7 @@ export async function updateScheduleTaskInTransaction(
                 where: { estimateItemId: data.estimateItemId, id: { not: taskId } },
                 select: { id: true, name: true },
             });
-            if (existing) throw new Error(`Already linked to "${existing.name}"`);
+            if (existing) throw new ScheduleTaskValidationError(`Already linked to "${existing.name}"`);
             const item = await tx.estimateItem.findUnique({
                 where: { id: data.estimateItemId },
                 select: { type: true, quantity: true, budgetUnit: true },
@@ -362,18 +363,18 @@ export async function updateScheduleTaskInTransaction(
 
     const hasDatePatch = data.startDate !== undefined || data.endDate !== undefined;
     if (hasDatePatch) {
-        if (!persisted.project) throw new Error("Task is not attached to a project");
+        if (!persisted.project) throw new ScheduleTaskValidationError("Task is not attached to a project");
         if (CLOSED_PROJECT_STATUSES.includes(persisted.project.status)) {
-            throw new Error(`Cannot update a task on a closed project (${persisted.project.status})`);
+            throw new ScheduleTaskValidationError(`Cannot update a task on a closed project (${persisted.project.status})`);
         }
         if (data.type !== undefined && data.type !== persisted.type) {
-            throw new Error("Change task type separately before editing its dates");
+            throw new ScheduleTaskValidationError("Change task type separately before editing its dates");
         }
         const startDate = data.startDate === undefined ? persisted.startDate : parseStartDateInput(data.startDate);
         const requestedEndDate = data.endDate === undefined ? persisted.endDate : parseStartDateInput(data.endDate);
         const endDate = persisted.type === "milestone" ? startDate : requestedEndDate;
-        if (persisted.type !== "milestone" && endDate < startDate) {
-            throw new Error("Task end date cannot be before its start date");
+        if (persisted.type !== "milestone" && endDate <= startDate) {
+            throw new ScheduleTaskValidationError("Task end date must be after its start date (the end date is the day after the last day of work)");
         }
         updateData.startDate = startDate;
         updateData.endDate = endDate;
@@ -423,9 +424,9 @@ export async function setTaskLeadInTransaction(
             assignments: { select: { userId: true, role: true } },
         },
     });
-    if (!task || task.projectId !== locked.projectId) throw new Error("Task not found");
+    if (!task || task.projectId !== locked.projectId) throw new ScheduleTaskValidationError("Task not found");
     if (userId && !task.assignments.some(assignment => assignment.userId === userId)) {
-        throw new Error("Task lead must be assigned to the crew");
+        throw new ScheduleTaskValidationError("Task lead must be assigned to the crew");
     }
     const previousLeadUserId = task.assignments.find(assignment => assignment.role === "lead")?.userId ?? null;
     await tx.taskAssignment.updateMany({

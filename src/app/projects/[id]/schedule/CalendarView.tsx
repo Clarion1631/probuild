@@ -19,6 +19,7 @@ import {
     parseUTCDate,
     todayUTC,
 } from "./schedule-utils";
+import { displayEndDate, storedEndDate } from "@/lib/schedule-dates";
 import ColorPicker from "./ColorPicker";
 import {
     createScheduleTask, updateScheduleTask, deleteScheduleTask,
@@ -71,10 +72,8 @@ type Segment = {
 
 function taskRange(task: Task): { start: Date; end: Date } {
     const start = parseUTCDate(task.startDate);
-    const endRaw = parseUTCDate(task.endDate);
-    // Calendar treats endDate as the last day shown (inclusive). Guard against
-    // legacy rows with end < start so they still draw as a one-day bar.
-    return { start, end: endRaw.getTime() < start.getTime() ? start : endRaw };
+    const end = parseUTCDate(displayEndDate(task.startDate, task.endDate, task.type));
+    return { start, end };
 }
 
 function buildWeekSegments(tasks: Task[], weekStart: Date, maxLanes: number): { segments: Segment[]; hiddenByDay: number[] } {
@@ -160,14 +159,15 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         if (!name || !target) { setQuickAdd(null); setQuickAddName(""); return; }
         const dateStr = formatDate(target);
         try {
-            await createScheduleTask(projectId, {
+            const res = await createScheduleTask(projectId, {
                 name,
                 startDate: dateStr,
-                endDate: dateStr,
+                endDate: storedEndDate(dateStr, dateStr, type),
                 color: "",
                 status: "Not Started",
                 type,
             });
+            if (!res.ok) { toast.error(res.error); return; }
             setQuickAdd(null);
             setQuickAddName("");
             toast.success(type === "milestone" ? "Milestone added" : "Task added");
@@ -226,7 +226,12 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         const before = tasks.find(t => t.id === taskId);
         setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...patch } : t));
         try {
-            await updateScheduleTask(taskId, patch);
+            const res = await updateScheduleTask(taskId, patch);
+            if (!res.ok) {
+                if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
+                toast.error(res.error);
+                return;
+            }
             startTransition(() => router.refresh());
         } catch {
             if (before) setTasks(prev => prev.map(t => t.id === taskId ? before : t));
@@ -239,7 +244,12 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         setTasks(prev => prev.filter(t => t.id !== taskId));
         setEditing(null);
         try {
-            await deleteScheduleTask(taskId);
+            const res = await deleteScheduleTask(taskId);
+            if (!res.ok) {
+                setTasks(before);
+                toast.error(res.error);
+                return;
+            }
             toast.success("Task deleted");
             startTransition(() => router.refresh());
         } catch {
@@ -298,13 +308,14 @@ export default function CalendarView({ projectId, tasks, setTasks, estimates = [
         if (current.mode === "resize") {
             const newEnd = day.getTime() < start.getTime() ? start : day;
             if (isSameUTCDay(newEnd, end)) return;
-            patchTask(task.id, { endDate: formatDate(newEnd) });
+            patchTask(task.id, { endDate: storedEndDate(task.startDate, formatDate(newEnd), task.type) });
             return;
         }
         const newStart = addDays(day, -current.offsetDays);
         if (isSameUTCDay(newStart, start)) return;
-        const duration = Math.max(0, getDaysBetween(start, end));
-        patchTask(task.id, { startDate: formatDate(newStart), endDate: formatDate(addDays(newStart, duration)) });
+        const spanDays = Math.max(0, getDaysBetween(start, end));
+        const newEndDisplay = addDays(newStart, spanDays);
+        patchTask(task.id, { startDate: formatDate(newStart), endDate: storedEndDate(formatDate(newStart), formatDate(newEndDisplay), task.type) });
     }
 
     /** Days that would be covered if the drag were dropped where the pointer is now. */
@@ -465,7 +476,8 @@ function shortDate(yyyyMmDd: string) {
 }
 
 function barTitle(t: Task) {
-    return t.startDate === t.endDate ? `${t.name} (${shortDate(t.startDate)})` : `${t.name} (${shortDate(t.startDate)} to ${shortDate(t.endDate)})`;
+    const displayEnd = displayEndDate(t.startDate, t.endDate, t.type);
+    return displayEnd === t.startDate ? `${t.name} (${shortDate(t.startDate)})` : `${t.name} (${shortDate(t.startDate)} to ${shortDate(displayEnd)})`;
 }
 
 /**
@@ -488,6 +500,7 @@ function TaskBar({
     const { task: t, startCol, spanDays, lane, startsHere, endsHere } = segment;
     const isMilestone = t.type === "milestone";
     const isDragging = dragTaskId === t.id;
+    const displayEnd = displayEndDate(t.startDate, t.endDate, t.type);
     const rounded = `${startsHere ? "rounded-l-md" : "rounded-l-none"} ${endsHere ? "rounded-r-md" : "rounded-r-none"}`;
     return (
         <div
@@ -522,7 +535,7 @@ function TaskBar({
                 {!dense && (
                     <span className="mt-0.5 flex items-center gap-1">
                         <span className={`text-[9px] px-1.5 py-0.5 rounded ${STATUS_COLORS[t.status] ?? "bg-slate-100 text-slate-600"}`}>{t.status}</span>
-                        {t.startDate !== t.endDate && <span className="text-[9px] text-slate-500">{shortDate(t.startDate)} to {shortDate(t.endDate)}</span>}
+                        {displayEnd !== t.startDate && <span className="text-[9px] text-slate-500">{shortDate(t.startDate)} to {shortDate(displayEnd)}</span>}
                     </span>
                 )}
             </button>
@@ -721,6 +734,7 @@ function QuickEditPopover({
 }) {
     const [nameDraft, setNameDraft] = useState(task.name);
     useEffect(() => { setNameDraft(task.name); }, [task.id, task.name]);
+    const displayEnd = displayEndDate(task.startDate, task.endDate, task.type);
 
     const [showColorPicker, setShowColorPicker] = useState(false);
     const colorAnchorRef = useRef<HTMLButtonElement | null>(null);
@@ -821,7 +835,7 @@ function QuickEditPopover({
                             const v = e.target.value;
                             if (!v) return;
                             const patch: any = { startDate: v };
-                            if (v > task.endDate) patch.endDate = v;
+                            if (v > displayEnd) patch.endDate = storedEndDate(v, v, task.type);
                             onPatch(patch);
                         }}
                         className="flex-1 hui-input text-xs py-1"
@@ -831,9 +845,9 @@ function QuickEditPopover({
                     <label className="text-slate-500 w-16">End</label>
                     <input
                         type="date"
-                        value={task.endDate}
+                        value={displayEnd}
                         min={task.startDate}
-                        onChange={e => { const v = e.target.value; if (!v) return; onPatch({ endDate: v }); }}
+                        onChange={e => { const v = e.target.value; if (!v) return; onPatch({ endDate: storedEndDate(task.startDate, v, task.type) }); }}
                         className="flex-1 hui-input text-xs py-1"
                     />
                 </div>

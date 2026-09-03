@@ -1,6 +1,7 @@
 import { GoogleGenAI, type Part } from "@google/genai";
 import { prisma } from "@/lib/prisma";
 import { loadSuggestableTasks, keywordMatchTasks } from "@/lib/time-suggestion";
+import { displayEndDate, toDateKey } from "@/lib/schedule-dates";
 
 // Stage A of the daily-log accuracy pipeline: when a daily log is written (or
 // its photos change), match the log's TEXT AND PHOTOS against the project's
@@ -189,11 +190,11 @@ export async function runDailyLogTaskMatch(dailyLogId: string): Promise<void> {
             where: { projectId: log.projectId, type: "task", status: "Complete" },
             orderBy: { updatedAt: "desc" },
             take: 8,
-            select: { name: true, endDate: true },
+            select: { name: true, startDate: true, endDate: true },
         });
         const completedLines = recentlyCompleted.length > 0
             ? recentlyCompleted
-                .map(task => `- <field>${task.name}</field> (scheduled to end ${task.endDate.toISOString().slice(0, 10)})`)
+                .map(task => `- <field>${task.name}</field> (scheduled to end ${displayEndDate(toDateKey(task.startDate), toDateKey(task.endDate), "task")})`)
                 .join("\n")
             : "(none)";
 

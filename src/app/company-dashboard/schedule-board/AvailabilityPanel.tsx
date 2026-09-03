@@ -11,6 +11,7 @@ import {
     type AvailabilityMember,
 } from "./availability";
 import { isDispatchable } from "@/lib/dispatch-roster";
+import { displayEndDate } from "@/lib/schedule-dates";
 
 // Planning panel for Richard (ops manager). Pure booked-vs-soft and conflict
 // derivation lives in availability.ts so Dispatch can consume the same rules.
@@ -30,7 +31,7 @@ function fullDateLabel(day: Date): string {
 function chipTooltip(chip: AvailabilityChip): string {
     const far = (chip.distanceMilesFromShop ?? 0) > FAR_JOB_MILES_THRESHOLD;
     const base = chip.kind === "booked"
-        ? `${chip.projectName} — ${chip.taskName} (${chip.startDate} → ${chip.endDate})`
+        ? `${chip.projectName} — ${chip.taskName} (${chip.startDate} → ${displayEndDate(chip.startDate, chip.endDate, "task")})`
         : `${chip.projectName} — on the crew, no task assignment that day`;
     return far ? `${base} — ${CAR_GLYPH} ~${chip.distanceMilesFromShop}mi — plan extended day` : base;
 }

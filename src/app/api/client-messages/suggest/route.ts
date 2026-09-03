@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { displayEndDate, toDateKey, formatDateKey } from "@/lib/schedule-dates";
 
 // POST /api/client-messages/suggest — AI-generated message suggestion
 // Accepts leadId or projectId
@@ -76,7 +77,7 @@ export async function POST(request: Request) {
             select: {
                 scheduleTasks: {
                     where: { startDate: { lte: new Date(Date.now() + 14 * 86400000) }, endDate: { gte: new Date() } },
-                    select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true },
+                    select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true, type: true },
                     orderBy: { startDate: "asc" },
                     take: 10,
                 },
@@ -84,7 +85,7 @@ export async function POST(request: Request) {
         });
         if (linkedProject?.scheduleTasks?.length) {
             scheduleContext = `\n\nUPCOMING SCHEDULE (next 2 weeks):\n${linkedProject.scheduleTasks.map(t =>
-                `- ${t.name}: ${t.startDate.toLocaleDateString()} to ${t.endDate.toLocaleDateString()} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
+                `- ${t.name}: ${formatDateKey(toDateKey(t.startDate))} to ${formatDateKey(displayEndDate(toDateKey(t.startDate), toDateKey(t.endDate), t.type))} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
             ).join("\n")}`;
         }
     } else {
@@ -104,7 +105,7 @@ export async function POST(request: Request) {
                 },
                 scheduleTasks: {
                     where: { startDate: { lte: new Date(Date.now() + 14 * 86400000) }, endDate: { gte: new Date() } },
-                    select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true },
+                    select: { name: true, startDate: true, endDate: true, status: true, progress: true, assignee: true, type: true },
                     orderBy: { startDate: "asc" },
                     take: 10,
                 },
@@ -124,7 +125,7 @@ export async function POST(request: Request) {
         ).join("\n");
         if (project.scheduleTasks?.length) {
             scheduleContext = `\n\nUPCOMING SCHEDULE (next 2 weeks):\n${project.scheduleTasks.map(t =>
-                `- ${t.name}: ${t.startDate.toLocaleDateString()} to ${t.endDate.toLocaleDateString()} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
+                `- ${t.name}: ${formatDateKey(toDateKey(t.startDate))} to ${formatDateKey(displayEndDate(toDateKey(t.startDate), toDateKey(t.endDate), t.type))} (${t.status}, ${t.progress}% done${t.assignee ? `, assigned to ${t.assignee}` : ""})`
             ).join("\n")}`;
         }
     }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
+import { displayEndDate, toDateKey, durationDays } from "@/lib/schedule-dates";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) return NextResponse.json({ error: "ANTHROPIC_API_KEY not configured" }, { status: 500 });
@@ -35,17 +36,15 @@ export async function POST(req: NextRequest) {
 
     const taskSummary = sub.taskAssignments.map(ta => {
         const t = ta.task;
-        const start = new Date(t.startDate);
-        const end = new Date(t.endDate);
-        const durationDays = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-        const isPastDue = end < new Date() && t.progress < 100;
+        const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
+        const isPastDue = today >= toDateKey(t.endDate) && t.progress < 100;
         const isComplete = t.progress === 100;
         const totalHoursLogged = t.timeEntries.reduce((sum, te) => sum + (te.durationHours || 0), 0);
         const hoursInfo = t.estimatedHours
             ? `${totalHoursLogged.toFixed(1)}/${t.estimatedHours}h logged/est`
             : totalHoursLogged > 0 ? `${totalHoursLogged.toFixed(1)}h logged` : "";
 
-        return `- ${t.name} (${t.project?.name || "No project"}) | ${t.startDate.toISOString().split("T")[0]} to ${t.endDate.toISOString().split("T")[0]} (${durationDays}d) | ${t.progress}% done | ${t.status}${isPastDue ? " OVERDUE" : ""}${isComplete ? " COMPLETE" : ""} ${hoursInfo}`;
+        return `- ${t.name} (${t.project?.name || "No project"}) | ${t.startDate.toISOString().split("T")[0]} to ${displayEndDate(toDateKey(t.startDate), toDateKey(t.endDate), t.type)} (${taskDurationDays}d) | ${t.progress}% done | ${t.status}${isPastDue ? " OVERDUE" : ""}${isComplete ? " COMPLETE" : ""} ${hoursInfo}`;
     }).join("\n");
 
     const projectSummary = sub.projectAccess.map(pa =>

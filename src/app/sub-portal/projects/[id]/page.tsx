@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import Link from "next/link";
 import ProjectViewTracker from "@/components/ProjectViewTracker";
 import SubTaskSummaryCard from "./SubTaskSummaryCard";
+import { displayEndDate, toDateKey } from "@/lib/schedule-dates";
 
 export default async function SubPortalProjectDetail(props: { params: Promise<{ id: string }> }) {
     const sub = await getSubPortalSession();
@@ -163,9 +164,9 @@ export default async function SubPortalProjectDetail(props: { params: Promise<{ 
                 {/* Task Rows */}
                 {tasks.map((task, idx) => {
                     const start = new Date(task.startDate);
-                    const end = new Date(task.endDate);
-                    const now = new Date();
-                    const isOverdue = now > end && task.status !== "Completed";
+                    const end = new Date(displayEndDate(toDateKey(task.startDate), toDateKey(task.endDate), task.type));
+                    const todayKey = toDateKey(new Date());
+                    const isOverdue = todayKey >= toDateKey(task.endDate) && task.status !== "Completed";
 
                     return (
                         <div

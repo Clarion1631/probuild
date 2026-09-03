@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, type Dispatch, type SetStateAction } from "react";
+import { toast } from "sonner";
 import { updateScheduleTask } from "@/lib/actions";
 import type { Task, ZoomLevel, EstimateSummary, TeamMember, Subcontractor } from "./schedule-types";
 import { STATUS_OPTIONS, STATUS_COLORS, getDaysBetween, addDays, formatDate, getMonday, isWeekend, getInitials, formatCurrency } from "./schedule-utils";
@@ -178,7 +179,14 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
             }
             const currentTask = tasksRef.current.find(t => t.id === taskId);
             if (!currentTask) return;
-            await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
+            const res = await updateScheduleTask(taskId, { startDate: currentTask.startDate, endDate: currentTask.endDate });
+            if (!res.ok) {
+                const restoredStart = formatDate(origStart);
+                const restoredEnd = formatDate(origEnd);
+                setTasks(prev => prev.map(t => t.id === taskId ? { ...t, startDate: restoredStart, endDate: restoredEnd } : t));
+                toast.error(res.error);
+                return;
+            }
             if (type === "move" && lastDayDelta !== 0) await actions.cascadeDependents(taskId, lastDayDelta);
         };
         const cleanup = () => {

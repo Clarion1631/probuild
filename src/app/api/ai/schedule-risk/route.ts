@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
+import { displayEndDate, toDateKey, durationDays } from "@/lib/schedule-dates";
 
 interface ScheduleTask {
     id: string;
@@ -32,14 +33,14 @@ export async function POST(req: NextRequest) {
     const taskSummary = tasks.map(t => {
         const start = new Date(t.startDate);
         const end = new Date(t.endDate);
-        const durationDays = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-        const isPast = end < new Date();
+        const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
+        const isPast = today >= toDateKey(t.endDate);
         const isActive = start <= new Date() && end >= new Date();
         const hoursVariance = t.estimatedHours && t.actualHours > 0
             ? `${t.actualHours.toFixed(0)}/${t.estimatedHours}h actual/est`
             : "";
 
-        return `- ${t.name} | ${t.startDate} → ${t.endDate} (${durationDays}d) | ${t.progress}% done | ${t.status}${isPast && t.progress < 100 ? " ⚠️OVERDUE" : ""}${isActive ? " 🔵ACTIVE" : ""} ${hoursVariance} | deps: ${t.dependencies.length}`;
+        return `- ${t.name} | ${t.startDate} → ${displayEndDate(t.startDate, t.endDate, t.type)} (${taskDurationDays}d) | ${t.progress}% done | ${t.status}${isPast && t.progress < 100 ? " ⚠️OVERDUE" : ""}${isActive ? " 🔵ACTIVE" : ""} ${hoursVariance} | deps: ${t.dependencies.length}`;
     }).join("\n");
 
     const prompt = `You are an expert construction project manager analyzing a schedule for a residential remodeling project in Vancouver, WA.
@@ -65,7 +66,7 @@ SCHEDULE GAPS & BOTTLENECKS:
 - [gap or bottleneck with impact analysis]
 - [gap or bottleneck]
 
-OVERDUE TASKS (${tasks.filter(t => new Date(t.endDate) < new Date() && t.progress < 100).length} detected):
+OVERDUE TASKS (${tasks.filter(t => today >= toDateKey(t.endDate) && t.progress < 100).length} detected):
 - [list each overdue task with recommended recovery action]
 
 BUFFER RECOMMENDATIONS:

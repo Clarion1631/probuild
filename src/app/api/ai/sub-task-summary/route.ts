@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
+import { displayEndDate, toDateKey } from "@/lib/schedule-dates";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
@@ -60,15 +61,15 @@ export async function POST(req: NextRequest) {
 
     const taskDetails = tasks.map((t) => {
         const start = new Date(t.startDate).toISOString().split("T")[0];
-        const end = new Date(t.endDate).toISOString().split("T")[0];
-        const isOverdue = new Date(t.endDate) < new Date() && t.status !== "Completed";
+        const end = displayEndDate(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
+        const isOverdue = today >= toDateKey(t.endDate) && t.status !== "Completed";
         return `- ${t.name} | Status: ${t.status} | Progress: ${t.progress}% | ${start} to ${end}${isOverdue ? " [OVERDUE]" : ""} | Est hours: ${t.estimatedHours ?? "N/A"}`;
     }).join("\n");
 
     const completed = tasks.filter((t) => t.status === "Completed").length;
     const inProgress = tasks.filter((t) => t.status === "In Progress").length;
     const notStarted = tasks.filter((t) => t.status === "Not Started").length;
-    const overdue = tasks.filter((t) => new Date(t.endDate) < new Date() && t.status !== "Completed").length;
+    const overdue = tasks.filter((t) => today >= toDateKey(t.endDate) && t.status !== "Completed").length;
 
     const prompt = `You are an AI assistant for a construction management platform. Provide a clear, concise summary for a subcontractor about their tasks on a project.
 
