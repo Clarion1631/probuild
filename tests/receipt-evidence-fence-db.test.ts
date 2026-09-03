@@ -237,10 +237,20 @@ async function takeLockNamed(tx: RawClient, name: string) {
 test("an evidence writer BLOCKS while the sweep holds the receipt-evidence lock", { skip }, async () => {
     await cleanup();
 
-    // What happened, in order. The assertion is about ORDER, not elapsed time:
-    // a sleep-threshold test passes on a slow runner for the wrong reason.
+    /**
+     * What happened, in order. The assertion is about ORDER, not elapsed time:
+     * a sleep-threshold test passes on a slow runner for the wrong reason.
+     *
+     * NOT a "did the sweep commit yet" boolean, which is what this test tried
+     * first and CI rejected (run 33773880632). Postgres releases an
+     * xact-scoped advisory lock AT COMMIT, so the parked writer is resumed by
+     * the very event that ends the sweep's transaction — its `order.push` can
+     * run before the sweep's own `await` resolves in JS and sets the flag. The
+     * flag races the commit boundary; the sequence below does not, and proves
+     * the same thing: the writer announced itself BEFORE the sweep's critical
+     * section and only got through AFTER it.
+     */
     const order: string[] = [];
-    let sweepCommitted = false;
     const lockedRef = `drive:${PREFIX}locked`;
 
     // The writer takes the same lock and then inserts. It cannot reach its
@@ -253,7 +263,7 @@ test("an evidence writer BLOCKS while the sweep holds the receipt-evidence lock"
         order.push("writer:waiting");
         await otherDb!.$transaction(async tx => {
             await takeLockNamed(tx, RECEIPT_EVIDENCE_LOCK);
-            order.push(sweepCommitted ? "writer:acquired-after-commit" : "writer:acquired-BEFORE-commit");
+            order.push("writer:acquired");
             await seedIntake(`${PREFIX}locked`);
         }, { timeout: 20_000 });
     })();
@@ -270,7 +280,6 @@ test("an evidence writer BLOCKS while the sweep holds the receipt-evidence lock"
         assert.equal(seen, 0, "the writer got past the lock while the sweep held it");
         order.push("sweep:read-clean");
     }, { timeout: 20_000 });
-    sweepCommitted = true;
 
     await writer;
 
@@ -278,8 +287,12 @@ test("an evidence writer BLOCKS while the sweep holds the receipt-evidence lock"
         "sweep:holding",
         "writer:waiting",
         "sweep:read-clean",
-        "writer:acquired-after-commit",
-    ], "the writer's acquire has to land after the sweep's commit, never before it");
+        "writer:acquired",
+    ], "the writer was parked across the sweep's whole critical section");
+    // Without the lock the writer would have acquired immediately and landed at
+    // index 2, ahead of "sweep:read-clean". That inversion is what this ordering
+    // detects — and the sweep's own count of 0, asserted above, is the
+    // independent second witness that nothing got in.
     await cleanup();
 });
 
