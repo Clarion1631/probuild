@@ -40,6 +40,7 @@ import {
     isAmbiguousCreateFailure,
     QBAmbiguousCreateError,
     MILESTONE_PUSH_BUDGET_MS,
+    MILESTONE_CLEANUP_BUDGET_MS,
 } from "./quickbooks-payments";
 import {
     composeCreateMarker,
@@ -767,9 +768,17 @@ export async function stageProgressBillingToQuickBooksCore(
     const invoice = billing.invoice;
     const qbo = deps?.qbo ?? await defaultStageQbo();
 
-    // Same default bound as the milestone push: unbudgeted was the last way to
-    // run to the platform ceiling and be killed between create and link.
-    const stageDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS);
+    // Same split as the milestone push: `routeDeadline` is the platform
+    // ceiling this stage — and its possible compensating delete — must fit
+    // inside; `stageDeadline` (the work budget) carves MILESTONE_CLEANUP_BUDGET_MS
+    // off its front, sharing the same start time, so that reserve is still
+    // genuinely there when compensation begins instead of measured off the
+    // (by then exhausted) work budget.
+    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS);
+    const stageDeadline = createRouteDeadline(
+        Math.max(1_000, routeDeadline.budgetMs - MILESTONE_CLEANUP_BUDGET_MS),
+        routeDeadline.startedAt,
+    );
 
     // Fail closed BEFORE spending a single QBO call: a previous attempt may
     // already have created this invoice, or another stager is mid-flight right
@@ -827,8 +836,22 @@ export async function stageProgressBillingToQuickBooksCore(
     // request ends. See composeCreateMarker's `at` param.
     const claimedAt = new Date();
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
+    // Pinned to the same content snapshot the create is about to build the
+    // invoice from — status alone lets a concurrent edit change subtotal,
+    // total, tax, or description between the pre-claim read above and this
+    // write and still pass the CAS, staging an invoice that no longer matches
+    // the billing.
     const claimedSend = await db.updateMany({
-        where: { id: billing.id, status: "Draft", qbInvoiceId: null, qbSyncError: null },
+        where: {
+            id: billing.id,
+            status: "Draft",
+            qbInvoiceId: null,
+            qbSyncError: null,
+            subtotal: billing.subtotal,
+            total: billing.total,
+            taxAmount: billing.taxAmount,
+            description: billing.description,
+        },
         data: { qbSyncError: inFlightMarker },
     });
     if (claimedSend.count !== 1) {
@@ -891,7 +914,10 @@ export async function stageProgressBillingToQuickBooksCore(
     // A progress billing also has to come back to Draft to be re-stageable.
     let compensationUnlinkFailed = false;
     const compensate = async (): Promise<boolean> => {
-        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(stageDeadline)));
+        // Measured off `routeDeadline`, not `stageDeadline` — the reserve was
+        // carved out of the route's front on entry, so it is still really
+        // there even once the work budget itself is exhausted.
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(routeDeadline)));
         const { deleted, unlinked } = await compensateAndUnlink(
             db,
             billing.id,

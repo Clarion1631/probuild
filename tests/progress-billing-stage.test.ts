@@ -91,6 +91,7 @@ function makeQbo(behaviour?: {
     payLinkThrows?: unknown;
     payLink?: string | null;
     deleteResult?: boolean;
+    deleteThrows?: unknown;
 }): { qbo: ProgressBillingStageQbo; calls: QboCalls } {
     const calls: QboCalls = { created: [], payLinks: [], deleted: [], tokens: 0 };
     const qbo: ProgressBillingStageQbo = {
@@ -113,6 +114,7 @@ function makeQbo(behaviour?: {
         },
         async deleteInvoice(_t, qbId) {
             calls.deleted.push(qbId);
+            if (behaviour?.deleteThrows) throw behaviour.deleteThrows;
             return behaviour?.deleteResult ?? true;
         },
     };
@@ -342,9 +344,11 @@ test("a compensated invoice takes the provisional link with it", async () => {
 
 test("a FAILED compensation keeps the link, so a human can find the invoice", async () => {
     // The opposite rule, deliberately: the invoice is still out there and
-    // collectible, and a row pointing at it is how anyone finds it.
+    // collectible, and a row pointing at it is how anyone finds it. A THROWN
+    // delete is the genuine-failure case — a bare `false` return now means
+    // "already gone" (an authoritative 404) and is a compensation SUCCESS.
     const { row, db } = makeDb(draftRow());
-    const { qbo } = makeQbo({ deleteResult: false });
+    const { qbo } = makeQbo({ deleteThrows: new Error("qbo delete failed") });
     let updates = 0;
     const lossyDb = {
         findUnique: db.findUnique,
@@ -378,7 +382,7 @@ test("compensateAndUnlink clears only a row still pointing at the deleted invoic
     };
 
     const ok = await compensateAndUnlink(delegate, "r1", "qb-1", async () => true, { status: "Draft" });
-    assert.deepEqual(ok, { deleted: true, unlinked: true });
+    assert.deepEqual(ok, { deleted: true, unlinked: true, alreadyAbsent: false });
     assert.equal(linked.qbInvoiceId, null);
     assert.equal(linked.qbSyncError, null);
     assert.equal(linked.status, "Draft");
@@ -394,21 +398,40 @@ test("compensateAndUnlink clears only a row still pointing at the deleted invoic
         },
     };
     const missed = await compensateAndUnlink(movedDelegate, "r2", "qb-1", async () => true);
-    assert.deepEqual(missed, { deleted: true, unlinked: false });
+    assert.deepEqual(missed, { deleted: true, unlinked: false, alreadyAbsent: false });
     assert.equal(moved.qbInvoiceId, "qb-OTHER", "the winner keeps its link");
 
-    // A failed delete never clears: the invoice still exists.
+    // A THROWN delete never clears: the remote outcome is unknown and the
+    // invoice may still exist.
     const keep: any = { id: "r3", qbInvoiceId: "qb-1", qbSyncError: "paylink-pending" };
     const keepDelegate = {
         async updateMany() {
             throw new Error("must not clear a link whose invoice still exists");
         },
     };
-    assert.deepEqual(await compensateAndUnlink(keepDelegate, "r3", "qb-1", async () => false), {
-        deleted: false,
-        unlinked: false,
-    });
+    assert.deepEqual(
+        await compensateAndUnlink(keepDelegate, "r3", "qb-1", async () => {
+            throw new Error("network error");
+        }),
+        { deleted: false, unlinked: false },
+    );
     assert.equal(keep.qbInvoiceId, "qb-1");
+
+    // A `false` return is NOT a failure: deleteQBInvoice returns it for an
+    // AUTHORITATIVE 404 — the invoice is already gone, so compensation
+    // succeeds and the row is cleared same as a real delete would.
+    const absent: any = { id: "r6", qbInvoiceId: "qb-1", qbInvoiceLink: "https://pay/1", qbSyncedAt: new Date(), qbSyncError: "paylink-pending", status: "Staged" };
+    const absentDelegate = {
+        async updateMany(args: any) {
+            const matches = Object.entries(args.where).every(([k, v]) => absent[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(absent, args.data);
+            return { count: 1 };
+        },
+    };
+    const alreadyGone = await compensateAndUnlink(absentDelegate, "r6", "qb-1", async () => false, { status: "Draft" });
+    assert.deepEqual(alreadyGone, { deleted: true, unlinked: true, alreadyAbsent: true });
+    assert.equal(absent.qbInvoiceId, null, "an already-absent invoice still releases the link");
 });
 
 test("round 29 gate: compensateAndUnlink falls back to the owned marker when the row never carried qbInvoiceId", async () => {
@@ -429,7 +452,7 @@ test("round 29 gate: compensateAndUnlink falls back to the owned marker when the
     };
 
     const result = await compensateAndUnlink(delegate, "r4", "qb-9", async () => true, { status: "Draft" }, marker);
-    assert.deepEqual(result, { deleted: true, unlinked: true });
+    assert.deepEqual(result, { deleted: true, unlinked: true, alreadyAbsent: false });
     assert.equal(neverLinked.qbSyncError, null, "the claim is released");
     assert.equal(neverLinked.qbInvoiceId, null);
 
@@ -445,6 +468,6 @@ test("round 29 gate: compensateAndUnlink falls back to the owned marker when the
         },
     };
     const withoutFallback = await compensateAndUnlink(delegate2, "r5", "qb-9", async () => true, { status: "Draft" });
-    assert.deepEqual(withoutFallback, { deleted: true, unlinked: false });
+    assert.deepEqual(withoutFallback, { deleted: true, unlinked: false, alreadyAbsent: false });
     assert.equal(stillNeverLinked.qbSyncError, marker, "no marker supplied — nothing was cleared");
 });

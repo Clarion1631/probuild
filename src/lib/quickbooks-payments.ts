@@ -327,6 +327,12 @@ export interface CompensatableDelegate {
  * delete would leave the claim parked forever with no invoice left to explain
  * it. `ownedInFlightMarker`, when supplied, is the fallback: clear by the exact
  * marker THIS caller wrote instead, so the claim is still released.
+ *
+ * `deleteInvoice()` returning `false` is not a failure: `deleteQBInvoice`
+ * (quickbooks.ts) returns `false` for an AUTHORITATIVE 404 — the invoice is
+ * already gone, which is exactly the state compensation wants. Only a THROWN
+ * error leaves the remote outcome unknown (the delete may or may not have
+ * landed), so only that case skips the unlink and reports failure.
  */
 export async function compensateAndUnlink(
     delegate: CompensatableDelegate,
@@ -337,9 +343,16 @@ export async function compensateAndUnlink(
     extraClearData: Record<string, unknown> = {},
     /** The in-flight marker this caller wrote before the create, if any. */
     ownedInFlightMarker?: string,
-): Promise<{ deleted: boolean; unlinked: boolean }> {
-    const deleted = await deleteInvoice().catch(() => false);
-    if (!deleted) return { deleted: false, unlinked: false };
+): Promise<{ deleted: boolean; unlinked: boolean; alreadyAbsent?: boolean }> {
+    let alreadyAbsent = false;
+    try {
+        const result = await deleteInvoice();
+        alreadyAbsent = result === false;
+    } catch {
+        // Thrown: the delete's outcome is genuinely unknown — the remote
+        // invoice may still exist. Do not touch the row.
+        return { deleted: false, unlinked: false };
+    }
     const cleared = await delegate.updateMany({
         where: { id: rowId, qbInvoiceId },
         data: {
@@ -352,8 +365,8 @@ export async function compensateAndUnlink(
             ...extraClearData,
         },
     }).catch(() => ({ count: 0 }));
-    if (cleared.count === 1) return { deleted: true, unlinked: true };
-    if (!ownedInFlightMarker) return { deleted: true, unlinked: false };
+    if (cleared.count === 1) return { deleted: true, unlinked: true, alreadyAbsent };
+    if (!ownedInFlightMarker) return { deleted: true, unlinked: false, alreadyAbsent };
     // The row never got as far as carrying qbInvoiceId — clear by the marker we
     // own instead, so a confirmed delete still releases the claim.
     const clearedByMarker = await delegate.updateMany({
@@ -365,7 +378,7 @@ export async function compensateAndUnlink(
             ...extraClearData,
         },
     }).catch(() => ({ count: 0 }));
-    return { deleted: true, unlinked: clearedByMarker.count === 1 };
+    return { deleted: true, unlinked: clearedByMarker.count === 1, alreadyAbsent };
 }
 
 /** One row waiting for its pay link, from either rail. */
@@ -686,9 +699,19 @@ export async function pushMilestoneToQuickBooks(
      */
     deadline?: RouteDeadline,
 ): Promise<MilestonePushResult> {
-    // A caller that passes nothing still gets a bound: unbudgeted was the last
-    // way to reach the platform ceiling and be killed between create and link.
-    const pushDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS);
+    // The ROUTE deadline is the platform ceiling this push — and its possible
+    // compensating delete — must fit inside. `pushDeadline` (the work budget)
+    // carves MILESTONE_CLEANUP_BUDGET_MS off the FRONT of it, sharing the same
+    // start time, so that reserve is still genuinely sitting on `routeDeadline`
+    // when compensation begins. Measuring the reserve off `pushDeadline` itself
+    // (the old form) handed cleanup whatever the work budget had left — which
+    // by the time compensation is needed is close to nothing, so the delete's
+    // own deadline was already-exhausted before it could even start.
+    const routeDeadline = deadline ?? createRouteDeadline(MILESTONE_PUSH_BUDGET_MS + MILESTONE_CLEANUP_BUDGET_MS);
+    const pushDeadline = createRouteDeadline(
+        Math.max(1_000, routeDeadline.budgetMs - MILESTONE_CLEANUP_BUDGET_MS),
+        routeDeadline.startedAt,
+    );
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentScheduleId },
         include: {
@@ -834,8 +857,22 @@ export async function pushMilestoneToQuickBooks(
     // request ends. See composeCreateMarker's `at` param.
     const claimedAt = new Date();
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
+    // Pinned to the same content snapshot the create is about to build the
+    // invoice from — not just qbInvoiceId/qbSyncError. Those two alone let a
+    // concurrent settle, cancel, or edit land between the pre-claim read above
+    // and this write and still pass the CAS, so the claim would protect an
+    // amount/name/dueDate/status that no longer matches what gets pushed.
     const claimedSend = await prisma.paymentSchedule.updateMany({
-        where: { id: schedule.id, qbInvoiceId: null, qbSyncError: null },
+        where: {
+            id: schedule.id,
+            qbInvoiceId: null,
+            qbSyncError: null,
+            status: schedule.status,
+            amount: schedule.amount,
+            qbPaymentId: schedule.qbPaymentId,
+            dueDate: schedule.dueDate,
+            name: schedule.name,
+        },
         data: { qbSyncError: inFlightMarker },
     });
     if (claimedSend.count !== 1) {
@@ -918,7 +955,7 @@ export async function pushMilestoneToQuickBooks(
             name: schedule.name,
             dueDate: schedule.dueDate,
         },
-        data: { qbInvoiceId: qbId, qbSyncError: PAYLINK_PENDING_MARKER },
+        data: { qbInvoiceId: qbId, qbSyncedAt: new Date(), qbSyncError: PAYLINK_PENDING_MARKER },
     });
 
     let payLink: string | null = null;
@@ -994,8 +1031,11 @@ export async function pushMilestoneToQuickBooks(
         // entry, where it would have been ticking down through every call that
         // preceded it and could already be spent by the time it is needed. It
         // is also capped by what the ROUTE has left, so cleanup cannot itself
-        // overrun the platform ceiling: reserve whichever is smaller.
-        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(pushDeadline)));
+        // overrun the platform ceiling: reserve whichever is smaller. Measured
+        // off `routeDeadline`, not the (by now likely exhausted) work budget —
+        // that reserve was carved out of the route's front on entry, so it is
+        // still really there.
+        const cleanupDeadline = createRouteDeadline(compensationWindowMs(remainingBudgetMs(routeDeadline)));
         // Deleting is only half of it: this row may already carry the
         // provisional link written before the pay-link fetch, and leaving it
         // pointing at a deleted invoice would block the next send behind an
