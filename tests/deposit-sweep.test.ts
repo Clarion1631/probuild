@@ -50,7 +50,6 @@ import {
     PROGRESS_WINDOW_DAYS,
     bankCreditFingerprint,
     booksWithoutOverride,
-    cumulativeMilestoneShare,
     hasPayerCorroboration,
     liveApplyEnabled,
     milestoneProgressTokens,
@@ -218,12 +217,17 @@ const queries: { paymentSchedule: Row[]; bankImage: Row[] } = { paymentSchedule:
 const callLog: string[] = [];
 /** fileId → the status its DepositIngest row was CREATED with. */
 const createdStatus = new Map<string, string>();
+/** fileId → the fingerprint create() was GIVEN. Distinct from the row's final
+ *  value, which the legacy backfill would repair a moment later — the point of
+ *  the rule is that the stamp happens at creation. */
+const createdFingerprint = new Map<string, string | null>();
 
 const fakePrisma: Row = {
     depositIngest: Object.assign(Object.create(tables.depositIngest), {
         create: async (args: { data: Row }) => {
             const row = await tables.depositIngest.create(args);
             createdStatus.set(String(row.fileId), String(row.status));
+            createdFingerprint.set(String(row.fileId), (args.data.bankFingerprint as string | undefined) ?? null);
             return row;
         },
         findFirst: async (args: { where?: Row }) => {
@@ -467,6 +471,7 @@ beforeEach(() => {
     queries.paymentSchedule = [];
     queries.bankImage = [];
     createdStatus.clear();
+    createdFingerprint.clear();
     callLog.length = 0;
     for (const key of Object.keys(calls) as Array<keyof typeof calls>) calls[key] = [];
     qboBalanceByInvoice = new Map();
@@ -681,32 +686,45 @@ test("progress tokens: a milestone name's distinctive words, and only those", ()
     assert.deepEqual(milestoneProgressTokens("Deposit"), []);
 });
 
-test("job progress: the field has to agree that this phase is done", async t => {
+test("job progress: the field has to agree that THIS PHASE is done", async t => {
     const base = {
         postDate: "2026-08-24",
         milestoneName: "Rough In complete",
-        inspections: [] as Array<{ result: string; date: string | null }>,
+        inspections: [] as Array<{ result: string; type: string | null; date: string | null }>,
         dailyLogs: [] as Array<{ date: string; workPerformed: string }>,
-        percentComplete: null as number | null,
-        percentCompleteAsOf: null as string | null,
-        requiredPercent: null as number | null,
     };
 
-    await t.test("(a) a passed inspection inside the window", () => {
-        const result = progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-08-21" }] });
+    await t.test("(a) a passed inspection OF THIS PHASE, inside the window", () => {
+        const result = progressCorroboration({ ...base, inspections: [{ result: "PASSED", type: "Rough-in", date: "2026-08-21" }] });
         assert.equal(result.corroborated, true);
         assert.equal(result.via, "inspection");
-        assert.match(result.detail, /inspection passed on 2026-08-21/);
+        assert.match(result.detail, /"Rough-in" inspection passed on 2026-08-21/);
     });
 
-    await t.test("…but not a FAILED one, and not one outside the window", () => {
-        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "FAILED", date: "2026-08-21" }] }).corroborated, false);
-        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-07-01" }] }).corroborated, false);
-        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: "2026-08-26" }] }).corroborated, false, "after the deposit");
-        assert.equal(progressCorroboration({ ...base, inspections: [{ result: "PASSED", date: null }] }).corroborated, false);
+    await t.test("…but an inspection of a DIFFERENT phase unlocks nothing", () => {
+        // The whole risk of this rung: a plumbing sign-off must not release a
+        // cabinetry milestone just because it happened the same week.
+        for (const type of ["Plumbing final", "Electrical service", "Gas line", null]) {
+            assert.equal(
+                progressCorroboration({ ...base, inspections: [{ result: "PASSED", type, date: "2026-08-21" }] }).corroborated,
+                false,
+                `a "${type}" inspection must not corroborate "Rough In complete"`,
+            );
+        }
     });
 
-    await t.test("(b) a daily log that names this phase", () => {
+    await t.test("…nor a FAILED one, nor one outside the window", () => {
+        const insp = (over: Record<string, unknown>) => progressCorroboration({
+            ...base,
+            inspections: [{ result: "PASSED", type: "Rough-in", date: "2026-08-21", ...over } as never],
+        }).corroborated;
+        assert.equal(insp({ result: "FAILED" }), false);
+        assert.equal(insp({ date: "2026-07-01" }), false, "older than the window");
+        assert.equal(insp({ date: "2026-08-26" }), false, "after the deposit");
+        assert.equal(insp({ date: null }), false);
+    });
+
+    await t.test("(b) a daily log that names this phase, as a WHOLE WORD", () => {
         const result = progressCorroboration({
             ...base,
             dailyLogs: [{ date: "2026-08-20", workPerformed: "Finished rough plumbing and electrical rough-in" }],
@@ -716,7 +734,33 @@ test("job progress: the field has to agree that this phase is done", async t => 
         assert.match(result.detail, /2026-08-20/);
     });
 
-    await t.test("…but a log about a DIFFERENT phase corroborates nothing", () => {
+    await t.test("…so a token buried inside another word corroborates nothing", () => {
+        // "textile" is not "tile"; "roughly" is not "rough". Substring matching
+        // would have taken either as proof the phase was finished.
+        assert.equal(
+            progressCorroboration({ ...base, dailyLogs: [{ date: "2026-08-20", workPerformed: "Roughly half the trim is up" }] }).corroborated,
+            false,
+        );
+        assert.equal(
+            progressCorroboration({
+                ...base,
+                milestoneName: "Tile complete",
+                dailyLogs: [{ date: "2026-08-20", workPerformed: "Delivered textile samples to the client" }],
+            }).corroborated,
+            false,
+        );
+        // …while the real word still does.
+        assert.equal(
+            progressCorroboration({
+                ...base,
+                milestoneName: "Tile complete",
+                dailyLogs: [{ date: "2026-08-20", workPerformed: "Set tile in the hall bath" }],
+            }).corroborated,
+            true,
+        );
+    });
+
+    await t.test("…and a log about a DIFFERENT phase corroborates nothing", () => {
         const result = progressCorroboration({
             ...base,
             dailyLogs: [{ date: "2026-08-20", workPerformed: "Hung drywall in the hall bath and taped corners" }],
@@ -725,43 +769,31 @@ test("job progress: the field has to agree that this phase is done", async t => 
         assert.match(result.detail, /no daily log mentioning "rough"/);
     });
 
-    await t.test("…and a name with no distinctive words can never match a log", () => {
+    await t.test("a name with no distinctive words can never be corroborated", () => {
         const result = progressCorroboration({
             ...base,
             milestoneName: "Final Payment",
+            inspections: [{ result: "PASSED", type: "Final", date: "2026-08-21" }],
             dailyLogs: [{ date: "2026-08-20", workPerformed: "final payment work complete milestone deposit" }],
         });
         assert.equal(result.corroborated, false);
         assert.match(result.detail, /no distinctive words/);
     });
 
-    await t.test("(c) percent complete past this milestone's share", () => {
-        const result = progressCorroboration({ ...base, percentComplete: 62, percentCompleteAsOf: "2026-08-25", requiredPercent: 60 });
-        assert.equal(result.corroborated, true);
-        assert.equal(result.via, "percent-complete");
-    });
-
-    await t.test("…but not when it is short, nor when it predates the deposit", () => {
-        assert.equal(progressCorroboration({ ...base, percentComplete: 55, percentCompleteAsOf: "2026-08-25", requiredPercent: 60 }).corroborated, false);
-        assert.equal(progressCorroboration({ ...base, percentComplete: 62, percentCompleteAsOf: "2026-08-01", requiredPercent: 60 }).corroborated, false);
-    });
-
     await t.test("nothing at all is not corroboration", () => {
         assert.equal(progressCorroboration(base).corroborated, false);
     });
-});
 
-test("cumulative share: what portion of the invoice a milestone bills through", () => {
-    const milestones = [
-        { id: "m1", amount: 10_000, dueDate: "2026-07-01", createdAt: "2026-06-01T00:00:00Z" },
-        { id: "m2", amount: 20_000, dueDate: "2026-08-01", createdAt: "2026-06-01T00:00:00Z" },
-        { id: "m3", amount: 20_000, dueDate: null, createdAt: "2026-06-01T00:00:00Z" },
-    ];
-    assert.equal(cumulativeMilestoneShare(milestones, "m1", 50_000), 20);
-    assert.equal(cumulativeMilestoneShare(milestones, "m2", 50_000), 60);
-    assert.equal(cumulativeMilestoneShare(milestones, "m3", 50_000), 100, "a null due date sorts last");
-    assert.equal(cumulativeMilestoneShare(milestones, "nope", 50_000), null);
-    assert.equal(cumulativeMilestoneShare(milestones, "m1", 0), null);
+    await t.test("there is NO percent-complete rung — it could not be dated", () => {
+        // Project.percentComplete has no historical snapshot: percentCompleteAsOf
+        // is just when it was last written, and the nightly recalc refreshes it,
+        // so progress made after the deposit would have vouched for it.
+        const result = progressCorroboration({
+            ...base,
+            percentComplete: 99, percentCompleteAsOf: "2026-08-25", requiredPercent: 10,
+        } as unknown as Parameters<typeof progressCorroboration>[0]);
+        assert.equal(result.corroborated, false, "percent-complete data must be ignored entirely");
+    });
 });
 
 test("the ladder: payer evidence and job progress both book without the switch", () => {
@@ -1717,11 +1749,17 @@ test("P0: with the live-apply switch OFF, a perfect amount-only match is SUGGEST
     const { body } = await post(bankBatch([{ ref: "REF-SUGGEST", amount: 6161.61 }]));
     const result = creditResult(body, "REF-SUGGEST");
     assert.equal(result.status, "proposed", `expected suggest-only, got ${result.status}: ${result.reason}`);
-    // The reason has to tell the operator what was missing, not just that a
-    // flag is off: this is the line a human acts on.
-    assert.match(String(result.reason), /amount matches Milestone \d+ but/);
-    assert.match(String(result.reason), /no daily log|no passed inspection/);
-    assert.match(String(result.reason), new RegExp(`set ${LIVE_APPLY_ENV_VAR}=true to book anyway`));
+    // The reason has to say plainly what happened, what did NOT happen to the
+    // money, and what a human can do about it: this is the line they act on.
+    assert.match(
+        String(result.reason),
+        /phase not corroborated by any daily log or inspection; no payment was booked; set DEPOSIT_SWEEP_LIVE_APPLY=true to book amount-only matches/,
+    );
+    assert.match(
+        String(result.reason),
+        /no daily log mentioning|no distinctive words/,
+        "and explains what it looked for, or why it could not look",
+    );
     assert.equal(calls.buildQBPaymentRequest.length, 0, "no money boundary is touched at all");
     assert.equal(depositRow("REF-SUGGEST")!.paymentScheduleId, milestone, "the suggestion is recorded");
     assert.equal(tables.paymentSchedule.rows.find(r => r.id === milestone)!.status, "Pending");
@@ -1996,6 +2034,65 @@ test("R7: a reused bank reference carrying DIFFERENT money is a human's problem"
     });
 });
 
+test("R8: every bank row records what it was, including collision rows", async t => {
+    await t.test("a collision-created row carries its fingerprint", async () => {
+        seedMilestone({ amount: 4321.99 });
+        await post(bankBatch([
+            { ref: "REF-CF-A", amount: 4321.99 },
+            { ref: "REF-CF-B", amount: 4321.99 },
+        ]));
+        for (const ref of ["REF-CF-A", "REF-CF-B"]) {
+            // Asserted on what create() was GIVEN: the legacy backfill would
+            // otherwise repair a missing stamp a moment later and hide the bug.
+            assert.ok(
+                createdFingerprint.get(bankFileId(ref)),
+                `${ref} must record the credit it was created from, at creation`,
+            );
+            assert.ok(depositRow(ref)!.bankFingerprint);
+        }
+
+        // …so reusing one of those references for different money is caught,
+        // instead of reading as a clean replay of a row that recorded nothing.
+        seedMilestone({ amount: 1111.11 });
+        const { body } = await post(bankBatch([{ ref: "REF-CF-A", amount: 1111.11 }]));
+        const result = creditResult(body, "REF-CF-A");
+        assert.equal(result.status, "reconcile");
+        assert.match(String(result.reason), /bank reference reused with different data/);
+    });
+
+    await t.test("a legacy row with no fingerprint is backfilled when the facts agree", async () => {
+        const milestone = seedMilestone({ amount: 2222.22 });
+        tables.depositIngest.rows.push({
+            id: "legacy-row", fileId: bankFileId("REF-LEGACY"), status: "proposed", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-LEGACY", extracted: JSON.stringify({ fileId: bankFileId("REF-LEGACY"), amount: 2222.22 }),
+            attempts: 1, amountCents: 222_222, postDate: utc(SETTLED_DAY),
+            bankFingerprint: null, updatedAt: new Date(),
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-LEGACY", amount: 2222.22 }]));
+        const result = creditResult(body, "REF-LEGACY");
+        assert.equal(result.status, "applied", `the legacy row is the same credit: ${result.reason}`);
+        assert.equal(result.scheduleId, milestone);
+        assert.ok(depositRow("REF-LEGACY")!.bankFingerprint, "and it now records what it was");
+    });
+
+    await t.test("a legacy row whose stored facts DISAGREE is not a replay", async () => {
+        seedMilestone({ amount: 3333.33 });
+        tables.depositIngest.rows.push({
+            id: "legacy-mismatch", fileId: bankFileId("REF-LEGACY-BAD"), status: "applied", source: BANK_DEPOSIT_SOURCE,
+            bankReference: "REF-LEGACY-BAD", extracted: "{}", attempts: 1,
+            amountCents: 999_999, postDate: utc(SETTLED_DAY), // a DIFFERENT amount
+            bankFingerprint: null, updatedAt: new Date(),
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-LEGACY-BAD", amount: 3333.33 }]));
+        const result = creditResult(body, "REF-LEGACY-BAD");
+        assert.equal(result.status, "reconcile");
+        assert.match(String(result.reason), /an unrecorded credit/);
+        assert.equal(body.ok, false);
+    });
+});
+
 test("R7: the claim domain is SERIALIZED — the advisory lock is taken before the claim query", async t => {
     await t.test("on the bank path", async () => {
         seedMilestone({ amount: 4567.89 });
@@ -2039,7 +2136,7 @@ test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log
     await t.test("an inspection passed three days before the credit → books", async () => {
         const milestone = hoppe();
         tables.inspection.rows.push({
-            id: "insp-1", projectId: "project-1", result: "PASSED", type: "Rough-in",
+            id: "insp-1", projectId: "project-1", result: "PASSED", type: "Rough-in plumbing",
             performedDate: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 4)), scheduledDate: null,
         });
 
@@ -2067,7 +2164,7 @@ test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log
         const { body } = await post(bankBatch([{ ref: "REF-NOEVIDENCE", amount: 13447.68 }]));
         const result = creditResult(body, "REF-NOEVIDENCE");
         assert.equal(result.status, "proposed");
-        assert.match(String(result.reason), /amount matches Rough In complete but/);
+        assert.match(String(result.reason), /phase not corroborated by any daily log or inspection; no payment was booked/);
         assert.match(String(result.reason), /no daily log mentioning "rough"/);
         assert.equal(calls.buildQBPaymentRequest.length, 0);
     });
@@ -2093,6 +2190,30 @@ test("R7: job progress unlocks auto-apply without the switch (Justin's daily-log
 
         const { body } = await post(bankBatch([{ ref: "REF-OTHERPROJECT", amount: 13447.68 }]));
         assert.equal(creditResult(body, "REF-OTHERPROJECT").status, "proposed");
+    });
+
+    await t.test("an inspection of a DIFFERENT PHASE on the right project does not either", async () => {
+        hoppe();
+        tables.inspection.rows.push({
+            id: "insp-wrongphase", projectId: "project-1", result: "PASSED", type: "Final electrical",
+            performedDate: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 4)), scheduledDate: null,
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-WRONGPHASE-INSP", amount: 13447.68 }]));
+        const result = creditResult(body, "REF-WRONGPHASE-INSP");
+        assert.equal(result.status, "proposed", `a final-electrical sign-off is not rough-in: ${result.reason}`);
+        assert.equal(calls.buildQBPaymentRequest.length, 0);
+    });
+
+    await t.test("a log with the token buried in another word does not either", async () => {
+        hoppe();
+        tables.dailyLog.rows.push({
+            id: "log-textile", projectId: "project-1", date: utc(isoDaysAgo(BANK_APPLY_MIN_AGE_DAYS + 2)),
+            workPerformed: "Roughly framed the soffit; textile samples delivered",
+        });
+
+        const { body } = await post(bankBatch([{ ref: "REF-SUBSTRING", amount: 13447.68 }]));
+        assert.equal(creditResult(body, "REF-SUBSTRING").status, "proposed");
     });
 });
 

@@ -55,8 +55,10 @@ export function hasPayerCorroboration(confidence: string): boolean {
  *
  *   1. payer evidence  — a check image (or QBO payment) naming the customer:
  *                        `verified` / `recorded`;
- *   2. job progress    — the field says the work this milestone bills for is
- *                        actually done: `progress` (see progressCorroboration);
+ *   2. job progress    — the FIELD says the work this milestone bills for is
+ *                        actually done, and says it about THIS phase: a passed
+ *                        inspection of the phase, or a daily log naming it
+ *                        (`progress`, see progressCorroboration);
  *   3. the switch      — DEPOSIT_SWEEP_LIVE_APPLY, for credits with neither.
  *
  * Rungs 1 and 2 book on their own. Rung 3 is the operator taking
@@ -712,20 +714,15 @@ export interface ProgressEvidence {
     /** YYYY-MM-DD — the credit's post date. */
     postDate: string;
     milestoneName: string;
-    /** PASSED/APPROVED inspections on the candidate's project, with the day
-     *  they were performed (or scheduled, when that is all there is). */
-    inspections: Array<{ result: string; date: string | null }>;
+    /** PASSED/APPROVED inspections on the candidate's project: what was
+     *  inspected, and the day it was performed (or scheduled, when that is all
+     *  there is). */
+    inspections: Array<{ result: string; type: string | null; date: string | null }>;
     /** Daily logs on the candidate's project: the day, and what was done. */
     dailyLogs: Array<{ date: string; workPerformed: string }>;
-    /** Project.percentComplete and when it was last written. */
-    percentComplete: number | null;
-    percentCompleteAsOf: string | null;
-    /** Cumulative share of the invoice billed through this milestone, 0-100.
-     *  Null when it cannot be computed (no invoice total, unordered rows). */
-    requiredPercent: number | null;
 }
 
-export type ProgressVia = "inspection" | "daily-log" | "percent-complete";
+export type ProgressVia = "inspection" | "daily-log";
 
 export interface ProgressResult {
     corroborated: boolean;
@@ -734,97 +731,76 @@ export interface ProgressResult {
     detail: string;
 }
 
+/** Whole-word, case-insensitive. Substring matching let "textile" corroborate
+ *  a Tile milestone and "roughly" a Rough In one — the opposite of evidence. */
+function mentionsToken(text: string, token: string): boolean {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i").test(text ?? "");
+}
+
 /**
  * Does the FIELD say this milestone's work is actually done?
  *
- * This is the second rung of the corroboration ladder, and the one Justin
- * asked for: a payer-less bank credit may book when the daily logs, an
- * inspection, or the project's own percent complete independently agree that
- * the phase this milestone bills for finished around when the money arrived.
- * It is corroboration, not identification — it never picks a candidate, it
- * only confirms the one the amount already picked uniquely.
+ * The second rung of the corroboration ladder, and the one Justin asked for: a
+ * payer-less bank credit may book when the field independently agrees that the
+ * phase this milestone bills for finished around when the money arrived. It is
+ * corroboration, not identification — it never picks a candidate, it only
+ * confirms the one the amount already picked uniquely.
+ *
+ * BOTH rungs must be about THIS PHASE. A passed plumbing inspection says
+ * nothing about a cabinetry milestone, and a log that happens to contain the
+ * letters of a token inside another word says nothing at all. Everything is
+ * matched on the milestone's distinctive tokens, whole words only, so a
+ * milestone whose name has no distinctive words ("Final Payment") cannot be
+ * corroborated by anything and stays suggest-only.
  *
  * Pure: the route does the fetching, this decides.
  */
 export function progressCorroboration(evidence: ProgressEvidence): ProgressResult {
     const from = isoDaysBefore(evidence.postDate, PROGRESS_WINDOW_DAYS);
     const inWindow = (day: string | null) => !!day && day >= from && day <= evidence.postDate;
+    const tokens = milestoneProgressTokens(evidence.milestoneName);
+
+    if (tokens.length === 0) {
+        return {
+            corroborated: false,
+            via: null,
+            detail: "the milestone name has no distinctive words, so no inspection or daily log can be tied to this phase",
+        };
+    }
 
     // (a) An inspection that PASSED is the strongest field signal there is: a
-    //     third party attended and signed the phase off.
-    const passed = evidence.inspections.find(
-        i => /^(PASSED|APPROVED)$/i.test((i.result ?? "").trim()) && inWindow(i.date),
-    );
+    //     third party attended and signed the phase off — PROVIDED it is this
+    //     phase. An unrelated plumbing sign-off must never unlock cabinetry.
+    const passed = evidence.inspections.find(i =>
+        /^(PASSED|APPROVED)$/i.test((i.result ?? "").trim())
+        && inWindow(i.date)
+        && tokens.some(token => mentionsToken(i.type ?? "", token)));
     if (passed) {
         return {
             corroborated: true,
             via: "inspection",
-            detail: `an inspection passed on ${passed.date} (within ${PROGRESS_WINDOW_DAYS} days of the deposit)`,
+            detail: `a "${passed.type}" inspection passed on ${passed.date} (within ${PROGRESS_WINDOW_DAYS} days of the deposit)`,
         };
     }
 
-    // (b) A daily log that names this phase. Distinctive tokens only, so
-    //     "Final Payment" cannot be corroborated by any log at all.
-    const tokens = milestoneProgressTokens(evidence.milestoneName);
-    if (tokens.length > 0) {
-        for (const log of evidence.dailyLogs) {
-            if (!inWindow(log.date)) continue;
-            const text = (log.workPerformed ?? "").toUpperCase();
-            const hit = tokens.find(token => text.includes(token));
-            if (hit) {
-                return {
-                    corroborated: true,
-                    via: "daily-log",
-                    detail: `the daily log for ${log.date} mentions "${hit.toLowerCase()}"`,
-                };
-            }
+    // (b) A daily log that names this phase.
+    for (const log of evidence.dailyLogs) {
+        if (!inWindow(log.date)) continue;
+        const hit = tokens.find(token => mentionsToken(log.workPerformed ?? "", token));
+        if (hit) {
+            return {
+                corroborated: true,
+                via: "daily-log",
+                detail: `the daily log for ${log.date} mentions "${hit.toLowerCase()}"`,
+            };
         }
     }
 
-    // (c) The project's own percent complete has reached the share of the
-    //     invoice this milestone bills through.
-    if (
-        evidence.percentComplete != null
-        && evidence.requiredPercent != null
-        && evidence.percentCompleteAsOf != null
-        && evidence.percentCompleteAsOf >= evidence.postDate
-        && evidence.percentComplete >= evidence.requiredPercent
-    ) {
-        return {
-            corroborated: true,
-            via: "percent-complete",
-            detail: `the project is ${evidence.percentComplete.toFixed(0)}% complete as of ` +
-                `${evidence.percentCompleteAsOf}, past the ${evidence.requiredPercent.toFixed(0)}% this milestone bills through`,
-        };
-    }
-
+    const wanted = tokens.map(t => `"${t.toLowerCase()}"`).join(" or ");
     return {
         corroborated: false,
         via: null,
-        detail: tokens.length > 0
-            ? `no daily log mentioning ${tokens.map(t => `"${t.toLowerCase()}"`).join(" or ")}, no passed inspection, and no percent-complete evidence`
-            : `no passed inspection and no percent-complete evidence (the milestone name has no distinctive words to look for in the daily logs)`,
+        detail: `no daily log mentioning ${wanted}, and no passed inspection of that phase, in the ${PROGRESS_WINDOW_DAYS} days before the deposit`,
     };
-}
-
-/**
- * The cumulative share of an invoice billed THROUGH a given milestone, as a
- * percentage. Milestones are ordered the way a human reads a payment schedule:
- * by due date, then by when the row was created, then by id so the order is
- * total. Null when there is nothing to divide by.
- */
-export function cumulativeMilestoneShare(
-    milestones: Array<{ id: string; amount: number; dueDate: string | null; createdAt: string }>,
-    candidateId: string,
-    invoiceTotal: number,
-): number | null {
-    if (!(invoiceTotal > 0)) return null;
-    const ordered = [...milestones].sort((a, b) =>
-        (a.dueDate ?? "9999-12-31").localeCompare(b.dueDate ?? "9999-12-31")
-        || a.createdAt.localeCompare(b.createdAt)
-        || a.id.localeCompare(b.id));
-    const index = ordered.findIndex(m => m.id === candidateId);
-    if (index < 0) return null;
-    const through = ordered.slice(0, index + 1).reduce((sum, m) => sum + m.amount, 0);
-    return (through / invoiceTotal) * 100;
 }

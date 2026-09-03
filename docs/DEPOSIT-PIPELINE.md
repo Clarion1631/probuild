@@ -94,10 +94,16 @@ What makes a bank credit safe to book on an amount alone:
 **The corroboration ladder: payer image > job progress > switch.** The deposit-class allowlist proves a customer *deposit* arrived; it says nothing about *which* customer. So a credit books on the strongest rung it can reach:
 
 1. **Payer evidence** — a check image (or QBO payment) naming the customer. Books on its own. A wrong-payer image is a conflict and never books, whatever else is true.
-2. **Job progress** — the field independently says this milestone's work is done, within 21 days before the deposit: a **passed inspection** on the project, a **daily log** whose work-performed text names a distinctive word of the milestone ("Rough In complete" → *rough*), or the project's **percent complete** (measured at or after the post date) having reached the share of the invoice this milestone bills through. Justin's rule, 2026-09-02: the money should align with the daily logs from the chat spaces. Books on its own.
+2. **Job progress** — the field independently says *this phase* is done, within 21 days before the deposit. Two rungs of evidence, and both must be about the milestone in hand:
+   - a **passed inspection whose type names the same phase** — "Rough-in plumbing" corroborates "Rough In complete"; a passed *final electrical* does not;
+   - a **daily log whose work-performed text names the phase**, matched on **whole words** — "set tile in the hall bath" corroborates a Tile milestone, "delivered textile samples" does not.
+
+   Matching uses the milestone's distinctive words (name minus stop words like *complete*, *payment*, *final*, tokens of 4+ characters), so a milestone called "Final Payment" has nothing to match on and can never be corroborated this way. Justin's rule, 2026-09-02: the money should align with the daily logs from the chat spaces. Books on its own.
+
+   There is deliberately **no percent-complete rung**. `Project.percentComplete` has no historical snapshot — `percentCompleteAsOf` records only when it was last written, and the nightly recalc refreshes it — so work finished *after* a deposit would have vouched for it retroactively.
 3. **The switch** — `DEPOSIT_SWEEP_LIVE_APPLY` must be exactly the string `true`. This is the operator taking responsibility for an amount-only match with no corroboration at all, and it is **OFF by default**.
 
-A credit that reaches no rung is recorded `proposed` with a reason naming what was missing ("amount matches Rough In complete but no daily log mentioning \"rough\", no passed inspection, and no percent-complete evidence confirms that phase is done"), and waits for a human.
+A credit that reaches no rung is recorded `proposed`, and its reason says plainly what happened: *"$13,447.68 matches \"Rough In complete\" (Hoppe Hall Bath, INV-00173) — phase not corroborated by any daily log or inspection; no payment was booked; set DEPOSIT_SWEEP_LIVE_APPLY=true to book amount-only matches (no daily log mentioning \"rough\", and no passed inspection of that phase, in the 21 days before the deposit)"*. It then waits for a human.
 
 Two deliberate differences in the money write, bank rows only:
 

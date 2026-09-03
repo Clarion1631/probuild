@@ -34,7 +34,6 @@ import {
     PROGRESS_WINDOW_DAYS,
     bankCreditFingerprint,
     booksWithoutOverride,
-    cumulativeMilestoneShare,
     isCustomerDepositClass,
     isDeterministicQboGuardFailure,
     isNotCustomerDepositReason,
@@ -808,7 +807,7 @@ const BANK_CANDIDATE_SELECT = {
     id: true, name: true, status: true, amount: true, invoiceId: true, qbInvoiceId: true,
     invoice: {
         select: {
-            code: true, totalAmount: true,
+            code: true,
             project: { select: { id: true, name: true } },
             client: { select: { name: true } },
         },
@@ -824,7 +823,6 @@ type BankCandidate = {
     qbInvoiceId: string | null;
     invoice: {
         code: string;
-        totalAmount: unknown;
         project: { id: string; name: string } | null;
         client: { name: string } | null;
     };
@@ -1010,6 +1008,10 @@ async function persistCollisionVerdict(
                     attempts: 1, processingStartedAt: new Date(), lastError: reason.slice(0, 1000),
                     source: BANK_DEPOSIT_SOURCE, bankReference: credit.bankReference,
                     postDate: isoDateToUtc(postDate), amountCents: credit.amountCents,
+                    // EVERY bank-row creation path stamps this, or a later reuse
+                    // of the reference reads as a clean replay of a row that
+                    // never recorded what it was.
+                    bankFingerprint: bankCreditFingerprint(payload),
                 },
             });
             const taskId = await ensureReviewTask(created, reason, "unmatched");
@@ -1149,9 +1151,26 @@ async function claimBankRow(payload: BankPayload): Promise<BankClaim> {
     // the idempotency key, so a bank that reuses a reference for different
     // money would otherwise have its new deposit silently swallowed as a
     // duplicate of the old one.
-    if (row && row.bankFingerprint && row.bankFingerprint !== fingerprint) {
+    // A row created before this column existed carries no fingerprint. Backfill
+    // it from the credit in hand ONLY when the two agree on the facts that were
+    // already stored (post date and amount); if they disagree, the reference has
+    // been reused and this is not a replay at all.
+    if (row && row.source === BANK_DEPOSIT_SOURCE && !row.bankFingerprint) {
+        const storedMatches = row.amountCents === payload.amountCents
+            && isoOf(row.postDate) === payload.postDate;
+        if (storedMatches) {
+            await prisma.depositIngest.updateMany({
+                where: { id: row.id, bankFingerprint: null },
+                data: { bankFingerprint: fingerprint },
+            });
+            row = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
+        }
+    }
+
+    if (row && row.source === BANK_DEPOSIT_SOURCE && row.bankFingerprint !== fingerprint) {
         const reason = `bank reference reused with different data — this row was created from ` +
-            `[${row.bankFingerprint}] but the batch now posts [${fingerprint}]; a human must work out which deposit is which`;
+            `[${row.bankFingerprint ?? "an unrecorded credit"}] but the batch now posts [${fingerprint}]; ` +
+            `a human must work out which deposit is which`;
         await prisma.depositIngest.updateMany({
             where: { id: row.id, status: { not: "reconcile" } },
             data: { status: "reconcile", lastError: reason.slice(0, 1000) },
@@ -1406,8 +1425,9 @@ async function matchAndApplyBank(row: DepositIngest, payload: BankPayload, opts:
 
     if (!booksWithoutOverride(confidence) && !liveApplyEnabled()) {
         return await finalizeProposed(row, picked.id,
-            `amount matches ${picked.name} but ${corroborationDetail} confirms that phase is done; ` +
-            `set ${LIVE_APPLY_ENV_VAR}=true to book anyway — would apply to ${describeCandidates([describeOne(picked)])}`);
+            `${amountLabel} matches ${describeCandidates([describeOne(picked)])} — phase not corroborated by any daily log ` +
+            `or inspection; no payment was booked; set ${LIVE_APPLY_ENV_VAR}=true to book amount-only matches ` +
+            `(${corroborationDetail})`);
     }
 
     const reserved = await reserveMilestone(row, picked.id, { amountCents: payload.amountCents, postDate: payload.postDate });
@@ -1433,10 +1453,13 @@ async function checkProgressCorroboration(picked: BankCandidate, postDate: strin
     const from = isoDateToUtc(isoDaysBefore(postDate, PROGRESS_WINDOW_DAYS));
     const to = isoDateToUtc(isoDaysAfter(postDate, 1)); // exclusive upper bound on the post day
 
-    const [inspections, dailyLogs, project, siblings] = await Promise.all([
+    const [inspections, dailyLogs] = await Promise.all([
         prisma.inspection.findMany({
             where: { projectId, result: { in: ["PASSED", "APPROVED"] } },
-            select: { result: true, performedDate: true, scheduledDate: true },
+            // `type` is what was inspected ("Rough-in", "Framing"): the rule
+            // needs it, because a passed plumbing inspection says nothing about
+            // a cabinetry milestone.
+            select: { result: true, type: true, performedDate: true, scheduledDate: true },
             orderBy: { performedDate: "desc" },
             take: 50,
         }),
@@ -1446,33 +1469,19 @@ async function checkProgressCorroboration(picked: BankCandidate, postDate: strin
             orderBy: { date: "desc" },
             take: 100,
         }),
-        prisma.project.findUnique({
-            where: { id: projectId },
-            select: { percentComplete: true, percentCompleteAsOf: true },
-        }),
-        prisma.paymentSchedule.findMany({
-            where: { invoiceId: picked.invoiceId },
-            select: { id: true, amount: true, dueDate: true, createdAt: true },
-        }),
     ]);
 
+    // NOTE: a percent-complete rung was considered and REMOVED. Project
+    // .percentComplete has no historical snapshot — `percentCompleteAsOf` is
+    // just when it was last written, and the nightly recalc refreshes it — so
+    // progress made LAST WEEK would have vouched for a deposit that landed
+    // before any of it happened. Corroboration has to be evidence dated around
+    // the money, and only the inspection and daily-log rungs can be.
     return progressCorroboration({
         postDate,
         milestoneName: picked.name,
-        inspections: inspections.map(i => ({ result: i.result, date: isoOf(i.performedDate ?? i.scheduledDate) })),
+        inspections: inspections.map(i => ({ result: i.result, type: i.type, date: isoOf(i.performedDate ?? i.scheduledDate) })),
         dailyLogs: dailyLogs.map(l => ({ date: isoOf(l.date) ?? "", workPerformed: l.workPerformed ?? "" })),
-        percentComplete: project?.percentComplete == null ? null : toNum(project.percentComplete),
-        percentCompleteAsOf: isoOf(project?.percentCompleteAsOf ?? null),
-        requiredPercent: cumulativeMilestoneShare(
-            siblings.map(m => ({
-                id: m.id,
-                amount: toNum(m.amount),
-                dueDate: isoOf(m.dueDate),
-                createdAt: m.createdAt.toISOString(),
-            })),
-            picked.id,
-            toNum(picked.invoice.totalAmount),
-        ),
     });
 }
 
