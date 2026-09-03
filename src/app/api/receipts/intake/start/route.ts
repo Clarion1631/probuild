@@ -9,6 +9,7 @@ import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core
 import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
+import { reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
 import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
@@ -245,6 +246,44 @@ export async function POST(req: Request) {
                         { status: 409 },
                     );
                 }
+                // A LIVE LEASE IS NOT INVALIDATED BY A RETRY HERE EITHER.
+                //
+                // The re-arm below is destructive by design — new version, new
+                // path, the old object deleted — and it used to run on EVERY
+                // /start for a recoverable row, including one whose signed URL
+                // was still live. Two retries for the same parked sourceRef (a
+                // forwarder's own retry policy, a double-tap) therefore raced:
+                // the second deleted the object the first was about to PUT its
+                // bytes to, and the first request's URL pointed at nothing.
+                // Same failure the STAGING path was fixed for; the rule is one
+                // rule now (see reuseLiveLease).
+                //
+                // The re-arm's identity writes still happen, because a recovery
+                // may legitimately arrive with a CORRECTED expected hash — they
+                // just land on the SAME path and the SAME lease version.
+                const keptRecovery = await reuseLiveLease(existing, ext, leaseDeps, {
+                    expectedSha256,
+                    fileSha256: "",
+                    mimeType,
+                    fileSize: 0,
+                    nextRetryAt: null,
+                });
+                if (keptRecovery) {
+                    if (keptRecovery.kind === "storage-unavailable") {
+                        return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                    }
+                    if (keptRecovery.kind === "conflict") return leaseConflict(existing.id);
+                    return NextResponse.json({
+                        ok: true,
+                        resumed: true,
+                        recovered: true,
+                        id: existing.id,
+                        state: existing.state,
+                        maxBytes: MAX_STORED_BYTES,
+                        ...keptRecovery.signed,
+                    });
+                }
+
                 // THE ROW MOVES FIRST, THEN THE URL IS SIGNED.
                 //
                 // The claim on the lease is made in ONE checked update: the
@@ -272,16 +311,7 @@ export async function POST(req: Request) {
                     },
                 });
                 if (count === 0) {
-                    return NextResponse.json(
-                        {
-                            ok: false,
-                            error: "publish-conflict",
-                            reason: "this row changed while a new upload URL was being issued; retry",
-                            retryable: true,
-                            existingId: existing.id,
-                        },
-                        { status: 409 },
-                    );
+                    return leaseConflict(existing.id);
                 }
                 const rearmed = await signUpload(retryPath);
                 if (!rearmed) {
@@ -358,50 +388,17 @@ export async function POST(req: Request) {
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
                 );
             }
-            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY.
-            //
-            // Every matching /start used to bump uploadLeaseVersion and repoint
-            // storagePath UNCONDITIONALLY, even when the existing lease had not
-            // expired. That invalidated the ORIGINAL caller's upload URL out
-            // from under it: two /start calls for the same sourceRef (a network
-            // retry, a double-tap, a forwarder's own retry policy) racing here
-            // meant whichever one finished second deleted the object the first
-            // was about to PUT its bytes to (`start-resumed-repath` below) —
-            // and the first request's signed URL now pointed at nothing.
-            //
-            // `createSignedUploadUrl` does not revoke a previously issued token
-            // when called again for the SAME path, so an unexpired lease can
-            // safely be served a fresh signed URL for its EXISTING path: same
-            // object identity, no repath, no delete of anything. This makes a
-            // retry against a live lease idempotent instead of destructive.
-            if (existing.uploadUrlExpiresAt && existing.uploadUrlExpiresAt.getTime() > Date.now()) {
-                const resigned = await signUpload(existing.storagePath);
-                if (!resigned) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-                // The DB lease must move with the URL it reissues. A resigned
-                // URL is good for a fresh ~2h window, but leaving
-                // uploadUrlExpiresAt untouched meant the row still recorded the
-                // ORIGINAL, older expiry — so the sweeper could judge the lease
-                // dead and reclaim the row while the client was still holding a
-                // perfectly live URL. CAS'd on the identity this retry already
-                // proved (id, state, storagePath, uploadLeaseVersion): if the
-                // row moved under us between the read and here, this loses the
-                // race and falls through to the resume-with-a-new-lease path
-                // below rather than handing out a URL for a lease we could not
-                // actually extend.
-                const { count } = await prisma.receiptIntake.updateMany({
-                    where: {
-                        id: existing.id,
-                        state: "STAGING",
-                        storagePath: existing.storagePath,
-                        uploadLeaseVersion: existing.uploadLeaseVersion,
-                    },
-                    data: { uploadUrlExpiresAt: uploadLeaseExpiry() },
-                });
-                if (count > 0) {
-                    return NextResponse.json({
-                        ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
-                    });
+            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY. Same rule, same
+            // helper, as the recoverable re-arm above.
+            const kept = await reuseLiveLease(existing, ext, leaseDeps);
+            if (kept) {
+                if (kept.kind === "storage-unavailable") {
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
                 }
+                if (kept.kind === "conflict") return leaseConflict(existing.id);
+                return NextResponse.json({
+                    ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...kept.signed,
+                });
             }
 
             // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one
@@ -425,18 +422,7 @@ export async function POST(req: Request) {
                     uploadUrlExpiresAt: uploadLeaseExpiry(),
                 },
             });
-            if (count === 0) {
-                return NextResponse.json(
-                    {
-                        ok: false,
-                        error: "publish-conflict",
-                        reason: "this row changed while a new upload URL was being issued; retry",
-                        retryable: true,
-                        existingId: existing.id,
-                    },
-                    { status: 409 },
-                );
-            }
+            if (count === 0) return leaseConflict(existing.id);
             const resumed = await signUpload(resumePath);
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             if (resumePath !== existing.storagePath) {
@@ -467,6 +453,26 @@ export async function POST(req: Request) {
         ...signed,
     });
 }
+
+function leaseConflict(existingId: string) {
+    return NextResponse.json(
+        {
+            ok: false,
+            error: "publish-conflict",
+            reason: "this row changed while a new upload URL was being issued; retry",
+            retryable: true,
+            existingId,
+        },
+        { status: 409 },
+    );
+}
+
+/** The live wiring for the shared lease rule (src/lib/receipt-intake/upload-lease.ts). */
+const leaseDeps = {
+    db: prisma.receiptIntake,
+    sign: (storagePath: string) => signUpload(storagePath),
+    expiresAt: uploadLeaseExpiry,
+};
 
 /**
  * The URL is `upsert: true` (see bucket.ts) so a resumed /start for the SAME

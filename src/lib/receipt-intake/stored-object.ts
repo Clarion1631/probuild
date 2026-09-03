@@ -158,6 +158,54 @@ export async function downloadVerified(
     return { ok: true, bytes: result.bytes };
 }
 
+/**
+ * "WE ALREADY HAVE IT" — THE ONE RULE BOTH REPLAY PATHS ANSWER IT WITH.
+ *
+ * `POST /api/receipts/intake` (a forwarder re-sending the same bytes) and
+ * `POST /api/receipts/intake/{id}/finalize` (a client retrying a finalize) both
+ * end in a 2xx that tells the sender we hold its document — and the forwarders
+ * delete their only copy on that answer.
+ *
+ * They used to decide it from PRESENCE alone: one metadata call saying something
+ * sits at the path. That authorised the delete on the strength of bytes nobody
+ * had looked at since they were sealed, so an object replaced or corrupted after
+ * publication (an upsert URL reused, a restore that put back a different
+ * version, a storage-side fault) was laundered into "we have your receipt" and
+ * the last good copy went with it. The row's `fileSha256` is the only hash this
+ * system has ever verified; the stored bytes must still hash to it.
+ *
+ * Cheap probe first, so the common orphan case never pays for a download.
+ * `content-mismatch` is deliberately its own answer: it is NOT retryable (the
+ * sender resending changes nothing) and it must never be healed here — the row
+ * is left exactly as it is for the worker's `content-changed` park and the
+ * sweeper to act on.
+ */
+export type StoredCopyCheck =
+    | { ok: true }
+    | { ok: false; kind: "missing" | "transient" | "content-mismatch"; message?: string };
+
+export async function verifyStoredCopy(
+    storagePath: string,
+    /** What the row was published with. Empty means a legacy row — see downloadVerified. */
+    fileSha256: string,
+    sizeOf: (storagePath: string) => Promise<SizeResult> = receiptObjectSize,
+    download: (storagePath: string) => Promise<DocBytesResult> = downloadReceiptObject,
+): Promise<StoredCopyCheck> {
+    const present = await sizeOf(storagePath);
+    if (!present.ok) {
+        return present.kind === "missing"
+            ? { ok: false, kind: "missing" }
+            : { ok: false, kind: "transient", message: present.message ?? "size-unavailable" };
+    }
+    const verified = await downloadVerified(storagePath, fileSha256, download);
+    if (verified.ok) return { ok: true };
+    // It was there a moment ago, so a `missing` here is a race, not a verdict —
+    // and either way it is never a 2xx.
+    return verified.kind === "sha-mismatch"
+        ? { ok: false, kind: "content-mismatch", message: verified.message }
+        : { ok: false, kind: verified.kind, message: verified.message };
+}
+
 export type StoredObjectCheck =
     /**
      * Valid: these are the values the row must be published with, plus the

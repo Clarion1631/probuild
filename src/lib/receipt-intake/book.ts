@@ -19,7 +19,11 @@
  */
 import { matchCostCode } from "@/lib/project-match";
 import { receiptUrlRef } from "./receipt-url";
-import { QBO_ATTACHMENT_MAX_BYTES } from "./intake-core";
+import {
+    phaseConfidenceMin,
+    phaseSuggestionIsConfident,
+    QBO_ATTACHMENT_MAX_BYTES,
+} from "./intake-core";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import {
     QBTimeoutError,
@@ -856,8 +860,29 @@ async function resolvePhase(
 ): Promise<{ costCodeId: string | null; note: string; rejected: string | null }> {
     // A human's explicit pick outranks the model's suggestion, but neither is
     // trusted without the project check.
-    const candidate = row.costCodeId ?? row.suggestedCostCodeId ?? null;
+    const explicit = row.costCodeId ?? null;
+    const candidate = explicit ?? row.suggestedCostCodeId ?? null;
     if (!candidate) return { costCodeId: null, note: "", rejected: null };
+
+    // THE CONFIDENCE THE PROMPT ASKS FOR IS NOW THE CONFIDENCE THAT DECIDES.
+    //
+    // read.ts tells the model a low number "sends the receipt to a human"; this
+    // is where that becomes true. Below the threshold (or with no number at
+    // all) the Expense books UNCODED and the suggestion is recorded as
+    // REJECTED — the same signal the wrong-job branch below raises, so it
+    // reaches the queue and the audit event through one path rather than two.
+    // Checked before the project round trip: a suggestion we will not apply is
+    // not worth a database call.
+    if (!explicit && !phaseSuggestionIsConfident(row.suggestedConfidence)) {
+        const stated = typeof row.suggestedConfidence === "number"
+            ? row.suggestedConfidence.toFixed(2)
+            : "none stated";
+        return {
+            costCodeId: null,
+            note: ` · phase suggestion withheld (confidence ${stated} < ${phaseConfidenceMin()}) — assign one`,
+            rejected: candidate,
+        };
+    }
 
     const allowed = await deps.isCostCodeAllowed(projectId, candidate);
     if (allowed) {

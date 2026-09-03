@@ -20,10 +20,14 @@ import {
     RECEIPT_BUCKET_FILE_SIZE_LIMIT,
     RECEIPT_BUCKET_MIME_TYPES,
     RECEIPT_INTAKE_STATES,
+    CONSTRAINT_LOOKUP_SQL,
     ensureReceiptBucket,
+    expectedConstraints,
+    foreignKeyDrift,
     parseSizeLimit,
     statements,
     targetMatches,
+    verifyConstraints,
 } from "../scripts/apply-receipt-intake.mjs";
 import { RECEIPT_INTAKE_STATES as RUNTIME_STATES } from "../src/lib/receipt-intake/route-state";
 
@@ -301,9 +305,143 @@ test("the wanted definition matches the snapshot CI compares against production"
 });
 
 test("verification asserts the CHECK ALLOWS every state, not just that it exists", () => {
+    assert.match(CONSTRAINT_LOOKUP_SQL, /pg_get_constraintdef\(oid\) AS def/, "verify reads the definition");
     const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-receipt-intake.mjs"), "utf8");
-    assert.match(source, /pg_get_constraintdef\(oid\) AS def FROM pg_constraint/, "verify reads the definition");
     assert.match(source, /does not allow/, "and fails loudly naming what is missing");
+});
+
+// ── A NAME IS NOT A CONSTRAINT (round-33 item 5) ───────────────────────────
+
+/**
+ * A `pg_constraint` catalog that honours the scope in the SQL it is handed.
+ *
+ * `pg_constraint` is database-wide, so a lookup by `conname` alone is satisfied
+ * by a constraint of that name on ANY relation. This fake answers for a row on
+ * another table UNLESS the query actually scopes itself — which is how the
+ * scoping can be tested without a database.
+ */
+function catalog(rows: { name: string; table: string; def: string }[]) {
+    return async (sql: string, name: string) => {
+        const scoped = /conrelid = '"ReceiptIntake"'::regclass/.test(sql);
+        return rows
+            .filter(r => r.name === name && (!scoped || r.table === "ReceiptIntake"))
+            .map(r => ({ def: r.def }));
+    };
+}
+
+type ExpectedFk = {
+    name: string; kind: string; table: string; column: string;
+    references: string; referencedColumn: string; onDelete: string; onUpdate: string;
+};
+
+const expectedFks = (expectedConstraints as unknown as ExpectedFk[]).filter(c => c.kind === "fk");
+
+/** What a CORRECT production database renders back, in pg's own shape. */
+const LIVE_CONSTRAINTS = [
+    {
+        name: "ReceiptIntake_state_check",
+        table: "ReceiptIntake",
+        def: `CHECK ((state = ANY (ARRAY[${
+            RECEIPT_INTAKE_STATES.map((s: string) => `'${s}'::text`).join(", ")
+        }])))`,
+    },
+    ...expectedFks.map(c => ({
+        name: c.name,
+        table: "ReceiptIntake",
+        def: `FOREIGN KEY ("${c.column}") REFERENCES "${c.references}"(${c.referencedColumn})`
+            + ` ON UPDATE ${c.onUpdate} ON DELETE ${c.onDelete}`,
+    })),
+];
+
+test("the control: a correct database verifies clean", async () => {
+    const { problems, notes } = await verifyConstraints(catalog(LIVE_CONSTRAINTS));
+    assert.deepEqual(problems, []);
+    assert.equal(notes.length, expectedConstraints.length, "every constraint reported");
+});
+
+test("a same-named constraint on ANOTHER table is drift, not a pass", async () => {
+    // The exact hole: pg_constraint is database-wide, so `WHERE conname = $1`
+    // was satisfied by a constraint of that name on any relation at all — and a
+    // database where ReceiptIntake never got its foreign keys still reported
+    // "verified 5 constraints".
+    const elsewhere = LIVE_CONSTRAINTS.map(c =>
+        c.name === "ReceiptIntake_projectId_fkey" ? { ...c, table: "SomeOtherTable" } : c);
+    const { problems } = await verifyConstraints(catalog(elsewhere));
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /ReceiptIntake_projectId_fkey missing on ReceiptIntake/);
+});
+
+test("a stale FK target is drift — the RIGHT name pointing at the WRONG parent", async () => {
+    const stale = LIVE_CONSTRAINTS.map(c =>
+        c.name === "ReceiptIntake_costCodeId_fkey"
+            ? { ...c, def: 'FOREIGN KEY ("costCodeId") REFERENCES "Phase"(id) ON UPDATE CASCADE ON DELETE SET NULL' }
+            : c);
+    const { problems } = await verifyConstraints(catalog(stale));
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /referenced table is Phase, want CostCode/);
+});
+
+test("ON DELETE CASCADE where SET NULL was written is drift", () => {
+    // The difference between "losing a project nulls a column" and "losing a
+    // project DELETES the audit trail of a booked receipt".
+    const expected = expectedFks.find(c => c.name === "ReceiptIntake_projectId_fkey")!;
+    const drift = foreignKeyDrift(
+        expected,
+        'FOREIGN KEY ("projectId") REFERENCES "Project"(id) ON UPDATE CASCADE ON DELETE CASCADE',
+    );
+    assert.match(drift!, /ON DELETE is CASCADE, want SET NULL/);
+});
+
+test("an FK with NO action clause reads as NO ACTION, never as 'unspecified'", () => {
+    // Postgres renders nothing at all for the SQL default, and NO ACTION is
+    // exactly the value that would BLOCK a project delete instead of nulling
+    // the column. Treating an absent clause as "fine" would wave that through.
+    const expected = expectedFks.find(c => c.name === "ReceiptIntake_expenseId_fkey")!;
+    const drift = foreignKeyDrift(expected, 'FOREIGN KEY ("expenseId") REFERENCES "Expense"(id)');
+    assert.match(drift!, /ON DELETE is NO ACTION, want SET NULL/);
+    assert.match(drift!, /ON UPDATE is NO ACTION, want CASCADE/);
+});
+
+test("a missing constraint is still a failure, and names the table", async () => {
+    const without = LIVE_CONSTRAINTS.filter(c => c.name !== "ReceiptIntake_expenseId_fkey");
+    const { problems } = await verifyConstraints(catalog(without));
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /ReceiptIntake_expenseId_fkey missing on ReceiptIntake/);
+});
+
+test("the state CHECK is still verified by CONTENT, through the same path", async () => {
+    const narrowed = LIVE_CONSTRAINTS.map(c =>
+        c.name === "ReceiptIntake_state_check"
+            ? { ...c, def: "CHECK ((state = ANY (ARRAY['RECEIVED'::text])))" }
+            : c);
+    const { problems } = await verifyConstraints(catalog(narrowed));
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /does not allow: STAGING/);
+});
+
+test("every lookup is scoped to ReceiptIntake, and every expectation names it", () => {
+    assert.match(CONSTRAINT_LOOKUP_SQL, /conrelid = '"ReceiptIntake"'::regclass/);
+    assert.match(CONSTRAINT_LOOKUP_SQL, /conname = \$1/, "the NAME is the parameter, the table is not");
+    for (const c of expectedConstraints) {
+        assert.equal(c.table, "ReceiptIntake", `${c.name} is scoped by the literal in the SQL`);
+    }
+});
+
+test("each expected FK matches the ALTER TABLE the script and the migration apply", () => {
+    // The expectation is only worth anything if it describes what is actually
+    // written. Both files are checked, so the verifier cannot drift away from
+    // either the production path or the CI one.
+    for (const fk of expectedFks) {
+        const shape = normalize(
+            `ADD CONSTRAINT "${fk.name}" FOREIGN KEY ("${fk.column}")`
+            + ` REFERENCES "${fk.references}"("${fk.referencedColumn}")`
+            + ` ON DELETE ${fk.onDelete} ON UPDATE ${fk.onUpdate}`,
+        );
+        const statement = statements.find((s: string) => s.includes(`ADD CONSTRAINT "${fk.name}"`));
+        assert.ok(statement, `${fk.name} is not in the script`);
+        assert.ok(normalize(statement!).includes(shape), `${fk.name}: script SQL disagrees with the expectation`);
+        assert.ok(normalize(migrationSql).includes(shape), `${fk.name}: migration.sql disagrees with the expectation`);
+    }
 });
 
 // ── The receipts bucket is provisioned, not assumed (round-13 item 3) ───────

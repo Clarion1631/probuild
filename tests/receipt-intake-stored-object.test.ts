@@ -18,6 +18,7 @@ import {
     publishFence,
     RECOVERABLE_PARK_REASONS,
     sealAndPublish,
+    verifyStoredCopy,
 } from "../src/lib/receipt-intake/stored-object";
 import { MAX_STORED_BYTES } from "../src/lib/receipt-intake/intake-core";
 import { receiptObjectSize } from "../src/lib/receipt-intake/bucket";
@@ -186,6 +187,91 @@ test("missing and transient stay distinguishable through verification", async ()
         ok: false, kind: "transient", message: "ECONNRESET",
     }));
     assert.equal((flaky as { kind: string }).kind, "transient");
+});
+
+// ── "We already have it" means THIS DOCUMENT (round-33 item 3) ────────────
+
+const replayRoutes = {
+    "POST /api/receipts/intake": readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
+        "utf8",
+    ),
+    "POST /api/receipts/intake/{id}/finalize": readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+        "utf8",
+    ),
+};
+
+test("MUTATED OBJECT: a replaced object is content-mismatch, never 'we have it'", async () => {
+    // Both replay paths used to confirm PRESENCE and return success. The
+    // forwarders delete their only copy on that answer — so an object replaced
+    // or corrupted after publication (an upsert URL reused, a restore that put
+    // back a different version, a storage-side fault) was laundered into "we
+    // have your receipt" and the last good copy went with it.
+    const realSha = createHash("sha256").update(PNG).digest("hex");
+    const mutated = Buffer.from(PNG);
+    mutated[mutated.length - 1] ^= 0xff; // one flipped bit is enough
+
+    const held = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: mutated }));
+    assert.deepEqual(
+        { ok: held.ok, kind: (held as { kind?: string }).kind },
+        { ok: false, kind: "content-mismatch" },
+    );
+});
+
+test("the control: the ORIGINAL bytes still verify", async () => {
+    const realSha = createHash("sha256").update(PNG).digest("hex");
+    const held = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: PNG }));
+    assert.deepEqual(held, { ok: true });
+});
+
+test("a mismatch is decided WITHOUT healing, and absence still reads as absence", async () => {
+    const realSha = createHash("sha256").update(PNG).digest("hex");
+    // The metadata probe runs first, so an orphan never pays for a download —
+    // and never reaches the hash comparison at all.
+    let downloads = 0;
+    const counted = async () => { downloads++; return { ok: true as const, bytes: PNG }; };
+    const gone = await verifyStoredCopy("p.png", realSha, async () => ({ ok: false, kind: "missing" }), counted);
+    assert.equal((gone as { kind: string }).kind, "missing");
+    assert.equal(downloads, 0, "no body was read for an object that is not there");
+
+    const flaky = await verifyStoredCopy(
+        "p.png", realSha,
+        async () => ({ ok: false, kind: "transient", message: "ECONNRESET" }),
+        counted,
+    );
+    assert.equal((flaky as { kind: string }).kind, "transient", "a fault is never a verdict");
+    assert.equal(downloads, 0);
+});
+
+test("a race — present, then gone before the read — is transient-or-missing, never success", async () => {
+    const realSha = createHash("sha256").update(PNG).digest("hex");
+    const raced = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: false, kind: "not-found" }));
+    assert.equal(raced.ok, false);
+    assert.equal((raced as { kind: string }).kind, "missing");
+});
+
+test("BOTH replay paths ask this one rule, and answer a mismatch with 409", () => {
+    // Two copies of "do we hold it" is how one path came to be stricter than
+    // the other. The routes map the verdict to their own response shapes, but
+    // the verdict itself is decided here.
+    for (const [route, source] of Object.entries(replayRoutes)) {
+        assert.match(source, /verifyStoredCopy\(/, `${route} uses the shared rule`);
+        assert.match(source, /error: "content-mismatch"/, `${route} has a mismatch answer`);
+        assert.match(source, /retryable: false/, `${route}: resending the same bytes changes nothing`);
+        // The mismatch branch must be decided BEFORE any success is returned.
+        assert.ok(
+            source.indexOf('error: "content-mismatch"') < source.indexOf("alreadyReceived: true")
+            || source.indexOf('error: "content-mismatch"') < source.indexOf("alreadyFinalized: true"),
+            `${route}: the mismatch is answered before the success`,
+        );
+        // And never healed: a re-upload is exactly how bytes get replaced.
+        const mismatch = source.slice(source.indexOf('error: "content-mismatch"'));
+        assert.ok(
+            !/storeObject|uploadReceiptObject/.test(mismatch.slice(0, 600)),
+            `${route}: a mismatch must not overwrite the stored object`,
+        );
+    }
 });
 
 test("a legacy row with no recorded sha is passed through, not refused", async () => {
@@ -556,17 +642,23 @@ test("the replay path heals only on an AFFIRMATIVE absence, and 503s on a fault"
         path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
         "utf8",
     );
-    const branch = intake.slice(intake.indexOf("const present = await receiptObjectSize("));
+    const branch = intake.slice(intake.indexOf("const held = await verifyStoredCopy("));
     const head = branch.slice(0, branch.indexOf("const healable"));
-    assert.match(head, /present\.kind === "transient"/);
+    assert.match(head, /held\.kind === "transient"/);
     assert.match(head, /status: 503/);
     // The transient answer is handled BEFORE the not-ok branch that heals, so a
-    // storage fault can never reach storeObject.
+    // storage fault can never reach storeObject. A CONTENT mismatch is answered
+    // ahead of it too: a re-upload is exactly how bytes get replaced, so healing
+    // one would let a replay launder the swap.
     assert.ok(
-        head.indexOf('present.kind === "transient"') < head.indexOf("if (!present.ok) {"),
+        head.indexOf('held.kind === "transient"') < head.indexOf("if (!held.ok) {"),
         "the fault check comes first",
     );
-    assert.ok(!/storeObject/.test(head), "nothing is written on the fault path");
+    assert.ok(
+        head.indexOf('held.kind === "content-mismatch"') < head.indexOf("if (!held.ok) {"),
+        "and so does the content check",
+    );
+    assert.ok(!/storeObject/.test(head), "nothing is written on the fault or mismatch paths");
     // And the collapsing helper is gone, so nothing can reintroduce it.
     const storage = readFileSync(path.join(__dirname, "..", "src/lib/secure-storage.ts"), "utf8");
     assert.ok(!/secureObjectExists/.test(storage), "no boolean exists-check to reach for");

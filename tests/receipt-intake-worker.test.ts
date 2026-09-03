@@ -903,11 +903,46 @@ test("a row with no job at claim time AND none at routing time still parks", asy
 });
 
 test("a failing re-read falls back to the claimed value instead of losing the row", async () => {
+    // The snapshot ALREADY names a job, so the fallback asserts something the
+    // row itself recorded and a late assignment can only have refined. The
+    // routing gate asks whether a job exists at all, so the stale answer and the
+    // fresh one agree — this one may stand.
     const h = harness([workerRow({ projectId: "proj-1" })], {
         refreshProjectId: async () => { throw new Error("pool exhausted"); },
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { READ: 1 });
+});
+
+test("RACE: a DB blip during the read must not park an assigned receipt NEEDS_JOB", async () => {
+    // The interleaving: the pass claims a row with no project and spends ~25s
+    // in the reader. A person assigns the job in that window, and the re-read
+    // that would have SEEN it throws (a pool timeout, a dropped connection).
+    //
+    // Swallowing the throw turned a transient fault into a routing decision:
+    // the fallback is the CLAIMED snapshot, which by definition predates the
+    // assignment, so it asserted "still unassigned" — exactly the fact the
+    // failed call was supposed to establish — and parked the receipt NEEDS_JOB
+    // for a job it already had. The person sees their own assignment ignored,
+    // and the row waits for a human nothing will summon.
+    const h = harness([workerRow({ projectId: null })], {
+        refreshProjectId: async () => { throw new Error("pool exhausted"); },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { RETRY: 1 }, "the normal retry path, not a verdict");
+    assert.deepEqual(h.states, [], "nothing was parked");
+    assert.equal(h.retried.length, 1, "with a backoff and an attempt spent");
+    assert.equal(h.retried[0].attempts, 1);
+    assert.match(h.retried[0].reason, /project-refresh-unavailable/);
+});
+
+test("the control: a re-read that ANSWERS 'no job' still parks NEEDS_JOB", async () => {
+    // The fix must not turn every unassigned receipt into an infinite retry.
+    // An answered null is a decision; only a FAILED call is a transient.
+    const h = harness([workerRow({ projectId: null })], { refreshProjectId: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_JOB: 1 });
+    assert.deepEqual(h.retried, []);
 });
 
 test("the deadline starts at invocation entry, so a slow sweep cannot overrun it", async () => {
@@ -1271,23 +1306,38 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
         path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
         "utf8",
     );
-    // Four: the new row, the re-armed park, the resumed STAGING upload, AND a
-    // retry against a still-live lease. A URL handed out without a lease
-    // extension is one the sweeper cannot see coming — a resigned URL for an
-    // unexpired lease is good for a fresh ~2h window, so leaving the row's
-    // recorded expiry at its OLD value let the sweeper judge the lease dead
-    // while the client still held a perfectly live URL.
+    // Four branches, four lease stamps: the new row, the re-armed park, the
+    // resumed STAGING upload, AND a retry against a still-live lease. A URL
+    // handed out without a lease extension is one the sweeper cannot see coming
+    // — a resigned URL for an unexpired lease is good for a fresh ~2h window,
+    // so leaving the row's recorded expiry at its OLD value let the sweeper
+    // judge the lease dead while the client still held a perfectly live URL.
+    //
+    // Three of them are here; the fourth is the shared live-lease rule, which
+    // now serves BOTH resumable states from one place (upload-lease.ts) and
+    // takes the same clock as an injected dependency.
     assert.equal(
         (start.match(/uploadUrlExpiresAt: uploadLeaseExpiry\(\)/g) ?? []).length,
-        4,
-        "create, re-arm, resume, and the live-lease retry all stamp the lease",
+        3,
+        "create, re-arm and resume stamp the lease inline",
+    );
+    assert.match(start, /expiresAt: uploadLeaseExpiry,/, "and the shared rule is given the same clock");
+    const lease = readFileSync(
+        path.join(__dirname, "..", "src/lib/receipt-intake/upload-lease.ts"),
+        "utf8",
+    );
+    assert.match(
+        lease,
+        /data: \{ \.\.\.rearm, uploadUrlExpiresAt: deps\.expiresAt\(\) \}/,
+        "the shared rule stamps it too",
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
-    assert.equal(signed, 4, "one signUpload call per branch");
+    assert.equal(signed, 3, "one signUpload call per inline branch");
+    assert.match(lease, /await deps\.sign\(path\)/, "and the shared rule signs the path it kept");
     assert.match(
-        start,
-        /existing\.uploadUrlExpiresAt && existing\.uploadUrlExpiresAt\.getTime\(\) > Date\.now\(\)/,
-        "the live-lease retry's CAS is gated on the lease still being live",
+        lease,
+        /if \(!row\.uploadUrlExpiresAt \|\| row\.uploadUrlExpiresAt\.getTime\(\) <= now\) return null;/,
+        "the live-lease retry is gated on the lease still being live",
     );
 });
 

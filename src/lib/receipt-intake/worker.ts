@@ -900,7 +900,34 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
 
     // Re-read RIGHT BEFORE routing. Everything above — the download, a 25s
     // model call — is time in which a late job assignment can have landed.
-    const projectId = await deps.refreshProjectId(row.id).catch(() => row.projectId);
+    //
+    // A FAILED RE-READ IS NOT AN ANSWER ABOUT THE JOB.
+    //
+    // Swallowing the throw and falling back to the CLAIMED snapshot turned a
+    // pool timeout into a routing decision: the snapshot is by definition the
+    // row as it looked BEFORE the read, so when it carried no project and a
+    // person assigned one during those seconds, the fallback parked a receipt
+    // NEEDS_JOB for a job it already had. The person sees their own assignment
+    // ignored, and the row waits for a human that nothing will summon.
+    //
+    // So the two cases are split by what the fallback would actually assert:
+    //   - snapshot has NO project: the fallback claims "still unassigned",
+    //     which is exactly the fact the failed call was supposed to establish.
+    //     Transient — normal backoff, attempt spent, claim handed back.
+    //   - snapshot HAS a project: the fallback claims "this job", which the
+    //     row itself already recorded and which a late assignment can only
+    //     have refined, never removed (the column is SetNull on delete, and a
+    //     deleted project is not a reason to re-read Gemini). The routing gate
+    //     only asks whether a job exists at all, so the stale answer and the
+    //     fresh one agree. It may stand.
+    const refreshed = await deps.refreshProjectId(row.id).then(
+        value => ({ ok: true, value } as const),
+        () => ({ ok: false, value: null } as const),
+    );
+    if (!refreshed.ok && !row.projectId) {
+        return retryTransient(row, deps, "project-refresh-unavailable");
+    }
+    const projectId = refreshed.ok ? refreshed.value : row.projectId;
     const hasProject = !!projectId;
 
     const routeInput = {

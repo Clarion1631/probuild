@@ -48,6 +48,51 @@ export const QBO_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
 /** The real ceiling for a stored receipt, enforced on the object itself. */
 export const MAX_STORED_BYTES = QBO_ATTACHMENT_MAX_BYTES;
 
+/**
+ * HOW SURE THE MODEL MUST BE BEFORE ITS PHASE SUGGESTION IS APPLIED.
+ *
+ * The reader's prompt (read.ts, STEP 3) asks for a 0..1 confidence and tells the
+ * model plainly that "a low number sends the receipt to a human". Nothing ever
+ * read the number: `suggestedCostCodeId` was applied to the Expense whatever the
+ * confidence said, including when the model itself reported it was guessing. So
+ * a phase the document never pointed at rode into the books, and every job-cost
+ * and variance report counted it as spend on a line nobody budgeted — silently,
+ * because the audit note read "phase suggested" either way.
+ *
+ * 0.6 because the suggestion is cheap to withhold and expensive to get wrong: a
+ * withheld phase leaves the Expense UNCODED and visible in the bookkeeper's
+ * queue, where coding it is one click; an applied wrong phase is invisible and
+ * has to be found in a variance report weeks later. Env-overridable so the
+ * threshold can be tuned from what the queue actually shows without a deploy.
+ *
+ * A HUMAN'S EXPLICIT PICK IS NEVER SUBJECT TO THIS — it is not a suggestion.
+ */
+export const RECEIPT_PHASE_CONFIDENCE_MIN = 0.6;
+
+/** The effective threshold. A junk or out-of-range override is ignored, not obeyed. */
+export function phaseConfidenceMin(
+    raw: string | undefined = process.env.RECEIPT_PHASE_CONFIDENCE_MIN,
+): number {
+    if (raw === undefined || raw.trim() === "") return RECEIPT_PHASE_CONFIDENCE_MIN;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : RECEIPT_PHASE_CONFIDENCE_MIN;
+}
+
+/**
+ * NULL IS NOT ZERO AND IT IS NOT "SURE".
+ *
+ * `normalizeConfidence` returns null when the model gave no number at all (an
+ * older prompt, a truncated response, a phase list that was never sent). That is
+ * an ABSENT answer, and an absent answer cannot clear a threshold — treating it
+ * as passing would apply exactly the suggestions we know least about.
+ */
+export function phaseSuggestionIsConfident(
+    confidence: number | null | undefined,
+    min: number = phaseConfidenceMin(),
+): boolean {
+    return typeof confidence === "number" && Number.isFinite(confidence) && confidence >= min;
+}
+
 /** Sources a shared-secret forwarder may declare. */
 export const MACHINE_SOURCES = new Set(["drive", "email", "chat"]);
 /** Minted server-side from the authenticated caller, never read off the body. */

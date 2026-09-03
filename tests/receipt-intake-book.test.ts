@@ -24,6 +24,11 @@ import {
     type BookableRow,
     type BookDependencies,
 } from "../src/lib/receipt-intake/book";
+import {
+    phaseConfidenceMin,
+    phaseSuggestionIsConfident,
+    RECEIPT_PHASE_CONFIDENCE_MIN,
+} from "../src/lib/receipt-intake/intake-core";
 import { QBTimeoutError } from "../src/lib/quickbooks";
 import {
     QboAccountConfigError,
@@ -843,10 +848,75 @@ test("unassigned during READ, assigned before BOOKING: the phase is re-checked",
 
 test("the phase-suggestion confidence is recorded when the suggestion is used", async () => {
     const r = recorder();
-    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.42 }), r.deps);
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.82 }), r.deps);
     assert.equal(r.expenses[0].costCodeId, "cc-plumb");
-    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.42\)/);
-    assert.equal(r.events[0].detail.suggestedConfidence, 0.42);
+    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.82\)/);
+    assert.equal(r.events[0].detail.suggestedConfidence, 0.82);
+});
+
+// ── The confidence the prompt asks for is the confidence that decides ──────
+
+test("a LOW-confidence suggestion books UNCODED and is flagged for a human", async () => {
+    // read.ts tells the model "a low number sends the receipt to a human", and
+    // then nothing read the number: the suggestion was applied whatever it
+    // said, including when the model itself reported it was guessing. A phase
+    // the document never pointed at then rode into the Expense and every
+    // variance report counted it as spend on a line nobody budgeted — silently,
+    // because the audit note said "phase suggested" either way.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.42 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, null, "the Expense books UNCODED");
+    assert.match(r.expenses[0].description, /phase suggestion withheld \(confidence 0\.42 < 0\.6\)/);
+    assert.match(r.expenses[0].description, /assign one/, "and says what a human must do");
+    assert.equal(r.events[0].detail.phaseRejected, "cc-plumb", "the discarded suggestion is auditable");
+    assert.equal(r.events[0].detail.suggestedConfidence, undefined);
+});
+
+test("NO confidence at all is not 'sure' — it books UNCODED too", async () => {
+    // null is an ABSENT answer (an older prompt, a truncated response, a phase
+    // list that was never sent). Letting it clear the bar would apply exactly
+    // the suggestions we know least about.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: null }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, null);
+    assert.match(r.expenses[0].description, /phase suggestion withheld \(confidence none stated < 0\.6\)/);
+    assert.equal(r.events[0].detail.phaseRejected, "cc-plumb");
+});
+
+test("exactly AT the threshold is confident enough — the boundary is inclusive", async () => {
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: null, suggestedConfidence: 0.6 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-plumb");
+    assert.match(r.expenses[0].description, /phase suggested \(confidence 0\.60\)/);
+});
+
+test("a HUMAN's explicit pick is never subject to the threshold", async () => {
+    // It is not a suggestion. A bookkeeper who codes a receipt by hand must not
+    // have it withheld because the model was unsure about a phase nobody asked
+    // it about.
+    const r = recorder();
+    await bookReceipt(row({ costCodeId: "cc-chosen", suggestedConfidence: 0.01 }), r.deps);
+    assert.equal(r.expenses[0].costCodeId, "cc-chosen");
+    assert.ok(!/withheld/.test(r.expenses[0].description));
+});
+
+test("the threshold is env-overridable, and a junk override is ignored", () => {
+    assert.equal(phaseConfidenceMin(undefined), RECEIPT_PHASE_CONFIDENCE_MIN);
+    assert.equal(phaseConfidenceMin(""), RECEIPT_PHASE_CONFIDENCE_MIN);
+    assert.equal(phaseConfidenceMin("0.8"), 0.8);
+    assert.equal(phaseConfidenceMin("0"), 0, "zero is a real choice: apply every suggestion");
+    assert.equal(phaseConfidenceMin("1"), 1);
+    for (const junk of ["banana", "-0.1", "1.5", "NaN", "Infinity"]) {
+        assert.equal(phaseConfidenceMin(junk), RECEIPT_PHASE_CONFIDENCE_MIN, junk);
+    }
+});
+
+test("null confidence never clears the bar, whatever the bar is", () => {
+    assert.equal(phaseSuggestionIsConfident(null, 0), false, "not even at zero");
+    assert.equal(phaseSuggestionIsConfident(undefined, 0), false);
+    assert.equal(phaseSuggestionIsConfident(0, 0), true, "but a stated zero does");
+    assert.equal(phaseSuggestionIsConfident(0.59, 0.6), false);
+    assert.equal(phaseSuggestionIsConfident(0.6, 0.6), true);
 });
 
 test("a human's explicit pick is not labelled a suggestion", async () => {

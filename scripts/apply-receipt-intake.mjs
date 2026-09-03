@@ -285,13 +285,151 @@ const expectedColumns = {
     ],
 };
 
-const expectedConstraints = [
-    { name: "ReceiptIntake_state_check", table: "ReceiptIntake" },
-    { name: "ReceiptIntake_projectId_fkey", table: "ReceiptIntake" },
-    { name: "ReceiptIntake_costCodeId_fkey", table: "ReceiptIntake" },
-    { name: "ReceiptIntake_createdById_fkey", table: "ReceiptIntake" },
-    { name: "ReceiptIntake_expenseId_fkey", table: "ReceiptIntake" },
+/**
+ * A NAME IS NOT A CONSTRAINT.
+ *
+ * The verification used to look each of these up by `conname` ALONE and, apart
+ * from the state CHECK, assert nothing about what came back. Two ways that
+ * passed while the table was wrong:
+ *
+ *   - `pg_constraint` is database-wide, not per-table. A constraint of the same
+ *     name on ANY other relation satisfied the lookup, so a run against a
+ *     database where `ReceiptIntake` never got its foreign keys could still
+ *     report "verified 5 constraints". Every lookup is scoped to
+ *     `ReceiptIntake` now, exactly like the DDL guards above already are.
+ *   - Even on the right table, existence says nothing about the TARGET or the
+ *     ACTIONS. An FK left over from an earlier shape (pointing at the wrong
+ *     parent, or ON DELETE CASCADE instead of SET NULL) is the difference
+ *     between "losing a project nulls a column" and "losing a project DELETES
+ *     the audit trail of a booked receipt" — which is the one thing the comment
+ *     above the DDL says must never happen. So each FK's full definition is
+ *     compared: referencing column, referenced table and column, and both
+ *     referential actions.
+ *
+ * These fields mirror the ALTER TABLE statements above one for one, and
+ * tests/apply-receipt-intake.test.ts asserts that parity against both the
+ * script's own SQL and the committed migration, so the expectation cannot drift
+ * away from what is actually applied.
+ */
+export const expectedConstraints = [
+    { name: "ReceiptIntake_state_check", table: "ReceiptIntake", kind: "check" },
+    {
+        name: "ReceiptIntake_projectId_fkey", table: "ReceiptIntake", kind: "fk",
+        column: "projectId", references: "Project", referencedColumn: "id",
+        onDelete: "SET NULL", onUpdate: "CASCADE",
+    },
+    {
+        name: "ReceiptIntake_costCodeId_fkey", table: "ReceiptIntake", kind: "fk",
+        column: "costCodeId", references: "CostCode", referencedColumn: "id",
+        onDelete: "SET NULL", onUpdate: "CASCADE",
+    },
+    {
+        name: "ReceiptIntake_createdById_fkey", table: "ReceiptIntake", kind: "fk",
+        column: "createdById", references: "User", referencedColumn: "id",
+        onDelete: "SET NULL", onUpdate: "CASCADE",
+    },
+    {
+        name: "ReceiptIntake_expenseId_fkey", table: "ReceiptIntake", kind: "fk",
+        column: "expenseId", references: "Expense", referencedColumn: "id",
+        onDelete: "SET NULL", onUpdate: "CASCADE",
+    },
 ];
+
+/**
+ * SCOPED TO THE TABLE. `$1` is the constraint name; the relation is pinned in
+ * the SQL itself, the same `'"ReceiptIntake"'::regclass` the DDL guards use.
+ */
+export const CONSTRAINT_LOOKUP_SQL =
+    `SELECT pg_get_constraintdef(oid) AS def
+       FROM pg_constraint
+      WHERE conname = $1
+        AND conrelid = '"ReceiptIntake"'::regclass`;
+
+/** Every referential action Postgres can render, longest first so the match is greedy enough. */
+const FK_ACTIONS = "NO ACTION|SET DEFAULT|SET NULL|RESTRICT|CASCADE";
+
+/** `"a", "b"` / `a` -> ["a", "b"] / ["a"]. pg quotes an identifier only when it must. */
+function identList(raw) {
+    return raw
+        .split(",")
+        .map(part => part.trim().replace(/^"(.*)"$/, "$1"))
+        .filter(Boolean);
+}
+
+/**
+ * Compare a live `pg_get_constraintdef` rendering against what the migration
+ * says the foreign key is. Returns a human description of every difference, or
+ * null when they agree.
+ *
+ * Parsed rather than string-compared on purpose: pg's rendering is not ours to
+ * predict (identifier quoting depends on the identifier, the clause order is
+ * pg's own, and a schema qualification appears only when the relation is not on
+ * the search path). An exact-string expectation would fail on rendering rather
+ * than on drift, which teaches everyone to ignore it.
+ *
+ * An ABSENT action clause means the SQL default, NO ACTION — not "unspecified".
+ * That distinction is the whole point here: an FK created without ON DELETE
+ * behaves as NO ACTION, and NO ACTION is exactly the value that would block a
+ * project delete instead of nulling the column.
+ */
+export function foreignKeyDrift(expected, def) {
+    if (typeof def !== "string") return "no definition returned";
+    const shape = /^FOREIGN KEY\s*\((.+?)\)\s*REFERENCES\s+(.+?)\s*\((.+?)\)\s*(.*)$/.exec(def.trim());
+    if (!shape) return `not a FOREIGN KEY definition: ${def}`;
+    const [, columns, referenced, referencedColumns, tail] = shape;
+
+    const actionFor = keyword => {
+        const found = new RegExp(`ON ${keyword}\\s+(${FK_ACTIONS})`, "i").exec(tail);
+        return (found ? found[1] : "NO ACTION").toUpperCase();
+    };
+
+    const problems = [];
+    const check = (label, actual, want) => {
+        if (actual !== want) problems.push(`${label} is ${actual}, want ${want}`);
+    };
+    check("column", identList(columns).join(", "), expected.column);
+    check("referenced table", identList(referenced.replace(/^public\./, "")).join(", "), expected.references);
+    check("referenced column", identList(referencedColumns).join(", "), expected.referencedColumn);
+    check("ON DELETE", actionFor("DELETE"), expected.onDelete);
+    check("ON UPDATE", actionFor("UPDATE"), expected.onUpdate);
+    return problems.length ? problems.join("; ") : null;
+}
+
+/**
+ * The whole constraint verification, over an injected query so it is testable
+ * without a database. `query(sql, name)` must resolve to the rows the lookup
+ * returns — zero rows meaning "not on THIS table", which is a failure, never a
+ * pass.
+ */
+export async function verifyConstraints(query) {
+    const problems = [];
+    const notes = [];
+    for (const expected of expectedConstraints) {
+        const [row] = await query(CONSTRAINT_LOOKUP_SQL, expected.name);
+        if (!row) {
+            problems.push(`constraint ${expected.name} missing on ${expected.table}`);
+            continue;
+        }
+        if (expected.kind === "check") {
+            // Existence is not enough for the state CHECK: an OLD definition
+            // still exists, and it is the thing that breaks the cutover.
+            const missing = RECEIPT_INTAKE_STATES.filter(state => !row.def.includes(`'${state}'`));
+            if (missing.length) {
+                problems.push(`${expected.name} does not allow: ${missing.join(", ")}\n  actual: ${row.def}`);
+                continue;
+            }
+            notes.push(`verified ${expected.name}: all ${RECEIPT_INTAKE_STATES.length} states allowed`);
+            continue;
+        }
+        const drift = foreignKeyDrift(expected, row.def);
+        if (drift) {
+            problems.push(`${expected.name} has drifted: ${drift}\n  actual: ${row.def}`);
+            continue;
+        }
+        notes.push(`verified ${expected.name}: ${row.def}`);
+    }
+    return { problems, notes };
+}
 
 // The partial index is the one object a "table exists" check cannot vouch for
 // (Prisma would have created the table on its own; it would never create this).
@@ -490,25 +628,13 @@ async function main() {
             }
             console.log(`verified ${table}: ${columns.length} columns`);
         }
-        for (const { name, table } of expectedConstraints) {
-            const [row] = await prisma.$queryRawUnsafe(
-                `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = $1`, name,
-            );
-            if (!row) {
-                console.error(`VERIFY FAILED: constraint ${name} missing on ${table}`);
-                process.exit(1);
-            }
-            // Existence is not enough for the state CHECK: an OLD definition
-            // still exists, and it is the thing that breaks the cutover.
-            if (name === "ReceiptIntake_state_check") {
-                const missing = RECEIPT_INTAKE_STATES.filter(state => !row.def.includes(`'${state}'`));
-                if (missing.length) {
-                    console.error(`VERIFY FAILED: ${name} does not allow: ${missing.join(", ")}
-  actual: ${row.def}`);
-                    process.exit(1);
-                }
-                console.log(`verified ${name}: all ${RECEIPT_INTAKE_STATES.length} states allowed`);
-            }
+        const constraints = await verifyConstraints(
+            (sql, name) => prisma.$queryRawUnsafe(sql, name),
+        );
+        for (const note of constraints.notes) console.log(note);
+        if (constraints.problems.length) {
+            for (const problem of constraints.problems) console.error(`VERIFY FAILED: ${problem}`);
+            process.exit(1);
         }
         console.log(`verified ${expectedConstraints.length} constraints`);
 

@@ -5,12 +5,12 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { receiptObjectSize } from "@/lib/receipt-intake/bucket";
 import {
     finalizeDisposition,
     inspectStoredObject,
     publishFence,
     sealAndPublish,
+    verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
 import {
     authorizeEffectiveProject,
@@ -30,23 +30,46 @@ import {
 export const dynamic = "force-dynamic";
 
 /**
- * A "we already have it" answer has to be TRUE.
+ * A "we already have it" answer has to be TRUE — and "it" means THIS DOCUMENT.
  *
  * Both replay paths used to return success from the row alone. The forwarders
  * treat that as permission to delete their only copy — so a row whose object had
  * gone missing (a bad publish, a cleanup that ran on the wrong path, a bucket
  * incident) got a cheerful 200 and the receipt ceased to exist anywhere.
  *
- * Metadata only, and bounded: one small `list` regardless of the object's size.
- * The three answers are deliberately different — an absence is a 409 the sender
- * can act on by re-uploading, a storage fault is a 503 it should simply retry,
- * and only a confirmed presence is success.
+ * PRESENCE WAS NOT ENOUGH EITHER. Confirming that SOMETHING sits at the path
+ * authorised the sender to delete its source copy on the strength of bytes
+ * nobody had looked at since they were sealed — so an object replaced or
+ * corrupted after publication (an upsert URL reused, a restore that put back a
+ * different version, a storage-side fault) was laundered into "we have your
+ * receipt" and the only good copy was then deleted by the sender. The row's
+ * `fileSha256` is the one hash this system ever verified; the stored bytes must
+ * still hash to it.
+ *
+ * Cheap probe first — one small `list` regardless of the object's size — so the
+ * common orphan case never pays for a download at all. The answers are
+ * deliberately different: an absence is a 409 the sender can act on by
+ * re-uploading, a storage fault is a 503 it should simply retry, a CONTENT
+ * mismatch is a 409 that must never look like success (the row is left exactly
+ * as it is, for the worker and the sweeper to act on), and only verified bytes
+ * are success.
  */
-async function confirmStoredCopy(storagePath: string): Promise<NextResponse | null> {
-    const present = await receiptObjectSize(storagePath);
-    if (present.ok) return null;
-    if (present.kind === "transient") {
+async function confirmStoredCopy(storagePath: string, fileSha256: string): Promise<NextResponse | null> {
+    const held = await verifyStoredCopy(storagePath, fileSha256);
+    if (held.ok) return null;
+    if (held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable", retryable: true }, { status: 503 });
+    }
+    if (held.kind === "content-mismatch") {
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "content-mismatch",
+                reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                retryable: false,
+            },
+            { status: 409 },
+        );
     }
     return NextResponse.json(
         {
@@ -271,8 +294,8 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     if (!recoverable) {
         // The object first: `alreadyFinalized` is what makes a forwarder drop
         // its copy, so it must not be said about a row whose bytes are gone.
-        const missing = await confirmStoredCopy(row.storagePath);
-        if (missing) return missing;
+        const unusable = await confirmStoredCopy(row.storagePath, row.fileSha256);
+        if (unusable) return unusable;
         const conflict = await applyLateFields(id, lateFields, auth);
         if (conflict) return conflict;
         // PERSISTED values, re-read after the reconcile — the caller must be
@@ -495,8 +518,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // Same outcome for the caller — but the late fields still have to be
         // reconciled against what that publisher wrote, and the same "do we
         // actually hold it" rule applies.
-        const missing = await confirmStoredCopy(current.storagePath);
-        if (missing) return missing;
+        // Against `current.fileSha256`, not this call's `fileSha256`: the two
+        // were just proven equal by `positivelyPublished`, and the row's own
+        // value is what every later reader verifies against.
+        const unusable = await confirmStoredCopy(current.storagePath, current.fileSha256);
+        if (unusable) return unusable;
         const reconciled = await applyLateFields(id, lateFields, auth);
         if (reconciled) return reconciled;
         return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current.state });

@@ -249,7 +249,51 @@ test("/start hands a recoverable park a NEW url, and asks the shared rule which 
     // Fenced like every other publish-path write, and a lost fence writes
     // nothing rather than pointing a live row at an empty path.
     assert.match(body, /where: \{ id: existing\.id, \.\.\.publishFence\(existing\) \}/);
-    assert.match(body, /publish-conflict/);
+    assert.match(body, /return leaseConflict\(existing\.id\)/);
+});
+
+test("A LIVE LEASE SURVIVES A RECOVERABLE RETRY — same path, same version, no delete", () => {
+    // The re-arm below it is destructive by design (new version, new path, the
+    // old object deleted) and it used to run on EVERY /start for a parked row,
+    // including one whose signed URL was still live. Two retries for the same
+    // parked sourceRef therefore raced: the second deleted the object the first
+    // was about to PUT its bytes to. An earlier round fixed exactly this for
+    // STAGING rows and left the recovery path alone — so the rule is now ONE
+    // rule, in one module, and both callers reach it.
+    const branch = start.slice(start.indexOf("if (recoverable) {"));
+    const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
+    const reuse = body.indexOf("await reuseLiveLease(existing, ext, leaseDeps, {");
+    assert.ok(reuse > 0, "the recovery asks the shared rule first");
+    assert.ok(
+        reuse < body.indexOf("const nextLease = existing.uploadLeaseVersion + 1"),
+        "BEFORE it bumps the version",
+    );
+    assert.ok(
+        reuse < body.indexOf("start-rearmed-repath"),
+        "and before anything is deleted",
+    );
+    // The identity writes a recovery needs still happen — they just land on the
+    // SAME path and lease version, so a corrected hash is not a reason to
+    // repath.
+    const patch = body.slice(reuse, body.indexOf("if (keptRecovery)"));
+    assert.match(patch, /expectedSha256,/);
+    assert.match(patch, /fileSha256: "",/);
+    assert.ok(!/uploadLeaseVersion/.test(patch), "the version is NOT touched");
+    assert.ok(!/storagePath/.test(patch), "and neither is the path");
+});
+
+test("both /start branches take the live-lease rule from the SAME place", () => {
+    // Two copies of "may I reuse this lease" is how the STAGING path came to be
+    // fixed while the recovery path stayed broken.
+    assert.equal((start.match(/await reuseLiveLease\(/g) ?? []).length, 2, "recovery and resume");
+    assert.match(start, /import \{ reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
+    // And one 409 helper, so every lost claim answers identically.
+    assert.equal(
+        (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
+        4,
+        "both reuse callers and both new-lease claims",
+    );
+    assert.match(start, /error: "publish-conflict",/, "which is still a publish-conflict");
 });
 
 test("the re-arm branch runs BEFORE the identity check, and only for a parked row", () => {
@@ -407,7 +451,15 @@ test("the sweeper and /start both fence on the lease version", () => {
         const update = start.lastIndexOf("await prisma.receiptIntake.updateMany(", at);
         assert.ok(update > 0 && update < at, `${branch}: the row moves before the URL is signed`);
     }
-    assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 2, "a lost claim is a 409 on both");
+    // ONE 409 helper now — four call sites (the two new-lease claims and the
+    // two live-lease reuses), so a lost claim cannot answer differently
+    // depending on which branch lost it.
+    assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 1, "one helper");
+    assert.equal(
+        (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
+        4,
+        "and every lost claim goes through it",
+    );
 
     // Every destructive sweeper write carries the version it observed.
     const fn = sweeper.slice(sweeper.indexOf("sweepStaleStaging: async"));

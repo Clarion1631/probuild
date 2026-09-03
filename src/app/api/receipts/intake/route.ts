@@ -6,7 +6,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { receiptObjectSize, uploadReceiptObject } from "@/lib/receipt-intake/bucket";
+import { uploadReceiptObject } from "@/lib/receipt-intake/bucket";
 import { getSupabase } from "@/lib/supabase";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
 import { deleteObjectOrRecord, recordPendingCleanup } from "@/lib/receipt-intake/storage-cleanup";
@@ -18,7 +18,7 @@ import {
     MAX_INLINE_UPLOAD_BYTES,
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
-import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
+import { finalizeDisposition, publishFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -526,15 +526,45 @@ async function respondToSourceRefConflict(
     // and the forwarder could delete its only copy of a receipt we did not
     // have. The state a row happens to be parked in says nothing about whether
     // its bytes exist.
-    // Metadata, not a download: this runs on every replay, and the object may
-    // be 8 MiB. A TRANSIENT answer is not evidence of absence — healing on it
+    // AND PRESENCE IS NOT THE SAME QUESTION AS CORRECTNESS.
+    //
+    // Existence alone still authorised the delete, on the strength of bytes
+    // nobody had looked at since they were sealed — so an object REPLACED after
+    // publication (an upsert URL reused, a restore that put back a different
+    // version, a storage-side fault) was laundered into "we have your receipt",
+    // and the last good copy went with it. `existing.fileSha256` is the hash
+    // this row was published with, and on this branch it provably equals the
+    // hash of the payload in this very request; the stored bytes must still
+    // hash to it. ONE rule, shared with /finalize (stored-object.ts), so the two
+    // replay paths cannot come to disagree about what "we already have it" means.
+    //
+    // A cheap metadata probe still runs first inside it: this path runs on every
+    // replay and the object may be 8 MiB, so an orphan never pays for a
+    // download. A TRANSIENT answer is not evidence of absence — healing on it
     // would overwrite a document that is really there — so it is answered 503
     // and the forwarder retries with its copy intact.
-    const present = await receiptObjectSize(existing.storagePath);
-    if (!present.ok && present.kind === "transient") {
+    const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256);
+    if (!held.ok && held.kind === "transient") {
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
-    if (!present.ok) {
+    if (!held.ok && held.kind === "content-mismatch") {
+        // NOT healed. A re-upload is exactly how bytes get replaced, so
+        // overwriting on a mismatch would let a replay launder the swap. Never a
+        // 2xx either: the sender keeps its copy. The row is left as it is for
+        // the worker's `content-changed` park and the sweeper to act on.
+        return NextResponse.json(
+            {
+                ok: false,
+                error: "content-mismatch",
+                reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                retryable: false,
+                id: existing.id,
+                state: existing.state,
+            },
+            { status: 409 },
+        );
+    }
+    if (!held.ok) {
         // The caller just handed us the bytes again, so the orphan is fixable:
         // store them and republish. This is the retry HEALING the row rather
         // than merely reporting on it.
@@ -588,8 +618,9 @@ async function respondToSourceRefConflict(
         );
     }
 
-    // The object is there. A STAGING row means the previous request uploaded
-    // successfully and only its publish UPDATE failed — finish it.
+    // The object is there AND it is this document. A STAGING row means the
+    // previous request uploaded successfully and only its publish UPDATE
+    // failed — finish it.
     if (existing.state === "STAGING") return publishStagedRow(existing.id, existing.storagePath);
 
     return NextResponse.json({
