@@ -17,6 +17,7 @@
 
 import { NextResponse } from "next/server";
 import { canAccessIntegrations, requireIntegrationAccess, validateStringMap } from "./integration-access";
+import { isPayrollEligibleRole } from "./payroll-config";
 
 export type GustoViewer = { id: string; role: string };
 
@@ -117,13 +118,30 @@ export async function validateEmployeeMappings(raw: unknown): Promise<MappingVal
     const ids = Object.keys(mappings);
     if (ids.length > 0) {
         const { prisma } = await import("./prisma");
-        const known = await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true } });
-        const knownIds = new Set(known.map((row) => row.id));
-        const unknown = ids.filter((id) => !knownIds.has(id));
+        // EXISTENCE WAS NOT ENOUGH (round 14, finding 2). A portal CLIENT account
+        // is a real row, so a customer id passed this check and was written into
+        // the map that decides whose hours are filed under which Gusto employee.
+        // The role comes back with the row and is judged by the SAME predicate
+        // the export roster, the rates panel, the CSV importer and the rate
+        // writer use — a mapping is a payroll fact, so the answer to "may this
+        // account appear on payroll" has to be the one answer.
+        const known = await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, role: true } });
+        const byId = new Map(known.map((row) => [row.id, row.role]));
+        const unknown = ids.filter((id) => !byId.has(id));
         if (unknown.length > 0) {
             return {
                 ok: false,
                 error: `These are not team members: ${unknown.slice(0, 5).join(", ")}${unknown.length > 5 ? "…" : ""}`,
+            };
+        }
+        // Named separately from "unknown": "that id does not exist" and "that
+        // account is a customer" are different problems with different fixes,
+        // and telling somebody their customer is a typo helps nobody.
+        const nonStaff = ids.filter((id) => !isPayrollEligibleRole(byId.get(id) ?? ""));
+        if (nonStaff.length > 0) {
+            return {
+                ok: false,
+                error: `These are not employees, so they cannot be mapped to a Gusto employee: ${nonStaff.slice(0, 5).join(", ")}${nonStaff.length > 5 ? "…" : ""}`,
             };
         }
     }

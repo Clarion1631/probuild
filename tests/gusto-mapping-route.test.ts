@@ -27,6 +27,8 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-gusto-mapping-route";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test?pgbouncer=true";
@@ -41,7 +43,13 @@ let lookedUp: string[][] = [];
 let POST: (req: Request) => Promise<Response>;
 
 /** The team the fake database knows about. */
-const KNOWN = ["u-alice", "u-bob"];
+const KNOWN: Record<string, string> = {
+    "u-alice": "FIELD_CREW",
+    "u-bob": "MANAGER",
+    // A portal CUSTOMER. A real row, so an existence check passed it (round 14,
+    // finding 2) and a customer could be mapped to a Gusto employee.
+    "u-customer": "CLIENT",
+};
 
 before(async () => {
     // Module._load, NOT Module.prototype.require.
@@ -93,7 +101,10 @@ before(async () => {
         user: {
             findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
                 lookedUp.push(where.id.in);
-                return where.id.in.filter((id) => KNOWN.includes(id)).map((id) => ({ id }));
+                // The ROLE comes back with the row. An existence-only stub could
+                // not tell a customer from an employee, which is exactly what
+                // the validator could not do either (round 14, finding 2).
+                return where.id.in.filter((id) => id in KNOWN).map((id) => ({ id, role: KNOWN[id] }));
             },
         },
     };
@@ -159,6 +170,48 @@ test("an ordinary map still saves — the control", async () => {
     assert.equal(Object.getPrototypeOf(saved[0].employeeMappings), null);
     // And the keys really were checked against the roster.
     assert.deepEqual(lookedUp, [["u-alice", "u-bob"]]);
+});
+
+test("a CUSTOMER cannot be mapped to a Gusto employee — existence was not enough", async () => {
+    // THE HOLE (round 14, finding 2). `u-customer` is a real row: a portal
+    // CLIENT account, made by the invite flow when a homeowner signs in to see
+    // their own project. The validator only asked whether the id EXISTED, so
+    // that row passed and a customer was written into the map deciding whose
+    // hours are filed under which Gusto employee. Round 8 closed the same hole
+    // in the rates panel, the CSV importer, the rate writer and the export
+    // roster; this was the fifth surface.
+    viewer = admin;
+    saved = [];
+    const res = await POST(request(`{"employeeMappings": {"u-customer": "GUSTO-9"}}`));
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    // A SPECIFIC message: "that id does not exist" and "that account is a
+    // customer" are different problems with different fixes.
+    assert.match(body.error, /not employees/);
+    assert.match(body.error, /u-customer/);
+    assert.deepEqual(saved, [], "a refusal is not a partial write");
+
+    // Mixed in with real staff, the whole save is refused rather than the
+    // customer being quietly dropped — a silently shortened map is a mapping
+    // somebody thinks they saved.
+    saved = [];
+    const mixed = await POST(request(`{"employeeMappings": {"u-alice": "GUSTO-1", "u-customer": "GUSTO-2"}}`));
+    assert.equal(mixed.status, 400);
+    assert.deepEqual(saved, []);
+});
+
+test("the Gusto settings page offers only staff in its picker", () => {
+    // The route is the guarantee; this is the surface that feeds it. A page
+    // still listing customers invites the refusal above on every save.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "settings", "integrations", "gusto", "page.tsx"),
+        "utf8"
+    );
+    assert.match(source, /payrollEligibleUserWhere\(\)/, "the page must compose the shared predicate");
+    // Composed INTO the user query, not merely imported.
+    assert.match(source, /where: \{[\s\S]{0,160}?\.\.\.payrollEligibleUserWhere\(\)/);
+    // And it is the shared one, not a local role list.
+    assert.ok(!/role:\s*\{\s*in:\s*\[/.test(source), "no hand-rolled role list — that is how five surfaces disagreed");
 });
 
 test("an unknown user id is 400, and a FIELD_CREW caller never gets that far", async () => {

@@ -47,6 +47,134 @@ export function classifySalariedEmails(raw) {
 /** `--dry-run` prints what the seed WOULD do and writes nothing. */
 export const isDryRun = (argv = process.argv) => argv.includes("--dry-run");
 
+// ---------------------------------------------------------------------------
+// WHICH DATABASE (round 13 review, finding 1 — a P0)
+//
+// This script used to load .env.production.local WITHOUT override and then use
+// `process.env.DATABASE_URL`. dotenv does not overwrite a variable that is
+// already set, so a developer with a local URL exported in their shell got that
+// URL — silently. The script then reported a clean apply and a clean
+// `--dry-run` against the wrong database, and the deploy step that gates this
+// PR would have been "verified" against a laptop while production still lacked
+// `payrollRevision`. Nothing in the output said which database it had touched.
+//
+// Three things fix that, and all three are needed:
+//
+//   1. The target is EXPLICIT. There is no default, so a bare invocation is a
+//      usage error rather than a guess.
+//   2. For `--target prod` the URL is read out of .env.production.local
+//      DIRECTLY (dotenv's own parse result), so an ambient DATABASE_URL cannot
+//      win — it is not consulted at all.
+//   3. After connecting, the script ASKS the database who it is and refuses on
+//      a mismatch, in both directions: `--target prod` against something that
+//      is not the pooler, or is not the expected database, or has no baseline
+//      migration row, is refused; and any other target against the production
+//      pooler is refused too.
+//
+// The identity is printed before the first statement — REDACTED, because the
+// URL carries the password and this output goes into deploy notes and PR
+// comments.
+// ---------------------------------------------------------------------------
+
+/**
+ * The migration every ProBuild database carries once it has been built from
+ * `prisma/migrations`. It proves "this schema is ours", NOT "this is
+ * production" — CI's throwaway Postgres has it too. The HOST is what separates
+ * those two, which is why both checks exist.
+ */
+export const PROD_BASELINE_MIGRATION = "20260814000000_baseline_production";
+
+/**
+ * What production looks like. Overridable by env so a pooler move or a database
+ * rename needs no code change, and so this file carries no credential.
+ */
+export function expectedProdIdentity(env = {}) {
+    return {
+        hostSuffix: env.PAYROLL_APPLY_EXPECT_HOST_SUFFIX || ".pooler.supabase.com",
+        database: env.PAYROLL_APPLY_EXPECT_DATABASE || "postgres",
+        baseline: PROD_BASELINE_MIGRATION,
+    };
+}
+
+export const TARGET_USAGE =
+    "usage: node scripts/apply-payroll-phase5.mjs --target <prod|local|ci> [--dry-run]\n" +
+    "  --target prod   reads DATABASE_URL from .env.production.local ONLY (an ambient one is ignored)\n" +
+    "  --target <name> uses the ordinary .env.local/.env chain, and REFUSES if that points at production";
+
+/** The target this invocation names. There is no default — a guess is the bug. */
+export function parseTarget(argv = process.argv) {
+    const at = argv.indexOf("--target");
+    if (at === -1) {
+        return { ok: false, error: `--target is required.\n${TARGET_USAGE}` };
+    }
+    const value = argv[at + 1];
+    if (!value || value.startsWith("--")) {
+        return { ok: false, error: `--target needs a value.\n${TARGET_USAGE}` };
+    }
+    return { ok: true, target: value };
+}
+
+/** host:port/database — never the user or the password. */
+export function redactUrl(raw) {
+    try {
+        const url = new URL(raw);
+        return `${url.hostname}:${url.port || "5432"}${url.pathname}`;
+    } catch {
+        return "(unparseable DATABASE_URL)";
+    }
+}
+
+/** One line, safe to paste into a PR comment. */
+export function identityLine({ target, url, database, hasBaseline }) {
+    return `target=${target} at=${redactUrl(url)} current_database=${database} baseline=${hasBaseline ? "present" : "ABSENT"}`;
+}
+
+/**
+ * Is the database we actually connected to the one `--target` claimed?
+ *
+ * Pure, so the refusals below are testable without a production connection.
+ */
+export function verifyTarget({ target, url, database, hasBaseline, env = {} }) {
+    const expect = expectedProdIdentity(env);
+    let host;
+    try {
+        host = new URL(url).hostname;
+    } catch {
+        return { ok: false, error: "DATABASE_URL is not a valid URL." };
+    }
+    const looksProduction = host.endsWith(expect.hostSuffix);
+
+    if (target === "prod") {
+        if (!looksProduction) {
+            return {
+                ok: false,
+                error: `REFUSING: --target prod, but ${redactUrl(url)} is not a ${expect.hostSuffix} host. This is the exact mistake the flag exists to catch — an ambient DATABASE_URL pointing at a local database while the deploy step reports success.`,
+            };
+        }
+        if (database !== expect.database) {
+            return {
+                ok: false,
+                error: `REFUSING: --target prod, but current_database() is "${database}" and production is "${expect.database}".`,
+            };
+        }
+        if (!hasBaseline) {
+            return {
+                ok: false,
+                error: `REFUSING: --target prod, but the baseline migration ${expect.baseline} is not recorded here. This database was not built from prisma/migrations.`,
+            };
+        }
+        return { ok: true };
+    }
+
+    if (looksProduction) {
+        return {
+            ok: false,
+            error: `REFUSING: --target ${target}, but ${redactUrl(url)} IS the production pooler. Run it with --target prod, deliberately, or point DATABASE_URL somewhere else.`,
+        };
+    }
+    return { ok: true };
+}
+
 import { config } from "dotenv";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "path";
@@ -754,20 +882,72 @@ const STATEMENTS = [
  * import.
  */
 async function main() {
-    config({ path: join(__dirname, "..", ".env.production.local") });
-    config({ path: join(__dirname, "..", ".env.local") });
-    config({ path: join(__dirname, "..", ".env") });
-
-    if (!process.env.DATABASE_URL) {
-        console.error("DATABASE_URL is not set (.env.production.local missing?).");
+    // THE TARGET, before anything else — including before any env file is read,
+    // so a bare invocation cannot pick up production credentials at all.
+    const parsed = parseTarget();
+    if (!parsed.ok) {
+        console.error(parsed.error);
         process.exit(1);
     }
+    const target = parsed.target;
 
-    const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
+    let databaseUrl;
+    if (target === "prod") {
+        // dotenv's PARSE RESULT, not process.env: `override: true` makes the
+        // file win, and reading `loaded.parsed` means an ambient DATABASE_URL is
+        // not merely outranked, it is never consulted.
+        const loaded = config({ path: join(__dirname, "..", ".env.production.local"), override: true });
+        databaseUrl = loaded.parsed?.DATABASE_URL;
+        if (!databaseUrl) {
+            console.error(
+                "REFUSING: --target prod needs DATABASE_URL in .env.production.local. An ambient DATABASE_URL is deliberately ignored for this target — pull the production env first (`vercel env pull .env.production.local`)."
+            );
+            process.exit(1);
+        }
+    } else {
+        config({ path: join(__dirname, "..", ".env.local") });
+        config({ path: join(__dirname, "..", ".env") });
+        databaseUrl = process.env.DATABASE_URL;
+        if (!databaseUrl) {
+            console.error(`DATABASE_URL is not set for --target ${target}.`);
+            process.exit(1);
+        }
+    }
+
+    const prisma = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
 
     const dryRun = isDryRun();
+    const prefix = dryRun ? "[dry-run] " : "";
 
     try {
+        // WHO IS THIS? Asked of the database itself, before a single statement,
+        // and printed redacted so the answer can go in the deploy notes.
+        const [{ db: currentDatabase }] = await prisma.$queryRawUnsafe(`SELECT current_database() AS db`);
+        const baselineRows = await prisma
+            .$queryRawUnsafe(
+                `SELECT count(*)::int AS n FROM "_prisma_migrations" WHERE "migration_name" = $1`,
+                PROD_BASELINE_MIGRATION
+            )
+            .catch(() => [{ n: 0 }]);
+        const hasBaseline = Number(baselineRows[0]?.n ?? 0) > 0;
+
+        console.log(`${prefix}${identityLine({ target, url: databaseUrl, database: currentDatabase, hasBaseline })}`);
+
+        const targetVerdict = verifyTarget({
+            target,
+            url: databaseUrl,
+            database: currentDatabase,
+            hasBaseline,
+            env: process.env,
+        });
+        if (!targetVerdict.ok) {
+            console.error(targetVerdict.error);
+            // exitCode rather than exit(), so the finally below still
+            // disconnects. Nothing has been executed at this point.
+            process.exitCode = 1;
+            return;
+        }
+
         // --dry-run is READ-ONLY, for the whole script — not just the seed.
         //
         // It is the verification step for a deploy, so it has to be safe to point

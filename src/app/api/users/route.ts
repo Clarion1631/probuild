@@ -7,9 +7,10 @@ import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { withPayrollUserWrite } from "@/lib/payroll-period";
 import { toSafeUser } from "@/lib/user-serialization";
 import {
-    checkUserCreate,
+    isUserMutationActorInvalidError,
     isUserMutationRefusedError,
     isUserMutationTargetNotFoundError,
+    withGuardedUserCreate,
     withGuardedUserMutation,
 } from "@/lib/user-mutation-guard";
 import { Resend } from "resend";
@@ -77,14 +78,12 @@ export async function POST(req: Request) {
         // A create cannot demote anybody, but it CAN mint an admin - this route
         // accepted an arbitrary `role` string from any manager (round 9,
         // finding 1). Status is not a parameter: every create starts PENDING.
-        const createVerdict = checkUserCreate({
-            actor: { id: currentUser.id, role: currentUser.role },
-            role,
-        });
-        if (!createVerdict.ok) {
-            return NextResponse.json({ error: createVerdict.error }, { status: createVerdict.status });
-        }
-
+        //
+        // The check now runs INSIDE the transaction below, against the actor's
+        // own row locked FOR SHARE. It used to run here, against the actor read
+        // taken before the transaction opened, and the insert happened
+        // afterwards — so a manager demoted or disabled in that gap still minted
+        // an account and still set its pay rates (round 14, finding 3).
         const exactEmailLower = email.toLowerCase().trim();
         const existingUser = await prisma.user.findUnique({ where: { email: exactEmailLower } });
         if (existingUser) return NextResponse.json({ error: "User with this email already exists" }, { status: 400 });
@@ -95,35 +94,41 @@ export async function POST(req: Request) {
         const hashedPin = pinCode ? await bcrypt.hash(pinCode, 10) : null;
         let newUser;
         try {
-            newUser = await prisma.$transaction(async (tx) => {
-                const created = await tx.user.create({
-                    data: {
-                        name: name || null,
-                        email: exactEmailLower,
-                        role: role || "FIELD_CREW",
-                        status: "PENDING",
-                        pinCode: hashedPin,
-                        invitedAt: new Date(),
-                    },
-                });
-                const rateResult = await applyRateChangeInTx(
-                    tx,
-                    currentUser,
-                    created.id,
-                    { hourlyRate, burdenRate, payType: body.payType }
-                );
-                if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
-                // RE-READ, inside the same transaction. `created` is the row as
-                // it was BEFORE applyRateChangeInTx ran its own update, so
-                // returning it answered 201 with hourlyRate/payType still null
-                // and payrollRevision/lastRateSyncAt still at their defaults —
-                // a body that contradicted the committed row and sent the
-                // caller's UI back to a rate nobody had entered.
-                return tx.user.findUniqueOrThrow({ where: { id: created.id } });
-            });
+            newUser = await prisma.$transaction(async (tx) =>
+                withGuardedUserCreate(tx, { actorId: currentUser.id, role }, async (actor) => {
+                    const created = await tx.user.create({
+                        data: {
+                            name: name || null,
+                            email: exactEmailLower,
+                            role: role || "FIELD_CREW",
+                            status: "PENDING",
+                            pinCode: hashedPin,
+                            invitedAt: new Date(),
+                        },
+                    });
+                    // The LOCKED actor, not the pre-transaction read.
+                    const rateResult = await applyRateChangeInTx(tx, actor, created.id, {
+                        hourlyRate,
+                        burdenRate,
+                        payType: body.payType,
+                    });
+                    if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
+                    // RE-READ, inside the same transaction. `created` is the row
+                    // as it was BEFORE applyRateChangeInTx ran its own update, so
+                    // returning it answered 201 with hourlyRate/payType still
+                    // null and payrollRevision/lastRateSyncAt still at their
+                    // defaults — a body that contradicted the committed row and
+                    // sent the caller's UI back to a rate nobody had entered.
+                    return tx.user.findUniqueOrThrow({ where: { id: created.id } });
+                })
+            );
         } catch (error) {
             if (error instanceof RateChangeError) {
                 return NextResponse.json({ error: error.message }, { status: error.status });
+            }
+            // The authority verdict, decided against the actor's LOCKED row.
+            if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
+                return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
             }
             throw error;
         }
@@ -230,14 +235,18 @@ export async function PATCH(req: Request) {
                 return withGuardedUserMutation(
                     tx,
                     {
-                        actor: { id: currentUser.id, role: currentUser.role },
+                        actorId: currentUser.id,
                         targetId: id,
                         changes: { role, status },
                         data,
                         rateChange,
                     },
-                    async () => {
-                        const rateResult = await applyRateChangeInTx(tx, currentUser, id, rateChange);
+                    async (_target, actor) => {
+                        // The LOCKED actor, not the pre-transaction read:
+                        // canWriteRates asks for financialReports, and a revocation
+                        // that committed a moment ago used to be invisible here
+                        // (round 14, finding 3).
+                        const rateResult = await applyRateChangeInTx(tx, actor, id, rateChange);
                         if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                         // status and name are EXPORT INPUTS — activating somebody
                         // adds them to the Gusto roster, and their name is printed in
@@ -259,7 +268,10 @@ export async function PATCH(req: Request) {
             if (error instanceof RateChangeError) {
                 return NextResponse.json({ error: error.message }, { status: error.status });
             }
-            if (isUserMutationRefusedError(error)) {
+            // An actor demoted, disabled or de-permissioned mid-flight is
+            // refused the same way a bad target is — the verdict carries the
+            // status (round 14, finding 3).
+            if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
                 return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
             }
             if (isUserMutationTargetNotFoundError(error)) {

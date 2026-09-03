@@ -81,11 +81,24 @@ async function seed(db: PrismaClient, suffix: string) {
         select: { id: true },
     });
 
+    // A REAL actor row. The guard locks and re-reads the actor inside the
+    // transaction now (round 14, finding 3), so a made-up id is a 403 rather
+    // than a rate edit.
+    const actorEmail = `lock-order-actor-${suffix}@example.test`;
+    await db.user.deleteMany({ where: { email: actorEmail } });
+    const actor = await db.user.create({
+        data: { name: `Lock Order Actor ${suffix}`, email: actorEmail, role: "ADMIN", status: "ACTIVATED" },
+        select: { id: true },
+    });
+
     return {
         user,
         bystander,
+        actor,
         restore: async () => {
-            await db.user.deleteMany({ where: { email: { in: [email, bystanderEmail] } } }).catch(() => {});
+            await db.user
+                .deleteMany({ where: { email: { in: [email, bystanderEmail, actorEmail] } } })
+                .catch(() => {});
         },
     };
 }
@@ -156,7 +169,7 @@ function clientPausingAfterRowLock(tx: unknown, hook: () => Promise<void>) {
 /** A rate-only edit through the REAL guard and the REAL rate writer. */
 async function guardedRateEdit(
     db: PrismaClient,
-    actorRole: string,
+    actorId: string,
     userId: string,
     rate: string,
     afterRowLock?: () => Promise<void>
@@ -170,7 +183,7 @@ async function guardedRateEdit(
             return withGuardedUserMutation(
                 tx as never,
                 {
-                    actor: { id: "actor-admin", role: actorRole },
+                    actorId,
                     targetId: userId,
                     // NOTHING in `changes` and NOTHING in `data`: this is the
                     // rate-only shape the old predicate was blind to.
@@ -178,8 +191,8 @@ async function guardedRateEdit(
                     data: {},
                     rateChange,
                 },
-                async () => {
-                    const result = await applyRateChangeInTx(tx as never, { role: actorRole }, userId, rateChange);
+                async (_target, actor) => {
+                    const result = await applyRateChangeInTx(tx as never, actor, userId, rateChange);
                     if (!result.ok) throw new Error(result.error);
                     return result;
                 }
@@ -228,11 +241,11 @@ test("the predicate answers for the WHOLE request, not half of it", async () => 
 test("RATE EDIT FIRST: it holds tier 1, so the period lock simply queues behind it", { skip }, async () => {
     const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
-    const { user, bystander, restore } = await seed(writer, "a");
+    const { user, bystander, actor, restore } = await seed(writer, "a");
     try {
         // The guarded rate edit runs to completion on its own — it never has to
         // wait for anything, because it takes tier 1 before tier 2.
-        await guardedRateEdit(writer, "ADMIN", user.id, "27.25");
+        await guardedRateEdit(writer, actor.id, user.id, "27.25");
 
         // And a period lock afterwards sees the committed value.
         const staged = stagePeriodLock(locker, bystander.id);
@@ -253,7 +266,7 @@ test("RATE EDIT FIRST: it holds tier 1, so the period lock simply queues behind 
 test("PERIOD LOCK FIRST: the rate edit BLOCKS on tier 1 holding no row, then completes", { skip }, async () => {
     const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
-    const { user, bystander, restore } = await seed(writer, "b");
+    const { user, bystander, actor, restore } = await seed(writer, "b");
     try {
         // The period lock holds a BYSTANDER's row, not the one being edited, so
         // the ONLY thing that can make the rate edit wait is tier 1. If the
@@ -261,7 +274,7 @@ test("PERIOD LOCK FIRST: the rate edit BLOCKS on tier 1 holding no row, then com
         const staged = stagePeriodLock(locker, bystander.id);
         await staged.atRow;
 
-        const editing = guardedRateEdit(writer, "ADMIN", user.id, "33.00");
+        const editing = guardedRateEdit(writer, actor.id, user.id, "33.00");
         // It really is waiting, not racing through: the period lock holds tier 1
         // EXCLUSIVE, and the rate edit asks for it before it touches the row.
         assert.equal(await stillPending(editing, 700), true, "the rate edit must wait for the period lock");
@@ -293,10 +306,10 @@ test("INTERLEAVED: a period lock arriving while the guard holds the row does NOT
     // reaches the row at all.
     const writer = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
     const locker = new PrismaClient({ datasources: { db: { url: databaseUrl! } } });
-    const { user, restore } = await seed(writer, "d");
+    const { user, actor, restore } = await seed(writer, "d");
     let periodLock: Promise<unknown> = Promise.resolve();
     try {
-        const editing = guardedRateEdit(writer, "ADMIN", user.id, "41.00", async () => {
+        const editing = guardedRateEdit(writer, actor.id, user.id, "41.00", async () => {
             periodLock = locker.$transaction(
                 async (tx) => {
                     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, KEY);

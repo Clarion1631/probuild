@@ -15,6 +15,7 @@ import {
 import { toSafeUser } from "@/lib/user-serialization";
 import {
     ASSIGNABLE_PERMISSIONS,
+    isUserMutationActorInvalidError,
     isUserMutationRefusedError,
     isUserMutationTargetNotFoundError,
     withGuardedUserMutation,
@@ -150,7 +151,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                     await withGuardedUserMutation(
                         tx,
                         {
-                            actor: { id: currentUser.id, role: currentUser.role },
+                            actorId: currentUser.id,
                             targetId: id,
                             changes: {
                                 role: userInfo?.role,
@@ -160,9 +161,13 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                             data,
                             rateChange,
                         },
-                        async (target) => {
+                        async (target, actor) => {
                             if (rateChange) {
-                                const rateResult = await applyRateChangeInTx(tx, currentUser, id, rateChange);
+                                // The LOCKED actor, not the pre-transaction read:
+                                // canWriteRates asks for financialReports, and a
+                                // revocation that committed a moment ago used to be
+                                // invisible here (round 14, finding 3).
+                                const rateResult = await applyRateChangeInTx(tx, actor, id, rateChange);
                                 if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
                                 // Rates are NOT written here — applyRateChange
                                 // above owns them (payroll permission, exact
@@ -206,7 +211,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 if (error instanceof RateChangeError) {
                     return NextResponse.json({ error: error.message }, { status: error.status });
                 }
-                if (isUserMutationRefusedError(error)) {
+                // An actor demoted, disabled or de-permissioned mid-flight is
+                // refused the same way a bad target is — the verdict carries the
+                // status (round 14, finding 3).
+                if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
                     return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
                 }
                 if (isUserMutationTargetNotFoundError(error)) {
@@ -329,7 +337,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
             await withGuardedUserMutation(
                 tx,
                 {
-                    actor: { id: currentUser.id, role: currentUser.role },
+                    actorId: currentUser.id,
                     targetId: id,
                     changes: {},
                 },
@@ -349,7 +357,10 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         if (isTimeEntriesExistError(error)) {
             return NextResponse.json({ error: error.message }, { status: 409 });
         }
-        if (isUserMutationRefusedError(error)) {
+        // An actor demoted, disabled or de-permissioned mid-flight is
+        // refused the same way a bad target is — the verdict carries the
+        // status (round 14, finding 3).
+        if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
             return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
         }
         if (isUserMutationTargetNotFoundError(error)) {

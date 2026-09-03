@@ -125,7 +125,7 @@ test("STATUS: a promotion committing mid-flight blocks, then refuses a manager's
         write = writer.$transaction(async (tx) => {
             return withGuardedUserMutation(
                 tx,
-                { actor: manager, targetId: target.id, changes: { status: "DISABLED" } },
+                { actorId: manager.id, targetId: target.id, changes: { status: "DISABLED" } },
                 async () => {
                     await tx.user.update({ where: { id: target.id }, data: { status: "DISABLED" } });
                 }
@@ -173,7 +173,7 @@ test("DELETE: a promotion committing mid-flight blocks, then refuses a manager's
         await new Promise((resolve) => setTimeout(resolve, 400));
 
         write = writer.$transaction(async (tx) => {
-            return withGuardedUserMutation(tx, { actor: manager, targetId: target.id, changes: {} }, async () => {
+            return withGuardedUserMutation(tx, { actorId: manager.id, targetId: target.id, changes: {} }, async () => {
                 await tx.user.delete({ where: { id: target.id } });
             });
         });
@@ -216,7 +216,7 @@ test("PERMISSIONS: a promotion committing mid-flight blocks, then refuses a mana
         write = writer.$transaction(async (tx) => {
             return withGuardedUserMutation(
                 tx,
-                { actor: manager, targetId: target.id, changes: { permissions: { schedules: true } } },
+                { actorId: manager.id, targetId: target.id, changes: { permissions: { schedules: true } } },
                 async () => {
                     await tx.userPermission.upsert({
                         where: { userId: target.id },
@@ -269,7 +269,7 @@ test("ADMIN CONTROL: the identical race succeeds when the actor is an admin", { 
         write = writer.$transaction(async (tx) => {
             return withGuardedUserMutation(
                 tx,
-                { actor: admin, targetId: target.id, changes: { status: "DISABLED" } },
+                { actorId: admin.id, targetId: target.id, changes: { status: "DISABLED" } },
                 async () => {
                     await tx.user.update({ where: { id: target.id }, data: { status: "DISABLED" } });
                 }

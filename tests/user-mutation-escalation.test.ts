@@ -224,14 +224,25 @@ function resetDb() {
                     },
                 },
                 $executeRawUnsafe: async () => 0,
-                // withGuardedUserMutation re-reads the target's role under this
-                // query (FOR UPDATE) INSIDE the transaction — the fake has to
-                // answer from the same USERS store the pre-tx findUnique above
-                // reads, or every guarded write would see a phantom row.
-                $queryRawUnsafe: async (_query: string, ...values: unknown[]) => {
+                // withGuardedUserMutation re-reads BOTH the target and the ACTOR
+                // under these queries (FOR UPDATE / FOR SHARE) INSIDE the
+                // transaction — the fake has to answer from the same USERS store
+                // the pre-tx findUnique above reads, or every guarded write would
+                // see a phantom row.
+                //
+                // It returns id, role AND status, because the guard now decides
+                // "is this actor still usable" and "is the actor the target"
+                // from what it read under the lock (round 14, finding 3). A fake
+                // that answered `{ role }` only made `actor.id` undefined, and
+                // the self-edit rules silently stopped matching.
+                $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
                     const id = values[0] as string;
+                    if (/UserPermission/.test(query)) {
+                        const row = USERS[id];
+                        return row?.permissions ? [row.permissions] : [];
+                    }
                     const row = USERS[id];
-                    return row ? [{ role: row.role }] : [];
+                    return row ? [{ id: row.id, role: row.role, status: row.status ?? "ACTIVATED" }] : [];
                 },
             }),
     };
@@ -423,7 +434,10 @@ test("every user-mutating writer routes through the shared guard", () => {
     const SRC = path.join(__dirname, "..", "src");
     for (const [file, expected] of [
         ["app/api/users/[id]/route.ts", "withGuardedUserMutation("],
-        ["app/api/users/route.ts", "checkUserCreate("],
+        // CREATION goes through the guard too now (round 14, finding 3): it used
+        // to call checkUserCreate directly, against the actor read the route
+        // took before it opened a transaction, and insert afterwards.
+        ["app/api/users/route.ts", "withGuardedUserCreate("],
         ["app/api/users/route.ts", "withGuardedUserMutation("],
         ["app/api/manager/employees/[id]/route.ts", "withGuardedUserMutation("],
     ] as const) {
@@ -441,6 +455,14 @@ test("every user-mutating writer routes through the shared guard", () => {
         assert.ok(
             !/\bcheckUserMutation\(/.test(source),
             `${file} must not call checkUserMutation directly — that authorizes on a read outside the write transaction`
+        );
+        // Creation too. It called checkUserCreate against the route's own
+        // pre-transaction actor read and inserted afterwards, so a manager
+        // demoted or disabled in that gap still minted an account (round 14,
+        // finding 3).
+        assert.ok(
+            !/\bcheckUserCreate\(/.test(source),
+            `${file} must not call checkUserCreate directly — withGuardedUserCreate runs it against the LOCKED actor`
         );
     }
     // And the old hand-rolled copies are gone, so there is nothing left to drift.

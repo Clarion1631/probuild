@@ -22,8 +22,17 @@ const databaseUrl = process.env.PAYROLL_LOCK_TEST_URL;
 const skip = !databaseUrl && "set PAYROLL_LOCK_TEST_URL to a disposable PostgreSQL URL";
 const root = process.cwd();
 
+/**
+ * Every invocation names its target. The script has no default any more: it
+ * used to take whatever DATABASE_URL happened to be in the environment, which
+ * is exactly what these tests set (round 14, finding 1). `ci` is a non-prod
+ * target, so the script uses the ordinary env chain and then REFUSES if that
+ * turns out to point at the production pooler.
+ */
+const TARGET = ["--target", "ci"];
+
 function runScript(args: string[]): string {
-    return execFileSync(process.execPath, [path.join(root, "scripts", "apply-payroll-phase5.mjs"), ...args], {
+    return execFileSync(process.execPath, [path.join(root, "scripts", "apply-payroll-phase5.mjs"), ...TARGET, ...args], {
         cwd: root,
         env: { ...process.env, DATABASE_URL: databaseUrl!, DIRECT_URL: databaseUrl! },
         encoding: "utf8",
@@ -40,7 +49,7 @@ function runScript(args: string[]): string {
  * returns the status instead of throwing on it.
  */
 function runScriptForStatus(args: string[]): { status: number | null; out: string } {
-    const result = spawnSync(process.execPath, [path.join(root, "scripts", "apply-payroll-phase5.mjs"), ...args], {
+    const result = spawnSync(process.execPath, [path.join(root, "scripts", "apply-payroll-phase5.mjs"), ...TARGET, ...args], {
         cwd: root,
         env: { ...process.env, DATABASE_URL: databaseUrl!, DIRECT_URL: databaseUrl! },
         encoding: "utf8",

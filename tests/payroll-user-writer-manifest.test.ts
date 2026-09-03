@@ -80,15 +80,15 @@ function findWriters(): string[] {
  */
 const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: string }> = {
     // ---- activation and profile edits: the round-34 hole --------------------
-    "app/api/users/[id]/route.ts:189::update": {
+    "app/api/users/[id]/route.ts:194::update": {
         kind: "wrapped",
         why: "the Team Members editor writes name/role/status in one payload; status is half the roster predicate and name is printed in both CSVs",
     },
-    "app/api/users/route.ts:248::update": {
+    "app/api/users/route.ts:257::update": {
         kind: "wrapped",
         why: "PATCH /api/users writes name/role/status — the same payload, for the same reason",
     },
-    "app/api/manager/employees/[id]/route.ts:96::update": {
+    "app/api/manager/employees/[id]/route.ts:101::update": {
         kind: "wrapped",
         why: "the mobile manager screen can activate or disable somebody, which moves them on and off the roster",
     },
@@ -118,7 +118,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "guarded",
         why: "setUserPayType, taking the same lock in the same order",
     },
-    "app/api/users/[id]/route.ts:337::delete": {
+    "app/api/users/[id]/route.ts:345::delete": {
         kind: "guarded",
         why: "runs through deleteParentWithTimeEntries, which takes acquirePayrollWriteLock and refuses while any of the member's hours sit in a locked period",
     },
@@ -132,7 +132,7 @@ const MANIFEST: Record<string, { kind: "wrapped" | "guarded" | "exempt"; why: st
         kind: "exempt",
         why: "a CLIENT-role portal account: no payType, and User.status defaults to PENDING, so it cannot be on an hourly roster and it has no punches",
     },
-    "app/api/users/[id]/route.ts:255::update": {
+    "app/api/users/[id]/route.ts:263::update": {
         kind: "exempt",
         why: "connect/disconnect on assignedProjects only — dispatch crew assignment reaches no column the export reads",
     },

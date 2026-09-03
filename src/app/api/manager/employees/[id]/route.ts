@@ -7,6 +7,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { applyRateChangeInTx, RateChangeError } from "@/lib/pay-rate-write";
 import { touchesPayrollRateState, withPayrollUserWrite } from "@/lib/payroll-period";
 import {
+    isUserMutationActorInvalidError,
     isUserMutationRefusedError,
     isUserMutationTargetNotFoundError,
     withGuardedUserMutation,
@@ -70,14 +71,18 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             return withGuardedUserMutation(
                 tx,
                 {
-                    actor: { id: user.id, role: user.role },
+                    actorId: user.id,
                     targetId: id,
                     changes: { role: body.role, status: body.status },
                     data,
                     rateChange,
                 },
-                async () => {
-                    const rateResult = await applyRateChangeInTx(tx, rateActor, id, rateChange);
+                async (_target, actor) => {
+                    // The LOCKED actor, not the pre-transaction read: canWriteRates
+                    // asks for financialReports, and a revocation that committed
+                    // a moment ago used to be invisible here (round 14,
+                    // finding 3).
+                    const rateResult = await applyRateChangeInTx(tx, actor, id, rateChange);
                     if (!rateResult.ok) throw new RateChangeError(rateResult.status, rateResult.error);
 
                     if (Object.keys(data).length === 0) {
@@ -109,7 +114,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         if (error instanceof RateChangeError) {
             return NextResponse.json({ error: error.message }, { status: error.status });
         }
-        if (isUserMutationRefusedError(error)) {
+        // An actor demoted, disabled or de-permissioned mid-flight is
+        // refused the same way a bad target is — the verdict carries the
+        // status (round 14, finding 3).
+        if (isUserMutationRefusedError(error) || isUserMutationActorInvalidError(error)) {
             return NextResponse.json({ error: error.verdict.error }, { status: error.verdict.status });
         }
         if (isUserMutationTargetNotFoundError(error)) {

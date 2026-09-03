@@ -275,6 +275,22 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # Round 12 locked the TARGET of a user mutation and re-read it inside the
+      # transaction. The ACTOR was still taken from a query the route ran BEFORE
+      # the transaction opened, so a manager demoted, disabled or stripped of
+      # financialReports a millisecond earlier still wrote — and creation sat
+      # outside the guard entirely. Both rows are now locked in ascending id
+      # order and every check re-runs against them. Real connections, one case
+      # per vector, a pre-fix control that wrongly succeeds, and a deadlock-
+      # freedom case (two managers editing each other at once).
+      - name: Prove a demoted or disabled actor cannot finish a user write
+        run: npx tsx --test tests/user-mutation-actor-race-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Reaches the app's prisma singleton through payroll-period — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

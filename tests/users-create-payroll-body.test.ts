@@ -62,7 +62,14 @@ function fakeTx() {
             // The FOR UPDATE row lock, and then the staff-role read that gates
             // every rate write (round 8, finding 2).
             if (sql.includes("FOR UPDATE")) locked.push(String(args[0]));
-            return [{ id: String(args[0]), role: "FIELD_CREW" }];
+            const id = String(args[0]);
+            // withGuardedUserCreate locks and re-reads the ACTOR inside the
+            // transaction now (round 14, finding 3) — creation used to be
+            // decided against the route's pre-transaction read. A fake that
+            // answered FIELD_CREW for every id therefore refused every create.
+            if (/UserPermission/.test(sql)) return [];
+            if (id === "u-admin") return [{ id, role: "ADMIN", status: "ACTIVATED" }];
+            return [{ id, role: "FIELD_CREW", status: "ACTIVATED" }];
         },
         // The payroll advisory lock — tier 1 of the global lock order, taken by
         // applyRateChangeInTx before the row lock (round 33, finding 1).
