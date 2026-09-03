@@ -545,47 +545,48 @@ export default function EntityContractsClient({
     };
 
     // ─── PRINT / SAVE AS PDF ───
-    // Opens the contract as the customer reads it (merge fields resolved, signing
-    // placeholders drawn as signature lines) in a print-ready tab and triggers the
-    // browser print dialog, which also offers "Save as PDF". Works in every status —
-    // before signing there is no executed PDF yet, so this is the only way to print,
-    // proof, or email a copy of a draft.
+    // Opens an unsigned (Draft/Sent/Viewed) HTML contract as the customer reads it —
+    // merge fields resolved, signing placeholders drawn as signature lines — in a
+    // print-ready tab and triggers the browser print dialog, whose "Save as PDF"
+    // printer yields an emailable copy. Signed/Finalized contracts are excluded on
+    // purpose: their authoritative copy is the executed PDF (Download PDF button).
     const [printing, setPrinting] = useState(false);
     const handlePrint = async () => {
         if (!editingContract) return;
         // Open synchronously inside the click so popup blockers allow it; fill it after the await.
         const win = window.open("", "_blank");
         if (!win) { toast.error("Your browser blocked the print window. Allow pop-ups for this site and try again."); return; }
+        win.opener = null;
         win.document.write("<!doctype html><title>Preparing contract…</title><p style=\"font-family:sans-serif;color:#64748b;padding:24px\">Preparing contract…</p>");
         setPrinting(true);
         try {
             const escapeHtml = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-            const isReadOnly = ["Signed", "Finalized"].includes(editingContract.status);
-            let html: string;
-            if (isReadOnly) {
-                // Signed contracts already carry their signature images via the read-only parser.
-                html = parsedReadOnlyBody;
-            } else {
-                const projectId = entity.type === "project" ? entity.id : null;
-                const leadId = entity.type === "lead" ? entity.id : null;
-                const mergeData = await getResolvedMergePreview(projectId, leadId);
-                const fill = (key: string): string | null => (key in mergeData ? escapeHtml(mergeData[key] || "") : null);
-                html = editBody;
-                html = html.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g, (m, key) => fill(key) ?? m);
-                html = html.replace(/\{\{(\w+)\}\}/g, (m, key) => fill(key) ?? m);
-                const line = (label: string, width: number) =>
-                    `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
-                const SIGN_LINES: Record<string, string> = {
-                    SIGNATURE_BLOCK: line("Client signature", 240),
-                    INITIAL_BLOCK: line("Initials", 70),
-                    DATE_BLOCK: line("Date", 120),
-                    CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl
-                        ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
-                        : line("Contractor signature", 240),
-                };
-                html = html.replace(/\{\{(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)\}\}/g, (_m, key) => SIGN_LINES[key]);
-                html = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
-            }
+            const projectId = entity.type === "project" ? entity.id : null;
+            const leadId = entity.type === "lead" ? entity.id : null;
+            const mergeData = await getResolvedMergePreview(projectId, leadId);
+            // Merge values are inserted raw (payment_schedule is a formatted <table>);
+            // the DOMPurify pass below sanitizes the whole document.
+            const fill = (key: string): string | null => (key in mergeData ? (mergeData[key] || "") : null);
+            const line = (label: string, width: number) =>
+                `<span style="display:inline-block;vertical-align:bottom;margin:6px 8px 0 0;"><span style="display:block;min-width:${width}px;border-bottom:1px solid #334155;height:28px;"></span><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">${label}</span></span>`;
+            const contractorDate = editingContract.contractorSignedAt ? fmtDate(editingContract.contractorSignedAt) : "";
+            const SIGN_LINES: Record<string, string> = {
+                SIGNATURE_BLOCK: line("Client signature", 240),
+                INITIAL_BLOCK: line("Initials", 70),
+                DATE_BLOCK: line("Date", 120),
+                CONTRACTOR_DATE_BLOCK: contractorDate ? `<strong>${contractorDate}</strong>` : line("Date", 120),
+                CONTRACTOR_SIGNATURE_BLOCK: editingContract.contractorSignatureUrl
+                    ? `<span style="display:inline-block;margin:4px 0;"><img src="${escapeHtml(editingContract.contractorSignatureUrl)}" alt="Contractor Signature" style="height:48px;object-fit:contain;" /><span style="display:block;font-size:10px;color:#64748b;margin-top:2px;">Contractor — ${escapeHtml(editingContract.contractorSignedBy || "")}</span></span>`
+                    : line("Contractor signature", 240),
+            };
+            let html = editBody;
+            // Signing placeholders first (both raw {{KEY}} and TipTap data-merge-field spans).
+            html = html.replace(/\{\{(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)\}\}|<span[^>]*data-merge-field="(SIGNATURE_BLOCK|INITIAL_BLOCK|DATE_BLOCK|CONTRACTOR_DATE_BLOCK|CONTRACTOR_SIGNATURE_BLOCK)"[^>]*>[\s\S]*?<\/span>/g,
+                (_m, k1, k2) => SIGN_LINES[k1 || k2]);
+            // Then data merge fields (TipTap spans, then any remaining raw placeholders).
+            html = html.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g, (m, key) => fill(key) ?? m);
+            html = html.replace(/\{\{(\w+)\}\}/g, (m, key) => fill(key) ?? m);
+            html = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
             const title = escapeHtml(editTitle || editingContract.title || "Contract");
             const doc = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
 <style>
@@ -830,7 +831,7 @@ export default function EntityContractsClient({
                                 {loadingPreview ? "Loading..." : isPreview ? "Back to Editor" : "Preview"}
                             </button>
                         )}
-                        {!editingContract.originalPdfPath && (
+                        {!isReadOnly && !editingContract.originalPdfPath && (
                             <button onClick={handlePrint} disabled={printing} title="Open a print-ready copy of this contract. Use “Save as PDF” in the print dialog to get a PDF you can email." className="px-3 py-1.5 text-sm font-medium rounded-lg transition border text-slate-600 border-slate-200 hover:bg-slate-50 disabled:opacity-50">
                                 {printing ? "Preparing..." : "🖨 Print / PDF"}
                             </button>
