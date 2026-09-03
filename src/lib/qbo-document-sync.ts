@@ -23,11 +23,15 @@ import { withTxRetry, lockMoneyParents, lockClientRow, lockProjectRow } from "./
 
 import { toNum } from "./prisma-helpers";
 import { documentIssuanceHash } from "./qbo-issuance";
+import { QBO_AUTH_EVENT_REASON } from "./pipeline-health";
 import {
     findQBEstimatesByDocNumber,
     findQBInvoicesByDocNumber,
     canonicalPrivateNote,
     QB_DOC_NUMBER_MAX_LEN,
+    isQboConnectionFailure,
+    isQboReconnectRequired,
+    isQBTimeoutError,
     type QBTokens,
     type RouteDeadline,
     type RemoteDocumentFacts,
@@ -138,8 +142,38 @@ export type DocumentSyncRecovery =
      * existed but had not indexed.
      */
     | { state: "absent" }
-    /** Could not be established, or could not be proved ours. Stays parked. */
-    | { state: "unknown"; reason: string };
+    /**
+     * Could not be established, or could not be proved ours. Stays parked.
+     *
+     * `failure` is what separates "this ROW is ambiguous" from "the CONNECTION
+     * is down". Both used to arrive here as a bare reason string, so the sweep
+     * read a 401 as a row-specific oddity, advanced the cursor and asked
+     * QuickBooks again — once per parked row, at a fresh timeout each, until the
+     * route budget ran out. Absent means row-ambiguous.
+     */
+    | { state: "unknown"; reason: string; failure?: DocumentSyncFailure };
+
+/**
+ * A failure of the CONNECTION, not of one row. Every one of these means the
+ * next row would fail identically, so the sweep stops both rails.
+ *
+ * The same three names the payments sweep already reports, so an operator
+ * reading a digest does not have to learn a second vocabulary: `qbo-auth` is
+ * the credential (only a human reconnecting fixes it, and health counts it
+ * toward the reconnect alert), `qbo-timeout` is our own deadline, and
+ * `qbo-unavailable` is everything else QuickBooks could not serve.
+ */
+export type DocumentSyncFailure =
+    | typeof QBO_AUTH_EVENT_REASON
+    | "qbo-timeout"
+    | "qbo-unavailable";
+
+/** Which shared failure is this, or `null` when it is about one row only. */
+export function classifyDocumentSyncFailure(error: unknown): DocumentSyncFailure | null {
+    if (!isQboConnectionFailure(error)) return null;
+    if (isQboReconnectRequired(error)) return QBO_AUTH_EVENT_REASON;
+    return isQBTimeoutError(error) ? "qbo-timeout" : "qbo-unavailable";
+}
 
 export interface DocumentSyncProbeDeps {
     findEstimates?: typeof findQBEstimatesByDocNumber;
@@ -215,7 +249,16 @@ export async function probeDocumentSync(
         // An outage, a timeout, or a truncated result set. NOT absence: the one
         // thing this must never do is conclude "there is none" from a question
         // QuickBooks did not answer, because that permits a duplicate create.
-        return { state: "unknown", reason: error instanceof Error ? error.message : "QuickBooks lookup failed" };
+        //
+        // Classified, not flattened. A caller sweeping many rows has to be able
+        // to tell a bad credential from a confusing answer about ONE document,
+        // because the first means every remaining row will fail the same way.
+        const failure = classifyDocumentSyncFailure(error);
+        return {
+            state: "unknown",
+            reason: error instanceof Error ? error.message : "QuickBooks lookup failed",
+            ...(failure ? { failure } : {}),
+        };
     }
 
     const ours = matches.filter((m) => documentMatchesClaim(m, identity).ok);
@@ -337,6 +380,8 @@ export interface DocumentSyncSweepResult {
     unvisited: number;
     /** Rows whose marker this rail does not recognise, stepped over and reported. */
     unrecognised: number;
+    /** Which rail this run started with, so the report shows the alternation. */
+    railFirst?: "estimate" | "invoice";
     /**
      * A SHARED stop only: out of budget, or QuickBooks unreachable.
      *
@@ -385,6 +430,17 @@ export const DOCUMENT_SYNC_CURSOR_KEYS = {
     estimate: "qbo-maintenance.document-sync.estimate.cursor",
     invoice: "qbo-maintenance.document-sync.invoice.cursor",
 } as const;
+
+/**
+ * Which rail went first LAST time, in the same store as the cursors.
+ *
+ * The order used to be `Date.now() % 2`, which is parity, not alternation: it
+ * is a coin flip per run, so under a tight budget or a recurring outage the
+ * same rail can win many runs in a row and the other starves — the exact
+ * failure the alternation exists to prevent. Persisting the last order and
+ * flipping it is what the payments sweep already does (PAYLINK_ORDER_KEY).
+ */
+export const DOCUMENT_SYNC_ORDER_KEY = "qbo-maintenance.document-sync.order";
 
 /** How many rows one rail may look at per run. */
 export const DOCUMENT_SYNC_PAGE_SIZE = 25;
@@ -435,9 +491,14 @@ export async function sweepPendingDocumentSyncs(
     const cursors = deps.cursors;
     const pageSize = deps.pageSize ?? DOCUMENT_SYNC_PAGE_SIZE;
 
-    // Alternate by clock when the caller does not say. A fixed order means the
-    // second rail is always the one that loses a short run.
-    const first = deps.railFirst ?? (Date.now() % 2 === 0 ? "estimate" : "invoice");
+    // Genuinely ALTERNATE: read which rail went first last time and take the
+    // other. An unset key is not "invoice last time" — it means nothing has run,
+    // so the first run keeps the historical estimate-first order and every run
+    // after it flips.
+    const lastOrder = await cursors?.get(DOCUMENT_SYNC_ORDER_KEY).catch(() => null);
+    const first: "estimate" | "invoice" =
+        deps.railFirst ?? (lastOrder === "estimate" ? "invoice" : "estimate");
+    result.railFirst = first;
     const rails: Array<"estimate" | "invoice"> = first === "estimate"
         ? ["estimate", "invoice"]
         : ["invoice", "estimate"];
@@ -504,6 +565,10 @@ export async function sweepPendingDocumentSyncs(
                 }
                 result.checked++;
                 tally.checked++;
+                // Where the cursor stood before this row, so a shared failure can
+                // put it back: a row the connection prevented us from examining
+                // must not be stepped over.
+                const beforeRow = checkpoint;
                 const found = await probe(tokens, { kind: row.kind, marker: row.marker }, deadline);
                 // The cursor advances PAST every row this run looked at,
                 // resolved or not. That is the whole fix: a row that can never
@@ -511,6 +576,27 @@ export async function sweepPendingDocumentSyncs(
                 // the next run.
                 checkpoint = row.id;
                 cursor = row.id;
+                if (found.state === "unknown" && found.failure) {
+                    // The CONNECTION is down, not this row. Every remaining row
+                    // on this rail and on the other one would fail identically,
+                    // at a fresh timeout each, so stop now and report why. This
+                    // used to be indistinguishable from a row-specific ambiguity:
+                    // the sweep advanced and probed again, once per parked row,
+                    // until the route budget was gone — and a 401 was filed as
+                    // ordinary trouble instead of a reconnect.
+                    //
+                    // The cursor still stands where it was BEFORE this row (the
+                    // checkpoint is rolled back below), because this row was never
+                    // really examined.
+                    result.reason = found.failure;
+                    tally.stopped = found.failure;
+                    tally.note = tally.note ?? found.reason;
+                    result.checked--;
+                    tally.checked--;
+                    checkpoint = beforeRow;
+                    cursor = beforeRow;
+                    break;
+                }
                 if (found.state !== "found") {
                     // `absent` is left for a real sync to act on; `unknown` is
                     // left for the next run. Either way the claim stands, so
@@ -536,13 +622,22 @@ export async function sweepPendingDocumentSyncs(
                     tally.note = tally.note ?? "a parked record no longer matches the document it claimed";
                 }
             }
-            if (result.reason === "budget-exhausted") break;
+            // Any run-wide reason ends this rail's paging, not just the budget:
+            // a connection failure set inside the row loop above breaks out of
+            // THAT loop, and without this the pager simply fetched the next page
+            // and probed again — the very behaviour the stop exists to prevent.
+            if (result.reason) break;
         }
 
         // Never throws — a lost cursor costs one restart from the top, never
         // correctness.
         await cursors?.set(key, exhausted ? "" : (checkpoint ?? "")).catch(() => {});
     }
+
+    // Recorded for the NEXT run to flip. Written even when the run stopped
+    // early: a run that died inside the first rail is exactly the one whose
+    // successor must start with the other.
+    await cursors?.set(DOCUMENT_SYNC_ORDER_KEY, first).catch(() => {});
 
     // Counted from the database AFTER the loop, so it includes rows this run
     // never reached as well as the ones it could not finish.

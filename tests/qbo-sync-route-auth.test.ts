@@ -43,8 +43,17 @@ const state: {
     createdDocumentNull: boolean;
     /** Every TxnDate the route actually sent, in order. */
     sentTxnDates: Array<string | undefined>;
+    /** Every service item id the route actually sent, in order. */
+    sentItemIds: Array<string | undefined>;
     /** Which client the document CURRENTLY hangs off, as read under its lock. */
     projectClientId: string;
+    /** The QuickBooks company the tokens are for RIGHT NOW. */
+    connectedRealm: string;
+    /** How many times the route resolved (and therefore wrote) the mapping. */
+    resolves: number;
+    /** What a resolution answers, and persists. */
+    resolvedCustomerId: string;
+    resolvedItemId: string;
     locksTaken: number;
     /** Every row lock taken, in order, as `SQL|values`. */
     locks: string[];
@@ -67,7 +76,8 @@ const state: {
     user: null, estimates: {}, invoices: {}, posts: [], createThrows: null,
     lookup: { estimates: [], invoices: [], throws: null, calls: [] },
     clientQbCustomerId: "42", locksTaken: 0, onCreate: null, onFirstRead: null, sentNotes: [], sentItems: [], sentTotals: [],
-    createdDocumentPatch: null, createdDocumentNull: false, sentTxnDates: [], projectClientId: "cli-1", locks: [], onFirstLock: null,
+    createdDocumentPatch: null, createdDocumentNull: false, sentTxnDates: [], sentItemIds: [], projectClientId: "cli-1", locks: [], onFirstLock: null,
+    connectedRealm: "realm-1", resolves: 0, resolvedCustomerId: "42", resolvedItemId: "7",
 };
 
 function resetState() {
@@ -81,12 +91,17 @@ function resetState() {
     state.locksTaken = 0;
     state.locks = [];
     state.onFirstLock = null;
+    state.connectedRealm = "realm-1";
+    state.resolves = 0;
+    state.resolvedCustomerId = "42";
+    state.resolvedItemId = "7";
     state.onCreate = null;
     state.onFirstRead = null;
     state.sentNotes = [];
     state.sentItems = [];
     state.sentTotals = [];
     state.sentTxnDates = [];
+    state.sentItemIds = [];
     state.createdDocumentPatch = null;
     state.createdDocumentNull = false;
     state.projectClientId = "cli-1";
@@ -190,8 +205,16 @@ function createdDocument(id: string, sent: any) {
 }
 
 const fakeQbPayments = {
-    getFreshQBTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: "realm-1" }),
-    resolveCustomerAndItem: async () => ({ customerId: "42", itemId: "7" }),
+    getFreshQBTokens: async () => ({ accessToken: "a", refreshToken: "r", realmId: state.connectedRealm }),
+    // COUNTED, because the point of round 47 is that recovery must not call
+    // this at all: it WRITES Client.qbCustomerId and the stored service item,
+    // so calling it while connected to another company corrupts the mapping
+    // before the realm can even be refused.
+    resolveCustomerAndItem: async () => {
+        state.resolves++;
+        state.clientQbCustomerId = state.resolvedCustomerId;
+        return { customerId: state.resolvedCustomerId, itemId: state.resolvedItemId };
+    },
 };
 
 const fakeIntegrationStore = {
@@ -261,6 +284,7 @@ before(async () => {
                     state.sentItems.push(e?.items ?? []);
                     state.sentTotals.push(e?.totalAmount);
                     state.sentTxnDates.push(e?.txnDate);
+                    state.sentItemIds.push(e?.itemId);
                     state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
                     return {
@@ -273,6 +297,7 @@ before(async () => {
                     state.posts.push({ kind: "invoice", requestId });
                     state.sentNotes.push(i?.privateNote);
                     state.sentTxnDates.push(i?.txnDate);
+                    state.sentItemIds.push(i?.itemId);
                     state.onCreate?.();
                     if (state.createThrows) throw state.createThrows;
                     return {
@@ -701,7 +726,11 @@ test("round 40: a customer remap between resolve and claim refuses BEFORE any cr
     // with — and nothing is sent at all.
     state.user = ADMIN;
     const row = seedEstimate();
-    state.clientQbCustomerId = "99";   // remapped since the resolve returned 42
+    // The remap lands AFTER the resolve (which persists what it resolved) and
+    // BEFORE the guarded re-read under the locks — the only window this guard
+    // exists for. Pre-setting the value instead would also have passed against
+    // a route that simply never resolved.
+    state.onFirstLock = () => { state.clientQbCustomerId = "99"; };
 
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     const body = await res.json();
@@ -832,6 +861,12 @@ test("round 41: a legacy claim carrying no payload hash is parked, never adopted
     // Markers written before this rail fingerprinted the payload cannot be
     // verified. Adopting on the fields that happen to be present is exactly the
     // guess the whole mechanism exists to refuse.
+    //
+    // Round 47 moved WHERE this one is refused, not whether: a marker with no
+    // recorded service item cannot be replayed against the item the settings
+    // happen to name today, so it is now parked before any resolution runs. The
+    // hash refusal still stands for a marker that records customer and item but
+    // no fingerprint — covered by the test below.
     const { composeSyncMarker, documentPrivateNote: note } = await import("../src/lib/qbo-document-sync");
     const { CREATE_IN_FLIGHT_MARKER } = await import("../src/lib/qbo-create-markers");
     state.user = ADMIN;
@@ -843,6 +878,35 @@ test("round 41: a legacy claim carrying no payload hash is parked, never adopted
         realmId: "realm-1",
         customerId: "42",
         // no issuanceHash: the legacy shape
+    } as any);
+    state.lookup.estimates = [{
+        id: "qb-est-real", docNumber: "EST-00001",
+        privateNote: note("EST-00001", "Kitchen"), total: 1000, customerId: "42", txnDate: qboTxnDate(), itemIds: ["7"],
+    }];
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 409);
+    assert.match(String(body.error), /does not record the QuickBooks customer and service item/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 47: a claim recording customer and item but NO payload hash is still parked", async () => {
+    // The original round-41 shape, now reachable only once the identity is
+    // complete enough to replay. Adoption still refuses without a fingerprint.
+    const { composeSyncMarker, documentPrivateNote: note } = await import("../src/lib/qbo-document-sync");
+    const { CREATE_IN_FLIGHT_MARKER } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    row.qbSyncMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, {
+        docNumber: "EST-00001",
+        privateNote: note("EST-00001", "Kitchen"),
+        expectedTotal: 1000,
+        realmId: "realm-1",
+        customerId: "42",
+        itemId: "7",
+        txnDate: qboTxnDate(),
+        // still no issuanceHash
     } as any);
     state.lookup.estimates = [{
         id: "qb-est-real", docNumber: "EST-00001",
@@ -1199,4 +1263,88 @@ test("round 46: an UNTOUCHED project still syncs (the control)", async () => {
     const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
     assert.equal(res.status, 200);
     assert.equal(row.qbEstimateId, "qb-est-1");
+});
+
+// --- Round 47: a stored claim freezes the identity, and recovery honours it ---
+
+/**
+ * `resolveCustomerAndItem` is not a read — it PERSISTS `Client.qbCustomerId`
+ * and the service item. Both branches used to call it before so much as
+ * looking at the stored marker, so reconnecting to another QuickBooks company
+ * overwrote the local mapping with that company's ids, and only THEN did the
+ * recovery refuse the realm. The refusal did not undo the corruption.
+ */
+test("round 47: a realm change under a stored claim parks BEFORE anything resolves", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+    const mappingBefore = state.clientQbCustomerId;
+    state.resolves = 0;
+    // Reconnected to a different company, which would resolve to ITS ids.
+    state.connectedRealm = "realm-2";
+    state.resolvedCustomerId = "999";
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /claimed against QuickBooks company realm-1 and realm-2 is connected now/);
+    assert.equal(state.resolves, 0, "nothing resolved, so nothing was written");
+    assert.equal(state.clientQbCustomerId, mappingBefore, "the local mapping is untouched");
+    assert.equal(state.lookup.calls.length, 0, "and QuickBooks was never asked about the other company");
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 47: the invoice rail refuses a realm change the same way", async () => {
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.user = ADMIN;
+    const row = seedInvoice();
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB invoice sync");
+    await POST(postRequest({ type: "invoice", id: "inv-1" }));
+    state.createThrows = null;
+    state.resolves = 0;
+    state.connectedRealm = "realm-2";
+
+    const res = await POST(postRequest({ type: "invoice", id: "inv-1" }));
+
+    assert.equal(res.status, 409);
+    assert.equal(state.resolves, 0);
+    assert.equal(row.qbInvoiceId, null);
+});
+
+test("round 47: a REPLAY sends the item frozen in the claim, not the one configured now", async () => {
+    // The replay reuses the original `requestid`. Sending different content
+    // under the same idempotency key is how a document lands against the wrong
+    // income account and is then parked as mismatched — the item decides the
+    // account, and nothing in the payload hash notices it moving.
+    state.user = ADMIN;
+    seedEstimate();
+    await parkEstimate();
+    state.resolves = 0;
+    // The configured service item has changed since the claim.
+    state.resolvedItemId = "99";
+    state.lookup.estimates = [];
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 200, JSON.stringify(await res.clone().json()));
+    assert.equal(state.resolves, 0, "a recovery resolves nothing");
+    assert.equal(
+        state.sentItemIds[state.sentItemIds.length - 1],
+        "7",
+        "the replay sent the item the claim froze, not the newly configured one",
+    );
+});
+
+test("round 47: a FRESH create still resolves, and sends what it resolved (control)", async () => {
+    // Without this the tests above would also pass against a route that never
+    // resolved at all, which could not create a first document.
+    state.user = ADMIN;
+    seedEstimate();
+    state.resolvedItemId = "12";
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+
+    assert.equal(res.status, 200);
+    assert.equal(state.resolves, 1, "a fresh create is the one path that may resolve");
+    assert.equal(state.sentItemIds[0], "12");
 });

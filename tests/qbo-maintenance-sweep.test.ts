@@ -1427,3 +1427,146 @@ test("round 43: an unreadable marker makes the maintenance run ok:false", async 
     assert.equal(res.unrecognised, 1, "reachable at last: the count no longer filters it out");
     assert.equal(res.recovered, 1, "and the valid row behind it is still processed");
 });
+
+// --- Round 47: a broken connection stops the sweep, and the rails alternate ---
+
+/**
+ * `probeDocumentSync` flattened every timeout, transport error, 401 and 5xx
+ * into a bare `state: "unknown"`, which is also what "this ROW is ambiguous"
+ * looks like. So the sweep advanced the cursor and asked QuickBooks about the
+ * next parked row, and the next, at a fresh timeout each — burning the whole
+ * route budget against a connection that was never going to answer, delaying
+ * the cron, and filing a bad credential as ordinary trouble.
+ */
+function connectionSweep(probeError: unknown, kv = new Map<string, string>()) {
+    const probes: string[] = [];
+    const rows = {
+        estimate: ["est-1", "est-2", "est-3"],
+        invoice: ["inv-1", "inv-2"],
+    };
+    const cursors = {
+        get: async (k: string) => kv.get(k) ?? null,
+        set: async (k: string, v: string) => { kv.set(k, v); },
+    };
+    return {
+        probes,
+        kv,
+        run: async () => {
+            const { sweepPendingDocumentSyncs, classifyDocumentSyncFailure } =
+                await import("../src/lib/qbo-document-sync");
+            return sweepPendingDocumentSyncs(
+                { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+                undefined,
+                {
+                    cursors,
+                    railFirst: "estimate",
+                    pageSize: 25,
+                    listParked: async (rail: "estimate" | "invoice", after?: string | null) =>
+                        rows[rail]
+                            .filter((id) => !after || id > after)
+                            .map((id) => ({ id, marker: `ambiguous-create:@1|${id}|note`, kind: rail, clientId: "cli-1" })),
+                    // The REAL classifier, against a real error object: a fake
+                    // that simply returned the failure code would prove nothing
+                    // about how a 401 is recognised.
+                    probe: (async () => {
+                        probes.push("probe");
+                        const failure = classifyDocumentSyncFailure(probeError);
+                        return {
+                            state: "unknown",
+                            reason: (probeError as Error)?.message ?? "failed",
+                            ...(failure ? { failure } : {}),
+                        };
+                    }) as any,
+                    adopt: async () => 1,
+                    countParked: async () => 5,
+                },
+            );
+        },
+    };
+}
+
+test("round 47: a 401 stops BOTH rails after exactly one probe, named as the credential", async () => {
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const sweep = connectionSweep(new QboHttpError("unauthorized", 401));
+    const res = await sweep.run();
+
+    assert.equal(sweep.probes.length, 1, "one probe, not one per parked row");
+    assert.equal(res.reason, "qbo-auth", "named as the credential, which health counts for the reconnect alert");
+    assert.equal(res.rails.estimate.stopped, "qbo-auth");
+    assert.equal(res.rails.invoice.checked, 0, "the second rail was never started");
+});
+
+test("round 47: a timeout and a 5xx are named as themselves and stop the same way", async () => {
+    const { QBTimeoutError, QboRetryableError } = await import("../src/lib/quickbooks");
+    const timeout = connectionSweep(new QBTimeoutError("QuickBooks request timed out after 20000ms"));
+    const timedOut = await timeout.run();
+    assert.equal(timeout.probes.length, 1);
+    assert.equal(timedOut.reason, "qbo-timeout");
+
+    const down = connectionSweep(new QboRetryableError("service unavailable", 503));
+    const unavailable = await down.run();
+    assert.equal(down.probes.length, 1);
+    assert.equal(unavailable.reason, "qbo-unavailable");
+});
+
+test("round 47: a shared failure does NOT step the cursor over the row it never examined", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const { DOCUMENT_SYNC_CURSOR_KEYS } = await import("../src/lib/qbo-document-sync");
+    const sweep = connectionSweep(new QBTimeoutError("timed out"));
+    await sweep.run();
+    assert.equal(
+        sweep.kv.get(DOCUMENT_SYNC_CURSOR_KEYS.estimate) || "",
+        "",
+        "the head row was never really looked at, so the cursor stays before it",
+    );
+});
+
+test("round 47: a ROW-specific ambiguity still advances, one probe per row (control)", async () => {
+    // Without this the tests above would also pass against a sweep that stopped
+    // on any `unknown` at all — which would wedge the queue behind one
+    // unresolvable document, the round-40 starvation bug all over again.
+    const sweep = connectionSweep(new Error("two documents match this code"));
+    const res = await sweep.run();
+
+    // Every row on both rails, plus the bounded wrap back to the head that
+    // the round-40 cursor work added. What matters here is that it did NOT
+    // stop at the first ambiguous row.
+    assert.ok(sweep.probes.length > 5, `expected every row to be examined, got ${sweep.probes.length}`);
+    assert.equal(res.reason, null);
+    assert.ok(res.rails.invoice.checked > 0, "the second rail ran");
+});
+
+// --- Round 47: the rails genuinely alternate ---
+
+test("round 47: three consecutive runs alternate the starting rail", async () => {
+    // `Date.now() % 2` is a coin flip per run, not alternation: the same rail
+    // can win indefinitely, which is the starvation the comment claimed to
+    // prevent. The order is now persisted next to the cursors and flipped.
+    const kv = new Map<string, string>();
+    const order: Array<string | undefined> = [];
+    for (let i = 0; i < 3; i++) {
+        const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+        const res = await sweepPendingDocumentSyncs(
+            { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+            undefined,
+            {
+                cursors: {
+                    get: async (k: string) => kv.get(k) ?? null,
+                    set: async (k: string, v: string) => { kv.set(k, v); },
+                },
+                pageSize: 5,
+                listParked: async () => [],
+                adopt: async () => 1,
+                countParked: async () => 0,
+            },
+        );
+        order.push(res.railFirst);
+    }
+
+    assert.deepEqual(order, ["estimate", "invoice", "estimate"], order.join(","));
+    // Deterministic proof of the MECHANISM, not just of the outcome: a coin
+    // flip produces this sequence about one run in four, so the sequence alone
+    // is not evidence. The order having been PERSISTED is.
+    const { DOCUMENT_SYNC_ORDER_KEY } = await import("../src/lib/qbo-document-sync");
+    assert.equal(kv.get(DOCUMENT_SYNC_ORDER_KEY), "estimate", "the run recorded which rail it started with");
+});

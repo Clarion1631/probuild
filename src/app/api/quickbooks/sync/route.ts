@@ -251,6 +251,61 @@ function unrecognisedMarker(code: string, marker: string) {
     );
 }
 
+/**
+ * The customer and service item a STORED claim was created with.
+ *
+ * A claim freezes an identity: the realm, the customer, the service item, the
+ * transaction date and the payload hash. Recovery exists to finish THAT
+ * document, so it must not re-resolve any of them — and re-resolving is not a
+ * read: `resolveCustomerAndItem` WRITES `Client.qbCustomerId` and the stored
+ * service item. Called while connected to a different QuickBooks company, it
+ * overwrites the local mapping with ids from that company before the recovery
+ * has had a chance to refuse the realm, and the corruption outlives the
+ * refusal.
+ *
+ * So the realm is checked HERE, before anything mutates, and the customer and
+ * item come out of the marker verbatim. A claim that cannot answer all three
+ * cannot be replayed safely and is parked for a human rather than replayed
+ * against whatever the settings happen to say now.
+ */
+function frozenCreateIdentity(
+    code: string,
+    marker: string,
+    tokens: QBTokens,
+): { ok: true; value: { customerId: string; itemId: string } } | { ok: false; response: NextResponse } {
+    const identity = syncMarkerIdentity(marker);
+    if (!identity) {
+        return { ok: false, response: parked(code, "its claim records no identity to replay", null) };
+    }
+    if (!identity.realmId) {
+        return {
+            ok: false,
+            response: parked(code, "its claim does not record which QuickBooks company it was made against", null),
+        };
+    }
+    if (identity.realmId !== tokens.realmId) {
+        return {
+            ok: false,
+            response: parked(
+                code,
+                `it was claimed against QuickBooks company ${identity.realmId} and ${tokens.realmId} is connected now`,
+                null,
+            ),
+        };
+    }
+    if (!identity.customerId || !identity.itemId) {
+        return {
+            ok: false,
+            response: parked(
+                code,
+                "its claim does not record the QuickBooks customer and service item it was created with",
+                null,
+            ),
+        };
+    }
+    return { ok: true, value: { customerId: identity.customerId, itemId: identity.itemId } };
+}
+
 function retryLater(code: string, reason: string) {
     return NextResponse.json(
         {
@@ -456,8 +511,6 @@ export async function POST(req: NextRequest) {
             }
             const tokens = await getFreshQBTokens(deadline);
 
-            const { customerId, itemId } = await resolveCustomerAndItem(tokens, client.id, deadline);
-
             // 2. RECOVER an existing claim, or CLAIM afresh.
             //
             //    A stored marker means an earlier attempt did not finish. That
@@ -481,8 +534,17 @@ export async function POST(req: NextRequest) {
             if (estimate.qbSyncMarker && !syncMarkerKind(estimate.qbSyncMarker)) {
                 return unrecognisedMarker(estimate.code, estimate.qbSyncMarker);
             }
+            // The customer and item this sync uses. On a RECOVERY they come out
+            // of the marker; only a fresh create resolves them, because resolving
+            // writes to Client.qbCustomerId — see frozenCreateIdentity.
+            let customerId: string;
+            let itemId: string;
             if (syncMarkerKind(estimate.qbSyncMarker)) {
                 const stored = estimate.qbSyncMarker as string;
+                const frozen = frozenCreateIdentity(estimate.code, stored, tokens);
+                if (!frozen.ok) return frozen.response;
+                customerId = frozen.value.customerId;
+                itemId = frozen.value.itemId;
                 estimateClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());
                 const recovery = await recoverClaimedRecord({
                     kind: "estimate", id: estimate.id, code: estimate.code, clientId: client.id,
@@ -503,6 +565,11 @@ export async function POST(req: NextRequest) {
                 // let it through because the record still matches it.
                 estimateFacts = recovery.facts;
             } else {
+                // No claim, so nothing is frozen yet: this is the one path that may
+                // resolve (and therefore write) the customer and item mapping.
+                const resolved = await resolveCustomerAndItem(tokens, client.id, deadline);
+                customerId = resolved.customerId;
+                itemId = resolved.itemId;
                 //    Claimed UNDER the money locks (Estimate → Invoice → Client), and
                 //    the identity is recomputed from the database INSIDE them rather
                 //    than from the read at the top of this handler:
@@ -664,8 +731,6 @@ export async function POST(req: NextRequest) {
         }
         const tokens = await getFreshQBTokens(deadline);
 
-        const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.client.id, deadline);
-
         const invoiceUrl = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
         // The invoice create used to send NO PrivateNote at all, which left its
         // recovery matching on DocNumber alone — and QuickBooks does not enforce
@@ -678,8 +743,16 @@ export async function POST(req: NextRequest) {
         if (invoice.qbSyncMarker && !syncMarkerKind(invoice.qbSyncMarker)) {
             return unrecognisedMarker(invoice.code, invoice.qbSyncMarker);
         }
+        // See the estimate branch: frozen on a recovery, resolved only when there
+        // is no claim to violate.
+        let customerId: string;
+        let itemId: string;
         if (syncMarkerKind(invoice.qbSyncMarker)) {
             const stored = invoice.qbSyncMarker as string;
+            const frozen = frozenCreateIdentity(invoice.code, stored, tokens);
+            if (!frozen.ok) return frozen.response;
+            customerId = frozen.value.customerId;
+            itemId = frozen.value.itemId;
             invoiceClaimedAt = new Date(parseCreateMarker(stored)?.atMs ?? Date.now());
             const recovery = await recoverClaimedRecord({
                 kind: "invoice", id: invoice.id, code: invoice.code, clientId: invoice.client.id,
@@ -698,6 +771,9 @@ export async function POST(req: NextRequest) {
             invoiceMarker = recovery.marker;
             invoiceFacts = recovery.facts;
         } else {
+            const resolved = await resolveCustomerAndItem(tokens, invoice.client.id, deadline);
+            customerId = resolved.customerId;
+            itemId = resolved.itemId;
             const claimed = await decideUnderIdentity({
                 kind: "invoice", id: invoice.id, clientId: invoice.client.id, expectCustomerId: customerId,
                 decide: async (tx, facts) => {
