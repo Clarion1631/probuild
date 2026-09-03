@@ -207,8 +207,55 @@ export function uploadLeaseActive(
     row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
     now: Date = new Date(),
 ): boolean {
-    if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt.getTime() > now.getTime();
-    return row.createdAt.getTime() > now.getTime() - STAGING_SWEEP_MINUTES * 60_000;
+    return leaseDeadline(row).getTime() > now.getTime();
+}
+
+/**
+ * The instant this row's upload capability dies. `uploadLeaseActive` is
+ * literally "is that instant still ahead of us", so the two can never
+ * disagree about a row.
+ */
+function leaseDeadline(row: { uploadUrlExpiresAt?: Date | null; createdAt: Date }): Date {
+    if (row.uploadUrlExpiresAt) return row.uploadUrlExpiresAt;
+    return new Date(row.createdAt.getTime() + STAGING_SWEEP_MINUTES * 60_000);
+}
+
+/**
+ * How long after a signed upload URL expires an object it could still have
+ * written may be deleted.
+ *
+ * A PUT that started one millisecond before the expiry is still in flight
+ * after it — Supabase validates the token when the request arrives, not when
+ * it completes — so deleting at the expiry itself can still race a write that
+ * was authorised. Five minutes is comfortably longer than an 8 MB upload.
+ */
+export const CLEANUP_GRACE_MS = 5 * 60_000;
+
+/**
+ * WHEN AN OBJECT AT THIS ROW'S PATH MAY BE DELETED — null meaning "now".
+ *
+ * A signed upload URL is a WRITE CAPABILITY, and it does not stop working
+ * because the row that requested it was rejected, published elsewhere, or
+ * re-pathed. Deleting the object while the URL is live only opens a window:
+ * the holder's delayed PUT recreates it (the URL is `upsert`-capable on the
+ * resume path), and nothing then references it, nothing remembers it, and no
+ * sweep is looking for it. The delete has to happen AFTER the capability
+ * dies, not before.
+ *
+ * This is the exact inverse of `uploadLeaseActive` — the same rule the
+ * stale-STAGING sweep already applies before it parks or rejects anything —
+ * so rejected-row cleanup and the sweep agree by construction rather than by
+ * two authors remembering the same thing.
+ *
+ * Null when the capability is ALREADY dead: there is nothing left to wait for
+ * and an immediate delete is correct.
+ */
+export function cleanupNotBefore(
+    row: { uploadUrlExpiresAt?: Date | null; createdAt: Date },
+    now: Date = new Date(),
+): Date | null {
+    if (!uploadLeaseActive(row, now)) return null;
+    return new Date(leaseDeadline(row).getTime() + CLEANUP_GRACE_MS);
 }
 /**
  * Consecutive AI-unavailable passes before a row is parked for a human. Ported
@@ -696,6 +743,22 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
             break;
         }
         processed++;
+        // THE ROW AS THE DATABASE NOW HOLDS IT, not as the claim handed it over.
+        //
+        // Every recovery write below (retryRow, applyState, releaseClaim) is
+        // CAS'd on `ownershipOf(...)`, i.e. on {state, claimToken}. The loop
+        // MOVES the state mid-row — READ -> BOOKING, committed by
+        // promoteToBooking — so a throw after that promotion was handed the
+        // ORIGINAL row and its CAS pinned state "READ", which no longer
+        // existed. It matched zero rows, `retryRow` reported false, the error
+        // was bumped as STALE, and `attempts` never moved: a persistent
+        // pre-send failure (a QBO auth outage, a poisoned vendor lookup)
+        // cycled the same row forever, never backing off and never reaching
+        // the max-retries park that exists to put it in front of a person.
+        //
+        // So the promotion's result is carried forward, and it is THIS value
+        // every error path is given.
+        let current = row;
         try {
             if (row.state === "RECEIVED") {
                 bump(await processReceived(row, deps));
@@ -732,8 +795,14 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
                     bump("NEEDS_REVIEW");
                     continue;
                 }
-                const result = await deps.book({ ...row, dryRun: false });
-                await deps.applyBookResult(row.id, result, row.claimToken);
+                // THE PROMOTION COMMITTED, so the row's state is BOOKING from
+                // here on and every CAS below must pin that, not the claimed
+                // "READ". The claim token is unchanged — promoteToBooking is
+                // fenced on it and does not reissue it — so the rest of the
+                // ownership tuple still holds.
+                current = { ...row, state: "BOOKING", dryRun: false };
+                const result = await deps.book(current);
+                await deps.applyBookResult(current.id, result, current.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
                 if (row.dryRun || dryRunGlobal) { bump(await parkForDryRun(row, deps)); continue; }
@@ -742,7 +811,7 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
                 bump(stateForBookResult(result));
             }
         } catch (error) {
-            bump(await handleRowError(row, deps, error));
+            bump(await handleRowError(current, deps, error));
         }
     }
 

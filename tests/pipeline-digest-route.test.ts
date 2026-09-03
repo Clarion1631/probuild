@@ -33,6 +33,7 @@ const HEALTH: PipelineHealth = {
         stuck: { status: "ok", count: 0 },
         needsReview: { status: "ok", count: 0 },
         unassigned: { status: "ok", count: 0 },
+        quarantined: { status: "ok", count: 0 },
     },
 };
 

@@ -633,6 +633,112 @@ test("a QBO fault thrown mid-row parks; a transient one past the ceiling also pa
     assert.equal(exhausted.states[0].reason, "max-retries");
 });
 
+// ── A failure AFTER the READ -> BOOKING promotion (Codex round-36 item 1) ────
+//
+// The promotion COMMITS a state change mid-row. Every recovery write is CAS'd
+// on the row's {state, claimToken}, so handing the error path the row as it was
+// CLAIMED pinned "READ" against a database that now said "BOOKING": zero rows
+// matched, `attempts` never moved, and the row came back next pass to fail the
+// same way forever without ever reaching max-retries.
+
+/**
+ * A harness whose recovery writes really evaluate the CAS, against a database
+ * state the promotion actually moves. Without that the fakes accept any
+ * ownership and the bug is invisible — which is how it survived 35 rounds.
+ */
+type Ownership = { state: string; claimToken: string | null };
+
+function promotedHarness(row: WorkerRow, thrown: unknown) {
+    const db: Ownership = { state: row.state, claimToken: row.claimToken };
+    const seen: Ownership[] = [];
+    /** What `updateMany({ where: { id, state, claimToken } })` would match. */
+    const wouldMatch = (o: Ownership) => o.state === db.state && o.claimToken === db.claimToken;
+    const cas = (ownership: Ownership) => {
+        seen.push(ownership);
+        return wouldMatch(ownership);
+    };
+    const h = harness([row], {
+        isDryRunEnabled: () => false,
+        promoteToBooking: async id => {
+            h.promoted.push(id);
+            db.state = "BOOKING";
+            return { promoted: true };
+        },
+        book: async () => { throw thrown; },
+        retryRow: async (id, attempts, _next, reason, ownership) => {
+            if (!cas(ownership)) return false;
+            h.retried.push({ id, attempts, reason });
+            return true;
+        },
+        applyState: async (id, state, reason, patch, ownership) => {
+            if (!cas(ownership!)) return false;
+            h.states.push({ id, state, reason, patch, ownership });
+            return true;
+        },
+    });
+    return { h, db, seen, wouldMatch };
+}
+
+test("a throw right after the promotion spends an attempt against the BOOKING row", async () => {
+    const row = workerRow({ state: "READ", dryRun: false, attempts: 2 });
+    const { h, db, seen, wouldMatch } = promotedHarness(row, new Error("connection reset"));
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { RETRY: 1 }, "retried, not silently stale");
+    assert.equal(h.retried.length, 1);
+    assert.equal(h.retried[0].attempts, 3, "the attempt actually landed");
+    assert.equal(db.state, "BOOKING", "the promotion committed");
+    assert.deepEqual(seen[0], { state: "BOOKING", claimToken: LIVE_TOKEN }, "the CAS pinned the CURRENT state");
+
+    // THE CONTROL. The old code passed the row as CLAIMED, so its CAS pinned
+    // "READ" — assert directly that such a write would have matched zero rows.
+    // Without this the assertion above would also pass for a harness that
+    // ignored the CAS entirely, which is what let the bug live for 35 rounds.
+    assert.equal(
+        wouldMatch({ state: row.state, claimToken: row.claimToken }),
+        false,
+        "the pre-promotion ownership matches nothing once the promotion has committed",
+    );
+});
+
+test("at the ceiling, a post-promotion failure PARKS instead of cycling forever", async () => {
+    // The consequence of the bug, not just its mechanism: with attempts frozen
+    // the row could never reach MAX_BOOK_ATTEMPTS, so the terminal park that
+    // puts it in front of a person was unreachable.
+    const row = workerRow({ state: "READ", dryRun: false, attempts: 19 });
+    const { h, seen } = promotedHarness(row, new Error("connection reset"));
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states.length, 1);
+    assert.equal(h.states[0].reason, "max-retries");
+    assert.deepEqual(seen.at(-1), { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
+test("a CLASSIFIED QBO fault after the promotion parks under the BOOKING state too", async () => {
+    // The terminal branch takes the same row, so it needs the same fix — and a
+    // qbo-fault park is the one that must NOT be lost: it means a send happened.
+    const row = workerRow({ state: "READ", dryRun: false });
+    const { h } = promotedHarness(row, new QboAccountConfigError("bad account"));
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.match(h.states[0].reason!, /^qbo-fault:/);
+    assert.deepEqual(h.states[0].ownership, { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
+test("a row claimed AT BOOKING is unaffected — its state never moves mid-pass", async () => {
+    // The control for the change itself: only the READ branch promotes, so the
+    // BOOKING branch must still CAS on the state it was claimed with.
+    const row = workerRow({ state: "BOOKING", dryRun: false, attempts: 0 });
+    const { h, seen } = promotedHarness(row, new Error("connection reset"));
+
+    assert.deepEqual((await runIntakeWorker(h.deps)).byState, { RETRY: 1 });
+    assert.deepEqual(h.promoted, [], "no promotion happens on this branch");
+    assert.deepEqual(seen[0], { state: "BOOKING", claimToken: LIVE_TOKEN });
+});
+
 test("isUniqueViolation is about the ERROR CODE, not Prisma's meta text", () => {
     // The previous version string-matched "dedupStrongKey" inside error.meta,
     // which is version-dependent and EMPTY for a partial index on some engine
@@ -1426,7 +1532,14 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
     assert.equal(signed, 3, "one signUpload call per inline branch");
-    assert.match(lease, /await deps\.sign\(path\)/, "and the shared rule signs the path it kept");
+    // ...and it is the ONE issuer that asks for an upsert-capable token, because
+    // it re-signs an EXISTING path so a client can replace its own partial
+    // upload. Every other issuer signs a path a version bump has just made new.
+    assert.match(
+        lease,
+        /await deps\.sign\(path, \{ upsert: true \}\)/,
+        "the shared rule signs the path it kept, with the overwrite capability it needs",
+    );
     assert.match(
         lease,
         /if \(!row\.uploadUrlExpiresAt \|\| row\.uploadUrlExpiresAt\.getTime\(\) <= now\) return null;/,

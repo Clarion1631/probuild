@@ -6,7 +6,7 @@ import { userCanAccessProject } from "@/lib/mobile-auth";
 import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
-import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
+import { cleanupNotBefore, uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import {
     finalizeDisposition,
@@ -196,6 +196,9 @@ export async function POST(req: Request) {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
                     uploadLeaseVersion: true, uploadUrlExpiresAt: true,
+                    // Only for cleanupNotBefore: an inline row has no expiry,
+                    // and its capability window is measured from createdAt.
+                    createdAt: true,
                 },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
@@ -346,8 +349,20 @@ export async function POST(req: Request) {
                 // deleteObjectOrRecord is exactly the guarded path for this —
                 // it deletes, and records a pending cleanup when the delete
                 // fails.
+                // SCHEDULED, not immediate. This branch is reached with a live
+                // lease in one case — a caller that changed its declared
+                // extension, so liveLeasePath refused to reuse the row's path
+                // — and the OLD path's signed URL is still working then.
+                // Deleting there only lets its holder PUT the object back
+                // after the row has moved on. cleanupNotBefore is null once
+                // that lease has expired, which is the common case, and the
+                // delete happens at once as before.
                 if (retryPath !== existing.storagePath) {
-                    await deleteObjectOrRecord(existing.storagePath, "start-rearmed-repath");
+                    await deleteObjectOrRecord(
+                        existing.storagePath,
+                        "start-rearmed-repath",
+                        cleanupNotBefore(existing),
+                    );
                 }
                 const rearmed = await signUpload(retryPath);
                 if (!rearmed) {
@@ -502,7 +517,15 @@ export async function POST(req: Request) {
             // success meant a 503 here left it in the bucket with nothing
             // pointing at it and nothing remembering it.
             if (resumePath !== existing.storagePath) {
-                await deleteObjectOrRecord(existing.storagePath, "start-resumed-repath");
+                // Same rule as the re-arm above: the previous lease is normally
+                // dead here (reuseLiveLease already declined it), so this is
+                // normally an immediate delete — but an extension change can
+                // reach it with a live URL, and that one has to wait.
+                await deleteObjectOrRecord(
+                    existing.storagePath,
+                    "start-resumed-repath",
+                    cleanupNotBefore(existing),
+                );
             }
             const resumed = await signUpload(resumePath);
             // The row is on the new path with a live expiry, so a retry resumes
@@ -583,14 +606,20 @@ function leaseConflict(existingId: string) {
 /** The live wiring for the shared lease rule (src/lib/receipt-intake/upload-lease.ts). */
 const leaseDeps = {
     db: prisma.receiptIntake,
-    sign: (storagePath: string) => signUpload(storagePath),
+    sign: (storagePath: string, opts: { upsert: boolean }) => signUpload(storagePath, opts),
     expiresAt: uploadLeaseExpiry,
 };
 
 /**
- * The URL is `upsert: true` (see bucket.ts) so a resumed /start for the SAME
- * row can replace its own partial upload — without that the second attempt
- * fails "already exists" and the row can never be finalized. The sha checks
- * above are what stop it from overwriting a DIFFERENT document.
+ * CREATE-ONLY BY DEFAULT.
+ *
+ * Every call in this file except the shared lease-reuse rule signs a path that
+ * a version bump has just made new, so nothing can be there and an overwrite
+ * capability would be handed out for no reason — and it would outlive the row
+ * it was issued for, which is what makes it worth withholding. Only
+ * `reuseLiveLease` asks for `upsert`, because replacing a partial upload at
+ * the SAME path is the whole point of the reuse (see bucket.ts). The sha
+ * checks above are what stop even that token from overwriting a DIFFERENT
+ * document.
  */
 const signUpload = createReceiptUploadUrl;

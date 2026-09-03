@@ -33,6 +33,7 @@ import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
+    cleanupNotBefore,
     RUN_HARD_BUDGET_MS,
     STAGING_SWEEP_BATCH,
     STAGING_SWEEP_MINUTES,
@@ -491,8 +492,16 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                             });
                             return count;
                         },
+                        // PUBLISHING is allowed while the lease is live (a
+                        // complete, correct object is one whether or not the
+                        // URL has expired), so unlike the park and reject
+                        // branches below this one CAN run with a live upload
+                        // URL — and the upload path's delete has to wait for
+                        // it, or the holder's late PUT recreates an object the
+                        // published row no longer points at.
                         dropUpload: uploadPath =>
-                            deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+                            deleteObjectOrRecord(uploadPath, "sealed", cleanupNotBefore(row))
+                                .then(() => undefined),
                         currentStoragePath: async (tx, rowId) => {
                             const r = await tx.receiptIntake.findUnique({
                                 where: { id: rowId },
@@ -548,6 +557,11 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         stateReason: row.stateReason,
                         storagePath: row.storagePath,
                         uploadLeaseVersion: row.uploadLeaseVersion,
+                        // Always null here — `leaseLive` above already refused
+                        // to reject a row whose URL still works. Passed anyway
+                        // so both rejecters state the rule the same way rather
+                        // than one of them relying on a guard several lines up.
+                        cleanupNotBefore: cleanupNotBefore(row),
                     },
                     check.reason,
                     undefined,
@@ -566,7 +580,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // FENCE LOST: somebody else owns this row now. Touch NOTHING —
                 // above all not the object, which the winner may be using.
                 if (!dropped.ok) continue;
-                await settleQueuedCleanup(dropped.eventId, row.storagePath);
+                await settleQueuedCleanup(dropped.eventId, row.storagePath, cleanupNotBefore(row));
                 rejected++;
             }
             if (published || parked || rejected || leaseActive) {

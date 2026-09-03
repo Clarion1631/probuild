@@ -665,8 +665,12 @@ an overlap safe in general.
      have no review UI in Phase 1 (see §3's GET /api/receipts/intake note: the Phase 2
      `/automation` Receipts tab is the intended consumer). Until that ships, rows in any of
      these three states are visible via the `ReceiptIntake` table directly (or
-     `GET /api/receipts/intake?state=`) and via the pipeline-health report's NEEDS_REVIEW /
-     NEEDS_JOB counts.
+     `GET /api/receipts/intake?state=`) and via the pipeline-health report, which counts
+     each of them separately: NEEDS_REVIEW (`intake.needsReview`), NEEDS_JOB
+     (`intake.unassigned`) and SHADOW_QUARANTINE (`intake.quarantined`, reason
+     `receipt-quarantine:<n>` and its own digest line). The quarantine count carries no age
+     threshold, because the state is terminal the instant it is written — nothing is coming
+     to move it on.
    - after the boundary -> handed to v2. v1 had already stopped, so nobody booked these.
    With no boundary recorded in live mode the worker **halts the entire pass before
    claiming anything** and logs `cutover-boundary-missing`. Not just the retire: booking

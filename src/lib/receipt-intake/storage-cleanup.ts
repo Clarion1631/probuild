@@ -20,6 +20,75 @@ import { removeReceiptObject, uploadReceiptObject } from "./bucket";
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
 /**
+ * THE SCHEDULE ON A QUEUED CLEANUP, and why one is needed at all.
+ *
+ * Deleting an object is not the same as making it undeletable-again. While a
+ * signed upload URL for the path is still valid, its holder's delayed PUT
+ * recreates the object AFTER we removed it — and by then the row that named
+ * the path is gone, so nothing references those bytes, nothing remembers them,
+ * and no sweep is looking for them. That is an unreferenced object in a
+ * private bucket, forever, created by our own cleanup.
+ *
+ * So a cleanup carries the instant it becomes safe (`cleanupNotBefore()`:
+ * the upload lease's own deadline plus a grace), and nothing acts on it before
+ * then. The event IS the tombstone — it outlives the row and holds the path
+ * and the expiry — which is what lets the row be deleted immediately while the
+ * OBJECT waits for the capability to die.
+ *
+ * Stored in `detail` rather than a column: AutomationEvent has no schedule
+ * field, this queue is normally empty, and adding one would be a production
+ * migration for a five-minute delay.
+ */
+export function cleanupDueAt(detail: string | null | undefined): Date | null {
+    if (!detail) return null;
+    let parsed: { notBefore?: unknown };
+    try {
+        parsed = JSON.parse(detail) as { notBefore?: unknown };
+    } catch {
+        return null;
+    }
+    if (typeof parsed.notBefore !== "string") return null;
+    const at = new Date(parsed.notBefore);
+    // An unparseable schedule is NOT permission to wait forever — it would
+    // wedge the event in the queue every pass with nothing able to clear it.
+    return Number.isNaN(at.getTime()) ? null : at;
+}
+
+/** Is a queued cleanup allowed to run yet? No schedule means "now". */
+export function cleanupDue(detail: string | null | undefined, now: Date = new Date()): boolean {
+    const due = cleanupDueAt(detail);
+    return !due || due.getTime() <= now.getTime();
+}
+
+/**
+ * The storage and queue writes the two request-path cleanups make. Injected
+ * for the same reason the sweep's are: "nothing was deleted" is only a real
+ * assertion if a test can see the delete not happening.
+ */
+export interface CleanupIo {
+    remove: (storagePath: string) => Promise<void>;
+    record: (storagePath: string, reason: string, notBefore: Date | null) => Promise<void>;
+    resolve: (eventId: string) => Promise<void>;
+    now: () => Date;
+}
+
+const liveIo: CleanupIo = {
+    remove: removeReceiptObject,
+    record: recordPendingCleanup,
+    resolve: async eventId => {
+        await prisma.automationEvent
+            .update({ where: { id: eventId }, data: { status: "resolved" } })
+            .catch(() => { /* the sweep will find it still pending and re-check */ });
+    },
+    now: () => new Date(),
+};
+
+/** A schedule that has not arrived yet, or null when the delete may run now. */
+function pending(notBefore: Date | null | undefined, now: Date): Date | null {
+    return notBefore && notBefore.getTime() > now.getTime() ? notBefore : null;
+}
+
+/**
  * ONE OBJECT PATH, ONE WRITER — publication or cleanup, never both at once.
  *
  * The two used to be free-running, and each was individually careful in a way
@@ -153,7 +222,12 @@ export async function sealObject(
  * and the row that points at them is about to be deleted. Recording the path
  * before that happens is the only way the orphan stays findable.
  */
-export async function recordPendingCleanup(storagePath: string, reason: string): Promise<void> {
+export async function recordPendingCleanup(
+    storagePath: string,
+    reason: string,
+    /** When the object may be deleted — see cleanupDueAt. Null means now. */
+    notBefore: Date | null = null,
+): Promise<void> {
     // THROWS on failure, unlike an audit write. This record is not an audit
     // trail — it is the ONLY thing that will remember the object once the row
     // pointing at it is gone. Swallowing the failure loses the orphan silently
@@ -163,7 +237,7 @@ export async function recordPendingCleanup(storagePath: string, reason: string):
         status: "pending",
         reason,
         source: "receipt-intake",
-        detail: { storagePath },
+        detail: notBefore ? { storagePath, notBefore: notBefore.toISOString() } : { storagePath },
     });
     const recorded = await prisma.automationEvent.findFirst({
         where: { kind: STORAGE_CLEANUP_KIND, status: "pending", detail: { contains: storagePath } },
@@ -212,6 +286,14 @@ export interface RejectFence {
     storagePath: string;
     /** The upload lease the caller inspected. A newer one means a newer file. */
     uploadLeaseVersion: number;
+    /**
+     * When the OBJECT may be deleted (`cleanupNotBefore()` of the same row).
+     * Deliberately NOT part of the delete's where clause — the fence is about
+     * which row we are entitled to remove, this is about when its bytes stop
+     * being writable by a URL somebody still holds. Null (the default) deletes
+     * as soon as the caller settles the queued cleanup.
+     */
+    cleanupNotBefore?: Date | null;
 }
 export interface RejectClient {
     $transaction<T>(fn: (tx: RejectTxClient) => Promise<T>): Promise<T>;
@@ -238,7 +320,17 @@ export async function rejectRowAndQueueCleanup(
                     status: "pending",
                     reason: reason.slice(0, 500),
                     source: "receipt-intake",
-                    detail: JSON.stringify({ storagePath: row.storagePath, rowId: row.id }),
+                    detail: JSON.stringify({
+                        storagePath: row.storagePath,
+                        rowId: row.id,
+                        // The tombstone's whole point: the row is about to be
+                        // gone, so this event is the only thing that will
+                        // still know both the path AND when its signed upload
+                        // URL stops being able to recreate it.
+                        ...(row.cleanupNotBefore
+                            ? { notBefore: row.cleanupNotBefore.toISOString() }
+                            : {}),
+                    }),
                 },
                 select: { id: true },
             });
@@ -302,10 +394,24 @@ class RejectFenceLost extends Error {
 /**
  * Try the queued deletion now. A failure is not an error for the caller — the
  * event stays pending and the worker's sweep retries it.
+ *
+ * `notBefore` is the same schedule the event carries. Passing it here is not
+ * belt-and-braces: this is the OPPORTUNISTIC delete a rejecting request makes
+ * on its way out, and it runs while the client's signed upload URL is at its
+ * most likely to still be live. Deleting now would leave the row deleted, the
+ * object gone, and the URL able to put it straight back with nothing left
+ * referencing it. Not deleting simply leaves the event pending, which is
+ * exactly what the sweep is for.
  */
-export async function settleQueuedCleanup(eventId: string, storagePath: string): Promise<boolean> {
+export async function settleQueuedCleanup(
+    eventId: string,
+    storagePath: string,
+    notBefore: Date | null = null,
+    io: CleanupIo = liveIo,
+): Promise<boolean> {
+    if (pending(notBefore, io.now())) return false;
     try {
-        await removeReceiptObject(storagePath);
+        await io.remove(storagePath);
     } catch (error) {
         console.error(
             "[receipts/intake] queued delete failed, left pending",
@@ -315,9 +421,7 @@ export async function settleQueuedCleanup(eventId: string, storagePath: string):
         return false;
     }
     // Resolve only AFTER a delete that did not throw, same rule as the sweep.
-    await prisma.automationEvent
-        .update({ where: { id: eventId }, data: { status: "resolved" } })
-        .catch(() => { /* the sweep will find it still pending and re-check */ });
+    await io.resolve(eventId);
     return true;
 }
 
@@ -325,14 +429,34 @@ export async function settleQueuedCleanup(eventId: string, storagePath: string):
  * Delete the object. If that fails, record the path so the sweep can retry.
  * Never throws: the caller is already rejecting a row and must not be derailed
  * by the cleanup of it.
+ *
+ * `notBefore` DEFERS the delete entirely rather than attempting it: a live
+ * signed upload URL for this path can recreate the object after we remove it,
+ * so the only delete that actually removes the bytes is one taken after the
+ * URL dies. The queue entry is written immediately either way — the path is
+ * never left unremembered.
  */
-export async function deleteObjectOrRecord(storagePath: string, reason: string): Promise<boolean> {
+export async function deleteObjectOrRecord(
+    storagePath: string,
+    reason: string,
+    notBefore: Date | null = null,
+    io: CleanupIo = liveIo,
+): Promise<boolean> {
+    const scheduled = pending(notBefore, io.now());
+    if (scheduled) {
+        // NOT an error path, so the record is not best-effort here either: it
+        // is the only pointer to the object from this moment on.
+        await io.record(storagePath, reason, scheduled).catch(recordError => {
+            console.error("[receipts/intake] ORPHANED OBJECT, no cleanup recorded", storagePath, recordError);
+        });
+        return false;
+    }
     try {
-        await removeReceiptObject(storagePath);
+        await io.remove(storagePath);
         return true;
     } catch (error) {
         console.error("[receipts/intake] object delete failed", storagePath, error instanceof Error ? error.name : "error");
-        await recordPendingCleanup(storagePath, reason).catch(recordError => {
+        await io.record(storagePath, reason, null).catch(recordError => {
             // Both the delete AND the record failed. Say so loudly: this is the
             // one combination that loses an object with nothing left to find it.
             console.error("[receipts/intake] ORPHANED OBJECT, no cleanup recorded", storagePath, recordError);
@@ -342,21 +466,70 @@ export async function deleteObjectOrRecord(storagePath: string, reason: string):
 }
 
 /**
- * Retry the deletions that failed earlier. Bounded per pass, like every other
- * housekeeping step in the worker, and it resolves each event it clears so the
- * queue drains instead of growing.
+ * Everything the sweep touches, injected so the schedule is a unit test rather
+ * than a property only a two-hour production wait could demonstrate. The
+ * default wiring below is the live one.
  */
-export async function retryPendingCleanups(limit: number, shouldStop: () => boolean): Promise<number> {
-    const pending = await prisma.automationEvent.findMany({
+/** How many queue entries are LOOKED at per delete slot. See retryPendingCleanups. */
+export const CLEANUP_SCAN_FACTOR = 5;
+
+export interface CleanupSweepDeps {
+    findPending: (take: number) => Promise<{ id: string; detail: string | null }[]>;
+    abandon: (eventId: string) => Promise<void>;
+    withObjectLock: <T>(storagePath: string, body: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>;
+    remove: (storagePath: string) => Promise<void>;
+    now: () => Date;
+}
+
+const liveSweepDeps: CleanupSweepDeps = {
+    findPending: take => prisma.automationEvent.findMany({
         where: { kind: STORAGE_CLEANUP_KIND, status: "pending" },
         orderBy: { createdAt: "asc" },
-        take: limit,
+        take,
         select: { id: true, detail: true },
-    });
+    }),
+    abandon: async eventId => {
+        await prisma.automationEvent.update({ where: { id: eventId }, data: { status: "abandoned" } });
+    },
+    withObjectLock: withReceiptObjectLock,
+    remove: removeReceiptObject,
+    now: () => new Date(),
+};
+
+/**
+ * Retry the deletions that failed earlier — and run the ones that were never
+ * attempted because their object was still writable by a live signed URL.
+ * Bounded per pass, like every other housekeeping step in the worker, and it
+ * resolves each event it clears so the queue drains instead of growing.
+ */
+export async function retryPendingCleanups(
+    limit: number,
+    shouldStop: () => boolean,
+    deps: CleanupSweepDeps = liveSweepDeps,
+): Promise<number> {
+    // THE SCAN IS WIDER THAN THE DELETE BUDGET, on purpose.
+    //
+    // `limit` bounds STORAGE ROUND TRIPS, which is the expensive part and the
+    // reason this step is bounded at all. It must not also bound the SELECT:
+    // the queue now holds entries that are not due yet, and fetching exactly
+    // `limit` oldest-first would let a burst of scheduled ones occupy every
+    // slot and starve the genuinely-due entries behind them — the same
+    // batch-starvation shape the STAGING sweep's own query was fixed for. A
+    // wider scan is a bigger `take` on one indexed query and nothing else.
+    //
+    // It is a widening, not a proof: a due entry sitting behind more than
+    // CLEANUP_SCAN_FACTOR x limit scheduled ones still waits. That wait is
+    // bounded rather than indefinite, and by construction — every scheduled
+    // entry becomes due within the upload lease's own TTL plus the grace, and
+    // they mature in the order they were created, which is the order this
+    // query returns them in.
+    const now = deps.now();
+    const queued = await deps.findPending(limit * CLEANUP_SCAN_FACTOR);
 
     let cleared = 0;
-    for (const event of pending) {
-        if (shouldStop()) break;
+    let attempted = 0;
+    for (const event of queued) {
+        if (shouldStop() || attempted >= limit) break;
         let storagePath: string | null = null;
         try {
             storagePath = (JSON.parse(event.detail ?? "{}") as { storagePath?: string }).storagePath ?? null;
@@ -366,9 +539,16 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
         if (!storagePath) {
             // Unparseable detail can never be acted on; close it rather than
             // retrying it every five minutes forever.
-            await prisma.automationEvent.update({ where: { id: event.id }, data: { status: "abandoned" } });
+            await deps.abandon(event.id);
             continue;
         }
+        // NOT YET. The object's signed upload URL is still live, so deleting it
+        // now would only open a window for a delayed PUT to recreate it with
+        // nothing left referencing or remembering the result. Left pending, not
+        // resolved, and not counted against the batch's storage budget — the
+        // next pass five minutes later looks again.
+        if (!cleanupDue(event.detail, now)) continue;
+        attempted++;
 
         // NEVER delete a path a LIVE row still points at — and never answer
         // that question while a publish is mid-flight at the same path.
@@ -390,7 +570,7 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
         // transaction holding the path's lock, so a publish either finished
         // before it (the row is visible, and this skips) or starts after it
         // (the object is already gone, and the seal simply writes it again).
-        const verdict = await withReceiptObjectLock(storagePath, async tx => {
+        const verdict = await deps.withObjectLock(storagePath, async tx => {
             const referenced = await tx.receiptIntake.findFirst({
                 where: { storagePath },
                 select: { id: true },
@@ -405,7 +585,7 @@ export async function retryPendingCleanups(limit: number, shouldStop: () => bool
             // A throw here rolls the whole transaction back, so the event stays
             // pending for the next pass — the same outcome the old separate
             // delete had, without the resolve ever landing on its own.
-            await removeReceiptObject(storagePath);
+            await deps.remove(storagePath);
             // Resolved ONLY after a delete that did not throw —
             // removeReceiptObject surfaces a missing storage client as an error
             // rather than a success, so a misconfigured deployment cannot

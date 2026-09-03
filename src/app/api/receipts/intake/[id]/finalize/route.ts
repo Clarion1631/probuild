@@ -28,6 +28,7 @@ import {
     settleQueuedCleanup,
     withReceiptPublishLock,
 } from "@/lib/receipt-intake/storage-cleanup";
+import { cleanupNotBefore } from "@/lib/receipt-intake/worker";
 
 export const dynamic = "force-dynamic";
 
@@ -223,9 +224,21 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             id: true, source: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
             mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true, uploadLeaseVersion: true,
+            // Read for ONE reason: the signed upload URL this row was given is
+            // a write capability that outlives every decision below, so every
+            // object deletion on this path has to be scheduled for after it
+            // dies rather than taken now. See cleanupNotBefore.
+            uploadUrlExpiresAt: true, createdAt: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+
+    // WHEN THIS ROW'S OBJECT MAY BE DELETED, computed ONCE from the row as
+    // read, so the reject path and the seal path cannot disagree about it.
+    // Null means the upload lease is already dead and an immediate delete is
+    // correct — which is the case the stale-STAGING sweep is always in, since
+    // it refuses to do anything destructive while a lease is live.
+    const cleanupAfter = cleanupNotBefore(row);
 
     // A SECRET OWNS SOURCES, NOT ROWS.
     //
@@ -364,6 +377,13 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // are ONE transaction. A best-effort delete followed by a best-effort
         // cleanup could drop the row and lose the object with nothing left
         // referencing or remembering it.
+        //
+        // THE OBJECT DOES NOT GO YET, THOUGH. Unlike the sweeper, this path
+        // rejects a row whose signed upload URL is typically still live —
+        // /finalize is what a client calls minutes after /start — and deleting
+        // under a live write capability just invites the holder's delayed PUT
+        // to put the bytes back with the row already gone. The queue entry
+        // carries the schedule and IS the tombstone until then.
         const rejected = await rejectRowAndQueueCleanup(
             {
                 id,
@@ -371,6 +391,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 stateReason: row.stateReason,
                 storagePath: row.storagePath,
                 uploadLeaseVersion: row.uploadLeaseVersion,
+                cleanupNotBefore: cleanupAfter,
             },
             check.reason,
         );
@@ -390,7 +411,9 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 { status: 409 },
             );
         }
-        await settleQueuedCleanup(rejected.eventId, row.storagePath);
+        // A no-op while the upload URL is still live; the sweep picks the
+        // event up once it is due.
+        await settleQueuedCleanup(rejected.eventId, row.storagePath, cleanupAfter);
         const status = check.reason.startsWith("file-too-large") ? 413 : 400;
         return NextResponse.json(
             { ok: false, reason: check.reason, maxBytes: MAX_STORED_BYTES },
@@ -496,7 +519,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             });
             return count;
         },
-        dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+        // The UPLOAD path, whose signed URL is exactly the one the client just
+        // used — so this delete waits for that URL to die. Deleting the moment
+        // the pointer moved to the canonical path left the holder able to PUT
+        // the upload path back into existence, unreferenced and unremembered.
+        dropUpload: uploadPath =>
+            deleteObjectOrRecord(uploadPath, "sealed", cleanupAfter).then(() => undefined),
         currentStoragePath: async (tx, rowId) => {
             const r = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
             return r?.storagePath ?? null;

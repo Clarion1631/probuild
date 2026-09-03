@@ -311,7 +311,13 @@ test("a re-arm that changes the extension does not orphan the old object", () =>
     const branch = start.slice(start.indexOf("if (recoverable) {"));
     const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
     assert.match(body, /retryPath !== existing\.storagePath/);
-    assert.match(body, /deleteObjectOrRecord\(existing\.storagePath, "start-rearmed-repath"\)/);
+    // Guarded AND scheduled: an extension change is precisely the case that
+    // reaches this branch with the OLD path's signed URL still live, so the
+    // delete waits for that URL to die rather than racing a late PUT.
+    assert.match(
+        body,
+        /deleteObjectOrRecord\(\s*\n?\s*existing\.storagePath,\s*\n?\s*"start-rearmed-repath",\s*\n?\s*cleanupNotBefore\(existing\),/,
+    );
 });
 
 // ── The sweeper rejects through the same fenced transaction ────────────────
@@ -345,7 +351,13 @@ test("the sweeper uses the fenced reject, and touches no bytes when it loses", (
     const body = fn.slice(0, fn.indexOf("loadPhases:"));
     assert.match(body, /const dropped = await rejectRowAndQueueCleanup\(/);
     assert.match(body, /if \(!dropped\.ok\) continue;/);
-    assert.match(body, /settleQueuedCleanup\(dropped\.eventId, row\.storagePath\)/);
+    // The schedule rides along even though it is always null here — the
+    // `leaseLive` guard above already refused to reject a row whose URL still
+    // works, and stating the rule beats relying on a check twenty lines up.
+    assert.match(
+        body,
+        /settleQueuedCleanup\(dropped\.eventId, row\.storagePath, cleanupNotBefore\(row\)\)/,
+    );
     // The unfenced pair this replaces.
     assert.ok(
         !/deleteMany\(\{ where: \{ id: row\.id, state: "STAGING" \} \}\)/.test(body),

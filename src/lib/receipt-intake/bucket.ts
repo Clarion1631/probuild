@@ -178,20 +178,38 @@ export async function removeReceiptObject(storagePath: string): Promise<void> {
     if (error) throw error;
 }
 
-/** The signed URL a client PUTs its bytes to. Scoped to ONE path, by design. */
+/**
+ * The signed URL a client PUTs its bytes to. Scoped to ONE path, by design.
+ *
+ * `upsert` IS OPT-IN, and the default is off.
+ *
+ * The option is a real capability difference, not a convenience: an
+ * upsert-capable token can OVERWRITE whatever is at the path for as long as it
+ * is valid, which outlives the row it was issued for. A token issued for a
+ * freshly-named path (every path is `id + leaseVersion + ext`, and every
+ * destructive /start branch bumps the version before it signs) can only ever
+ * create, so it does not need the stronger capability and must not be handed
+ * it. The ONE caller that does is `reuseLiveLease`: it re-signs an EXISTING
+ * path so a client can replace its own partial upload, and without upsert that
+ * second PUT fails "The resource already exists" and the row can never be
+ * finalized. `createSignedUploadUrl(path, { upsert })` is storage-js's own
+ * option (@supabase/storage-js 2.99: `createSignedUploadUrl(path, options?: {
+ * upsert: boolean })`), defaulting to false — the sha checks in /finalize are
+ * what stop even the upsert token from binding a DIFFERENT document to this
+ * identity.
+ */
 export async function createReceiptUploadUrl(
     storagePath: string,
+    opts: { upsert?: boolean } = {},
 ): Promise<{ uploadUrl: string; token: string; storagePath: string } | null> {
     const path = safePath(storagePath);
     if (!path) return null;
     const supabase = getSupabase();
     if (!supabase) return null;
     try {
-        // upsert: a resumed /start for the SAME row must be able to replace a
-        // partial upload at the same path.
         const { data, error } = await supabase.storage
             .from(RECEIPT_BUCKET)
-            .createSignedUploadUrl(path, { upsert: true });
+            .createSignedUploadUrl(path, { upsert: opts.upsert ?? false });
         if (error || !data) {
             console.error("[receipts/intake] sign failed", error?.message);
             return null;

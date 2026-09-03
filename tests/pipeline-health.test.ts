@@ -42,6 +42,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         intakeStuck: { status: "ok" as const, count: 0 },
         intakeNeedsReview: { status: "ok" as const, count: 0 },
         intakeUnassigned: { status: "ok" as const, count: 0 },
+        intakeQuarantined: { status: "ok" as const, count: 0 },
         now: NOW,
         ...overrides,
     };
@@ -190,6 +191,7 @@ function sampleHealth(overrides: Partial<PipelineHealth> = {}): PipelineHealth {
             stuck: { status: "ok", count: 0 },
             needsReview: { status: "ok", count: 0 },
             unassigned: { status: "ok", count: 0 },
+            quarantined: { status: "ok", count: 0 },
         },
         ...overrides,
     };
@@ -600,8 +602,37 @@ test("stuck and unassigned are reported separately", () => {
     assert.ok(v.reasons.includes("intake-unassigned:3"));
 });
 
+test("QUARANTINED cutover rows are counted, and get their own reason", () => {
+    // SHADOW_QUARANTINE is terminal, never auto-requeued, and NOBODY has
+    // booked it: v1 stopped, and v2 refused because there is no shared QBO
+    // identity to make a second booking idempotent. It is neither NEEDS_REVIEW
+    // nor NEEDS_JOB, so before this it was invisible to every probe here and a
+    // pile of unbooked expenses read as a healthy pipeline.
+    const v = evaluatePipelineHealth(snapshot({ intakeQuarantined: { status: "ok", count: 3 } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["receipt-quarantine:3"]);
+});
+
+test("the quarantine reason is separate from review and unassigned", () => {
+    // Three different actions: check QuickBooks and decide, clear a review
+    // item, assign a job. Folding them into one number hides two of them.
+    const v = evaluatePipelineHealth(snapshot({
+        intakeUnassigned: { status: "ok", count: 2 },
+        intakeQuarantined: { status: "ok", count: 4 },
+    }));
+    assert.ok(v.reasons.includes("intake-unassigned:2"));
+    assert.ok(v.reasons.includes("receipt-quarantine:4"));
+});
+
+test("CONTROL: a NEEDS_REVIEW backlog does not produce a quarantine reason", () => {
+    // Without this, a count that accidentally selected every parked state
+    // would still pass the test above.
+    const v = evaluatePipelineHealth(snapshot({ intakeNeedsReview: { status: "ok", count: 40 } }));
+    assert.deepEqual(v.reasons, []);
+});
+
 test("an intake probe that FAILED is not an intake probe that found nothing", () => {
-    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned"] as const) {
+    for (const name of ["intakeStuck", "intakeNeedsReview", "intakeUnassigned", "intakeQuarantined"] as const) {
         const v = evaluatePipelineHealth(snapshot({ [name]: { status: "error", reason: "timeout", count: 0 } }));
         assert.equal(v.ok, false, name);
         assert.ok(v.reasons.includes(`probe-failed:${name}`), name);
@@ -648,17 +679,42 @@ test("a STAGING row is not counted as stuck while its own upload lease is still 
     );
 });
 
-test("the digest prints all three intake numbers", () => {
+test("the quarantine PROBE actually counts SHADOW_QUARANTINE, with no age gate", () => {
+    // Same source-level pin as the STAGING test above, for the same reason:
+    // count() talks to real Prisma. Two properties, and both matter — the
+    // state it selects, and that it does NOT carry a createdAt threshold. A
+    // quarantined row is terminal the instant the cutover writes it, so an
+    // age gate copied from the NEEDS_JOB probe next door would hide every one
+    // of them for six hours for no reason.
+    const root = path.resolve(__dirname, "..");
+    const src = readFileSync(path.join(root, "src/lib/pipeline-health.ts"), "utf8");
+    // Anchored on the probe DECLARATION, not on the name — the name also
+    // appears in namedProbes above, and slicing from there would read the
+    // whole evaluator and pass on any mention of the state anywhere.
+    const declared = /probe<number>\(\r?\n\s*"intakeQuarantined",([\s\S]*?)\r?\n\s*\),/.exec(src);
+    assert.ok(declared, "the probe exists");
+    const branch = declared[1];
+    assert.match(branch, /state: "SHADOW_QUARANTINE"/);
+    assert.ok(!branch.includes("createdAt"), "no age threshold on a terminal state");
+    // And it is a REASON, not just a printed number.
+    assert.match(src, /receipt-quarantine:\$\{input\.intakeQuarantined\.count\}/);
+});
+
+test("the digest prints all four intake numbers", () => {
     const { text } = formatPipelineDigest(sampleHealth({
         intake: {
             stuck: { status: "ok", count: 3 },
             needsReview: { status: "ok", count: 7 },
             unassigned: { status: "ok", count: 2 },
+            quarantined: { status: "ok", count: 5 },
         },
     }));
     assert.match(text, /Receipt intake stuck >6h: 3/);
     assert.match(text, /Receipt intake awaiting review: 7/);
     assert.match(text, /Receipt intake awaiting a job \(>6h\): 2/);
+    // SHADOW_QUARANTINE rows are terminal and unbooked, and no other line here
+    // can see them: before this they were invisible to the whole digest.
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): 5/);
 });
 
 test("the digest says a failed intake probe is unavailable, never zero", () => {
@@ -667,8 +723,10 @@ test("the digest says a failed intake probe is unavailable, never zero", () => {
             stuck: { status: "error", reason: "timeout", count: 0 },
             needsReview: { status: "error", reason: "timeout", count: 0 },
             unassigned: { status: "error", reason: "timeout", count: 0 },
+            quarantined: { status: "error", reason: "timeout", count: 0 },
         },
     }));
     assert.match(text, /Receipt intake stuck >6h: unavailable \(probe failed\)/);
     assert.match(text, /Receipt intake awaiting review: unavailable \(probe failed\)/);
+    assert.match(text, /Receipt intake quarantined \(cutover, needs a decision\): unavailable \(probe failed\)/);
 });

@@ -109,6 +109,25 @@ export interface PipelineHealth {
          * alert.
          */
         unassigned: CountProbe;
+        /**
+         * TERMINAL, UNBOOKED, AND WAITING ON A PERSON — the states nothing
+         * else here can see.
+         *
+         * Enumerated from RECEIPT_INTAKE_STATES rather than guessed at.
+         * STAGING/RECEIVED/READ/BOOKING are working states (`stuck` covers
+         * them); BOOKED and ARCHIVED reached QuickBooks; SHADOW_DONE was
+         * booked by v1; DUPLICATE and NON_RECEIPT are decided answers that
+         * deliberately never book; NEEDS_REVIEW and NEEDS_JOB have their own
+         * probes above; VOID has no writer anywhere in the codebase. That
+         * leaves SHADOW_QUARANTINE, which the cutover creates for a
+         * pre-boundary row with no evidence v1 booked it and no Drive identity
+         * to make a v2 booking idempotent. It is terminal, it is NEVER
+         * auto-requeued, and it is an expense that has reached nobody's books
+         * — so a queue of them could grow indefinitely while every other probe
+         * read green, which is the exact silent failure this check exists to
+         * eliminate.
+         */
+        quarantined: CountProbe;
     };
 }
 
@@ -229,6 +248,11 @@ export function evaluatePipelineHealth(input: {
     intakeStuck: CountProbe;
     intakeNeedsReview: CountProbe;
     intakeUnassigned: CountProbe;
+    /**
+     * Optional so an older caller (or a stored snapshot) still evaluates. An
+     * ABSENT probe is silent; a probe that ran and found rows is a reason.
+     */
+    intakeQuarantined?: CountProbe;
     now: number;
 }): { ok: boolean; reasons: string[] } {
     const reasons: string[] = [];
@@ -243,6 +267,7 @@ export function evaluatePipelineHealth(input: {
         ["intakeStuck", input.intakeStuck],
         ["intakeNeedsReview", input.intakeNeedsReview],
         ["intakeUnassigned", input.intakeUnassigned],
+        ...(input.intakeQuarantined ? [["intakeQuarantined", input.intakeQuarantined] as [string, { status: ProbeStatus }]] : []),
     ];
     for (const [name, probe] of namedProbes) {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
@@ -281,6 +306,18 @@ export function evaluatePipelineHealth(input: {
     // restart a worker.
     if (input.intakeUnassigned.status === "ok" && input.intakeUnassigned.count > 0) {
         reasons.push(`intake-unassigned:${input.intakeUnassigned.count}`);
+    }
+
+    // A quarantined shadow-week row is a receipt the cutover could neither
+    // retire nor hand to v2, so NOBODY has booked it and nothing will until a
+    // person checks QuickBooks and uses "book anyway". Terminal and never
+    // auto-requeued, which is precisely why it needs its own reason: unlike
+    // the NEEDS_REVIEW backlog it is not "working as designed", and unlike a
+    // stuck row no restart clears it. It is also not covered by ANY other
+    // probe here — the count is why the spec's claim that these rows are
+    // visible via pipeline health is true rather than aspirational.
+    if (input.intakeQuarantined?.status === "ok" && input.intakeQuarantined.count > 0) {
+        reasons.push(`receipt-quarantine:${input.intakeQuarantined.count}`);
     }
 
     if (input.lastPaymentsSync.status === "ok") {
@@ -369,7 +406,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
 
     const [
         intuit, lastPurchase, lastPush, lastPaymentsSync, receiptRows, lastBankLine, stuck,
-        intakeStuck, intakeNeedsReview, intakeUnassigned,
+        intakeStuck, intakeNeedsReview, intakeUnassigned, intakeQuarantined,
     ] = await Promise.all([
         fetchIntuitStatus(),
         // Expense carries no updatedAt column — qbSyncedAt IS the "when did the
@@ -530,6 +567,15 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                 }),
             0,
         ),
+        // NO AGE THRESHOLD, unlike NEEDS_JOB. A quarantined row is terminal the
+        // instant the cutover writes it — nothing is coming to move it on — so
+        // "wait six hours in case it resolves itself" would be waiting for
+        // something that cannot happen.
+        probe<number>(
+            "intakeQuarantined",
+            () => prisma.receiptIntake.count({ where: { state: "SHADOW_QUARANTINE" } }),
+            0,
+        ),
     ]);
 
     const counts: Record<string, number> = {};
@@ -571,6 +617,11 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: intakeUnassigned.reason,
             count: intakeUnassigned.value,
         },
+        intakeQuarantined: {
+            status: intakeQuarantined.status,
+            reason: intakeQuarantined.reason,
+            count: intakeQuarantined.value,
+        },
     };
 
     const verdict = evaluatePipelineHealth({ ...snapshot, now });
@@ -591,6 +642,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             stuck: snapshot.intakeStuck,
             needsReview: snapshot.intakeNeedsReview,
             unassigned: snapshot.intakeUnassigned,
+            quarantined: snapshot.intakeQuarantined,
         },
     };
 }
@@ -653,6 +705,12 @@ export function formatPipelineDigest(health: PipelineHealth): { subject: string;
         }`,
         `Receipt intake awaiting a job (>${INTAKE_STUCK_HOURS}h): ${
             health.intake?.unassigned?.status === "error" ? "unavailable (probe failed)" : health.intake?.unassigned?.count ?? "unavailable"
+        }`,
+        // Its own line, not folded into "awaiting review": a quarantined row
+        // needs somebody to check QuickBooks and decide, which is a different
+        // action from clearing a review item.
+        `Receipt intake quarantined (cutover, needs a decision): ${
+            health.intake?.quarantined?.status === "error" ? "unavailable (probe failed)" : health.intake?.quarantined?.count ?? "unavailable"
         }`,
     ];
     if (health.reasons.length > 0) lines.push(`Needs attention: ${health.reasons.join(", ")}`);

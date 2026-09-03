@@ -44,7 +44,11 @@ export interface LeaseClient {
 
 export interface LeaseDeps {
     db: LeaseClient;
-    sign: (storagePath: string) => Promise<SignedUpload | null>;
+    /**
+     * `opts.upsert` is passed through to the signer. Only THIS module ever
+     * asks for it (see below), so every other issuer gets a create-only token.
+     */
+    sign: (storagePath: string, opts: { upsert: boolean }) => Promise<SignedUpload | null>;
     /** When a freshly issued URL stops working. */
     expiresAt: () => Date;
     now?: () => number;
@@ -140,7 +144,14 @@ export async function reuseLiveLease(
     });
     if (count === 0) return { kind: "conflict" };
 
-    const signed = await deps.sign(path);
+    // THE ONE PLACE AN UPSERT-CAPABLE TOKEN IS ISSUED.
+    //
+    // This is the reuse path: the path already exists as far as the client is
+    // concerned, and the whole point is to let it replace a partial or
+    // superseded upload of its own. Every other issuer signs a path a version
+    // bump has just made new, so a create-only token is enough there and the
+    // weaker capability is what they get (see createReceiptUploadUrl).
+    const signed = await deps.sign(path, { upsert: true });
     return signed ? { kind: "signed", signed } : { kind: "storage-unavailable" };
 }
 
