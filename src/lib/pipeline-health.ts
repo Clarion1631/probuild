@@ -254,7 +254,7 @@ export function evaluatePipelineHealth(input: {
      * as "the pull is switched off", i.e. as HEALTH — and the one check that
      * watches the chaser's whole input went quiet exactly when it was needed.
      */
-    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null };
+    bankPull: { status: ProbeStatus; reason?: string; enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number };
     /** Chat cards whose delivery was never confirmed and which nobody has resolved. */
     uncertainCards: CountProbe;
     /** Can we authenticate to Drive at all? Gates the signed-memo path. */
@@ -361,6 +361,14 @@ export function evaluatePipelineHealth(input: {
         if (stale) reasons.push("bank-pull-stale");
     }
 
+    // Ambiguous reconcile groups are a human call, never auto-resolved (see
+    // BANK_PULL_AMBIGUOUS_KEY) — reported whenever the probe actually READ a
+    // count, independent of the staleness check above, so a backlog surfaces
+    // even on a night the pull itself is otherwise current.
+    if (input.bankPull.status === "ok" && input.bankPull.ambiguousCount > 0) {
+        reasons.push(`bank-pull-ambiguous:${input.bankPull.ambiguousCount}`);
+    }
+
     // A CHASER THAT HAS NOT FINISHED is the input every other receipt surface
     // depends on. Reported in HOURS so the digest says how long, rather than
     // just that something is wrong.
@@ -411,6 +419,17 @@ export const CHASER_STALE_HOURS = 26;
 export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
 
 /**
+ * Where the pull records how many reconcile groups came back AMBIGUOUS on its
+ * most recent completed reconcile (Codex round-31 gate, finding 2). A
+ * same-identity 2×2 (or larger) statement-first group is a human call, never
+ * auto-resolved — this is what makes that backlog visible instead of the pull
+ * silently reporting "done" over it. Overwritten every run reconcile actually
+ * completes (0 clears a resolved alarm); left untouched when reconcile itself
+ * never ran, so a missing read can never read as "zero ambiguous".
+ */
+export const BANK_PULL_AMBIGUOUS_KEY = "bankRegisterPullAmbiguousCount";
+
+/**
  * Is the nightly pull on, and when did it last SUCCEED?
  *
  * A read failure reports `enabled: false` rather than "enabled and stale":
@@ -424,14 +443,22 @@ export const BANK_PULL_LAST_SUCCESS_KEY = "bankRegisterPullLastSuccess";
  * knows how to say "we could not read this" (`probe-failed:bankPull`) and how
  * to give up on a hung database instead of holding the whole health check open.
  */
-async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null }> {
+async function readBankPullState(): Promise<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }> {
     // ENABLED BECAUSE THE CRON EXISTS. The previous gate keyed off
     // BANK_LINE_MINT_FROM_QBO — an undocumented env var that controls MINTING,
     // not the pull — so with minting off (its shipped default) the pull could
     // be dead for weeks and health stayed green. The pull is scheduled in
     // vercel.json unconditionally, so it is expected to run unconditionally.
-    const row = await prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } });
-    return { enabled: true, lastSuccessAt: row?.value || null };
+    const [successRow, ambiguousRow] = await Promise.all([
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_LAST_SUCCESS_KEY } }),
+        prisma.automationSetting.findUnique({ where: { key: BANK_PULL_AMBIGUOUS_KEY } }),
+    ]);
+    const parsedAmbiguous = ambiguousRow?.value ? Number.parseInt(ambiguousRow.value, 10) : 0;
+    return {
+        enabled: true,
+        lastSuccessAt: successRow?.value || null,
+        ambiguousCount: Number.isFinite(parsedAmbiguous) ? parsedAmbiguous : 0,
+    };
 }
 
 /** A probe that has not answered within this long is treated as failed. */
@@ -646,10 +673,10 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
         // IN the Promise.all, and probed: it used to be an unprobed `await`
         // after it, so a hung database held the whole health check open past
         // every other probe's deadline and then answered "switched off".
-        probe<{ enabled: boolean; lastSuccessAt: string | null }>(
+        probe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }>(
             "bankPull",
             readBankPullState,
-            { enabled: false, lastSuccessAt: null },
+            { enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
         ),
         // Can we authenticate to Drive? Asked here rather than at the moment a
         // memo arrives, because the answer "no" produces no symptom anywhere
@@ -740,6 +767,7 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
             reason: bankPull.reason,
             enabled: bankPull.value.enabled,
             lastSuccessAt: bankPull.value.lastSuccessAt,
+            ambiguousCount: bankPull.value.ambiguousCount,
         },
     };
 

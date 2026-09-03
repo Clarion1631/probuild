@@ -389,7 +389,7 @@ test("the bank pull fails on a stale fetch and on chunk errors; truncation is no
     // budget-truncated run read part of one window, which is not proof the
     // register is current. Behaviour lives in tests/bank-pull-window.test.ts.
     const route = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
-    assert.match(route, /if \(summary\.ok && summary\.complete\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
 });
 
 test("health enablement is the cron's existence, not an undocumented env var", () => {
@@ -398,7 +398,7 @@ test("health enablement is the cron's existence, not an undocumented env var", (
     // flag is not used must not fail the gate it documents.
     assert.doesNotMatch(health, /process\.env\.BANK_LINE_MINT_FROM_QBO/, "that flag controls MINTING, not the pull");
     assert.doesNotMatch(health, /process\.env\.BANK_REGISTER_PULL_ENABLED/);
-    assert.match(health, /return \{ enabled: true, lastSuccessAt: row\?\.value \|\| null \};/);
+    assert.match(health, /enabled: true,\s*\n\s*lastSuccessAt: successRow\?\.value \|\| null,/);
     const vercel = JSON.parse(readFileSync(join(repoRoot, "vercel.json"), "utf8")) as {
         crons: Array<{ path: string }>;
     };
@@ -797,7 +797,7 @@ test("mintFromQbo reports truncation, and a truncated run stamps nothing", () =>
     assert.match(route, /const MINT_MAX_BATCHES = 10;/);
     assert.match(route, /remainingCursor = result\.nextId;/);
     // The freshness clock needs a run that was BOTH clean and whole.
-    assert.match(route, /if \(summary\.ok && summary\.complete\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
+    assert.match(route, /if \(summary\.ok && summary\.complete && ambiguousCount === 0\) \{[\s\S]{0,400}BANK_PULL_LAST_SUCCESS_KEY/);
     // And the cursor is persisted, so a backlog that is not draining is visible.
     assert.match(route, /mintRemainingCursor: typeof parsed\.mintRemainingCursor === "string"/);
 

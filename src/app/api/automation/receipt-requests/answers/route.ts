@@ -140,6 +140,17 @@ export async function POST(request: Request) {
             { status: 422 },
         );
     }
+    // FOUND IS NOT ENOUGH — it only proves Drive has an object at that id, not
+    // that the object is the signed memo it claims to be. Any Drive object
+    // (a folder, an image, a Doc) passed `found` before this check, and this
+    // route recorded `memo-signed` for it regardless. The chase stays open
+    // until the bridge sends the real PDF.
+    if (probe.mimeType !== "application/pdf") {
+        return NextResponse.json(
+            { ok: false, reason: "not-a-pdf", detail: probe.mimeType ?? "unknown", targetKey: bankLineId },
+            { status: 422 },
+        );
+    }
     /**
      * THE LINK MUST NAME THE FILE WE JUST VERIFIED.
      *

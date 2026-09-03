@@ -322,7 +322,7 @@ function getMockFiles(projectName: string, folderId?: string | null) {
  * artifact nobody ever confirmed exists. Unknown is its own answer.
  */
 export type DriveFileProbe =
-    | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null }
+    | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null; mimeType: string | null }
     /** Google answered, and there is no such file (or it is in the bin). */
     | { kind: "missing"; reason: string }
     /** We could not ask, or could not understand the answer. NOT a verdict. */
@@ -342,7 +342,7 @@ export async function probeDriveFile(fileId: string, timeoutMs = 5_000): Promise
     try {
         const drive = google.drive({ version: "v3", auth: oauth2Client });
         const response = await drive.files.get(
-            { fileId: fileId.trim(), fields: "id, name, trashed, webViewLink", supportsAllDrives: true },
+            { fileId: fileId.trim(), fields: "id, name, trashed, webViewLink, mimeType", supportsAllDrives: true },
             { timeout: timeoutMs },
         );
         const data = response.data;
@@ -355,6 +355,7 @@ export async function probeDriveFile(fileId: string, timeoutMs = 5_000): Promise
             name: data.name ?? null,
             trashed: false,
             webViewLink: data.webViewLink ?? null,
+            mimeType: data.mimeType ?? null,
         };
     } catch (error) {
         const status = (error as { code?: number; status?: number })?.code

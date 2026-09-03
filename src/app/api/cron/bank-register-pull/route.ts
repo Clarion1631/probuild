@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { releaseLease, takeLease } from "@/lib/cron-lease";
-import { BANK_PULL_LAST_SUCCESS_KEY } from "@/lib/pipeline-health";
+import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_AMBIGUOUS_KEY } from "@/lib/pipeline-health";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import {
@@ -307,6 +307,12 @@ async function runPull() {
                 // links both leave observations unlinked.
                 chunkErrors: result.chunkErrors.length,
                 remaining: result.remaining,
+                // Surfaced, not discarded (Codex round-31 gate, finding 2): a
+                // same-identity 2x2 statement-first group is a human call, not
+                // something reconcile can guess at. This used to be dropped
+                // here, so those groups never showed up anywhere the pull
+                // reported.
+                ambiguous: result.ambiguous,
             };
         },
 
@@ -315,6 +321,27 @@ async function runPull() {
         // "enabled" branch inside the pull to get wrong.
         ...(process.env.BANK_LINE_MINT_FROM_QBO === "true" ? { mintFromQbo } : {}),
     });
+
+    // Same-identity groups reconcile refused to guess a pairing for — a human
+    // call, never auto-resolved. `summary.reconciled` is only absent when
+    // reconcile itself never completed (it threw, see runBankRegisterPull),
+    // in which case there is nothing new to report and the LAST recorded
+    // count must stand rather than reading as "resolved".
+    const ambiguousCount = summary.reconciled?.ambiguous?.length ?? 0;
+    if (ambiguousCount > 0) {
+        console.warn("[cron/bank-register-pull] ambiguous reconcile groups need a human", ambiguousCount);
+    }
+    if (summary.reconciled) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key: BANK_PULL_AMBIGUOUS_KEY },
+                update: { value: String(ambiguousCount) },
+                create: { key: BANK_PULL_AMBIGUOUS_KEY, value: String(ambiguousCount) },
+            });
+        } catch (error) {
+            console.error("[cron/bank-register-pull] ambiguous-count write failed", error instanceof Error ? error.message : "UnknownError");
+        }
+    }
 
     if (!summary.ok) {
         console.error("[cron/bank-register-pull]", JSON.stringify(summary));
@@ -333,7 +360,12 @@ async function runPull() {
     // register is current either — it read part of one window — so it does not
     // stamp the clock. If truncation persists, the mark goes stale and
     // `bank-pull-stale` fires, which is exactly the signal wanted.
-    if (summary.ok && summary.complete) {
+    // UNRESOLVED AMBIGUITY is the same shape of lie: reconcile left a
+    // same-identity group unmatched on purpose, and stamping the clock over it
+    // told the health check the register was fully current while a manual
+    // decision sat waiting. `bank-pull-ambiguous` is what surfaces that
+    // instead (see evaluatePipelineHealth).
+    if (summary.ok && summary.complete && ambiguousCount === 0) {
         try {
             await prisma.automationSetting.upsert({
                 where: { key: BANK_PULL_LAST_SUCCESS_KEY },

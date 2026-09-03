@@ -50,7 +50,7 @@ function snapshot(overrides: Partial<Parameters<typeof evaluatePipelineHealth>[0
         // A chase that finished an hour ago is the normal state.
         chaser: { status: "ok" as const, phase: "done", completedAt: iso(1 * HOUR) },
         // The nightly QBO pull is OFF by default, so it contributes no reason.
-        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null },
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
         now: NOW,
         ...overrides,
     };
@@ -722,41 +722,41 @@ test("unassigned and stuck are reported separately", () => {
 
 test("a disabled bank pull is never a reason — an unset flag is not a failure", () => {
     assert.deepEqual(evaluatePipelineHealth(snapshot({
-        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null },
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
     })), { ok: true, reasons: [] });
     // Even a long-dead one, while it is switched off.
     assert.deepEqual(evaluatePipelineHealth(snapshot({
-        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: iso(1000 * HOUR) },
+        bankPull: { status: "ok" as const, enabled: false, lastSuccessAt: iso(1000 * HOUR), ambiguousCount: 0 },
     })), { ok: true, reasons: [] });
 });
 
 test("an ENABLED pull that has never succeeded is stale", () => {
     // "We turned it on and it has never worked" is the failure most worth
     // catching, and a null that reads as healthy is the null-means-OK trap.
-    const result = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null } }));
+    const result = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null, ambiguousCount: 0 } }));
     assert.equal(result.ok, false);
     assert.deepEqual(result.reasons, ["bank-pull-stale"]);
 });
 
 test("36h is the line: 35h is fine, 37h is stale", () => {
     assert.deepEqual(
-        evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(35 * HOUR) } })),
+        evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(35 * HOUR), ambiguousCount: 0 } })),
         { ok: true, reasons: [] },
     );
-    const stale = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(37 * HOUR) } }));
+    const stale = evaluatePipelineHealth(snapshot({ bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: iso(37 * HOUR), ambiguousCount: 0 } }));
     assert.deepEqual(stale.reasons, ["bank-pull-stale"]);
 });
 
 test("an unparseable last-success is stale, not healthy", () => {
     const result = evaluatePipelineHealth(snapshot({
-        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: "not a date" },
+        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: "not a date", ambiguousCount: 0 },
     }));
     assert.deepEqual(result.reasons, ["bank-pull-stale"]);
 });
 
 test("the stale reason rides alongside the others, it does not replace them", () => {
     const result = evaluatePipelineHealth(snapshot({
-        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null },
+        bankPull: { status: "ok" as const, enabled: true, lastSuccessAt: null, ambiguousCount: 0 },
         stuck: { status: "ok" as const, count: 3 },
     }));
     assert.equal(result.ok, false);
@@ -784,15 +784,15 @@ test("a bank-pull probe that cannot answer says so, instead of reading as 'switc
     // try/catch returning `{enabled:false}` — which reads as "the pull is
     // turned off", i.e. as health. A hung database also held the whole check
     // open past every other probe's deadline.
-    const hung = await runProbe<{ enabled: boolean; lastSuccessAt: string | null }>(
+    const hung = await runProbe<{ enabled: boolean; lastSuccessAt: string | null; ambiguousCount: number }>(
         "bankPull",
         () => new Promise(() => { /* never resolves */ }),
-        { enabled: false, lastSuccessAt: null },
+        { enabled: false, lastSuccessAt: null, ambiguousCount: 0 },
         20,
     );
     assert.equal(hung.status, "error", "the deadline fires");
     assert.equal(hung.reason, "timeout");
-    assert.deepEqual(hung.value, { enabled: false, lastSuccessAt: null }, "and the fallback is the SAFE one");
+    assert.deepEqual(hung.value, { enabled: false, lastSuccessAt: null, ambiguousCount: 0 }, "and the fallback is the SAFE one");
 
     // And that status reaches the verdict as its own reason.
     const verdict = evaluatePipelineHealth(snapshot({
@@ -810,7 +810,7 @@ test("the bank-pull read runs inside the Promise.all, as a probe", () => {
         join(dirname(fileURLToPath(import.meta.url)), "..", "src/lib/pipeline-health.ts"),
         "utf8",
     );
-    assert.match(source, /probe<\{ enabled: boolean; lastSuccessAt: string \| null \}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
+    assert.match(source, /probe<\{ enabled: boolean; lastSuccessAt: string \| null; ambiguousCount: number \}>\(\s*\n\s*"bankPull",\s*\n\s*readBankPullState,/);
     assert.doesNotMatch(source, /bankPull: await readBankPullState\(\)/, "the unprobed await is gone");
     // The read no longer swallows its own failure — the probe reports it.
     const fn = source.slice(source.indexOf("async function readBankPullState("));

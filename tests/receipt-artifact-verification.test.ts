@@ -47,6 +47,9 @@ test("the three Drive outcomes map to three different answers", () => {
     assert.match(route, /if \(probe\.kind === "unreachable"\) \{[\s\S]{0,1200}retry: true[\s\S]{0,200}status: 503/);
     assert.match(route, /const unconfigured = probe\.reason === "no-drive-token";/);
     assert.match(route, /reason: unconfigured \? "drive-not-configured" : "artifact-unverifiable",/);
+    // FOUND is not enough on its own — any Drive object at that id passes it.
+    // Only a real PDF may be recorded as a signed memo.
+    assert.match(route, /if \(probe\.mimeType !== "application\/pdf"\) \{[\s\S]{0,300}reason: "not-a-pdf"[\s\S]{0,200}status: 422/);
     // The probe runs BEFORE the write loop, and the id is persisted.
     const probeAt = route.indexOf("const probe = await probeDriveFile(pdfId);");
     const writeAt = route.indexOf("details.resolution = \"memo-signed\";");
@@ -70,8 +73,9 @@ test("the probe never falls back to mock data, and reads metadata only", () => {
     const client = readFileSync(join(repoRoot, "src/lib/gmail-client.ts"), "utf8");
     assert.match(client, /googleDriveRefreshToken: true/, "ensureDriveAuth reads the stored credential");
     assert.doesNotMatch(body, /getMock/, "no mock fallback on the verification path");
-    // Metadata, bounded — never a download.
-    assert.match(body, /fields: "id, name, trashed, webViewLink"/);
+    // Metadata, bounded — never a download. mimeType is what lets the caller
+    // tell a real PDF from any other Drive object at the same id.
+    assert.match(body, /fields: "id, name, trashed, webViewLink, mimeType"/);
     assert.match(body, /\{ timeout: timeoutMs \}/);
     assert.doesNotMatch(body, /alt: "media"/);
     // A trashed file is not durable: it disappears on its own.

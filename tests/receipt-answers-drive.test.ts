@@ -26,7 +26,7 @@ process.env.RECEIPT_BRIDGE_SECRET = "bridge-secret";
 const FILE_ID = "1sEISJBJaGRYpivooQJBR";
 
 type Probe =
-    | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null }
+    | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null; mimeType: string | null }
     | { kind: "missing"; reason: string }
     | { kind: "unreachable"; reason: string };
 
@@ -116,6 +116,7 @@ test("a VALID artifact records the memo and clears the chase", async () => {
         name: "Missing receipt memo.pdf",
         trashed: false,
         webViewLink: `https://drive.google.com/file/d/${FILE_ID}/view`,
+        mimeType: "application/pdf",
     };
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 200);
@@ -132,7 +133,7 @@ test("a VALID artifact records the memo and clears the chase", async () => {
 
 test("a caller's own durable URL is kept, but the ID is still what was verified", async () => {
     reset();
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null };
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
     const pdfUrl = `https://drive.google.com/file/d/${FILE_ID}/view?usp=sharing`;
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, pdf_url: pdfUrl });
     assert.equal(res.status, 200);
@@ -160,6 +161,30 @@ test("a TRASHED file is missing too — it disappears on its own", async () => {
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
     assert.equal(res.status, 422);
     assert.deepEqual(writes, []);
+});
+
+test("a Drive object that is NOT a PDF is refused — found is not enough", async () => {
+    // Drive answering `found` only proves an object exists at that id, not
+    // that it is the signed memo it claims to be. A folder, an image, or a
+    // Doc all passed `found` before this check and got recorded as
+    // `memo-signed` regardless.
+    reset();
+    probeResult = {
+        kind: "found",
+        id: FILE_ID,
+        name: "not-a-memo.jpg",
+        trashed: false,
+        webViewLink: `https://drive.google.com/file/d/${FILE_ID}/view`,
+        mimeType: "image/jpeg",
+    };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    const payload = await res.json() as { ok: boolean; reason: string; detail: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "not-a-pdf");
+    assert.equal(payload.detail, "image/jpeg");
+    assert.deepEqual(writes, [], "no resolution recorded for a non-PDF artifact");
+    assert.deepEqual(cleared, [], "and the chase stays open");
 });
 
 test("an UNREACHABLE Drive is 503 with retry — never a recorded resolution", async () => {
@@ -193,7 +218,7 @@ test("NO CREDENTIAL is named as such — it will not fix itself", async () => {
 
 test("Drive is never asked about a body that cannot carry an artifact", async () => {
     reset();
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null };
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
     // Not a signature, an unknown fingerprint, and a malformed id: all decided
     // before any network call.
     assert.equal((await post({ fingerprint: "pb-bl-1", signed: false, pdf_id: FILE_ID })).status, 200);
@@ -209,7 +234,7 @@ test("a caller URL naming a DIFFERENT file is refused — the link must be the i
     // different documents — and only one of them was ever checked.
     reset();
     const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink };
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
     const someoneElse = "1AAAAAAAAAAAAAAAAAAAA";
     const res = await post({
         fingerprint: "pb-bl-1",
@@ -228,7 +253,7 @@ test("a durable URL that names no file at all is refused too", async () => {
     // neither can prove anything about a Drive id. Durability is not identity.
     reset();
     const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink };
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
     const res = await post({
         fingerprint: "pb-bl-1",
         signed: true,
@@ -244,7 +269,7 @@ test("an alternate Drive shape for the SAME id is still accepted", async () => {
     // /file/d/<id>/ all name the file, and refusing them would throw away a
     // perfectly good link the forwarder had.
     reset();
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null };
+    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
     for (const url of [
         `https://drive.google.com/open?id=${FILE_ID}`,
         `https://drive.google.com/uc?id=${FILE_ID}&export=download`,

@@ -27,6 +27,8 @@
  * overwritten.
  */
 
+import type { ReconcileAmbiguousGroup } from "@/lib/bank-ledger";
+
 export interface BankRegisterRowLike {
     date: string;
     qbType: string;
@@ -393,6 +395,14 @@ export interface BankRegisterPullDependencies {
         chunkErrors?: number;
         /** Links this invocation never attempted, because it hit its own cap. */
         remaining?: number;
+        /**
+         * Same-identity groups reconcile refused to guess a pairing for
+         * (Codex round-31 gate, finding 2). Surfaced here rather than
+         * discarded, so a same-identity 2×2 statement-first group is visible
+         * instead of the run reporting "done" over it — resolution stays
+         * manual, this only makes the backlog seen.
+         */
+        ambiguous?: ReconcileAmbiguousGroup[];
     } | null>;
     /**
      * Mints canonical BankLines from still-unlinked QBO observations
@@ -473,7 +483,7 @@ export interface BankRegisterPullSummary {
      * a no-op for them.
      */
     conflictQbTxnIds?: string[];
-    reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number } | null;
+    reconciled?: { linked: number; proposed: number; chunkErrors?: number; remaining?: number; ambiguous?: ReconcileAmbiguousGroup[] } | null;
     /** The point this run resumed FROM, when it resumed. */
     resumedAfter?: { postedDate: string; qbTxnId: string } | null;
     /** The point the NEXT run should resume from, when this one stopped early. */
