@@ -70,6 +70,17 @@ test("an end date before the start date is still rejected", async () => {
     assert.equal(updates.length, 0);
 });
 
+test("a malformed date is a validation failure, not an unexpected error", async () => {
+    const { tx, updates } = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });
+    for (const bad of ["2026-13-45", "09/03/2026", "2026-09-03T00:00:00Z"]) {
+        await assert.rejects(
+            () => updateScheduleTaskInTransaction(tx, TASK_ID, { endDate: bad }, actor, PROJECT_ID),
+            (err: unknown) => err instanceof ScheduleTaskValidationError && /Invalid date/.test((err as Error).message),
+        );
+    }
+    assert.equal(updates.length, 0);
+});
+
 test("changing type without dates keeps the stored dates valid", async () => {
     // task -> milestone collapses end onto start
     const a = fakeTx({ startDate: new Date("2026-09-03T00:00:00Z"), endDate: new Date("2026-09-08T00:00:00Z") });

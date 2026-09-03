@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicText } from "@/lib/anthropic";
 import { prisma } from "@/lib/prisma";
-import { displayEndDate, toDateKey, durationDays } from "@/lib/schedule-dates";
+import { displayEndDate, toDateKey, durationDays, isTaskOverdue } from "@/lib/schedule-dates";
 
 interface ScheduleTask {
     id: string;
@@ -34,7 +34,7 @@ export async function POST(req: NextRequest) {
         const start = new Date(t.startDate);
         const end = new Date(t.endDate);
         const taskDurationDays = durationDays(toDateKey(t.startDate), toDateKey(t.endDate), t.type);
-        const isPast = today >= toDateKey(t.endDate);
+        const isPast = isTaskOverdue(t.startDate, t.endDate, today, t.type);
         const isActive = start <= new Date() && end >= new Date();
         const hoursVariance = t.estimatedHours && t.actualHours > 0
             ? `${t.actualHours.toFixed(0)}/${t.estimatedHours}h actual/est`
@@ -66,7 +66,7 @@ SCHEDULE GAPS & BOTTLENECKS:
 - [gap or bottleneck with impact analysis]
 - [gap or bottleneck]
 
-OVERDUE TASKS (${tasks.filter(t => today >= toDateKey(t.endDate) && t.progress < 100).length} detected):
+OVERDUE TASKS (${tasks.filter(t => isTaskOverdue(t.startDate, t.endDate, today, t.type) && t.progress < 100).length} detected):
 - [list each overdue task with recommended recovery action]
 
 BUFFER RECOMMENDATIONS:

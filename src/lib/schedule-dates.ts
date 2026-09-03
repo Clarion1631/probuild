@@ -84,6 +84,20 @@ export function durationDays(startDate: string, endDate: string, type?: Schedule
     return Math.max(1, daysBetweenKeys(startDate, endDate));
 }
 
+/**
+ * Overdue = the task's last working day is behind us. Tasks: today >= stored
+ * (exclusive) end, with a legacy zero-length row treated as one day.
+ * Milestones: today is past their day (they are not overdue on the day itself).
+ */
+export function isTaskOverdue(startDate: string | Date, endDate: string | Date, today: string | Date, type?: ScheduleTaskKind): boolean {
+    const start = toDateKey(startDate);
+    const todayKey = toDateKey(today);
+    if (type === "milestone") return todayKey > start;
+    const end = toDateKey(endDate);
+    const effectiveEnd = end <= start ? addDaysKey(start, 1) : end;
+    return todayKey >= effectiveEnd;
+}
+
 /** True when `day` (YYYY-MM-DD) is a working day of the stored task: start <= day < end, milestones on their day. */
 export function isTaskOnDay(startDate: string, endDate: string, day: string, type?: ScheduleTaskKind): boolean {
     const start = toDateKey(startDate);

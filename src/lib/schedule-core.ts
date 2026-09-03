@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { withTxRetry } from "./tx-retry";
+import { ScheduleTaskValidationError } from "./schedule-task-result";
 import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
@@ -108,12 +109,15 @@ function haversineMiles(lat1: number, lng1: number, lat2: number, lng2: number):
  * input like "2026-13-45" that a bare regex would pass). Throws otherwise.
  */
 export function parseStartDateInput(raw: string): Date {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        throw new Error(`Invalid start date "${raw}" — use YYYY-MM-DD (no time component).`);
+    // A malformed date is a caller mistake, not a system failure, so it is a
+    // ScheduleTaskValidationError and reaches users as VALIDATION (see
+    // schedule-task-result.ts) instead of the opaque UNEXPECTED fallback.
+    if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        throw new ScheduleTaskValidationError(`Invalid date "${raw}" — use YYYY-MM-DD (no time component).`);
     }
     const parsed = parseUTCDate(raw);
     if (formatDate(parsed) !== raw) {
-        throw new Error(`Invalid start date "${raw}" — not a real calendar date.`);
+        throw new ScheduleTaskValidationError(`Invalid date "${raw}" — not a real calendar date.`);
     }
     return parsed;
 }

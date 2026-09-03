@@ -7,6 +7,7 @@ import {
     durationDays,
     formatDateKey,
     isTaskOnDay,
+    isTaskOverdue,
     storedEndDate,
 } from "@/lib/schedule-dates";
 
@@ -51,6 +52,19 @@ test("full ISO timestamps are accepted and reduced to their date part", () => {
     assert.equal(displayEndDate("2026-09-03T00:00:00.000Z", "2026-09-08T00:00:00.000Z"), "2026-09-07");
     assert.equal(isTaskOnDay("2026-09-03T00:00:00.000Z", "2026-09-08T00:00:00.000Z", "2026-09-07"), true);
     assert.equal(isTaskOnDay("2026-09-03T00:00:00.000Z", "2026-09-08T00:00:00.000Z", "2026-09-08"), false);
+});
+
+test("overdue means the last working day is behind us", () => {
+    // Task 9/3..9/7 shown, stored end 9/8: not overdue on 9/7, overdue from 9/8.
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-08", "2026-09-07"), false);
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-08", "2026-09-08"), true);
+    // Legacy zero-length row counts as one day.
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-03", "2026-09-03"), false);
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-03", "2026-09-04"), true);
+    // Milestones are not overdue on their own day.
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-03", "2026-09-03", "milestone"), false);
+    assert.equal(isTaskOverdue("2026-09-03", "2026-09-03", "2026-09-04", "milestone"), true);
+    assert.equal(isTaskOverdue("2026-09-03T00:00:00.000Z", "2026-09-08T00:00:00.000Z", new Date("2026-09-09T15:00:00Z")), true);
 });
 
 test("formatDateKey formats a date key without local-timezone drift", () => {

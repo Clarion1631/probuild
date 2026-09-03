@@ -36,7 +36,10 @@ export class ScheduleTaskValidationError extends Error {
     }
 }
 
-export const UNEXPECTED_SCHEDULE_TASK_ERROR = "Something went wrong saving the task. Nothing was changed.";
+// Outcome-neutral on purpose: a connection drop while the commit is being
+// acknowledged can leave the write in place, so this must not promise that
+// nothing changed or invite a blind retry.
+export const UNEXPECTED_SCHEDULE_TASK_ERROR = "Something went wrong saving the task. Refresh the schedule to see what was saved before trying again.";
 
 /** Narrow helper for callers that want the message regardless of outcome shape. */
 export function scheduleTaskErrorMessage(result: ScheduleTaskFailure, fallback = UNEXPECTED_SCHEDULE_TASK_ERROR): string {
