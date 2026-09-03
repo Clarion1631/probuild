@@ -185,12 +185,18 @@ export const MONEY_IN_FLIGHT_STATUSES = ["qbo_unknown", "qbo_created", "reconcil
  * update including the sweep's own re-assert, so a long-running sweep keeps its
  * claim alive). A claim older than the TTL belongs to a sweep that crashed: the
  * human may then override it (their write clears the marker) and the sweep must
- * treat it as lost. A deposit batch is capped at 60s of function time, so 15
- * minutes is far longer than any honest claim needs.
+ * treat it as lost.
+ *
+ * The TTL is 5 minutes, sized off the work rather than off caution: a bank
+ * batch is capped at 60s of function time (`maxDuration` in the deposit-ingest
+ * route), so no honest claim lives anywhere near this long, and the only thing
+ * the TTL really bounds is how long a CRASHED sweep can keep a human waiting
+ * for their own task. It matches STALE_PROCESSING_MS, the deposit row's own
+ * lease, so a dead worker's two holds expire together.
  */
 export const SWEEP_TASK_CLAIM = "Deposit sweep working";
 
-export const SWEEP_CLAIM_TTL_MS = 15 * 60_000;
+export const SWEEP_CLAIM_TTL_MS = 5 * 60_000;
 
 export const SWEEP_CLAIM_BUSY_MESSAGE =
     "The deposit sweep is booking this deposit right now; try again in a few minutes.";
