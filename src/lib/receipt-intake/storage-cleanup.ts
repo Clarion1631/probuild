@@ -248,6 +248,56 @@ export async function recordPendingCleanup(
     if (!recorded) throw new Error(`could not record a cleanup for ${storagePath}`);
 }
 
+/** The one write `queueObjectCleanup` needs — injectable, so it is testable. */
+export interface CleanupQueueTx {
+    automationEvent: {
+        create(args: {
+            // The CONCRETE shape, not Record<string, unknown>: a real
+            // Prisma.TransactionClient is passed here (unlike RejectTxClient,
+            // which is reached through a cast), and Prisma's own create only
+            // accepts an argument type that names its required columns.
+            data: { kind: string; status: string; reason: string; source: string; detail: string };
+            select: { id: true };
+        }): Promise<{ id: string }>;
+    };
+}
+
+/**
+ * ENQUEUE A CLEANUP INSIDE SOMEBODY ELSE'S TRANSACTION.
+ *
+ * The counterpart to `recordPendingCleanup`'s durability rule, for the callers
+ * that have a transaction: the event is written with the caller's `tx`, so it
+ * commits with the pointer transition that orphaned the object or not at all.
+ * A failure here throws and takes that transition down with it, which is the
+ * correct outcome — a pointer that moved without its cleanup recorded is bytes
+ * nothing will ever find.
+ *
+ * No read-back, unlike recordPendingCleanup: this write is a plain `create`
+ * inside a transaction the caller commits, so it either raises or is part of
+ * that commit. (recordPendingCleanup goes through logAutomationEvent, which is
+ * fire-and-forget by contract, and that is what the read-back is there for.)
+ */
+export async function queueObjectCleanup(
+    tx: CleanupQueueTx,
+    storagePath: string,
+    reason: string,
+    notBefore: Date | null = null,
+): Promise<string> {
+    const event = await tx.automationEvent.create({
+        data: {
+            kind: STORAGE_CLEANUP_KIND,
+            status: "pending",
+            reason: reason.slice(0, 500),
+            source: "receipt-intake",
+            detail: JSON.stringify(
+                notBefore ? { storagePath, notBefore: notBefore.toISOString() } : { storagePath },
+            ),
+        },
+        select: { id: true },
+    });
+    return event.id;
+}
+
 /**
  * Reject a row and queue its object for deletion IN ONE TRANSACTION.
  *
@@ -286,6 +336,18 @@ export interface RejectFence {
     storagePath: string;
     /** The upload lease the caller inspected. A newer one means a newer file. */
     uploadLeaseVersion: number;
+    /**
+     * The lease GENERATION the caller inspected, and its expiry.
+     *
+     * The version cannot see a REFRESH: `reuseLiveLease` reissues a working
+     * signed URL over the same path at the same version, so a reject decided
+     * before that refresh still matched the row and deleted it out from under
+     * a client whose URL had just been renewed — and queued the path for
+     * deletion on the stale expiry, which the renewed URL then outlives. See
+     * leaseFence; this is the same pin, on the delete instead of the publish.
+     */
+    uploadLeaseNonce: string | null;
+    uploadUrlExpiresAt: Date | null;
     /**
      * When the OBJECT may be deleted (`cleanupNotBefore()` of the same row).
      * Deliberately NOT part of the delete's where clause — the fence is about
@@ -364,6 +426,12 @@ export async function rejectRowAndQueueCleanup(
                     // this and re-points the row at a new path, so a sweep
                     // that decided on the old upload deletes nothing.
                     uploadLeaseVersion: row.uploadLeaseVersion,
+                    // ...and the GENERATION, which is the only column a
+                    // same-path, same-version REFRESH moves. Without it a
+                    // /start that handed the client a fresh URL a millisecond
+                    // ago does not stop this delete.
+                    uploadLeaseNonce: row.uploadLeaseNonce,
+                    uploadUrlExpiresAt: row.uploadUrlExpiresAt,
                 },
             });
             if (count !== 1) throw new RejectFenceLost(row.id);
@@ -427,14 +495,24 @@ export async function settleQueuedCleanup(
 
 /**
  * Delete the object. If that fails, record the path so the sweep can retry.
- * Never throws: the caller is already rejecting a row and must not be derailed
- * by the cleanup of it.
  *
  * `notBefore` DEFERS the delete entirely rather than attempting it: a live
  * signed upload URL for this path can recreate the object after we remove it,
  * so the only delete that actually removes the bytes is one taken after the
  * URL dies. The queue entry is written immediately either way — the path is
  * never left unremembered.
+ *
+ * THROWS when the queue entry cannot be written, and that is the whole point.
+ *
+ * This used to swallow it and return false, and every caller discarded the
+ * false AFTER moving the row's pointer — so one transient database failure
+ * left bytes in a private bucket that no row referenced, no event remembered
+ * and no sweep would ever look at. Silent and permanent.
+ *
+ * Callers that move a pointer must therefore enqueue INSIDE that pointer's
+ * transaction (`queueObjectCleanup`), so the two commit together or neither
+ * does. Callers with no transaction to pair with must let the throw reach
+ * their response, so the client retries instead of being told it worked.
  */
 export async function deleteObjectOrRecord(
     storagePath: string,
@@ -444,11 +522,8 @@ export async function deleteObjectOrRecord(
 ): Promise<boolean> {
     const scheduled = pending(notBefore, io.now());
     if (scheduled) {
-        // NOT an error path, so the record is not best-effort here either: it
-        // is the only pointer to the object from this moment on.
-        await io.record(storagePath, reason, scheduled).catch(recordError => {
-            console.error("[receipts/intake] ORPHANED OBJECT, no cleanup recorded", storagePath, recordError);
-        });
+        // No catch. See THROWS, above.
+        await io.record(storagePath, reason, scheduled);
         return false;
     }
     try {
@@ -456,11 +531,12 @@ export async function deleteObjectOrRecord(
         return true;
     } catch (error) {
         console.error("[receipts/intake] object delete failed", storagePath, error instanceof Error ? error.name : "error");
-        await io.record(storagePath, reason, null).catch(recordError => {
-            // Both the delete AND the record failed. Say so loudly: this is the
-            // one combination that loses an object with nothing left to find it.
-            console.error("[receipts/intake] ORPHANED OBJECT, no cleanup recorded", storagePath, recordError);
-        });
+        // No catch here either — a delete that failed AND a record that failed
+        // is the one combination that loses an object with nothing left to find
+        // it, and swallowing it turned that into a silent, permanent leak. The
+        // caller has to decide, and every caller that moved a pointer has a
+        // transaction to roll back.
+        await io.record(storagePath, reason, null);
         return false;
     }
 }
@@ -582,6 +658,33 @@ export async function retryPendingCleanups(
                 });
                 return "referenced" as const;
             }
+            // THE NEWEST SCHEDULE FOR THIS PATH WINS, never the one this
+            // particular event happens to carry.
+            //
+            // An event records the expiry its author OBSERVED, and that author
+            // can have been overtaken: a /start refresh extends the lease, and
+            // a second cleanup for the same path is then queued with a LATER
+            // deadline. Acting on the older event would delete the object
+            // while the refreshed URL still works — precisely the orphan the
+            // schedule exists to prevent, arriving through the queue instead
+            // of through the fence. Taken inside the lock, with the row's own
+            // current expiry folded in, so "newest" is answered against the
+            // same snapshot the delete acts on.
+            const siblings = await tx.automationEvent.findMany({
+                where: {
+                    kind: STORAGE_CLEANUP_KIND,
+                    status: "pending",
+                    detail: { contains: JSON.stringify(storagePath) },
+                },
+                select: { id: true, detail: true },
+            });
+            const newest = siblings
+                .map(s => cleanupDueAt(s.detail))
+                .reduce<Date | null>(
+                    (latest, at) => (at && (!latest || at > latest) ? at : latest),
+                    null,
+                );
+            if (pending(newest, now)) return "not-due" as const;
             // A throw here rolls the whole transaction back, so the event stays
             // pending for the next pass — the same outcome the old separate
             // delete had, without the resolve ever landing on its own.
@@ -590,7 +693,18 @@ export async function retryPendingCleanups(
             // removeReceiptObject surfaces a missing storage client as an error
             // rather than a success, so a misconfigured deployment cannot
             // quietly mark the queue clean.
-            await tx.automationEvent.update({ where: { id: event.id }, data: { status: "resolved" } });
+            // EVERY pending event naming this path, not just the one we came
+            // in on. They all describe the same object and it is now gone; a
+            // sibling left pending would be retried every pass forever, its
+            // remove() throwing "not found" each time, because nothing else
+            // will ever resolve it. Two events for one path is the normal
+            // shape once a lease can be refreshed mid-flight.
+            for (const sibling of siblings.length ? siblings : [{ id: event.id }]) {
+                await tx.automationEvent.update({
+                    where: { id: sibling.id },
+                    data: { status: "resolved" },
+                });
+            }
             return "deleted" as const;
         }).catch(error => {
             console.error(

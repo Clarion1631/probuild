@@ -21,6 +21,7 @@ import {
     driveFileIdOf,
     expenseAmountCents,
     MIN_BOOKING_BUDGET_MS,
+    reconcileExistingExpense,
     type BookableRow,
     type BookDependencies,
 } from "../src/lib/receipt-intake/book";
@@ -141,16 +142,24 @@ interface Recorder {
     sendMarks: string[];
     purchaseCalls: any[];
     expenses: any[];
+    expenseUpdates: any[];
     intakeUpdates: any[];
     events: any[];
+    /** Every qbPurchaseId the shared advisory lock was taken on. */
+    locks: string[];
 }
 
-function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?: { id: string }[] } = {}): Recorder {
+function recorder(
+    overrides: Partial<BookDependencies> = {},
+    opts: { estimates?: { id: string }[]; existingExpense?: Record<string, unknown> | null } = {},
+): Recorder {
     const purchaseCalls: any[] = [];
     const sendMarks: string[] = [];
     const expenses: any[] = [];
+    const expenseUpdates: any[] = [];
     const intakeUpdates: any[] = [];
     const events: any[] = [];
+    const locks: string[] = [];
 
     const tx = {
         project: {
@@ -161,12 +170,20 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
             }),
         },
         expense: {
-            findUnique: async () => null,
+            findUnique: async () => (opts.existingExpense ?? null),
             create: async (args: any) => { expenses.push(args.data); return { id: `exp-${expenses.length}` }; },
+            update: async (args: any) => { expenseUpdates.push(args.data); return {}; },
         },
         receiptIntake: {
             update: async (args: any) => { intakeUpdates.push(args.data); return {}; },
             updateMany: async (args: any) => { intakeUpdates.push(args.data); return { count: 1 }; },
+        },
+        // The shared per-qbPurchaseId advisory lock. Recorded rather than
+        // ignored: taking it is the whole point of the fix, so a version that
+        // stopped taking it must fail a test.
+        $queryRawUnsafe: async (_sql: string, ...values: unknown[]) => {
+            locks.push(String(values[0]));
+            return [];
         },
         $transaction: async (fn: any) => fn(tx),
     };
@@ -189,7 +206,7 @@ function recorder(overrides: Partial<BookDependencies> = {}, opts: { estimates?:
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events };
+    return { deps, sendMarks, purchaseCalls, expenses, expenseUpdates, intakeUpdates, events, locks };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {
@@ -664,13 +681,190 @@ test("alreadyExists books identically — the lost-response retry", async () => 
     assert.equal(r.events[0].status, "already-exists");
 });
 
+
+// ── Never link an Expense blindly (Codex round-12 item 2) ──────────────────
+//
+// The row under this `qbPurchaseId` is not necessarily one we wrote. The
+// expected race: the worker creates the QBO Purchase, dies before its commit,
+// and QBO expense sync imports that Purchase before the retry comes round. The
+// imported row is right about the money and knows nothing about this receipt —
+// `QboExpenseWrite` carries neither `costCodeId` nor `receiptUrl`. Legacy and
+// human-edited rows can disagree about more than that.
+//
+// Selecting `{ id: true }` and taking `existing ?? create` marked the intake
+// row BOOKED against whatever was there.
+
+/**
+ * What the QBO importer writes for this Purchase: right about the money,
+ * silent about the receipt. NOTE the date anchor — qboTransactionDate() writes
+ * `${txnDate}T00:00:00.000Z`, UTC midnight, while this file writes the
+ * company's LOCAL midnight for the same calendar day. The two differ by hours
+ * and mean the same day; a reconcile that compared instants would call every
+ * imported row a conflict.
+ */
+function importedExpense(over: Record<string, unknown> = {}) {
+    return {
+        id: "exp-existing",
+        estimateId: "est-1",
+        amount: 364.98,
+        vendor: "Lowes",
+        date: new Date("2026-08-03T00:00:00.000Z"),
+        costCodeId: null,
+        receiptUrl: null,
+        ...over,
+    };
+}
+
+/** The row a crash-gap retry finds of its OWN making: fully attributed. */
+function matchingExpense(over: Record<string, unknown> = {}) {
+    return importedExpense({
+        // Local midnight Pacific for the same day — the other anchor.
+        date: new Date("2026-08-03T07:00:00.000Z"),
+        costCodeId: "cc-plumb",
+        receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+        ...over,
+    });
+}
+
 test("an existing Expense for the same Purchase is reused, never duplicated", async () => {
-    const r = recorder();
-    (r.deps.db as any).expense.findUnique = async () => ({ id: "exp-existing" });
+    // The crash-gap retry finding its OWN row: everything agrees, so it links.
+    const r = recorder({}, { existingExpense: matchingExpense() });
     const result = await bookReceipt(row(), r.deps);
     assert.equal((result as any).expenseId, "exp-existing");
     assert.equal(r.expenses.length, 0, "no second Expense row");
+    assert.deepEqual(r.locks, ["QB-1"], "and the shared per-Purchase lock was taken first");
 });
+
+test("IMPORTER WINS: the receipt fills the attribution the sync could not know", async () => {
+    // The expected race. The importer's row carries no cost code and no
+    // receiptUrl — it cannot, those columns are not in QboExpenseWrite — so the
+    // retry fills them rather than linking a job-cost row that points at
+    // nothing and sits on no phase.
+    const r = recorder({}, { existingExpense: importedExpense() });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "booked");
+    assert.equal((result as any).expenseId, "exp-existing");
+    assert.equal(r.expenses.length, 0, "still no duplicate");
+    assert.equal(r.expenseUpdates.length, 1, "the existing row was completed, not replaced");
+    assert.equal(r.expenseUpdates[0].costCodeId, "cc-plumb");
+    assert.match(String(r.expenseUpdates[0].receiptUrl), /FILE123/);
+    // Money and identity agreed, so nothing there was touched.
+    for (const field of ["estimateId", "amount", "vendor", "date"]) {
+        assert.ok(!(field in r.expenseUpdates[0]), `${field} is not rewritten`);
+    }
+});
+
+test("the two date ANCHORS are not a conflict — same day, different midnight", async () => {
+    // The trap this test exists for: the importer stamps UTC midnight and this
+    // file stamps local midnight, so `existing.date.getTime() !== receipt.date`
+    // for EVERY imported row. Comparing instants would park the whole queue.
+    const utcAnchored = reconcileExistingExpense(importedExpense() as never, receiptValues());
+    const localAnchored = reconcileExistingExpense(matchingExpense() as never, receiptValues());
+    assert.deepEqual(utcAnchored.conflicts, [], "UTC-midnight marker, from the importer");
+    assert.deepEqual(localAnchored.conflicts, [], "local midnight, from this file");
+    // CONTROL: a genuinely different DAY is still a conflict.
+    const wrongDay = reconcileExistingExpense(
+        importedExpense({ date: new Date("2026-08-04T00:00:00.000Z") }) as never,
+        receiptValues(),
+    );
+    assert.deepEqual(wrongDay.conflicts, ["date"]);
+});
+
+test("a human's cost code is never overwritten by the receipt's suggestion", async () => {
+    // costCodeId and receiptUrl are fill-only. The importer cannot write either
+    // column, so a value there came from a person or an earlier receipt — and
+    // theirs is the answer that stands. There is no provenance column and no
+    // `notHumanCodedExpenseWhere` helper in this codebase; "the importer could
+    // not have written this" is the honest predicate.
+    const r = recorder({}, { existingExpense: importedExpense({ costCodeId: "cc-electrical" }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    const patch = r.expenseUpdates[0] ?? {};
+    assert.ok(!("costCodeId" in patch), "the human's phase stands");
+    assert.match(String(patch.receiptUrl), /FILE123/, "but the missing receipt link is still filled");
+});
+
+test("a CONFLICTING amount parks for a human instead of linking", async () => {
+    // Two views of one Purchase that disagree about real money. Nothing here
+    // can pick a winner, and linking would mark the intake row BOOKED against
+    // a job-cost figure the books do not have.
+    const r = recorder({}, { existingExpense: importedExpense({ amount: 401.11 }) });
+    const result = await bookReceipt(row(), r.deps);
+
+    assert.equal(result.outcome, "needs-review");
+    assert.match((result as any).reason, /^expense-conflict:/);
+    assert.match((result as any).reason, /amount/);
+    // THE KEY IS RETAINED. A Purchase provably exists in QuickBooks, so
+    // releasing it would let a resubmission of this receipt book a second one.
+    assert.equal((result as any).releaseStrongKey, false);
+    assert.equal(r.expenses.length, 0, "nothing written");
+    assert.equal(r.expenseUpdates.length, 0);
+    assert.ok(
+        !r.intakeUpdates.some(u => u.state === "BOOKED"),
+        "and the intake row was never marked BOOKED",
+    );
+});
+
+test("a CONFLICTING job parks too, and names the field", async () => {
+    const r = recorder({}, { existingExpense: importedExpense({ estimateId: "est-other" }) });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "needs-review");
+    assert.match((result as any).reason, /estimate/);
+    assert.equal((result as any).releaseStrongKey, false);
+});
+
+test("reconcile: the truth table, field by field", () => {
+    const base = () => reconcileExistingExpense(importedExpense() as never, receiptValues());
+    assert.deepEqual(base().conflicts, [], "the expected importer row is not a conflict");
+    assert.deepEqual(
+        Object.keys(base().fill).sort(),
+        ["costCodeId", "receiptUrl"],
+        "only what the importer could not know",
+    );
+
+    // Nullable columns: absent means missing attribution, not disagreement.
+    const noVendor = reconcileExistingExpense(importedExpense({ vendor: null }) as never, receiptValues());
+    assert.deepEqual(noVendor.conflicts, []);
+    assert.equal(noVendor.fill.vendor, "Lowes");
+    const noDate = reconcileExistingExpense(importedExpense({ date: null }) as never, receiptValues());
+    assert.deepEqual(noDate.conflicts, []);
+    assert.ok(noDate.fill.date instanceof Date);
+
+    // Populated and different: a real contradiction.
+    assert.deepEqual(
+        reconcileExistingExpense(importedExpense({ vendor: "Home Depot" }) as never, receiptValues()).conflicts,
+        ["vendor"],
+    );
+    // Several at once are all reported, so a reviewer sees the whole picture.
+    assert.deepEqual(
+        reconcileExistingExpense(
+            importedExpense({ estimateId: "est-9", amount: 1, vendor: "X" }) as never,
+            receiptValues(),
+        ).conflicts,
+        ["estimate", "amount", "vendor"],
+    );
+    // A receipt with no phase to offer fills nothing rather than nulling one.
+    const noSuggestion = reconcileExistingExpense(
+        importedExpense() as never,
+        { ...receiptValues(), costCodeId: null },
+    );
+    assert.ok(!("costCodeId" in noSuggestion.fill));
+});
+
+/** The receipt's canonical values, as bookReceipt computes them for row(). */
+function receiptValues() {
+    return {
+        estimateId: "est-1",
+        amountCents: 36498,
+        vendor: "Lowes",
+        date: new Date("2026-08-03T07:00:00.000Z"),
+        calendarDay: "2026-08-03",
+        timeZone: "America/Los_Angeles",
+        costCodeId: "cc-plumb",
+        receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+    };
+}
 
 test("a DB failure AFTER the Purchase exists retries — the create is idempotent", async () => {
     const r = recorder();
@@ -1315,7 +1509,6 @@ test("the mismatch park is NOT recoverable by a re-upload", async () => {
         finalizeDisposition({
             state: "NEEDS_REVIEW",
             stateReason: `${QBO_PURCHASE_MISMATCH_PREFIX}project`,
-            uploadLeaseVersion: 1,
         }),
         "not-recoverable",
     );

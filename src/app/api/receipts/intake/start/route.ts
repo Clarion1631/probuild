@@ -10,13 +10,13 @@ import { cleanupNotBefore, uploadLeaseExpiry } from "@/lib/receipt-intake/worker
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
 import {
     finalizeDisposition,
-    publishFence,
+    leaseFence,
     uploadPathFor,
     verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
 import { discardUnresumedLease, newLeaseNonce, reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
 import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
-import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
+import { queueObjectCleanup } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
@@ -196,6 +196,8 @@ export async function POST(req: Request) {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
                     uploadLeaseVersion: true, uploadUrlExpiresAt: true,
+                    // The generation the fences pin — see leaseFence.
+                    uploadLeaseNonce: true,
                     // Only for cleanupNotBefore: an inline row has no expiry,
                     // and its capability window is measured from createdAt.
                     createdAt: true,
@@ -312,9 +314,18 @@ export async function POST(req: Request) {
                 // already in the client's hands.
                 const nextLease = existing.uploadLeaseVersion + 1;
                 const retryPath = uploadPathFor(existing.id, nextLease, ext);
-                const { count } = await prisma.receiptIntake.updateMany({
-                    where: { id: existing.id, ...publishFence(existing) },
-                    data: {
+                // ONE TRANSACTION: the repath and the OLD path's cleanup entry.
+                //
+                // The move orphans the previous object, and the queue entry is
+                // the only thing that will remember it. Writing them separately
+                // meant a transient database failure on the second left bytes
+                // no row referenced and no sweep would ever look at — silently,
+                // because the failure was swallowed. Now they commit together
+                // or the row never moves.
+                const repathed = await repathWithCleanup(
+                    existing,
+                    { id: existing.id, ...leaseFence(existing) },
+                    {
                         storagePath: retryPath,
                         expectedSha256,
                         uploadUrlExpiresAt: uploadLeaseExpiry(),
@@ -331,8 +342,13 @@ export async function POST(req: Request) {
                         fileSize: 0,
                         nextRetryAt: null,
                     },
-                });
-                if (count === 0) {
+                    retryPath,
+                    "start-rearmed-repath",
+                );
+                if (repathed === "unavailable") {
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                }
+                if (repathed === "conflict") {
                     return leaseConflict(existing.id);
                 }
                 // THE OLD OBJECT IS UNREFERENCED THE INSTANT THE CAS LANDS —
@@ -349,21 +365,6 @@ export async function POST(req: Request) {
                 // deleteObjectOrRecord is exactly the guarded path for this —
                 // it deletes, and records a pending cleanup when the delete
                 // fails.
-                // SCHEDULED, not immediate. This branch is reached with a live
-                // lease in one case — a caller that changed its declared
-                // extension, so liveLeasePath refused to reuse the row's path
-                // — and the OLD path's signed URL is still working then.
-                // Deleting there only lets its holder PUT the object back
-                // after the row has moved on. cleanupNotBefore is null once
-                // that lease has expired, which is the common case, and the
-                // delete happens at once as before.
-                if (retryPath !== existing.storagePath) {
-                    await deleteObjectOrRecord(
-                        existing.storagePath,
-                        "start-rearmed-repath",
-                        cleanupNotBefore(existing),
-                    );
-                }
                 const rearmed = await signUpload(retryPath);
                 if (!rearmed) {
                     // The row keeps the NEW path and a live expiry, so the
@@ -497,36 +498,32 @@ export async function POST(req: Request) {
             // game to invalidate, since nothing live can still be relying on it.
             const nextLease = existing.uploadLeaseVersion + 1;
             const resumePath = uploadPathFor(existing.id, nextLease, ext);
-            const { count } = await prisma.receiptIntake.updateMany({
-                where: {
+            // ONE TRANSACTION, same rule as the re-arm above: the repath
+            // orphans the previous object and the queue entry is all that will
+            // remember it, so the two commit together or neither does. Also
+            // BEFORE the signing — the CAS re-points the row whatever the
+            // signer does next, so cleaning up only on the happy path left
+            // every 503 below leaking an object nothing referenced.
+            const resumedRepath = await repathWithCleanup(
+                existing,
+                {
                     id: existing.id,
                     state: "STAGING",
                     uploadLeaseVersion: existing.uploadLeaseVersion,
                 },
-                data: {
+                {
                     storagePath: resumePath,
                     uploadLeaseVersion: nextLease,
                     uploadUrlExpiresAt: uploadLeaseExpiry(),
                     uploadLeaseNonce: newLeaseNonce(),
                 },
-            });
-            if (count === 0) return leaseConflict(existing.id);
-            // BEFORE the signing, for the same reason as the re-arm above: the
-            // CAS already re-pointed the row, so the previous lease's object is
-            // unreferenced whatever the signer does next. Cleaning up only on
-            // success meant a 503 here left it in the bucket with nothing
-            // pointing at it and nothing remembering it.
-            if (resumePath !== existing.storagePath) {
-                // Same rule as the re-arm above: the previous lease is normally
-                // dead here (reuseLiveLease already declined it), so this is
-                // normally an immediate delete — but an extension change can
-                // reach it with a live URL, and that one has to wait.
-                await deleteObjectOrRecord(
-                    existing.storagePath,
-                    "start-resumed-repath",
-                    cleanupNotBefore(existing),
-                );
+                resumePath,
+                "start-resumed-repath",
+            );
+            if (resumedRepath === "unavailable") {
+                return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
             }
+            if (resumedRepath === "conflict") return leaseConflict(existing.id);
             const resumed = await signUpload(resumePath);
             // The row is on the new path with a live expiry, so a retry resumes
             // through reuseLiveLease over that same path.
@@ -588,6 +585,63 @@ export async function POST(req: Request) {
         maxBytes: MAX_STORED_BYTES,
         ...signed,
     });
+}
+
+/**
+ * REPOINT A ROW AND REMEMBER THE OBJECT IT LEAVES BEHIND, ATOMICALLY.
+ *
+ * Both destructive /start branches do the same two writes: a fenced CAS that
+ * moves `storagePath` to a freshly-versioned path, and a cleanup entry for the
+ * path it just abandoned. They were separate statements, and the second one's
+ * failure was swallowed — so a transient database error left bytes in a
+ * private bucket that no row referenced, no event remembered and no sweep
+ * would ever look at. Permanently, and silently.
+ *
+ * In one transaction they are all-or-nothing: either the row moves AND the
+ * orphan is queued, or the row does not move and the object is still reachable
+ * through it. `unavailable` is the caller's 503 — the honest answer when we
+ * could not do both.
+ *
+ * The cleanup is SCHEDULED, not immediate. Normally the previous lease is
+ * already dead here (reuseLiveLease declined it), and `cleanupNotBefore`
+ * returns null so the sweep deletes at once. The exception is a caller that
+ * changed its declared extension: liveLeasePath then refuses to reuse the
+ * path even though the URL still works, and deleting under that live
+ * capability would let its holder PUT the object straight back.
+ */
+async function repathWithCleanup(
+    existing: { storagePath: string; uploadUrlExpiresAt: Date | null; createdAt: Date },
+    fence: Record<string, unknown>,
+    data: Record<string, unknown>,
+    nextPath: string,
+    reason: string,
+): Promise<"moved" | "conflict" | "unavailable"> {
+    try {
+        return await prisma.$transaction(async tx => {
+            const { count } = await tx.receiptIntake.updateMany({ where: fence, data });
+            if (count === 0) return "conflict" as const;
+            // Only when the path actually MOVED. Queueing the path the row was
+            // just re-pointed AT would mark the live upload target for deletion.
+            if (nextPath !== existing.storagePath) {
+                await queueObjectCleanup(
+                    tx,
+                    existing.storagePath,
+                    reason,
+                    cleanupNotBefore(existing),
+                );
+            }
+            return "moved" as const;
+        });
+    } catch (error) {
+        // The row did NOT move: the transaction rolled back, so it still points
+        // at its old object and nothing is orphaned. A retryable answer.
+        console.error(
+            "[receipts/intake] repath transaction failed",
+            reason,
+            error instanceof Error ? error.name : "error",
+        );
+        return "unavailable";
+    }
 }
 
 function leaseConflict(existingId: string) {

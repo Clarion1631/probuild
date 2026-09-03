@@ -18,7 +18,7 @@ import {
     MAX_INLINE_UPLOAD_BYTES,
     MAX_STORED_BYTES,
 } from "@/lib/receipt-intake/intake-core";
-import { finalizeDisposition, publishFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
+import { finalizeDisposition, leaseFence, verifyStoredCopy } from "@/lib/receipt-intake/stored-object";
 import {
     ARCHIVE_READABLE_STATES,
     listReceiptIntakes,
@@ -431,8 +431,25 @@ async function publishStagedRow(id: string, expectStoragePath: string, expectSta
             // path (see /start), so nothing else will ever find this one to
             // clean it up. Do it now, before reporting the idempotent outcome
             // the loser is about to return.
+            //
+            // AND THE FAILURE IS NOT SWALLOWED. deleteObjectOrRecord throws
+            // when it can neither delete the object nor record it, and this
+            // caller has no transaction to roll back — so the throw has to
+            // reach the client as a retryable 503 rather than be discarded on
+            // the way to a cheerful `alreadyPublished`. A forwarder deletes
+            // its only copy on that answer, and the bytes we just orphaned
+            // would be the ones nobody can find.
             if (current?.storagePath && current.storagePath !== expectStoragePath) {
-                await deleteObjectOrRecord(expectStoragePath, "orphaned-by-concurrent-publish");
+                const remembered = await deleteObjectOrRecord(
+                    expectStoragePath,
+                    "orphaned-by-concurrent-publish",
+                ).then(() => true, () => false);
+                if (!remembered) {
+                    return NextResponse.json(
+                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { status: 503 },
+                    );
+                }
             }
             // Somebody else published it; that is the outcome the caller wanted.
             if (current?.state === "RECEIVED") {
@@ -483,7 +500,9 @@ async function respondToSourceRefConflict(
         select: {
             id: true, state: true, source: true, sourceRef: true, projectId: true,
             dryRun: true, fileSha256: true, createdById: true, storagePath: true, stateReason: true,
-            uploadLeaseVersion: true,
+            // The whole lease identity, because the heal's CAS pins it — see
+            // leaseFence. A refresh moves only the nonce and the expiry.
+            uploadLeaseVersion: true, uploadLeaseNonce: true, uploadUrlExpiresAt: true,
         },
     });
     // The row vanished between the failed insert and this read (a delete
@@ -587,12 +606,28 @@ async function respondToSourceRefConflict(
             // while we were uploading, so the object we just wrote is
             // unreferenced — clean it up rather than orphan it.
             const { count } = await prisma.receiptIntake.updateMany({
-                where: { id: existing.id, ...publishFence(existing) },
+                // leaseFence: the heal REPOINTS the row at bytes this request
+                // uploaded, and a /start that reissued the client's URL in the
+                // meantime moves neither the state, the reason nor the version.
+                where: { id: existing.id, ...leaseFence(existing) },
                 data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
             });
             if (count === 0) {
+                // Same rule as the publish-race drop above: this branch has no
+                // transaction of its own, so a cleanup that could neither
+                // delete nor record must surface as a retryable 503 instead of
+                // being lost inside a 409.
                 if (payload.storagePath !== existing.storagePath) {
-                    await deleteObjectOrRecord(payload.storagePath, "heal-lost-race");
+                    const remembered = await deleteObjectOrRecord(
+                        payload.storagePath,
+                        "heal-lost-race",
+                    ).then(() => true, () => false);
+                    if (!remembered) {
+                        return NextResponse.json(
+                            { ok: false, reason: "storage-unavailable", retryable: true },
+                            { status: 503 },
+                        );
+                    }
                 }
                 return NextResponse.json(
                     { ok: false, error: "publish-conflict", id: existing.id },

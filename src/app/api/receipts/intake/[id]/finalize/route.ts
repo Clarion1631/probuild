@@ -9,7 +9,7 @@ import {
     declaredShaConflict,
     finalizeDisposition,
     inspectStoredObject,
-    publishFence,
+    leaseFence,
     sealAndPublish,
     verifyStoredCopy,
 } from "@/lib/receipt-intake/stored-object";
@@ -23,6 +23,7 @@ import {
 } from "@/lib/receipt-intake/late-fields";
 import {
     deleteObjectOrRecord,
+    queueObjectCleanup,
     rejectRowAndQueueCleanup,
     sealObject,
     settleQueuedCleanup,
@@ -229,6 +230,11 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             // object deletion on this path has to be scheduled for after it
             // dies rather than taken now. See cleanupNotBefore.
             uploadUrlExpiresAt: true, createdAt: true,
+            // The lease GENERATION. Read so leaseFence can pin it: a /start
+            // refresh moves nothing else on this row, so without it an
+            // in-flight finalizer publishes (or rejects) over a lease that has
+            // already been reissued to a client still holding a working URL.
+            uploadLeaseNonce: true,
         },
     });
     if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
@@ -391,6 +397,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 stateReason: row.stateReason,
                 storagePath: row.storagePath,
                 uploadLeaseVersion: row.uploadLeaseVersion,
+                // The lease GENERATION, so a /start that reissued this
+                // client's URL while we were inspecting the object makes this
+                // delete match zero rows instead of destroying a row whose
+                // upload link works again.
+                uploadLeaseNonce: row.uploadLeaseNonce,
+                uploadUrlExpiresAt: row.uploadUrlExpiresAt,
                 cleanupNotBefore: cleanupAfter,
             },
             check.reason,
@@ -503,7 +515,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                 // this write — a re-park under a different reason, a worker
                 // claim, a job filled in — invalidates what was checked above,
                 // so the publish must lose rather than overwrite it.
-                where: { id, ...publishFence(row), ...merged.guard },
+                where: { id, ...leaseFence(row), ...merged.guard },
                 data: {
                     state: "RECEIVED",
                     stateReason: null,
@@ -523,8 +535,14 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // used — so this delete waits for that URL to die. Deleting the moment
         // the pointer moved to the canonical path left the holder able to PUT
         // the upload path back into existence, unreferenced and unremembered.
-        dropUpload: uploadPath =>
-            deleteObjectOrRecord(uploadPath, "sealed", cleanupAfter).then(() => undefined),
+        //
+        // ENQUEUED IN THE COMMIT TRANSACTION: the queue entry is the only thing
+        // that remembers this object once the row points elsewhere, so it must
+        // commit with the pointer or not at all.
+        queueUploadCleanup: (tx, uploadPath) =>
+            queueObjectCleanup(tx, uploadPath, "sealed", cleanupAfter),
+        settleUploadCleanup: (eventId, uploadPath) =>
+            settleQueuedCleanup(eventId, uploadPath, cleanupAfter).then(() => undefined),
         currentStoragePath: async (tx, rowId) => {
             const r = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
             return r?.storagePath ?? null;

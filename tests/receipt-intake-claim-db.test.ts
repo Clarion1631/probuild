@@ -14,6 +14,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient, Prisma } from "@prisma/client";
 import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
+import { lockQboExpense } from "../src/lib/qbo-expense-sync";
+import { reconcileExistingExpense } from "../src/lib/receipt-intake/book";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
 const looksLikeProd = !!url && /supabase\.(co|com)/i.test(url);
@@ -309,4 +311,147 @@ test("the PER-OBJECT lock really is mutually exclusive, and really is per path",
         Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtext('receipt-object:' || ${"receipts/a/v1/aa.png"})) AS locked`,
     );
     assert.equal(after.locked, true, "the lock was released when its transaction ended");
+});
+
+// ── The importer-wins race, against a REAL Postgres (round-12 item 2) ───────
+//
+// The expected crash gap: the worker creates the QBO Purchase, dies before its
+// commit, and `syncQboExpenses` imports that Purchase before the retry comes
+// round. The retry then finds an Expense it did not write — right about the
+// money, silent about this receipt, because `QboExpenseWrite` carries neither
+// `costCodeId` nor `receiptUrl`.
+//
+// The unit suite drives `reconcileExistingExpense` directly. What it cannot
+// show is that the two writers actually take the SAME advisory lock, and that
+// the reconcile survives a real `Decimal` column and a real `@db.Timestamptz`
+// round trip — a `Number(Decimal)` that lost a cent, or a date that came back
+// in a different anchor, would park every imported receipt in production while
+// every mock stayed green.
+
+const EXPENSE_PREFIX = "QBTEST-";
+
+async function cleanupExpenses() {
+    await db!.expense.deleteMany({ where: { qbPurchaseId: { startsWith: EXPENSE_PREFIX } } });
+    await db!.estimate.deleteMany({ where: { code: { startsWith: EXPENSE_PREFIX } } });
+}
+
+/**
+ * A disposable Estimate to hang the Expense off. CREATED, never found: CI's
+ * database is built from migrations with no seed data, so a test that skipped
+ * when it could not find one would be a silent no-op in the one place it is
+ * meant to run. Estimate needs no foreign key of its own.
+ */
+async function disposableEstimateId(): Promise<string> {
+    const estimate = await db!.estimate.create({
+        data: {
+            title: "receipt-intake expense reconcile",
+            code: `${EXPENSE_PREFIX}EST`,
+            totalAmount: new Prisma.Decimal("0"),
+            balanceDue: new Prisma.Decimal("0"),
+        },
+        select: { id: true },
+    });
+    return estimate.id;
+}
+
+test("the per-Purchase lock is SHARED, and it really serializes", { skip }, async () => {
+    // lockQboExpense is exported from qbo-expense-sync and called by book.ts —
+    // one function, so the two writers cannot drift onto different keys. This
+    // proves the SQL runs and that the key actually excludes a second holder.
+    const purchaseId = `${EXPENSE_PREFIX}lock-1`;
+    const blocked = await db!.$transaction(async tx => {
+        await lockQboExpense(tx, purchaseId);
+        const [row] = await db!.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${purchaseId}, 0)) AS locked`,
+        );
+        return row.locked;
+    });
+    assert.equal(blocked, false, "a second writer of the same Purchase id waits");
+
+    // A DIFFERENT Purchase id never waits — the lock is per-Purchase, not global.
+    const other = await db!.$transaction(async tx => {
+        await lockQboExpense(tx, purchaseId);
+        const [row] = await db!.$queryRaw<{ locked: boolean }[]>(
+            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${`${EXPENSE_PREFIX}lock-2`}, 0)) AS locked`,
+        );
+        return row.locked;
+    });
+    assert.equal(other, true);
+});
+
+test("IMPORTER WINS: the retry reconciles a real imported Expense", { skip }, async () => {
+    await cleanupExpenses();
+    const estimateId = await disposableEstimateId();
+    const qbPurchaseId = `${EXPENSE_PREFIX}race-1`;
+    try {
+        // The sync imports the Purchase first. Exactly what upsertQboExpense
+        // writes — note the UTC-midnight date anchor and the absent cost code.
+        const imported = await db!.expense.create({
+            data: {
+                estimateId,
+                qbPurchaseId,
+                qbSyncToken: "0",
+                amount: new Prisma.Decimal("364.98"),
+                vendor: "Lowes",
+                date: new Date("2026-08-03T00:00:00.000Z"),
+                description: "[QBO] Lowes",
+                status: "Reviewed",
+            },
+            select: {
+                id: true, estimateId: true, amount: true, vendor: true,
+                date: true, costCodeId: true, receiptUrl: true,
+            },
+        });
+
+        // The worker retry reads it back through the SAME select book.ts uses,
+        // and reconciles against the receipt's canonical values.
+        const verdict = reconcileExistingExpense(imported, {
+            estimateId,
+            amountCents: 36498,
+            vendor: "Lowes",
+            // The worker's own anchor: local midnight, hours away from the
+            // importer's UTC marker for the same day.
+            date: new Date("2026-08-03T07:00:00.000Z"),
+            calendarDay: "2026-08-03",
+            timeZone: "America/Los_Angeles",
+            costCodeId: null,
+            receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+        });
+
+        // A real Decimal and a real Timestamptz round trip, and the two date
+        // anchors, are all non-conflicts.
+        assert.deepEqual(verdict.conflicts, [], "the imported row is not a conflict");
+        assert.deepEqual(
+            Object.keys(verdict.fill),
+            ["receiptUrl"],
+            "only the attribution the importer could not write",
+        );
+
+        await db!.expense.update({ where: { id: imported.id }, data: verdict.fill });
+        const healed = await db!.expense.findUnique({
+            where: { id: imported.id },
+            select: { receiptUrl: true, amount: true, vendor: true },
+        });
+        assert.match(healed!.receiptUrl!, /FILE123/);
+        assert.equal(Number(healed!.amount), 364.98, "and the money was not touched");
+
+        // THE CONFLICTING VARIANT. A populated amount that disagrees is a real
+        // contradiction about real money — it parks rather than linking.
+        const conflicting = reconcileExistingExpense(
+            { ...imported, amount: new Prisma.Decimal("401.11") },
+            {
+                estimateId,
+                amountCents: 36498,
+                vendor: "Lowes",
+                date: new Date("2026-08-03T07:00:00.000Z"),
+                calendarDay: "2026-08-03",
+                timeZone: "America/Los_Angeles",
+                costCodeId: null,
+                receiptUrl: "https://drive.google.com/file/d/FILE123/view",
+            },
+        );
+        assert.deepEqual(conflicting.conflicts, ["amount"]);
+    } finally {
+        await cleanupExpenses();
+    }
 });

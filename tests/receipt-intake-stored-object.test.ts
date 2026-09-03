@@ -16,7 +16,9 @@ import {
     downloadVerified,
     finalizeDisposition,
     inspectStoredObject,
+    leaseFence,
     publishFence,
+    type ObservedRow,
     RECOVERABLE_PARK_REASONS,
     sealAndPublish,
     verifyStoredCopy,
@@ -369,7 +371,8 @@ function publishHarness(
             return opts.sealOk === false ? null : canonical;
         },
         commit: async () => { calls.push("commit"); return opts.committed ?? 1; },
-        dropUpload: async () => { calls.push("drop"); },
+        queueUploadCleanup: async () => { calls.push("queue-cleanup"); return "ev-1"; },
+        settleUploadCleanup: async () => { calls.push("drop"); },
         currentStoragePath: async () => {
             calls.push("current-path");
             if (opts.currentPathThrows) throw new Error("db is down");
@@ -388,7 +391,13 @@ test("the upload object is deleted only AFTER the row pointer is committed", asy
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, h.deps);
     // And the seal and the commit are INSIDE one critical section: the gap
     // between them is exactly where the cleanup sweep used to fit.
-    assert.deepEqual(h.calls, ["lock", "seal", "commit", "unlock", "drop"]);
+    //
+    // THE QUEUE ENTRY IS INSIDE IT TOO, between the commit and the unlock. It
+    // is the only thing that remembers the upload object once the pointer has
+    // moved, so it commits with that pointer or not at all; the actual delete
+    // stays outside, after the unlock, where a failure costs nothing because
+    // the sweep will pick the entry up.
+    assert.deepEqual(h.calls, ["lock", "seal", "commit", "queue-cleanup", "unlock", "drop"]);
     assert.equal(outcome?.published, true);
     assert.equal(outcome?.canonicalPath, `receipts/row-1/v1/${CHECK.fileSha256}.png`);
 });
@@ -520,7 +529,8 @@ async function raceSweepAgainstPublish(lockPaths: boolean) {
             rowStoragePath = canonical;
             return 1;
         },
-        dropUpload: async (uploadPath: string) => { objects.delete(uploadPath); },
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async (_id: string, uploadPath: string) => { objects.delete(uploadPath); },
         currentStoragePath: async () => rowStoragePath,
         dropOrphanedCanonical: async () => {},
     } as never);
@@ -602,36 +612,71 @@ test("the sweeper's two parks are the ones /finalize recovers from", () => {
 // ── Which parks a re-upload may clear, and the fence it publishes under ─────
 
 test("only the two SWEEPER parks are recoverable; a human's park is not", () => {
-    assert.equal(finalizeDisposition({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 }), "publish");
+    assert.equal(finalizeDisposition({ state: "STAGING", stateReason: null }), "publish");
     for (const reason of RECOVERABLE_PARK_REASONS) {
-        assert.equal(finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason, uploadLeaseVersion: 1 }), "publish", reason);
+        assert.equal(finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }), "publish", reason);
     }
     // Everything else parked for review is somebody's decision. Republishing it
     // drags the row back to RECEIVED and re-reads it, discarding that decision.
     for (const reason of ["vendor-mismatch", "weak-dup:row-9", "qbo-fault:6210", "amount-mismatch", null]) {
         assert.equal(
-            finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason, uploadLeaseVersion: 1 }),
+            finalizeDisposition({ state: "NEEDS_REVIEW", stateReason: reason }),
             "not-recoverable",
             String(reason),
         );
     }
     // And a row that already moved on is simply settled — not an error.
     for (const state of ["RECEIVED", "READ", "BOOKING", "BOOKED", "ARCHIVED", "DUPLICATE"]) {
-        assert.equal(finalizeDisposition({ state, stateReason: null, uploadLeaseVersion: 1 }), "settled", state);
+        assert.equal(finalizeDisposition({ state, stateReason: null }), "settled", state);
     }
 });
 
+/** An observed row, with a lease generation the fences can pin. */
+const NONCE = "nonce-a";
+const EXPIRY = new Date("2026-09-03T12:00:00.000Z");
+const observedRow = (over: Partial<ObservedRow> = {}): ObservedRow => ({
+    state: "STAGING",
+    stateReason: null,
+    uploadLeaseVersion: 1,
+    uploadLeaseNonce: NONCE,
+    uploadUrlExpiresAt: EXPIRY,
+    ...over,
+});
+
 test("the publish fence pins the exact state, the exact reason and an unclaimed row", () => {
-    assert.deepEqual(publishFence({ state: "NEEDS_REVIEW", stateReason: "file-missing", uploadLeaseVersion: 1 }), {
+    assert.deepEqual(publishFence(observedRow({ state: "NEEDS_REVIEW", stateReason: "file-missing" })), {
         state: "NEEDS_REVIEW",
         stateReason: "file-missing",
         claimToken: null, uploadLeaseVersion: 1,
     });
-    assert.deepEqual(publishFence({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 }), {
+    assert.deepEqual(publishFence(observedRow()), {
         state: "STAGING",
         stateReason: null,
         claimToken: null, uploadLeaseVersion: 1,
     });
+});
+
+test("the LEASE fence adds the generation publishFence cannot see", () => {
+    // The gap this closes: reuseLiveLease reissues a working signed URL over
+    // the SAME path at the SAME version and moves nothing else, so a finalizer
+    // that read the row before the refresh still satisfies publishFence.
+    assert.deepEqual(leaseFence(observedRow()), {
+        state: "STAGING",
+        stateReason: null,
+        claimToken: null,
+        uploadLeaseVersion: 1,
+        uploadLeaseNonce: NONCE,
+        uploadUrlExpiresAt: EXPIRY,
+    });
+    // CONTROL: publishFence carries neither, which is exactly why a refresh
+    // was invisible to it — the two fences must differ on precisely these two
+    // keys and nothing else.
+    const weak = publishFence(observedRow());
+    const strong = leaseFence(observedRow());
+    assert.deepEqual(
+        Object.keys(strong).filter(k => !(k in weak)).sort(),
+        ["uploadLeaseNonce", "uploadUrlExpiresAt"],
+    );
 });
 
 /** Enough of Prisma's updateMany semantics to run a CAS against one row. */
@@ -656,15 +701,15 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
     // would reset a reason it never looked at back to RECEIVED — discarding the
     // newer decision and republishing a row somebody else now owns.
     const store = rowStore({
-        id: "row-1", state: "NEEDS_REVIEW", stateReason: "file-missing", claimToken: null, uploadLeaseVersion: 1,
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "file-missing", claimToken: null, uploadLeaseVersion: 1, uploadLeaseNonce: NONCE, uploadUrlExpiresAt: EXPIRY,
     });
-    const observed = {
+    const observed = observedRow({
         state: store.get().state as string,
         stateReason: store.get().stateReason as string,
         uploadLeaseVersion: store.get().uploadLeaseVersion as number,
-    };
+    });
     assert.equal(finalizeDisposition(observed), "publish", "it was recoverable when we read it");
-    const fence = publishFence(observed);
+    const fence = leaseFence(observed);
 
     let dropped = false;
     let droppedOrphan = false;
@@ -681,7 +726,8 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
                 { id: "row-1", ...fence },
                 { state: "RECEIVED", stateReason: null, storagePath: canonicalPath },
             ),
-        dropUpload: async () => { dropped = true; },
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async () => { dropped = true; },
         currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
         dropOrphanedCanonical: async () => { droppedOrphan = true; },
     } as never);
@@ -698,9 +744,9 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
 
 test("RACE: a worker claim taken during sealing also loses the publish", async () => {
     const store = rowStore({
-        id: "row-1", state: "STAGING", stateReason: null, claimToken: null, uploadLeaseVersion: 1,
+        id: "row-1", state: "STAGING", stateReason: null, claimToken: null, uploadLeaseVersion: 1, uploadLeaseNonce: NONCE, uploadUrlExpiresAt: EXPIRY,
     });
-    const fence = publishFence({ state: "STAGING", stateReason: null, uploadLeaseVersion: 1 });
+    const fence = leaseFence(observedRow());
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
         withObjectLock: noLock,
         seal: async (_u: string, canonical: string) => {
@@ -708,7 +754,8 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
             return canonical;
         },
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED" }),
-        dropUpload: async () => {},
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async () => {},
         currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
         dropOrphanedCanonical: async () => {},
     } as never);
@@ -718,14 +765,15 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
 
 test("an unchanged row still publishes — the control", async () => {
     const store = rowStore({
-        id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null, uploadLeaseVersion: 1,
+        id: "row-1", state: "NEEDS_REVIEW", stateReason: "sha-mismatch", claimToken: null, uploadLeaseVersion: 1, uploadLeaseNonce: NONCE, uploadUrlExpiresAt: EXPIRY,
     });
-    const fence = publishFence({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch", uploadLeaseVersion: 1 });
+    const fence = leaseFence(observedRow({ state: "NEEDS_REVIEW", stateReason: "sha-mismatch" }));
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", 1, CHECK, {
         withObjectLock: noLock,
         seal: async (_u: string, canonical: string) => canonical,
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED", stateReason: null, uploadLeaseVersion: 1 }),
-        dropUpload: async () => {},
+        queueUploadCleanup: async () => "ev-1",
+        settleUploadCleanup: async () => {},
     } as never);
     assert.equal(outcome?.published, true);
     assert.equal(store.get().state, "RECEIVED");
@@ -740,8 +788,14 @@ test("both publishers use the shared fence, and finalize refuses the other parks
         path.join(__dirname, "..", "src/app/api/receipts/intake/route.ts"),
         "utf8",
     );
-    assert.match(finalize, /where: \{ id, \.\.\.publishFence\(row\), \.\.\.merged\.guard \}/);
-    assert.match(intake, /where: \{ id: existing\.id, \.\.\.publishFence\(existing\) \}/);
+    // leaseFence, not publishFence: BOTH publishers pin the lease generation
+    // too, so a /start that reissued the client's URL over the same path and
+    // version invalidates an in-flight finalizer instead of being invisible.
+    assert.match(finalize, /where: \{ id, \.\.\.leaseFence\(row\), \.\.\.merged\.guard \}/);
+    assert.match(intake, /where: \{ id: existing\.id, \.\.\.leaseFence\(existing\) \}/);
+    for (const [name, src] of [["finalize", finalize], ["intake", intake]] as const) {
+        assert.ok(!/\bpublishFence\(/.test(src), `${name}: the weaker fence is gone entirely`);
+    }
     assert.ok(
         !/state: \{ in: \["STAGING", "NEEDS_REVIEW"\] \}/.test(finalize),
         "the state-SET fence is gone",
@@ -947,4 +1001,115 @@ test("the OTHER two replay paths already refuse a mismatching hash", () => {
         replayRoutes["POST /api/receipts/intake"],
         /if \(existing\.fileSha256 !== fileSha256\) \{/,
     );
+});
+
+// ── A /start REFRESH during an in-flight finalize (Codex round-12 item 1) ───
+//
+// `reuseLiveLease` hands a retrying client a brand-new signed URL over the
+// SAME path at the SAME lease version. It writes exactly two columns —
+// `uploadLeaseNonce` and `uploadUrlExpiresAt` — and moves nothing else. So a
+// fence built from state/reason/claim/version matched just as well after that
+// refresh as before it, and a finalizer that had already read the row could:
+//
+//   - PUBLISH bytes the client has just been invited to replace, and schedule
+//     the upload object's cleanup against the expiry it read — which the
+//     refreshed URL then outlives, so a later valid PUT recreates an object no
+//     row references and no sweep is looking for; or
+//   - REJECT the row, deleting it out from under a client whose upload link
+//     works again, on that same stale schedule.
+//
+// The fix is `leaseFence`. Each test below runs the interleaving, and each
+// carries the pre-fix control: the same interleaving judged by `publishFence`,
+// which still matches and would still have written.
+
+/** What reuseLiveLease writes: a fresh generation and a longer window. */
+const REFRESHED_NONCE = "nonce-b";
+const REFRESHED_EXPIRY = new Date(EXPIRY.getTime() + 2 * 60 * 60_000);
+
+function leasedRow() {
+    return rowStore({
+        id: "row-1",
+        state: "STAGING",
+        stateReason: null,
+        claimToken: null,
+        storagePath: "receipts/intake/row-1.v1.png",
+        uploadLeaseVersion: 1,
+        uploadLeaseNonce: NONCE,
+        uploadUrlExpiresAt: EXPIRY,
+    });
+}
+
+/** The /start retry that adopts the live lease. Same path, same version. */
+function refreshLease(store: ReturnType<typeof rowStore>) {
+    store.set({ uploadLeaseNonce: REFRESHED_NONCE, uploadUrlExpiresAt: REFRESHED_EXPIRY });
+}
+
+test("PUBLISH vs REFRESH: a lease reissued mid-finalize invalidates the publish", async () => {
+    const store = leasedRow();
+    // The finalizer reads the row...
+    const observed = observedRow({
+        state: store.get().state as string,
+        stateReason: store.get().stateReason as string | null,
+        uploadLeaseVersion: store.get().uploadLeaseVersion as number,
+        uploadLeaseNonce: store.get().uploadLeaseNonce as string,
+        uploadUrlExpiresAt: store.get().uploadUrlExpiresAt as Date,
+    });
+
+    let queued = 0;
+    const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
+        seal: async (_u: string, canonical: string) => {
+            // ...and /start refreshes the lease while the bytes are being sealed.
+            refreshLease(store);
+            return canonical;
+        },
+        commit: async () => store.updateMany(
+            { id: "row-1", ...leaseFence(observed) },
+            { state: "RECEIVED", stateReason: null },
+        ),
+        queueUploadCleanup: async () => { queued++; return "ev-1"; },
+        settleUploadCleanup: async () => {},
+        currentStoragePath: async () => store.get().storagePath as string,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+
+    assert.equal(outcome?.published, false, "the publish lost");
+    assert.equal(store.get().state, "STAGING", "the row is untouched, still awaiting its upload");
+    assert.equal(queued, 0, "and nothing was queued against the stale expiry");
+
+    // THE PRE-FIX CONTROL. The same interleaving, judged by publishFence: it
+    // matches, so the old code published — over a lease somebody else now owns,
+    // and scheduled the upload cleanup against an expiry two hours too early.
+    const wouldHaveMatched = Object.entries(publishFence(observed))
+        .every(([k, v]) => store.get()[k] === v);
+    assert.equal(wouldHaveMatched, true, "publishFence cannot see a refresh — that was the bug");
+});
+
+test("PUBLISH vs REFRESH control: an UNrefreshed lease still publishes", async () => {
+    // Without this, a leaseFence that simply never matched would pass the test
+    // above while breaking every honest publish.
+    const store = leasedRow();
+    const observed = observedRow({
+        state: "STAGING",
+        stateReason: null,
+        uploadLeaseVersion: 1,
+        uploadLeaseNonce: NONCE,
+        uploadUrlExpiresAt: EXPIRY,
+    });
+    let queued = 0;
+    const outcome = await sealAndPublish("receipts/intake/row-1.v1.png", "row-1", 1, CHECK, {
+        withObjectLock: noLock,
+        seal: async (_u: string, canonical: string) => canonical,
+        commit: async () => store.updateMany(
+            { id: "row-1", ...leaseFence(observed) },
+            { state: "RECEIVED", stateReason: null },
+        ),
+        queueUploadCleanup: async () => { queued++; return "ev-1"; },
+        settleUploadCleanup: async () => {},
+        currentStoragePath: async () => store.get().storagePath as string,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+    assert.equal(outcome?.published, true);
+    assert.equal(store.get().state, "RECEIVED");
+    assert.equal(queued, 1, "and the upload object's cleanup is queued in the commit");
 });

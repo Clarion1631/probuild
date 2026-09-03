@@ -110,8 +110,27 @@ export interface SealPublishDeps {
         canonicalPath: string,
         check: { mimeType: string; fileSize: number; fileSha256: string },
     ) => Promise<number>;
-    /** Best-effort, AFTER the commit and OUTSIDE the lock. Records a cleanup event on failure. */
-    dropUpload: (uploadPath: string) => Promise<void>;
+    /**
+     * ENQUEUE the upload object's cleanup INSIDE the commit transaction, and
+     * return the queued event's id.
+     *
+     * It used to be a best-effort delete after the lock closed, and that made
+     * the queue entry — the only thing that remembers an object once the row
+     * stops pointing at it — a write that could fail on its own while the
+     * pointer had already moved. One transient database error then left bytes
+     * nothing referenced and nothing would ever sweep.
+     *
+     * A THROW here rolls the pointer transition back with it, which is the
+     * point: the row keeps pointing at the upload path, so the object is still
+     * reachable and the retry re-runs the whole thing.
+     */
+    queueUploadCleanup: (tx: PublishTx, uploadPath: string) => Promise<string>;
+    /**
+     * Try the queued deletion now, AFTER the pointer is committed and outside
+     * the lock. Best-effort by design: the event is already durable, so a
+     * failure here is just work the sweep picks up.
+     */
+    settleUploadCleanup: (eventId: string, uploadPath: string) => Promise<void>;
     /**
      * Consulted ONLY when the commit CAS is lost, to tell apart the two
      * reasons that can happen. Returns wherever the row's storagePath points
@@ -120,11 +139,16 @@ export interface SealPublishDeps {
      */
     currentStoragePath: (tx: PublishTx, rowId: string) => Promise<string | null>;
     /**
-     * Best-effort, AFTER a lost commit CAS, and ONLY when the winner is
-     * proven to be pointing somewhere else (see below). Same shape as
-     * dropUpload — a separate dependency so each caller can record its own
-     * reason for the cleanup queue rather than reusing "sealed", which would
-     * describe the wrong event.
+     * AFTER a lost commit CAS, and ONLY when the winner is proven to be
+     * pointing somewhere else (see below). A separate dependency so each
+     * caller can record its own reason for the cleanup queue rather than
+     * reusing "sealed", which would describe the wrong event.
+     *
+     * Runs inside the lock's transaction, and is no longer swallowed: if it
+     * cannot delete AND cannot record, the transaction rolls back and
+     * sealAndPublish reports the retryable null. Nothing of ours was
+     * published on this path anyway (the CAS was lost), so there is nothing
+     * to lose by rolling back — and swallowing it dropped an orphan silently.
      */
     dropOrphanedCanonical: (canonicalPath: string) => Promise<void>;
 }
@@ -150,7 +174,17 @@ export async function sealAndPublish(
         if (!sealed) return null;
 
         const count = await deps.commit(tx, canonicalPath, check);
-        if (count > 0) return count;
+        if (count > 0) {
+            // THE POINTER MOVED, so the upload object is orphaned from this
+            // instant — and the record of that has to commit WITH the move,
+            // not after it. Enqueued here, inside the same transaction; a
+            // throw takes the pointer transition down with it and the row
+            // stays on the upload path, still reachable, for the retry.
+            const eventId = uploadPath === canonicalPath
+                ? null
+                : await deps.queueUploadCleanup(tx, uploadPath);
+            return { count, eventId };
+        }
 
         // LOST THE CAS. Some other publish already moved the row — but "moved
         // it where" is the whole question, and it splits into two very
@@ -173,9 +207,13 @@ export async function sealAndPublish(
         // on uncertainty about what the winner is using.
         const winnerPath = await deps.currentStoragePath(tx, rowId).catch(() => canonicalPath);
         if (winnerPath !== canonicalPath) {
-            await deps.dropOrphanedCanonical(canonicalPath).catch(() => undefined);
+            // NOT swallowed any more: a drop that can neither delete nor record
+            // is an orphan nobody will find, and this transaction has nothing
+            // of ours to protect — the CAS was already lost. Rolling back turns
+            // it into the retryable `null` below.
+            await deps.dropOrphanedCanonical(canonicalPath);
         }
-        return count;
+        return { count, eventId: null };
     }).catch(error => {
         // A lock we could not take, or a transaction that could not commit.
         // NOTHING was published, and the same `null` the seal failure returns
@@ -189,14 +227,20 @@ export async function sealAndPublish(
     });
     if (moved === null) return null;
 
-    if (moved > 0) {
+    if (moved.count > 0) {
         // Only once the row points at the sealed copy is the upload object
         // safe to remove — and only if we are the one who moved the row. A
         // publisher that lost the CAS must not delete an object the winner
         // may still be using. Outside the lock deliberately: it is a
         // best-effort delete of a DIFFERENT path, and it must not hold a lock
         // every other publisher of this row is waiting on.
-        if (uploadPath !== canonicalPath) await deps.dropUpload(uploadPath);
+        //
+        // Best-effort is SAFE here now, and only because the queue entry
+        // committed with the pointer above: whatever happens to this call, the
+        // path is remembered and the sweep will get to it.
+        if (moved.eventId) {
+            await deps.settleUploadCleanup(moved.eventId, uploadPath).catch(() => undefined);
+        }
         return { published: true, canonicalPath };
     }
     return { published: false, canonicalPath };
@@ -394,12 +438,34 @@ export interface ObservedRow {
      * client is on v2 — the row it judged does not exist any more.
      */
     uploadLeaseVersion: number;
+    /**
+     * THE LEASE GENERATION — and the only thing that can see a REFRESH.
+     *
+     * `reuseLiveLease` hands a retrying client a brand-new signed URL over the
+     * SAME path and the SAME version: nothing else about the row moves. So a
+     * fence built from state/reason/version/path matches just as well after
+     * that refresh as before it, and an in-flight finalizer that read the row
+     * BEFORE it could still publish — or delete a rejected row — on the
+     * strength of a lease somebody has already replaced. This column is
+     * rewritten on every issue and every adoption, so pinning it is what makes
+     * "nobody re-leased this row since I read it" checkable at all.
+     *
+     * Nullable: rows created before the column existed, and the single-shot
+     * inline path, carry null — and null pins just as well as a value.
+     */
+    uploadLeaseNonce: string | null;
+    /** Pinned beside the nonce: see leaseFence. */
+    uploadUrlExpiresAt: Date | null;
 }
 
 /** What a finalize may do with the row it just read. */
 export type FinalizeDisposition = "publish" | "not-recoverable" | "settled";
 
-export function finalizeDisposition(row: ObservedRow): FinalizeDisposition {
+/**
+ * Reads only the state and the reason, and says so: this is a question about
+ * what a finalize may DO, not about which lease it observed.
+ */
+export function finalizeDisposition(row: Pick<ObservedRow, "state" | "stateReason">): FinalizeDisposition {
     if (row.state === "STAGING") return "publish";
     if (row.state === "NEEDS_REVIEW") {
         return RECOVERABLE_PARK_REASONS.includes(row.stateReason ?? "") ? "publish" : "not-recoverable";
@@ -430,6 +496,42 @@ export function publishFence(row: ObservedRow): {
         stateReason: row.stateReason,
         claimToken: null,
         uploadLeaseVersion: row.uploadLeaseVersion,
+    };
+}
+
+/**
+ * THE FENCE EVERY DESTRUCTIVE FINALIZER MUST CARRY: publishFence PLUS the
+ * lease generation it observed.
+ *
+ * publishFence alone cannot see a lease REFRESH. `reuseLiveLease` reissues a
+ * signed URL over the same path and the same version — state, reason, claim
+ * and version are all untouched — so a finalizer that read the row before the
+ * refresh still matches, and:
+ *
+ *   - a PUBLISH commits on bytes the client has already been invited to
+ *     replace, and schedules the upload object's cleanup against the OLD
+ *     expiry. The refreshed URL then outlives that schedule, and a later valid
+ *     PUT recreates an object nothing references.
+ *   - a REJECT deletes the row out from under a client that holds a working
+ *     URL, and queues the path for deletion on the same stale schedule.
+ *
+ * Pinning the nonce turns both into a lost CAS, which every caller already
+ * answers as a retryable 409. The expiry rides along because it is free and
+ * rules out an adopter independently — the same belt-and-braces
+ * discardUnresumedLease uses.
+ *
+ * `reuseLiveLease` deliberately does NOT use this: two honest /start retries
+ * may legitimately adopt the same live lease, and failing the second would
+ * break the idempotency that module exists to provide.
+ */
+export function leaseFence(row: ObservedRow): ReturnType<typeof publishFence> & {
+    uploadLeaseNonce: string | null;
+    uploadUrlExpiresAt: Date | null;
+} {
+    return {
+        ...publishFence(row),
+        uploadLeaseNonce: row.uploadLeaseNonce,
+        uploadUrlExpiresAt: row.uploadUrlExpiresAt,
     };
 }
 

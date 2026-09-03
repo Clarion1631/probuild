@@ -136,7 +136,7 @@ const startBranches = {
 test("the OLD object is cleaned up before the signer can fail, in BOTH branches", () => {
     for (const [name, branch] of Object.entries(startBranches)) {
         assert.notEqual(branch.length, 0, name);
-        const cleanupAt = branch.search(/deleteObjectOrRecord\(\s*\n?\s*existing\.storagePath/);
+        const cleanupAt = branch.search(/repathWithCleanup\(/);
         const signAt = branch.indexOf("await signUpload(");
         assert.notEqual(cleanupAt, -1, `${name}: the previous lease's object must still be cleaned up`);
         assert.notEqual(signAt, -1, `${name}: the branch must still sign a URL`);
@@ -144,20 +144,34 @@ test("the OLD object is cleaned up before the signer can fail, in BOTH branches"
             cleanupAt < signAt,
             `${name}: the cleanup must run BEFORE the signer, or a 503 orphans the old object`,
         );
-        // Guarded, not a bare delete: a delete that fails records a pending
-        // cleanup, which is the only thing that will remember those bytes.
-        // And SCHEDULED: this branch can be reached with the old path's signed
-        // URL still live (a caller that changed its declared extension), and
-        // deleting under a live write capability only lets the holder's late
-        // PUT put the object back with nothing referencing it.
+        // ONE CALL, so the repath and the cleanup entry cannot be separated:
+        // they are one transaction (see repathWithCleanup). Writing them as two
+        // statements meant one transient database failure moved the pointer and
+        // lost the only record of the object it abandoned.
         assert.match(
             branch,
-            /deleteObjectOrRecord\(\s*\n?\s*existing\.storagePath,\s*\n?\s*"start-(rearmed|resumed)-repath",\s*\n?\s*cleanupNotBefore\(existing\),/,
+            /repathWithCleanup\(\s*\n?\s*existing,/,
+            `${name}: the repath and its cleanup go through the shared transaction`,
         );
-        // ...and still only when the path actually moved. Deleting the path the
-        // row was just re-pointed AT would destroy the live upload target.
-        assert.match(branch, /if \((retryPath|resumePath) !== existing\.storagePath\) \{/);
+        assert.match(
+            branch,
+            /"start-(rearmed|resumed)-repath",/,
+            `${name}: and it names its own reason`,
+        );
+        // A transaction that could not do BOTH is a 503, never a silent success
+        // on a row that did not move.
+        assert.match(branch, /=== "unavailable"/, `${name}: an unrecordable cleanup is retryable`);
+        assert.match(branch, /=== "conflict"/, `${name}: a lost fence is still a 409`);
     }
+    // The guarded-and-scheduled properties now live in ONE place rather than
+    // being restated per branch — pin them there.
+    const helper = bodyOf(start, "async function repathWithCleanup");
+    assert.match(helper, /prisma\.\$transaction\(/, "one transaction");
+    assert.match(helper, /queueObjectCleanup\(/, "the cleanup is enqueued with the caller's tx");
+    assert.match(helper, /cleanupNotBefore\(existing\)/, "and it is SCHEDULED, not immediate");
+    // ...and still only when the path actually moved. Queueing the path the
+    // row was just re-pointed AT would mark the live upload target for deletion.
+    assert.match(helper, /if \(nextPath !== existing\.storagePath\)/);
 });
 
 test("a signer failure still answers 503, and the row keeps the NEW lease", () => {
@@ -200,6 +214,15 @@ import {
     type CleanupSweepDeps,
 } from "../src/lib/receipt-intake/storage-cleanup";
 import { CLEANUP_GRACE_MS, cleanupNotBefore } from "../src/lib/receipt-intake/worker";
+import { sealAndPublish } from "../src/lib/receipt-intake/stored-object";
+
+/** The verified bytes a publish carries. Only the shape matters here. */
+const CHECK = {
+    mimeType: "image/png",
+    fileSize: 4,
+    fileSha256: "b".repeat(64),
+    bytes: Buffer.from("abcd"),
+};
 
 const T0 = new Date("2026-09-02T12:00:00.000Z");
 const UPLOAD = "receipts/intake/row-1.v1.bin";
@@ -253,6 +276,11 @@ function world(now: Date = T0) {
                     rows.find(r => r.storagePath === where.storagePath) ?? null,
             },
             automationEvent: {
+                // Every PENDING event naming this path — the sweep folds their
+                // schedules together and takes the latest, so an older event
+                // can never authorise a delete a newer one is still deferring.
+                findMany: async ({ where }: { where: { detail: { contains: string } } }) =>
+                    events.filter(e => e.status === "pending" && e.detail.includes(where.detail.contains)),
                 update: async ({ where, data }: { where: { id: string }; data: { status: string } }) => {
                     const event = events.find(e => e.id === where.id);
                     if (event) event.status = data.status;
@@ -288,7 +316,10 @@ test("BOTH destructive /finalize paths carry the schedule, and the sweeper state
     assert.match(fin, /uploadUrlExpiresAt: true, createdAt: true,/, "and the row is read for it");
     assert.match(fin, /cleanupNotBefore: cleanupAfter,/, "the reject tombstone carries it");
     assert.match(fin, /settleQueuedCleanup\(rejected\.eventId, row\.storagePath, cleanupAfter\)/);
-    assert.match(fin, /deleteObjectOrRecord\(uploadPath, "sealed", cleanupAfter\)/);
+    // ENQUEUED IN THE COMMIT TRANSACTION, not deleted after it: the queue entry
+    // is the only thing that remembers the upload object once the pointer moves.
+    assert.match(fin, /queueUploadCleanup: \(tx, uploadPath\) =>\s*\n?\s*queueObjectCleanup\(tx, uploadPath, "sealed", cleanupAfter\)/);
+    assert.match(fin, /settleUploadCleanup: \(eventId, uploadPath\) =>/);
 
     // The sweeper publishes while a lease can still be live, so its dropUpload
     // needs the same treatment; its reject branch is already gated on a dead
@@ -297,7 +328,7 @@ test("BOTH destructive /finalize paths carry the schedule, and the sweeper state
         path.join(ROOT, "src/app/api/cron/receipt-intake-worker/route.ts"),
         "utf8",
     );
-    assert.match(cron, /deleteObjectOrRecord\(uploadPath, "sealed", cleanupNotBefore\(row\)\)/);
+    assert.match(cron, /queueObjectCleanup\(tx, uploadPath, "sealed", cleanupNotBefore\(row\)\)/);
     assert.match(cron, /cleanupNotBefore: cleanupNotBefore\(row\),/);
 });
 
@@ -454,4 +485,169 @@ test("not-yet-due entries do not crowd out the ones that are", async () => {
         CLEANUP_SCAN_FACTOR - 1,
         "the scheduled ones are untouched, and left pending rather than resolved",
     );
+});
+
+// ── "Durable" cleanup must not degrade to best-effort (Codex round-12 item 3) ──
+//
+// The cleanup record is the ONLY thing that remembers an object once the row
+// stops pointing at it. `deleteObjectOrRecord` used to catch the failure to
+// write that record and return `false`, and every caller discarded the `false`
+// AFTER it had already moved the pointer — so one transient database error
+// left bytes in a private bucket that no row referenced, no event remembered
+// and no sweep would ever look at. Silently, and permanently.
+//
+// Two halves to the fix, and one test each:
+//   - the swallow is gone, so a caller with no transaction sees the failure;
+//   - callers that MOVE a pointer enqueue inside that pointer's transaction,
+//     so either both land or neither does.
+
+test("an unrecordable cleanup THROWS instead of reporting a quiet false", async () => {
+    const w = world();
+    w.objects.add(UPLOAD);
+    const io: CleanupIo = { ...w.io, record: async () => { throw new Error("db is down"); } };
+
+    // The scheduled branch: nothing is deleted, and the caller is told.
+    await assert.rejects(
+        () => deleteObjectOrRecord(UPLOAD, "sealed", cleanupNotBefore(leased, T0), io),
+        /db is down/,
+    );
+    assert.ok(w.objects.has(UPLOAD), "nothing deleted");
+
+    // ...and the delete-failed branch, which is the one that actually loses an
+    // object: storage refused AND the queue refused.
+    const gone: CleanupIo = {
+        ...io,
+        remove: async () => { throw new Error("storage refused"); },
+    };
+    await assert.rejects(() => deleteObjectOrRecord(UPLOAD, "sealed", null, gone), /db is down/);
+    assert.ok(w.objects.has(UPLOAD), "still there, and now remembered by the throw");
+});
+
+test("CONTROL: a recordable cleanup still returns rather than throwing", async () => {
+    // Without this, a function that simply always threw would pass the test
+    // above while breaking every ordinary cleanup.
+    const w = world();
+    w.objects.add(UPLOAD);
+    assert.equal(await deleteObjectOrRecord(UPLOAD, "sealed", cleanupNotBefore(leased, T0), w.io), false);
+    assert.equal(w.pending().length, 1, "queued, not thrown");
+    assert.equal(await deleteObjectOrRecord(UPLOAD, "sealed", null, w.io), true, "and a due one deletes");
+    assert.equal(w.objects.has(UPLOAD), false);
+});
+
+test("a cleanup-record failure ROLLS BACK the pointer transition it belongs to", async () => {
+    // The seal path, end to end: the row's pointer moves to the canonical path
+    // and the upload object becomes an orphan in the same instant, so the
+    // record of that orphan has to commit with the move.
+    const store = { storagePath: UPLOAD, state: "STAGING" };
+    let committed = false;
+    // Everything the body writes goes here first; only a body that returns
+    // without throwing is copied onto `store`. That is what makes this a real
+    // rollback rather than a mutation the assertions cannot see.
+    let staged = { ...store };
+    const attempt = (queueThrows: boolean) => sealAndPublish(UPLOAD, "row-1", 1, CHECK, {
+        withObjectLock: async (_p: string, body: (tx: never) => Promise<unknown>) => {
+            staged = { ...store };
+            const out = await body({
+                receiptIntake: { findUnique: async () => ({ storagePath: staged.storagePath }) },
+            } as never);
+            Object.assign(store, staged);
+            committed = true;
+            return out;
+        },
+        seal: async (_u: string, canonical: string) => canonical,
+        commit: async (_tx: never, canonical: string) => {
+            staged.storagePath = canonical;
+            staged.state = "RECEIVED";
+            return 1;
+        },
+        queueUploadCleanup: async () => {
+            if (queueThrows) throw new Error("cleanup insert failed");
+            return "ev-1";
+        },
+        settleUploadCleanup: async () => {},
+        currentStoragePath: async () => staged.storagePath,
+        dropOrphanedCanonical: async () => {},
+    } as never);
+
+    const failed = await attempt(true);
+    assert.equal(failed, null, "the publish reports the retryable answer");
+    assert.equal(committed, false, "the transaction never committed");
+    assert.equal(store.storagePath, UPLOAD, "the row still points at its object");
+    assert.equal(store.state, "STAGING", "so nothing is orphaned, and the retry can recover");
+
+    // CONTROL: the identical run with a queue that works publishes normally —
+    // otherwise the assertions above would pass for a seal that never commits.
+    const ok = await attempt(false);
+    assert.equal(ok?.published, true);
+    assert.equal(committed, true);
+    assert.notEqual(store.storagePath, UPLOAD, "the pointer moved");
+});
+
+test("the repath helper puts the CAS and the cleanup in one transaction", () => {
+    // /start has no sealAndPublish to hang the enqueue off, so the two writes
+    // are wrapped explicitly. Pinned because the failure it prevents — a
+    // repath that commits without its cleanup entry — leaves no trace anywhere
+    // to test against after the fact.
+    const helper = bodyOf(start, "async function repathWithCleanup");
+    const txAt = helper.indexOf("prisma.$transaction(");
+    const casAt = helper.indexOf("updateMany(");
+    const queueAt = helper.indexOf("queueObjectCleanup(");
+    assert.ok(txAt >= 0 && txAt < casAt, "the transaction opens first");
+    assert.ok(casAt < queueAt, "the CAS runs, then the cleanup is enqueued with the same tx");
+    assert.match(helper, /queueObjectCleanup\(\s*\n?\s*tx,/, "with the TRANSACTION's client");
+    // A throw out of either one is the caller's 503, never a silent success.
+    assert.match(helper, /return "unavailable"/);
+});
+
+test("the NEWEST schedule for a path wins, never the event's own", async () => {
+    // An event records the expiry its author OBSERVED, and that author can be
+    // overtaken: a /start refresh extends the lease, and a second cleanup for
+    // the same path is queued with a LATER deadline. Acting on the older event
+    // would delete the object while the refreshed URL still works — the exact
+    // orphan the schedule exists to prevent, arriving through the queue rather
+    // than through the fence.
+    const w = world();
+    w.objects.add(UPLOAD);
+    // The first author saw a lease that has since expired...
+    await w.io.record(UPLOAD, "sealed", new Date(T0.getTime() - 60_000));
+    // ...and a second, later author saw the refreshed one.
+    const refreshedUntil = new Date(T0.getTime() + 60 * 60_000);
+    await w.io.record(UPLOAD, "sealed", refreshedUntil);
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 0, "deferred to the newer one");
+    assert.ok(w.objects.has(UPLOAD), "the object the live URL can still write survives");
+    assert.equal(w.pending().length, 2, "and BOTH events are left pending, not resolved");
+
+    // Once the newest schedule passes, the object goes and the queue drains.
+    w.advance(2 * 60 * 60_000);
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1);
+    assert.equal(w.objects.has(UPLOAD), false);
+    assert.equal(w.pending().length, 0, "the sibling was cleared with it");
+});
+
+test("CONTROL: with no newer sibling, the due event deletes at once", async () => {
+    // Without this the assertions above would pass for a sweep that had simply
+    // stopped deleting anything.
+    const w = world();
+    w.objects.add(UPLOAD);
+    await w.io.record(UPLOAD, "sealed", new Date(T0.getTime() - 60_000));
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1);
+    assert.equal(w.objects.has(UPLOAD), false);
+});
+
+test("a newer schedule on a DIFFERENT path does not defer this one", async () => {
+    // The lookup is matched on the JSON-quoted path, so a prefix cannot widen
+    // it — otherwise one deferred cleanup would hold up every path it prefixes.
+    const w = world();
+    const due = "receipts/intake/row-1.v1.bin";
+    const other = "receipts/intake/row-1.v1.bin.other";
+    w.objects.add(due);
+    w.objects.add(other);
+    await w.io.record(due, "sealed", new Date(T0.getTime() - 60_000));
+    await w.io.record(other, "sealed", new Date(T0.getTime() + 60 * 60_000));
+
+    assert.equal(await retryPendingCleanups(10, () => false, w.sweep), 1, "the due path is not held up");
+    assert.equal(w.objects.has(due), false);
+    assert.ok(w.objects.has(other), "and the deferred one is untouched");
 });

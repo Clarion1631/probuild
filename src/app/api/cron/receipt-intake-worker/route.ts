@@ -9,6 +9,7 @@ import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
 import {
     deleteObjectOrRecord,
+    queueObjectCleanup,
     rejectRowAndQueueCleanup,
     retryPendingCleanups,
     sealObject,
@@ -392,7 +393,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 select: {
                     id: true, storagePath: true, mimeType: true, stateReason: true,
                     createdAt: true, expectedSha256: true, uploadUrlExpiresAt: true,
-                    uploadLeaseVersion: true,
+                    uploadLeaseVersion: true, uploadLeaseNonce: true,
                 },
                 // Rows that never had a signed URL first (an inline upload that
                 // died mid-request is an orphan NOW, and nothing is coming for
@@ -499,8 +500,14 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // URL — and the upload path's delete has to wait for
                         // it, or the holder's late PUT recreates an object the
                         // published row no longer points at.
-                        dropUpload: uploadPath =>
-                            deleteObjectOrRecord(uploadPath, "sealed", cleanupNotBefore(row))
+                        //
+                        // Enqueued INSIDE the commit transaction, same rule as
+                        // /finalize: the queue entry outlives the pointer, so
+                        // the two have to commit together.
+                        queueUploadCleanup: (tx, uploadPath) =>
+                            queueObjectCleanup(tx, uploadPath, "sealed", cleanupNotBefore(row)),
+                        settleUploadCleanup: (eventId, uploadPath) =>
+                            settleQueuedCleanup(eventId, uploadPath, cleanupNotBefore(row))
                                 .then(() => undefined),
                         currentStoragePath: async (tx, rowId) => {
                             const r = await tx.receiptIntake.findUnique({
@@ -557,6 +564,13 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         stateReason: row.stateReason,
                         storagePath: row.storagePath,
                         uploadLeaseVersion: row.uploadLeaseVersion,
+                        // The generation too: the version alone cannot see a
+                        // same-path lease refresh (see leaseFence). The
+                        // `verify` callback below still re-reads the row, and
+                        // the two are complementary — this one fails the CAS,
+                        // that one aborts the transaction.
+                        uploadLeaseNonce: row.uploadLeaseNonce,
+                        uploadUrlExpiresAt: row.uploadUrlExpiresAt,
                         // Always null here — `leaseLive` above already refused
                         // to reject a row whose URL still works. Passed anyway
                         // so both rejecters state the rule the same way rather
