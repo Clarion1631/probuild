@@ -27,6 +27,16 @@ export const QB_API_BASE = process.env.QB_SANDBOX === "true"
  */
 export const QB_PRIVATE_NOTE_MAX_LEN = 4000;
 
+/**
+ * Intuit's DocNumber field length cap. Every create path truncates to this
+ * before sending — and, same reasoning as QB_PRIVATE_NOTE_MAX_LEN above, a
+ * caller composing a create-marker's recovery identity (qbo-create-markers.ts)
+ * MUST truncate to the SAME length first. QuickBooks stores the truncated
+ * DocNumber; the resolver looks it up by that exact value, so an untruncated
+ * identity next to a truncated stored one never matches.
+ */
+export const QB_DOC_NUMBER_MAX_LEN = 21;
+
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 
 export interface QBTokens {
@@ -136,6 +146,32 @@ export function isQboMalformedResponseError(error: unknown): boolean {
     return (
         error instanceof QboMalformedResponseError ||
         (error instanceof Error && error.name === "QboMalformedResponseError")
+    );
+}
+
+/**
+ * A document create (`/estimate` or `/invoice` POST) whose outcome we never
+ * learned — a timeout or transport failure AFTER the request was dispatched,
+ * or a 2xx response that omitted the created document's id. QuickBooks may
+ * already have made the document, so this must never be treated as a plain
+ * retryable outage: the caller has to check QuickBooks before trying again.
+ *
+ * Distinct from a definite refusal (QboHttpError from a 4xx/401/403, or a
+ * pre-dispatch failure like a token refresh): QuickBooks answered "no" there,
+ * or the request never went out, so nothing was created and a retry is safe.
+ */
+export class QBAmbiguousDocumentCreateError extends Error {
+    name = "QBAmbiguousDocumentCreateError";
+    constructor(label: string) {
+        super(`${label}: QuickBooks did not confirm the outcome of this create — check QuickBooks for the document before retrying.`);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBAmbiguousDocumentCreateError(error: unknown): boolean {
+    return (
+        error instanceof QBAmbiguousDocumentCreateError ||
+        (error instanceof Error && error.name === "QBAmbiguousDocumentCreateError")
     );
 }
 
@@ -931,7 +967,7 @@ export async function createQBMilestoneInvoice(
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
     const payload: Record<string, unknown> = {
-        DocNumber: input.docNumber.slice(0, 21),
+        DocNumber: input.docNumber.slice(0, QB_DOC_NUMBER_MAX_LEN),
         TxnDate: new Date().toISOString().split("T")[0],
         CustomerRef: { value: input.customerId },
         // QuickBooks Payments is the ONLY payment rail (Stripe is disabled until
@@ -1604,7 +1640,11 @@ export async function getQBPurchaseChangesSince(
         },
     );
     if (!response.ok) {
-        throw new Error(`QBO Purchase CDC failed with status ${response.status}`);
+        // Through the shared classifier, not a bare Error: a 401/403 here is
+        // the credential, not this fetch, and a caller must be able to tell
+        // it apart from an ordinary transient outage (see
+        // /api/integrations/qbo-expenses/sync's classification).
+        throw await qboResponseError(response, "QBO Purchase CDC");
     }
 
     const payload = await response.json();
@@ -1728,17 +1768,29 @@ export async function syncEstimateToQB(
 
     const payload = {
         TxnDate: new Date().toISOString().split("T")[0],
-        DocNumber: estimate.code.slice(0, 21),
+        DocNumber: estimate.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
         PrivateNote: estimate.title,
         CustomerRef: { value: estimate.customerId },
         Line: lines,
     };
 
-    const res = await qbFetch("/estimate", tokens, {
-        method: "POST",
-        body: JSON.stringify(payload),
-        qbDeadline: deadline,
-    });
+    let res: Response;
+    try {
+        res = await qbFetch("/estimate", tokens, {
+            method: "POST",
+            body: JSON.stringify(payload),
+            qbDeadline: deadline,
+        });
+    } catch (error) {
+        // The POST was dispatched — a timeout or transport failure now means
+        // the outcome is UNKNOWN, not that the create failed. QuickBooks may
+        // already hold the estimate; the caller must not retry as though this
+        // were an ordinary outage (see /api/quickbooks/sync's classification).
+        if (isQBTimeoutError(error) || isRetryableQboError(error)) {
+            throw new QBAmbiguousDocumentCreateError("QB estimate sync");
+        }
+        throw error;
+    }
 
     // Every non-2xx goes through the shared classifier: a 429 or 5xx here is
     // QuickBooks being unavailable, not a verdict on this estimate, and a bare
@@ -1747,7 +1799,12 @@ export async function syncEstimateToQB(
 
     const data = await res.json();
     const qbId = data.Estimate?.Id;
-    const realmId = tokens.realmId;
+    if (!qbId) {
+        // A 2xx with no Estimate.Id is not a success — returning it as one
+        // left every caller building URLs and persisting `txnId: undefined`.
+        // Treat it the same as an unconfirmed outcome.
+        throw new QBAmbiguousDocumentCreateError("QB estimate sync");
+    }
     const qbUrl = `https://app.qbo.intuit.com/app/estimate?txnId=${qbId}`;
 
     return { qbId, qbUrl };
@@ -1786,23 +1843,37 @@ export async function syncInvoiceToQB(
     }
 
     const payload = {
-        DocNumber: invoice.code.slice(0, 21),
+        DocNumber: invoice.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
         TxnDate: new Date().toISOString().split("T")[0],
         CustomerRef: { value: invoice.customerId },
         Line: lines,
     };
 
-    const res = await qbFetch("/invoice", tokens, {
-        method: "POST",
-        body: JSON.stringify(payload),
-        qbDeadline: deadline,
-    });
+    let res: Response;
+    try {
+        res = await qbFetch("/invoice", tokens, {
+            method: "POST",
+            body: JSON.stringify(payload),
+            qbDeadline: deadline,
+        });
+    } catch (error) {
+        // Same "dispatched, outcome unknown" handling as the estimate push above.
+        if (isQBTimeoutError(error) || isRetryableQboError(error)) {
+            throw new QBAmbiguousDocumentCreateError("QB invoice sync");
+        }
+        throw error;
+    }
 
     // Same shared classification as the estimate push above.
     if (!res.ok) throw await qboResponseError(res, "QB invoice sync");
 
     const data = await res.json();
     const qbId = data.Invoice?.Id;
+    if (!qbId) {
+        // A 2xx with no Invoice.Id is not a success — see the matching comment
+        // on syncEstimateToQB above.
+        throw new QBAmbiguousDocumentCreateError("QB invoice sync");
+    }
     const qbUrl = `https://app.qbo.intuit.com/app/invoice?txnId=${qbId}`;
     return { qbId, qbUrl };
 }

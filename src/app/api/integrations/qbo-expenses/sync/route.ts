@@ -6,9 +6,29 @@ import {
     QBO_EXPENSE_SYNC_BUDGET_MS,
     type QboExpenseSyncResult,
 } from "@/lib/qbo-expense-sync";
-import { createRouteDeadline, type QBTokens, type RouteDeadline } from "@/lib/quickbooks";
+import {
+    createRouteDeadline, isQBTokenStrandedError, qboHttpStatus,
+    type QBTokens, type RouteDeadline,
+} from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
+import { QBO_AUTH_EVENT_REASON } from "@/lib/pipeline-health";
+
+/**
+ * Did QuickBooks reject who we are, rather than what this sync asked for?
+ *
+ * Same rule as qbo-receipts/create/route.ts's isQboAuthFailure, narrowed to
+ * the failures this route's own calls (token refresh, the CDC purchase read)
+ * can actually throw. Name-based, for the same cross-module-identity reason
+ * as isQBNotConnectedError: a bare `instanceof` can miss the SAME error class
+ * loaded from a second module instance.
+ */
+function isQboAuthFailure(error: unknown): boolean {
+    if (isQBTokenStrandedError(error)) return true;
+    if (error instanceof Error && error.name === "QBTokenPersistenceError") return true;
+    const status = qboHttpStatus(error);
+    return status === 401 || status === 403;
+}
 
 export const dynamic = "force-dynamic";
 // 300s: the first historical backfill reads every QBO Purchase page since the
@@ -126,6 +146,18 @@ export function createQboExpenseSyncHandlers(
                 "QBO expense sync failed",
                 error instanceof Error ? error.name : "UnknownError",
             );
+            // A credential rejection (401/403 on the CDC purchase read, or a
+            // stranded refresh) is self-healing only once a human reconnects —
+            // pipeline-health.ts's reconnect alert watches for exactly this
+            // reason string. Recording the raw error name here instead buried
+            // it in the generic error bucket and the digest never flagged it.
+            if (isQboAuthFailure(error)) {
+                await logEvent({ kind: "qbo-sync", status: "error", reason: QBO_AUTH_EVENT_REASON, source });
+                return NextResponse.json(
+                    { ok: false, retry: true, reason: QBO_AUTH_EVENT_REASON },
+                    { status: 503 },
+                );
+            }
             await logEvent({ kind: "qbo-sync", status: "error", reason: error instanceof Error ? error.name : "UnknownError", source });
             return NextResponse.json(
                 { ok: false, reason: "sync-failed" },

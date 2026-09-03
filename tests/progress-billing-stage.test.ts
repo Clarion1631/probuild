@@ -267,10 +267,39 @@ test("an unknown outcome parks the row ambiguous and records why", async () => {
             subtotal: 1000,
             total: 1089,
         }),
+        // Round 33 gate: the resolver's total-match check reads this off the
+        // marker, so it has to ride along with the rest of the identity.
+        expectedTotal: 1089,
     });
     assert.equal(row.qbInvoiceId, null, "we never learned an id to record");
     assert.equal(events.at(-1)?.reason, "ambiguous-create");
     assert.equal(events.at(-1)?.source, "progress-billing-stage");
+});
+
+test("round 33 gate: a DocNumber over QuickBooks' 21-char cap is truncated BEFORE it reaches the marker", async () => {
+    // Codex gate: the create POST truncated its own DocNumber to 21 chars
+    // (createQBMilestoneInvoice), but the marker's identity was composed from
+    // the untruncated billing.code — so the resolver's later exact-match
+    // lookup would ask QuickBooks about a document with a DIFFERENT DocNumber
+    // than the one actually stored, always find nothing, and offer to release
+    // a row whose real invoice is sitting there collectible.
+    events.length = 0;
+    const longCode = "INV-00171-P123456789-EXTRA"; // 27 chars, over the 21-char cap
+    const { row, db } = makeDb(draftRow({ code: longCode }));
+    const { qbo, calls } = makeQbo({ createThrows: new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/invoice") });
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        (e: unknown) => e instanceof QBAmbiguousCreateError,
+    );
+
+    const truncated = longCode.slice(0, 21);
+    assert.equal(truncated.length, 21);
+    // What the create call actually sent QuickBooks...
+    assert.equal(calls.created[0].docNumber, truncated);
+    // ...is exactly what the parked marker records, so a recovery asks
+    // QuickBooks about the SAME document it created.
+    assert.equal(parseCreateMarker(row.qbSyncError)?.identity?.docNumber, truncated);
 });
 
 test("a lost link claim compensates the invoice it created", async () => {

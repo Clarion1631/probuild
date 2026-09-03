@@ -33,7 +33,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
-import { createRouteDeadline, remainingBudgetMs, QB_PRIVATE_NOTE_MAX_LEN, type RouteDeadline, type QBTokens } from "./quickbooks";
+import { createRouteDeadline, remainingBudgetMs, QB_PRIVATE_NOTE_MAX_LEN, QB_DOC_NUMBER_MAX_LEN, type RouteDeadline, type QBTokens } from "./quickbooks";
 import {
     compensateAndUnlink,
     compensationWindowMs,
@@ -820,8 +820,14 @@ export async function stageProgressBillingToQuickBooksCore(
     // lets a `confirmed-none` clear release a row that already has a real,
     // collectible duplicate sitting in QuickBooks.
     const privateNote = progressBillingPrivateNote(invoice.code, billing.code).slice(0, QB_PRIVATE_NOTE_MAX_LEN);
+    // Truncated to QBO's DocNumber cap BEFORE it goes anywhere — same reasoning
+    // as the PrivateNote truncation above. `createInvoice` (createQBMilestoneInvoice)
+    // truncates again defensively, but the marker's identity has to be composed
+    // from the SAME value QBO actually stores, or the resolver's exact-match
+    // lookup misses a document we did create.
+    const docNumber = billing.code.slice(0, QB_DOC_NUMBER_MAX_LEN);
     const identity = {
-        docNumber: billing.code,
+        docNumber,
         privateNote,
         // Pinned to the values the link CAS below requires, not to whatever was
         // loaded — those are what this invoice is genuinely issued against.
@@ -830,6 +836,11 @@ export async function stageProgressBillingToQuickBooksCore(
             subtotal: billing.subtotal,
             total: billing.total,
         }),
+        // The QBO invoice TOTAL this create expects to produce. DocNumber +
+        // PrivateNote prove a resolved match is OURS; they carry no dollar
+        // figure, so this is what lets the ambiguous-create resolver refuse a
+        // coincidental match whose total is wrong instead of linking it blind.
+        expectedTotal: total,
     };
     // Captured once and reused for the promotion below — the ambiguous-create
     // marker must carry this SAME claim time, not a fresh one taken after the
@@ -861,7 +872,7 @@ export async function stageProgressBillingToQuickBooksCore(
     let created: { qbId: string; total: number };
     try {
         created = await qbo.createInvoice(tokens, {
-            docNumber: billing.code,
+            docNumber,
             customerId,
             itemId,
             description: billing.description,

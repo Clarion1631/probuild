@@ -88,6 +88,20 @@ export interface CreateIdentity {
      * the resolver treats that as unverifiable and refuses to link.
      */
     issuanceHash?: string;
+    /**
+     * The QuickBooks invoice TOTAL this create expects to produce.
+     *
+     * DocNumber + PrivateNote prove a document the resolver finds is OURS;
+     * neither carries a dollar figure. Without this, a resolver that matched
+     * on identity alone would link ANY invoice sharing that DocNumber and
+     * PrivateNote, whatever its actual total — including a coincidental match
+     * or a QuickBooks-side edit that changed the amount after our create.
+     * `undefined` means the marker predates this field: the resolver skips the
+     * comparison rather than refusing outright, since issuanceHash already
+     * covers the "did our own row move" case this is a belt-and-suspenders
+     * check on top of.
+     */
+    expectedTotal?: number;
 }
 
 /** Separates the marker kind from its identity payload. */
@@ -128,6 +142,14 @@ const MARKER_TIME_PREFIX = "@";
  * PrivateNote can begin with them -- see the invariants in composeCreateMarker.
  */
 const MARKER_HASH_PREFIX = "#";
+/**
+ * Prefixes the expected total, e.g.
+ * `ambiguous-create:#4f1c2ab90de7331a|$1089.00|INV-00171-2|ProBuild ...`.
+ *
+ * Sits after the optional `#hash` field and before the docNumber, for the
+ * same positional-safety reason as the hash prefix.
+ */
+const MARKER_TOTAL_PREFIX = "$";
 
 /**
  * `create-in-flight:@1730000000000|INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
@@ -161,13 +183,20 @@ export function composeCreateMarker(
     // malformed field and the marker would parse as corrupt (fail-closed, but
     // silently unresolvable). Ours never do -- this is an invariant, not input
     // validation, same as the separator check above.
-    if (identity.docNumber.startsWith(MARKER_TIME_PREFIX) || identity.docNumber.startsWith(MARKER_HASH_PREFIX)) {
+    if (
+        identity.docNumber.startsWith(MARKER_TIME_PREFIX)
+        || identity.docNumber.startsWith(MARKER_HASH_PREFIX)
+        || identity.docNumber.startsWith(MARKER_TOTAL_PREFIX)
+    ) {
         throw new Error(
-            `DocNumber must not start with "${MARKER_TIME_PREFIX}" or "${MARKER_HASH_PREFIX}": ${identity.docNumber}`,
+            `DocNumber must not start with "${MARKER_TIME_PREFIX}", "${MARKER_HASH_PREFIX}" or "${MARKER_TOTAL_PREFIX}": ${identity.docNumber}`,
         );
     }
     if (identity.issuanceHash != null && !/^[0-9a-f]+$/.test(identity.issuanceHash)) {
         throw new Error(`Issuance hash must be lowercase hex: ${identity.issuanceHash}`);
+    }
+    if (identity.expectedTotal != null && !Number.isFinite(identity.expectedTotal)) {
+        throw new Error(`Expected total must be finite: ${identity.expectedTotal}`);
     }
     // Both marker kinds carry the timestamp now -- a promotion to
     // ambiguous-create must preserve the in-flight claim's original time, not
@@ -176,7 +205,10 @@ export function composeCreateMarker(
     const hashPart = identity.issuanceHash
         ? `${MARKER_HASH_PREFIX}${identity.issuanceHash}${MARKER_FIELD_SEP}`
         : "";
-    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const totalPart = identity.expectedTotal != null
+        ? `${MARKER_TOTAL_PREFIX}${identity.expectedTotal}${MARKER_FIELD_SEP}`
+        : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${hashPart}${totalPart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -233,6 +265,17 @@ export function parseCreateMarker(
         // A malformed `#...` field falls through unstripped for the same reason
         // as a malformed `@...` one: it lands in docNumber and reads as corrupt.
     }
+    let expectedTotal: number | undefined;
+    if (payload.startsWith(MARKER_TOTAL_PREFIX)) {
+        const totalEnd = payload.indexOf(MARKER_FIELD_SEP);
+        const raw = totalEnd > 0 ? payload.slice(MARKER_TOTAL_PREFIX.length, totalEnd) : "";
+        const parsed = raw ? Number(raw) : NaN;
+        if (totalEnd > 0 && Number.isFinite(parsed)) {
+            expectedTotal = parsed;
+            payload = payload.slice(totalEnd + MARKER_FIELD_SEP.length);
+        }
+        // A malformed `$...` field falls through unstripped, same as `@...`/`#...`.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
@@ -240,12 +283,17 @@ export function parseCreateMarker(
     const docNumber = payload.slice(0, sep);
     const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
     if (!docNumber || !privateNote) return { kind, identity: null, atMs };
-    // The key is OMITTED, not set to undefined, when the marker carries no
-    // hash: a deep-equality check against a two-field identity has to keep
-    // reading as equal for a legacy marker.
+    // Each optional key is OMITTED, not set to undefined, when the marker
+    // carries no hash / total: a deep-equality check against a two-field
+    // identity has to keep reading as equal for a legacy marker.
     return {
         kind,
-        identity: issuanceHash ? { docNumber, privateNote, issuanceHash } : { docNumber, privateNote },
+        identity: {
+            docNumber,
+            privateNote,
+            ...(issuanceHash ? { issuanceHash } : {}),
+            ...(expectedTotal != null ? { expectedTotal } : {}),
+        },
         atMs,
     };
 }

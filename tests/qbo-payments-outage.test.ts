@@ -1811,12 +1811,19 @@ test("the sweep KEEPS the marker when the pay-link body is malformed", async () 
 
 test("the milestone claim writes an identity-carrying marker, and compensation unlinks", async () => {
     const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
-    const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
+    // From claimMilestonePreCreateUnderLock (the claim itself) through the end
+    // of pushMilestoneToQuickBooks — the claim now lives in a helper the push
+    // calls, so the identity/CAS assertions below have to see both.
+    const push = src.slice(src.indexOf("export async function claimMilestonePreCreateUnderLock"));
 
     // The claim CAS writes the composed marker, not the bare kind: recomputing
     // the docNumber later (it is a POSITION) or the note (it carries names)
     // would ask QuickBooks about a document we never created.
-    assert.match(push, /const identity = \{ docNumber, privateNote, issuanceHash \}/);
+    assert.match(push, /const identity = \{\s*\n\s*docNumber, privateNote, issuanceHash,/);
+    // Round 33 gate: DocNumber + PrivateNote prove a resolved match is OURS,
+    // not that its total is right — the identity must also carry the expected
+    // total so the resolver can refuse a coincidental match.
+    assert.match(push, /expectedTotal: amount,/);
     // The SAME claim timestamp is captured once and threaded into both the
     // in-flight marker and its later promotion to ambiguous-create — a
     // promotion must never reset the clock the resolver's cooldown reads.
@@ -1828,12 +1835,99 @@ test("the milestone claim writes an identity-carrying marker, and compensation u
     // time would hash as itself and match itself again at resolve time.
     assert.match(push, /const issuanceHash = milestoneIssuanceHash\(\{/);
     assert.match(push, /status: "Pending",\s*\n\s*qbPaymentId: null,/);
+    // Round 33 gate: the pre-create claim is taken UNDER the invoice lock, with
+    // a re-check of the progress-billing relationship inside that same lock —
+    // see the interleaving test below for the race this closes.
+    assert.match(push, /await lockMoneyParents\(tx, \{ invoiceId: schedule\.invoiceId \}\);/);
+    assert.match(push, /const claimedNow = await tx\.progressBillingLine\.findFirst\(\{/);
     assert.match(push, /data: \{ qbSyncError: inFlightMarker \}/);
+    assert.match(push, /const claimedSend = await claimMilestonePreCreateUnderLock\(schedule, inFlightMarker\);/);
     // Release and promote are pinned to OUR marker, not to any in-flight row.
     assert.match(push, /where: \{ id: schedule\.id, qbSyncError: inFlightMarker \}/);
     assert.match(push, /qbSyncError: composeCreateMarker\(AMBIGUOUS_CREATE_MARKER/);
     // And compensation goes through the shared delete+unlink step.
     assert.match(push, /compensateAndUnlink\(\s*prisma\.paymentSchedule/);
+});
+
+test("round 33 gate: a progress billing that lands between the pre-read and the claim makes the claim refuse", async () => {
+    // Codex gate: the pre-create CAS used to run OUTSIDE the invoice lock. A
+    // full progress billing could claim this same milestone (createProgressBillingCore
+    // takes the same Invoice lock — tx-retry.ts's canonical order) in the window
+    // between pushMilestoneToQuickBooks's early check and this write — both
+    // remote QBO calls (token refresh, customer/item resolve) happen in
+    // between — and the claim would still succeed, leaving two collectible
+    // QuickBooks invoices for one milestone.
+    const { claimMilestonePreCreateUnderLock } = await import("../src/lib/quickbooks-payments");
+
+    const schedule = {
+        id: "ps-1", invoiceId: "inv-1", status: "Pending",
+        amount: 1000, qbPaymentId: null, dueDate: null, name: "Rough-in",
+    };
+    const locked: string[] = [];
+    const claims: any[] = [];
+    const tx = {
+        // Stands in for lockMoneyParents's `SELECT ... FOR UPDATE` — its own
+        // unit is covered by tx-retry.ts; here it just has to run BEFORE the
+        // re-check below, which the call order in claimMilestonePreCreateUnderLock
+        // already guarantees.
+        $queryRaw: async () => { locked.push("invoice"); return []; },
+        progressBillingLine: {
+            async findFirst() {
+                // The interleaving: a progress billing landed on this exact
+                // milestone since the caller's earlier (unlocked) check.
+                return { billing: { code: "INV-1-P1", status: "Draft" } };
+            },
+        },
+        paymentSchedule: {
+            async updateMany(args: any) {
+                claims.push(args);
+                return { count: 1 };
+            },
+        },
+    };
+    const previous = (globalThis as any).prisma;
+    (globalThis as any).prisma = { $transaction: async (fn: any) => fn(tx) };
+    try {
+        await assert.rejects(
+            () => claimMilestonePreCreateUnderLock(schedule, "create-in-flight:@1|INV-1-2|note"),
+            /already covered by progress invoice INV-1-P1 \(Draft\)/,
+        );
+    } finally {
+        (globalThis as any).prisma = previous;
+    }
+    assert.equal(locked.length, 1, "the invoice lock must still be taken before the re-check");
+    assert.equal(claims.length, 0, "the claim write must never run once a progress billing owns this milestone");
+});
+
+test("round 33 gate: with no progress billing in the way, the locked claim still succeeds", async () => {
+    const { claimMilestonePreCreateUnderLock } = await import("../src/lib/quickbooks-payments");
+
+    const schedule = {
+        id: "ps-1", invoiceId: "inv-1", status: "Pending",
+        amount: 1000, qbPaymentId: null, dueDate: null, name: "Rough-in",
+    };
+    const claims: any[] = [];
+    const tx = {
+        $queryRaw: async () => [],
+        progressBillingLine: { async findFirst() { return null; } },
+        paymentSchedule: {
+            async updateMany(args: any) {
+                claims.push(args);
+                return { count: 1 };
+            },
+        },
+    };
+    const previous = (globalThis as any).prisma;
+    (globalThis as any).prisma = { $transaction: async (fn: any) => fn(tx) };
+    try {
+        const result = await claimMilestonePreCreateUnderLock(schedule, "create-in-flight:@1|INV-1-2|note");
+        assert.equal(result.count, 1);
+    } finally {
+        (globalThis as any).prisma = previous;
+    }
+    assert.equal(claims.length, 1);
+    assert.equal(claims[0].where.id, "ps-1");
+    assert.equal(claims[0].data.qbSyncError, "create-in-flight:@1|INV-1-2|note");
 });
 
 test("round 29 gate: the final link write proves ownership of the in-flight marker even on the retry branch", async () => {
@@ -1967,4 +2061,106 @@ test("deleteQBInvoice: a clean read + delete returns true", async () => {
         return json(200, { Invoice: { Id: "inv-1" } });
     }), () => deleteQBInvoice(TOKENS, "inv-1"));
     assert.equal(deleted, true);
+});
+
+// --- Round 33 gate: an estimate/invoice sync whose create outcome is unknown ---
+
+/**
+ * PR #438 round 33: /api/quickbooks/sync advertised retry:true after ANY
+ * timeout, including one that happened AFTER the create POST was dispatched —
+ * syncEstimateToQB/syncInvoiceToQB neither create a durable claim nor pass a
+ * QBO `requestid`, so a blind retry there risks a genuine duplicate document.
+ * These pin that syncEstimateToQB/syncInvoiceToQB now throw a distinct,
+ * name-based error for exactly that case, so the route can classify it apart
+ * from an ordinary pre-dispatch outage.
+ */
+
+const ESTIMATE_INPUT = {
+    id: "est-1",
+    code: "EST-00001",
+    title: "Kitchen Remodel",
+    totalAmount: 100,
+    items: [{ id: "item-1", parentId: null, name: "Demo", quantity: 1, unitCost: 100, total: 100, type: "Item" }],
+    customerId: "cust-1",
+    itemId: "item-svc-1",
+    project: { name: "Mesplay Kitchen" },
+};
+
+const INVOICE_INPUT = {
+    code: "INV-00001",
+    totalAmount: 100,
+    balanceDue: 100,
+    customerId: "cust-1",
+    itemId: "item-svc-1",
+    project: { name: "Mesplay Kitchen" },
+};
+
+test("syncEstimateToQB: a timeout AFTER the create POST is dispatched is ambiguous, not a plain outage", async () => {
+    const { syncEstimateToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => { throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/estimate"); },
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error, "must throw, not resolve");
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncEstimateToQB: a 2xx response missing Estimate.Id is ambiguous, not a silent success", async () => {
+    const { syncEstimateToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => json(200, { Estimate: {} }), // no Id
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error, "must throw, not return txnId:undefined as a success");
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncEstimateToQB: a definite 400 refusal is NOT ambiguous — QuickBooks answered no, nothing was created", async () => {
+    const { syncEstimateToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => json(400, { Fault: { Error: [{ Message: "bad request" }] } }),
+        () => syncEstimateToQB(TOKENS, ESTIMATE_INPUT as any, {}),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(isQBAmbiguousDocumentCreateError(error), false, "a plain refusal must not be told apart as ambiguous");
+    assert.equal(error?.name, "QboHttpError");
+});
+
+test("syncInvoiceToQB: a timeout AFTER dispatch is ambiguous", async () => {
+    const { syncInvoiceToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => { throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/invoice"); },
+        () => syncInvoiceToQB(TOKENS, INVOICE_INPUT as any),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("syncInvoiceToQB: a 2xx response missing Invoice.Id is ambiguous", async () => {
+    const { syncInvoiceToQB, isQBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    const error = await withFetch(
+        async () => json(200, { Invoice: {} }),
+        () => syncInvoiceToQB(TOKENS, INVOICE_INPUT as any),
+    ).then(() => null, (e: unknown) => e as Error);
+
+    assert.ok(error);
+    assert.equal(isQBAmbiguousDocumentCreateError(error), true, `not classified ambiguous: ${error?.name}`);
+});
+
+test("the /api/quickbooks/sync route classifies an ambiguous create distinctly, retry:false", async () => {
+    const fs = await import("node:fs");
+    const source = fs.readFileSync("src/app/api/quickbooks/sync/route.ts", "utf8");
+    assert.ok(source.includes("isQBAmbiguousDocumentCreateError"), "route does not classify the ambiguous-create error");
+    // The ambiguous branch must come first (checked before the generic
+    // retry:true outage classifier) and must never advertise retry:true.
+    const ambiguousIdx = source.indexOf("isQBAmbiguousDocumentCreateError(err)");
+    const genericIdx = source.indexOf("isQBBudgetExhaustedError(err)");
+    assert.ok(ambiguousIdx > -1 && genericIdx > -1 && ambiguousIdx < genericIdx, "ambiguous branch must be checked first");
+    const ambiguousBlock = source.slice(ambiguousIdx, genericIdx);
+    assert.ok(ambiguousBlock.includes('retry: false'), "an ambiguous create must never advertise retry:true");
+    assert.ok(ambiguousBlock.includes('"ambiguous-create"'), "must surface the ambiguous-create reason");
 });

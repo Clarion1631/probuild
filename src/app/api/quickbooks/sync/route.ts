@@ -3,11 +3,13 @@ import { getQBSettings, saveQBSettings } from "@/lib/integration-store";
 import {
     syncEstimateToQB, syncInvoiceToQB, ensureQBCustomer, ensureQBServiceItem,
     createRouteDeadline, isQBBudgetExhaustedError, isQBTimeoutError, isQboConnectionFailure,
+    isQBAmbiguousDocumentCreateError,
     type QBTokens, type RouteDeadline,
 } from "@/lib/quickbooks";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
+import { currentStaffUserOrNull, hasPermission, canAccessProject, canAccessEstimate } from "@/lib/permissions";
 
 /**
  * Whole-request budget. This route makes a serial CHAIN of QuickBooks calls —
@@ -48,20 +50,28 @@ export async function POST(req: NextRequest) {
         if (!type || !id) {
             return NextResponse.json({ error: "type and id required" }, { status: 400 });
         }
-
-        const qb = await getQBSettings();
-        if (!qb.connected) {
-            return NextResponse.json({ error: "QuickBooks not connected", notConnected: true }, { status: 400 });
+        if (type !== "estimate" && type !== "invoice") {
+            return NextResponse.json({ error: "Unknown type" }, { status: 400 });
         }
 
-        const tokens = await getFreshQBTokens(deadline);
+        // In-handler authorization. The proxy in front of this route proves the
+        // request came through the app, not that THIS caller may sync THIS
+        // record — checked before any token fetch or QuickBooks call, so an
+        // unauthorized request never spends a QBO round trip.
+        const user = await currentStaffUserOrNull();
+        if (!user) {
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        }
+        if (!hasPermission(user, type === "estimate" ? "estimates" : "invoices")) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
 
         if (type === "estimate") {
             const estimate = await prisma.estimate.findUnique({
                 where: { id },
                 select: {
                     id: true, code: true, title: true, status: true,
-                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
+                    totalAmount: true, balanceDue: true, createdAt: true, projectId: true, leadId: true,
                     // id/parentId feed the section-header detection in `buildQBEstimateLines`.
                     // orderBy keeps QB LineNum in the estimate's own row order rather than
                     // whatever order Postgres happens to return.
@@ -73,9 +83,18 @@ export async function POST(req: NextRequest) {
                 },
             });
             if (!estimate) return NextResponse.json({ error: "Estimate not found" }, { status: 404 });
+            if (!canAccessEstimate(user, { projectId: estimate.projectId, leadId: estimate.leadId })) {
+                return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+            }
 
             const client = estimate.project?.client;
             if (!client) return NextResponse.json({ error: "No client attached to estimate" }, { status: 400 });
+
+            const qb = await getQBSettings();
+            if (!qb.connected) {
+                return NextResponse.json({ error: "QuickBooks not connected", notConnected: true }, { status: 400 });
+            }
+            const tokens = await getFreshQBTokens(deadline);
 
             const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
                 id: client.id, name: client.name, email: client.email ?? null, qbCustomerId: client.qbCustomerId ?? null,
@@ -105,38 +124,59 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
         }
 
-        if (type === "invoice") {
-            const invoice = await prisma.invoice.findUnique({
-                where: { id },
-                include: {
-                    client: true,
-                    project: true,
-                },
-            });
-            if (!invoice) return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
-
-                const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
-                    id: invoice.client.id, name: invoice.client.name,
-                    email: invoice.client.email ?? null, qbCustomerId: invoice.client.qbCustomerId ?? null,
-                }, deadline);
-
-                const result = await syncInvoiceToQB(tokens, {
-                    code: invoice.code,
-                    totalAmount: toNum(invoice.totalAmount),
-                    balanceDue: toNum(invoice.balanceDue),
-                    customerId,
-                    itemId,
-                    project: invoice.project ? { name: invoice.project.name } : null,
-                }, deadline);
-
-            return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
+        const invoice = await prisma.invoice.findUnique({
+            where: { id },
+            include: {
+                client: true,
+                project: true,
+            },
+        });
+        if (!invoice) return NextResponse.json({ error: "Invoice not found" }, { status: 404 });
+        if (!canAccessProject(user, invoice.projectId)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
-        return NextResponse.json({ error: "Unknown type" }, { status: 400 });
+        const qb = await getQBSettings();
+        if (!qb.connected) {
+            return NextResponse.json({ error: "QuickBooks not connected", notConnected: true }, { status: 400 });
+        }
+        const tokens = await getFreshQBTokens(deadline);
+
+        const { customerId, itemId } = await resolveCustomerAndItem(tokens, {
+            id: invoice.client.id, name: invoice.client.name,
+            email: invoice.client.email ?? null, qbCustomerId: invoice.client.qbCustomerId ?? null,
+        }, deadline);
+
+        const result = await syncInvoiceToQB(tokens, {
+            code: invoice.code,
+            totalAmount: toNum(invoice.totalAmount),
+            balanceDue: toNum(invoice.balanceDue),
+            customerId,
+            itemId,
+            project: invoice.project ? { name: invoice.project.name } : null,
+        }, deadline);
+
+        return NextResponse.json({ success: true, qbId: result.qbId, qbUrl: result.qbUrl });
     } catch (err) {
-        // Out of budget, or QuickBooks unreachable: 503 + retry, not a 500. The
-        // caller should come back rather than treat an outage as a rejected
-        // document.
+        // The create POST may already have reached QuickBooks — a timeout or
+        // transport failure AFTER dispatch, or a 2xx response missing the
+        // created document's id (see syncEstimateToQB / syncInvoiceToQB).
+        // Retrying blindly risks a duplicate, so this is reported distinctly
+        // from an ordinary outage and never advertises retry:true.
+        if (isQBAmbiguousDocumentCreateError(err)) {
+            return NextResponse.json(
+                {
+                    error: "QuickBooks did not confirm whether this document was created — check QuickBooks for it before retrying.",
+                    retry: false,
+                    reason: "ambiguous-create",
+                },
+                { status: 503 },
+            );
+        }
+        // Out of budget, or QuickBooks unreachable BEFORE the create was
+        // dispatched (token refresh, customer/item lookup): 503 + retry, not
+        // a 500. The caller should come back rather than treat an outage as a
+        // rejected document.
         if (isQBBudgetExhaustedError(err) || isQboConnectionFailure(err)) {
             return NextResponse.json(
                 { error: isQBTimeoutError(err) ? "QuickBooks did not respond in time" : "QuickBooks is unavailable", retry: true },

@@ -42,6 +42,7 @@ import {
     parseCreateMarker,
     getFreshQBTokens,
 } from "./quickbooks-payments";
+import type { CreateIdentity } from "./qbo-create-markers";
 import { milestoneIssuanceHash, progressBillingIssuanceHash } from "./qbo-issuance";
 
 /** Whole-operation budget: a token refresh plus one query, and room to answer. */
@@ -73,7 +74,8 @@ export type AmbiguousCreateRefusal =
     | "create-still-active"
     | "result-set-truncated"
     | "issuance-changed"
-    | "issuance-unverifiable";
+    | "issuance-unverifiable"
+    | "mismatch";
 
 export type ResolveAmbiguousCreateResult =
     | { ok: true; outcome: "linked"; qbInvoiceId: string; message: string }
@@ -137,7 +139,7 @@ interface ParkedRow {
      * nothing, and offer to release a row whose real invoice is collectible.
      * `null` means the marker predates the identity (or is corrupt): refuse.
      */
-    identity: { docNumber: string; privateNote: string; issuanceHash?: string } | null;
+    identity: CreateIdentity | null;
     /**
      * The issuance hash of the row AS IT STANDS NOW, recomputed from the same
      * columns the create hashed. Compared against the marker's before linking.
@@ -293,6 +295,25 @@ export async function resolveAmbiguousInvoiceCreateCore(
                     `so linking it would attach a bill for the wrong money. Check invoice ${parked.identity.docNumber} in QuickBooks — if it is wrong, void or delete it there. Nothing was changed here.`,
             };
         }
+        // DocNumber and PrivateNote prove this invoice is OURS; neither carries
+        // a dollar figure, and the issuance-hash check above only proves our OWN
+        // row hasn't moved — it says nothing about the invoice QuickBooks
+        // actually holds. A coincidental identity match (or a QuickBooks-side
+        // edit) with the wrong total would otherwise be linked blind, attaching
+        // a bill for money this row does not actually owe.
+        if (
+            parked.identity.expectedTotal != null
+            && Math.abs(matches[0].total - parked.identity.expectedTotal) > 0.005
+        ) {
+            return {
+                ok: false,
+                refusal: "mismatch",
+                message:
+                    `A QuickBooks invoice matching ${parked.identity.docNumber} exists, but its total ($${matches[0].total.toFixed(2)}) ` +
+                    `does not match what ${parked.code} expected ($${parked.identity.expectedTotal.toFixed(2)}) — check invoice ${parked.identity.docNumber} ` +
+                    `in QuickBooks before doing anything else with this row. Nothing was changed here.`,
+            };
+        }
         // QuickBooks is the truth: an invoice exists, whatever the operator
         // asserted. Adopt it. PAYLINK_PENDING_MARKER rather than null, because
         // we have the id but not the pay link — the maintenance sweep fetches it.
@@ -440,7 +461,7 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
  */
 function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string | null }): {
     marker: string;
-    identity: { docNumber: string; privateNote: string; issuanceHash?: string } | null;
+    identity: CreateIdentity | null;
     kind: string | null;
     atMs: number | null;
 } {

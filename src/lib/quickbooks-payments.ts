@@ -47,6 +47,7 @@ import {
     getQBPayment,
     deleteQBInvoice,
     QB_PRIVATE_NOTE_MAX_LEN,
+    QB_DOC_NUMBER_MAX_LEN,
 } from "./quickbooks";
 import {
     AMBIGUOUS_CREATE_MARKER,
@@ -293,7 +294,7 @@ export {
  */
 export function milestoneDocNumber(invoiceCode: string, position: number): string {
     const suffix = `-${position}`;
-    return `${invoiceCode.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
+    return `${invoiceCode.slice(0, Math.max(1, QB_DOC_NUMBER_MAX_LEN - suffix.length))}${suffix}`;
 }
 
 /** The PrivateNote every milestone invoice carries — what proves it is ours. */
@@ -675,6 +676,67 @@ export function compensationWindowMs(routeRemainingMs: number): number {
 }
 
 /**
+ * Claim a milestone's pre-create CAS UNDER the invoice lock, re-checking the
+ * "not already covered by a progress billing" relationship inside the SAME
+ * lock the claim write takes.
+ *
+ * `pushMilestoneToQuickBooks`'s earlier check of this relationship (before
+ * tokens are refreshed and the customer/item are resolved — both real QBO
+ * round trips) is a cheap fast-path, not the guard: a progress billing can
+ * still land on this milestone in the window between that check and the
+ * claim below, and `createProgressBillingCore` takes the SAME Invoice lock
+ * (see tx-retry.ts's canonical lock order) — so re-checking here, inside the
+ * lock, is what actually serializes the two paths instead of letting them
+ * interleave into two collectible invoices for one milestone.
+ *
+ * Split out so the interleaving it closes can be tested without a database —
+ * see tests/qbo-payments-outage.test.ts.
+ */
+export async function claimMilestonePreCreateUnderLock(
+    schedule: {
+        id: string;
+        invoiceId: string;
+        status: string;
+        amount: Prisma.Decimal | number;
+        qbPaymentId: string | null;
+        dueDate: Date | null;
+        name: string;
+    },
+    inFlightMarker: string,
+): Promise<{ count: number }> {
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { billing: { select: { code: true, status: true } } },
+        });
+        if (claimedNow) {
+            throw new Error(
+                `This milestone is already covered by progress invoice ${claimedNow.billing.code} (${claimedNow.billing.status}) — stage that instead of creating a separate QuickBooks invoice here.`
+            );
+        }
+        // Pinned to the same content snapshot the create is about to build the
+        // invoice from — not just qbInvoiceId/qbSyncError. Those two alone let a
+        // concurrent settle, cancel, or edit land between the pre-claim read and
+        // this write and still pass the CAS, so the claim would protect an
+        // amount/name/dueDate/status that no longer matches what gets pushed.
+        return tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                qbInvoiceId: null,
+                qbSyncError: null,
+                status: schedule.status,
+                amount: schedule.amount,
+                qbPaymentId: schedule.qbPaymentId,
+                dueDate: schedule.dueDate,
+                name: schedule.name,
+            },
+            data: { qbSyncError: inFlightMarker },
+        });
+    }));
+}
+
+/**
  * The per-issuance idempotency seed, minted before the first QBO call.
  *
  * Keying on the row id de-duplicated a retry but could not express a
@@ -851,30 +913,25 @@ export async function pushMilestoneToQuickBooks(
         amount: schedule.amount,
         dueDate: schedule.dueDate,
     });
-    const identity = { docNumber, privateNote, issuanceHash };
+    const identity = {
+        docNumber, privateNote, issuanceHash,
+        // The QBO invoice TOTAL this create expects to produce. DocNumber +
+        // PrivateNote prove a resolved match is OURS; they carry no dollar
+        // figure, so this is what lets the ambiguous-create resolver refuse a
+        // coincidental match whose total is wrong instead of linking it blind.
+        expectedTotal: amount,
+    };
     // Captured once and reused for the promotion below — the ambiguous-create
     // marker must carry this SAME claim time, not a fresh one taken after the
     // request ends. See composeCreateMarker's `at` param.
     const claimedAt = new Date();
     const inFlightMarker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, claimedAt);
-    // Pinned to the same content snapshot the create is about to build the
-    // invoice from — not just qbInvoiceId/qbSyncError. Those two alone let a
-    // concurrent settle, cancel, or edit land between the pre-claim read above
-    // and this write and still pass the CAS, so the claim would protect an
-    // amount/name/dueDate/status that no longer matches what gets pushed.
-    const claimedSend = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            qbInvoiceId: null,
-            qbSyncError: null,
-            status: schedule.status,
-            amount: schedule.amount,
-            qbPaymentId: schedule.qbPaymentId,
-            dueDate: schedule.dueDate,
-            name: schedule.name,
-        },
-        data: { qbSyncError: inFlightMarker },
-    });
+    // Claimed UNDER the invoice lock, re-checking the progress-billing
+    // relationship inside that same lock — see claimMilestonePreCreateUnderLock's
+    // doc comment for why the earlier check above is not enough on its own.
+    // The lock is released (the transaction ends) here, BEFORE the QBO create
+    // call below.
+    const claimedSend = await claimMilestonePreCreateUnderLock(schedule, inFlightMarker);
     if (claimedSend.count !== 1) {
         throw new QBAmbiguousCreateError(schedule.invoice.code);
     }

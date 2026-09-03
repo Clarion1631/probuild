@@ -67,6 +67,9 @@ const MILESTONE_IDENTITY = {
     docNumber: MILESTONE_DOC,
     privateNote: MILESTONE_NOTE,
     issuanceHash: milestoneIssuanceHash(MILESTONE_STATE),
+    // The invoice() fixture below defaults total=1089 to match — a mismatch
+    // test overrides one side or the other, never both.
+    expectedTotal: MILESTONE_STATE.amount,
 };
 
 const BILLING_STATE = {
@@ -104,6 +107,7 @@ function billingRow(overrides: Record<string, any> = {}): any {
             docNumber: "INV-00171-P1",
             privateNote: progressBillingPrivateNote("INV-00171", "INV-00171-P1"),
             issuanceHash: progressBillingIssuanceHash(BILLING_STATE),
+            expectedTotal: BILLING_STATE.total,
         }, AMBIGUOUS_MARKER_AT),
         invoiceId: "inv-1",
         invoice: { code: "INV-00171", projectId: "proj-1" },
@@ -175,6 +179,23 @@ test("exactly one matching invoice is adopted, and the marker becomes paylink-pe
     assert.equal(events.at(-1)?.detail.actorEmail, "admin@example.com");
     assert.equal(events.at(-1)?.detail.operatorReason, "Checked QuickBooks");
     assert.equal(events.at(-1)?.detail.decision, "link-existing");
+});
+
+test("round 33 gate: DocNumber and PrivateNote match but the total differs — refused, not linked", async () => {
+    // The issuance-hash check only proves our OWN row hasn't moved since the
+    // create; it says nothing about what QuickBooks actually holds. A matching
+    // identity with the wrong total must not be adopted blind.
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE, 5000)], db),
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.refusal, "mismatch");
+    assert.equal(row.qbInvoiceId, null, "nothing written");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked for manual review");
 });
 
 test("an invoice sharing the DocNumber but not our PrivateNote is NOT ours", async () => {
