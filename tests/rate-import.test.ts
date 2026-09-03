@@ -666,3 +666,112 @@ test("apply REQUIRES the csv and re-parses it — the check cannot be skipped by
     // gives the NEXT preview a fresh value to be keyed on.
     assert.match(body, /payrollRevision: \{ increment: 1 \}/);
 });
+
+// ── Strict CSV + strict money (round 33, findings 4 and 5) ─────────────────
+//
+// Newlines are built with String.fromCharCode(10), like the rest of this file:
+// these cases are about exact characters, and an escape sequence is one more
+// thing to get wrong while writing a test about getting characters wrong.
+
+const LF = String.fromCharCode(10);
+const CRLF = String.fromCharCode(13, 10);
+const Q = String.fromCharCode(34);
+
+test("a character after a CLOSING quote is a parse error, naming the row and column", () => {
+    // `"Alex Smith"x` used to read as `Alex Smithx`: the quotes were forgotten
+    // and the stray character appended. In the rate column the same bug reads
+    // `"28.50"0` as 28.500 — somebody's paycheque, quietly wrong.
+    assert.throws(
+        () => parseCsvGrid(["name,rate", Q + "Alex Smith" + Q + "x,28.50", ""].join(LF)),
+        /Line 2, column 1[\s\S]*closing quote/
+    );
+    // The column named is the one the stray character is actually in.
+    assert.throws(
+        () => parseCsvGrid(["name,rate", "Alex," + Q + "28.50" + Q + "0", ""].join(LF)),
+        /Line 2, column 2/
+    );
+    // WHITESPACE IS REFUSED TOO, deliberately. There is no honest reading of
+    // `"Alex Smith" ,`: either the space belonged inside the quotes, or the
+    // file was written by something that disagrees with this parser about where
+    // a field ends — and the next surprise it holds may not be one this parser
+    // notices.
+    assert.throws(() => parseCsvGrid(["name,rate", Q + "Alex Smith" + Q + " ,28.50", ""].join(LF)), /closing quote/);
+    assert.throws(() => parseCsvGrid(["name", Q + "Alex Smith" + Q + " ", ""].join(LF)), /closing quote/);
+    // A second quote after a closed one is the same class of malformed.
+    assert.throws(() => parseCsvGrid(["name", Q + "Alex Smith" + Q + Q, ""].join(LF)), /quote/);
+});
+
+test("the import REFUSES such a file rather than importing the mangled rows", () => {
+    // The parse error has to reach the human as a refusal, not as a row that
+    // parsed "close enough" — this is the path the preview actually takes.
+    const parsed = parseGustoRateCsv(
+        ["Employee name,Email,Compensation rate", Q + "Brennan, Tim" + Q + "x,tim@example.com,28.50"].join(LF)
+    );
+    assert.deepEqual(parsed.rows, []);
+    assert.match(parsed.errors[0], /closing quote/);
+});
+
+test("legitimate quoting still parses — the strictness has an exact edge", () => {
+    // A doubled quote is an ESCAPE inside the field; it does not close it.
+    assert.deepEqual(parseCsvGrid(Q + "a" + Q + Q + "b" + Q + LF), [["a" + Q + "b"]]);
+    assert.deepEqual(parseCsvGrid(Q + "a" + Q + Q + "b" + Q + "," + Q + "c" + Q + LF), [["a" + Q + "b", "c"]]);
+    // An empty quoted field; a quoted field at EOF with no trailing newline;
+    // CRLF straight after a closing quote. (An ALL-empty row is dropped as
+    // blank by the populated-rows filter below, which predates this and is why
+    // this case pairs an empty field with a real one.)
+    assert.deepEqual(parseCsvGrid(Q + "a" + Q + "," + Q + Q + LF), [["a", ""]]);
+    assert.deepEqual(parseCsvGrid(Q + "a" + Q + "," + Q + "b" + Q), [["a", "b"]]);
+    assert.deepEqual(parseCsvGrid(Q + "a" + Q + "," + Q + "b" + Q + CRLF + Q + "c" + Q + "," + Q + "d" + Q + CRLF), [
+        ["a", "b"],
+        ["c", "d"],
+    ]);
+    // Whitespace INSIDE the quotes is content, and is kept.
+    assert.deepEqual(parseCsvGrid(Q + "Alex Smith " + Q + LF), [["Alex Smith "]]);
+});
+
+test("malformed money is REFUSED, not scrubbed into a plausible number", () => {
+    // Every `$` and every space anywhere used to be deleted before matching, so
+    // a mistyped rate was quietly repaired into one that looked fine. These two
+    // reached a paycheque: "2$8" became 28.00, and "2 8.50" became 28.50.
+    assert.equal(parseRateValue("2$8"), null);
+    assert.equal(parseRateValue("2 8.50"), null);
+    assert.equal(parseRateValue("2 8"), null);
+    assert.equal(parseRateValue("$$28.50"), null);
+    assert.equal(parseRateValue("28.50$"), null);
+    assert.equal(parseRateValue("$ 28.50"), null);
+    assert.equal(parseRateValue("abc"), null);
+    // A thousands separator stays REFUSED: the comma rule cannot tell
+    // "1,234.56" from the European "28,50" without guessing at the file's
+    // locale, and guessing wrong is a 100x rate. Nothing under the $500/h
+    // import ceiling needs one anyway.
+    assert.equal(parseRateValue("1,234.56"), null);
+
+    // What is still accepted, unchanged: one leading $, surrounding whitespace,
+    // a bare decimal, and a sign — which the caller reports as "a negative rate
+    // is not a rate", a better message than "unreadable".
+    assert.equal(parseRateValue("$28.50"), "28.50");
+    assert.equal(parseRateValue("  $28.50  "), "28.50");
+    assert.equal(parseRateValue("28.5"), "28.50");
+    assert.equal(parseRateValue("28"), "28.00");
+    assert.equal(parseRateValue("-$28.50"), "-28.50");
+});
+
+test("the mangling reached the manual rate writers too, and is refused there", async () => {
+    // pay-rate-write.ts is the ONE place a rate is written by hand, and it
+    // parses with exactly this function — so "2$8" typed into the team-member
+    // editor used to store 28.00.
+    const { applyRateChange } = await import("../src/lib/pay-rate-write");
+    const client = {
+        $transaction: async (fn: any) =>
+            fn({
+                user: { update: async () => ({}) },
+                $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+                $executeRawUnsafe: async () => 0,
+            }),
+    };
+    for (const bad of ["2$8", "2 8.50", "1,234.56"]) {
+        const result = await applyRateChange({ role: "ADMIN" }, "u1", { hourlyRate: bad }, client as never);
+        assert.equal(result.ok, false, bad);
+    }
+    assert.equal((await applyRateChange({ role: "ADMIN" }, "u1", { hourlyRate: "$28.50" }, client as never)).ok, true);
+});

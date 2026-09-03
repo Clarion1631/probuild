@@ -144,7 +144,7 @@ export function isPeriodLockedError(error: unknown): error is PeriodLockedError 
  * `pg_advisory_xact_lock*` releases at COMMIT or ROLLBACK, so there is no leak
  * path: it cannot outlive the transaction even if the handler throws.
  */
-export async function acquirePayrollWriteLock(tx: PayrollTxClient): Promise<void> {
+export async function acquirePayrollWriteLock(tx: Pick<PayrollTxClient, "$executeRawUnsafe">): Promise<void> {
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock_shared(hashtext($1))`, PAYROLL_ADVISORY_LOCK_KEY);
 }
 

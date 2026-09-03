@@ -15498,6 +15498,13 @@ export async function applyGustoRateImport(
     try {
         await prisma.$transaction(async (tx) => {
             const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
+            const { acquirePayrollWriteLock } = await import("./payroll-period");
+            // TIER 1 OF THE GLOBAL LOCK ORDER, before any row lock. Rates and
+            // pay types are EXPORT INPUTS — pay type decides who is on the
+            // Gusto roster at all — so this import has to serialise against a
+            // period being locked, not just against another rate writer. See
+            // the same lock in pay-rate-write.ts.
+            await acquirePayrollWriteLock(tx as never);
             // EXCLUSIVE row locks first, in a stable id order so two concurrent
             // imports cannot deadlock on each other. This is the other half of
             // settlement's FOR SHARE: a day mid-reprice holds the shared lock, so
@@ -15582,16 +15589,29 @@ export async function setUserPayType(
     if (payType !== "HOURLY" && payType !== "SALARY") {
         return { success: false as const, error: "Pay type must be hourly or salary." };
     }
-    const updated = await prisma.user.updateMany({
-        where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
-        // lastRateSyncAt is NOT touched here — it means "a rate was actually
-        // confirmed", and this write never touches hourlyRate/burdenRate.
-        // payrollRevision moves instead: the rate-import token is signed over
-        // it (see oldPayrollRevision in applyGustoRateImport), so a
-        // HOURLY -> SALARY -> HOURLY cycle still advances the counter and an
-        // old, already-shown approval's signature stops verifying even though
-        // payType (and lastRateSyncAt) end up back where they started.
-        data: { payType, payrollRevision: { increment: 1 } },
+    const { acquirePayrollWriteLock } = await import("./payroll-period");
+    const { lockOwnerRowForUpdate } = await import("./pay-rate-guard");
+    // A PAYROLL WRITE, not a profile edit. payType decides who appears on the
+    // Gusto roster and whether their hours are summarised, so this is an input
+    // to the export hash that lockPayrollPeriod freezes. Taking the shared
+    // payroll advisory lock FIRST — tier 1 of the global lock order — is what
+    // makes this writer wait for a period being locked instead of committing
+    // between that lock's "confirmed" recompute and its COMMIT. The row lock
+    // comes after, same order as every other rate writer (pay-rate-write.ts).
+    const updated = await prisma.$transaction(async (tx) => {
+        await acquirePayrollWriteLock(tx as never);
+        await lockOwnerRowForUpdate(tx as never, userId);
+        return tx.user.updateMany({
+            where: options.historical ? { id: userId } : { id: userId, status: { not: "DISABLED" } },
+            // lastRateSyncAt is NOT touched here — it means "a rate was actually
+            // confirmed", and this write never touches hourlyRate/burdenRate.
+            // payrollRevision moves instead: the rate-import token is signed over
+            // it (see oldPayrollRevision in applyGustoRateImport), so a
+            // HOURLY -> SALARY -> HOURLY cycle still advances the counter and an
+            // old, already-shown approval's signature stops verifying even though
+            // payType (and lastRateSyncAt) end up back where they started.
+            data: { payType, payrollRevision: { increment: 1 } },
+        });
     });
     if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
 

@@ -19,16 +19,21 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 function fakeClient() {
     const writes: Array<{ where: unknown; data: Record<string, unknown> }> = [];
     const locks: string[] = [];
+    // Every lock statement in order, advisory and row alike — the ORDER is the
+    // thing that has to hold (payroll advisory first, then the row).
+    const lockOrder: string[] = [];
     return {
         writes,
         // A transaction, because the real write takes the exclusive row lock and
         // updates in one atomic step. `locks` records that it did.
         locks,
+        lockOrder,
         client: {
             $transaction: async (fn: any) =>
                 fn({
                     user: { update: async (args: any) => { writes.push(args); return {}; } },
-                    $queryRawUnsafe: async (_q: string, id: string) => { locks.push(id); return [{ id }]; },
+                    $queryRawUnsafe: async (_q: string, id: string) => { locks.push(id); lockOrder.push(`row:${id}`); return [{ id }]; },
+                    $executeRawUnsafe: async (_q: string, key: string) => { lockOrder.push(`advisory:${key}`); return 0; },
                 }),
         },
     };
@@ -125,10 +130,15 @@ test("the lock is taken BEFORE the write, not after it", async () => {
                     order.push(q.includes("FOR UPDATE") ? "lock" : "read");
                     return [{ id }];
                 },
+                $executeRawUnsafe: async () => { order.push("payroll"); return 0; },
             }),
     };
     await applyRateChange(ADMIN, "u1", { hourlyRate: "31.00" }, client as never);
-    assert.deepEqual(order, ["lock", "write"], "a lock taken after the write serializes nothing");
+    assert.deepEqual(
+        order,
+        ["payroll", "lock", "write"],
+        "a lock taken after the write serializes nothing — and the payroll lock comes before the row lock"
+    );
 });
 
 test("a refused write never reaches the transaction at all", async () => {
@@ -200,6 +210,7 @@ test("applyRateChangeInTx does NOT open a transaction — a tx has no $transacti
     const tx = {
         user: { update: async (args: unknown) => { writes.push(args); return {}; } },
         $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+        $executeRawUnsafe: async () => 0,
         // Deliberately absent: $transaction. Reaching for it is the bug.
     };
     const result = await applyRateChangeInTx(tx, ADMIN, "u1", { hourlyRate: "31.00" });
@@ -230,6 +241,7 @@ test("applyRateChange is the ONLY opener, and refuses before taking a connection
             return fn({
                 user: { update: async () => ({}) },
                 $queryRawUnsafe: async (_q: string, id: string) => [{ id }],
+                $executeRawUnsafe: async () => 0,
             });
         },
     };
@@ -250,4 +262,36 @@ test("a payload with no rate fields still short-circuits without a transaction",
     const result = await applyRateChange(CREW, "u1", {}, client as never);
     assert.deepEqual(result, { ok: true, changed: false });
     assert.equal(opened, false, "an ordinary profile edit must not need payroll permission OR a transaction");
+});
+
+// ── The payroll advisory lock (round 33, finding 1) ─────────────────────────
+
+test("a rate or pay-type write takes the PAYROLL advisory lock, before the row lock", async () => {
+    // The race this closes: lockPayrollPeriod holds the EXCLUSIVE payroll
+    // advisory lock while it recomputes the CSVs and hashes them. A rate or
+    // pay-type write that took only the row lock could commit inside that
+    // window, so the period was frozen around a roster that had already moved —
+    // payType decides who is on the Gusto file at all.
+    for (const change of [{ hourlyRate: "31.00" }, { payType: "SALARY" }, { burdenRate: "6.00" }]) {
+        const { client, lockOrder } = fakeClient();
+        const result = await applyRateChange(ADMIN, "u1", change, client as never);
+        assert.equal(result.ok, true);
+        assert.deepEqual(
+            lockOrder,
+            ["advisory:payroll-period", "row:u1"],
+            `${JSON.stringify(change)}: payroll lock first, THEN the row — the order is what keeps it deadlock-free`
+        );
+    }
+});
+
+test("a refused write takes no lock at all", async () => {
+    // Permission and validation are decided before anything is locked, so a
+    // rejected profile edit never contends with a pay period being locked.
+    const denied = fakeClient();
+    assert.equal((await applyRateChange(CREW, "u1", { hourlyRate: "31.00" }, denied.client as never)).ok, false);
+    assert.deepEqual(denied.lockOrder, []);
+
+    const invalid = fakeClient();
+    assert.equal((await applyRateChange(ADMIN, "u1", { hourlyRate: "2$8" }, invalid.client as never)).ok, false);
+    assert.deepEqual(invalid.lockOrder, [], "a malformed rate is refused before the locks, not after");
 });

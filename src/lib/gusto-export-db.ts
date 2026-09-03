@@ -78,6 +78,41 @@ async function lockExportInputRows(client: Prisma.TransactionClient): Promise<vo
     await client.$queryRawUnsafe(`SELECT "id" FROM "Integration" WHERE "id" = $1 FOR SHARE`, "system_settings");
 }
 
+/**
+ * Re-read the roster's User rows FOR SHARE, and use THOSE values.
+ *
+ * The third mutable, non-entry input. name, email and payType all reach the
+ * CSVs — payType decides whether somebody is summarised as hourly at all — and
+ * an ordinary findMany holds nothing, so a pay-type change could commit between
+ * the export's read and lockPayrollPeriod's COMMIT and leave a period frozen
+ * around a roster that had already moved.
+ *
+ * The advisory lock in every rate/pay-type writer (pay-rate-write.ts,
+ * setUserPayType, applyGustoRateImport) is the primary defence: they wait for
+ * the exclusive lock the period holds. This is the second one, at the row
+ * level, so a writer that somehow does NOT take that lock still blocks here
+ * until this transaction commits.
+ *
+ * FOR SHARE re-reads rather than reusing the findMany's values on purpose: under
+ * READ COMMITTED the earlier read can already be stale, and the point of the
+ * lock is to hash what is committed at the moment it is held.
+ *
+ * LOCK ORDER: after the payroll advisory lock, after the settings rows, after
+ * the TimeEntry read — the same "TimeEntry before User" ordering settlement
+ * uses (see settleDayInTx), so the two cannot form a cycle. Sorted by id, like
+ * every other multi-row lock here.
+ */
+async function readExportUsersForShare(
+    client: Prisma.TransactionClient,
+    ids: string[]
+): Promise<Array<{ id: string; name: string | null; email: string; payType: string | null }>> {
+    if (ids.length === 0) return [];
+    return (await client.$queryRawUnsafe(
+        `SELECT "id", "name", "email", "payType" FROM "User" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE`,
+        ids
+    )) as Array<{ id: string; name: string | null; email: string; payType: string | null }>;
+}
+
 export type LoadedGustoExport = GustoExport & {
     periodStart: Date;
     periodEnd: Date;
@@ -382,7 +417,24 @@ export async function loadGustoExport(
         select: { id: true, name: true, email: true, payType: true },
         orderBy: { id: "asc" },
     });
-    const users: ExportUser[] = userRows.map((row) => ({
+
+    // The roster is settled; now PIN it. Inside a transaction the rows are
+    // re-read FOR SHARE and those values are what gets hashed — see
+    // readExportUsersForShare. Outside one the lock would be released before the
+    // next statement, so the findMany above is the answer (the page render and
+    // the download endpoint are ordinary reads, exactly like the settings rows).
+    const lockedRows = isTransactionClient(client)
+        ? await readExportUsersForShare(client as Prisma.TransactionClient, userRows.map((row) => row.id))
+        : userRows;
+    if (lockedRows.length !== userRows.length) {
+        // A row on this roster was deleted in the window between the two reads.
+        // Freezing a pay period around a roster that just changed is the thing
+        // the lock exists to prevent, so refuse and let the caller start again.
+        throw new Error(
+            "A team member on this pay period changed while it was being read. Nothing was changed - refresh and try again."
+        );
+    }
+    const users: ExportUser[] = lockedRows.map((row) => ({
         id: row.id,
         name: row.name,
         email: row.email,

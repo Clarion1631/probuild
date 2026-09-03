@@ -16,6 +16,7 @@ import { prisma } from "./prisma";
 import { hasPermission } from "./access-rules";
 import { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } from "./rate-import";
 import { isKnownPayType, lockOwnerRowForUpdate } from "./pay-rate-guard";
+import { acquirePayrollWriteLock } from "./payroll-period";
 
 export type RateActor = { role: string; permissions?: unknown } | null | undefined;
 
@@ -79,6 +80,8 @@ export type RateWriteClient = {
 export type RateWriteTx = {
     user: { update(args: unknown): Promise<unknown> };
     $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+    /** For the payroll advisory lock — tier 1 of the global lock order. */
+    $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
 };
 
 /** Does this payload touch payroll at all? Both entry points ask, so they cannot disagree. */
@@ -141,6 +144,22 @@ export async function applyRateChangeInTx(
     // hand) still moves this counter forward, so an old approval's signature
     // stops verifying even though lastRateSyncAt cannot tell the difference.
     if (touchesRates || touchesPayType) data.payrollRevision = { increment: 1 };
+
+    // TIER 1 OF THE GLOBAL LOCK ORDER (src/lib/payroll-period.ts), before any
+    // row lock. hourlyRate, burdenRate and payType are all EXPORT INPUTS: pay
+    // type decides who is on the Gusto roster and whether their hours are
+    // summarised at all, and lockPayrollPeriod hashes the result and freezes it.
+    // Without this, a pay-type change could commit between that lock's
+    // "confirmed" recompute and its COMMIT, and the period would be frozen
+    // around a roster that had already moved — the advisory lock is what makes
+    // this writer wait for the lock creation instead.
+    //
+    // The SHARED half: rate writers do not conflict with each other (the row
+    // lock below is what serialises those), only with a period being locked.
+    // Taken BEFORE the row lock, which is also what keeps it deadlock-free: a
+    // writer can never hold a User row while waiting for the payroll lock, so
+    // the export's FOR SHARE on those rows cannot close a cycle.
+    await acquirePayrollWriteLock(tx);
 
     // EXCLUSIVE row lock, then the write, on the CALLER's transaction.
     // Settlement reads the same row FOR SHARE while it reprices a day, so this

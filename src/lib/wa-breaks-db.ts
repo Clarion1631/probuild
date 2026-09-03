@@ -117,6 +117,17 @@ export async function settleDay(
  * as sufficient froze a flagged day — a later shift that changed the meal
  * allocation was skipped, and the earlier row kept hours the day no longer
  * produces.
+ *
+ * `flagsChange` is checked FOR BOTH BRANCHES, before either. It used to be
+ * consulted only at a real rate, so on a $0-rate day the review state was
+ * frozen along with the hours: a re-plan that had newly decided the day
+ * OVERLAPS another, or that no attestation was on file, wrote nothing at all
+ * because the hours still matched and the zero-rate note was already there —
+ * and the manager queue never showed the reason. The retirement direction is
+ * just as bad: an overlap that has since been edited away kept its note
+ * forever, because dropping a reason is also a flags change and it was also
+ * being skipped. Review state is an OUTPUT of the re-plan, not a reason to
+ * skip it.
  */
 export function settlementRowIsCurrent(input: {
     stored: {
@@ -136,7 +147,10 @@ export function settlementRowIsCurrent(input: {
         Math.abs((stored.mealDeductionHours ?? 0) - update.mealDeductionHours) < 1e-9 &&
         stored.mealOutcome === update.mealOutcome;
     if (!hoursMatch) return false;
-    if (!input.zeroRate) return !input.flagsChange;
+    // A review-state change is a WRITE, at any rate. Adding a reason and
+    // retiring one are both changes, and both have to land.
+    if (input.flagsChange) return false;
+    if (!input.zeroRate) return true;
     return stored.needsReview && (stored.reviewReason ?? "").includes(ZERO_RATE_REVIEW_NOTE);
 }
 

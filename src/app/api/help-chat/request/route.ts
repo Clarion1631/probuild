@@ -17,6 +17,8 @@ import {
   readJsonBody,
   reserveHelpRequest,
   submissionMarker,
+  SUBMISSION_KEY_CONFLICT,
+  SUBMISSION_KEY_CONFLICT_MESSAGE,
 } from "@/lib/help-chat/submission-guard";
 import { findIssueByMarker } from "@/lib/help-chat/github";
 
@@ -99,6 +101,15 @@ export async function POST(req: NextRequest) {
       submissionId: effectiveSubmissionId,
     });
     if (!reserved.ok) {
+      // The key was reused for DIFFERENT content. That is not a retry, so
+      // nothing is filed and nothing is attached — 409, and the caller sends
+      // the new report under a new id.
+      if (reserved.reason === "payload-conflict") {
+        return NextResponse.json(
+          { error: SUBMISSION_KEY_CONFLICT_MESSAGE, code: SUBMISSION_KEY_CONFLICT },
+          { status: 409 }
+        );
+      }
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
     // A retry carrying the same submissionId. If the previous attempt died
@@ -118,6 +129,13 @@ export async function POST(req: NextRequest) {
       });
     }
     const requestId = reserved.id;
+    // THE CONTENT THAT GETS FILED — the stored row's, not this request's. On a
+    // resume the two are equal by fingerprint (a mismatch was refused above), so
+    // reading the incoming body here would only be a way to drift back to it
+    // later. The label follows the STORED type for the same reason: what the
+    // saved report says it is, not what this caller says.
+    const filing = reserved.payload;
+    const filedAsBug = filing.type === "bug";
 
     // Before filing, ask GitHub whether this submission is already there. A
     // resume happens precisely because the previous attempt's outcome is
@@ -160,13 +178,13 @@ export async function POST(req: NextRequest) {
       alreadyFiled ??
       (await createHelpChatGitHubIssue({
         signal: deadline,
-        title,
-        description,
-        currentPage,
-        labelPrefix: fromMobile ? "Bug Fix" : "Feature Request",
-        labels: fromMobile ? ["bug-fix", "from-mobile"] : ["feature-request", "from-chat"],
+        title: filing.question,
+        description: filing.response,
+        currentPage: filing.currentPage,
+        labelPrefix: filedAsBug ? "Bug Fix" : "Feature Request",
+        labels: filedAsBug ? ["bug-fix", "from-mobile"] : ["feature-request", "from-chat"],
         metadata: [
-          ...(conversationId ? [`**Conversation ID:** \`${conversationId}\``] : []),
+          ...(filing.conversationId ? [`**Conversation ID:** \`${filing.conversationId}\``] : []),
           // The idempotency marker, in the body, so a resumed attempt can find
           // this issue instead of opening a second one.
           marker,

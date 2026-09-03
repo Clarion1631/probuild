@@ -16,6 +16,8 @@ import {
   readJsonBody,
   reserveHelpRequest,
   submissionMarker,
+  SUBMISSION_KEY_CONFLICT,
+  SUBMISSION_KEY_CONFLICT_MESSAGE,
 } from "@/lib/help-chat/submission-guard";
 import { findIssueByMarker } from "@/lib/help-chat/github";
 
@@ -99,6 +101,14 @@ export async function POST(req: NextRequest) {
       submissionId,
     });
     if (!reserved.ok) {
+      // Same rule as /request: an idempotency key reused for different content
+      // is not a retry. Nothing is filed and nothing is attached.
+      if (reserved.reason === "payload-conflict") {
+        return NextResponse.json(
+          { error: SUBMISSION_KEY_CONFLICT_MESSAGE, code: SUBMISSION_KEY_CONFLICT },
+          { status: 409 }
+        );
+      }
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
     // See the request route: a stale `submitting` row is resumed, not returned.
@@ -112,6 +122,12 @@ export async function POST(req: NextRequest) {
       });
     }
     const requestId = reserved.id;
+    // THE CONTENT THAT GETS FILED — the stored row's, not this request's. A
+    // resume finishes the report that was SAVED; the incoming body only got
+    // this far because its fingerprint matched, so reading it here would buy
+    // nothing and could drift. `steps` is already folded into the stored
+    // `response` by buildBugFixDetails, so the fingerprint covers it too.
+    const filing = reserved.payload;
 
     // Same provider-reconciliation protocol as /api/help-chat/request. A resume
     // happens precisely because the previous attempt's outcome is unknown — it
@@ -152,9 +168,9 @@ export async function POST(req: NextRequest) {
       alreadyFiled ??
       (await createHelpChatGitHubIssue({
         signal: deadline,
-        title,
-        description: issueDetails,
-        currentPage: currentPage || null,
+        title: filing.question,
+        description: filing.response,
+        currentPage: filing.currentPage,
         labelPrefix: "Bug Fix",
         // Phase 5 G5 opened the widget to every ACTIVATED role, but the
         // agent-task label is what hands the issue to Phantom unattended —
@@ -162,7 +178,7 @@ export async function POST(req: NextRequest) {
         labels: bugFixIssueLabels(auth.user),
         metadata: [
           steps ? `**Steps to Reproduce:**\n${steps}` : "",
-          `**Conversation ID:** \`${conversationId}\``,
+          `**Conversation ID:** \`${filing.conversationId}\``,
           // The idempotency marker, in the body, so a resumed attempt can find
           // this issue instead of opening a second one.
           marker,

@@ -62,6 +62,12 @@ function fakeTx() {
             locked.push(String(args[0]));
             return [];
         },
+        // The payroll advisory lock — tier 1 of the global lock order, taken by
+        // applyRateChangeInTx before the row lock (round 33, finding 1).
+        $executeRawUnsafe: async (_sql: string, ...args: unknown[]) => {
+            locked.push(`advisory:${String(args[0])}`);
+            return 0;
+        },
         user: {
             create: async ({ data }: { data: Record<string, unknown> }) => {
                 row = {
@@ -197,8 +203,13 @@ test("the 201 body carries the rate that was committed, not the pre-update snaps
         );
     }
 
-    // The rate write really did take its row lock inside the same transaction.
-    assert.deepEqual(locked, ["u-new"], "applyRateChangeInTx locks the owner row it is about to write");
+    // The rate write really did take its locks inside the same transaction, in
+    // the global order: payroll advisory lock first, THEN the owner row.
+    assert.deepEqual(
+        locked,
+        ["advisory:payroll-period", "u-new"],
+        "applyRateChangeInTx takes the payroll lock, then locks the owner row it is about to write"
+    );
 });
 
 test("the pre-update snapshot is genuinely different — this test could fail", async () => {

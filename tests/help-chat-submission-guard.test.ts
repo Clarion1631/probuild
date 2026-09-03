@@ -25,6 +25,7 @@ import {
     HELP_DESCRIPTION_MAX,
     HELP_SUBMISSIONS_PER_HOUR,
     HELP_SUBMISSION_ID_MAX,
+    HELP_SUBMITTING_STALE_MS,
     HELP_THROTTLE_WINDOW_MS,
     HELP_TITLE_MAX,
     isThrottled,
@@ -177,8 +178,12 @@ test("the request route classifies a mobile submission as a bug, with bug labels
     );
     assert.match(source, /const fromMobile = fromMobileClient \|\| isMobileSubmission\(currentPage\)/);
     assert.match(source, /type: fromMobile \? "bug" : "feature_request"/);
-    assert.match(source, /labelPrefix: fromMobile \? "Bug Fix" : "Feature Request"/);
-    assert.match(source, /fromMobile \? \["bug-fix", "from-mobile"\]/);
+    // The LABEL follows the type that was STORED, not the one this request
+    // computed: on a resume the issue belongs to the saved report (round 33,
+    // finding 3), and the two are the same value on a fresh insert.
+    assert.match(source, /const filedAsBug = filing\.type === "bug"/);
+    assert.match(source, /labelPrefix: filedAsBug \? "Bug Fix" : "Feature Request"/);
+    assert.match(source, /filedAsBug \? \["bug-fix", "from-mobile"\]/);
 });
 
 test("submissionId is optional, bounded, and makes a retry idempotent", () => {
@@ -563,7 +568,23 @@ function fakeClient(options: { insertWins: boolean; existing?: any; quota?: bool
             return Promise.resolve(1);
         },
         helpRequest: {
-            findUnique: () => Promise.resolve(options.existing ?? null),
+            findUnique: () =>
+                Promise.resolve(
+                    options.existing
+                        ? {
+                              // The stored row's CONTENT. Defaulted to the
+                              // submission under test so a fixture only has to
+                              // say what DIFFERS — reserveHelpRequest now checks
+                              // the key against the content it was issued for.
+                              type: SUBMISSION.type,
+                              question: SUBMISSION.question,
+                              response: SUBMISSION.response,
+                              currentPage: SUBMISSION.currentPage,
+                              conversationId: SUBMISSION.conversationId,
+                              ...options.existing,
+                          }
+                        : null
+                ),
         },
     };
     return {
@@ -713,3 +734,114 @@ test("a pending row stays resumable, so a later retry finishes it", () => {
 // request-level test in a file that never statically imports that chain is
 // what makes the patch effective — see that file's header for the full
 // explanation.
+
+// ---------------------------------------------------------------------------
+// Round 33, finding 3: an idempotency key is bound to the payload it was
+// issued for.
+// ---------------------------------------------------------------------------
+
+test("a key reused with DIFFERENT content is refused — no attaching, no filing, no quota", async () => {
+    // What used to happen: the conflict branch returned status metadata only, so
+    // the route filed the INCOMING text while attaching the issue to the stored
+    // row. The saved report and the GitHub issue raised from it then described
+    // two different things, and whichever one you read was the wrong one.
+    const replay = fakeClient({
+        insertWins: false,
+        existing: { id: "new-row", status: "submitting", createdAt: new Date(), providerState: "pending" },
+    });
+    const result = await reserveHelpRequest(
+        { ...SUBMISSION, question: "a completely different bug" },
+        replay.client as never
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "payload-conflict");
+    assert.ok(
+        !replay.sql.some((s) => s.includes("COUNT(*)::int AS count")),
+        "a refused submission is not charged a quota slot either"
+    );
+});
+
+test("every fingerprinted field is load-bearing", async () => {
+    for (const differing of [
+        { question: "different title" },
+        { response: "different description" },
+        { currentPage: "/projects/abc" },
+        { conversationId: "conv-2" },
+        { type: "feature_request" },
+    ]) {
+        const replay = fakeClient({
+            insertWins: false,
+            existing: { id: "new-row", status: "submitting", createdAt: new Date(), providerState: "pending" },
+        });
+        const result = await reserveHelpRequest({ ...SUBMISSION, ...differing }, replay.client as never);
+        assert.equal(
+            result.ok === false && result.reason,
+            "payload-conflict",
+            `${JSON.stringify(differing)} must not be able to ride an old key`
+        );
+    }
+});
+
+test("a genuine replay resumes from the STORED payload, never the incoming one", async () => {
+    // The fingerprint is NORMALISED (trimmed, absent === empty), so a retry that
+    // differs only in whitespace or in null-vs-"" is still the same report — and
+    // what comes back is the row's own copy, which is what the issue must be
+    // filed from.
+    const replay = fakeClient({
+        insertWins: false,
+        existing: {
+            id: "new-row",
+            status: "submitting",
+            createdAt: new Date(Date.now() - HELP_SUBMITTING_STALE_MS - 1_000),
+            providerState: "pending",
+            currentPage: "mobile:Time Clock",
+            conversationId: null,
+        },
+    });
+    const result = await reserveHelpRequest(
+        { ...SUBMISSION, currentPage: "  mobile:Time Clock  ", conversationId: "" },
+        replay.client as never
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.resume, true, "an abandoned attempt is still resumable");
+    assert.deepEqual(
+        result.ok && result.payload,
+        {
+            type: SUBMISSION.type,
+            question: SUBMISSION.question,
+            response: SUBMISSION.response,
+            currentPage: "mobile:Time Clock",
+            conversationId: null,
+        },
+        "the STORED copy — untrimmed incoming text and an empty-string conversationId must not leak through"
+    );
+});
+
+test("a fresh insert hands back the payload it just stored", async () => {
+    const fresh = fakeClient({ insertWins: true });
+    const result = await reserveHelpRequest(SUBMISSION, fresh.client as never);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.payload, {
+        type: SUBMISSION.type,
+        question: SUBMISSION.question,
+        response: SUBMISSION.response,
+        currentPage: SUBMISSION.currentPage,
+        conversationId: SUBMISSION.conversationId,
+    });
+});
+
+test("both routes answer 409 submission-key-conflict, and file from reserved.payload", () => {
+    for (const route of [
+        "src/app/api/help-chat/request/route.ts",
+        "src/app/api/help-chat/bug-fix/route.ts",
+    ]) {
+        const source = readFileSync(path.join(process.cwd(), route), "utf8");
+        assert.match(source, /reason === "payload-conflict"/, `${route}: the conflict is handled, not folded into 429`);
+        assert.match(source, /SUBMISSION_KEY_CONFLICT[\s\S]{0,120}status: 409/, `${route}: 409, with the code`);
+        assert.match(source, /const filing = reserved\.payload/, `${route}: files from the STORED payload`);
+        assert.ok(
+            source.indexOf('reason === "payload-conflict"') < source.indexOf("createHelpChatGitHubIssue("),
+            `${route}: refuse before filing, not after`
+        );
+    }
+});

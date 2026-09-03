@@ -180,6 +180,52 @@ export function helpChatResponse(options: {
   );
 }
 
+/**
+ * The content of a submission — everything that ends up in the GitHub issue.
+ *
+ * Returned by reserveHelpRequest so a route files from THIS rather than from
+ * the body it was handed: on a replay the two are not the same thing.
+ */
+export type HelpRequestPayload = {
+    type: string;
+    question: string;
+    response: string;
+    currentPage: string | null;
+    conversationId: string | null;
+};
+
+/**
+ * sha256 of what a submission SAYS, so an idempotency key can be checked
+ * against the content it was issued for.
+ *
+ * A submissionId is chosen by the client and is only a promise that "this is
+ * the same report as before". Nothing used to hold it to that promise: a second
+ * request could reuse a key with entirely different content, attach itself to
+ * the first report's row, and file a GitHub issue describing text that row does
+ * not contain — so the saved report and the issue raised from it disagreed, and
+ * whichever one you read was the wrong one.
+ *
+ * Normalised before hashing (trimmed, absent === empty) so a stored NULL and an
+ * incoming "" are the same answer rather than a spurious conflict. JSON rather
+ * than a joined string: a separator that can appear inside a field is a
+ * separator a caller can forge a collision with.
+ */
+export function helpPayloadFingerprint(payload: HelpRequestPayload): string {
+    const norm = (value: string | null | undefined) => (typeof value === "string" ? value.trim() : "");
+    return createHash("sha256")
+        .update(
+            JSON.stringify([
+                norm(payload.type),
+                norm(payload.question),
+                norm(payload.response),
+                norm(payload.currentPage),
+                norm(payload.conversationId),
+            ]),
+            "utf8"
+        )
+        .digest("hex");
+}
+
 export type ReserveResult =
     | {
           ok: true;
@@ -193,9 +239,18 @@ export type ReserveResult =
            * tell "filed" from "saved, not filed yet".
            */
           providerState: string | null;
+          /**
+           * THE CONTENT TO FILE. The incoming payload on a fresh insert; the
+           * STORED row's own content on a replay — which is the whole point,
+           * because a resumed attempt is finishing the report that was saved,
+           * not the request that happens to be asking.
+           */
+          payload: HelpRequestPayload;
       }
     | { ok: false; reason: "throttled" }
-    | { ok: false; reason: "in-flight" };
+    | { ok: false; reason: "in-flight" }
+    /** The key was reused with DIFFERENT content. Nothing is filed; the route answers 409. */
+    | { ok: false; reason: "payload-conflict" };
 
 /** How long a provider lease is honoured before another attempt may take it. */
 export const HELP_LEASE_MS = 4 * 60 * 1000;
@@ -327,6 +382,11 @@ export function submissionMarker(requestId: string): string {
 
 /** A mobile caller with no idempotency key cannot be made safe to retry. */
 export const MOBILE_SUBMISSION_ID_REQUIRED = "submission-id-required";
+
+/** The idempotency key was reused with different content — see helpPayloadFingerprint. */
+export const SUBMISSION_KEY_CONFLICT = "submission-key-conflict";
+export const SUBMISSION_KEY_CONFLICT_MESSAGE =
+    "That submission id was already used for a different report. Nothing was filed — send this one with a new id.";
 
 /**
  * Deterministic idempotency key for a mobile caller that sends no
@@ -467,6 +527,13 @@ export async function reserveHelpRequest(input: {
  */
 client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prisma as never
 ): Promise<ReserveResult> {
+    const incoming: HelpRequestPayload = {
+        type: input.type,
+        question: input.question,
+        response: input.response,
+        currentPage: input.currentPage,
+        conversationId: input.conversationId,
+    };
     try {
         return await client.$transaction(async (tx) => {
             // ONE statement decides "new report" vs "replay". The old shape read
@@ -495,10 +562,38 @@ client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prism
                           where: {
                               userId_submissionId: { userId: input.userId, submissionId: input.submissionId },
                           },
-                          select: { id: true, status: true, createdAt: true, providerState: true },
+                          select: {
+                              id: true,
+                              status: true,
+                              createdAt: true,
+                              providerState: true,
+                              // The stored CONTENT, so the key can be checked
+                              // against what it was issued for — and so a
+                              // resume files the report that was saved.
+                              type: true,
+                              question: true,
+                              response: true,
+                              currentPage: true,
+                              conversationId: true,
+                          },
                       })
                     : null;
                 if (!existing) throw new HelpReserveRaceError();
+                const stored: HelpRequestPayload = {
+                    type: existing.type,
+                    question: existing.question,
+                    response: existing.response,
+                    currentPage: existing.currentPage,
+                    conversationId: existing.conversationId,
+                };
+                // The key promised "this is the same report". If it is not, this
+                // is not a retry at all — it is a different report wearing an
+                // old report's key, and attaching it would file an issue whose
+                // text the stored row does not contain. Refuse both: no filing,
+                // no attaching, and no quota charged either.
+                if (helpPayloadFingerprint(stored) !== helpPayloadFingerprint(incoming)) {
+                    return { ok: false, reason: "payload-conflict" } as ReserveResult;
+                }
                 const age = Date.now() - (existing.createdAt?.getTime() ?? 0);
                 // Resume ANY row whose issue was never created — providerState is
                 // the only reliable signal. Keying off status === "submitting"
@@ -512,6 +607,10 @@ client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prism
                     existing: true,
                     resume: stale,
                     providerState: existing.providerState ?? null,
+                    // The STORED content, never `incoming` — the fingerprints
+                    // agree above, and this is the copy that is actually on the
+                    // row the issue will be attached to.
+                    payload: stored,
                 } as ReserveResult;
             }
 
@@ -544,7 +643,10 @@ client: { $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T> } = prism
             `;
             if (isThrottled(counted[0]?.count ?? 0)) throw new HelpThrottledError();
 
-            return { ok: true, id: inserted[0].id, existing: false, resume: false, providerState: null };
+            // A fresh insert stored EXACTLY `incoming`, so it is both the
+            // incoming payload and the stored one — the route takes the same
+            // field on both branches and cannot pick the wrong copy.
+            return { ok: true, id: inserted[0].id, existing: false, resume: false, providerState: null, payload: incoming };
         });
     } catch (error) {
         if (error instanceof HelpThrottledError) return { ok: false, reason: "throttled" };

@@ -100,10 +100,13 @@ const store: { rows: FakeRow[]; nextId: number } = { rows: [], nextId: 1 };
 /** GitHub issues the fake provider has opened. Reset with the store, or counts leak between tests. */
 let issueCounter = 0;
 
+const CONVERSATION_ID = "conv-1";
+
 function resetStore() {
     store.rows = [];
     store.nextId = 1;
     issueCounter = 0;
+    filedIssues.length = 0;
 }
 
 /**
@@ -122,10 +125,12 @@ const fakePrisma = {
             where.id === MOBILE_USER.id ? MOBILE_USER : null,
     },
     chatConversation: {
-        // MOBILE_PAYLOAD carries no conversationId, so this branch never runs —
-        // defined only so an unexpected call fails loudly instead of throwing
-        // "findFirst is not a function".
-        findFirst: async () => null,
+        // MOBILE_PAYLOAD carries no conversationId, so the /request tests never
+        // reach this. The bug-fix route REQUIRES one, so it answers for the
+        // single conversation those tests use and null for anything else — an
+        // unexpected id then fails as a 404, loudly.
+        findFirst: async ({ where }: { where: { id?: string } }) =>
+            where.id === CONVERSATION_ID ? { id: CONVERSATION_ID } : null,
     },
     helpRequest: {
         findUnique: async ({ where }: { where: { id: string } }) =>
@@ -233,11 +238,26 @@ const fakePrisma = {
  * saved but not filed" test below reads exactly as it did against the real
  * module.
  */
+/** Everything createHelpChatGitHubIssue was asked to file, newest last. */
+const filedIssues: Array<{ title: string; description: string; currentPage: string | null; labelPrefix: string }> = [];
+
 const fakeGithub = {
-    createHelpChatGitHubIssue: async () =>
-        process.env.GITHUB_TOKEN
+    createHelpChatGitHubIssue: async (args: {
+        title: string;
+        description: string;
+        currentPage: string | null;
+        labelPrefix: string;
+    }) => {
+        filedIssues.push({
+            title: args.title,
+            description: args.description,
+            currentPage: args.currentPage ?? null,
+            labelPrefix: args.labelPrefix,
+        });
+        return process.env.GITHUB_TOKEN
             ? { number: ++issueCounter, url: `https://github.test/probuild/issues/${issueCounter}` }
-            : null,
+            : null;
+    },
     findIssueByMarker: async () => null,
 };
 
@@ -248,6 +268,7 @@ const MODULE_MOCKS = new Map<string, unknown>([
 ]);
 
 let POST: (req: Request) => Promise<Response>;
+let BUG_FIX_POST: (req: Request) => Promise<Response>;
 let signMobileToken: (user: { id: string; role: string; email: string }, via: "pin" | "google") => Promise<string>;
 let HELP_SUBMISSION_ID_MAX: number;
 
@@ -267,6 +288,7 @@ before(async () => {
     } as typeof Module.prototype.require;
 
     let routeModule: { POST?: unknown };
+    let bugFixModule: { POST?: unknown } = {};
     let mobileAuthModule: { signMobileToken?: unknown };
     let guardModule: { HELP_SUBMISSION_ID_MAX?: unknown };
     try {
@@ -275,6 +297,11 @@ before(async () => {
         // the FIRST time either module loads in this process, so both execute
         // — and get faked — inside this one window.
         routeModule = await import("../src/app/api/help-chat/request/route");
+        // The sibling route, loaded inside the SAME patch window: it shares
+        // reserveHelpRequest and has to answer a reused idempotency key the
+        // same way. Its whole dependency chain is already cached and faked by
+        // the load above, so this adds no un-mocked prisma.
+        bugFixModule = await import("../src/app/api/help-chat/bug-fix/route");
         // Both already sit in Node's require cache from the load above (keyed
         // by resolved absolute path, not by which literal specifier asked for
         // it) — these just retrieve the same faked instances to read exports
@@ -301,7 +328,11 @@ before(async () => {
                 `PRISMA_SPECIFIERS to match.`
         );
     }
+    if (typeof bugFixModule.POST !== "function") {
+        throw new Error("help-chat-request-route.test.ts: the bug-fix route did not load under the prisma mock");
+    }
     POST = routeModule.POST as typeof POST;
+    BUG_FIX_POST = bugFixModule.POST as typeof BUG_FIX_POST;
     signMobileToken = mobileAuthModule.signMobileToken as typeof signMobileToken;
     HELP_SUBMISSION_ID_MAX = guardModule.HELP_SUBMISSION_ID_MAX as number;
 });
@@ -445,6 +476,140 @@ test("a DIFFERENT report from the same crew member is never collapsed onto the f
         assert.equal(other.body.duplicate, undefined);
         assert.equal(store.rows.length, 2);
         assert.equal(issueCounter, 2);
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+// ── an idempotency key is bound to its payload (round 33, finding 3) ────────
+//
+// The gap: the conflict branch of reserveHelpRequest returned status metadata
+// only. A second request could reuse a key with entirely different content,
+// attach itself to the FIRST report's row, and open a GitHub issue describing
+// text that row does not contain — so the saved report and the issue raised
+// from it disagreed, and whichever one you read was the wrong one.
+
+/** A crew-app POST carrying an EXPLICIT idempotency key. */
+async function postWithKey(submissionId: string, payload: Record<string, unknown>) {
+    const token = await signMobileToken(MOBILE_USER, "pin");
+    const res = await POST(
+        new Request("https://example.test/api/help-chat/request", {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify({ ...payload, submissionId }),
+        })
+    );
+    return { res, body: await res.json() };
+}
+
+async function postBugFix(submissionId: string, payload: Record<string, unknown>) {
+    const token = await signMobileToken(MOBILE_USER, "pin");
+    const res = await BUG_FIX_POST(
+        new Request("https://example.test/api/help-chat/bug-fix", {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify({ ...payload, submissionId, conversationId: CONVERSATION_ID }),
+        })
+    );
+    return { res, body: await res.json() };
+}
+
+test("/request: a key reused for a DIFFERENT report is 409 — nothing filed, nothing attached", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const first = await postWithKey("key-1", MOBILE_PAYLOAD);
+        assert.equal(first.body.status, "filed");
+        assert.equal(store.rows.length, 1);
+        assert.equal(filedIssues.length, 1);
+
+        const second = await postWithKey("key-1", {
+            ...MOBILE_PAYLOAD,
+            title: "Totally different bug: the schedule is blank",
+        });
+        assert.equal(second.res.status, 409);
+        assert.equal(second.body.code, "submission-key-conflict");
+        assert.equal(store.rows.length, 1, "no row for the rejected report");
+        assert.equal(filedIssues.length, 1, "and above all: no issue filed against the first report's row");
+        assert.equal(store.rows[0].question, MOBILE_PAYLOAD.title, "the stored report is untouched");
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+test("/request: a RESUMED attempt files the STORED report, not the request that woke it", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    // No token: the first attempt saves the report and fails to file it — the
+    // exact state a resume exists for.
+    delete process.env.GITHUB_TOKEN;
+    try {
+        const first = await postWithKey("key-2", MOBILE_PAYLOAD);
+        assert.equal(first.body.status, "pending");
+        assert.equal(store.rows.length, 1);
+
+        // Older than HELP_SUBMITTING_STALE_MS, so the retry RESUMES rather than
+        // returning early.
+        ageStoredRowsBy(5 * 60 * 1000);
+        process.env.GITHUB_TOKEN = "test-token";
+
+        // The same report, differing only in ways the fingerprint normalises
+        // away (surrounding whitespace, absent vs empty). Still a resume — and
+        // what gets filed is the row's own copy.
+        const resumed = await postWithKey("key-2", {
+            title: MOBILE_PAYLOAD.title,
+            description: MOBILE_PAYLOAD.description,
+            currentPage: MOBILE_PAYLOAD.currentPage,
+        });
+        assert.equal(resumed.res.status, 200);
+        assert.equal(store.rows.length, 1, "still one report");
+        // The first attempt CALLED GitHub and got nothing back (no token), so
+        // there are two attempts on record and exactly one issue.
+        assert.equal(issueCounter, 1, "one issue exists for one report");
+        const filed = filedIssues[filedIssues.length - 1];
+        assert.equal(filed.title, store.rows[0].question, "the issue title is the STORED title");
+        assert.equal(filed.description, store.rows[0].response);
+        assert.equal(filed.currentPage, store.rows[0].currentPage);
+        assert.equal(filed.labelPrefix, "Bug Fix", "and the label follows the STORED type");
+    } finally {
+        if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+        else process.env.GITHUB_TOKEN = originalGithubToken;
+    }
+});
+
+test("/bug-fix: the same key rule, on the other route", async () => {
+    resetStore();
+    const originalGithubToken = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "test-token";
+    try {
+        const first = await postBugFix("bug-key-1", {
+            title: "Save does nothing",
+            description: "Tapped Save and nothing happened",
+        });
+        assert.equal(first.res.status, 200);
+        assert.equal(store.rows.length, 1);
+        assert.equal(filedIssues.length, 1);
+
+        const conflicting = await postBugFix("bug-key-1", {
+            title: "Save does nothing",
+            description: "A completely different description",
+        });
+        assert.equal(conflicting.res.status, 409);
+        assert.equal(conflicting.body.code, "submission-key-conflict");
+        assert.equal(store.rows.length, 1);
+        assert.equal(filedIssues.length, 1, "no second issue on the first report's row");
+
+        // And an identical replay is still absorbed the way it always was.
+        const replay = await postBugFix("bug-key-1", {
+            title: "Save does nothing",
+            description: "Tapped Save and nothing happened",
+        });
+        assert.equal(replay.res.status, 200);
+        assert.equal(replay.body.duplicate, true);
+        assert.equal(filedIssues.length, 1);
     } finally {
         if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
         else process.env.GITHUB_TOKEN = originalGithubToken;

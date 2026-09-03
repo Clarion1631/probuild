@@ -176,6 +176,43 @@ test("at a real rate the flag plays no part; a flag CHANGE alone forces a write"
     assert.equal(settlementRowIsCurrent({ stored: STORED, update: UPDATE, zeroRate: false, flagsChange: true }), false);
 });
 
+// ---------------------------------------------------------------- round 33, finding 2
+
+test("a $0-rate row with UNCHANGED hours is still rewritten when the review state moves", () => {
+    // The gap: flagsChange was consulted only at a real rate. On a $0-rate day
+    // the hours matched and the zero-rate note was already on the row, so the
+    // shortcut skipped the write — and a re-plan that had newly decided this
+    // day OVERLAPS another, or that no attestation was on file, wrote nothing.
+    // The manager queue never showed the reason, and the export ran on a row
+    // whose review state was a round out of date.
+    assert.equal(
+        settlementRowIsCurrent({ stored: STORED, update: UPDATE, zeroRate: true, flagsChange: true }),
+        false,
+        "ADDING a settlement-owned reason must write, even at a $0 rate with identical hours"
+    );
+
+    // RETIREMENT is the same rule read the other way, and was broken the same
+    // way: an overlap that has since been edited away has to lose its note, and
+    // dropping a reason is also a flags change. A row that keeps a retired
+    // reason forever is a permanent false alarm in the queue.
+    const stillFlagged = {
+        ...STORED,
+        reviewReason: "Overlaps another shift; Closed at a $0 pay rate — set the rate and recheck this entry",
+    };
+    assert.equal(
+        settlementRowIsCurrent({ stored: stillFlagged, update: UPDATE, zeroRate: true, flagsChange: true }),
+        false,
+        "RETIRING a settlement-owned reason must write too"
+    );
+
+    // And the skip still exists where it should: same hours, same review state.
+    assert.equal(
+        settlementRowIsCurrent({ stored: STORED, update: UPDATE, zeroRate: true, flagsChange: false }),
+        true,
+        "nothing changed at all — the shortcut is still a shortcut"
+    );
+});
+
 // ---------------------------------------------------------------- item 4
 
 test("day locks are the QUALIFIED wa-breaks key, everywhere they are taken", () => {

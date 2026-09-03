@@ -146,6 +146,21 @@ jobs:
           # pgbouncer reasoning as the rate-lock step above.
           DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
 
+      # payType and hourlyRate are EXPORT INPUTS: pay type decides who is on the
+      # Gusto file at all, and lockPayrollPeriod hashes the roster and freezes
+      # it. Neither the export's roster read nor the rate writers held anything
+      # against the other, so a pay type could change between the lock's
+      # "confirmed" recompute and its COMMIT. The fake-client test pins which
+      # lock is taken and in what order; only this step shows PostgreSQL
+      # actually holds each side off.
+      - name: Prove a pay-type change cannot land while a pay period is being locked
+        run: npx tsx --test tests/payroll-paytype-lock-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+          # Imports the app's prisma singleton via pay-rate-write — same
+          # pgbouncer reasoning as the rate-lock step above.
+          DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations?pgbouncer=true
+
       - name: Prove the blind-spot checker rejects function and trigger drift
         run: npx tsx --test tests/migration-history-blind-spots.test.ts
         env:

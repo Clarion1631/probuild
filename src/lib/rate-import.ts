@@ -148,6 +148,16 @@ export class CsvParseError extends Error {
  *    file means somebody's NAME lands in the rate column, or one person's rate
  *    lands on another person's row.
  *
+ *  - characters AFTER a closing quote were appended to the value as if the
+ *    quotes had never been there: `"Alex Smith"x` read as `Alex Smithx`, and
+ *    `"28.50"0` as a rate of 28.500. Neither is what the file says, and both
+ *    come from exactly the kind of half-escaped export this parser exists to
+ *    refuse. TRAILING SPACES ARE REFUSED TOO (`"Alex Smith" ,`): there is no
+ *    honest reading of them — either the space is part of the name, in which
+ *    case it belonged inside the quotes, or the file was written by something
+ *    that does not agree with this one about where a field ends, and the next
+ *    surprise it holds may not be one this parser notices.
+ *
  * A pay-rate file that cannot be read exactly is not a file to guess at.
  */
 export function parseCsvGrid(text: string): string[][] {
@@ -156,6 +166,8 @@ export function parseCsvGrid(text: string): string[][] {
     let field = "";
     let inQuotes = false;
     let fieldWasQuoted = false;
+    /** A quoted field has ENDED; only a delimiter, a line ending or EOF may follow. */
+    let closedQuote = false;
     let sawAnyChar = false;
     let line = 1;
 
@@ -163,6 +175,7 @@ export function parseCsvGrid(text: string): string[][] {
         row.push(field);
         field = "";
         fieldWasQuoted = false;
+        closedQuote = false;
     };
 
     for (let i = 0; i < text.length; i += 1) {
@@ -174,12 +187,24 @@ export function parseCsvGrid(text: string): string[][] {
                     i += 1;
                 } else {
                     inQuotes = false;
+                    closedQuote = true;
                 }
             } else {
                 if (char === "\n") line += 1;
                 field += char;
             }
             continue;
+        }
+        // Between the closing quote and the end of the field, NOTHING is
+        // allowed through. `\r` is let past because it is the first half of a
+        // CRLF line ending, which the `\n` branch below then terminates the
+        // field on; a `\r` followed by anything else lands back here on the
+        // next character and is refused there.
+        if (closedQuote && char !== "," && char !== "\r" && char !== "\n") {
+            throw new CsvParseError(
+                `Line ${line}, column ${row.length + 1}: "${char}" appears after a closing quote. ` +
+                    `A quoted value must be followed by a comma, the end of the line, or the end of the file — trailing spaces included.`
+            );
         }
         if (char === '"') {
             // A quote may only OPEN a field. Mid-field it is a malformed row,
@@ -262,15 +287,29 @@ function findColumn(headers: string[], hints: string[]): number {
  *    not a rate somebody meant, and silently making it 28.01 (or 28.00) is the
  *    kind of half-cent decision a human should make, not an importer.
  *
+ * WHAT IS STRIPPED, AND WHAT IS NOT. This used to delete EVERY `$` and every
+ * space anywhere in the string before matching, which quietly repaired
+ * malformed money into a plausible number instead of refusing it: `2$8` became
+ * 28.00 and `2 8.50` became 28.50 — a rate nobody typed, on somebody's
+ * paycheque, with no error to look at. Now only SURROUNDING whitespace is
+ * trimmed and only ONE LEADING `$` is accepted; a `$` or a space anywhere else
+ * is a malformed value and is refused like any other.
+ *
+ * THOUSANDS SEPARATORS STAY REFUSED, deliberately: the comma rule above cannot
+ * tell "1,234.56" apart from the European "28,50" without guessing at the
+ * file's locale, and guessing wrong is a 100x rate. Nothing under the
+ * $500/h import ceiling needs one anyway.
+ *
  * The result is text, never a float — the caller hands it to Prisma.Decimal.
  */
 export function parseRateValue(raw: string): string | null {
     if (raw.includes(",")) return null;
-    const cleaned = raw.replace(/[$\s]/g, "");
-    if (!cleaned) return null;
-    // Optional sign, digits, optional . and up to 2 digits. No exponent, no hex,
-    // no "Infinity" — all of which Number() would happily accept.
-    const match = /^([+-]?)(\d+)(?:\.(\d{1,2}))?$/.exec(cleaned);
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    // Optional sign, ONE optional leading $, digits, optional . and up to 2
+    // digits. No exponent, no hex, no "Infinity" — all of which Number() would
+    // happily accept — and no internal $ or whitespace.
+    const match = /^([+-]?)\$?(\d+)(?:\.(\d{1,2}))?$/.exec(trimmed);
     if (!match) return null;
     const [, sign, whole, fraction = ""] = match;
     if (sign === "-") return "-" + whole + "." + fraction.padEnd(2, "0");
