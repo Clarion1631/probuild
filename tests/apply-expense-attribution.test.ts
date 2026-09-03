@@ -28,6 +28,7 @@ import {
     postDeployStatements,
     PROJECT_ID_BACKFILL,
     reanchorSql,
+    SOURCE_FILE_ID_BACKFILL,
     statements,
     targetMatches,
 } from "../scripts/apply-expense-attribution.mjs";
@@ -211,7 +212,11 @@ test("the FK is SET NULL, named the way Prisma would name it, and guarded on its
         "an ON DELETE CASCADE constraint of the same name must be rejected",
     );
 
-    assert.deepEqual(expectedIndexes, [{ name: "Expense_projectId_idx", table: "Expense" }]);
+    assert.deepEqual(expectedIndexes, [
+        { name: "Expense_projectId_idx", table: "Expense" },
+        { name: "Expense_sourceFileId_idx", table: "Expense" },
+        { name: "Expense_sourceFileId_sourceGroupIndex_key", table: "Expense" },
+    ]);
 });
 
 test("every statement is additive — nothing drops, renames, or rewrites data", () => {
@@ -603,7 +608,7 @@ test("the post-deploy set is a SUBSET of the main run, never a second copy", () 
     }
 });
 
-test("both post-deploy statements are idempotent BY PREDICATE", () => {
+test("every post-deploy statement is idempotent BY PREDICATE", () => {
     // The whole reason a second pass is safe. The projectId fill only ever
     // touches a NULL, and the date re-anchor only ever touches a row that is
     // still sitting at UTC midnight AND whose company-zone anchor would
@@ -611,10 +616,17 @@ test("both post-deploy statements are idempotent BY PREDICATE", () => {
     // whether that row has ever been anchored before or not (round 31, item 3:
     // it must NOT be gated on the marker, or an old client's rewrite of an
     // already-anchored row is invisible to this exact pass).
-    const [projectFill, reanchor] = postDeployStatements("America/Los_Angeles");
+    const [projectFill, reanchor, sourceFileFill] = postDeployStatements("America/Los_Angeles");
+    assert.equal(postDeployStatements("America/Los_Angeles").length, 3);
     assert.match(projectFill, /"projectId" IS NULL/);
     assert.doesNotMatch(reanchor, /"attributionAnchoredAt" IS NULL/);
     assert.match(reanchor, /"date"::time = TIME '00:00:00'/);
+    // The third one has the SAME live-write gap and the same shape of answer:
+    // the old build keeps writing receipt expenses with a receiptUrl and no
+    // sourceFileId after this statement has already passed over the table, and
+    // a row left in that shape is invisible to the new equality dedupe.
+    assert.match(sourceFileFill, /"sourceFileId" IS NULL/);
+    assert.equal(sourceFileFill, SOURCE_FILE_ID_BACKFILL, "the array holds the exported constant");
 });
 
 test("the live-write gap is documented where the statement is, not only in a PR", () => {
@@ -626,4 +638,87 @@ test("the live-write gap is documented where the statement is, not only in a PR"
     assert.match(script, /--post-deploy/, "and the mode that re-runs it exists");
     // The backfill itself is the exported constant the mode reuses.
     assert.match(PROJECT_ID_BACKFILL, /UPDATE "Expense" e SET "projectId"/);
+});
+
+// ── the receipt dedupe's own identity column (round 34, item 1) ────────────
+
+test("the source-file identity is added by BOTH files, with its indexes", () => {
+    // The ingest deduped with `receiptUrl contains fileId` while storing a
+    // CALLER-SUPPLIED url. A payload whose `fileUrl` omitted the id deduped
+    // against nothing and re-booked the receipt on every delivery, and the
+    // substring match conflated a file id that is a prefix of another. The
+    // fix needs a column, so the column has to reach production (this script)
+    // and a fresh database (the migration) identically — a column present in
+    // only one of them is the shape P2022 shows up as.
+    for (const column of ["sourceFileId", "sourceGroupIndex"]) {
+        assert.ok(
+            (statements as string[]).some(s =>
+                s.includes(`ADD COLUMN IF NOT EXISTS "${column}"`)),
+            `the script must add ${column}`,
+        );
+        assert.ok(expectedColumns.Expense.includes(column), `and verify ${column} after the run`);
+    }
+
+    // The plain index the equality dedupe reads through...
+    assert.ok(
+        (statements as string[]).some(s => s.includes('"Expense_sourceFileId_idx"')),
+        "the lookup index is created",
+    );
+    // ...and the PARTIAL UNIQUE index that makes a duplicate group
+    // unrepresentable even for a writer that never takes the ingest's
+    // advisory lock. Partial on `sourceFileId IS NOT NULL` so manual and
+    // QBO-imported expenses are outside it entirely.
+    const unique = (statements as string[]).find(s =>
+        s.includes('"Expense_sourceFileId_sourceGroupIndex_key"'));
+    assert.ok(unique, "the durable backstop is created");
+    assert.match(unique!, /CREATE UNIQUE INDEX IF NOT EXISTS/);
+    assert.match(unique!, /\("sourceFileId", "sourceGroupIndex"\)/, "on the PAIR, not the file alone");
+    assert.match(unique!, /WHERE "sourceFileId" IS NOT NULL/);
+});
+
+test("Prisma cannot see the partial unique index, so the snapshot must", () => {
+    // `prisma migrate diff` omits partial indexes without comment, which is
+    // exactly why scripts/check-migrations-match.mjs compares them against
+    // prisma/prisma-blind-spots.json instead. An index created by the
+    // migration and absent from that file fails CI's migrations job — and,
+    // worse, an index in neither would be silently missing from a fresh
+    // database while production had it.
+    const snapshot = JSON.parse(
+        readFileSync(path.join(__dirname, "..", "prisma", "prisma-blind-spots.json"), "utf8"),
+    ) as { partialIndexes: { name: string; def: string }[] };
+    const entry = snapshot.partialIndexes.find(
+        row => row.name === "Expense_sourceFileId_sourceGroupIndex_key",
+    );
+    assert.ok(entry, "the partial unique index is recorded as a Prisma blind spot");
+    // Compared RAW against pg_get_indexdef by the checker, so the recorded
+    // definition has to be the canonical rendering, not an approximation.
+    assert.equal(
+        entry!.def,
+        'CREATE UNIQUE INDEX "Expense_sourceFileId_sourceGroupIndex_key" ON public."Expense" ' +
+            'USING btree ("sourceFileId", "sourceGroupIndex") WHERE ("sourceFileId" IS NOT NULL)',
+    );
+});
+
+test("the sourceFileId backfill parses the id EXACTLY, or leaves it null", () => {
+    // A guessed id is worse than none: it would dedupe two unrelated
+    // documents against each other, which is the failure this whole column
+    // exists to end. Only the two url shapes the app has ever written are
+    // parsed, and anything else stays NULL.
+    assert.match(SOURCE_FILE_ID_BACKFILL, /'\/d\/\(\[A-Za-z0-9_-\]\+\)'/);
+    assert.match(SOURCE_FILE_ID_BACKFILL, /'\[\?&\]id=\(\[A-Za-z0-9_-\]\+\)'/);
+    // Idempotent by predicate, like every other backfill here: a re-run
+    // touches 0 rows and cannot overwrite an id the ingest wrote itself.
+    assert.match(SOURCE_FILE_ID_BACKFILL, /"sourceFileId" IS NULL/);
+    // And it writes NO group ordinal. Nothing can say which group of a
+    // document an old row was, and a false ordinal under a unique index is a
+    // fabricated identity. NULLs are distinct in a btree unique index, so
+    // those rows neither collide with each other nor gain its protection.
+    assert.ok(
+        !/sourceGroupIndex/.test(SOURCE_FILE_ID_BACKFILL),
+        "the backfill must not invent a group ordinal",
+    );
+    // The migration carries the same statement (the generic parity test
+    // above proves it), and the array holds the exported constant rather
+    // than a copy that could drift from it.
+    assert.ok((statements as string[]).includes(SOURCE_FILE_ID_BACKFILL));
 });

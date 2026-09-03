@@ -64,15 +64,38 @@ export async function POST(req: Request) {
 
     const receiptUrl = body.fileUrl || `https://drive.google.com/file/d/${body.fileId}/view`;
 
-    // Dedupe, FAST PATH ONLY (round 33, item 1). This read takes no lock and
-    // is not the decision: the authoritative check is the identical query
-    // repeated inside the write transaction, underneath the per-file advisory
-    // lock. It stays here because it also short-circuits the project match
-    // below — a re-delivery of a file whose Drive folder has since been
-    // renamed used to answer `alreadyIngested`, and must keep doing so rather
-    // than suddenly reporting `project-not-matched`.
+    // THE DEDUPE KEY IS THE FILE ID, NOT A SUBSTRING OF A URL THE CALLER CHOSE
+    // (round 34, item 1 — the failure mode this replaces).
+    //
+    // `receiptUrl` is `body.fileUrl` when the caller supplies one, and only
+    // falls back to a url built from the id. The dedupe asked
+    // `receiptUrl contains fileId`, so it was asking whether a value the
+    // CALLER controls happens to embed the identity. Two ways that is wrong,
+    // and neither is hypothetical — the Apps Script sends whatever Drive
+    // returned for the file:
+    //
+    //   * a `fileUrl` that does NOT contain the id (a shortened link, a
+    //     `/uc?export=...` form, a re-hosted copy) matches nothing, so every
+    //     re-delivery of that document — a retry after a lost response, a
+    //     re-run over the same folder — inserted the whole receipt again. The
+    //     advisory lock below does not help: both deliveries agree there is no
+    //     prior row, because there is no prior row the QUERY can see.
+    //   * `contains` is a SUBSTRING test, so file id "abc" matches a stored
+    //     url carrying "abcd". Two unrelated documents dedupe against each
+    //     other and the second one is silently dropped.
+    //
+    // So the identity is stored in its own column, exactly as received, and
+    // compared with `equals`. `receiptUrl` goes on being the human link.
+    //
+    // FAST PATH ONLY. This read takes no lock and is not the decision: the
+    // authoritative check is the identical query repeated inside the write
+    // transaction, underneath the per-file advisory lock. It stays here
+    // because it also short-circuits the project match below — a re-delivery
+    // of a file whose Drive folder has since been renamed used to answer
+    // `alreadyIngested`, and must keep doing so rather than suddenly
+    // reporting `project-not-matched`.
     const existing = await prisma.expense.findFirst({
-        where: { receiptUrl: { contains: body.fileId } },
+        where: { sourceFileId: body.fileId },
         select: { id: true },
     });
     if (existing) {
@@ -217,24 +240,28 @@ export async function POST(req: Request) {
             // less often than the 32-bit `hashtext`. A collision only makes
             // two unrelated files serialise, which costs nothing here.
             //
-            // NO UNIQUE INDEX BACKS THIS UP, because the schema has no key to
-            // build one on: every group of one receipt shares the SAME
-            // `receiptUrl`, and there is no per-group ordinal column, so the
-            // only honest constraint would need columns this PR does not add.
-            // The lock is the whole guarantee — said plainly rather than
-            // implying a durable backstop that is not there.
+            // AND A UNIQUE INDEX NOW BACKS IT UP. The previous round said
+            // plainly that nothing did, because every group of one receipt
+            // shared the same `receiptUrl` and there was no per-group
+            // ordinal to key on. Both of those columns exist now
+            // (`sourceFileId`, `sourceGroupIndex`), so the partial unique
+            // index `Expense_sourceFileId_sourceGroupIndex_key` refuses a
+            // second copy of a group even from a writer that never takes this
+            // lock. A violation aborts the whole transaction — the document is
+            // written whole or not at all — and the retry then reads the
+            // winner's committed rows and answers `alreadyIngested`.
             await raw.$queryRawUnsafe(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
                 `${RECEIPT_INGEST_LOCK_PREFIX}${body.fileId}`,
             );
             const alreadyIngested = await tx.expense.findFirst({
-                where: { receiptUrl: { contains: body.fileId } },
+                where: { sourceFileId: body.fileId },
                 select: { id: true },
             });
             if (alreadyIngested) return null;
 
             const outcomes: GroupResult[] = [];
-            for (const group of body.groups) {
+            for (const [groupIndex, group] of body.groups.entries()) {
                 // Finite and non-zero by the validation above, which refuses
                 // the whole document rather than letting this loop skip a
                 // group out of a transaction that then reports success.
@@ -286,6 +313,15 @@ export async function POST(req: Request) {
                         estimateId: pair.estimateId,
                         projectId: pair.projectId,
                         costCodeId: phaseId,
+                        // THE SOURCE DOCUMENT'S IDENTITY, ON EVERY GROUP. The
+                        // id exactly as the caller sent it — the dedupe above
+                        // compares it with `equals`, so anything derived from
+                        // it (a url, a normalised form) would reintroduce the
+                        // mismatch this replaces. The ordinal is what makes
+                        // the pair unique per row: the file id alone repeats
+                        // across every group of one receipt.
+                        sourceFileId: body.fileId,
+                        sourceGroupIndex: groupIndex,
                         // The category came from the Apps Script's Gemini
                         // read, not from a person — "ai", never "capture", so
                         // nothing downstream treats it as a human's answer.

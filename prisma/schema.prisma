@@ -692,6 +692,30 @@ model Expense {
   costCodeSource      String?
   costCodeConfidence  Decimal?
 
+  /// THE SOURCE DOCUMENT'S OWN IDENTITY — the Drive file id, stored exactly as
+  /// the ingest received it. `receiptUrl` cannot serve as this: it is built
+  /// from a CALLER-SUPPLIED `fileUrl` that need not contain the id at all, so
+  /// the dedupe that asked `receiptUrl contains fileId` matched nothing when a
+  /// custom URL omitted it, and every re-delivery booked the receipt again. It
+  /// also matched by SUBSTRING, so a file id that is a prefix of another ("abc"
+  /// vs "abcd") deduped two unrelated documents against each other. Written by
+  /// the Drive ingest, and compared by EQUALITY.
+  sourceFileId        String?
+  /// Which group of that document this row is. A receipt is AI-split into
+  /// category groups and each becomes its own Expense, so the file id alone is
+  /// not a per-row identity. Together with `sourceFileId` it is the identity the
+  /// partial unique index `Expense_sourceFileId_sourceGroupIndex_key` enforces
+  /// (SQL-only: Prisma cannot express a partial index — see
+  /// prisma/prisma-blind-spots.json, and the same reason BankImage.driveFileId
+  /// is not marked @unique here either).
+  ///
+  /// NULL on every row backfilled from an existing `receiptUrl`: those predate
+  /// the column and nothing can say which group they were. A btree unique index
+  /// treats NULLs as distinct, so those rows neither collide with each other
+  /// nor gain the constraint's protection — the file-level dedupe still finds
+  /// them, which is what idempotency actually needs.
+  sourceGroupIndex    Int?
+
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
@@ -719,6 +743,7 @@ model Expense {
   @@index([estimateId])
   @@index([changeOrderId])
   @@index([projectId])
+  @@index([sourceFileId])
 }
 
 model Invoice {

@@ -23,6 +23,7 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
 import { lockPhaseRowsForShare, provePhaseMembershipTx } from "../src/lib/phase-invariant";
+import { writeUnderAttributionLocks } from "../scripts/backfill-expense-attribution";
 
 const url =
     process.env.PHASE_INVARIANT_DB_TEST_URL ??
@@ -47,6 +48,15 @@ const PROJECT = `${PFX}-project`;
 const CODE = `${PFX}-costcode`;
 const ESTIMATE = `${PFX}-estimate`;
 const ITEM = `${PFX}-item`;
+/**
+ * The expense's OWN estimate, deliberately separate from the phantom one and
+ * deliberately carrying no line items. It exists because `Expense.estimateId`
+ * is a required FK, so the row cannot be seeded at all without an estimate —
+ * and if the expense hung off the phantom estimate, the phantom could not be
+ * a phantom (it would have to exist before the scans ran).
+ */
+const CARRIER = `${PFX}-carrier`;
+const EXPENSE = `${PFX}-expense`;
 
 /** A promise a later step resolves — how the interleaving is made deterministic. */
 function gate() {
@@ -57,8 +67,9 @@ function gate() {
 
 async function cleanup() {
     if (!holder) return;
+    await holder.expense.deleteMany({ where: { id: EXPENSE } });
     await holder.estimateItem.deleteMany({ where: { id: ITEM } });
-    await holder.estimate.deleteMany({ where: { id: ESTIMATE } });
+    await holder.estimate.deleteMany({ where: { id: { in: [ESTIMATE, CARRIER] } } });
     await holder.project.deleteMany({ where: { id: PROJECT } });
     await holder.costCode.deleteMany({ where: { id: CODE } });
     await holder.client.deleteMany({ where: { id: CLIENT } });
@@ -201,6 +212,130 @@ test("the scans alone would NOT have caught it", { skip }, async () => {
         });
         deleteSettled.open();
         assert.equal(await held, true, "the four scans cannot hold a row that did not exist yet");
+    } finally {
+        await cleanup();
+    }
+});
+
+// ── the BACKFILL reaches the same proof, on its own lock stack ─────────────
+
+/** The expense the backfill would code, plus the estimate it must hang off. */
+async function seedTheExpense() {
+    await holder!.estimate.create({
+        data: {
+            id: CARRIER,
+            title: "Phase Invariant DB carrier",
+            code: `EST-${PFX}-carrier`,
+            projectId: PROJECT,
+            status: "Approved",
+            totalAmount: 100,
+            balanceDue: 100,
+        },
+    });
+    await holder!.expense.create({
+        data: {
+            id: EXPENSE,
+            estimateId: CARRIER,
+            projectId: PROJECT,
+            amount: 120.5,
+            vendor: "Phase invariant probe",
+            costCodeId: null,
+            costCodeSource: null,
+        },
+    });
+}
+
+test("the backfill's cost-code write holds the row its phase verdict came from", { skip }, async () => {
+    // WHY THIS IS NOT THE TEST ABOVE. That one drives the helper directly.
+    // The backfill reaches it through its OWN lock stack —
+    // `writeUnderAttributionLocks` takes the estimate, item, phase and cost-code
+    // share locks and the per-expense advisory lock before the callback runs —
+    // and until this round it then decided phase membership from an UNLOCKED
+    // `estimateItem.findMany` inside that transaction. Those scans lock what
+    // EXISTS when they run; a concurrent transaction can insert an estimate and
+    // a line item and commit them afterwards, and the next statement sees them
+    // (READ COMMITTED takes a fresh snapshot per statement). The pass then wrote
+    // a cost code justified by a row nothing was holding, which could be deleted
+    // — or its estimate archived or moved to another job — before the UPDATE
+    // committed. That is money on a phase the job does not have, written by the
+    // one writer with no human behind it.
+    //
+    // So: same interleaving, but through the real entry point, and it ends with
+    // the write actually landing — the lock must protect the verdict without
+    // deadlocking the pass against its own locks.
+    await seedWithoutTheItem();
+    await seedTheExpense();
+    try {
+        const scansDone = gate();
+        const phantomLanded = gate();
+        const deleteSettled = gate();
+        let deleteError: unknown = null;
+        let deleteSucceededBeforeCommit = false;
+        let verdict: boolean | null = null;
+
+        const written = writeUnderAttributionLocks(
+            holder!,
+            {
+                expenseId: EXPENSE,
+                estimateIds: [CARRIER],
+                estimateItemIds: [null],
+                phaseProjectId: PROJECT,
+                costCodeId: CODE,
+            },
+            async (tx: any) => {
+                // Every lock the backfill takes is held by now, and there is
+                // no estimate item of this project for them to have locked.
+                scansDone.open();
+                await phantomLanded.reached;
+
+                verdict = await provePhaseMembershipTx(tx, PROJECT, CODE);
+                assert.equal(verdict, true, "the phantom is visible to the proof query");
+
+                await deleteSettled.reached;
+                assert.equal(
+                    deleteSucceededBeforeCommit,
+                    false,
+                    "the proving row was deleted while the backfill was still relying on it",
+                );
+                return tx.expense.updateMany({
+                    where: { id: EXPENSE, costCodeId: null },
+                    data: { costCodeId: CODE, costCodeSource: "backfill", costCodeConfidence: null },
+                });
+            },
+        );
+
+        await scansDone.reached;
+        await insertThePhantom();
+        phantomLanded.open();
+
+        // Let the holder actually run the proof before the delete races it, or
+        // the assertion would be about timing rather than about locking.
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        try {
+            await deleter!.$transaction(async tx => {
+                await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '1s'`);
+                await tx.$executeRawUnsafe(`DELETE FROM "EstimateItem" WHERE id = $1`, ITEM);
+                deleteSucceededBeforeCommit = true;
+            });
+        } catch (error) {
+            deleteError = error;
+        }
+        deleteSettled.open();
+
+        assert.deepEqual(await written, { count: 1 }, "and the code is actually written");
+        assert.ok(deleteError, "the delete was refused, not merely slow");
+        assert.match(
+            String((deleteError as { message?: string })?.message ?? deleteError),
+            /lock timeout|55P03|canceling statement/i,
+            "blocked by the share lock, not by some unrelated failure",
+        );
+
+        const coded = await deleter!.expense.findUnique({
+            where: { id: EXPENSE },
+            select: { costCodeId: true, costCodeSource: true },
+        });
+        assert.deepEqual(coded, { costCodeId: CODE, costCodeSource: "backfill" });
     } finally {
         await cleanup();
     }

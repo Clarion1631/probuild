@@ -542,6 +542,10 @@ type ExpenseTransaction = {
             taxAtSource?: boolean;
             installedAtCustomer?: boolean | null;
             taxDeductibleBase?: unknown;
+            // Provenance for the BASE, which is NOT taxSource: the two are
+            // decided by different parties and the deactivate path has to
+            // know whether this one is already retired.
+            taxDeductibleBaseSource?: string | null;
             needsTaxReview?: boolean;
             taxSource?: string | null;
             amount: unknown;
@@ -647,11 +651,18 @@ export interface QboExpenseRetirementData {
     taxSource: null;
     installedAtCustomer: null;
     taxDeductibleBase: null;
+    // The base's provenance retires WITH the base. Leaving "manual" behind on
+    // a row whose base is now NULL makes it claim a person allocated a figure
+    // that no longer exists, and book.ts reads that provenance.
+    taxDeductibleBaseSource: null;
     needsTaxReview: false;
 }
 
 export type QboExpenseUpdateData = Partial<QboExpenseWrite> & {
     taxDeductibleBase?: null;
+    // Never written on its own: it is cleared in the same statement as the
+    // base it is the provenance for. See planQboExpenseUpdate.
+    taxDeductibleBaseSource?: null;
     taxAmount?: null;
     taxAtSource?: false;
     installedAtCustomer?: null;
@@ -774,6 +785,12 @@ export function planQboExpenseUpdate(
         data.taxAtSource = false;
         data.installedAtCustomer = null;
         data.taxDeductibleBase = null;
+        // BOTH provenances go with the figures they described. The base is
+        // cleared on the line above, so a surviving "manual" here would say a
+        // bookkeeper allocated a figure this row no longer carries — and
+        // book.ts and the correction UI read it as exactly that claim. It is
+        // the same rule the taxSource line below states, for the other column.
+        data.taxDeductibleBaseSource = null;
         data.needsTaxReview = true;
         // THE PROVENANCE GOES WITH THE FIGURES IT DESCRIBED. Every human
         // answer this row carried is cleared above — leaving `taxSource` as
@@ -798,6 +815,11 @@ export function planQboExpenseUpdate(
             // Flagging it is what keeps the report's exclusion honest until a
             // person re-splits the receipt.
             data.taxDeductibleBase = null;
+            // ...and its provenance, in the same statement. This branch is
+            // reached with the tax UNTOUCHED, so nothing else on this path
+            // would ever clear it: the row would keep saying a human decided
+            // an allocation that has just been thrown away.
+            data.taxDeductibleBaseSource = null;
             data.needsTaxReview = true;
         }
     }
@@ -1132,6 +1154,12 @@ export async function deactivateQboExpense(
                 // purchase that a bookkeeper had classified reports "unchanged"
                 // forever while still carrying their provenance.
                 taxSource: true,
+                // The SAME argument for the base's provenance, which this path
+                // used to omit from the select, from the retirement test and
+                // from the write. A deleted purchase whose base a bookkeeper
+                // had allocated ended up with a NULL base and a "manual"
+                // source: provenance for a figure that is gone.
+                taxDeductibleBaseSource: true,
             },
         });
         if (!existing) return "unchanged";
@@ -1162,7 +1190,8 @@ export async function deactivateQboExpense(
             existing.installedAtCustomer === null &&
             existing.taxDeductibleBase === null &&
             existing.needsTaxReview === false &&
-            existing.taxSource === null;
+            existing.taxSource === null &&
+            existing.taxDeductibleBaseSource === null;
         if (
             Number(existing.amount) === 0 &&
             existing.description === description &&
@@ -1185,6 +1214,7 @@ export async function deactivateQboExpense(
                 taxSource: null,
                 installedAtCustomer: null,
                 taxDeductibleBase: null,
+                taxDeductibleBaseSource: null,
                 needsTaxReview: false,
             },
         });

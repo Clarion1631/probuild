@@ -7,6 +7,10 @@
       "def": "CREATE UNIQUE INDEX \"BankImage_driveFileId_key\" ON public.\"BankImage\" USING btree (\"driveFileId\") WHERE (\"driveFileId\" IS NOT NULL)"
     },
     {
+      "name": "Expense_sourceFileId_sourceGroupIndex_key",
+      "def": "CREATE UNIQUE INDEX \"Expense_sourceFileId_sourceGroupIndex_key\" ON public.\"Expense\" USING btree (\"sourceFileId\", \"sourceGroupIndex\") WHERE (\"sourceFileId\" IS NOT NULL)"
+    },
+    {
       "name": "BankLineObservation_source_bankLineId_key",
       "def": "CREATE UNIQUE INDEX \"BankLineObservation_source_bankLineId_key\" ON public.\"BankLineObservation\" USING btree (source, \"bankLineId\") WHERE (\"bankLineId\" IS NOT NULL)"
     },

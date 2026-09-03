@@ -226,6 +226,50 @@ export const PROJECT_ID_BACKFILL =
       WHERE e."estimateId" = locked.id AND e."projectId" IS NULL`;
 
 /**
+ * FILL THE SOURCE FILE ID FROM THE URL WE ALREADY STORED.
+ *
+ * -- POST-DEPLOY: re-run this section
+ *
+ * Only where the Drive id is UNAMBIGUOUS. Both url shapes the app has ever
+ * written carry it (`/d/<id>/view` from the ingest's own default, `id=<id>`
+ * from a Drive share link); anything else is left NULL, because a guessed id
+ * would dedupe two unrelated documents against each other — the exact failure
+ * the substring match caused.
+ *
+ * WHAT A LEFT-NULL ROW COSTS, said plainly: a legacy receipt whose stored url
+ * carries no recoverable id stays invisible to the new equality dedupe, so a
+ * re-delivery of THAT file would book it again. That is not a regression —
+ * `receiptUrl contains fileId` did not match those rows either, for exactly the
+ * same reason — and it is bounded: every row the new ingest writes carries the
+ * id, so the set can only shrink.
+ *
+ * Idempotent by predicate (`"sourceFileId" IS NULL`), so it is safe in the
+ * --post-deploy pass. It has the SAME live-write gap the projectId fill has,
+ * and for the same reason: this script runs before the new build deploys, so
+ * the old build keeps writing receipt Expenses with a `receiptUrl` and no
+ * `sourceFileId` after this statement has already passed over the table. A
+ * row left in that shape is invisible to the new equality dedupe, so a
+ * re-delivery of that file would book it a second time — which is why this is
+ * part of the post-deploy set rather than a one-shot.
+ *
+ * It writes no `sourceGroupIndex`: nothing here can say which group of a
+ * document an old row was, and inventing one would put a false identity under
+ * a unique index. NULLs are distinct in a btree unique index, so those rows
+ * neither collide nor gain its protection.
+ */
+export const SOURCE_FILE_ID_BACKFILL =
+    `UPDATE "Expense"
+   SET "sourceFileId" = COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       )
+ WHERE "sourceFileId" IS NULL
+   AND COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       ) IS NOT NULL`;
+
+/**
  * The pair, checked in BOTH directions after the run.
  *
  * The original verification asked only "is any expense still NULL against an
@@ -265,6 +309,18 @@ export const statements = [
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT`,
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,30)`,
+    // THE SOURCE DOCUMENT'S OWN IDENTITY. The ingest stored a caller-supplied
+    // url and deduped with `receiptUrl contains fileId`, so a payload whose
+    // `fileUrl` omitted the id deduped against nothing and re-booked the
+    // receipt on every delivery — and the substring match conflated a file id
+    // that is a prefix of another. Compared by equality now.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceFileId" TEXT`,
+    // Which group of that document this row is: one receipt becomes one
+    // Expense per category group, so the file id alone is not a row identity.
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceGroupIndex" INTEGER`,
+    // ...and fill it for the rows that predate the column. See the POST-DEPLOY
+    // note above SOURCE_FILE_ID_BACKFILL.
+    SOURCE_FILE_ID_BACKFILL,
     // Mixed receipts: the portion actually resold, when it is less than the
     // whole pre-tax total. NULL means "all of it".
     `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxDeductibleBase" DECIMAL(65,30)`,
@@ -323,6 +379,26 @@ export const statements = [
     `ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL`,
 
     `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
+    `CREATE INDEX IF NOT EXISTS "Expense_sourceFileId_idx" ON "Expense"("sourceFileId")`,
+
+    // THE DURABLE BACKSTOP FOR THE INGEST LOCK. The advisory lock in the
+    // ingest route serialises two concurrent deliveries of one Drive file, but
+    // an advisory lock is not a constraint — a writer that does not take it
+    // cannot be stopped by it. This index makes the duplicate unrepresentable
+    // for every row the new ingest writes, which stamps both columns.
+    //
+    // PARTIAL and NULLS-DISTINCT, both deliberately: `sourceFileId IS NOT
+    // NULL` keeps manual and QBO-imported expenses out of it entirely, and the
+    // rows backfilled above have a NULL `sourceGroupIndex` (nothing can say
+    // which group they were), which a btree unique index treats as distinct —
+    // so the backfill cannot collide with itself. Those legacy rows are NOT
+    // protected by this index; the file-level dedupe covers them.
+    //
+    // Prisma cannot express a partial index, so it is SQL-only and recorded in
+    // prisma/prisma-blind-spots.json, exactly like BankImage_driveFileId_key.
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
+  ON "Expense"("sourceFileId", "sourceGroupIndex")
+  WHERE "sourceFileId" IS NOT NULL`,
 
     // SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
     // project delete must not silently destroy spend history that the estimate
@@ -434,14 +510,14 @@ END $$`,
 ];
 
 /**
- * The re-runnable half: the two statements marked POST-DEPLOY above.
+ * The re-runnable half: the three statements marked POST-DEPLOY above.
  *
  * Both are already in the main run — this is a SUBSET, never a second copy, so
  * the two can never say different things (asserted in
  * tests/apply-expense-attribution.test.ts).
  */
 export function postDeployStatements(timeZone) {
-    return [PROJECT_ID_BACKFILL, reanchorSql(timeZone)];
+    return [PROJECT_ID_BACKFILL, reanchorSql(timeZone), SOURCE_FILE_ID_BACKFILL];
 }
 
 export const expectedColumns = {
@@ -449,6 +525,7 @@ export const expectedColumns = {
         "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
         "costCodeSource", "costCodeConfidence", "taxDeductibleBase", "needsTaxReview",
         "taxSource", "taxDeductibleBaseSource", "attributionAnchoredAt", "updatedAt",
+        "sourceFileId", "sourceGroupIndex",
     ],
 };
 
@@ -512,6 +589,12 @@ export const expectedCheckConstraints = [
 
 export const expectedIndexes = [
     { name: "Expense_projectId_idx", table: "Expense" },
+    { name: "Expense_sourceFileId_idx", table: "Expense" },
+    // The partial UNIQUE index. Verified by name like the others: the shape it
+    // must have is asserted against a real catalog by
+    // scripts/check-migrations-match.mjs, which reads it out of
+    // prisma/prisma-blind-spots.json.
+    { name: "Expense_sourceFileId_sourceGroupIndex_key", table: "Expense" },
 ];
 
 async function main() {

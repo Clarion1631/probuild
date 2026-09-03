@@ -63,7 +63,7 @@ import {
 } from "../src/lib/expense-attribution";
 import { OVERHEAD_PROJECT_ID } from "../src/lib/overhead-project";
 import { lockExpense } from "../src/lib/expense-lock";
-import { lockPhaseRowsForShare } from "../src/lib/phase-invariant";
+import { lockPhaseRowsForShare, provePhaseMembershipTx } from "../src/lib/phase-invariant";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "../src/lib/project-phases";
 import { csvCell, csvNumber } from "../src/lib/csv-safe";
 
@@ -552,32 +552,31 @@ export async function runBackfill({
         allowedCodesByProject.get(projectId).add(row.costCodeId);
     }
 
-    // ROW-SCOPED RE-READS, for the write phase only.
+    // ROW-SCOPED RE-READ, for the write phase only.
     //
     // The two maps above are a SNAPSHOT taken before a loop that can run for
     // minutes. Re-planning under the lock (below) proved the row itself had not
-    // moved, but it was still re-planned against those stale maps — so a phase
-    // deleted from the job, an estimate moved to another project, or an item
-    // re-coded after the snapshot would all be invisible, and the pass would
-    // write a code that was correct only in the past.
+    // moved, but it was still re-planned against those stale maps — so an
+    // estimate moved to another project, or an item re-coded after the
+    // snapshot, would be invisible and the pass would write a code that was
+    // correct only in the past.
     //
-    // These read the same things the snapshot did, `PHASE_ELIGIBLE_ESTIMATE_WHERE`
-    // and all, but for ONE project and ONE item, inside the transaction that is
-    // about to write.
-    const readAllowedCodes = async (tx, projectId) => {
-        const fresh = new Map();
-        if (!projectId) return fresh;
-        const rows = await tx.estimateItem.findMany({
-            where: {
-                costCodeId: { not: null },
-                costCode: { isActive: true },
-                estimate: { ...PHASE_ELIGIBLE_ESTIMATE_WHERE, projectId },
-            },
-            select: { costCodeId: true },
-        });
-        fresh.set(projectId, new Set(rows.map(r => r.costCodeId).filter(Boolean)));
-        return fresh;
-    };
+    // This reads the same thing the snapshot did, but for ONE item, inside the
+    // transaction that is about to write.
+    //
+    // THE PHASE LIST IS NO LONGER RE-READ HERE (round 34, item 3). It used to
+    // be, with a plain `estimateItem.findMany` — an UNLOCKED query, taken
+    // inside the transaction but holding nothing. That is the same phantom the
+    // shared invariant module was rewritten to close in round 32: under READ
+    // COMMITTED a concurrent transaction can insert an estimate and a line item
+    // and commit them between this script's lock scans and this read, and this
+    // read WILL see them (each statement takes a fresh snapshot). The verdict
+    // then rested on a row nothing was holding, so the item could be deleted —
+    // or its estimate archived or moved to another job — before this pass's own
+    // UPDATE committed, and the money landed on a phase the job does not have.
+    // The proof with the `FOR SHARE OF ei, e` clause is the fix, and it lives
+    // in src/lib/phase-invariant.ts; it is called below, immediately before the
+    // write, rather than reimplemented here.
     const readItem = async (tx, itemId) => {
         const fresh = new Map();
         if (!itemId) return fresh;
@@ -835,28 +834,63 @@ export async function runBackfill({
             //
             // `planBackfill` is the single copy of the rules, so it is run
             // again over this one row rather than re-implemented here.
-            // The item link and the phase list, RE-READ for this row inside
-            // the lock — not the minutes-old snapshot. See readItem /
-            // readAllowedCodes above.
+            // The item link, RE-READ for this row inside the lock — not the
+            // minutes-old snapshot. See readItem above. The phase list is NOT
+            // re-read here any more; see the proof below.
             const resolvedProjectId = current.projectId ?? current.estimate?.projectId ?? null;
-            const [freshItems, freshAllowed] = await Promise.all([
-                readItem(tx, current.itemId),
-                readAllowedCodes(tx, resolvedProjectId),
-            ]);
+            const freshItems = await readItem(tx, current.itemId);
+            // THE RE-PLAN PROPOSES; THE LOCKED PROOF DECIDES.
+            //
+            // `planBackfill`'s phase gate is a set-membership test against a
+            // map, and the only map that can be handed to it here is the ONE
+            // code this write is about — the code the plan chose and the
+            // predicate below names. Anything the re-plan lands on that is not
+            // that code voids the write on the very next line, so narrowing the
+            // map cannot make the re-plan accept something the wider map would
+            // have refused; what it does is stop this script deciding phase
+            // membership from a list it read for itself, without a lock.
+            //
+            // Membership is answered by provePhaseMembershipTx instead, below.
+            const candidateOnly = resolvedProjectId
+                ? new Map([[resolvedProjectId, new Set([fill.costCodeId])]])
+                : new Map();
             const replanned = planBackfill({
                 expenses: [current],
                 items: freshItems,
                 costCodeIdByCode,
                 scopedProjectIds,
-                allowedCodesByProject: freshAllowed,
+                allowedCodesByProject: candidateOnly,
             });
             const fresh = replanned.codeFills[0];
             // No longer codeable at all, or codeable as something else — either
             // way the planned write is void. A re-run will plan it properly.
             if (!fresh || fresh.costCodeId !== fill.costCodeId) return { count: 0 };
+            // IS THIS CODE A PHASE OF THIS JOB — PROVED, AND HELD (round 34,
+            // item 3). The shared query answers on THIS transaction and locks
+            // the exact estimate/line-item pair its answer came from
+            // (`FOR SHARE OF ei, e`), so the row that proved membership is
+            // still proving it when the UPDATE below commits. The four scans
+            // `writeUnderAttributionLocks` already took cannot do that on
+            // their own: they lock what EXISTED when they ran, and a phantom
+            // committed afterwards is visible to the next statement and held
+            // by nothing.
+            //
+            // `provePhaseMembershipTx` rather than `assertPhaseOfProjectTx`
+            // on purpose. The latter also admits the company Safety phase on an
+            // In Progress job with no estimate item behind it, and this pass
+            // deliberately does not (see the phaseRows comment above: a
+            // materials receipt is never a safety meeting). The proof query is
+            // the half that answers the question this script actually asks, and
+            // it is the half that carries the lock.
+            if (!resolvedProjectId) return { count: 0 };
+            if (!(await provePhaseMembershipTx(tx, resolvedProjectId, fresh.costCodeId))) {
+                return { count: 0 };
+            }
             // A RETIRED CODE IS NOT AN ANSWER, however well the re-plan agrees
-            // with the plan. Asked here, under the lock taken above, so the
-            // answer cannot change between this line and the update below.
+            // with the plan — and the proof above does not ask: `isActive` is
+            // a company-wide switch, not a fact about this job's phases. Asked
+            // here, under the lock taken above, so the answer cannot change
+            // between this line and the update below.
             if (!(await costCodeStillActive(tx, fresh.costCodeId))) return { count: 0 };
 
             return tx.expense.updateMany({

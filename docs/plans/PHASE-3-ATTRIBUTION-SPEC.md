@@ -169,6 +169,48 @@ ReceiptIntake lines in a `to_regclass('"ReceiptIntake"')` guard so the script is
 in either merge order; the checked-in migration for those two columns then belongs to
 whichever PR ships second.)
 
+**AS BUILT — the source document's identity is its OWN column (Codex round 34).** The
+Drive ingest deduped with `receiptUrl contains fileId` while storing a CALLER-SUPPLIED
+`fileUrl`, so it was asking whether a value the caller controls happened to embed the
+identity. Two ways that fails, and neither is hypothetical: a url that does not contain
+the id (a resourcekey link, a `/uc?export=...` form) matched nothing, so every
+re-delivery booked the whole receipt again — the advisory lock added in round 33 cannot
+help, because both deliveries agree there is no prior row when the query cannot see one;
+and `contains` is a substring test, so file id `abc` matched a stored url carrying
+`abcd` and the second, unrelated document was silently dropped. As built:
+
+```prisma
+  sourceFileId        String?  // the Drive file id, exactly as received; compared by EQUALITY
+  sourceGroupIndex    Int?     // which AI-split category group of that document this row is
+  @@index([sourceFileId])
+```
+
+```sql
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceFileId" TEXT;
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceGroupIndex" INTEGER;
+CREATE INDEX IF NOT EXISTS "Expense_sourceFileId_idx" ON "Expense"("sourceFileId");
+CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
+  ON "Expense"("sourceFileId", "sourceGroupIndex") WHERE "sourceFileId" IS NOT NULL;
+```
+
+Round 33 recorded that no unique index could back the ingest lock, because every group of
+one receipt shared a `receiptUrl` and there was no per-group ordinal. Both columns exist
+now, so there is one: the partial unique index above makes a duplicate group
+unrepresentable even for a writer that never takes the lock. It is PARTIAL so manual and
+QBO-imported expenses are outside it entirely, and NULLS-DISTINCT (the btree default)
+because rows backfilled from an existing `receiptUrl` have no knowable group ordinal —
+they neither collide with each other nor gain the constraint's protection, and the
+file-level dedupe is what keeps a re-delivery of those idempotent. Prisma cannot express a
+partial index, so it is SQL-only and recorded in `prisma/prisma-blind-spots.json`, the
+same treatment `BankImage_driveFileId_key` gets.
+
+The backfill parses the id out of `receiptUrl` only where it is unambiguous (`/d/<id>`
+or `id=<id>`) and leaves it NULL otherwise: a guessed id would dedupe two unrelated
+documents against each other, which is the failure the column exists to end. It is part of
+the POST-DEPLOY set for the same reason the `projectId` fill is — the old build keeps
+writing receipt expenses with a url and no `sourceFileId` while it drains, and a row left
+in that shape is invisible to the new equality dedupe.
+
 ## 3. Writers
 
 Rule: **every writer sets `projectId` from the project it already knows**, and sets
@@ -375,6 +417,17 @@ return. As built:
   one, and a human base keeps its own provenance through any number of OCR tax fills.
   The "I do not know" retraction clears BOTH provenances with both figures.
 
+  **So does every QBO invalidation (Codex round 34).** `planQboExpenseUpdate` has two
+  branches that throw a figure away — a gross too small to carry the recorded tax, and a
+  hand allocation stranded above the new pre-tax remainder — and `deactivateQboExpense`
+  retires the lot when QuickBooks says the purchase never happened. Each of them now
+  clears `taxDeductibleBaseSource` in the SAME statement that clears
+  `taxDeductibleBase`, and deactivation counts it in "is this row already retired?" as
+  well. Leaving it standing left the row saying "base NULL, and a person decided that
+  base" — provenance for a figure that does not exist, which `book.ts` reads to decide
+  whether an automated pass may touch the allocation and the correction UI shows a
+  bookkeeper as their own answer.
+
   Rows that predate the column are backfilled to `"manual"` where a base stands beside a
   human `taxSource` — before the split a human base could only exist on a row a human had
   also answered about tax, so that is the conservative reading. Rows with an OCR or
@@ -414,6 +467,21 @@ return. As built:
   `createExpenseCore`, the Drive receipt ingest, receipt booking (which parks the row as
   `phase-changed:<reason>` rather than booking an uncoded receipt) and the QBO suggester.
   `tests/expense-writer-phase-guard.test.ts` fails when a new writer appears without it.
+
+  **The attribution backfill is the eighth (Codex round 34).** It was the last writer
+  deciding phase membership from a list it fetched for itself — a plain
+  `estimateItem.findMany` taken inside its write transaction but holding nothing. Under
+  READ COMMITTED a concurrent transaction can insert an estimate and a line item and
+  commit them after this script's lock scans, and the next statement sees them; the
+  verdict then rested on a row nobody had locked, so it could be deleted, or its estimate
+  archived or moved to another job, before the `UPDATE` committed. It now calls
+  `provePhaseMembershipTx` on its own transaction immediately before the write, whose
+  `FOR SHARE OF ei, e` clause holds the exact pair that answered.
+  `provePhaseMembershipTx` rather than the whole `assertPhaseOfProjectTx` on purpose:
+  the latter also admits the company Safety phase on an In Progress job with no estimate
+  item behind it, and this pass deliberately does not — a materials receipt is never a
+  safety meeting. `tests/phase-invariant-db.test.ts` drives the interleaving against a
+  real Postgres in CI's `migrations` job.
 * the correction path is **`PATCH /api/expenses/[id]`**, NOT the PUT on that route. PUT is
   guarded by `assertExpenseMutableOutsideQbo`, and every expense the pipeline books carries a
   `qbPurchaseId` — so PUT cannot reach a single row the tax report is made of, and it now

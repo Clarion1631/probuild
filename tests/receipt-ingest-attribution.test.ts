@@ -148,12 +148,21 @@ const fakePrisma: any = {
     expense: {
         // The dedupe query, answered from what has actually COMMITTED. A
         // hard-coded null could never tell a first delivery from a second.
+        //
+        // EQUALITY ON THE STORED FILE ID, modelled as equality. Postgres would
+        // not silently accept a `contains` here, and neither does this: a
+        // regression back to matching a substring of the caller-supplied
+        // `receiptUrl` throws rather than quietly passing the substring tests
+        // below by doing the very thing they exist to forbid.
         findFirst: async (args: any) => {
-            const needle = args?.where?.receiptUrl?.contains;
-            if (typeof needle !== "string") return null;
-            const hit = created.find(
-                row => typeof row.receiptUrl === "string" && row.receiptUrl.includes(needle),
-            );
+            const wanted = args?.where?.sourceFileId;
+            if (typeof wanted !== "string") {
+                throw new Error(
+                    "receipt-ingest dedupe must ask for an exact sourceFileId, got " +
+                        JSON.stringify(args?.where),
+                );
+            }
+            const hit = created.find(row => row.sourceFileId === wanted);
             return hit ? { id: "exp-existing" } : null;
         },
         create: async (args: { data: Record<string, unknown> }) => {
@@ -423,4 +432,86 @@ test("attribution changing BETWEEN group 1 and group 2 rolls back group 1 too", 
     assert.equal(body.ok, false);
     assert.equal(body.reason, "attribution-race");
     assert.equal(body.retryable, true);
+});
+
+// ── the dedupe key is the FILE ID, not a substring of a url (round 34) ─────
+
+test("every group carries the source file id and its own ordinal", async () => {
+    // The identity has to be ON the rows, or none of the tests below can
+    // mean anything. The ordinal is what makes the pair unique per row:
+    // one receipt becomes one Expense per category group, so the file id
+    // alone repeats — which is why the durable backstop is the partial
+    // unique index on the PAIR.
+    const res = await post({
+        ...PAYLOAD,
+        groups: [
+            { category: "Plumbing", amount: 120.5 },
+            { category: "Framing", amount: 80 },
+        ],
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(
+        created.map(row => [row.sourceFileId, row.sourceGroupIndex]),
+        [["drive-file-1", 0], ["drive-file-1", 1]],
+    );
+});
+
+test("a custom fileUrl that does NOT contain the id still dedupes", async () => {
+    // THE BUG. `receiptUrl` is whatever the caller sent, and the dedupe
+    // asked whether that value happened to embed the identity. Drive hands
+    // the Apps Script urls that do not: a resourcekey form, a shortened
+    // link, a `/uc?export=...` download url. For those documents the
+    // dedupe matched nothing, so a retry after a lost response — or a
+    // second run over the same folder — booked the whole receipt again, on
+    // the same job, with nothing in the data to tell the copies apart. The
+    // advisory lock could not help: both deliveries agreed there was no
+    // prior row, because there was none the query could see.
+    const payload = {
+        ...PAYLOAD,
+        fileUrl: "https://drive.google.com/open?resourcekey=0-Xq7t",
+    };
+    const first = await post(payload);
+    assert.equal((await first.json()).created, 1);
+
+    const second = await post(payload);
+    assert.deepEqual(await second.json(), { ok: true, alreadyIngested: true, created: 0 });
+    assert.equal(created.length, 1, "the second delivery booked nothing");
+});
+
+test("...and the same holds when the two deliveries RACE", async () => {
+    // The locked half of the same story. The fast path and the locked
+    // re-check ask the same question, so a url that defeats one defeats
+    // both — the lock serialised two deliveries that then each concluded
+    // "nothing here" and inserted.
+    const payload = { ...PAYLOAD, fileUrl: "https://drive.google.com/open?resourcekey=0-Xq7t" };
+    const [first, second] = await Promise.all([post(payload), post(payload)]);
+    const bodies = [await first.json(), await second.json()];
+    assert.equal(created.length, 1, "one set of expenses, not two");
+    assert.equal(bodies.filter(b => b.created === 1).length, 1);
+    assert.ok(bodies.some(b => b.alreadyIngested));
+});
+
+test("a file id that is a PREFIX of another is not deduped against it", async () => {
+    // The second half of the same defect. `contains` is a substring test,
+    // so file id "abc" matched a stored url carrying "abcd" and the second,
+    // unrelated document was silently answered `alreadyIngested` and never
+    // booked. Drive ids are opaque and this is not a contrived pair.
+    const longer = await post({ ...PAYLOAD, fileId: "abcd" });
+    assert.equal((await longer.json()).created, 1);
+
+    const shorter = await post({ ...PAYLOAD, fileId: "abc" });
+    const body = await shorter.json();
+    assert.equal(body.created, 1, "a different document is a different document");
+    assert.ok(!body.alreadyIngested);
+    assert.equal(created.length, 2);
+    assert.deepEqual(created.map(row => row.sourceFileId), ["abcd", "abc"]);
+});
+
+test("the id is stored EXACTLY as sent, never derived from the url", async () => {
+    // Anything derived — a normalised form, a re-parse of `receiptUrl` —
+    // reintroduces the mismatch: the dedupe compares what the caller sent
+    // against what was stored, and those have to be the same bytes.
+    await post({ ...PAYLOAD, fileId: "1AbC_-dEf", fileUrl: "https://example.test/whatever" });
+    assert.equal(created[0].sourceFileId, "1AbC_-dEf");
+    assert.equal(created[0].receiptUrl, "https://example.test/whatever", "the url is still the human link");
 });

@@ -1970,6 +1970,97 @@ test("clearing a tax classification is never reported as 'unchanged'", () => {
     assert.equal(plan.data.needsTaxReview, true);
 });
 
+// ── provenance is cleared WITH the figure it described (round 34, item 2) ──
+
+test("a gross too small for the recorded tax clears BOTH provenances, not just the tax's", () => {
+    // The failure this replaces. The branch already cleared `taxAmount`,
+    // `installedAtCustomer`, `taxDeductibleBase` and `taxSource` — but
+    // `taxDeductibleBaseSource` was left standing at "manual". The row then
+    // said: base NULL, and a person decided that base. Provenance for a figure
+    // that does not exist. src/lib/receipt-intake/book.ts reads exactly this
+    // column to decide whether an automated pass may touch the allocation, and
+    // the correction UI shows it to a bookkeeper as their own answer.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1",
+            estimateId: "estimate-1",
+            amount: 412.1,
+            taxAmount: 500,
+            taxDeductibleBase: 50,
+            installedAtCustomer: true,
+            taxSource: "manual",
+        },
+        { ...WRITE, amount: 300 },
+    );
+    assert.equal(plan.data.taxAmount, null);
+    assert.equal(plan.data.taxDeductibleBase, null);
+    assert.equal(plan.data.taxSource, null, "the tax's provenance goes with the tax");
+    assert.equal(plan.data.taxDeductibleBaseSource, null, "and the base's goes with the base");
+    assert.equal(plan.data.needsTaxReview, true);
+});
+
+test("...from a NULL base source too — the write is unconditional, not a repair", () => {
+    // A row that never had a base provenance still gets an explicit null, in
+    // the same statement. The alternative — writing it only when something is
+    // there to clear — makes the invariant depend on a read, and this branch's
+    // whole point is that it does not.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1",
+            estimateId: "estimate-1",
+            amount: 412.1,
+            taxAmount: 500,
+            taxDeductibleBase: null,
+            taxSource: null,
+        },
+        { ...WRITE, amount: 300 },
+    );
+    assert.equal(plan.data.taxDeductibleBaseSource, null);
+    assert.ok("taxDeductibleBaseSource" in plan.data, "written, not merely absent");
+});
+
+test("a STRANDED allocation clears its provenance even though the tax is untouched", () => {
+    // The other branch, and the one nothing else on this path would ever
+    // reach: the recorded tax still fits the new gross, so `taxSource` is
+    // deliberately left alone — but the hand allocation no longer fits, is
+    // cleared, and its provenance has to go with it or the row keeps claiming
+    // a bookkeeper split a receipt into figures it no longer carries.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1",
+            estimateId: "estimate-1",
+            amount: 412.1,
+            taxAmount: 16.55,
+            taxDeductibleBase: 300,
+            taxSource: "ocr",
+        },
+        { ...WRITE, amount: 100 },
+    );
+    assert.equal(plan.data.taxDeductibleBase, null);
+    assert.equal(plan.data.taxDeductibleBaseSource, null);
+    assert.equal(plan.data.needsTaxReview, true);
+    assert.ok(!("taxSource" in plan.data), "the TAX's provenance is deliberately untouched here");
+    assert.ok(!("taxAmount" in plan.data), "and so is the tax itself");
+});
+
+test("an allocation that still fits keeps both the figure and its provenance", () => {
+    // The control. If this ever starts clearing, the tests above are passing
+    // because the branch fires on everything, not because it fires correctly.
+    const plan = planQboExpenseUpdate(
+        {
+            projectId: "project-1",
+            estimateId: "estimate-1",
+            amount: 412.1,
+            taxAmount: 16.55,
+            taxDeductibleBase: 50,
+            taxSource: "manual",
+        },
+        { ...WRITE, amount: 412.1 },
+    );
+    assert.ok(!("taxDeductibleBase" in plan.data));
+    assert.ok(!("taxDeductibleBaseSource" in plan.data));
+});
+
 test("deactivation RETIRES the tax classification in the same statement as the zeroing", async () => {
     // Codex round 7, item 2. Zeroing `amount` while leaving `taxAmount` behind
     // leaves taxAmount > amount, which the new CHECK refuses — so one
@@ -1985,6 +2076,11 @@ test("deactivation RETIRES the tax classification in the same statement as the z
             taxAtSource: true,
             installedAtCustomer: true,
             taxDeductibleBase: 50,
+            // A bookkeeper's split, with their name on it. The deactivate path
+            // used to omit this column from the select, from the "is it
+            // already retired?" test and from the write, so a deleted purchase
+            // ended up with a NULL base and a "manual" source (round 34).
+            taxDeductibleBaseSource: "manual",
             needsTaxReview: true,
         } as any,
     ]);
@@ -2003,6 +2099,7 @@ test("deactivation RETIRES the tax classification in the same statement as the z
     assert.equal(row.taxAtSource, false);
     assert.equal(row.installedAtCustomer, null);
     assert.equal(row.taxDeductibleBase, null);
+    assert.equal(row.taxDeductibleBaseSource, null, "the base's provenance retires with the base");
     assert.equal(row.needsTaxReview, false, "a vanished purchase is not something to re-check");
     // The constrained row is legal: tax <= amount and base <= amount - tax.
     assert.ok(Number(row.taxAmount ?? 0) <= Number(row.amount));
@@ -2015,7 +2112,7 @@ test("a second deactivation of an already-retired row is unchanged", async () =>
         description: "[QuickBooks import] Removed in QBO (deleted)",
         qbSyncToken: "1",
         taxAmount: null, taxAtSource: false, taxSource: null, installedAtCustomer: null,
-        taxDeductibleBase: null, needsTaxReview: false,
+        taxDeductibleBase: null, taxDeductibleBaseSource: null, needsTaxReview: false,
     };
     const fake = createFakePrisma([retired as any]);
     assert.equal(
@@ -2025,6 +2122,31 @@ test("a second deactivation of an already-retired row is unchanged", async () =>
         }),
         "unchanged",
     );
+});
+
+test("a row retired in every way EXCEPT the base's provenance is NOT 'unchanged'", async () => {
+    // The half of the omission a write-only fix would miss. Clearing the
+    // column on the write is not enough if the retirement TEST cannot see it:
+    // a deleted purchase carrying a stale "manual" base source would answer
+    // "unchanged" on this and every future pass, and the provenance would
+    // outlive the purchase forever.
+    const stale = {
+        ...WRITE, id: "expense-1", projectId: "project-1", receiptUrl: null,
+        amount: 0, status: "Reviewed" as const,
+        description: "[QuickBooks import] Removed in QBO (deleted)",
+        qbSyncToken: "1",
+        taxAmount: null, taxAtSource: false, taxSource: null, installedAtCustomer: null,
+        taxDeductibleBase: null, taxDeductibleBaseSource: "manual", needsTaxReview: false,
+    };
+    const fake = createFakePrisma([stale as any]);
+    assert.equal(
+        await deactivateQboExpense(fake.client, {
+            qbPurchaseId: "purchase-1", qbSyncToken: "1",
+            qbSyncedAt: new Date("2026-07-29T15:00:00.000Z"), reason: "deleted",
+        }),
+        "removed",
+    );
+    assert.equal((fake.rows.get("purchase-1") as any).taxDeductibleBaseSource, null);
 });
 
 test("a tax PATCH landing mid-sync is NOT clobbered — the sync re-plans", async () => {

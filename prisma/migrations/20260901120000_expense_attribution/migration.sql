@@ -21,6 +21,30 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DE
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN;
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT;
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,30);
+-- THE SOURCE DOCUMENT'S OWN IDENTITY, AND WHICH GROUP OF IT THIS ROW IS.
+-- The Drive ingest deduped on `receiptUrl LIKE '%' || fileId || '%'` while
+-- storing a CALLER-SUPPLIED url: a payload whose `fileUrl` omitted the id
+-- deduped against nothing and re-booked the receipt on every delivery, and the
+-- substring match conflated a file id that is a prefix of another. The id is
+-- now its own column, compared by equality. `sourceGroupIndex` is the group
+-- ordinal within that document, because one receipt becomes one Expense per
+-- category group and the file id alone is not a per-row identity.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceFileId" TEXT;
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "sourceGroupIndex" INTEGER;
+-- BACKFILL FROM THE URL, BUT ONLY WHERE THE ID IS UNAMBIGUOUS. Both shapes the
+-- app has ever produced carry it (`/d/<id>` and `id=<id>`); anything else is
+-- left NULL rather than guessed, since a wrong id would dedupe two unrelated
+-- documents together. Idempotent by the IS NULL predicate.
+UPDATE "Expense"
+   SET "sourceFileId" = COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       )
+ WHERE "sourceFileId" IS NULL
+   AND COALESCE(
+         substring("receiptUrl" from '/d/([A-Za-z0-9_-]+)'),
+         substring("receiptUrl" from '[?&]id=([A-Za-z0-9_-]+)')
+       ) IS NOT NULL;
 -- Mixed receipts: the portion actually resold, when it is less than the whole
 -- pre-tax total. NULL means "all of it", and is only reached on a row a human
 -- has explicitly flagged installed-at-customer.
@@ -76,6 +100,31 @@ UPDATE "Expense" SET "updatedAt" = COALESCE("createdAt", now()) WHERE "updatedAt
 ALTER TABLE "Expense" ALTER COLUMN "updatedAt" SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId");
+CREATE INDEX IF NOT EXISTS "Expense_sourceFileId_idx" ON "Expense"("sourceFileId");
+
+-- THE DURABLE BACKSTOP FOR THE INGEST LOCK.
+--
+-- The advisory lock in the ingest route serialises two concurrent deliveries of
+-- one Drive file, but an advisory lock is not a constraint: a writer that does
+-- not take it (a script, a future route) can still insert a second copy. This
+-- index makes the duplicate unrepresentable for every row written by the new
+-- ingest, which stamps both columns on every group.
+--
+-- PARTIAL, and NULLS-DISTINCT, both deliberately. `sourceFileId IS NOT NULL`
+-- keeps every expense that did not come from a Drive document (manual entries,
+-- the QBO import) out of it entirely. And rows backfilled from `receiptUrl`
+-- above have a NULL `sourceGroupIndex` — nothing can say which group they
+-- were — so a btree unique index treats them as distinct and the backfill
+-- cannot collide with itself. Those legacy rows are therefore NOT protected by
+-- this index; they are covered by the file-level dedupe, which is what makes a
+-- re-delivery idempotent.
+--
+-- Prisma cannot express a partial index, so this is SQL-only and recorded in
+-- prisma/prisma-blind-spots.json (same treatment as
+-- BankImage_driveFileId_key); scripts/check-migrations-match.mjs asserts it.
+CREATE UNIQUE INDEX IF NOT EXISTS "Expense_sourceFileId_sourceGroupIndex_key"
+  ON "Expense"("sourceFileId", "sourceGroupIndex")
+  WHERE "sourceFileId" IS NOT NULL;
 
 -- SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
 -- project delete must not silently destroy spend history that the estimate
