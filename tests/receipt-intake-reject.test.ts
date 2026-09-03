@@ -286,7 +286,7 @@ test("both /start branches take the live-lease rule from the SAME place", () => 
     // Two copies of "may I reuse this lease" is how the STAGING path came to be
     // fixed while the recovery path stayed broken.
     assert.equal((start.match(/await reuseLiveLease\(/g) ?? []).length, 2, "recovery and resume");
-    assert.match(start, /import \{ reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
+    assert.match(start, /import \{ discardUnresumedLease, reuseLiveLease \} from "@\/lib\/receipt-intake\/upload-lease";/);
     // And one 409 helper, so every lost claim answers identically.
     assert.equal(
         (start.match(/return leaseConflict\(existing\.id\)/g) ?? []).length,
@@ -471,4 +471,68 @@ test("the sweeper and /start both fence on the lease version", () => {
     );
     // ...and the reject also re-reads the row inside the transaction.
     assert.match(body, /fresh => uploadLeaseActive\(/);
+});
+
+// ── A FAILED SIGNER MUST NOT DELETE A ROW SOMEBODY ELSE RESUMED ────────────
+
+test("/start's signer-failure cleanup is a CAS over the lease it wrote, not a delete by id", () => {
+    // The row is created BEFORE the URL is signed, so a concurrent /start for
+    // the same sourceRef can hit the unique violation, adopt the row through
+    // reuseLiveLease and be holding a working URL by the time the original's
+    // signer fails. The unconditional `delete({ where: { id } })` this replaces
+    // then removed the shared row: the retry's bytes landed at a path nothing
+    // pointed at, /finalize 404'd, and the sourceRef stopped protecting the
+    // document's identity. The behaviour is in tests/receipt-intake-upload-lease.
+    assert.ok(
+        !/receiptIntake\.delete\(/.test(start),
+        "no unconditional delete is left anywhere in the route",
+    );
+    const branch = start.slice(start.indexOf("const signed = await signUpload(storagePath);"));
+    assert.match(branch, /await discardUnresumedLease\(/);
+    assert.match(branch, /\{ id, storagePath, uploadLeaseVersion: 1, uploadUrlExpiresAt: leaseExpiresAt \}/);
+    // The SAME value that was written to the row — a second uploadLeaseExpiry()
+    // call would compare a fresh instant against the stored one and never match,
+    // which would leak a STAGING row (and its sourceRef) on every signer fault.
+    assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,\n\s+uploadLeaseVersion: 1,/);
+    // A lost CAS is the idempotent conflict, never an error about a row that is
+    // alive and in somebody else's hands.
+    assert.match(branch, /if \(discarded === "resumed"\) \{/);
+    assert.match(branch, /return leaseConflict\(id\);/);
+    assert.ok(
+        branch.indexOf(`discarded === "resumed"`) < branch.indexOf(`reason: "storage-unavailable"`),
+        "the conflict is answered before the signer's own 503",
+    );
+});
+
+// ── The cutover writes are fenced on the rows they were decided about ──────
+
+test("no cutover write updates by id alone", () => {
+    // READ COMMITTED lets an admin review (or any writer that never touches the
+    // claim's advisory lock) move a parked row between the SELECT that triaged
+    // it and the UPDATE that acts on the verdict. `where: { id: { in: [...] } }`
+    // then overwrote that with a TERMINAL SHADOW_* state, or handed the row to
+    // v2 with `dryRun: false`. Behaviour: tests/receipt-intake-cutover.
+    const fn = sweeper.slice(sweeper.indexOf("async function claim("));
+    const body = fn.slice(0, fn.indexOf("const ELIGIBLE ="));
+    assert.equal(
+        (body.match(/await applyCutoverVerdict\(/g) ?? []).length,
+        3,
+        "retire, quarantine and requeue all go through the fenced write",
+    );
+    assert.ok(
+        !/tx\.receiptIntake\.updateMany\(/.test(body),
+        "and none of them writes an unfenced updateMany of its own",
+    );
+    // The rows the verdict is applied to are the ones that were triaged, not a
+    // re-derived id list — that is how the two came to disagree before.
+    assert.match(body, /const byId = new Map<string, CutoverRow>\(candidates\.map\(row => \[row\.id, row\]\)\);/);
+    assert.match(
+        body,
+        /state: true, stateReason: true, dryRun: true, claimToken: true,/,
+        "the evidence each write fences on is selected with them",
+    );
+    // Rows whose CAS lost are reported, not silently dropped.
+    assert.match(body, /shadowSkippedMoved \+= /);
+    assert.match(body, /shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,/);
 });

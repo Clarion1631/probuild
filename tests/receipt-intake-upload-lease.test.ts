@@ -16,7 +16,12 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { liveLeasePath, reuseLiveLease, type LeaseRow } from "../src/lib/receipt-intake/upload-lease";
+import {
+    discardUnresumedLease,
+    liveLeasePath,
+    reuseLiveLease,
+    type LeaseRow,
+} from "../src/lib/receipt-intake/upload-lease";
 import { uploadPathFor } from "../src/lib/receipt-intake/stored-object";
 
 const HOUR = 60 * 60_000;
@@ -53,16 +58,25 @@ interface Store {
  */
 function client(rows: (LeaseRow | Record<string, unknown>)[]) {
     const store: Store = { rows: rows.map(r => ({ ...r } as Record<string, unknown>)), signed: [], deleted: [] };
+    const matching = (where: Record<string, unknown>) => (row: Record<string, unknown>) =>
+        Object.entries(where).every(([key, want]) => {
+            const have = row[key];
+            if (want instanceof Date) return have instanceof Date && have.getTime() === want.getTime();
+            return have === want || (have == null && want == null);
+        });
     const deps = {
         db: {
             updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
-                const hits = store.rows.filter(row =>
-                    Object.entries(where).every(([key, want]) => {
-                        const have = row[key];
-                        if (want instanceof Date) return have instanceof Date && have.getTime() === want.getTime();
-                        return have === want || (have == null && want == null);
-                    }));
+                const hits = store.rows.filter(matching(where));
                 for (const hit of hits) Object.assign(hit, data);
+                return { count: hits.length };
+            },
+            // The discard is a DELETE over the same evaluated where, so the fake
+            // has to be able to lose the CAS the same way the database would.
+            deleteMany: async ({ where }: { where: Record<string, unknown> }) => {
+                const hits = store.rows.filter(matching(where));
+                store.rows = store.rows.filter(row => !hits.includes(row));
+                for (const hit of hits) store.deleted.push(String(hit.storagePath));
                 return { count: hits.length };
             },
         },
@@ -246,4 +260,95 @@ test("an extended lease whose URL cannot be signed is a 503, not a fall-through"
     const outcome = await reuseLiveLease(row, "png", { ...deps, sign: async () => null });
     assert.deepEqual(outcome, { kind: "storage-unavailable" });
     assert.equal(store.rows[0].uploadLeaseVersion, 2, "and the row still holds its lease");
+});
+
+// ── The finding: a failed signer deleted a row another request had RESUMED ──
+
+/** The lease /start just wrote, as the request that wrote it knows it. */
+const asCreated = (row: LeaseRow) => ({
+    id: row.id,
+    storagePath: row.storagePath,
+    uploadLeaseVersion: row.uploadLeaseVersion,
+    uploadUrlExpiresAt: row.uploadUrlExpiresAt!,
+});
+
+test("A RESUMED ROW SURVIVES the original request's signer failure", async () => {
+    // /start creates the row FIRST and signs its URL SECOND. In that gap a
+    // concurrent /start for the same sourceRef hits the unique violation, finds
+    // this row with a live lease, and reuseLiveLease hands it a WORKING signed
+    // URL over the same path. The unconditional delete this replaces then
+    // removed the row that retry had just adopted: its bytes landed at a path
+    // no row pointed at, /finalize 404'd on an id that no longer existed, and
+    // the sourceRef stopped protecting the document's identity.
+    const created = staging();
+    const { store, deps } = client([created]);
+
+    // The retry, interleaved BEFORE the original's discard.
+    const resumed = await reuseLiveLease(created, "png", deps);
+    assert.equal(resumed?.kind, "signed");
+
+    const outcome = await discardUnresumedLease(asCreated(created), deps.db);
+    assert.equal(outcome, "resumed", "the CAS refuses to delete a row somebody else adopted");
+    assert.equal(store.rows.length, 1, "the row survives");
+    assert.deepEqual(store.deleted, [], "and nothing is dropped");
+    // The URL the retry is holding still names the path the surviving row
+    // points at, so its upload finalizes against a live row.
+    const signed = (resumed as { signed: { storagePath: string } }).signed;
+    assert.equal(signed.storagePath, store.rows[0].storagePath);
+    assert.equal(store.rows[0].state, "STAGING", "still resumable, not orphaned");
+});
+
+test("with NOBODY resuming it, the row really is discarded", async () => {
+    // The control. Without it a CAS that matched nothing would pass the test
+    // above while leaking a STAGING row — and its sourceRef — on every signer
+    // failure.
+    const created = staging();
+    const { store, deps } = client([created]);
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "discarded");
+    assert.deepEqual(store.rows, [], "no row is left holding the sourceRef");
+});
+
+test("a row the RESUME branch repathed is not deleted either", async () => {
+    // The other way a retry adopts the row: an expired lease, or a caller
+    // declaring a different extension, takes the destructive branch — new lease
+    // version, new path. Pinning the version and the path is what sees it.
+    const created = staging();
+    const { store, deps } = client([created]);
+    store.rows[0].uploadLeaseVersion = 2;
+    store.rows[0].storagePath = uploadPathFor(created.id, 2, "png");
+
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
+    assert.equal(store.rows.length, 1);
+});
+
+test("a row that PUBLISHED under us is not deleted", async () => {
+    // /finalize can land between the create and the signer failure. Deleting a
+    // published row would destroy a receipt over a signing hiccup.
+    const created = staging();
+    const { store, deps } = client([created]);
+    store.rows[0].state = "RECEIVED";
+    assert.equal(await discardUnresumedLease(asCreated(created), deps.db), "resumed");
+    assert.equal(store.rows.length, 1);
+});
+
+test("the discard CAS reads every column an adopter would have moved", async () => {
+    // Each of the four is the ONLY witness for one way the row can be adopted:
+    // the expiry for a lease reuse, the version and path for a resume, the
+    // state for a publish.
+    const created = staging();
+    const { store, deps } = client([created]);
+    for (const [column, value] of [
+        ["uploadUrlExpiresAt", new Date(Date.now() + 3 * HOUR)],
+        ["uploadLeaseVersion", 9],
+        ["storagePath", "receipts/intake/row-1.v9.png"],
+        ["state", "NEEDS_REVIEW"],
+    ] as const) {
+        store.rows = [{ ...created, [column]: value } as Record<string, unknown>];
+        assert.equal(
+            await discardUnresumedLease(asCreated(created), deps.db),
+            "resumed",
+            `a moved ${column} must lose the CAS`,
+        );
+        assert.equal(store.rows.length, 1, column);
+    }
 });

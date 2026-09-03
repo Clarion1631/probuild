@@ -200,6 +200,14 @@ const replayRoutes = {
         path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
         "utf8",
     ),
+    // THREE, not two. /start answers a retrying forwarder about a SETTLED row,
+    // and the forwarder deletes its only copy on that answer just as it does
+    // for the other two — but this one used to decide it from a size probe
+    // alone.
+    "POST /api/receipts/intake/start": readFileSync(
+        path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
+        "utf8",
+    ),
 };
 
 test("MUTATED OBJECT: a replaced object is content-mismatch, never 'we have it'", async () => {
@@ -251,7 +259,7 @@ test("a race — present, then gone before the read — is transient-or-missing,
     assert.equal((raced as { kind: string }).kind, "missing");
 });
 
-test("BOTH replay paths ask this one rule, and answer a mismatch with 409", () => {
+test("ALL THREE replay paths ask this one rule, and answer a mismatch with 409", () => {
     // Two copies of "do we hold it" is how one path came to be stricter than
     // the other. The routes map the verdict to their own response shapes, but
     // the verdict itself is decided here.
@@ -662,4 +670,62 @@ test("the replay path heals only on an AFFIRMATIVE absence, and 503s on a fault"
     // And the collapsing helper is gone, so nothing can reintroduce it.
     const storage = readFileSync(path.join(__dirname, "..", "src/lib/secure-storage.ts"), "utf8");
     assert.ok(!/secureObjectExists/.test(storage), "no boolean exists-check to reach for");
+});
+
+// ── /start's "we already have it" was PRESENCE, not verification ───────────
+
+test("/start's settled branch verifies the BYTES, and no longer probes for a size", async () => {
+    // The finding: this branch checked object size/presence and returned
+    // `alreadyReceived`. The forwarder deletes its only copy on that answer, so
+    // an object replaced or corrupted after publication (the upload URL is
+    // `upsert: true`, a restore can put back a different version, storage can
+    // fault) was laundered into "we hold your receipt" and the last good copy
+    // went with it. Inline replay and /finalize already downloaded and
+    // SHA-verified; this path did not.
+    const start = replayRoutes["POST /api/receipts/intake/start"];
+    const branch = start.slice(start.indexOf(`if (existing.state !== "STAGING") {`));
+    const body = branch.slice(0, branch.indexOf("alreadyReceived: true"));
+
+    assert.match(body, /verifyStoredCopy\(existing\.storagePath, existing\.fileSha256\)/);
+    assert.ok(
+        !/receiptObjectSize/.test(start),
+        "the presence-only probe is gone from the route entirely, not merely bypassed",
+    );
+
+    // The three verdicts, each mapped to its own answer, all decided BEFORE any
+    // success is returned.
+    assert.ok(body.indexOf(`held.kind === "transient"`) < body.indexOf(`if (!held.ok) {`),
+        "a storage fault is answered first — it is never evidence about the bytes");
+    assert.match(body, /reason: "verify-unavailable", retryable: true \}/);
+    assert.match(body, /status: 503/);
+    assert.ok(body.indexOf(`held.kind === "content-mismatch"`) < body.indexOf(`if (!held.ok) {`),
+        "and so is a content mismatch");
+    assert.match(body, /error: "content-mismatch"/);
+    assert.match(body, /retryable: false/);
+    assert.match(body, /error: "file-missing"/, "an affirmative absence keeps its own 409");
+    assert.ok(!/storeObject|uploadReceiptObject|updateMany/.test(body),
+        "and none of the three heals or otherwise writes to the row");
+});
+
+test("the three verdicts /start maps: mutated -> mismatch, fault -> transient, match -> ok", async () => {
+    // The behaviour behind the mapping above, driven through the same shared
+    // rule the route calls, with storage injected.
+    const realSha = createHash("sha256").update(PNG).digest("hex");
+    const mutated = Buffer.concat([PNG, Buffer.from([0])]);
+
+    // A replaced object: 409 content-mismatch, and the row is left alone.
+    const swapped = await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: mutated }));
+    assert.equal(swapped.ok, false);
+    assert.equal((swapped as { kind: string }).kind, "content-mismatch");
+
+    // A download that FAILS (downloadReceiptObject turns a thrown transport
+    // fault into exactly this): 503 verify-unavailable, retryable. Never a
+    // verdict about the bytes, so never the file-missing answer.
+    const faulted = await verifyStoredCopy(
+        "p.png", realSha, SMALL, give({ ok: false, kind: "transient", message: "TypeError: fetch failed" }),
+    );
+    assert.equal((faulted as { kind: string }).kind, "transient");
+
+    // Only verified bytes reach alreadyReceived.
+    assert.deepEqual(await verifyStoredCopy("p.png", realSha, SMALL, give({ ok: true, bytes: PNG })), { ok: true });
 });

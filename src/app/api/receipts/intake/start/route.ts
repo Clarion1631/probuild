@@ -8,9 +8,14 @@ import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { uploadLeaseExpiry } from "@/lib/receipt-intake/worker";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
-import { finalizeDisposition, publishFence, uploadPathFor } from "@/lib/receipt-intake/stored-object";
-import { reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
-import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/bucket";
+import {
+    finalizeDisposition,
+    publishFence,
+    uploadPathFor,
+    verifyStoredCopy,
+} from "@/lib/receipt-intake/stored-object";
+import { discardUnresumedLease, reuseLiveLease } from "@/lib/receipt-intake/upload-lease";
+import { createReceiptUploadUrl } from "@/lib/receipt-intake/bucket";
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -138,6 +143,10 @@ export async function POST(req: Request) {
     // Lease 1 from the outset: the version is part of the path, so there is no
     // "version 0" object to confuse with a resumed upload later.
     const storagePath = uploadPathFor(id, 1, ext);
+    // Held in a const, not re-derived: it is the value written to the row AND
+    // the value the discard below CASes on. Calling uploadLeaseExpiry() twice
+    // would compare a fresh instant against the stored one and never match.
+    const leaseExpiresAt = uploadLeaseExpiry();
 
     let created: { id: string; sourceRef: string; state: string };
     try {
@@ -166,7 +175,7 @@ export async function POST(req: Request) {
                 // The promise this response makes: until then the client's URL
                 // works, so nothing may declare the object missing or reject
                 // the row for what is at that path.
-                uploadUrlExpiresAt: uploadLeaseExpiry(),
+                uploadUrlExpiresAt: leaseExpiresAt,
                 uploadLeaseVersion: 1,
             },
             select: { id: true, sourceRef: true, state: true },
@@ -357,16 +366,52 @@ export async function POST(req: Request) {
 
             if (existing.state !== "STAGING") {
                 // "We already have it" has to be TRUE: the forwarder deletes its
-                // only copy on this answer. Metadata only, and bounded — one
-                // small list call whatever the object weighs.
-                const present = await receiptObjectSize(existing.storagePath);
-                if (!present.ok && present.kind === "transient") {
+                // only copy on this answer.
+                //
+                // PRESENCE WAS NOT TRUTH. This branch used to ask storage for a
+                // SIZE and answer alreadyReceived on anything that came back, so
+                // the sender was authorised to destroy its copy on the strength
+                // of bytes nobody had looked at since they were sealed. An
+                // object replaced or corrupted after publication — the upload
+                // URL is `upsert: true`, a restore can put back a different
+                // version, storage can fault — was laundered into "we hold your
+                // receipt" and the last good copy went with it. The row's
+                // `fileSha256` is the only hash this system has ever verified;
+                // the stored bytes must still hash to it.
+                //
+                // ONE rule, shared with the other two replay paths (POST
+                // /intake and /intake/{id}/finalize, see stored-object.ts), so
+                // the three cannot come to disagree about what "we already have
+                // it" means. The cheap metadata probe still runs first inside
+                // it, so the common orphan case never pays for a download.
+                const held = await verifyStoredCopy(existing.storagePath, existing.fileSha256);
+                if (!held.ok && held.kind === "transient") {
+                    // Storage could not answer. That is never evidence about the
+                    // bytes, so it is never a verdict: the sender retries with
+                    // its copy intact.
                     return NextResponse.json(
-                        { ok: false, reason: "storage-unavailable", retryable: true },
+                        { ok: false, reason: "verify-unavailable", retryable: true },
                         { status: 503 },
                     );
                 }
-                if (!present.ok) {
+                if (!held.ok && held.kind === "content-mismatch") {
+                    // NOT healed, and never a 2xx. A re-upload is exactly how
+                    // bytes get replaced, so healing here would let a replay
+                    // launder the swap. The row is left exactly as it is for the
+                    // worker's `content-changed` park and the sweeper to act on.
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "content-mismatch",
+                            reason: "the stored document is not the one this row was published with; keep your copy and escalate",
+                            retryable: false,
+                            existingId: existing.id,
+                            state: existing.state,
+                        },
+                        { status: 409 },
+                    );
+                }
+                if (!held.ok) {
                     // A settled row with no object. Recovering it is not this
                     // endpoint's job — /start hands out an upload URL for rows
                     // that are still STAGING or recoverably parked, and dragging
@@ -440,7 +485,32 @@ export async function POST(req: Request) {
 
     const signed = await signUpload(storagePath);
     if (!signed) {
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        // THE ROW ONLY GOES IF NOBODY ELSE ADOPTED IT.
+        //
+        // Creating the row and signing its URL are two steps, and a concurrent
+        // /start for the same sourceRef can complete BOTH of its own steps in
+        // the gap: it hits the unique violation, finds this row with a live
+        // lease, and reuseLiveLease hands it a working URL over this very path.
+        // The unconditional delete this replaces then removed the row that
+        // retry had just adopted — its bytes landed at a path no row pointed
+        // at, /finalize 404d on an id that no longer existed, and the
+        // sourceRef stopped protecting anything. See discardUnresumedLease for
+        // the four columns the CAS reads and why the expiry alone catches a
+        // reuse.
+        //
+        // Still best effort, exactly as before: a cleanup that could not run at
+        // all leaves a STAGING row with no object, which the stale-STAGING
+        // sweep already knows how to park. It never leaves a row deleted.
+        const discarded = await discardUnresumedLease(
+            { id, storagePath, uploadLeaseVersion: 1, uploadUrlExpiresAt: leaseExpiresAt },
+            prisma.receiptIntake,
+        ).catch(() => null);
+        if (discarded === "resumed") {
+            // Somebody else owns this row and their URL works. Reporting our
+            // own signer failure would tell a client to retry a row that is
+            // alive and in good hands; the idempotent conflict says who to ask.
+            return leaseConflict(id);
+        }
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
 

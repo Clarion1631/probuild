@@ -444,6 +444,13 @@ export interface WorkerRunSummary {
     requeued?: number;
     /** Held for a human: no v1 evidence AND no Drive identity to make v2 idempotent. */
     shadowQuarantined?: number;
+    /**
+     * Cutover rows whose fenced write matched nothing: they changed between the
+     * select that triaged them and the update that would have moved them, so
+     * the verdict was DROPPED rather than applied to a row it was not computed
+     * for. They come back round on the next pass.
+     */
+    shadowSkippedMoved?: number;
     /** The cutover could not run because no boundary is recorded. */
     cutoverBlocked?: "cutover-boundary-missing";
     /** STAGING rows whose upload never landed, parked for a human. */
@@ -558,6 +565,8 @@ export interface ClaimResult {
     requeued: number;
     /** Pre-boundary, no evidence, and no Drive identity — a human decides. */
     shadowQuarantined: number;
+    /** Rows that moved under the triage, so no cutover verdict was applied. */
+    shadowSkippedMoved: number;
 }
 
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
@@ -633,7 +642,7 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
-    const { rows, shadowRetired, requeued, shadowQuarantined } = claimed;
+    const { rows, shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved } = claimed;
 
     // Rows whose upload never landed are invisible to the claim by design, so
     // this is the only thing that will ever notice them.
@@ -714,6 +723,7 @@ async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary
         ...(shadowRetired ? { shadowRetired } : {}),
         ...(requeued ? { requeued } : {}),
         ...(shadowQuarantined ? { shadowQuarantined } : {}),
+        ...(shadowSkippedMoved ? { shadowSkippedMoved } : {}),
         ...(staged ? { staleStagingSwept: staged } : {}),
         ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };

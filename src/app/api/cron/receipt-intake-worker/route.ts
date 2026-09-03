@@ -20,8 +20,9 @@ import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/li
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
+    applyCutoverVerdict,
     driveFileIdOf,
-    triageCutoverRows, resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
+    triageCutoverRows, resolveCutoverBoundary, type CutoverRow } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -146,6 +147,8 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         let shadowRetired = 0;
         let shadowQuarantined = 0;
         let requeued = 0;
+        /** Rows that moved between the select and the write, so no verdict landed. */
+        let shadowSkippedMoved = 0;
         if (!opts.dryRunGlobal) {
             // runIntakeWorker halts before ever calling claim() without one, so
             // this is belt-and-braces rather than the real gate.
@@ -191,6 +194,14 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     select: {
                         id: true, source: true, sourceRef: true,
                         archivedByV1: true, createdAt: true,
+                        // The evidence each write fences on, read here so the
+                        // verdict and the row it was reached about travel
+                        // together instead of the write re-deriving a predicate.
+                        // claimToken is PINNED at what was observed rather than
+                        // required null — see CutoverRow for why demanding null
+                        // would hide a stale-claimed row from the cutover for
+                        // good.
+                        state: true, stateReason: true, dryRun: true, claimToken: true,
                     },
                 });
 
@@ -234,18 +245,30 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 const { evidenced, unevidenced, quarantined } =
                     triageCutoverRows(candidates, opts.boundary, bookedByV1);
 
+                // EVERY cutover write is a CAS over the row the verdict was
+                // reached about — see applyCutoverVerdict. Constraining only
+                // `id` let a concurrent transition (an admin review, a late
+                // completion) be overwritten with a terminal SHADOW_* state or
+                // silently handed to v2, in a transaction that had read the row
+                // before any of that happened.
+                const byId = new Map<string, CutoverRow>(candidates.map(row => [row.id, row]));
+                const rowsFor = (ids: string[]) =>
+                    ids.map(id => byId.get(id)).filter((row): row is CutoverRow => !!row);
+
                 if (evidenced.length) {
-                    const retired = await tx.receiptIntake.updateMany({
-                        where: { id: { in: evidenced } },
-                        data: { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
-                    });
-                    shadowRetired = retired.count;
+                    const retired = await applyCutoverVerdict(
+                        rowsFor(evidenced),
+                        { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null },
+                        tx.receiptIntake,
+                    );
+                    shadowRetired = retired.moved;
+                    shadowSkippedMoved += retired.skippedMoved;
                 }
 
                 if (quarantined.length) {
-                    const held = await tx.receiptIntake.updateMany({
-                        where: { id: { in: quarantined } },
-                        data: {
+                    const held = await applyCutoverVerdict(
+                        rowsFor(quarantined),
+                        {
                             state: "SHADOW_QUARANTINE",
                             stateReason: "no-v1-evidence",
                             // Terminal: it must never come back round on a
@@ -253,8 +276,10 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                             nextRetryAt: null,
                             dryRun: false,
                         },
-                    });
-                    shadowQuarantined = held.count;
+                        tx.receiptIntake,
+                    );
+                    shadowQuarantined = held.moved;
+                    shadowSkippedMoved += held.skippedMoved;
                 }
 
                 // Everything else is v2's to book. The list is built row by
@@ -262,17 +287,19 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 // here, so the two can never disagree about which rows the
                 // evidence check already claimed.
                 if (unevidenced.length) {
-                    const handed = await tx.receiptIntake.updateMany({
-                        where: { id: { in: unevidenced } },
-                        data: { dryRun: false, nextRetryAt: null },
-                    });
-                    requeued = handed.count;
+                    const handed = await applyCutoverVerdict(
+                        rowsFor(unevidenced),
+                        { dryRun: false, nextRetryAt: null },
+                        tx.receiptIntake,
+                    );
+                    requeued = handed.moved;
+                    shadowSkippedMoved += handed.skippedMoved;
                 }
 
-                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0) {
+                if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0 || shadowSkippedMoved > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
                         boundary: opts.boundary.toISOString(),
-                        shadowRetired, requeued, shadowQuarantined,
+                        shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved,
                     }));
                 }
             }
@@ -290,7 +317,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             take: BATCH_SIZE,
             select: { id: true },
         });
-        if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+        if (due.length === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved };
 
         // THE claim is ATOMIC with the select it followed: the UPDATE re-checks
         // the SAME eligibility predicate rather than blindly writing every id
@@ -307,7 +334,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             where: { id: { in: ids }, ...ELIGIBLE },
             data: { nextRetryAt: new Date(now.getTime() + LEASE_MS), claimToken, claimedAt: now },
         });
-        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined };
+        if (claimed.count === 0) return { rows: [], shadowRetired, requeued, shadowQuarantined, shadowSkippedMoved };
 
         // Re-read by id AND the fresh token — never by the original id list —
         // so only the rows this UPDATE actually touched are handed to the pass.
@@ -322,6 +349,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             shadowRetired,
             requeued,
             shadowQuarantined,
+            shadowSkippedMoved,
         };
     });
 }

@@ -13,7 +13,10 @@ import {
     CUTOVER_SETTING_KEY,
     driveFileIdOf,
     triageCutoverRows,
+    applyCutoverVerdict,
     type CutoverCandidate,
+    type CutoverRow,
+    type CutoverWriteClient,
 } from "../src/lib/receipt-intake/cutover";
 
 test("a missing or malformed boundary is null — never epoch", () => {
@@ -140,4 +143,146 @@ test("driveFileIdOf only claims a shared identity for a real drive ref", () => {
     assert.equal(driveFileIdOf({ source: "drive", sourceRef: "drive:ABC" }), "ABC");
     assert.equal(driveFileIdOf({ source: "email", sourceRef: "drive:ABC" }), null);
     assert.equal(driveFileIdOf({ source: "drive", sourceRef: "web:ABC" }), null);
+});
+
+// ── The cutover WRITES, fenced on the rows they were decided about ─────────
+
+function row(over: Partial<CutoverRow> = {}): CutoverRow {
+    return {
+        ...candidate(),
+        state: "READ",
+        stateReason: null,
+        dryRun: true,
+        claimToken: null,
+        ...over,
+    };
+}
+
+/**
+ * A store whose `updateMany` really evaluates the where clause — the fence IS
+ * the subject, so a fake that matched on the id alone would report success for
+ * a row somebody else had already moved, which is precisely the bug.
+ */
+function store(rows: (CutoverRow | Record<string, unknown>)[]) {
+    const state = {
+        rows: rows.map(r => ({ ...r } as Record<string, unknown>)),
+        wheres: [] as Record<string, unknown>[],
+    };
+    const db: CutoverWriteClient = {
+        updateMany: async ({ where, data }) => {
+            state.wheres.push(where);
+            const { id, ...rest } = where as { id: { in: string[] } } & Record<string, unknown>;
+            const hits = state.rows.filter(r =>
+                id.in.includes(r.id as string)
+                && Object.entries(rest).every(([k, v]) => r[k] === v || (r[k] == null && v == null)));
+            for (const hit of hits) Object.assign(hit, data);
+            return { count: hits.length };
+        },
+    };
+    return { state, db };
+}
+
+const RETIRE = { state: "SHADOW_DONE", stateReason: "booked-by-v1", nextRetryAt: null };
+
+test("A ROW REVIEWED BETWEEN THE SELECT AND THE WRITE KEEPS ITS REVIEWED STATE", async () => {
+    // The finding: the three cutover updates constrained nothing but `id`. The
+    // candidates are read in the claim transaction, but READ COMMITTED lets a
+    // writer that never touches the advisory lock — an admin review, a future
+    // queue UI, a late completion — move a row in the gap. The verdict then
+    // landed on a row it was never computed for, and SHADOW_DONE /
+    // SHADOW_QUARANTINE are terminal.
+    const observed = row({ id: "reviewed" });
+    const { state, db } = store([observed]);
+
+    // The concurrent review, AFTER the triage saw the row and BEFORE the write.
+    state.rows[0].state = "NEEDS_REVIEW";
+    state.rows[0].stateReason = "human-hold";
+
+    const moved = await applyCutoverVerdict([observed], RETIRE, db);
+    assert.deepEqual(moved, { moved: 0, skippedMoved: 1 }, "the verdict is dropped, and counted");
+    assert.equal(state.rows[0].state, "NEEDS_REVIEW", "the human's decision survives");
+    assert.equal(state.rows[0].stateReason, "human-hold");
+});
+
+test("an UNTOUCHED row still gets its verdict", async () => {
+    // The control: without it, a CAS that never matches anything would pass the
+    // test above while breaking the entire cutover.
+    const observed = row({ id: "quiet" });
+    const { state, db } = store([observed]);
+    const moved = await applyCutoverVerdict([observed], RETIRE, db);
+    assert.deepEqual(moved, { moved: 1, skippedMoved: 0 });
+    assert.equal(state.rows[0].state, "SHADOW_DONE");
+    assert.equal(state.rows[0].stateReason, "booked-by-v1");
+});
+
+test("a row CLAIMED between the select and the write is skipped, not overwritten", async () => {
+    // A worker that owns the row is mid-flight on it. Retiring it under the
+    // claim would strand a pass writing results into a terminal state.
+    const observed = row({ id: "claimed" });
+    const { state, db } = store([observed]);
+    state.rows[0].claimToken = "tok-9";
+    const moved = await applyCutoverVerdict([observed], RETIRE, db);
+    assert.deepEqual(moved, { moved: 0, skippedMoved: 1 });
+    assert.equal(state.rows[0].state, "READ");
+});
+
+test("a row taken off the shadow switch mid-pass is not handed to v2 twice", async () => {
+    // `dryRun` is pinned too: the requeue writes `dryRun: false`, and a row
+    // something else already flipped is no longer the row that was triaged.
+    const observed = row({ id: "live-now" });
+    const { state, db } = store([observed]);
+    state.rows[0].dryRun = false;
+    const moved = await applyCutoverVerdict([observed], { dryRun: false, nextRetryAt: null }, db);
+    assert.deepEqual(moved, { moved: 0, skippedMoved: 1 });
+});
+
+test("the CAS carries the WHOLE parked predicate plus the observed evidence", async () => {
+    const observed = row({ id: "r1", state: "BOOKING", stateReason: "qbo-fault:6240" });
+    const { state, db } = store([observed]);
+    await applyCutoverVerdict([observed], RETIRE, db);
+    assert.deepEqual(state.wheres, [{
+        id: { in: ["r1"] },
+        dryRun: true,
+        state: "BOOKING",
+        stateReason: "qbo-fault:6240",
+        claimToken: null,
+    }]);
+});
+
+test("a STALE claim is pinned, not demanded away — the row still reaches its verdict", async () => {
+    // A shadow-parked row is excluded from the claim entirely, so a token on it
+    // on the live pass is a leftover from a pass that died during the shadow
+    // week. Requiring `claimToken: null` would hide the row from the cutover
+    // FOREVER: nothing can re-claim it to release the token, so it would never
+    // be retired, requeued or quarantined, and nobody would be told.
+    const observed = row({ id: "stale", claimToken: "dead-tok" });
+    const { state, db } = store([observed]);
+    const moved = await applyCutoverVerdict([observed], RETIRE, db);
+    assert.deepEqual(moved, { moved: 1, skippedMoved: 0 });
+    assert.equal(state.rows[0].state, "SHADOW_DONE");
+    assert.equal(state.wheres[0].claimToken, "dead-tok", "pinned at what was observed");
+});
+
+test("rows are grouped by their OBSERVED state, so one verdict cannot smear another's", async () => {
+    // Grouping is a round-trip optimisation, not a loosening: two rows parked
+    // for different reasons must not be written under one another's fence.
+    const a = row({ id: "a", state: "READ", stateReason: null });
+    const b = row({ id: "b", state: "READ", stateReason: null });
+    const c = row({ id: "c", state: "BOOKING", stateReason: "qbo-fault:6240" });
+    const { state, db } = store([a, b, c]);
+    // `c` moves; `a` and `b` do not.
+    state.rows[2].stateReason = "max-retries";
+
+    const moved = await applyCutoverVerdict([a, b, c], RETIRE, db);
+    assert.deepEqual(moved, { moved: 2, skippedMoved: 1 });
+    assert.equal(state.wheres.length, 2, "one statement per distinct observed state");
+    assert.equal(state.rows[0].state, "SHADOW_DONE");
+    assert.equal(state.rows[1].state, "SHADOW_DONE");
+    assert.equal(state.rows[2].state, "BOOKING", "the row that moved is untouched");
+});
+
+test("no rows is no statements", async () => {
+    const { state, db } = store([]);
+    assert.deepEqual(await applyCutoverVerdict([], RETIRE, db), { moved: 0, skippedMoved: 0 });
+    assert.deepEqual(state.wheres, []);
 });

@@ -110,3 +110,65 @@ export async function reuseLiveLease(
     const signed = await deps.sign(path);
     return signed ? { kind: "signed", signed } : { kind: "storage-unavailable" };
 }
+
+/** The lease /start just created, as the request that created it knows it. */
+export interface CreatedLease {
+    id: string;
+    storagePath: string;
+    uploadLeaseVersion: number;
+    uploadUrlExpiresAt: Date;
+}
+
+export interface DiscardClient {
+    deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
+}
+
+/**
+ * THROW AWAY A ROW WHOSE URL WAS NEVER ISSUED — BUT ONLY IF NOBODY RESUMED IT.
+ *
+ * /start creates the row FIRST and signs the upload URL SECOND, so a signer
+ * failure leaves a STAGING row for an upload that will never happen and the
+ * row has to go: it holds the sourceRef, and while it does, every honest retry
+ * is answered about a lease its caller was never given.
+ *
+ * The delete used to be unconditional (`delete({ where: { id } })`), and that
+ * is a race with the retry path this module exists for. A concurrent /start for
+ * the same sourceRef hits the unique violation, finds this very row with a LIVE
+ * lease, and reuseLiveLease hands it a working signed URL over the same path —
+ * all of which can complete while the original request is still waiting on its
+ * own failing signer. The unconditional delete then removed the row the retry
+ * had just adopted: the retry's bytes landed at a path no row pointed at,
+ * /finalize 404'd on an id that no longer existed, and the sourceRef's
+ * protection against a DIFFERENT document reusing it was gone with it.
+ *
+ * So the delete is a CAS over the lease THIS request wrote. Every way another
+ * request can adopt the row moves one of these four columns:
+ *   - reuseLiveLease extends `uploadUrlExpiresAt` (same path, same version)
+ *   - the resume branch bumps `uploadLeaseVersion` and repaths `storagePath`
+ *   - anything that publishes or parks it moves `state` off STAGING
+ *
+ * The expiry alone is enough to see the reuse: a retry can only reach it AFTER
+ * this request's INSERT committed (that is what gave it the unique violation),
+ * so its `expiresAt()` is read strictly later than ours — never the same
+ * millisecond as a value that was computed before a round trip the retry had to
+ * observe the result of.
+ *
+ * `resumed` is not an error: somebody else owns this row and their URL works.
+ * The caller answers the idempotent conflict rather than reporting a failure
+ * for a row that is alive and in good hands.
+ */
+export async function discardUnresumedLease(
+    created: CreatedLease,
+    db: DiscardClient,
+): Promise<"discarded" | "resumed"> {
+    const { count } = await db.deleteMany({
+        where: {
+            id: created.id,
+            state: "STAGING",
+            storagePath: created.storagePath,
+            uploadLeaseVersion: created.uploadLeaseVersion,
+            uploadUrlExpiresAt: created.uploadUrlExpiresAt,
+        },
+    });
+    return count > 0 ? "discarded" : "resumed";
+}

@@ -145,7 +145,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         },
         claim: async opts => {
             h.claimOpts.push(opts);
-            return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+            return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
         cutoverBoundary: async () => h.boundary,
         isDryRunEnabled: () => true,
@@ -392,7 +392,7 @@ test("CUTOVER: the boundary is passed to the claim so the backlog can be split",
         claim: async opts => {
             h.claimOpts.push(opts);
             // Rows BEFORE the boundary were booked by v1; rows after it by nobody.
-            return { rows: [], shadowRetired: 7, requeued: 2, shadowQuarantined: 0 };
+            return { rows: [], shadowRetired: 7, requeued: 2, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -413,7 +413,7 @@ test("CUTOVER refuses entirely when no boundary is recorded", async () => {
         claim: async opts => {
             h.claimOpts.push(opts);
             assert.equal(opts.boundary, null);
-            return { rows: [], shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+            return { rows: [], shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -1086,7 +1086,7 @@ test("the cutover reports quarantined rows separately from retired and requeued"
         isDryRunEnabled: () => false,
         claim: async opts => {
             h.claimOpts.push(opts);
-            return { rows: [], shadowRetired: 4, requeued: 2, shadowQuarantined: 3 };
+            return { rows: [], shadowRetired: 4, requeued: 2, shadowQuarantined: 3, shadowSkippedMoved: 0 };
         },
     });
     const summary = await runIntakeWorker(h.deps);
@@ -1316,10 +1316,16 @@ test("/start stamps a lease on every url it issues, including a live-lease retry
     // Three of them are here; the fourth is the shared live-lease rule, which
     // now serves BOTH resumable states from one place (upload-lease.ts) and
     // takes the same clock as an injected dependency.
+    // The create branch holds its stamp in a const, because the signer-failure
+    // discard CASes on that EXACT value and a second uploadLeaseExpiry() call
+    // would compare a fresh instant against the stored one; the other two stamp
+    // inline.
+    assert.match(start, /const leaseExpiresAt = uploadLeaseExpiry\(\);/);
+    assert.match(start, /uploadUrlExpiresAt: leaseExpiresAt,/, "the new row still gets a lease");
     assert.equal(
         (start.match(/uploadUrlExpiresAt: uploadLeaseExpiry\(\)/g) ?? []).length,
-        3,
-        "create, re-arm and resume stamp the lease inline",
+        2,
+        "re-arm and resume stamp the lease inline",
     );
     assert.match(start, /expiresAt: uploadLeaseExpiry,/, "and the shared rule is given the same clock");
     const lease = readFileSync(
@@ -1582,7 +1588,7 @@ function starvationQueue(opts: { states?: (dryRunGlobal: boolean) => string[] } 
                 .slice(0, BATCH_SIZE);
             // The claim bumps every taken row's nextRetryAt by the lease.
             for (const r of due) nextRetryAt.set(r.id, clock + 10 * 60_000);
-            return { rows: due, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+            return { rows: due, shadowRetired: 0, requeued: 0, shadowQuarantined: 0, shadowSkippedMoved: 0 };
         },
         /** What the worker's own release writes back. */
         release: async (id: string, when: Date) => { nextRetryAt.set(id, when.getTime()); return true; },
