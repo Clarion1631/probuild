@@ -1009,3 +1009,119 @@ test("round 40: no document under that code at all is ABSENT, so a create may pr
     const res = await probeWith({ marker: await claimMarker(), found: [] });
     assert.deepEqual(res, { state: "absent" });
 });
+
+// ─── Round 41 gate, finding 3: QuickBooks actions need project scope ───
+
+/**
+ * `assertInvoicePermission()` answers "may this user touch invoices at all",
+ * never "may this user touch THIS invoice", and every one of these is a
+ * remotely invokable Server Action taking a bare id. `createQBPaymentLink`
+ * hands back a hosted PAY LINK — a URL that collects money — so an unscoped id
+ * was a way to mint one for any project in the company.
+ *
+ * A source tripwire because what has to hold is an ORDERING: the scope check
+ * precedes the first token fetch or remote call. An outcome assertion on the
+ * happy path cannot see that, and actions.ts pulls in most of the app.
+ */
+test("round 41: every QuickBooks action scopes to its project before any remote call", async () => {
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/actions.ts", "utf8"));
+    const body = (name: string) => {
+        const at = src.indexOf(`export async function ${name}(`);
+        assert.ok(at > -1, `${name} not found — has it been renamed?`);
+        return src.slice(at, src.indexOf("\nexport ", at + 10));
+    };
+
+    // name -> the gate it must use, and the first thing that must come AFTER it.
+    const gated: Array<[string, string, string]> = [
+        ["createQBPaymentLink", "assertMilestoneAccess(", "pushMilestoneToQuickBooks"],
+        ["refreshQBPayments", "assertInvoiceAccess(", "syncQuickBooksPayments"],
+        ["sendMilestoneInvoices", "assertInvoiceAccess(", "sendMilestoneInvoicesCore"],
+        ["recordPayment", "assertInvoiceAccess(", "recordPaymentCore"],
+    ];
+    for (const [name, gate, thenWhat] of gated) {
+        const fn = body(name);
+        const at = fn.indexOf(gate);
+        assert.ok(at > -1, `${name} is missing its horizontal gate (${gate})`);
+        const work = fn.indexOf(thenWhat);
+        assert.ok(work > -1, `${name}: ${thenWhat} not found`);
+        assert.ok(at < work, `${name} does its work BEFORE checking project scope`);
+    }
+
+    // ...and the gates really do refuse. A check placed correctly but calling
+    // something permissive would satisfy the ordering above and nothing else.
+    const { canAccessProject } = await import("../src/lib/access-rules");
+    const scoped = { id: "u1", role: "FINANCE", permissions: null, projectAccess: [], assignedProjects: [] } as any;
+    assert.equal(canAccessProject(scoped, "proj-not-theirs"), false);
+    assert.equal(canAccessProject({ ...scoped, role: "ADMIN" }, "proj-not-theirs"), true,
+        "and an ADMIN still passes, so the guard is not simply always-false");
+});
+
+test("round 41: the horizontal gates fail CLOSED on a row that does not exist", async () => {
+    // "Not found" and "not yours" must answer alike, or the gate becomes a way
+    // to probe which ids exist.
+    const src = await import("node:fs").then((fs) => fs.readFileSync("src/lib/actions.ts", "utf8"));
+    for (const helper of ["assertInvoiceAccess", "assertMilestoneAccess"]) {
+        const at = src.indexOf(`async function ${helper}(`);
+        assert.ok(at > -1, `${helper} not found`);
+        const fn = src.slice(at, src.indexOf("\n}", at) + 2);
+        assert.match(fn, /if \(!\w+ \|\| !canAccessProject\(/,
+            `${helper} must refuse a missing row the same way it refuses a foreign one`);
+    }
+});
+
+// ─── Round 41 gate, finding 4: corrupt markers must not wedge the queue ───
+
+test("round 41: a page of unrecognised markers is stepped over, not read as exhaustion", async () => {
+    // The sweep selected every non-null marker and filtered the recognised ones
+    // in memory, so a page made entirely of legacy or corrupt values came back
+    // EMPTY — which the pager read as "this rail is done", leaving every valid
+    // row behind it unvisited.
+    const { sweepPendingDocumentSyncs } = await import("../src/lib/qbo-document-sync");
+    const rows = [
+        { id: "est-1", marker: "gibberish", kind: "estimate" as const },
+        { id: "est-2", marker: "voided", kind: "estimate" as const },
+        { id: "est-3", marker: "ambiguous-create:@1|EST-3|note", kind: "estimate" as const },
+    ];
+    const adopted: string[] = [];
+    const res = await sweepPendingDocumentSyncs(
+        { accessToken: "a", refreshToken: "r", realmId: "realm-1" },
+        undefined,
+        {
+            railFirst: "estimate",
+            // Three rows is the whole rail, so the run stops there rather than
+            // wrapping back over what it just did.
+            pageSize: 3,
+            listParked: async (rail, after) => {
+                if (rail !== "estimate") return [];
+                return rows.filter((r) => !after || r.id > after);
+            },
+            probe: (async () => ({ state: "found", qbId: "qb-3" })) as any,
+            adopt: async (row) => { adopted.push(row.id); return 1; },
+            countParked: async () => 2,
+        },
+    );
+    assert.deepEqual(adopted, ["est-3"], "the valid row behind the junk is reached");
+    assert.equal(res.unrecognised, 2, "and the junk is counted, not silently dropped");
+    assert.equal(res.checked, 1, "only the readable row cost a QuickBooks call");
+});
+
+test("round 41: the maintenance query filters recognised markers itself", async () => {
+    // Stepping over junk in the loop is the belt; filtering in the QUERY is the
+    // braces — without it a page of a thousand corrupt rows would spend the whole
+    // run stepping over them.
+    const { documentSyncMarkerWhere } = await import("../src/lib/qbo-document-sync");
+    const where = documentSyncMarkerWhere();
+    assert.deepEqual(where, [
+        { qbSyncMarker: "create-in-flight" },
+        { qbSyncMarker: { startsWith: "create-in-flight:" } },
+        { qbSyncMarker: "ambiguous-create" },
+        { qbSyncMarker: { startsWith: "ambiguous-create:" } },
+    ]);
+
+    const src = await import("node:fs").then((fs) =>
+        fs.readFileSync("src/app/api/integrations/qbo-maintenance/route.ts", "utf8"));
+    assert.match(src, /const markerWhere = \{ OR: documentSyncMarkerWhere\(\) \}/,
+        "the page query, and the parked COUNT, must use the same predicate");
+    assert.doesNotMatch(src, /qbSyncMarker: \{ not: null \}/,
+        "selecting every non-null marker is the bug this closes");
+});

@@ -296,7 +296,10 @@ function seedEstimate(overrides: Record<string, any> = {}) {
         totalAmount: 1000, balanceDue: 1000, createdAt: new Date(),
         itemsRevision: 7,
         projectId: "proj-1", leadId: null, items: [],
-        project: { name: "Kitchen", client: { id: "cli-1" } },
+        // `loadDocumentIdentity` reads the customer from the nested Client under
+        // the lock, so the remap knob has to live there — not only on the
+        // separate client.findUnique the claim used to consult.
+        project: { name: "Kitchen", client: { id: "cli-1", get qbCustomerId() { return state.clientQbCustomerId; } } },
         ...overrides,
     };
     return state.estimates["est-1"];
@@ -307,7 +310,8 @@ function seedInvoice(overrides: Record<string, any> = {}) {
         id: "inv-1", code: "INV-00001", projectId: "proj-1",
         qbInvoiceId: null, qbSyncMarker: null, qbSyncedAt: null,
         totalAmount: 1000, balanceDue: 1000, taxAmount: 0,
-        client: { id: "cli-1" }, project: { name: "Kitchen" },
+        client: { id: "cli-1", get qbCustomerId() { return state.clientQbCustomerId; } },
+        project: { name: "Kitchen" },
         ...overrides,
     };
     return state.invoices["inv-1"];
@@ -622,4 +626,150 @@ test("round 40: the create sends the canonical marker note on BOTH rails", async
     await POST(postRequest({ type: "invoice", id: "inv-1" }));
     assert.equal(state.sentNotes[0], documentPrivateNote("EST-00001", "Kitchen"));
     assert.equal(state.sentNotes[1], documentPrivateNote("INV-00001", "Kitchen"));
+});
+
+// ─── Round 41 gate, findings 1 + 2: EVERY decision recomputes the identity ───
+
+/**
+ * Rounds 39, 40 and 41 each found the same bug somewhere new: a decision
+ * comparing SOME of the state and missing whichever field the next reviewer
+ * thought of. Adoption and replay were the two that still did it — both moved
+ * on `(id, unlinked, marker)` alone and never asked whether the record still
+ * described what was sent.
+ */
+async function parkEstimate() {
+    // Leaves the estimate carrying an ambiguous-create claim.
+    const { QBAmbiguousDocumentCreateError } = await import("../src/lib/quickbooks");
+    state.createThrows = new QBAmbiguousDocumentCreateError("QB estimate sync");
+    await POST(postRequest({ type: "estimate", id: "est-1" }));
+    state.createThrows = null;
+}
+
+test("round 41: an edit after an ambiguous create is NOT adopted", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+
+    // The document IS in QuickBooks and provably ours — but the record has
+    // moved since, so linking it would attach a stale document to changed money.
+    state.lookup.estimates = [{
+        id: "qb-est-real", docNumber: "EST-00001",
+        privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+        total: 1000, customerId: "42",
+    }];
+    row.itemsRevision = 99;
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 409);
+    assert.equal(body.reason, "identity-mismatch");
+    assert.equal(body.retry, false, "retrying will not help — only a human can settle it");
+    assert.equal(body.qbId, "qb-est-real", "and the operator is told which document to look at");
+    assert.equal(row.qbEstimateId, null, "not linked");
+    assert.equal(state.posts.length, 1, "and not re-created either");
+});
+
+test("round 41: an UNEDITED record is still adopted (the control)", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+    state.lookup.estimates = [{
+        id: "qb-est-real", docNumber: "EST-00001",
+        privateNote: documentPrivateNote("EST-00001", "Kitchen"),
+        total: 1000, customerId: "42",
+    }];
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-real");
+});
+
+test("round 41: an edited record with an ABSENT document does not replay the old identity", async () => {
+    // The replay reuses the old claim, and therefore its requestid. That is only
+    // safe while the payload is still the one that claim describes — otherwise
+    // it would send NEW content under the OLD identity, and Intuit dedupe could
+    // hand back the old document for it.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+    state.lookup.estimates = [];          // authoritatively none
+    row.totalAmount = 4321;               // repriced since the claim
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 409);
+    assert.equal(body.reason, "identity-mismatch");
+    assert.equal(state.posts.length, 1, "no create under an identity that no longer describes it");
+    assert.ok(String(row.qbSyncMarker).startsWith("ambiguous-create:"), "the claim is untouched");
+});
+
+test("round 41: an UNEDITED record with an absent document still replays (the control)", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    await parkEstimate();
+    state.lookup.estimates = [];
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 200);
+    assert.equal(row.qbEstimateId, "qb-est-1");
+    assert.equal(state.posts.length, 2, "it really did create the second time");
+});
+
+test("round 41: a legacy claim carrying no payload hash is parked, never adopted", async () => {
+    // Markers written before this rail fingerprinted the payload cannot be
+    // verified. Adopting on the fields that happen to be present is exactly the
+    // guess the whole mechanism exists to refuse.
+    const { composeSyncMarker, documentPrivateNote: note } = await import("../src/lib/qbo-document-sync");
+    const { CREATE_IN_FLIGHT_MARKER } = await import("../src/lib/qbo-create-markers");
+    state.user = ADMIN;
+    const row = seedEstimate();
+    row.qbSyncMarker = composeSyncMarker(CREATE_IN_FLIGHT_MARKER, {
+        docNumber: "EST-00001",
+        privateNote: note("EST-00001", "Kitchen"),
+        expectedTotal: 1000,
+        realmId: "realm-1",
+        customerId: "42",
+        // no issuanceHash: the legacy shape
+    } as any);
+    state.lookup.estimates = [{
+        id: "qb-est-real", docNumber: "EST-00001",
+        privateNote: note("EST-00001", "Kitchen"), total: 1000, customerId: "42",
+    }];
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    const body = await res.json();
+    assert.equal(res.status, 409);
+    assert.match(String(body.error), /did not fingerprint the payload/);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 41: a project RENAME between claim and finalize does not link", async () => {
+    // The rename changes the QuickBooks document description, and the old
+    // finalize pinned itemsRevision/totalAmount/title — none of which move.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.onCreate = () => { row.project.name = "Kitchen (phase 2)"; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.equal(row.qbEstimateId, null, "the document describes a project name that has changed");
+});
+
+test("round 41: a client REMAP between claim and finalize does not link", async () => {
+    // Another field no column on the estimate records.
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.onCreate = () => { state.clientQbCustomerId = "99"; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.equal(row.qbEstimateId, null);
+});
+
+test("round 41: a REPARENT (losing the billable client) between claim and finalize does not link", async () => {
+    state.user = ADMIN;
+    const row = seedEstimate();
+    state.onCreate = () => { row.project = null; };
+
+    const res = await POST(postRequest({ type: "estimate", id: "est-1" }));
+    assert.equal(res.status, 409);
+    assert.equal(row.qbEstimateId, null);
 });

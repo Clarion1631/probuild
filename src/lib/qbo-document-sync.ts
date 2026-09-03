@@ -17,6 +17,8 @@
  */
 import { createHash } from "node:crypto";
 
+import { toNum } from "./prisma-helpers";
+import { documentIssuanceHash } from "./qbo-issuance";
 import {
     findQBEstimatesByDocNumber,
     findQBInvoicesByDocNumber,
@@ -35,6 +37,22 @@ import {
 
 /** The two kinds a document-sync marker can carry. */
 export const DOCUMENT_SYNC_MARKERS: readonly string[] = [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER];
+
+/**
+ * A Prisma `OR` that matches only markers this rail understands.
+ *
+ * The sweep used to select every non-null `qbSyncMarker` and filter the
+ * recognised ones in memory. A page made entirely of legacy or corrupt values
+ * then came back EMPTY after filtering, which the pager read as "this rail is
+ * exhausted" — so every valid row behind it was never visited. Filtering in the
+ * QUERY means a page is only empty when there is genuinely nothing left.
+ */
+export function documentSyncMarkerWhere(): Array<{ qbSyncMarker: string | { startsWith: string } }> {
+    return DOCUMENT_SYNC_MARKERS.flatMap((kind) => [
+        { qbSyncMarker: kind },
+        { qbSyncMarker: { startsWith: `${kind}:` } },
+    ]);
+}
 
 export function syncMarkerKind(marker: string | null | undefined): string | null {
     return parseCreateMarker(marker)?.kind ?? null;
@@ -222,6 +240,8 @@ export interface DocumentSyncSweepResult {
     stillParked: number;
     /** Rows eligible at the start that this run never reached. */
     unvisited: number;
+    /** Rows whose marker this rail does not recognise, stepped over and reported. */
+    unrecognised: number;
     reason: string | null;
 }
 
@@ -294,7 +314,7 @@ export async function sweepPendingDocumentSyncs(
     deps?: DocumentSyncSweepDeps,
 ): Promise<DocumentSyncSweepResult> {
     const result: DocumentSyncSweepResult = {
-        checked: 0, recovered: 0, stillParked: 0, unvisited: 0, reason: null,
+        checked: 0, recovered: 0, stillParked: 0, unvisited: 0, unrecognised: 0, reason: null,
     };
     if (!deps?.listParked || !deps?.adopt || !deps?.countParked) {
         // The caller owns the reads and the write. No default: a silent no-op
@@ -357,6 +377,16 @@ export async function sweepPendingDocumentSyncs(
                     break;
                 }
                 visited++;
+                // A marker this rail cannot read is STEPPED OVER, not stopped on:
+                // the cursor advances past it exactly as it does for a resolved
+                // row, so it can never wedge the queue. It is counted so an
+                // operator can see the rail is carrying values nobody handles.
+                if (!syncMarkerKind(row.marker)) {
+                    result.unrecognised++;
+                    checkpoint = row.id;
+                    cursor = row.id;
+                    continue;
+                }
                 result.checked++;
                 const found = await probe(tokens, { kind: row.kind, marker: row.marker }, deadline);
                 // The cursor advances PAST every row this run looked at,
@@ -387,4 +417,153 @@ export async function sweepPendingDocumentSyncs(
     result.stillParked = await deps.countParked().catch(() => result.checked - result.recovered);
     result.unvisited = Math.max(0, result.stillParked - (result.checked - result.recovered));
     return result;
+}
+
+// ─── The ONE identity decision ──────────────────────────────────────────────
+
+/**
+ * Everything a document-sync decision is allowed to decide from.
+ *
+ * Rounds 39, 40 and 41 all found the same shape of bug: a decision — adopt,
+ * replay, finalize — comparing a SUBSET of columns and missing whichever one the
+ * next reviewer thought of. So there is now exactly one description of "what
+ * this record would send to QuickBooks right now", one function that computes it
+ * under the money locks, and one comparison against what the marker recorded.
+ * Every decision routes through them; none of them re-derives a subset.
+ */
+export interface DocumentIdentityFacts {
+    /** Fingerprint of the whole payload: lines, totals, tax, text, customer. */
+    hash: string;
+    docNumber: string;
+    privateNote: string;
+    total: number;
+    customerId: string;
+    /** Estimates only: the canonical optimistic-concurrency token for items. */
+    itemsRevision: number | null;
+}
+
+/** Why an identity comparison refused. Reported verbatim to the operator. */
+export type IdentityMismatch =
+    | { ok: true }
+    | { ok: false; reason: string };
+
+/**
+ * Does the record, AS IT STANDS NOW, still describe what the claim recorded?
+ *
+ * Fail-closed in every uncertain direction. A marker with no issuance hash is a
+ * legacy shape from before this rail recorded one: it cannot be verified, so it
+ * is refused rather than adopted on the fields that happen to be present.
+ */
+export function identityMatchesMarker(facts: DocumentIdentityFacts, marker: string): IdentityMismatch {
+    const identity = syncMarkerIdentity(marker);
+    if (!identity) return { ok: false, reason: "its claim could not be read" };
+    if (!identity.issuanceHash) {
+        return {
+            ok: false,
+            reason:
+                "its claim was recorded by an older release that did not fingerprint the payload, so it cannot be " +
+                "verified — check QuickBooks and reconcile it by hand",
+        };
+    }
+    if (identity.issuanceHash !== facts.hash) {
+        return { ok: false, reason: "it was edited after that QuickBooks document was requested" };
+    }
+    if (identity.customerId !== facts.customerId) {
+        return { ok: false, reason: "its QuickBooks customer changed after that document was requested" };
+    }
+    if (identity.docNumber !== facts.docNumber) {
+        return { ok: false, reason: "its code changed after that document was requested" };
+    }
+    if (identity.privateNote !== facts.privateNote) {
+        return { ok: false, reason: "its description changed after that document was requested" };
+    }
+    if (identity.expectedTotal != null && !sameMoney(identity.expectedTotal, facts.total)) {
+        return { ok: false, reason: "its total changed after that document was requested" };
+    }
+    return { ok: true };
+}
+
+/**
+ * Load what this record would send RIGHT NOW, from inside a transaction that
+ * already holds the money locks.
+ *
+ * The customer is read from `Client` under the lock rather than taken from a
+ * caller argument: `resolveCustomerAndItem` re-points that column, and a
+ * decision made against a value read before that write is exactly the class of
+ * bug this exists to close.
+ *
+ * Returns null when the record is gone, or has no client/project association
+ * left to bill — both of which must refuse rather than fall back to a default.
+ */
+export async function loadDocumentIdentity(
+    tx: {
+        estimate: { findUnique(args: any): Promise<any> };
+        invoice: { findUnique(args: any): Promise<any> };
+    },
+    kind: "estimate" | "invoice",
+    id: string,
+): Promise<DocumentIdentityFacts | null> {
+    if (kind === "estimate") {
+        const row = await tx.estimate.findUnique({
+            where: { id },
+            select: {
+                id: true, code: true, title: true, totalAmount: true, itemsRevision: true,
+                items: {
+                    orderBy: [{ order: "asc" }, { id: "asc" }],
+                    select: { id: true, name: true, quantity: true, unitCost: true, total: true },
+                },
+                // The ASSOCIATION as well as the name: a reparent changes which
+                // client is billed, which no column on the estimate itself records.
+                project: { select: { id: true, name: true, client: { select: { id: true, qbCustomerId: true } } } },
+            },
+        });
+        if (!row?.project?.client?.qbCustomerId) return null;
+        const note = documentPrivateNote(row.code, row.title);
+        return {
+            hash: documentIssuanceHash({
+                kind: "estimate",
+                code: row.code,
+                itemsRevision: row.itemsRevision,
+                total: row.totalAmount,
+                taxAmount: null,
+                title: row.title,
+                projectName: row.project.name,
+                customerId: row.project.client.qbCustomerId,
+                lines: row.items,
+            }),
+            docNumber: row.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+            privateNote: note,
+            total: toNum(row.totalAmount),
+            customerId: row.project.client.qbCustomerId,
+            itemsRevision: row.itemsRevision,
+        };
+    }
+    const row = await tx.invoice.findUnique({
+        where: { id },
+        select: {
+            id: true, code: true, totalAmount: true, balanceDue: true, taxAmount: true,
+            project: { select: { id: true, name: true } },
+            client: { select: { id: true, qbCustomerId: true } },
+        },
+    });
+    if (!row?.client?.qbCustomerId) return null;
+    const note = documentPrivateNote(row.code, row.project?.name ?? null);
+    return {
+        hash: documentIssuanceHash({
+            kind: "invoice",
+            code: row.code,
+            itemsRevision: null,
+            total: row.totalAmount,
+            taxAmount: row.taxAmount,
+            title: null,
+            projectName: row.project?.name ?? null,
+            customerId: row.client.qbCustomerId,
+            lines: [],
+        }),
+        docNumber: row.code.slice(0, QB_DOC_NUMBER_MAX_LEN),
+        privateNote: note,
+        total: toNum(row.totalAmount),
+        customerId: row.client.qbCustomerId,
+        itemsRevision: null,
+    };
 }

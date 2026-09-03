@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getFreshQBTokens, QBNotConnectedError, sweepPendingPayLinks, sweepPendingDeletions, automationSettingCursorStore } from "@/lib/quickbooks-payments";
-import { sweepPendingDocumentSyncs, syncMarkerKind } from "@/lib/qbo-document-sync";
+import { documentSyncMarkerWhere, sweepPendingDocumentSyncs } from "@/lib/qbo-document-sync";
 import {
     createRouteDeadline,
     isBudgetExhausted,
@@ -333,7 +333,11 @@ export async function POST(req: Request) {
         // still makes the run ok:false via `docSyncsFailed`), never allowed to
         // throw away the results of the repairs that succeeded.
         try {
-            const markerWhere = { qbSyncMarker: { not: null } } as const;
+            // Recognised markers only, IN THE QUERY. Selecting every non-null
+            // value and filtering afterwards meant a page of legacy or corrupt
+            // ones came back empty, which the pager read as exhaustion — and
+            // every valid row behind it went unvisited.
+            const markerWhere = { OR: documentSyncMarkerWhere() };
             docSyncs = await sweepPendingDocumentSyncs(tokens, deadline, {
                 isExhausted: isBudgetExhausted,
                 // ONE page of ONE rail, after that rail cursor. The sweep owns the
@@ -358,13 +362,11 @@ export async function POST(req: Request) {
                             select: { id: true, qbSyncMarker: true },
                             orderBy: { id: "asc" }, take,
                         });
-                    // Only rows carrying a marker this rail understands. A value the
-                    // vocabulary does not recognise is somebody else data, and
-                    // adopting a QuickBooks document on the strength of it would be
-                    // a guess.
-                    return rows
-                        .filter((r) => syncMarkerKind(r.qbSyncMarker))
-                        .map((r) => ({ id: r.id, marker: r.qbSyncMarker as string, kind: rail }));
+                    // No in-memory filter: the WHERE above already restricts this
+                    // to markers the vocabulary knows, and the sweep steps over
+                    // (and counts) anything that still slips through, so a page is
+                    // only ever empty when the rail really is.
+                    return rows.map((r) => ({ id: r.id, marker: r.qbSyncMarker as string, kind: rail }));
                 },
                 // CAS-pinned to the exact marker the probe was run against, so a row
                 // that moved in between keeps whatever replaced it.

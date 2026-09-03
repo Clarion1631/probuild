@@ -2819,7 +2819,10 @@ export async function sendMilestoneInvoices(
 ) {
     // Permission gate stays here (remotely invokable server action); the send
     // logic lives in billing-core.ts, shared with the MCP connector.
-    const actor = await assertInvoicePermission();
+    //
+    // HORIZONTAL too: this stages QuickBooks invoices and emails a client, so
+    // the broad permission is not enough on its own.
+    const { user: actor } = await assertInvoiceAccess(invoiceId);
     const { sendMilestoneInvoicesCore } = await import("./billing-core");
     return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
 }
@@ -3675,7 +3678,11 @@ export async function recordPayment(
         notes?: string | null;
     },
 ) {
-    await assertInvoicePermission();
+    // Found by the same sweep: it makes no QuickBooks call, but it SETTLES a
+    // milestone from two bare ids and had only the broad permission. The
+    // milestone/invoice pairing is enforced inside the settle core below; this is
+    // the missing half, which project the invoice belongs to.
+    await assertInvoiceAccess(invoiceId);
 
     const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
@@ -3736,7 +3743,12 @@ export async function updateMonthlyOverhead(amount: number) {
 
 /** Create (or fetch) the QuickBooks invoice + hosted pay link for one milestone. */
 export async function createQBPaymentLink(paymentId: string) {
-    await assertInvoicePermission();
+    // Scoped to the milestone OWN project before a single QuickBooks call.
+    // The broad `invoices` permission says nothing about THIS job, and this
+    // action creates a real QBO invoice and hands back its hosted PAY LINK —
+    // a URL that collects money — so an unscoped id was a way to mint one for
+    // any project in the company. Same gate as breakQBInvoiceLink.
+    await assertMilestoneAccess(paymentId);
     try {
         const { pushMilestoneToQuickBooks, MILESTONE_PUSH_ROUTE_BUDGET_MS } = await import("./quickbooks-payments");
         const { createRouteDeadline } = await import("./quickbooks");
@@ -3756,7 +3768,9 @@ export async function createQBPaymentLink(paymentId: string) {
 
 /** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
 export async function refreshQBPayments(invoiceId: string) {
-    await assertInvoicePermission();
+    // Reconciliation is a money-path write (it settles milestones from QBO
+    // payments), so it is scoped to the invoice project before the sync runs.
+    await assertInvoiceAccess(invoiceId);
     const { syncQuickBooksPayments, ON_VIEW_PAYMENTS_SYNC_BUDGET_MS } = await import("./quickbooks-payments");
     const { createRouteDeadline } = await import("./quickbooks");
     // Its OWN sub-ceiling, not the cron's. Passing no deadline inherited the
@@ -4533,6 +4547,38 @@ async function assertEstimateAccess(estimateId: string) {
     const estimate = await estimateOwnerOrThrow(estimateId);
     assertEstimateScope(user, estimate);
     return { user, projectId: estimate.projectId, leadId: estimate.leadId };
+}
+
+/**
+ * Horizontal-access check for an INVOICE, the mirror of assertEstimateAccess.
+ *
+ * `assertInvoicePermission()` answers "may this user touch invoices at all",
+ * never "may this user touch THIS invoice", and every action in this file is a
+ * remotely invokable Server Action taking a bare id. Without this a
+ * project-scoped user could hand in another job id and act on it — the estimate
+ * IDOR (#333) one table across.
+ */
+async function assertInvoiceAccess(invoiceId: string) {
+    const user = await assertInvoicePermission();
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { id: true, projectId: true },
+    });
+    // Fail CLOSED on a missing row: "not found" and "not yours" answer alike, so
+    // the gate cannot be used to probe which ids exist.
+    if (!invoice || !canAccessProject(user, invoice.projectId)) throw new Error("Forbidden");
+    return { user, invoiceId: invoice.id, projectId: invoice.projectId };
+}
+
+/** The same gate reached through a milestone, for the schedule-id actions. */
+async function assertMilestoneAccess(paymentScheduleId: string) {
+    const user = await assertInvoicePermission();
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { id: true, invoiceId: true, invoice: { select: { projectId: true } } },
+    });
+    if (!schedule || !canAccessProject(user, schedule.invoice.projectId)) throw new Error("Forbidden");
+    return { user, invoiceId: schedule.invoiceId, projectId: schedule.invoice.projectId };
 }
 
 /**
