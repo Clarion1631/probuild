@@ -111,8 +111,12 @@ test.describe("bridge endpoint auth", () => {
 });
 
 test.describe("bridge endpoints with the machine secret", () => {
-    const SECRET = process.env.RECEIPT_INTAKE_SECRET || "";
-    test.skip(() => !SECRET, "RECEIPT_INTAKE_SECRET is not set for the server under test");
+    // The BRIDGE secret, not the intake key — src/lib/receipt-intake/intake-auth.ts
+    // splits these into three distinct capabilities (ingest/archive/bridge) and
+    // presenting the wrong one is a 403, not a 401. These two routes accept
+    // ONLY the bridge secret.
+    const SECRET = process.env.RECEIPT_BRIDGE_SECRET || "";
+    test.skip(() => !SECRET, "RECEIPT_BRIDGE_SECRET is not set for the server under test");
 
     test("threads returns the affidavit-threads.json envelope", async ({ playwright, baseURL }) => {
         const context = await playwright.request.newContext({

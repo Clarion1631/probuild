@@ -372,6 +372,17 @@ export async function applyReceiptRequestPlan(
  * MORE likely to close than the batch would be — the safe direction on a retry
  * path, since the next full sweep reopens anything it got wrong, whereas a
  * wrongly-reapplied stale open nags a human tonight.
+ *
+ * EXPORTED so `/api/cron/receipt-request-cards` can reuse the SAME evidence
+ * check immediately before a card is delivered, rather than writing a second
+ * matcher (Codex PR #443 gate, finding 1). That cron's own re-verification
+ * only ever re-read `ReviewIssue` — clearedAt/acknowledged/resolved/owner —
+ * which the NIGHTLY sweep is what normally updates. A receipt photographed
+ * after last night's sweep and booked by the 5-minute intake worker satisfies
+ * the charge hours before the issue itself is cleared, and the safe-direction
+ * bias above is exactly right there too: erring toward NOT sending a chase
+ * that might already be answered beats nagging a human for a receipt they
+ * already sent.
  */
 /**
  * The most competing lines one recompute will load before it gives up.
@@ -417,7 +428,7 @@ async function loadCompetingComponent(seed: {
     );
 }
 
-async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
+export async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     const [line, issue] = await Promise.all([
         prisma.bankLine.findUnique({
             where: { id: targetKey },

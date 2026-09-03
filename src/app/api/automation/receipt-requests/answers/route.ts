@@ -2,7 +2,14 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateBridge } from "@/lib/receipt-intake/intake-auth";
 import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
-import { RECEIPT_REQUEST_TARGET_TYPE, bankLineIdFromFingerprint, driveFileIdFromUrl, isDurableArtifactUrl } from "@/lib/receipt-requests";
+import {
+    RECEIPT_REQUEST_TARGET_TYPE,
+    bankLineIdFromFingerprint,
+    driveFileIdFromUrl,
+    hasResolution,
+    isDurableArtifactUrl,
+} from "@/lib/receipt-requests";
+import { centsToAmount } from "@/lib/receipt-request-cards";
 import { isDriveFileId, probeDriveFile } from "@/lib/google-drive";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 
@@ -51,6 +58,73 @@ interface AnswerBody {
 /** A stored URL is display data; cap it so a stray blob cannot bloat the row. */
 const MAX_URL_LEN = 2_000;
 
+/**
+ * The affidavit generator's own naming contract
+ * (PHASE-2-QUEUE-AND-MEMOS-SPEC.md §"Sign flow", verified against
+ * `chatAffidavitApp.js:524-573` — a SEPARATE Apps Script repo this route
+ * cannot change): `MissingReceiptAffidavit_<date>_<vendor>_<amount>_<name>.pdf`.
+ * It carries no fingerprint or bank-line id — Beverly's app never sees either
+ * — so the strongest binding available without touching that external script
+ * is the DOLLAR AMOUNT: a fixed "123.45" string the generator embeds verbatim,
+ * specific enough that a PDF minted for a different charge will not carry it.
+ */
+const AFFIDAVIT_NAME_PREFIX = "MissingReceiptAffidavit_";
+
+/**
+ * True when a probed Drive filename could plausibly BE the signed memo for
+ * THIS charge, rather than some other PDF the bridge secret happens to be
+ * able to read.
+ *
+ * `signed:true` plus a Drive id that merely EXISTS used to be enough to close
+ * a chase — nothing tied the artifact to the charge it claims to answer
+ * (Codex PR #443 gate, finding 3). Not exact-format verification — Beverly's
+ * vendor/date sanitization is not this route's to pin down — but a PDF minted
+ * for a different amount will not contain this issue's own "123.45", and a
+ * file with the wrong prefix was never produced by the sign flow at all.
+ */
+function affidavitNameMatchesIssue(name: string | null, amountCents: number): boolean {
+    if (!name) return false;
+    if (!name.toLowerCase().endsWith(".pdf")) return false;
+    if (!name.startsWith(AFFIDAVIT_NAME_PREFIX)) return false;
+    return name.includes(centsToAmount(amountCents));
+}
+
+/**
+ * A card asked about this item at least once — the `cards[]` (or legacy
+ * `card`) history `recordCardOnIssues` appends when a chase card lists it
+ * (`receipt-request-cards.ts`). Every card offers "sign N" alongside a photo
+ * or a job name, so an item that was never carded never had that option to
+ * begin with: a signature for one did not come from anything WE sent.
+ */
+function hasRecordedMemoRequest(details: Record<string, unknown>): boolean {
+    const cards = details.cards;
+    if (Array.isArray(cards) && cards.length > 0) return true;
+    return details.card !== undefined && details.card !== null;
+}
+
+/**
+ * True when this Drive file is already recorded as the memo-signed evidence
+ * on a DIFFERENT bank-line issue. One signed affidavit answers exactly one
+ * charge; accepting it a second time is how a single memo silently closes two
+ * chases.
+ */
+async function pdfIdReusedElsewhere(pdfId: string, ownTargetKey: string): Promise<boolean> {
+    const candidates = await prisma.reviewIssue.findMany({
+        where: {
+            targetType: RECEIPT_REQUEST_TARGET_TYPE,
+            targetKey: { not: ownTargetKey },
+            // Coarse pre-filter — displayDetails is TEXT, so the parsed field
+            // cannot be queried directly. Verified exactly below.
+            displayDetails: { contains: pdfId },
+        },
+        select: { displayDetails: true },
+    });
+    return candidates.some(row => {
+        const details = parseMissingReceiptDetails(row.displayDetails);
+        return hasResolution(details) && details.pdfId === pdfId;
+    });
+}
+
 export async function POST(request: Request) {
     // RECEIPT_BRIDGE_SECRET, not the intake key — see the threads route.
     const auth = authenticateBridge(request);
@@ -79,6 +153,23 @@ export async function POST(request: Request) {
     // by the sweep and answered by the matcher.
     if (body.signed !== true) {
         return NextResponse.json({ ok: true, ignored: true, reason: "not-a-signature" });
+    }
+
+    /**
+     * AN UNKNOWN TARGET IS IGNORED BEFORE ANYTHING ELSE IS REQUIRED OF THE
+     * BODY. A fingerprint shaped like ours (`pb-<bankLineId>`) but naming a
+     * line whose issue was never created, or was deleted, is not an error the
+     * forwarder should be told to fix by resending a "more complete" body —
+     * there is nothing here to complete. Checked before `pdf_id`/Drive so a
+     * malformed or partial record for a target that does not exist reads the
+     * same as one that does: ignored, never retried forever.
+     */
+    const targetIssue = await prisma.reviewIssue.findUnique({
+        where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
+        select: { id: true },
+    });
+    if (!targetIssue) {
+        return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
     }
 
     /**
@@ -178,17 +269,37 @@ export async function POST(request: Request) {
     let recorded: { targetKey: string } | null = null;
     let alreadyCleared = false;
     let missing = false;
+    let neverRequested = false;
+    let mismatch = false;
+    let reused = false;
 
-    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing; attempt++) {
+    for (let attempt = 0; attempt < 2 && !recorded && !alreadyCleared && !missing && !neverRequested && !mismatch && !reused; attempt++) {
         const issue = await prisma.reviewIssue.findUnique({
             where: { targetType_targetKey: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: bankLineId } },
             select: { id: true, version: true, displayDetails: true, clearedAt: true },
         });
         if (!issue) { missing = true; break; }
 
+        // THE ARTIFACT MUST BE BOUND TO THIS CHARGE, not merely accessible.
+        // A caller-supplied fingerprint plus any readable Drive PDF used to be
+        // enough to close a chase: nothing checked that this item was ever
+        // actually asked about, that the file was minted FOR it, or that the
+        // SAME file was not already spent answering a different one (Codex
+        // PR #443 gate, finding 3). Checked on the FIRST attempt only — a
+        // fresh read on a lost race would repeat identically.
+        if (attempt === 0 && await pdfIdReusedElsewhere(pdfId, bankLineId)) { reused = true; break; }
+
         // Merged from THIS read, not from anything older: a card record or a
         // corrected amount written since must survive.
         const details = parseMissingReceiptDetails(issue.displayDetails);
+
+        if (!hasRecordedMemoRequest(details)) { neverRequested = true; break; }
+        const amountCents = typeof details.amountCents === "number" ? details.amountCents : null;
+        if (amountCents === null || !affidavitNameMatchesIssue(probe.name, amountCents)) {
+            mismatch = true;
+            break;
+        }
+
         details.resolution = "memo-signed";
         // The ID is the durable identity; the URL is how a human opens it.
         details.pdfId = pdfId;
@@ -216,6 +327,39 @@ export async function POST(request: Request) {
 
     if (missing) {
         return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
+    }
+    if (reused) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "artifact-reused",
+                detail: "this Drive file is already recorded as memo-signed evidence on a different charge",
+                targetKey: bankLineId,
+            },
+            { status: 409 },
+        );
+    }
+    if (neverRequested) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "not-requested",
+                detail: "no chase card has ever asked about this charge",
+                targetKey: bankLineId,
+            },
+            { status: 422 },
+        );
+    }
+    if (mismatch) {
+        return NextResponse.json(
+            {
+                ok: false,
+                reason: "artifact-mismatch",
+                detail: "the PDF's name does not match this charge",
+                targetKey: bankLineId,
+            },
+            { status: 422 },
+        );
     }
     if (!recorded) {
         // Two attempts both lost the race. Clearing now would silence the chase

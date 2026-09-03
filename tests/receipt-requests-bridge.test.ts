@@ -637,11 +637,12 @@ test("a duplicate target must be a real original, and cycles are refused", () =>
 
 // ── A signed memo needs a durable artifact (round-11 item 6) ────────────────
 
-test("signed:true with no verifiable artifact is a 422 that writes nothing", async () => {
-    // `signed:true` on its own used to close the chase, so a truncated or
-    // malformed forwarder row silenced a genuinely missing receipt and left
-    // nothing behind a human could open. These requests are refused BEFORE any
-    // read or write — the route never reaches Prisma on this path.
+test("auth, signature and fingerprint-shape are all refused BEFORE any read or write", async () => {
+    // These are refused on the body alone — the route never reaches Prisma on
+    // this path. The FURTHER checks (pdf_id/Drive/binding) do need to know
+    // whether the target exists first (see the next test's comment), so their
+    // "malformed body" cases live in receipt-answers-drive.test.ts against a
+    // mocked Prisma instead of asserted here.
     // The BRIDGE key now, not the intake one — see receipt-bridge-secret.test.ts.
     process.env.RECEIPT_INTAKE_SECRET = "test-intake-secret";
     process.env.RECEIPT_ARCHIVE_SECRET = "test-archive-secret";
@@ -660,27 +661,8 @@ test("signed:true with no verifiable artifact is a 422 that writes nothing", asy
         },
     ));
 
-    // A signed memo must carry a Drive FILE ID. None of these is one, and none
-    // of them reaches Drive or the database: 422, because re-sending the same
-    // body would fail the same way (see receipt-answers-drive.test.ts for the
-    // three Drive outcomes).
-    for (const [label, body] of [
-        ["no artifact at all", { fingerprint: "pb-bl-1", signed: true }],
-        ["the gate's own example", { fingerprint: "pb-bl-1", signed: true, pdf_id: "x" }],
-        ["a URL where the id goes", { fingerprint: "pb-bl-1", signed: true, pdf_id: "https://drive.google.com/file/d/1abc/view" }],
-        ["a URL and no id", { fingerprint: "pb-bl-1", signed: true, pdf_url: "https://drive.google.com/file/d/1abc/view" }],
-        ["a signature id, which is no longer accepted", { fingerprint: "pb-bl-1", signed: true, signature_id: "sig-123" }],
-    ] as const) {
-        const res = await post(body);
-        assert.equal(res.status, 422, label);
-        const payload = await res.json() as { ok: boolean; reason: string; targetKey: string };
-        assert.equal(payload.ok, false, label);
-        assert.equal(payload.reason, "missing-artifact", label);
-        assert.equal(payload.targetKey, "bl-1", label);
-    }
-
-    // Unauthenticated is still 401, and a row that is not a signature is still
-    // an ignore rather than an error — neither path reaches the artifact gate.
+    // Unauthenticated is 401, and a row that is not a signature is an ignore
+    // rather than an error — neither path reaches the artifact gate.
     const unauth = await POST(new Request("https://probuild.test/api/automation/receipt-requests/answers", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -698,6 +680,25 @@ test("signed:true with no verifiable artifact is a 422 that writes nothing", asy
     const notOurs = await post({ fingerprint: "bev-42", signed: true });
     assert.equal(notOurs.status, 200);
     assert.deepEqual(await notOurs.json(), { ok: true, ignored: true });
+});
+
+test("an unknown target is ignored BEFORE the pdf_id/Drive gate, not 422'd for a missing field", () => {
+    // Codex PR #443 gate: e2e/receipt-requests.spec.ts posts a signed answer
+    // with NO pdf_id for a bank line that has no ReviewIssue at all, and
+    // expects `{ok:true, ignored:true, reason:"unknown-target"}` — CI runs
+    // with no Drive credentials configured (no GOOGLE_DRIVE_*/GMAIL_REFRESH_TOKEN
+    // in ci.yml), so the ONLY way to reach that answer is checking existence
+    // BEFORE requiring pdf_id/probing Drive, not after. See
+    // receipt-answers-drive.test.ts for the full mocked-Prisma coverage of
+    // this ordering (the malformed-body 422 cases, now against a KNOWN target,
+    // moved there for the same reason).
+    const source = readFileSync(join(repoRoot, "src/app/api/automation/receipt-requests/answers/route.ts"), "utf8");
+    const signedCheckAt = source.indexOf('if (body.signed !== true) {');
+    const existenceAt = source.indexOf("const targetIssue = await prisma.reviewIssue.findUnique(");
+    const pdfIdCheckAt = source.indexOf("if (!isDriveFileId(body.pdf_id)) {");
+    assert.ok(signedCheckAt > 0 && existenceAt > signedCheckAt && pdfIdCheckAt > existenceAt,
+        "existence is checked after signed:true but before pdf_id is required");
+    assert.match(source, /if \(!targetIssue\) \{\s*\n\s*return NextResponse\.json\(\{ ok: true, ignored: true, reason: "unknown-target" \}\);/);
 });
 
 test("the card snapshot is re-verified under the claim, immediately before the send", () => {

@@ -25,6 +25,16 @@
  * content (QBO edited an amount/date after we recorded it) is a 409 from the
  * ingest path — a real restatement a human must look at, never silently
  * overwritten.
+ *
+ * THE INTRA-WINDOW CURSOR (`continueAfter`) IS ONE-DIRECTIONAL, and the run
+ * that finishes draining it has to account for that. It exists so a
+ * budget-truncated run resumes past what it already posted instead of
+ * replaying it — but a row QuickBooks backdates in LATER, behind that cursor,
+ * was never in the fetch that set it, so blindly trusting the cursor forever
+ * would drop it silently. `splitAtCursor` and the prefix-rescan block in
+ * `runBankRegisterPull` close that: the run that finally drains `pending`
+ * re-posts the PREFIX too, through this same idempotent ingest, before the
+ * window may be marked complete.
  */
 
 import type { ReconcileAmbiguousGroup } from "@/lib/bank-ledger";
@@ -312,6 +322,36 @@ export function planPullWindow(state: PullWindowState, now: Date): PullWindow {
 
 /** The newest TxnDate in a converted batch — the new high-water mark. */
 /**
+ * Split a fetched window into the PREFIX at/before a saved cursor and the
+ * PENDING suffix after it, in the one total order the cursor is recorded in
+ * (postedDate, qbTxnId).
+ *
+ * The split is what makes the prefix rescan in `runBankRegisterPull` possible:
+ * `pending` is exactly what `resumeAfter` used to return (and still does — it
+ * is now a thin wrapper over this), and `prefix` is everything that split
+ * discarded, silently assumed already posted. That assumption is only true for
+ * what the run that SET the cursor actually saw. A row QuickBooks inserts
+ * LATER with a postedDate/qbTxnId at or before the cursor — a genuine
+ * backdate, arriving after the cursor was already written — was never in that
+ * run's fetch, so `resumeAfter` alone would discard it forever: the cursor
+ * never moves backwards, so every future run repeats the same silent drop.
+ */
+export function splitAtCursor(
+    lines: readonly BankRegisterIngestLine[],
+    from: { postedDate: string; qbTxnId: string } | null | undefined,
+): { prefix: BankRegisterIngestLine[]; pending: BankRegisterIngestLine[] } {
+    const ordered = [...lines].sort((a, b) =>
+        (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1
+            : a.qbTxnId < b.qbTxnId ? -1 : a.qbTxnId > b.qbTxnId ? 1 : 0));
+    if (!from) return { prefix: [], pending: ordered };
+    const idx = ordered.findIndex(line =>
+        line.postedDate > from.postedDate
+        || (line.postedDate === from.postedDate && line.qbTxnId > from.qbTxnId));
+    if (idx === -1) return { prefix: ordered, pending: [] };
+    return { prefix: ordered.slice(0, idx), pending: ordered.slice(idx) };
+}
+
+/**
  * Drop everything up to and including the continuation point.
  *
  * Ordered by (postedDate, qbTxnId) — the same total order the resume point is
@@ -323,13 +363,7 @@ export function resumeAfter(
     lines: readonly BankRegisterIngestLine[],
     from: { postedDate: string; qbTxnId: string } | null | undefined,
 ): BankRegisterIngestLine[] {
-    const ordered = [...lines].sort((a, b) =>
-        (a.postedDate < b.postedDate ? -1 : a.postedDate > b.postedDate ? 1
-            : a.qbTxnId < b.qbTxnId ? -1 : a.qbTxnId > b.qbTxnId ? 1 : 0));
-    if (!from) return ordered;
-    return ordered.filter(line =>
-        line.postedDate > from.postedDate
-        || (line.postedDate === from.postedDate && line.qbTxnId > from.qbTxnId));
+    return splitAtCursor(lines, from).pending;
 }
 
 export function highWaterOf(lines: readonly BankRegisterIngestLine[], previous: string | null): string | null {
@@ -595,11 +629,17 @@ export async function runBankRegisterPull(
     // RESUME INSIDE THE WINDOW. Ordered, and past whatever the last run
     // finished, so a budget-limited run makes real progress every time instead
     // of re-posting its own first batches.
-    const pending = resumeAfter(lines, dependencies.windowState?.continueAfter);
-    summary.resumedAfter = dependencies.windowState?.continueAfter ?? null;
+    const cursor = dependencies.windowState?.continueAfter;
+    const { prefix, pending } = splitAtCursor(lines, cursor);
+    summary.resumedAfter = cursor ?? null;
     const batches = chunkLines(pending, BANK_REGISTER_CHUNK_SIZE);
     let batchIndex = 0;
     let lastPosted: BankRegisterIngestLine | null = null;
+    // Whether THIS loop — the pending rows after the cursor — was cut short by
+    // the budget. Kept separate from `summary.continues`, which the prefix
+    // rescan below can also set: only a truncation HERE means there is more
+    // pending work to resume, and only then should the cursor advance.
+    let pendingTruncated = false;
     for (const batch of batches) {
         if (elapsed() >= budgetMs) {
             summary.continues = true;
@@ -609,6 +649,7 @@ export async function runBankRegisterPull(
             // freshness stamp.
             summary.complete = false;
             summary.remainingBatches = batches.length - batchIndex;
+            pendingTruncated = true;
             break;
         }
         batchIndex++;
@@ -626,6 +667,54 @@ export async function runBankRegisterPull(
             summary.conflictQbTxnIds = [...new Set([...(summary.conflictQbTxnIds ?? []), body.qbTxnId])];
         }
         break;
+    }
+
+    // RESCAN THE PREFIX ON THE FINISHING RUN, before this window is ever
+    // allowed to look complete.
+    //
+    // `pending` only ever covers rows strictly AFTER the saved cursor —
+    // everything at or before it was assumed already posted by whichever run
+    // set that cursor. That assumption holds for what THAT run actually saw at
+    // its own fetch time, but not for a row QuickBooks records LATER with an
+    // older postedDate/qbTxnId (a genuine backdate): `resumeAfter`/`splitAtCursor`
+    // would silently discard it on every run from now on, because the cursor
+    // never moves backwards to let it back in.
+    //
+    // So the run that finishes draining `pending` — and ONLY that run, and only
+    // when there was a cursor to begin with — re-posts the PREFIX too, through
+    // the same idempotent ingest (upsert keyed by qbTxnId). A row already
+    // stored comes back `existing` and costs nothing; a row that genuinely
+    // never posted is caught here, on the one run positioned to see it before
+    // the window is stamped complete and the cursor is cleared. A restated row
+    // (same qbTxnId, different content) 409s exactly like any other conflict —
+    // reconciled by a human, never silently skipped.
+    if (summary.ok && !pendingTruncated && cursor && prefix.length > 0) {
+        const prefixBatches = chunkLines(prefix, BANK_REGISTER_CHUNK_SIZE);
+        for (const batch of prefixBatches) {
+            if (elapsed() >= budgetMs) {
+                // BUDGET RAN OUT DURING THE RESCAN ITSELF. Deliberately does NOT
+                // touch `summary.continueAfter` — leaving it unset falls back to
+                // the unchanged original cursor below, so the window is neither
+                // marked complete nor advanced, and the next run repeats the
+                // rescan rather than certifying a prefix only half re-verified.
+                summary.continues = true;
+                summary.complete = false;
+                break;
+            }
+            const { status, body } = await dependencies.ingest(account, batch);
+            if (status === 200 && body?.ok) {
+                summary.inserted += body.inserted ?? 0;
+                summary.existing += body.existing ?? 0;
+                continue;
+            }
+            summary.ok = false;
+            summary.complete = false;
+            summary.error = body?.reason ?? `http-${status}`;
+            if (body?.qbTxnId) {
+                summary.conflictQbTxnIds = [...new Set([...(summary.conflictQbTxnIds ?? []), body.qbTxnId])];
+            }
+            break;
+        }
     }
 
     // Reconcile even after a partial ingest: whatever DID land is real
@@ -708,7 +797,14 @@ export async function runBankRegisterPull(
     // after a partial or conflicted pull would step the next run's window past
     // rows this one never actually stored.
     // A run that stopped early records WHERE, so the next one carries on.
-    if (summary.continues && lastPosted) {
+    //
+    // GATED ON `pendingTruncated`, not the broader `summary.continues` — the
+    // prefix rescan above can also set `continues` when ITS budget runs out,
+    // and `lastPosted` there is stale (the last row of `pending`, not of the
+    // rescan). Advancing the cursor to it would mark part of the prefix
+    // re-verified that never actually was. Leaving `continueAfter` unset in
+    // that case falls through to the unchanged original cursor below.
+    if (pendingTruncated && lastPosted) {
         summary.continueAfter = { postedDate: lastPosted.postedDate, qbTxnId: lastPosted.qbTxnId };
     }
 

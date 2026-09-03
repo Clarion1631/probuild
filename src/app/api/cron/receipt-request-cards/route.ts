@@ -23,6 +23,10 @@ import {
 import { SWEEP_MARKER_KEY, chaserCompletedFor, parseSweepMarker } from "@/lib/receipt-sweep-marker";
 import { parseMissingReceiptDetails } from "@/app/automation/receipts-data";
 import { itemsMissingCardRecord, recordCardOnIssues } from "@/lib/receipt-card-history";
+// Reused rather than re-implemented (Codex PR #443 gate, finding 1) — see its
+// doc comment for why the safe-direction bias that governs an OCC retry is
+// exactly the bias this re-verification wants too.
+import { recomputeCodesFor } from "@/app/api/cron/receipt-requests/route";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -183,25 +187,44 @@ async function scanCandidates(): Promise<{ candidates: CardCandidateIssue[]; pag
 }
 
 /**
- * Current truth for the issues in a claimed snapshot, read in ONE query right
- * before the send. The shape is exactly what `rebuildCardItems` needs, so the
- * decision itself stays pure and testable.
+ * Current truth for the issues in a claimed snapshot, read right before the
+ * send. The shape is exactly what `rebuildCardItems` needs, so the decision
+ * itself stays pure and testable.
  */
 async function loadCardItemTruth(issueIds: string[]): Promise<Map<string, CardItemTruth>> {
     if (issueIds.length === 0) return new Map();
     const rows = await prisma.reviewIssue.findMany({
         where: { id: { in: issueIds } },
-        select: { id: true, clearedAt: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
+        select: { id: true, targetKey: true, clearedAt: true, reasonCodes: true, acknowledgedCodes: true, displayDetails: true },
     });
     const truth = new Map<string, CardItemTruth>();
     for (const row of rows) {
         const details = parseMissingReceiptDetails(row.displayDetails);
         const currentCodes = decodeReasonCodes(row.reasonCodes);
         const acked = new Set(decodeReasonCodes(row.acknowledgedCodes));
+        const clearedAt = row.clearedAt;
+        const resolved = hasResolution(details);
+        const acknowledged = currentCodes.length > 0 && currentCodes.every(code => acked.has(code));
+        /**
+         * RE-VERIFY AGAINST RECEIPT EVIDENCE, not just this issue's own
+         * clearedAt — the ReviewIssue-only checks above answer "did the
+         * NIGHTLY sweep already close this", which is a stale question for a
+         * receipt that landed since. `recomputeCodesFor` does the same real
+         * evidence match the sweep itself uses (Expense.hasReceipt, a booked
+         * ReceiptIntake, or a signed memo), scoped to this one line.
+         *
+         * Only spent on an item that would otherwise be SENT: it does real
+         * queries (component load + evidence), and one already dead for a
+         * cheaper reason (cleared/resolved/acknowledged) skips it for free.
+         */
+        const evidenceSatisfied = clearedAt === null && !resolved && !acknowledged
+            ? (await recomputeCodesFor(row.targetKey)).length === 0
+            : false;
         truth.set(row.id, {
-            clearedAt: row.clearedAt,
-            acknowledged: currentCodes.length > 0 && currentCodes.every(code => acked.has(code)),
-            resolved: hasResolution(details),
+            clearedAt,
+            acknowledged,
+            resolved,
+            evidenceSatisfied,
             owner: effectiveOwner(details),
         });
     }

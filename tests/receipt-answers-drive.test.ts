@@ -25,6 +25,20 @@ process.env.RECEIPT_BRIDGE_SECRET = "bridge-secret";
 
 const FILE_ID = "1sEISJBJaGRYpivooQJBR";
 
+/**
+ * The affidavit generator's naming contract (MissingReceiptAffidavit_<date>_
+ * <vendor>_<amount>_<name>.pdf) applied to the default fixture's own amount
+ * (-12345 cents = "123.45"), so the happy-path tests carry a name the answers
+ * route's binding checks actually accept.
+ */
+const MATCHING_NAME = "MissingReceiptAffidavit_2026-08-16_LOWES_123.45_CJ.pdf";
+
+/** A `displayDetails` blob that has been CARDED (see hasRecordedMemoRequest). */
+const CARDED_DETAILS = JSON.stringify({
+    amountCents: -12_345,
+    cards: [{ n: 1, date: "2026-08-16", threadName: "spaces/x/threads/y", messageName: "spaces/x/messages/z", requestId: "receipt-req-CJ-2026-08-16" }],
+});
+
 type Probe =
     | { kind: "found"; id: string; name: string | null; trashed: boolean; webViewLink: string | null; mimeType: string | null }
     | { kind: "missing"; reason: string }
@@ -42,6 +56,14 @@ const fakePrisma = {
         findUnique: async ({ where }: { where: { targetType_targetKey?: { targetKey: string }; id?: string } }) => {
             const key = where.targetType_targetKey?.targetKey ?? where.id ?? "";
             return issues.get(key) ?? null;
+        },
+        // The reuse check's coarse pre-filter (Codex PR #443 gate, finding 3):
+        // every OTHER issue, so it can be searched for the same pdf_id.
+        findMany: async ({ where }: { where: { targetKey?: { not?: string } } }) => {
+            const excluded = where.targetKey?.not;
+            return [...issues.entries()]
+                .filter(([key]) => key !== excluded)
+                .map(([, row]) => ({ displayDetails: row.displayDetails }));
         },
         updateMany: async ({ data }: { data: Record<string, unknown> }) => {
             writes.push(data);
@@ -96,7 +118,7 @@ function reset() {
     probedIds = [];
     writes = [];
     cleared = [];
-    issues = new Map([["bl-1", { id: "ri-1", version: 3, displayDetails: "{}", clearedAt: null }]]);
+    issues = new Map([["bl-1", { id: "ri-1", version: 3, displayDetails: CARDED_DETAILS, clearedAt: null }]]);
 }
 
 const post = (body: Record<string, unknown>) => POST(new Request(
@@ -113,7 +135,7 @@ test("a VALID artifact records the memo and clears the chase", async () => {
     probeResult = {
         kind: "found",
         id: FILE_ID,
-        name: "Missing receipt memo.pdf",
+        name: MATCHING_NAME,
         trashed: false,
         webViewLink: `https://drive.google.com/file/d/${FILE_ID}/view`,
         mimeType: "application/pdf",
@@ -133,7 +155,7 @@ test("a VALID artifact records the memo and clears the chase", async () => {
 
 test("a caller's own durable URL is kept, but the ID is still what was verified", async () => {
     reset();
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
     const pdfUrl = `https://drive.google.com/file/d/${FILE_ID}/view?usp=sharing`;
     const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID, pdf_url: pdfUrl });
     assert.equal(res.status, 200);
@@ -216,6 +238,48 @@ test("NO CREDENTIAL is named as such — it will not fix itself", async () => {
     assert.deepEqual(cleared, []);
 });
 
+test("a KNOWN target with no verifiable artifact is still 422 missing-artifact", async () => {
+    // These cases lived in tests/receipt-requests-bridge.test.ts, asserting the
+    // route "never reaches Prisma on this path" — true before the unknown-
+    // target check moved earlier (Codex PR #443 gate). Now ANY signed "pb-"
+    // fingerprint touches Prisma once to learn whether the target exists; a
+    // KNOWN target (bl-1, seeded by reset()) still gets exactly this 422 for
+    // every one of these malformed artifacts, re-sending would fail the same
+    // way each time.
+    reset();
+    for (const [label, body] of [
+        ["no artifact at all", { fingerprint: "pb-bl-1", signed: true }],
+        ["the gate's own example", { fingerprint: "pb-bl-1", signed: true, pdf_id: "x" }],
+        ["a URL where the id goes", { fingerprint: "pb-bl-1", signed: true, pdf_id: "https://drive.google.com/file/d/1abc/view" }],
+        ["a URL and no id", { fingerprint: "pb-bl-1", signed: true, pdf_url: "https://drive.google.com/file/d/1abc/view" }],
+        ["a signature id, which is no longer accepted", { fingerprint: "pb-bl-1", signed: true, signature_id: "sig-123" }],
+    ] as const) {
+        writes = [];
+        const res = await post(body);
+        assert.equal(res.status, 422, label);
+        const payload = await res.json() as { ok: boolean; reason: string; targetKey: string };
+        assert.equal(payload.ok, false, label);
+        assert.equal(payload.reason, "missing-artifact", label);
+        assert.equal(payload.targetKey, "bl-1", label);
+        assert.deepEqual(writes, [], label);
+    }
+    assert.deepEqual(probedIds, [], "none of these pdf_id shapes ever reach Drive");
+});
+
+test("an unknown target is ignored BEFORE pdf_id is even required — CI e2e round", async () => {
+    // A fingerprint shaped like ours but naming a line with no ReviewIssue at
+    // all (deleted, or never opened) used to hit the pdf_id/Drive checks
+    // first and come back 422 "missing-artifact" for a body that was never
+    // going to resolve anything — teaching the forwarder to retry with a
+    // "more complete" body that cannot exist. e2e/receipt-requests.spec.ts
+    // posts exactly this shape (no pdf_id at all) and expects a soft ignore.
+    reset();
+    const res = await post({ fingerprint: "pb-no-such-bank-line", signed: true });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, ignored: true, reason: "unknown-target" });
+    assert.deepEqual(probedIds, [], "Drive is never asked about a target that does not exist");
+});
+
 test("Drive is never asked about a body that cannot carry an artifact", async () => {
     reset();
     probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
@@ -234,7 +298,7 @@ test("a caller URL naming a DIFFERENT file is refused — the link must be the i
     // different documents — and only one of them was ever checked.
     reset();
     const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
     const someoneElse = "1AAAAAAAAAAAAAAAAAAAA";
     const res = await post({
         fingerprint: "pb-bl-1",
@@ -253,7 +317,7 @@ test("a durable URL that names no file at all is refused too", async () => {
     // neither can prove anything about a Drive id. Durability is not identity.
     reset();
     const probedLink = `https://drive.google.com/file/d/${FILE_ID}/view`;
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: probedLink, mimeType: "application/pdf" };
     const res = await post({
         fingerprint: "pb-bl-1",
         signed: true,
@@ -269,7 +333,7 @@ test("an alternate Drive shape for the SAME id is still accepted", async () => {
     // /file/d/<id>/ all name the file, and refusing them would throw away a
     // perfectly good link the forwarder had.
     reset();
-    probeResult = { kind: "found", id: FILE_ID, name: null, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
     for (const url of [
         `https://drive.google.com/open?id=${FILE_ID}`,
         `https://drive.google.com/uc?id=${FILE_ID}&export=download`,
@@ -280,4 +344,96 @@ test("an alternate Drive shape for the SAME id is still accepted", async () => {
         assert.equal(res.status, 200);
         assert.equal(JSON.parse(writes[0].displayDetails as string).pdfUrl, url, url);
     }
+});
+
+// ── The artifact must be BOUND to the issue it resolves (Codex PR #443 gate, finding 3) ──
+
+test("a PDF whose name doesn't carry this charge's amount is refused — 422 artifact-mismatch", async () => {
+    reset();
+    probeResult = {
+        kind: "found",
+        id: FILE_ID,
+        // Real prefix, real .pdf, but a DIFFERENT amount than bl-1's $123.45.
+        name: "MissingReceiptAffidavit_2026-08-01_SOMEONE_999.99_CJ.pdf",
+        trashed: false,
+        webViewLink: null,
+        mimeType: "application/pdf",
+    };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    const payload = await res.json() as { ok: boolean; reason: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "artifact-mismatch");
+    assert.deepEqual(writes, [], "no resolution for an unbound PDF");
+    assert.deepEqual(cleared, []);
+});
+
+test("an unrelated PDF that never went through the sign flow at all is refused the same way", async () => {
+    reset();
+    probeResult = { kind: "found", id: FILE_ID, name: "quarterly-report.pdf", trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json() as { reason: string }).reason, "artifact-mismatch");
+});
+
+test("a charge that was never carded cannot be closed by a signature — 422 not-requested", async () => {
+    // No card ever offered "sign N" for this item, so a signature could not
+    // have come from anything WE sent.
+    reset();
+    issues.set("bl-2", { id: "ri-2", version: 1, displayDetails: JSON.stringify({ amountCents: -12_345 }), clearedAt: null });
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    const res = await post({ fingerprint: "pb-bl-2", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 422);
+    const payload = await res.json() as { ok: boolean; reason: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "not-requested");
+    assert.deepEqual(writes, []);
+    assert.deepEqual(cleared, []);
+});
+
+test("the same Drive file already recorded on a DIFFERENT charge is refused — 409 artifact-reused", async () => {
+    reset();
+    // bl-9 already carries this exact pdf_id as its recorded memo-signed evidence.
+    issues.set("bl-9", {
+        id: "ri-9",
+        version: 1,
+        displayDetails: JSON.stringify({ amountCents: -5_000, resolution: "memo-signed", pdfId: FILE_ID }),
+        clearedAt: null,
+    });
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 409);
+    const payload = await res.json() as { ok: boolean; reason: string };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.reason, "artifact-reused");
+    assert.deepEqual(writes, [], "the second charge gets no resolution from a spent memo");
+    assert.deepEqual(cleared, []);
+});
+
+test("re-answering the SAME issue with the SAME pdf_id is not a reuse conflict", async () => {
+    // The forwarder retries; this is idempotency, not two charges sharing one memo.
+    reset();
+    issues.set("bl-1", {
+        id: "ri-1",
+        version: 3,
+        displayDetails: JSON.stringify({
+            amountCents: -12_345,
+            resolution: "memo-signed",
+            pdfId: FILE_ID,
+            cards: [{ n: 1, date: "2026-08-16" }],
+        }),
+        clearedAt: null,
+    });
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+});
+
+test("matching name, carded, and not reused → memo-signed, exactly the happy path", async () => {
+    reset();
+    probeResult = { kind: "found", id: FILE_ID, name: MATCHING_NAME, trashed: false, webViewLink: null, mimeType: "application/pdf" };
+    const res = await post({ fingerprint: "pb-bl-1", signed: true, pdf_id: FILE_ID });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, cleared: true, memoRecorded: true, targetKey: "bl-1" });
+    assert.equal(JSON.parse(writes[0].displayDetails as string).resolution, "memo-signed");
 });

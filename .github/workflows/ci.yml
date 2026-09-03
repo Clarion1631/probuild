@@ -217,6 +217,14 @@ jobs:
       # The archive mirror's key is DELIBERATELY different — the specs assert
       # that cross-use between the two capabilities is a 403.
       RECEIPT_ARCHIVE_SECRET: "e2e-ci-receipt-archive-secret"
+      # Beverly's Chat bridge key (Phase 2 §4) — a THIRD, distinct capability
+      # from the two above (src/lib/receipt-intake/intake-auth.ts). Gates
+      # /api/automation/receipt-requests/threads and .../answers; presenting
+      # either other secret there is a 403, which is exactly what e2e/
+      # receipt-requests.spec.ts's "bridge endpoints with the machine secret"
+      # suite exercises, so it needs its OWN value here, not a reuse of
+      # RECEIPT_INTAKE_SECRET.
+      RECEIPT_BRIDGE_SECRET: "e2e-ci-receipt-bridge-secret"
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.

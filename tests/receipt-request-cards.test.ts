@@ -294,6 +294,7 @@ const truthOf = (over: Partial<CardItemTruth> = {}): CardItemTruth => ({
     clearedAt: null,
     acknowledged: false,
     resolved: false,
+    evidenceSatisfied: false,
     owner: "CJ",
     ...over,
 });
@@ -335,6 +336,30 @@ test("an item answered between selection and the send is dropped from the card",
         { issueId: "d", reason: "acknowledged" },
         { issueId: "e", reason: "owner-changed" },
     ]);
+});
+
+test("evidence found after fingerprinting drops the item — the issue's own clearedAt is stale, not authoritative", () => {
+    // The nightly sweep is what normally clears the ReviewIssue, and it runs
+    // once a night. A receipt photographed after it ran and booked by the
+    // 5-minute intake worker satisfies the charge hours before `clearedAt`
+    // moves — asking for it anyway is exactly the noise this re-check exists
+    // to prevent (Codex PR #443 gate, finding 1).
+    const items = [cardItem("a", 1), cardItem("f", 2)];
+    const truth = new Map<string, CardItemTruth>([
+        ["a", truthOf()],
+        ["f", truthOf({ evidenceSatisfied: true })],
+    ]);
+    const rebuilt = rebuildCardItems(items, truth, "CJ");
+    assert.deepEqual(rebuilt.items.map(i => i.issueId), ["a"]);
+    assert.deepEqual(rebuilt.dropped, [{ issueId: "f", reason: "evidence-found" }]);
+});
+
+test("evidence-found is checked BEFORE acknowledged/owner — the strongest reason to drop wins", () => {
+    const truth = new Map<string, CardItemTruth>([
+        ["a", truthOf({ evidenceSatisfied: true, acknowledged: true, owner: "Richard" })],
+    ]);
+    const rebuilt = rebuildCardItems([cardItem("a", 1)], truth, "CJ");
+    assert.deepEqual(rebuilt.dropped, [{ issueId: "a", reason: "evidence-found" }]);
 });
 
 test("an issue that no longer exists is dropped, not carried", () => {
@@ -379,6 +404,19 @@ test("an untouched snapshot rebuilds to itself, byte for byte", () => {
     const rebuilt = rebuildCardItems(items, truth, "CJ");
     assert.deepEqual(rebuilt.items, items);
     assert.deepEqual(rebuilt.dropped, []);
+});
+
+test("the cron re-verifies against CURRENT receipt evidence, not just the issue's own clearedAt (finding 1)", () => {
+    const source = readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "..", "src/app/api/cron/receipt-request-cards/route.ts"),
+        "utf8",
+    );
+    // Reused from the nightly sweep rather than a second matcher.
+    assert.match(source, /import \{ recomputeCodesFor \} from "@\/app\/api\/cron\/receipt-requests\/route";/);
+    assert.match(source, /await recomputeCodesFor\(row\.targetKey\)/);
+    // Only spent on an item that would otherwise be sent — already dead for a
+    // cheaper reason skips the real evidence query.
+    assert.match(source, /clearedAt === null && !resolved && !acknowledged/);
 });
 
 // ── An unconfirmed delivery is PARTIAL, and needs a human (round-13 item 6) ─

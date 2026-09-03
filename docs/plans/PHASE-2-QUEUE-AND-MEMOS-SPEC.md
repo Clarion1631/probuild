@@ -292,6 +292,26 @@ Planner output for the executor: build exactly this; do not guess.
   syntactic test), and `signature_id` is no longer accepted at all. Photo answers need no
   handling here — the resulting Expense/ReceiptIntake closes the issue via the nightly
   matcher. Unknown fingerprints (Beverly's own) → `{ok:true, ignored:true}`.
+- **THE ARTIFACT MUST BE BOUND TO THE ISSUE IT RESOLVES** (Codex PR #443 gate, finding
+  3) — an existing, real PDF was previously accepted for ANY fingerprint the caller
+  named, with nothing tying the two together. Three checks, all before the write:
+  1. **Requested.** The target `ReviewIssue` must carry `cards[]`/`card` history — a
+     chase card actually listed it, which is the only way the "sign N" reply flow can
+     have been reached. Otherwise **422** `not-requested`. (Not gated on the issue being
+     OPEN — a signature answering an issue the sweep already auto-closed is still
+     recorded, per the "RECORDED EVEN ON A CLEARED ISSUE" rule above; that invariant
+     stays as-is.)
+  2. **Not reused.** The same `pdf_id` already recorded as `{resolution:"memo-signed"}`
+     on a DIFFERENT `targetKey` is refused with **409** `artifact-reused` — one signed
+     affidavit answers exactly one charge.
+  3. **Named for this charge.** The probed Drive filename must start with
+     `MissingReceiptAffidavit_` (the sign flow's own prefix, §"Sign flow" above) and
+     contain this issue's dollar amount (`"123.45"`, from `displayDetails.amountCents`)
+     — otherwise **422** `artifact-mismatch`. NOT the fingerprint: the generator
+     (`chatAffidavitApp.js`, a separate Apps Script repo) never embeds it, so the amount
+     — a fixed, unambiguous string it DOES embed verbatim — is the strongest binding
+     available without changing that external script. Date/vendor sanitization is not
+     checked; it is not this route's to pin down.
 
 ## 5. Crons — `vercel.json` additions
 

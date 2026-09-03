@@ -425,11 +425,22 @@ export interface CardItemTruth {
     acknowledged: boolean;
     /** A signed memo (or another recorded answer) is on the row. */
     resolved: boolean;
+    /**
+     * Receipt evidence exists RIGHT NOW for this bank line, recomputed from
+     * current Expense/ReceiptIntake data — NOT merely inferred from the issue
+     * being cleared. The nightly sweep is what normally clears an issue when a
+     * receipt lands, but that sweep runs once a night: a receipt photographed
+     * after it ran, and booked by the 5-minute intake worker, satisfies the
+     * charge hours before `clearedAt` moves. Without this, a card built in
+     * that gap chased a receipt that had already arrived (Codex PR #443 gate,
+     * finding 1).
+     */
+    evidenceSatisfied: boolean;
     /** Who owns it NOW — a human may have reassigned it since selection. */
     owner: string;
 }
 
-export type CardItemDropReason = "missing" | "cleared" | "acknowledged" | "resolved" | "owner-changed";
+export type CardItemDropReason = "missing" | "cleared" | "acknowledged" | "resolved" | "evidence-found" | "owner-changed";
 
 export interface RebuiltCard {
     items: CardItem[];
@@ -472,11 +483,13 @@ export function rebuildCardItems(
                 ? "cleared"
                 : current.resolved
                     ? "resolved"
-                    : current.acknowledged
-                        ? "acknowledged"
-                        : current.owner !== owner
-                            ? "owner-changed"
-                            : null;
+                    : current.evidenceSatisfied
+                        ? "evidence-found"
+                        : current.acknowledged
+                            ? "acknowledged"
+                            : current.owner !== owner
+                                ? "owner-changed"
+                                : null;
         if (reason) {
             dropped.push({ issueId: item.issueId, reason });
             continue;

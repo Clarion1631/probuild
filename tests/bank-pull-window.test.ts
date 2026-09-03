@@ -14,6 +14,7 @@ import {
     advanceScanBoundary,
     highWaterOf,
     resumeAfter,
+    splitAtCursor,
     type PullWindowState,
     planPullWindow,
     runBankRegisterPull,
@@ -207,45 +208,177 @@ test("resumeAfter drops the prefix already posted, in (date, qbTxnId) order", ()
     assert.deepEqual(resumeAfter(lines, { postedDate: "2026-08-02", qbTxnId: "b" }), []);
 });
 
-test("two budget-limited runs make PROGRESS instead of replaying the same prefix", async () => {
+/** An idempotent ingest fake, keyed like the real upsert (qbTxnId → content). */
+function idempotentStore() {
+    const stored = new Map<string, string>();
+    const posted: string[][] = [];
+    return {
+        stored,
+        posted,
+        ingest: async (_account: string, batch: BankRegisterIngestLine[]) => {
+            posted.push(batch.map(l => l.qbTxnId));
+            let inserted = 0;
+            let existing = 0;
+            for (const line of batch) {
+                const content = JSON.stringify([line.postedDate, line.amountCents, line.rawDescriptor, line.checkNumber]);
+                const prior = stored.get(line.qbTxnId);
+                if (prior === undefined) { stored.set(line.qbTxnId, content); inserted++; continue; }
+                if (prior !== content) {
+                    return { status: 409, body: { ok: false, reason: "qbo-txn-conflict", qbTxnId: line.qbTxnId } };
+                }
+                existing++;
+            }
+            return { status: 200, body: { ok: true, inserted, existing } };
+        },
+    };
+}
+
+test("two budget-limited runs make PROGRESS, and the finishing run rescans the prefix it skipped", async () => {
     // The high-water mark only moves on a COMPLETE run, which is right — but it
     // meant a half-finished run recorded nothing, so the next one re-fetched
     // the same window and died at the same place. A big backlog never drained.
-    const posted: string[][] = [];
+    //
+    // The FINISHING run also re-verifies the PREFIX it resumed past — see
+    // splitAtCursor and the rescan block in runBankRegisterPull — through the
+    // same idempotent ingest, so a row genuinely never posted in run 1 is not
+    // lost forever behind a cursor that can only move forward. Re-posting the
+    // already-stored prefix costs nothing: the store is keyed by qbTxnId,
+    // exactly like the real upsert.
+    const store = idempotentStore();
     const state: { highWater: string | null; lastFullSweep: string | null; continueAfter?: { postedDate: string; qbTxnId: string } | null } = {
         highWater: "2026-08-30", lastFullSweep: "2026-09-01", continueAfter: null,
     };
-    const run = async () => {
+    const run = (budgetMs: number) => {
         let clock = 0;
         return runBankRegisterPull({
             now: () => Date.parse("2026-09-02T02:00:00Z"),
             fetchRows: async () => ({ rows: ROWS, stale: false }),
-            ingest: async (_a, batch) => {
-                posted.push(batch.map(l => l.qbTxnId));
-                return { status: 200, body: { ok: true, inserted: batch.length, existing: 0 } };
-            },
+            ingest: store.ingest,
             reconcile: async () => ({ linked: 0, proposed: 0 }),
             windowState: { ...state },
             saveWindowState: async next => { Object.assign(state, next); },
             elapsedMs: () => (clock += 20_000) - 20_000,
-            budgetMs: 25_000,
+            budgetMs,
         });
     };
 
-    const first = await run();
+    const first = await run(25_000);
     assert.equal(first.continues, true);
     assert.ok(first.continueAfter, "it must record where it stopped");
     assert.deepEqual(state.continueAfter, first.continueAfter, "and persist it");
     assert.equal(state.highWater, "2026-08-30", "the mark does NOT move on a partial run");
+    assert.ok(store.stored.size > 0 && store.stored.size < ROWS.length, "run 1 posted only part of the window");
 
-    const firstIds = posted.flat();
-    posted.length = 0;
-    const second = await run();
-    const secondIds = posted.flat();
-
+    store.posted.length = 0;
+    // Generous budget: this run both finishes the resumed pending rows AND
+    // rescans the prefix run 1 never got to.
+    const second = await run(1_000_000);
     assert.deepEqual(second.resumedAfter, first.continueAfter, "the second run picks up where the first stopped");
-    assert.equal(secondIds.length > 0, true, "and it does real work");
-    assert.equal(firstIds.some(id => secondIds.includes(id)), false, "no batch is posted twice");
+    assert.equal(store.stored.size, ROWS.length, "every row lands once the window finishes");
+    assert.equal(state.continueAfter, null, "a genuinely finished window clears the cursor");
+    assert.equal(state.highWater, "2026-09-02", "and the mark advances to the window's end");
+    // The rescanned prefix was re-SENT (idempotently) for verification, not
+    // merely trusted because it sorted before the old cursor: run 2 sends
+    // every row in the window, not just the ones `pending` would have named.
+    const secondSentCount = store.posted.reduce((n, batch) => n + batch.length, 0);
+    assert.equal(secondSentCount, ROWS.length, "the prefix rescan re-sent the rows already stored, not just the new ones");
+});
+
+test("a row QuickBooks backdates BEHIND the cursor is caught by the finishing run's rescan", async () => {
+    // The classic gap: run 1 posts the first slice and stops on budget with a
+    // cursor part way through the window. Before run 2, QuickBooks records a
+    // genuinely NEW transaction whose postedDate/qbTxnId sort BEFORE that
+    // cursor — a real backdate, not a re-fetch of something already seen.
+    // Without the prefix rescan, `resumeAfter` discards it on every run from
+    // here on: the cursor never moves backwards to let it back in.
+    const store = idempotentStore();
+    const state: { highWater: string | null; lastFullSweep: string | null; continueAfter?: { postedDate: string; qbTxnId: string } | null } = {
+        highWater: "2026-08-30", lastFullSweep: "2026-09-01", continueAfter: null,
+    };
+    let rows = ROWS;
+    const run = (budgetMs: number) => {
+        let clock = 0;
+        return runBankRegisterPull({
+            now: () => Date.parse("2026-09-02T02:00:00Z"),
+            fetchRows: async () => ({ rows, stale: false }),
+            ingest: store.ingest,
+            reconcile: async () => ({ linked: 0, proposed: 0 }),
+            windowState: { ...state },
+            saveWindowState: async next => { Object.assign(state, next); },
+            elapsedMs: () => (clock += 20_000) - 20_000,
+            budgetMs,
+        });
+    };
+
+    const first = await run(25_000);
+    assert.ok(first.continueAfter, "run 1 stopped part way through");
+    // Sorts before the recorded cursor: same date as the fixture, qbTxnId
+    // "txn-0000" precedes every "txn-<n>" lexicographically.
+    const backdated: BankRegisterRowLike = {
+        date: "2026-08-30", qbType: "Expense", qbTxnId: "txn-0000",
+        docNum: null, name: "BACKDATED VENDOR", memo: null, amountCents: -4_242,
+    };
+    assert.ok(backdated.qbTxnId! < first.continueAfter!.qbTxnId, "the fixture must actually sort before the cursor");
+    rows = [...ROWS, backdated];
+
+    const second = await run(1_000_000);
+    assert.equal(second.ok, true);
+    assert.ok(store.stored.has("txn-0000"), "the backdated row is ingested by the finishing run's prefix rescan");
+    assert.equal(state.continueAfter, null, "and the window still finishes clean");
+});
+
+test("a row restated BEHIND the cursor (same qbTxnId, different content) is flagged, not silently skipped", async () => {
+    const store = idempotentStore();
+    const state: { highWater: string | null; lastFullSweep: string | null; continueAfter?: { postedDate: string; qbTxnId: string } | null } = {
+        highWater: "2026-08-30", lastFullSweep: "2026-09-01", continueAfter: null,
+    };
+    let rows = ROWS;
+    const run = (budgetMs: number) => {
+        let clock = 0;
+        return runBankRegisterPull({
+            now: () => Date.parse("2026-09-02T02:00:00Z"),
+            fetchRows: async () => ({ rows, stale: false }),
+            ingest: store.ingest,
+            reconcile: async () => ({ linked: 0, proposed: 0 }),
+            windowState: { ...state },
+            saveWindowState: async next => { Object.assign(state, next); },
+            elapsedMs: () => (clock += 20_000) - 20_000,
+            budgetMs,
+        });
+    };
+
+    const first = await run(25_000);
+    assert.ok(first.continueAfter, "run 1 stopped part way through");
+    // Pick a qbTxnId that was actually posted in run 1's prefix (sorts before
+    // the cursor) and restate its amount — QuickBooks editing a transaction
+    // we already recorded, behind the point we resumed from.
+    const restatedId = "txn-0";
+    assert.ok(restatedId < first.continueAfter!.qbTxnId, "must fall in the prefix run 1 already posted");
+    assert.ok(store.stored.has(restatedId), "sanity: run 1 really did post it");
+    rows = ROWS.map(r => (r.qbTxnId === restatedId ? { ...r, amountCents: -999_999 } : r));
+
+    const second = await run(1_000_000);
+    assert.equal(second.ok, false, "a restatement in the prefix fails the run, exactly like one in `pending`");
+    assert.equal(second.error, "qbo-txn-conflict");
+    assert.deepEqual(second.conflictQbTxnIds, [restatedId]);
+    assert.notEqual(state.continueAfter, null, "an unresolved restatement must not let the window look finished");
+    const storedContent = JSON.parse(store.stored.get(restatedId) as string) as [string, number, string, string | null];
+    assert.notEqual(storedContent[1], -999_999, "the stored observation is never silently overwritten");
+});
+
+test("splitAtCursor: the prefix is everything resumeAfter would have discarded", () => {
+    const l = (postedDate: string, qbTxnId: string): BankRegisterIngestLine =>
+        ({ postedDate, amountCents: -1, rawDescriptor: "X", checkNumber: null, qbTxnId });
+    const lines = [l("2026-08-02", "b"), l("2026-08-01", "z"), l("2026-08-02", "a")];
+
+    const noCursor = splitAtCursor(lines, null);
+    assert.deepEqual(noCursor.prefix, []);
+    assert.deepEqual(noCursor.pending.map(x => x.qbTxnId), resumeAfter(lines, null).map(x => x.qbTxnId));
+
+    const cursor = { postedDate: "2026-08-02", qbTxnId: "a" };
+    const split = splitAtCursor(lines, cursor);
+    assert.deepEqual(split.pending.map(x => x.qbTxnId), resumeAfter(lines, cursor).map(x => x.qbTxnId));
+    assert.deepEqual(split.prefix.map(x => x.qbTxnId), ["z", "a"], "everything at/before the cursor, in order");
 });
 
 test("a COMPLETE run clears the continuation point", async () => {
