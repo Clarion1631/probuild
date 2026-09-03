@@ -88,27 +88,14 @@ try {
     await client.$executeRawUnsafe(`
         INSERT INTO "ReviewIssue" ("id", "targetType", "targetKey", "reasonCodes", "reasonHash",
                                    "acknowledgedCodes", "displayDetails", "clearedAt",
-                                   "firstObservedAt", "updatedAt")
+                                   "firstObservedAt", "createdAt", "updatedAt")
         VALUES ('ci-issue-1', 'bank-line', 'ci-line-1', '["MISSING_RECEIPT"]', 'ci-hash-1',
-                '[]', $1, $3, '2026-08-01T00:00:00Z', $3),
+                '[]', $1, $3::timestamp, '2026-08-01T00:00:00'::timestamp, $3::timestamp, $3::timestamp),
                ('ci-issue-2', 'bank-line', 'ci-line-2', '["MISSING_RECEIPT"]', 'ci-hash-2',
-                '[]', $2, $3, '2026-08-02T00:00:00Z', $3)
+                '[]', $2, $3::timestamp, '2026-08-02T00:00:00'::timestamp, $3::timestamp, $3::timestamp)
         ON CONFLICT ("id") DO NOTHING`,
         details("ci-shared-pdf"), details("ci-shared-pdf"), now);
 
-    /**
-     * And two legacy cards carrying a delivery claim, plus one without — so the
-     * backfill has to produce exactly two rows and the unique index has to
-     * accept two different days for the same owner.
-     */
-    await client.$executeRawUnsafe(`
-        INSERT INTO "ReceiptRequestCard" ("id", "owner", "pacificDate", "itemsJson", "overflow",
-                                          "overflowExact", "status", "postedAt", "deliveredOn",
-                                          "attempts", "createdAt", "updatedAt")
-        VALUES ('ci-card-1', 'CJ', '2026-08-01', '[]', 0, true, 'POSTED', $1, '2026-08-01', 1, $1, $1),
-               ('ci-card-2', 'CJ', '2026-08-02', '[]', 0, true, 'POSTED', $1, '2026-08-02', 1, $1, $1),
-               ('ci-card-3', 'Richard', '2026-08-01', '[]', 0, true, 'PENDING', NULL, NULL, 0, $1, $1)
-        ON CONFLICT ("id") DO NOTHING`, now);
 } finally {
     await client.$disconnect();
 }
@@ -128,7 +115,34 @@ run("node", [script, ...guard], env);
 // Idempotency is the property the whole deploy story rests on: the script is
 // run before merge, may be re-run after, and a crash part way has to be safe to
 // resume from the top.
-console.log("\n=== apply, again (idempotency) ===");
+/**
+ * SEED THE LEGACY DELIVERY CLAIMS **BETWEEN** THE TWO RUNS.
+ *
+ * `ReceiptRequestCard` does not exist before this migration — the script
+ * creates it — so there is no earlier moment at which a legacy card could be
+ * seeded. This is also the truer story: production will carry cards written by
+ * the deployed app between the first apply and any re-run, and the backfill has
+ * to pick those up rather than only what existed at create time.
+ *
+ * `::timestamp` on every instant: a bound parameter arrives as text, and
+ * Postgres will not coerce it into a timestamp column on its own.
+ */
+const seed = new PrismaClient({ datasources: { db: { url: targetUrl } } });
+try {
+    await seed.$executeRawUnsafe(`
+        INSERT INTO "ReceiptRequestCard" ("id", "owner", "pacificDate", "itemsJson", "overflow",
+                                          "overflowExact", "status", "postedAt", "deliveredOn",
+                                          "attempts", "createdAt", "updatedAt")
+        VALUES ('ci-card-1', 'CJ', '2026-08-01', '[]', 0, true, 'POSTED', $1::timestamp, '2026-08-01', 1, $1::timestamp, $1::timestamp),
+               ('ci-card-2', 'CJ', '2026-08-02', '[]', 0, true, 'POSTED', $1::timestamp, '2026-08-02', 1, $1::timestamp, $1::timestamp),
+               ('ci-card-3', 'Richard', '2026-08-01', '[]', 0, true, 'PENDING', NULL, NULL, 0, $1::timestamp, $1::timestamp)
+        ON CONFLICT ("id") DO NOTHING`, new Date().toISOString());
+} finally {
+    await seed.$disconnect();
+}
+
+
+console.log("\n=== apply, again (idempotency, and the backfill has work now) ===");
 run("node", [script, ...guard], env);
 
 /**

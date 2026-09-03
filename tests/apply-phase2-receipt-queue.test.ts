@@ -500,3 +500,31 @@ test("an unset expected project ref is a refusal, not a default", () => {
     const firstStatementAt = source.indexOf("for (const sql of statements) {");
     assert.ok(refCheckAt > 0 && firstStatementAt > refCheckAt);
 });
+
+test("the REAL production pooler URL passes the host guard, port and all", () => {
+    /**
+     * Codex found this on P0: `new URL(url).host` INCLUDES the port, so a
+     * `/pooler\.supabase\.com$/` test against `host` can never match the real
+     * transaction-pooler URL — the guard rejects production itself, and
+     * `--target prod` is never exercised. This script uses `hostname`; the
+     * assertion below is what keeps it that way.
+     */
+    const PROD = "postgresql://postgres.ghzdbzdnwjxazvmcefbh:s3cret@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true";
+
+    assert.equal(new URL(PROD).host, "aws-0-us-west-2.pooler.supabase.com:6543", "host carries the port");
+    assert.equal(isProductionPoolerHost(new URL(PROD).host), false,
+        "which is exactly why `host` cannot be the thing checked");
+    assert.equal(isProductionPoolerHost(new URL(PROD).hostname), true, "hostname is");
+
+    const source = readFileSync(path.join(__dirname, "..", "scripts", "apply-phase2-receipt-queue.mjs"), "utf8");
+    assert.match(source, /isProductionPoolerHost\(new URL\(url\)\.hostname\)/);
+    assert.doesNotMatch(source, /isProductionPoolerHost\(new URL\(url\)\.host\)/);
+
+    // And the whole identity check agrees for the real URL: right ref passes,
+    // wrong ref refuses.
+    assert.equal(projectRefFromUrl(PROD), "ghzdbzdnwjxazvmcefbh");
+    const matches = (expected: string) =>
+        isProductionPoolerHost(new URL(PROD).hostname) && projectRefFromUrl(PROD) === expected;
+    assert.equal(matches("ghzdbzdnwjxazvmcefbh"), true, "the real production URL is accepted");
+    assert.equal(matches("someotherprojectref00"), false, "a different project is refused");
+});

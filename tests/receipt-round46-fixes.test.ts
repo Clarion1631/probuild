@@ -238,8 +238,18 @@ test("CI runs the apply script against a real database, with seeded rows", () =>
     assert.match(driver, /the losing memo-signed claim was not quarantined/);
     assert.match(driver, /INSERT INTO "ReceiptRequestCard"/);
     assert.match(driver, /"deliveredOn"/);
-    // Run twice, for idempotency.
-    assert.match(driver, /apply, again \(idempotency\)/);
+    // Run twice, for idempotency — and the legacy CARDS are seeded BETWEEN the
+    // two runs, because `ReceiptRequestCard` does not exist until the first one
+    // creates it. That is also the truer story: production carries cards the
+    // deployed app wrote after the first apply.
+    assert.match(driver, /apply, again \(idempotency, and the backfill has work now\)/);
+    const firstRunAt = driver.indexOf("=== apply ===");
+    const cardSeedAt = driver.indexOf("INSERT INTO \"ReceiptRequestCard\"");
+    const secondRunAt = driver.indexOf("=== apply, again");
+    assert.ok(firstRunAt > 0 && cardSeedAt > firstRunAt && secondRunAt > cardSeedAt,
+        "apply, then seed the legacy cards, then apply again");
+    // A bound parameter arrives as text; timestamps need the cast.
+    assert.match(driver, /\$1::timestamp/);
     // And the resulting shape is compared against a database built from the
     // committed migration — columns, indexes, RLS and policies.
     assert.match(driver, /pg_policies/);
