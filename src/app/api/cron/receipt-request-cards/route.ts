@@ -673,7 +673,34 @@ export async function GET(request: Request) {
         take: QUEUED_RESEND_DRAIN_LIMIT,
         select: { id: true, owner: true, pacificDate: true, itemsJson: true, overflow: true, overflowExact: true },
     });
+    /**
+     * ONE PER OWNER, AND ONLY IF TODAY IS STILL FREE (Codex PR #443 gate round
+     * 42, finding 4).
+     *
+     * The query above can return several queued days for one owner, and it says
+     * nothing about whether that owner already had today's card. Both break the
+     * one-message-per-owner-per-day rule the whole (owner, pacificDate) key
+     * exists to keep — from a direction that key cannot see, because a resend
+     * carries an OLD date.
+     *
+     * So: the oldest queued row per owner is taken, and the delivery-day claim
+     * below (`deliveredOn`, unique per owner and day) is what actually enforces
+     * it — a check here alone would be a race between two invocations.
+     */
+    const queuedByOwner = new Map<string, typeof queued[number]>();
     for (const row of queued) {
+        if (!queuedByOwner.has(row.owner)) queuedByOwner.set(row.owner, row);
+    }
+    const deliveredToday = new Set(
+        (await prisma.receiptRequestCard.findMany({
+            where: { deliveredOn: date },
+            select: { owner: true },
+        })).map(row => row.owner),
+    );
+    for (const row of queuedByOwner.values()) {
+        // Their card already went out today; the resend waits for tomorrow
+        // rather than becoming a second message.
+        if (deliveredToday.has(row.owner)) continue;
         const token = randomUUID();
         const taken = await prisma.receiptRequestCard.updateMany({
             where: {
@@ -840,6 +867,13 @@ export async function GET(request: Request) {
     // send them safely. NOT a failure and NOT uncertain: nothing was sent, the
     // claim is released, and the next invocation picks the row up unchanged.
     const sendDeferred: string[] = [];
+    /**
+     * Cards held back because their pre-send validation ran out of budget
+     * (round-42 gate, finding 3). Distinct from a plain send deferral: nothing
+     * about this card was decided, so the row keeps its snapshot AND its queue
+     * marker.
+     */
+    const budgetDeferred: string[] = [];
     for (const { card: claimedCard, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
         /**
          * ONE CACHE PER CARD, NOT PER RUN (Codex PR #443 gate round 37,
@@ -899,6 +933,40 @@ export async function GET(request: Request) {
             deadlineExceeded: () => remainingRevalidationBudgetMs(runStartedAt) <= 0,
         });
         const rebuilt = rebuildCardItems(claimedCard.items, truth, claimedCard.owner);
+
+        /**
+         * A REVALIDATION TIMEOUT IS NOT A VERDICT (Codex PR #443 gate round 42,
+         * finding 3).
+         *
+         * When the budget runs out mid-check, `rebuildCardItems` drops the
+         * items it could not verify with reason `revalidation-deadline` — which
+         * is right for "do not send this item", and catastrophic if the caller
+         * then treats the remainder as a decision: it rewrote the row's snapshot
+         * to a partial list, or deleted the row outright when every item was
+         * unverified, taking a queued resend and the operator's decision with
+         * it.
+         *
+         * So an incomplete validation defers the whole card instead: the row and
+         * its `resendQueuedAt` are left exactly as they were, the claim is
+         * released so the next pass can take it, and the run reports
+         * `deferred:budget`. Nothing is deleted and nothing is rewritten on the
+         * strength of a check that did not finish.
+         */
+        const unverified = rebuilt.dropped.filter(drop => drop.reason === "revalidation-deadline");
+        if (unverified.length > 0) {
+            await prisma.receiptRequestCard.updateMany({
+                where: { id: rowId, claimToken: token, postedAt: null },
+                data: { claimedAt: null, claimToken: null },
+            });
+            sendDeferred.push(claimedCard.owner);
+            budgetDeferred.push(claimedCard.owner);
+            continue;
+        }
+
+        // Only drops that were ACTED ON are reported. A deferred card dropped
+        // nothing — its items are unjudged, not excluded — so recording them
+        // here would put "revalidation-deadline" in the run summary for items
+        // the very next pass may well send.
         for (const drop of rebuilt.dropped) dropped.push({ owner: claimedCard.owner, ...drop });
 
         if (rebuilt.items.length === 0) {
@@ -1037,6 +1105,13 @@ export async function GET(request: Request) {
                 data: {
                     status: "POSTED",
                     postedAt: new Date(),
+                    // THE DELIVERY-DAY CLAIM (round-42 gate, finding 4): unique
+                    // per owner and day, so a second card for the same owner on
+                    // the same day loses on the constraint rather than on a
+                    // check somebody has to remember. Written with the post, in
+                    // the same transaction, because "delivered" and "claimed the
+                    // day" are the same event.
+                    deliveredOn: date,
                     threadName: result.threadName,
                     messageName: result.messageName,
                     attempts: { increment: 1 },
@@ -1137,7 +1212,15 @@ export async function GET(request: Request) {
         // reason rides along so a run that keeps deferring is distinguishable
         // from a quiet morning.
         sendDeferredOwners: sendDeferred,
-        ...(sendDeferred.length > 0 ? { deferredReason: "send-deferred" as const } : {}),
+        // Held back mid-validation, with nothing rewritten (round-42, finding
+        // 3). A budget deferral IS a send deferral — the card did not go out —
+        // so the owner appears in both lists; the REASON is the specific one,
+        // because "we ran out of clock before the send" and "we ran out of
+        // clock inside the check" are different failures to chase.
+        ...(budgetDeferred.length > 0 ? { budgetDeferredOwners: budgetDeferred } : {}),
+        ...(budgetDeferred.length > 0
+            ? { deferredReason: "deferred:budget" as const }
+            : sendDeferred.length > 0 ? { deferredReason: "send-deferred" as const } : {}),
         // Rows deleted this run because their stored itemsJson parsed to
         // nothing. Worth seeing, not worth failing the run over.
         invalidRows,

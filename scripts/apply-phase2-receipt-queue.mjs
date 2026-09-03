@@ -166,6 +166,26 @@ export const statements = [
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_resendQueuedAt_idx"
   ON "ReceiptRequestCard"("resendQueuedAt")`,
 
+    // THE DAY A CARD WAS ACTUALLY DELIVERED (Codex PR #443 gate round 42, finding 4).
+    //
+    // `pacificDate` is the day a card was SELECTED for, and a resend deliberately
+    // keeps its original one (its request id, and therefore its Chat thread, are
+    // derived from it). That leaves nothing recording the day it was SENT — so the
+    // one-message-per-owner-per-day rule, which is the whole point of the (owner,
+    // pacificDate) key, could be broken from two directions: several queued
+    // resends for one owner drained in the same run, and a resend drained on a day
+    // the owner had already had their ordinary card.
+    //
+    // This column is the delivery-day claim, taken BEFORE the post and unique per
+    // owner and day, so the second attempt loses on the constraint rather than on
+    // a check somebody has to remember to write.
+    `ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "deliveredOn" TEXT`,
+
+    // PARTIAL, so a card that has never been delivered holds no claim at all.
+    `CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptRequestCard_owner_deliveredOn_key"
+  ON "ReceiptRequestCard"("owner", "deliveredOn")
+  WHERE "deliveredOn" IS NOT NULL`,
+
     `CREATE INDEX IF NOT EXISTS "ReceiptRequestCard_pacificDate_idx"
        ON "ReceiptRequestCard"("pacificDate")`,
 
@@ -356,6 +376,9 @@ export const expectedColumns = {
         // NULLABLE and DEFAULTLESS: "no resend was asked for" is the absence of
         // a decision, not a decision with a date (round-41 gate, finding 3).
         { name: "resendQueuedAt", type: "timestamp without time zone", nullable: true, default: null },
+        // NULLABLE: "never delivered" is the absence of a claim, and the unique
+        // index is partial for exactly that reason (round-42 gate, finding 4).
+        { name: "deliveredOn", type: "text", nullable: true, default: null },
         { name: "id", type: "text", nullable: false, default: null },
         { name: "owner", type: "text", nullable: false, default: null },
         { name: "pacificDate", type: "text", nullable: false, default: null },

@@ -75,14 +75,29 @@ export async function GET(request: Request) {
     const auth = authenticateBridge(request);
     if (!auth.ok) return auth.response;
 
-    const cutoff = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
+    /**
+     * RETENTION FOLLOWS THE LAST DELIVERY, NOT THE CARD'S ORIGINAL DAY (Codex
+     * PR #443 gate round 42, finding 5).
+     *
+     * A resend keeps its original `pacificDate` on purpose — the request id,
+     * and therefore the thread, are derived from it (round-41 finding 2). But
+     * this export filtered on that same date, so a 20-day-old card resent this
+     * morning fell outside the window the moment it was posted: the bridge could
+     * not export its thread, and every "sign N" reply in it resolved against
+     * nothing.
+     *
+     * `postedAt` is when the card last actually reached Chat, which is exactly
+     * when its thread started being a place people reply in. The window is
+     * measured from there.
+     */
+    const cutoffAt = new Date(Date.now() - WINDOW_DAYS * 86_400_000);
 
     // POSTED cards only. A claimed-but-unposted row describes a message that
     // never reached Chat, and exporting its thread would invite the sweep to
     // look for replies in a thread that does not exist.
     const cards = await prisma.receiptRequestCard.findMany({
-        where: { pacificDate: { gte: cutoff }, postedAt: { not: null }, threadName: { not: null } },
-        orderBy: { pacificDate: "desc" },
+        where: { postedAt: { gte: cutoffAt }, threadName: { not: null } },
+        orderBy: { postedAt: "desc" },
         take: 200,
         select: { owner: true, pacificDate: true, itemsJson: true, threadName: true, messageName: true },
     });

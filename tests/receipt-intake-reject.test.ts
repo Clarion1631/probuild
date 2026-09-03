@@ -20,6 +20,8 @@ import {
     type RejectTxClient,
 } from "../src/lib/receipt-intake/storage-cleanup";
 
+/** How many times the reject transaction took the receipt-evidence lock. */
+let lockCalls = 0;
 const ROOT = path.resolve(__dirname, "..");
 const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
 const finalize = readFileSync(
@@ -65,7 +67,13 @@ function client(rows: Row[], onTx?: (store: Store) => void): { db: RejectClient;
             let staged = store.rows.map(r => ({ ...r }));
             const stagedEvents: Store["events"] = [];
             let seq = 0;
+            lockCalls = 0;
             const tx: RejectTxClient = {
+                // The receipt-evidence lock this transaction now takes
+                // (round-42 gate, finding 1). Recorded, because taking it is
+                // the invariant: a reject that skipped it could delete a row
+                // the sweep was mid-decision on.
+                $executeRaw: async () => { lockCalls++; return 0; },
                 automationEvent: {
                     create: async ({ data }) => {
                         const id = `ev-${++seq}`;
@@ -165,7 +173,9 @@ test("a lost reject fence answers 409 publish-conflict and keeps the object", ()
 test("publishing STAGING -> RECEIVED is fenced on the exact state", () => {
     const fn = intake.slice(intake.indexOf("async function publishStagedRow"));
     const body = fn.slice(0, fn.indexOf("\n/**"));
-    assert.match(body, /updateMany/, "not a bare update by id");
+    // `evidenceUpdateMany` since round 42 (finding 1): still a fenced
+    // updateMany, now inside the transaction that holds the evidence lock.
+    assert.match(body, /evidenceUpdateMany/i, "not a bare update by id");
     assert.match(
         body,
         /where: \{ id, state: expectState, storagePath: expectStoragePath \}/,
@@ -404,7 +414,9 @@ test("the sweeper and /start both fence on the lease version", () => {
     for (const branch of ["const rearmed = await signUpload(retryPath)", "const resumed = await signUpload(resumePath)"]) {
         const at = start.indexOf(branch);
         assert.ok(at > 0, branch);
-        const update = start.lastIndexOf("await prisma.receiptIntake.updateMany(", at);
+        // The write is  since round 42 (finding 1) — the
+        // same fenced updateMany, inside the evidence lock.
+        const update = start.lastIndexOf("await evidenceUpdateMany(", at);
         assert.ok(update > 0 && update < at, `${branch}: the row moves before the URL is signed`);
     }
     assert.equal((start.match(/error: "publish-conflict"/g) ?? []).length, 2, "a lost claim is a 409 on both");

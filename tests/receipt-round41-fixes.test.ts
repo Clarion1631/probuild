@@ -115,6 +115,11 @@ const cardsPrisma: Record<string, unknown> = {
             cards.get(`${where.owner_pacificDate.owner}|${where.owner_pacificDate.pacificDate}`) ?? null,
         /** THE DRAIN'S QUERY: queued rows for an earlier date. */
         findMany: async ({ where, take }: { where: Record<string, unknown>; take?: number }) => {
+            // The delivery-day claim lookup (round-42 gate, finding 4):
+            // which owners already had a card TODAY.
+            if (typeof where.deliveredOn === "string") {
+                return [...cards.values()].filter(row => row.deliveredOn === where.deliveredOn);
+            }
             const queuedOnly = where.resendQueuedAt as { not?: null } | undefined;
             const before = (where.pacificDate as { lt?: string } | undefined)?.lt;
             const rows = [...cards.values()].filter(row => {
@@ -316,7 +321,7 @@ test("a queued resend Chat rejected is still drained, and still counted", async 
 test("the drain and the probes read the column, and only a POST discharges it", () => {
     const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
     assert.match(cron, /resendQueuedAt: \{ not: null \},/, "the drain selects on the column");
-    assert.match(cron, /status: "POSTED",[\s\S]{0,900}resendQueuedAt: null,/, "and only a successful post clears it");
+    assert.match(cron, /status: "POSTED",[\s\S]{0,1500}resendQueuedAt: null,/, "and only a successful post clears it");
     assert.doesNotMatch(cron, /lastError: CARD_RESEND_QUEUED_REASON,\s*\n\s*pacificDate/, "the text is no longer the query");
     assert.match(cron, /if \(drainedOwners\.has\(owner\)\) continue;/);
 
@@ -381,7 +386,7 @@ test("the component transaction is fenced by its own re-read, at the isolation t
     // NOT SERIALIZABLE, deliberately and with evidence: snapshot isolation
     // hides the very row the re-read exists to catch, and SSI raises nothing
     // for this access pattern (one rw edge, no cycle). Both facts are measured
-    // against a real Postgres in tests/receipt-sweep-serializable-db.test.ts.
+    // against a real Postgres in tests/receipt-evidence-fence-db.test.ts.
     assert.doesNotMatch(sweep, /isolationLevel: "Serializable"/);
 
     // The re-read comes after the locks and BEFORE the writes — a check that

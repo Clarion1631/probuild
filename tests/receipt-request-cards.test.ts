@@ -631,7 +631,7 @@ test("the cron commits delivery+history together and repairs old gaps", () => {
         "utf8",
     );
     // ONE transaction: the POSTED write and the history write.
-    assert.match(source, /const completed = await prisma\.\$transaction\(async tx => \{[\s\S]{0,1400}await recordCardOnIssues\(card, result\.threadName, result\.messageName, now, tx\);/);
+    assert.match(source, /const completed = await prisma\.\$transaction\(async tx => \{[\s\S]{0,2000}await recordCardOnIssues\(card, result\.threadName, result\.messageName, now, tx\);/);
     // And no second, un-transacted call after it.
     assert.doesNotMatch(source, /await recordCardOnIssues\(card, result\.threadName, result\.messageName, now\);/);
     // THE REPAIR PASS: bounded, idempotent, and it never fails the run.

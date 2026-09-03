@@ -38,6 +38,7 @@ import {
 import { REGISTER_WINDOW_DAYS, registerWindowStartYmd } from "@/lib/bank-register-pull";
 import { lockBankLedgerEpoch, readBankLedgerEpoch } from "@/lib/bank-ledger-epoch";
 import { withTxRetry } from "@/lib/tx-retry";
+import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 import { BANK_PULL_LAST_SUCCESS_KEY, BANK_PULL_CHASER_WINDOW_HOURS } from "@/lib/pipeline-health";
 import {
     SWEEP_MARKER_KEY,
@@ -472,6 +473,64 @@ async function writePhase(
 }
 
 /** The resume cursor: the last BankLine id this sweep finished, oldest-first. */
+/**
+ * THE CURSOR AND THE EPOCH IT BELONGS TO (Codex PR #443 gate round 42,
+ * finding 2).
+ *
+ * The cursor says "this cycle has judged everything up to here". That claim is
+ * only true of the LEDGER IT WAS TAKEN AGAINST: a BankLine inserted between two
+ * invocations joins the next invocation's freshly-read baseline epoch and, if
+ * its component key sorts before the cursor, is filtered out and never judged —
+ * while the fence, comparing the new baseline to itself, sees nothing wrong.
+ * The cycle then stamps complete over a line nobody looked at.
+ *
+ * So the epoch travels WITH the cursor, as one value, and a resume that finds a
+ * different epoch restarts the cycle from the top rather than trusting a
+ * position measured against a ledger that has since moved.
+ *
+ * Stored as `e<epoch>|<component key>`. The `e` prefix is load bearing: a
+ * component key is ITSELF `<date>|<id>`, so a bare `<epoch>|<key>` cannot be
+ * told apart from a legacy cursor whose date happened to look like an epoch.
+ * Anything without the prefix is a value from an older build and reads as "no
+ * epoch", which restarts — the safe direction.
+ */
+interface SweepCursor {
+    key: string | null;
+    epoch: string | null;
+}
+
+/** The prefix that tells an epoch-carrying cursor from a legacy bare key. */
+const CURSOR_EPOCH_PREFIX = "e";
+
+export function parseSweepCursor(value: string | null): SweepCursor {
+    if (!value) return { key: null, epoch: null };
+    if (!value.startsWith(CURSOR_EPOCH_PREFIX)) return { key: value, epoch: null };
+    const at = value.indexOf("|");
+    if (at < 0) return { key: value, epoch: null };
+    const epoch = value.slice(CURSOR_EPOCH_PREFIX.length, at);
+    // An epoch is a counter. Anything else came from somewhere this format
+    // does not describe, and is not a position worth trusting.
+    if (!/^[0-9]+$/.test(epoch)) return { key: value, epoch: null };
+    return { epoch, key: value.slice(at + 1) || null };
+}
+
+export function formatSweepCursor(cursor: SweepCursor): string | null {
+    if (!cursor.key) return null;
+    if (cursor.epoch === null) return cursor.key;
+    return `${CURSOR_EPOCH_PREFIX}${cursor.epoch}|${cursor.key}`;
+}
+
+/**
+ * Is a persisted cursor still usable against the ledger this run sees?
+ *
+ * Only when it was taken against the SAME epoch. Anything else — a different
+ * epoch, a cursor from a build that stored no epoch — means the ledger moved
+ * under the cycle, and the honest answer is to start it again.
+ */
+export function cursorUsableAt(cursor: SweepCursor, epoch: string): boolean {
+    return cursor.key !== null && cursor.epoch === epoch;
+}
+
 async function readCursor(): Promise<string | null> {
     try {
         const row = await prisma.automationSetting.findUnique({ where: { key: CURSOR_KEY } });
@@ -1309,7 +1368,7 @@ async function processBatch(
              * ComponentMovedError, nothing is written, and the batch replans.
              *
              * SERIALIZABLE WAS TRIED AND IS WRONG HERE, twice over
-             * (tests/receipt-sweep-serializable-db.test.ts measures both against
+             * (tests/receipt-evidence-fence-db.test.ts measures both against
              * a real Postgres):
              *   * SSI aborts a transaction only to break a rw-antidependency
              *     CYCLE. This transaction reads the evidence and writes
@@ -1328,7 +1387,20 @@ async function processBatch(
              */
             await withTxRetry(() => prisma.$transaction(async tx => {
                 /**
-                 * 0. THE COMPONENT LOCK.
+                 * 0a. THE EVIDENCE LOCK, FIRST OF ALL (round-42 gate, finding 1).
+                 *
+                 * Held across the reads below AND the ReviewIssue writes at the
+                 * end, so a receipt landing mid-component blocks until this
+                 * transaction commits and is seen by the next pass — instead of
+                 * slipping between the evidence read and the verdict. It is the
+                 * OUTERMOST lock by convention: every holder takes it before the
+                 * component lock, the identity lock, or any row lock, which is
+                 * what makes the order global and deadlock-free.
+                 */
+                await lockReceiptEvidence(tx);
+
+                /**
+                 * 0b. THE COMPONENT LOCK.
                  *
                  * Row locks cover the rows that EXIST; they cannot exclude a
                  * concurrent sweep that is about to read the same Expense and
@@ -1598,7 +1670,18 @@ export async function GET(request: Request) {
         return NextResponse.json({ ok: true, skipped: "already-running" });
     }
     try {
-        // A scheduled full run always starts a fresh cycle at the top.
+        /**
+         * A SCHEDULED FULL RUN STARTS A FRESH CYCLE, CURSORS AND ALL (round-42
+         * gate, finding 2).
+         *
+         * It already restarted the PHASE at the top; it also read whatever
+         * cursors the previous cycle left, so a stale line cursor could filter
+         * out components the fresh run was supposed to judge. A fresh cycle
+         * means fresh everywhere: the cursors are cleared before the read.
+         */
+        if (!continueOnly) {
+            await Promise.all([writeCursor(null), writeOpenCursor(null)]);
+        }
         return await runSweep(now, continueOnly ? resumePhase : "open-issues");
     } catch (error) {
         // A cursor that will not persist is an INVOCATION ERROR, not a quiet
@@ -1823,10 +1906,28 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
             ))
             .flatMap(component => component.lineIds),
     );
-    // The cursor is a COMPONENT KEY now. A cursor left by an older build is a
-    // bare BankLine id; it cannot be placed in this ordering, so the cycle
-    // restarts once — idempotent, and it self-corrects on the first checkpoint.
-    const resumeFrom = isComponentKey(cursor) ? cursor : null;
+    /**
+     * THE CURSOR IS ONLY VALID AGAINST THE EPOCH IT WAS TAKEN AT (round-42
+     * gate, finding 2).
+     *
+     * A BankLine inserted between two invocations joins this run's baseline and
+     * can sort BEFORE the persisted cursor — filtered out, never judged, while
+     * the fence (which compares this run's baseline to itself) sees nothing.
+     * A cursor whose epoch does not match this run's is therefore not a
+     * position at all, and the cycle restarts from the top; re-judging is free
+     * (every write here is idempotent) and skipping is not.
+     *
+     * A cursor left by an older build carries no epoch and restarts the same
+     * way. The FRESH 13:00 run is handled by `retryOnly` below: it clears the
+     * cursor before this point rather than resuming into it.
+     */
+    const parsedCursor = parseSweepCursor(cursor);
+    const cursorEpochMatches = cursorUsableAt(parsedCursor, snapshotEpoch);
+    if (!cursorEpochMatches && parsedCursor.key !== null) {
+        console.log("[cron/receipt-requests] ledger moved between invocations; restarting the cycle",
+            { cursorEpoch: parsedCursor.epoch, snapshotEpoch });
+    }
+    const resumeFrom = cursorEpochMatches && isComponentKey(parsedCursor.key ?? "") ? parsedCursor.key : null;
     const pages = pageComponents(
         resumeFrom ? components.filter(component => component.key > resumeFrom) : components,
         BATCH_SIZE,
@@ -1846,7 +1947,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // judge, but the checkpoint still has to move past it.
         if (batch.length === 0) {
             cursor = page[page.length - 1].key;
-            await writeCursor(cursor);
+            await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch }));
             if (pageIndex >= pages.length) exhausted = true;
             continue;
         }
@@ -1895,7 +1996,7 @@ async function runSweep(now: Date, startPhase: SweepPhase = "open-issues") {
         // The checkpoint is the last COMPONENT this page finished, so a resume
         // can never land in the middle of a competition set.
         cursor = page[page.length - 1].key;
-        await writeCursor(cursor);
+        await writeCursor(formatSweepCursor({ key: cursor, epoch: snapshotEpoch }));
         if (pageIndex >= pages.length) { exhausted = true; break; }
     }
 

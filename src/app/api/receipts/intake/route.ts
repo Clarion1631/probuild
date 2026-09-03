@@ -25,6 +25,30 @@ import {
     serializeReceiptIntake,
     withArchiveDownloadUrls,
 } from "@/lib/receipt-intake/queries";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it READ, and holds the
+ * same advisory lock across those reads and its verdicts — so every writer of
+ * that evidence takes it too, inside its own transaction, before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist.
+ *
+ * Held for one write. Never across a Drive download or a QuickBooks call.
+ */
+const evidenceCreate = <T = { id: string; state: string; sourceRef: string; projectId: string | null; dryRun: boolean }>(
+    args: Prisma.ReceiptIntakeCreateArgs,
+): Promise<T> =>
+    withReceiptEvidenceLock<T>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.create(args) as unknown as Promise<T>);
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
+const evidenceDeleteMany = (args: Prisma.ReceiptIntakeDeleteManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.deleteMany(args));
+const evidenceDelete = (args: Prisma.ReceiptIntakeDeleteArgs) =>
+    withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.receiptIntake.delete(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -257,7 +281,7 @@ export async function POST(req: Request) {
     // case storage is never touched at all.
     let created: { id: string; state: string; sourceRef: string; projectId: string | null; dryRun: boolean };
     try {
-        created = await prisma.receiptIntake.create({
+        created = await evidenceCreate({
             data: {
                 id,
                 source,
@@ -308,7 +332,7 @@ export async function POST(req: Request) {
 
     const supabase = getSupabase();
     if (!supabase) {
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        await evidenceDelete({ where: { id } }).catch(() => { /* best effort */ });
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
     // A THROW here is not the same as an error result — the SDK can reject
@@ -362,7 +386,7 @@ export async function POST(req: Request) {
         // told did not exist.
         let deletedCount: number;
         try {
-            const result = await prisma.receiptIntake.deleteMany({
+            const result = await evidenceDeleteMany({
                 where: { id, state: "STAGING", storagePath },
             });
             deletedCount = result.count;
@@ -427,7 +451,7 @@ async function publishStagedRow(id: string, expectStoragePath: string, expectSta
         // publisher onto the same state with two different ideas of which
         // object is now canonical. Pinning storagePath makes that update
         // match zero rows instead.
-        const { count } = await prisma.receiptIntake.updateMany({
+        const { count } = await evidenceUpdateMany({
             where: { id, state: expectState, storagePath: expectStoragePath },
             data: { state: "RECEIVED" },
         });
@@ -568,7 +592,7 @@ async function respondToSourceRefConflict(
             // reason, unclaimed. Losing this race means somebody moved the row
             // while we were uploading, so the object we just wrote is
             // unreferenced — clean it up rather than orphan it.
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: existing.id, ...publishFence(existing) },
                 data: { storagePath: payload.storagePath, state: "RECEIVED", stateReason: null, nextRetryAt: null },
             });

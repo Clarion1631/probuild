@@ -15,6 +15,7 @@
 import { logAutomationEvent } from "@/lib/automation-events";
 import { prisma } from "@/lib/prisma";
 import { removeReceiptObject, uploadReceiptObject } from "./bucket";
+import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 export const STORAGE_CLEANUP_KIND = "storage-cleanup-pending";
 
@@ -95,6 +96,11 @@ export async function recordPendingCleanup(storagePath: string, reason: string):
  */
 /** The two writes the reject transaction needs — injectable so it is testable. */
 export interface RejectTxClient {
+    /**
+     * The receipt-evidence lock runs through here (round-42 gate, finding 1):
+     * this transaction changes what the sweep reads, so it queues behind it.
+     */
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
     automationEvent: { create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }> };
     receiptIntake: {
         deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
@@ -136,6 +142,9 @@ export async function rejectRowAndQueueCleanup(
 ): Promise<{ ok: true; eventId: string } | { ok: false }> {
     try {
         const eventId = await db.$transaction(async tx => {
+            // Deleting a row removes evidence, so it queues behind the sweep
+            // like every other writer (round-42 gate, finding 1).
+            await lockReceiptEvidence(tx);
             const event = await tx.automationEvent.create({
                 data: {
                     kind: STORAGE_CLEANUP_KIND,

@@ -38,6 +38,7 @@ import {
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
 import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, preservedTaxWarning } from "./route-state";
+import { lockReceiptEvidence } from "@/lib/receipt-evidence-lock";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -171,6 +172,11 @@ export type BookResult =
 
 /** Structural subset of PrismaClient this module uses. */
 export interface BookPrismaClient {
+    /**
+     * The receipt-evidence lock runs through here (round-42 gate, finding 1):
+     * this transaction changes what the sweep reads, so it queues behind it.
+     */
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
     project: {
         findUnique(args: any): Promise<{
             id: string;
@@ -661,6 +667,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
             : (row.refNumber && row.refNumber !== "NoInv" ? `Invoice ${row.refNumber}` : "Receipt");
 
         const expenseId = await deps.db.$transaction(async tx => {
+            // The evidence lock, before anything is read or written here: this
+            // transaction moves a row to BOOKED and attaches its Expense, which
+            // is exactly what the sweep reads as "the receipt exists"
+            // (round-42 gate, finding 1).
+            await lockReceiptEvidence(tx);
             // THE FENCE COMES FIRST, and that ordering is the whole point.
             //
             // It used to run after the Expense was created, which meant a void

@@ -37,7 +37,7 @@ import type { Prisma } from "@prisma/client";
  * point of `withDuplicateChainLock` is that the caller writes inside the same
  * transaction that took the lock (round-40 gate, finding 1).
  */
-export type DuplicateGuardClient = Pick<Prisma.TransactionClient, "$queryRaw" | "receiptIntake">;
+export type DuplicateGuardClient = Pick<Prisma.TransactionClient, "$queryRaw" | "$executeRaw" | "receiptIntake">;
 
 interface LockedRow { id: string; duplicateOfId: string | null }
 

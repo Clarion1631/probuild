@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateIntake, STAFF_READ_ROLES, type IntakeAuth } from "@/lib/receipt-intake/intake-auth";
@@ -26,6 +27,20 @@ import {
     sealObject,
     settleQueuedCleanup,
 } from "@/lib/receipt-intake/storage-cleanup";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it read and holds one
+ * advisory lock across those reads AND its verdicts, so every writer of that
+ * evidence takes the same lock inside its own transaction before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist. Held for one write only.
+ */
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
 
 export const dynamic = "force-dynamic";
 
@@ -78,7 +93,7 @@ async function applyLateFields(
             select: { costCodeId: true, projectId: true, state: true, claimToken: true },
         }),
         applyIfNull: async (rowId, state, toApply) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: {
                     id: rowId,
                     state,
@@ -415,7 +430,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     const outcome = await sealAndPublish(row.storagePath, id, check, {
         seal: sealObject,
         commit: async (canonicalPath, values) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 // Fenced on the EXACT state and reason observed, on the row
                 // being unclaimed, and on every captured value this publish was
                 // validated against. Anything that moved between the read and

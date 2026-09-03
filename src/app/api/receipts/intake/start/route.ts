@@ -13,6 +13,24 @@ import { createReceiptUploadUrl, receiptObjectSize } from "@/lib/receipt-intake/
 import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * The missing-receipt sweep decides from the evidence it read and holds one
+ * advisory lock across those reads AND its verdicts, so every writer of that
+ * evidence takes the same lock inside its own transaction before writing. A
+ * bare `prisma.*` call is its own implicit transaction and cannot hold an
+ * xact-scoped lock, which is why these wrappers exist. Held for one write only.
+ */
+const evidenceCreate = <T>(args: Prisma.ReceiptIntakeCreateArgs): Promise<T> =>
+    withReceiptEvidenceLock<T>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.create(args) as unknown as Promise<T>);
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
+const evidenceDelete = (args: Prisma.ReceiptIntakeDeleteArgs) =>
+    withReceiptEvidenceLock(fn => prisma.$transaction(fn), tx => tx.receiptIntake.delete(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -140,7 +158,7 @@ export async function POST(req: Request) {
 
     let created: { id: string; sourceRef: string; state: string };
     try {
-        created = await prisma.receiptIntake.create({
+        created = await evidenceCreate({
             data: {
                 id,
                 source: decided.source,
@@ -255,7 +273,7 @@ export async function POST(req: Request) {
                 // already in the client's hands.
                 const nextLease = existing.uploadLeaseVersion + 1;
                 const retryPath = uploadPathFor(existing.id, nextLease, ext);
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: { id: existing.id, ...publishFence(existing) },
                     data: {
                         storagePath: retryPath,
@@ -388,7 +406,7 @@ export async function POST(req: Request) {
                 // race and falls through to the resume-with-a-new-lease path
                 // below rather than handing out a URL for a lease we could not
                 // actually extend.
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: {
                         id: existing.id,
                         state: "STAGING",
@@ -413,7 +431,7 @@ export async function POST(req: Request) {
             // game to invalidate, since nothing live can still be relying on it.
             const nextLease = existing.uploadLeaseVersion + 1;
             const resumePath = uploadPathFor(existing.id, nextLease, ext);
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: {
                     id: existing.id,
                     state: "STAGING",
@@ -454,7 +472,7 @@ export async function POST(req: Request) {
 
     const signed = await signUpload(storagePath);
     if (!signed) {
-        await prisma.receiptIntake.delete({ where: { id } }).catch(() => { /* best effort */ });
+        await evidenceDelete({ where: { id } }).catch(() => { /* best effort */ });
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
 

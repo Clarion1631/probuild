@@ -2807,6 +2807,20 @@ model ReceiptRequestCard {
   messageName String?
   attempts    Int       @default(0)
   lastError   String?
+  /// THE DAY A CARD WAS ACTUALLY DELIVERED (Codex PR #443 gate round 42, finding 4).
+  ///
+  /// `pacificDate` is the day a card was SELECTED for, and a resend deliberately
+  /// keeps its original one (its request id, and therefore its Chat thread, are
+  /// derived from it). That leaves nothing recording the day it was SENT — so the
+  /// one-message-per-owner-per-day rule, which is the whole point of the (owner,
+  /// pacificDate) key, could be broken from two directions: several queued
+  /// resends for one owner drained in the same run, and a resend drained on a day
+  /// the owner had already had their ordinary card.
+  ///
+  /// This column is the delivery-day claim, taken BEFORE the post and unique per
+  /// owner and day, so the second attempt loses on the constraint rather than on
+  /// a check somebody has to remember to write.
+  deliveredOn String?
   /// When an operator asked for this card to be RESENT (Codex PR #443 gate
   /// round 41, finding 3).
   ///
@@ -2822,6 +2836,11 @@ model ReceiptRequestCard {
   updatedAt   DateTime  @updatedAt
 
   @@unique([owner, pacificDate])
+  /// ONE DELIVERY PER OWNER PER DAY, enforced rather than remembered
+  /// (round-42 gate, finding 4). Partial in the database — a row that has never
+  /// been delivered holds no claim — so the constraint only binds real
+  /// deliveries.
+  @@unique([owner, deliveredOn])
   @@index([pacificDate])
   /// The drain's own lookup: queued rows, oldest first, whatever date they are
   /// for. Partial so it stays small — a card that was never resent is not in it.

@@ -108,6 +108,7 @@ interface Recorder {
     purchaseCalls: any[];
     expenses: any[];
     intakeUpdates: any[];
+    lockCalls: string[];
     events: any[];
 }
 
@@ -121,6 +122,7 @@ function recorder(
     const expenses: any[] = [];
     const intakeUpdates: any[] = [];
     const events: any[] = [];
+    const lockCalls: string[] = [];
 
     const tx = {
         project: {
@@ -147,6 +149,14 @@ function recorder(
                 return { count: 1 };
             },
         },
+        // THE RECEIPT-EVIDENCE FENCE (Codex PR #443 gate round 42, finding 1).
+        // Booking a row changes what the sweep reads, so the write is taken
+        // under the shared advisory lock; the fake records that it was asked
+        // for, and `lockCalls` below is what the assertion reads.
+        $executeRaw: async (query: TemplateStringsArray, ...values: unknown[]) => {
+            lockCalls.push(`${query.join("?")}|${values.join(",")}`);
+            return 1;
+        },
         $transaction: async (fn: any) => fn(tx),
     };
 
@@ -168,7 +178,7 @@ function recorder(
         markSendAttempted: async id => { sendMarks.push(id); return true; },
         ...overrides,
     };
-    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events };
+    return { deps, sendMarks, purchaseCalls, expenses, intakeUpdates, events, lockCalls };
 }
 
 test("a taxed receipt splits into a pre-tax line and a sales-tax line that reconstruct the total", () => {

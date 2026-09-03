@@ -148,6 +148,7 @@ import {
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
 import { findThreadItem } from "./selection-item-thread-dependencies";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "./receipt-evidence-lock";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -15271,6 +15272,15 @@ async function receiptIntakeWriteFailure(id: string, allowedStates: readonly str
  * clean case takes exactly one write, and the fallback only runs for a row
  * whose send had already started.
  */
+/**
+ * INTAKE WRITES FROM THE QUEUE UI, EACH IN ITS OWN LOCKED TRANSACTION (Codex
+ * PR #443 gate round 42, finding 1). Unmarking a duplicate, parking an orphan
+ * or re-routing a row all change what the missing-receipt sweep reads, so they
+ * queue behind it exactly like the worker's writes do.
+ */
+const evidenceIntakeUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
+
 async function runParkWrites(
     plan: ParkPlan,
     id: string,
@@ -15368,7 +15378,7 @@ export async function setReceiptIntakeJob(id: string, projectId: string, expecte
     if (!["NEEDS_JOB", "NEEDS_REVIEW"].includes(expected)) {
         throw new Error("A job can only be set on a receipt waiting for one");
     }
-    const result = await prisma.receiptIntake.updateMany({
+    const result = await evidenceIntakeUpdateMany({
         where: { id, state: expected, updatedAt: seenAt, ...notClaimedByWorker(now) },
         data: {
             projectId,
@@ -15429,6 +15439,9 @@ export async function markReceiptIntakeDuplicate(id: string, duplicateOfId: stri
      * the inbound references cannot change between the read and the write.
      */
     await withDuplicateChainLock(fn => prisma.$transaction(fn), [id, duplicateOfId], async (tx, inbound) => {
+        // The evidence lock is the OUTERMOST lock (round-42 gate, finding 1):
+        // marking a row DUPLICATE changes what the sweep reads.
+        await lockReceiptEvidence(tx);
 
         // RE-READ INSIDE THE LOCK. Everything below was read a moment ago on
         // the page; under the lock it is read again because that is the only
@@ -15485,7 +15498,7 @@ export async function unmarkReceiptIntakeDuplicate(id: string, expectedUpdatedAt
 
     const now = new Date();
     const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
-    const result = await prisma.receiptIntake.updateMany({
+    const result = await evidenceIntakeUpdateMany({
         // DUPLICATE twice over is the ABA case exactly: unmarked, re-marked
         // against a different original, and this click would undo the new one.
         where: { id, state: "DUPLICATE", updatedAt: seenAt, ...notClaimedByWorker(now) },
@@ -15513,6 +15526,8 @@ export async function voidReceiptIntake(id: string, expectedState: string, expec
      * a duplicate marked a moment later slips through the gap.
      */
     await withDuplicateChainLock(fn => prisma.$transaction(fn), [id], async (tx, inboundById) => {
+        // Same rule for a void: the row stops being evidence.
+        await lockReceiptEvidence(tx);
         const inbound = inboundById.get(id) ?? [];
         if (inbound.length > 0) throw duplicateChainRefusal("void", inbound);
         await runParkWrites(planParkWrites({
@@ -15558,7 +15573,7 @@ export async function retryReceiptIntake(id: string, expectedUpdatedAt: string) 
         );
     }
 
-    const result = await prisma.receiptIntake.updateMany({
+    const result = await evidenceIntakeUpdateMany({
         // The row version the human SAW, not merely the state and reason the
         // re-read found: those two can be identical across a whole failed
         // attempt in between.
@@ -15615,7 +15630,7 @@ export async function resolveOrphanedQbPurchase(id: string, expectedUpdatedAt: s
     // CAS on BOTH the state and the purchase id: the worker can move the state
     // and a second tab can resolve the same row, and either means the view this
     // click came from is stale.
-    const result = await prisma.receiptIntake.updateMany({
+    const result = await evidenceIntakeUpdateMany({
         where: { id, state: row.state, updatedAt: seenAt, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
         data: { postVoidQbPurchaseId: null, stateReason },
     });
@@ -15775,7 +15790,7 @@ export async function resolveUnknownOrphan(
             dedupStrongKey: null,
             stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.noPurchase}`.slice(0, 400),
         };
-    const result = await prisma.receiptIntake.updateMany({ where: orphanWhere, data });
+    const result = await evidenceIntakeUpdateMany({ where: orphanWhere, data });
     if (result.count === 0) {
         // TYPED, so the caller can tell "somebody else got here first" from
         // "this row was never an unknown-id orphan" — the second one is a bug

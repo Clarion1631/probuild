@@ -371,7 +371,10 @@ test("the sweep is time-budgeted, checkpoints per batch, and stops at a failure"
     assert.match(source, /const RUN_BUDGET_MS = 45_000;/);
     assert.match(source, /while \([^)]*Date\.now\(\) - startedAt < RUN_BUDGET_MS\)/);
     // Checkpoint after every page, so a killed run loses one page, not all.
-    assert.match(source, /await writeCursor\(cursor\);/);
+    // The checkpoint carries the epoch it was taken against (round-42 gate,
+    // finding 2): a cursor measured against a ledger that has since moved is
+    // not a position, and resuming into it skipped newly inserted lines.
+    assert.match(source, /await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch \}\)\)/);
     // The cursor must NOT advance past a target whose write threw — from
     // either half of the page (round-20 finding 3) — or past an unresolved
     // contended component (round-22 finding: no replan ever reached a verdict).

@@ -3,6 +3,7 @@ import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
+import { withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -181,7 +182,10 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         : null;
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
-    return prisma.expense.create({
+    // Carries a receiptUrl, so it is sweep evidence (round-42 gate, finding 1).
+    return withReceiptEvidenceLock<Awaited<ReturnType<typeof prisma.expense.create>>>(
+        fn => prisma.$transaction(fn),
+        tx => tx.expense.create({
         data: {
             estimateId,
             itemId: data.itemId || null,
@@ -195,7 +199,8 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
             changeOrderId: changeOrder?.id ?? null,
             isBillable: data.isBillable ?? Boolean(changeOrder),
         },
-    });
+        }),
+    );
 }
 
 export async function tagTimeEntriesToChangeOrderCore(

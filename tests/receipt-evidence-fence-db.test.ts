@@ -34,6 +34,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
 import { componentVersionOf, componentVersionsMatch } from "../src/lib/receipt-requests";
+import { RECEIPT_EVIDENCE_LOCK } from "../src/lib/receipt-evidence-lock";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
 const looksLikeProd = !!url && /supabase\.(co|com)/i.test(url);
@@ -209,6 +210,105 @@ test("SERIALIZABLE would not have helped: no 40001, and the re-read goes blind",
     assert.equal(outcome.moved, false, "snapshot isolation hides the row the fence needs to see");
     assert.equal(outcome.opened, true, "and SSI raises no serialization failure for this access pattern");
     assert.equal(await sweepDb!.reviewIssue.count({ where: { targetKey } }), 1);
+    await cleanup();
+});
+
+/**
+ * THE LOCK ITSELF — does it actually make an evidence writer WAIT?
+ *
+ * Codex PR #443 gate round 42, finding 1. The re-read above catches evidence
+ * that moved; the lock is what stops it moving in the first place, so a
+ * component that plans, re-reads and writes is not racing a booking at all. A
+ * source-text tripwire can prove every writer CALLS lockReceiptEvidence. Only a
+ * second connection can prove the call does anything.
+ *
+ * Both halves are measured here: an evidence writer blocks while the sweep
+ * holds the lock, and the SAME writer sails straight through when the sweep
+ * holds a different one. The control matters because pg_advisory_xact_lock
+ * never fails — a lock nobody else takes is indistinguishable from no lock at
+ * all, which is exactly what a name typo would produce.
+ */
+type RawClient = { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> };
+
+async function takeLockNamed(tx: RawClient, name: string) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${name}))`;
+}
+
+test("an evidence writer BLOCKS while the sweep holds the receipt-evidence lock", { skip }, async () => {
+    await cleanup();
+
+    // What happened, in order. The assertion is about ORDER, not elapsed time:
+    // a sleep-threshold test passes on a slow runner for the wrong reason.
+    const order: string[] = [];
+    let sweepCommitted = false;
+    const lockedRef = `drive:${PREFIX}locked`;
+
+    // The writer takes the same lock and then inserts. It cannot reach its
+    // insert until the sweep's transaction ends.
+    const writer = (async () => {
+        // Give the sweep a moment to BEGIN and take the lock. If it has not,
+        // the writer wins the lock and the order assertion fails loudly rather
+        // than passing vacuously.
+        await new Promise(resolve => setTimeout(resolve, 250));
+        order.push("writer:waiting");
+        await otherDb!.$transaction(async tx => {
+            await takeLockNamed(tx, RECEIPT_EVIDENCE_LOCK);
+            order.push(sweepCommitted ? "writer:acquired-after-commit" : "writer:acquired-BEFORE-commit");
+            await seedIntake(`${PREFIX}locked`);
+        }, { timeout: 20_000 });
+    })();
+
+    await sweepDb!.$transaction(async tx => {
+        await takeLockNamed(tx, RECEIPT_EVIDENCE_LOCK);
+        order.push("sweep:holding");
+        // While the sweep holds it the writer is parked inside
+        // pg_advisory_xact_lock, before its INSERT.
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        // Proof it is parked rather than merely slow: the sweep's own next
+        // statement, on its own connection, still sees no such row.
+        const seen = await tx.receiptIntake.count({ where: { sourceRef: lockedRef } });
+        assert.equal(seen, 0, "the writer got past the lock while the sweep held it");
+        order.push("sweep:read-clean");
+    }, { timeout: 20_000 });
+    sweepCommitted = true;
+
+    await writer;
+
+    assert.deepEqual(order, [
+        "sweep:holding",
+        "writer:waiting",
+        "sweep:read-clean",
+        "writer:acquired-after-commit",
+    ], "the writer's acquire has to land after the sweep's commit, never before it");
+    await cleanup();
+});
+
+test("PRE-FIX CONTROL: a DIFFERENT lock name blocks nothing at all", { skip }, async () => {
+    /**
+     * The same interleaving with the sweep holding "receipt-evidence-typo".
+     * pg_advisory_xact_lock cannot fail, so from the writer's side a fence on
+     * the wrong name looks identical to a real one — which is what makes the
+     * single-lock-name tripwire in receipt-evidence-lock.test.ts load bearing
+     * rather than cosmetic.
+     */
+    await cleanup();
+    let acquiredWhileHeld = false;
+
+    const writer = (async () => {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        await otherDb!.$transaction(async tx => {
+            await takeLockNamed(tx, RECEIPT_EVIDENCE_LOCK);
+            acquiredWhileHeld = true;
+        }, { timeout: 20_000 });
+    })();
+
+    await sweepDb!.$transaction(async tx => {
+        await takeLockNamed(tx, `${RECEIPT_EVIDENCE_LOCK}-typo`);
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        assert.equal(acquiredWhileHeld, true, "with a mismatched name the writer should NOT have been held up");
+    }, { timeout: 20_000 });
+
+    await writer;
     await cleanup();
 });
 

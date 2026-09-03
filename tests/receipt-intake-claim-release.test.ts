@@ -21,11 +21,30 @@ import path from "node:path";
 const ROOT = path.resolve(__dirname, "..");
 const route = readFileSync(path.join(ROOT, "src/app/api/cron/receipt-intake-worker/route.ts"), "utf8");
 
-/** Every `data: { ... }` of every receiptIntake update in the file, with context. */
+/**
+ * Every `data: { ... }` of every receiptIntake update in the file, with context.
+ *
+ * TWO CALL SHAPES since the round-42 evidence fence (finding 1): a direct
+ * `tx.receiptIntake.updateMany(...)` and the fenced `evidenceUpdateMany(...)`
+ * helper, which takes the identical args object and runs it under the shared
+ * advisory lock. A walker that only knew the first shape silently stopped
+ * seeing most of the worker's transitions the moment they were fenced — which
+ * is exactly the vacuous pass the count assertion below exists to catch.
+ */
+const UPDATE_CALL_SHAPES = ["receiptIntake.update", "evidenceUpdateMany("];
+
 function updateBlocks(source: string): { data: string; where: string }[] {
     const blocks: { data: string; where: string }[] = [];
-    const needle = "receiptIntake.update";
-    let at = source.indexOf(needle);
+    let at = -1;
+    const nextCall = (from: number) => {
+        let best = -1;
+        for (const candidate of UPDATE_CALL_SHAPES) {
+            const hit = source.indexOf(candidate, from);
+            if (hit !== -1 && (best === -1 || hit < best)) best = hit;
+        }
+        return best;
+    };
+    at = nextCall(0);
     while (at !== -1) {
         // Balanced scan from the call's opening brace to its close.
         const open = source.indexOf("{", at);
@@ -49,7 +68,7 @@ function updateBlocks(source: string): { data: string; where: string }[] {
             // aliased ones, the `owns` object it was built from).
             blocks.push({ data: call.slice(i, stop + 1), where: call.slice(0, dataAt) });
         }
-        at = source.indexOf(needle, end);
+        at = nextCall(end);
     }
     return blocks;
 }

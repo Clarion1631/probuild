@@ -154,7 +154,9 @@ test("the orphan write carries the WHOLE predicate, so a BOOKED row is untouchab
         assert.ok(!UNKNOWN_ORPHAN_STATES.includes(state), `${state} is never an unknown-id orphan`);
     }
     // The write uses it, and a miss is a TYPED refusal rather than a generic one.
-    assert.match(actions, /await prisma\.receiptIntake\.updateMany\(\{ where: orphanWhere, data \}\)/);
+    // The write goes through the receipt-evidence lock since round 42
+    // (finding 1): parking an orphan changes what the sweep reads.
+    assert.match(actions, /await evidenceIntakeUpdateMany\(\{ where: orphanWhere, data \}\)/);
     assert.match(actions, /code: "not-an-unknown-orphan" as const/);
     // The only reason string that can reach the predicate is the one the park
     // plan writes.
@@ -187,7 +189,7 @@ test("both answers are audited, and only ONE of them frees the dedup key", () =>
     // AUDITED with who decided, after the write committed.
     assert.match(actions, /kind: ORPHAN_AUDIT_KIND,/);
     assert.match(actions, /decidedBy: user\.email \?\? user\.id,/);
-    const writeAt = actions.indexOf("updateMany({ where: orphanWhere, data })");
+    const writeAt = actions.indexOf("evidenceIntakeUpdateMany({ where: orphanWhere, data })");
     const auditAt = actions.indexOf("kind: ORPHAN_AUDIT_KIND,");
     assert.ok(writeAt > 0 && auditAt > writeAt, "an event describing a decision that did not commit is worse than none");
     // QuickBooks stays READ-only.

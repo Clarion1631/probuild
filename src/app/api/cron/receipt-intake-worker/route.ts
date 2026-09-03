@@ -18,6 +18,7 @@ import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { duplicateChainReason, withDuplicateChainLock } from "@/lib/receipt-intake/duplicate-guard";
+import { lockReceiptEvidence, withReceiptEvidenceLock } from "@/lib/receipt-evidence-lock";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
     driveFileIdOf,
@@ -44,6 +45,22 @@ import {
     type WorkerDependencies,
     type WorkerRow,
 } from "@/lib/receipt-intake/worker";
+
+/**
+ * RECEIPT-EVIDENCE WRITES, EACH IN ITS OWN SHORT LOCKED TRANSACTION (Codex PR
+ * #443 gate round 42, finding 1).
+ *
+ * Every write these wrap changes what the missing-receipt sweep reads as
+ * evidence — a state transition, a booking, a row it is about to judge — so
+ * each runs behind the same advisory lock the sweep holds across its reads AND
+ * its verdicts. A bare `prisma.*` call is its own implicit transaction and
+ * cannot hold an xact-scoped lock, which is the whole reason these exist.
+ *
+ * The lock is held for this one write. Never across a Drive download, a
+ * QuickBooks call, or a read pass.
+ */
+const evidenceUpdateMany = (args: Prisma.ReceiptIntakeUpdateManyArgs): Promise<{ count: number }> =>
+    withReceiptEvidenceLock<{ count: number }>(fn => prisma.$transaction(fn), tx => tx.receiptIntake.updateMany(args));
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -411,7 +428,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         // correct bytes arriving a minute later would find the
                         // row already gone from STAGING.
                         if (leaseLive) { leaseActive++; continue; }
-                        await prisma.receiptIntake.updateMany({
+                        await evidenceUpdateMany({
                             // Fenced on the lease this verdict was reached
                             // about: a resumed /start bumps it, and the bytes
                             // that mismatched belong to an upload nobody is
@@ -435,7 +452,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     const outcome = await sealAndPublish(row.storagePath, row.id, check, {
                         seal: sealObject,
                         commit: async (canonicalPath, values) => {
-                            const { count } = await prisma.receiptIntake.updateMany({
+                            const { count } = await evidenceUpdateMany({
                                 where: {
                                     id: row.id,
                                     state: "STAGING",
@@ -479,7 +496,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     // connection came back to find its row already in the review
                     // queue. Wait until the URL cannot possibly land any more.
                     if (leaseLive) { leaseActive++; continue; }
-                    await prisma.receiptIntake.updateMany({
+                    await evidenceUpdateMany({
                         where: {
                             id: row.id,
                             state: "STAGING",
@@ -582,7 +599,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // reclaim a half-routed row and book it while this one was
                 // still deciding — and then this one would regress it.
                 // finishRouting()/applyState() release the lease.
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                     data: { ...patch, lastError: null },
                 });
@@ -668,13 +685,16 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             },
         ),
 
-        applyState: async (rowId, state, stateReason, patch, ownership) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+        // EVIDENCE, so it takes the evidence lock (round-42 gate, finding 1):
+        // a terminal state is what the sweep reads as "this receipt exists" or
+        // "it does not".
+        applyState: async (rowId, state, stateReason, patch, ownership) => withReceiptEvidenceLock(fn => prisma.$transaction(fn), async tx => {
+            const { count } = await tx.receiptIntake.updateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { ...(patch ?? {}), state, stateReason, nextRetryAt: null, ...RELEASE_CLAIM },
             });
             return count > 0;
-        },
+        }),
 
         // RECEIVED -> READ, and the ONLY place the routing lease is released.
         finishRouting: async (rowId, claimToken, stateReason) => {
@@ -686,7 +706,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // successor's work — including over a NEEDS_REVIEW the successor
             // had every reason to set. Matching the token makes that write
             // affect zero rows instead.
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: "RECEIVED", claimToken },
                 data: {
                     state: "READ",
@@ -802,7 +822,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 // CAS: only the CURRENT claim holder may mark a send. A zero
                 // count means this worker was superseded, and bookReceipt
                 // aborts on it before touching QuickBooks.
-                const { count } = await prisma.receiptIntake.updateMany({
+                const { count } = await evidenceUpdateMany({
                     where: { id: rowId, state: "BOOKING", claimToken },
                     data: { sendAttempted: true },
                 });
@@ -857,7 +877,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // waiting to book can be written by a booking result.
             const owns = { id: rowId, state: "BOOKING", claimToken } as const;
             if (result.outcome === "needs-review") {
-                await prisma.receiptIntake.updateMany({
+                await evidenceUpdateMany({
                     where: owns,
                     data: {
                         state: "NEEDS_REVIEW",
@@ -875,7 +895,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             if (result.outcome === "deferred") {
                 // A switch is off: hold in BOOKING, look again in an hour, and
                 // do NOT spend an attempt — this document did nothing wrong.
-                await prisma.receiptIntake.updateMany({
+                await evidenceUpdateMany({
                     where: owns,
                     data: {
                         state: "BOOKING",
@@ -886,7 +906,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                 });
                 return;
             }
-            await prisma.receiptIntake.updateMany({
+            await evidenceUpdateMany({
                 where: owns,
                 data: {
                     state: "BOOKING",
@@ -903,7 +923,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             // costs no `attempts` — only a delay and one busy pass. Reuses the
             // booking backoff table so one outage does not hammer Gemini from
             // every row at once.
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: {
                     busyPasses,
@@ -916,7 +936,7 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
         },
 
         retryRow: async (rowId, attempts, nextRetryAt, reason, ownership) => {
-            const { count } = await prisma.receiptIntake.updateMany({
+            const { count } = await evidenceUpdateMany({
                 where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
                 data: { attempts, lastError: reason, nextRetryAt, ...RELEASE_CLAIM },
             });

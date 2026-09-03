@@ -421,11 +421,14 @@ test("the sweep resumes from a durable cursor, oldest-first", () => {
     assert.match(source, /let cursor = await readCursor\(\);/);
     // The cursor is a COMPONENT KEY, not a line id: resuming inside a
     // competition set is what let one receipt close two charges.
-    assert.match(source, /const resumeFrom = isComponentKey\(cursor\) \? cursor : null;/);
+    // A resume only happens when the cursor's epoch still matches this run's
+    // (round-42 gate, finding 2); anything else restarts the cycle.
+    assert.match(source, /const cursorEpochMatches = cursorUsableAt\(parsedCursor, snapshotEpoch\);/);
+    assert.match(source, /const resumeFrom = cursorEpochMatches && isComponentKey\(/);
     assert.match(source, /components\.filter\(component => component\.key > resumeFrom\)/);
     assert.doesNotMatch(source, /cursor: \{ id: cursor \}, skip: 1/, "id paging is gone");
     // Checkpointed after EVERY page, so a run that dies loses one page.
-    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(cursor\);/);
+    assert.match(source, /cursor = page\[page\.length - 1\]\.key;\s*\n\s*await writeCursor\(formatSweepCursor\(\{ key: cursor, epoch: snapshotEpoch \}\)\);/);
 });
 
 // ── Allocation spans the whole cohort, not one page (round-5 item 3) ────────
@@ -1010,7 +1013,7 @@ test("the whole component aborts together — never half its verdicts", () => {
     // underneath it.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     // One transaction per component, holding its verdicts.
-    assert.match(source, /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{[\s\S]{0,1400}FOR UPDATE/);
+    assert.match(source, /await withTxRetry\(\(\) => prisma\.\$transaction\(async tx => \{[\s\S]{0,2600}FOR UPDATE/);
     // And it opens with the component's advisory lock, so two sweeps working
     // the same set serialize instead of both passing their checks.
     assert.match(source, /pg_advisory_xact_lock\(hashtext\(\$\{`\$\{COMPONENT_LOCK_PREFIX\}/);
