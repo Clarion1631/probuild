@@ -654,13 +654,13 @@ export async function ensureQBCustomer(
 ): Promise<string> {
     // Trust a previously stored id if it still exists
     if (client.qbCustomerId) {
-        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`);
+        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`, deadline);
         if (existing.length > 0) return client.qbCustomerId;
     }
 
     const name = client.name.trim();
     if (!name) throw new Error("Client name is empty — cannot sync customer to QuickBooks.");
-    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`);
+    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`, deadline);
     if (byName.length > 0) return byName[0].Id;
 
     // QBO normalizes whitespace when enforcing DisplayName uniqueness, so an
@@ -670,7 +670,8 @@ export async function ensureQBCustomer(
     const prefix = name.split(/\s+/)[0];
     const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
         tokens,
-        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`,
+        deadline,
     );
     const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(name));
     if (matches.length > 1) {
@@ -684,6 +685,7 @@ export async function ensureQBCustomer(
             DisplayName: name,
             ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
         }),
+        qbDeadline: deadline,
     });
     if (!res.ok) {
         const err = await res.text();

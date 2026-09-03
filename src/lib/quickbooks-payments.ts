@@ -737,36 +737,55 @@ export interface QBPaymentSyncResult {
  * per-row failures (a business error, a DB conflict) are recorded and the loop
  * carries on.
  */
-export async function runQboRowLoop<T>(
+export async function runQboRowLoop<T extends { id: string }>(
     rows: T[],
     result: QBPaymentSyncResult,
     handleRow: (row: T) => Promise<void>,
     onRowError: (row: T, error: unknown) => void,
     skippedLabel: string,
     deadline?: RouteDeadline,
-): Promise<void> {
+    /**
+     * When paginating, the caller counts what is left straight from the
+     * database AFTER this page's cursor — which already includes this page's
+     * unprocessed tail. Adding it here too counted those rows twice. Standalone
+     * callers keep the tally; `forEachPendingPage` opts out and owns the count.
+     */
+    countSkipped: boolean = true,
+): Promise<{ lastCompletedId: string | null; skippedInPage: number }> {
+    // The id of the last row this loop actually finished with. The cursor may
+    // only advance to HERE: jumping to the end of the page after a mid-page
+    // outage would step straight over every row the outage cut short, and they
+    // would not be looked at again until the cursor wrapped all the way round.
+    let lastCompletedId: string | null = null;
+    let skippedInPage = 0;
+    const skip = (count: number) => {
+        skippedInPage += count;
+        if (countSkipped) result.skipped += count;
+    };
+
     for (const [index, row] of rows.entries()) {
         // A previous pass already hit the wall — the connection is shared, so
         // there is nothing to gain by trying again here.
         if (result.abortedOnQboOutage) {
-            result.skipped += rows.length - index;
-            return;
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         // Checked before EVERY row: a row costs several serial QBO calls, so
         // starting one with seconds left is how a run gets killed mid-write
         // instead of returning a result someone can act on.
         if (isBudgetExhausted(deadline)) {
-            result.skipped += rows.length - index;
-            return;
+            skip(rows.length - index);
+            return { lastCompletedId, skippedInPage };
         }
         try {
             await handleRow(row);
+            lastCompletedId = row.id;
         } catch (error) {
             // Out of time is not a QBO fault: stop cleanly, count the rest as
             // skipped (making the run partial), and let the next run continue.
             if (isQBBudgetExhaustedError(error)) {
-                result.skipped += rows.length - index;
-                return;
+                skip(rows.length - index);
+                return { lastCompletedId, skippedInPage };
             }
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
@@ -775,12 +794,17 @@ export async function runQboRowLoop<T>(
                 result.errors.push(
                     `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
                 );
-                result.skipped += rows.length - index - 1;
-                return;
+                skip(rows.length - index - 1);
+                return { lastCompletedId, skippedInPage };
             }
+            // A row-level failure is recorded and the run continues, so this
+            // row IS finished as far as the cursor is concerned — leaving the
+            // cursor behind it would retry the same bad row forever.
             onRowError(row, error);
+            lastCompletedId = row.id;
         }
     }
+    return { lastCompletedId, skippedInPage };
 }
 
 /**
@@ -819,6 +843,84 @@ export interface SyncQuickBooksPaymentsOptions {
     qboClient?: PaymentsSyncQboClient;
     /** Whole-run time budget; defaults to PAYMENTS_SYNC_BUDGET_MS. */
     deadline?: RouteDeadline;
+    /** Where the resume cursors live; defaults to the AutomationSetting table. */
+    cursorStore?: PaymentsSyncCursorStore;
+}
+
+/**
+ * Where the last run stopped, per collection, so the next one CONTINUES rather
+ * than restarting.
+ *
+ * Ordering by id made each run deterministic, but every run still began at the
+ * same end: with more pending rows than one run's budget, the rows past the cap
+ * were re-skipped forever and never verified. Persisting the cursor turns the
+ * cap into a rolling window over the whole set. Wrapping to the start on
+ * exhaustion keeps it a cycle rather than a dead end.
+ */
+export const PAYMENTS_CURSOR_KEYS = {
+    milestones: "qbo-payments-sync.cursor.milestones",
+    billings: "qbo-payments-sync.cursor.billings",
+} as const;
+/** Which collection goes first; flipped each run so neither can starve the other. */
+export const PAYMENTS_ORDER_KEY = "qbo-payments-sync.order";
+
+export interface PaymentsSyncCursorStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+
+/** AutomationSetting-backed cursor store. Never throws: a cursor is an optimisation. */
+export const automationSettingCursorStore: PaymentsSyncCursorStore = {
+    async get(key) {
+        try {
+            const row = await prisma.automationSetting.findUnique({ where: { key }, select: { value: true } });
+            return row?.value ?? null;
+        } catch {
+            return null;
+        }
+    },
+    async set(key, value) {
+        try {
+            await prisma.automationSetting.upsert({
+                where: { key },
+                create: { key, value },
+                update: { value },
+            });
+        } catch {
+            // A lost cursor costs one restart from the top, never correctness.
+        }
+    },
+};
+
+/**
+ * Rows this run has not looked at, given where it started, where it stopped,
+ * and whether it wrapped.
+ *
+ * Counting only `id > cursor` under-reported every capped run that resumed
+ * mid-collection: with the cursor at row 100 and the cap reached at row 199,
+ * rows 0-99 are equally unverified but sat before the cursor, so the run
+ * reported them as nothing left to do and called itself clean.
+ */
+export async function countUnvisited(
+    count: (where: Record<string, unknown>) => Promise<number>,
+    state: { cursorId: string | null; originalCursor: string | null; wrapped: boolean },
+): Promise<number> {
+    const { cursorId, originalCursor, wrapped } = state;
+
+    if (wrapped) {
+        // Walking the head segment: the tail past the original cursor is done.
+        if (!originalCursor) return 0;
+        return count({
+            id: { ...(cursorId ? { gt: cursorId } : {}), lte: originalCursor },
+        });
+    }
+
+    // Still in the tail. Everything after where we stopped, PLUS the head
+    // segment we resumed past and never came back to.
+    const tail = await count(cursorId ? { id: { gt: cursorId } } : {});
+    if (!originalCursor) return tail;
+    const head = await count({ id: { lte: originalCursor } });
+    return tail + head;
 }
 
 /** One database page. Small enough to stay responsive, big enough to be cheap. */
@@ -835,31 +937,97 @@ const PAYMENTS_SYNC_MAX_ROWS = 500;
  * Ordering by id makes the walk deterministic, and anything we do not reach is
  * counted as skipped so the run is honestly reported as partial.
  */
-async function forEachPendingPage<T extends { id: string }>(
+export async function forEachPendingPage<T extends { id: string }>(
     result: QBPaymentSyncResult,
     deadline: RouteDeadline,
-    fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
-    countRemaining: (cursorId: string | null) => Promise<number>,
-    handlePage: (rows: T[]) => Promise<void>,
+    /**
+     * `stopAfterId` bounds the WRAPPED pass: rows with an id greater than it
+     * were already visited earlier in this same run, so re-fetching them would
+     * process them twice (and could loop). Null means "no upper bound".
+     */
+    fetchPage: (cursorId: string | null, take: number, stopAfterId: string | null) => Promise<T[]>,
+    /**
+     * How many rows this run has NOT visited. Takes the whole traversal state,
+     * not just the cursor: a run that resumed at C and stopped at D has left
+     * both (> D) AND (<= C) unvisited, and the head segment is invisible to a
+     * plain "after the cursor" count. After a wrap it is the reverse — the tail
+     * past C was already done, so only (> D and <= C) is left.
+     */
+    countRemaining: (state: {
+        cursorId: string | null;
+        originalCursor: string | null;
+        wrapped: boolean;
+    }) => Promise<number>,
+    /** Returns the last row it actually completed — the furthest the cursor may move. */
+    handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
+    cursor?: { store: PaymentsSyncCursorStore; key: string },
+    maxRows: number = PAYMENTS_SYNC_MAX_ROWS,
 ): Promise<void> {
-    let cursorId: string | null = null;
+    // Resume where the last run stopped. A run that finishes the tail wraps
+    // back to the start, so the window rolls over the whole collection instead
+    // of stalling at whichever rows happen to sort last.
+    const storedCursor = cursor ? await cursor.store.get(cursor.key) : null;
+    // "" is how "start from the top" is stored; it is never a real id.
+    let cursorId: string | null = storedCursor && storedCursor.length > 0 ? storedCursor : null;
+    // Wrapping exists to reach the rows BEFORE a resume point. A run that
+    // already started at the top has no such rows, so wrapping there would
+    // just re-walk everything it had only now finished — the guard has to be
+    // "did this run resume?", not "is the cursor non-null?" (which is true of
+    // any run that processed a page).
+    const startedFromCursor = cursorId !== null;
     let processed = 0;
+    let wrapped = false;
+
+    const saveCursor = async (value: string | null) => {
+        if (cursor) await cursor.store.set(cursor.key, value ?? "");
+    };
 
     while (true) {
         if (result.abortedOnQboOutage) break;
-        if (processed >= PAYMENTS_SYNC_MAX_ROWS) break;
+        if (processed >= maxRows) break;
         if (isBudgetExhausted(deadline)) break;
 
-        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, PAYMENTS_SYNC_MAX_ROWS - processed);
-        const page = await fetchPage(cursorId, take);
-        if (page.length === 0) return; // exhausted — nothing was missed
+        const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, maxRows - processed);
+        // After wrapping, the run is walking the rows BEFORE where it started;
+        // it must stop at that point or it would revisit the ones it has
+        // already done this run.
+        const page = await fetchPage(cursorId, take, wrapped ? storedCursor : null);
 
-        await handlePage(page);
+        if (page.length === 0) {
+            // End of the collection. If we started mid-way, wrap once and keep
+            // going with whatever budget is left; the rows before the old
+            // cursor are exactly the ones a fixed start would never reach.
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null); // fully drained: next run starts at the top
+            return;
+        }
+
+        const { lastCompletedId } = await handlePage(page);
         processed += page.length;
-        cursorId = page[page.length - 1].id;
+        // Only past what finished. On a clean page this is the page tail; on a
+        // page an outage cut short it is wherever the loop actually got to, so
+        // the next run resumes at the first unverified row rather than after it.
+        if (lastCompletedId !== null) {
+            cursorId = lastCompletedId;
+            await saveCursor(cursorId);
+        }
 
         // A short page means we reached the end of the collection.
-        if (page.length < take) return;
+        if (page.length < take) {
+            if (startedFromCursor && !wrapped) {
+                wrapped = true;
+                cursorId = null;
+                await saveCursor(null);
+                continue;
+            }
+            await saveCursor(null);
+            return;
+        }
     }
 
     // Stopped early. Count what is genuinely left AFTER the cursor rather than
@@ -871,7 +1039,7 @@ async function forEachPendingPage<T extends { id: string }>(
     // and an unknown amount of unverified payment work vanished from the
     // record. Not knowing is a failed run.
     try {
-        const remaining = await countRemaining(cursorId);
+        const remaining = await countRemaining({ cursorId, originalCursor: storedCursor, wrapped });
         if (remaining > 0) result.skipped += remaining;
     } catch (error) {
         result.runFailed = true;
@@ -1011,26 +1179,51 @@ async function runPaymentsSync(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
+    // A SCOPED run (the on-view refresh for one invoice or project) is not a
+    // sweep: it looks at a handful of rows the user is staring at. Letting it
+    // read the shared cursor would make it skip the very row it was asked
+    // about, and letting it WRITE one would move the cron's resume point to
+    // wherever that user happened to be looking — silently starving everything
+    // after it. Only the unscoped cron sweep carries cursors.
+    const isSweep = !scope?.invoiceId && !scope?.projectId;
+    const cursorStore = options?.cursorStore ?? automationSettingCursorStore;
+    const milestoneCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.milestones }
+        : undefined;
+    const billingCursor = isSweep
+        ? { store: cursorStore, key: PAYMENTS_CURSOR_KEYS.billings }
+        : undefined;
+
     const milestoneSelect = {
         id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
         invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
     } as const;
 
-    await forEachPendingPage(
+    const runMilestonePass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.paymentSchedule.findMany({
-            where: pendingWhere,
+        (cursorId, take, stopAfterId) => prisma.paymentSchedule.findMany({
+            where: {
+                ...pendingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: milestoneSelect,
             // Stable key: without it Postgres may return the same first page
             // every run and starve everything behind it.
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
-        (cursorId) => prisma.paymentSchedule.count({
-            where: cursorId ? { ...pendingWhere, id: { gt: cursorId } } : pendingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.paymentSchedule.count({ where: { ...pendingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (schedule) => {
         result.checked++;
         {
@@ -1113,7 +1306,8 @@ async function runPaymentsSync(
         }
     }, (schedule, e) => {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "milestones", routeDeadline),
+        }, "milestones", routeDeadline, false),
+        milestoneCursor,
     );
 
     // ── Progress billings ───────────────────────────────────────────────────
@@ -1129,19 +1323,29 @@ async function runPaymentsSync(
         invoice: { select: { code: true, estimateId: true } },
     } as const;
 
-    await forEachPendingPage(
+    const runBillingPass = () => forEachPendingPage(
         result,
         routeDeadline,
-        (cursorId, take) => prisma.progressBilling.findMany({
-            where: billingWhere,
+        (cursorId, take, stopAfterId) => prisma.progressBilling.findMany({
+            where: {
+                ...billingWhere,
+                ...(cursorId || stopAfterId
+                    ? {
+                        id: {
+                            ...(cursorId ? { gt: cursorId } : {}),
+                            ...(stopAfterId ? { lte: stopAfterId } : {}),
+                        },
+                    }
+                    : {}),
+            },
             select: billingSelect,
             orderBy: { id: "asc" },
             take,
-            ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
         }),
-        (cursorId) => prisma.progressBilling.count({
-            where: cursorId ? { ...billingWhere, id: { gt: cursorId } } : billingWhere,
-        }),
+        ({ cursorId, originalCursor, wrapped }) => countUnvisited(
+            (where) => prisma.progressBilling.count({ where: { ...billingWhere, ...where } }),
+            { cursorId, originalCursor, wrapped },
+        ),
         (page) => runQboRowLoop(page, result, async (billing) => {
         {
             const probe = await qbo.probeInvoice(billing.qbInvoiceId!);
@@ -1171,8 +1375,30 @@ async function runPaymentsSync(
         }
     }, (billing, e) => {
             result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "progress billings", routeDeadline),
-    )
+        }, "progress billings", routeDeadline, false),
+        billingCursor,
+    );
+
+    // WHICH RAIL GOES FIRST, alternated run to run.
+    //
+    // The row cap is shared, so a fixed order means one collection always eats
+    // the budget first: a milestone backlog big enough to fill a run left the
+    // progress billings unverified every single time, and their own cursor
+    // never moved. Flipping the order gives each rail a run of its own.
+    let billingsFirst = false;
+    if (isSweep) {
+        const lastOrder = await cursorStore.get(PAYMENTS_ORDER_KEY);
+        billingsFirst = lastOrder !== "billings-first";
+        await cursorStore.set(PAYMENTS_ORDER_KEY, billingsFirst ? "billings-first" : "milestones-first");
+    }
+
+    if (billingsFirst) {
+        await runBillingPass();
+        await runMilestonePass();
+    } else {
+        await runMilestonePass();
+        await runBillingPass();
+    }
 
     if (newlyFlagged.length > 0) {
         const { notifyQBSyncIssues } = await import("./payment-notifications");

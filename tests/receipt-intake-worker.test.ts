@@ -31,6 +31,11 @@ import {
     readBudgetFor,
     READ_MIN_BUDGET_MS,
     READ_SAFETY_MARGIN_MS,
+    claimableStates,
+    eligibleClaimWhere,
+    BATCH_SIZE,
+    DRYRUN_PARK_RETRY_MS,
+    QBO_WRITING_STATES,
 } from "../src/lib/receipt-intake/worker";
 import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
@@ -109,6 +114,9 @@ interface Harness {
     finished: { id: string; claimToken: string | null; stateReason: string | null }[];
     deferred: { id: string; busyPasses: number }[];
     retried: { id: string; attempts: number; reason: string }[];
+    releasedClaims: { id: string; nextRetryAt: Date }[];
+    leaseAcquires: number;
+    leaseReleases: number;
     claimOpts: CutoverRequest[];
     boundary: Date | null;
     sweepCalls: number;
@@ -122,12 +130,19 @@ interface Harness {
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], finished: [], deferred: [],
-        retried: [], claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
+        retried: [], releasedClaims: [], leaseAcquires: 0, leaseReleases: 0,
+        claimOpts: [], sweepCalls: 0, cleanupCalls: 0, bookBudgets: [], clock: 0,
         sendReads: [],
         boundary: new Date("2026-08-25T00:00:00.000Z"),
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
+        // The default harness always gets the lease. The tests that care about
+        // overlap override it.
+        acquireLease: async () => {
+            h.leaseAcquires++;
+            return { release: async () => { h.leaseReleases++; } };
+        },
         claim: async opts => {
             h.claimOpts.push(opts);
             return { rows, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
@@ -165,6 +180,7 @@ function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {})
         },
         applyBookResult: async () => {},
         deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); return true; },
+        releaseClaim: async (id, nextRetryAt) => { h.releasedClaims.push({ id, nextRetryAt }); return true; },
         retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); return true; },
         now: () => NOW,
         monotonicMs: () => h.clock,
@@ -358,7 +374,7 @@ test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", 
 test("the shadow week does NOT run the cutover", async () => {
     const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.claimOpts[0].run, false);
+    assert.equal(h.claimOpts[0].dryRunGlobal, true);
     assert.equal(h.claimOpts[0].boundary, null, "the boundary is not even read while dry-run is on");
     assert.equal(summary.shadowRetired, undefined);
 });
@@ -380,7 +396,7 @@ test("CUTOVER: the boundary is passed to the claim so the backlog can be split",
         },
     });
     const summary = await runIntakeWorker(h.deps);
-    assert.equal(h.claimOpts[0].run, true);
+    assert.equal(h.claimOpts[0].dryRunGlobal, false);
     assert.equal(h.claimOpts[0].boundary?.toISOString(), boundary.toISOString());
     assert.equal(summary.shadowRetired, 7, "v1 already booked these");
     assert.equal(summary.requeued, 2, "nobody booked these — v2 must");
@@ -1425,4 +1441,220 @@ test("the sweep query excludes live leases and orders null-lease rows first", ()
     assert.match(query, /\{ uploadUrlExpiresAt: \{ sort: "asc", nulls: "first" \} \}/);
     assert.match(query, /\{ createdAt: "asc" \}/);
     assert.match(query, /take: STAGING_SWEEP_BATCH/);
+});
+
+// ── Dry-run ROLLBACK starvation (Codex a2998e8a, finding 1) ──────────────────
+//
+// The hole the last round left: booking learned to honour the CURRENT global
+// switch, but claim ELIGIBILITY still only excluded rows whose PERSISTED
+// dryRun was true. Flip RECEIPT_INTAKE_DRYRUN back on after a live window and
+// every row claimed during that window is still `dryRun:false`, still sitting
+// in READ/BOOKING, and still claimable — so each pass filled its ten-row batch
+// with rows it then refused to advance (without even releasing the claim), and
+// the newer RECEIVED receipts behind them were never read.
+
+test("claimable states are a function of the CURRENT switch, not the row flag", () => {
+    assert.deepEqual(
+        claimableStates(true),
+        ["RECEIVED"],
+        "under dry-run nothing whose next step is a QBO write may be claimed",
+    );
+    assert.deepEqual(claimableStates(false), ["RECEIVED", "READ", "BOOKING"]);
+    // The two lists differ by exactly the QBO-writing states — spelled out so a
+    // future state added to one list cannot silently skip the other.
+    assert.deepEqual([...QBO_WRITING_STATES], ["READ", "BOOKING"]);
+});
+
+test("the claim predicate drops the QBO-writing states while dry-run is on", () => {
+    const now = new Date("2026-09-01T12:00:00.000Z");
+
+    const dry = eligibleClaimWhere(now, true) as Record<string, unknown>;
+    assert.deepEqual(dry.state, { in: ["RECEIVED"] });
+
+    const live = eligibleClaimWhere(now, false) as Record<string, unknown>;
+    assert.deepEqual(live.state, { in: ["RECEIVED", "READ", "BOOKING"] });
+    // The shadow-week park exclusion survives the change: a dryRun=true row at
+    // READ/BOOKING is still off the list on a LIVE pass until the cutover
+    // requeues it.
+    assert.deepEqual(live.NOT, { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] });
+    // And the retry clause is untouched by any of it.
+    assert.deepEqual(live.OR, [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }]);
+});
+
+/**
+ * A queue with more than two full batches of OLD rows left live by a previous
+ * window, plus newer RECEIVED receipts behind them.
+ *
+ * The fake claim is deliberately built on the SHIPPED `claimableStates` rather
+ * than a hand-written state list, so this test measures the real predicate. The
+ * `states` override is what lets the same fixture reproduce the BUG (the old
+ * predicate, which ignored the switch) as a control.
+ */
+function starvationQueue(opts: { states?: (dryRunGlobal: boolean) => string[] } = {}) {
+    const pickStates = opts.states ?? claimableStates;
+    const rows: WorkerRow[] = [];
+    // 25 old rows — two and a half batches — left at READ with dryRun=false by
+    // a live window that has since been rolled back.
+    for (let i = 0; i < 25; i++) {
+        rows.push(workerRow({
+            id: "old-" + i,
+            sourceRef: "drive:OLD" + i,
+            state: "READ",
+            dryRun: false,
+            createdAt: new Date(Date.parse("2026-08-20T00:00:00.000Z") + i * 60_000),
+        }));
+    }
+    // Three receipts that arrived AFTER the rollback. These are the ones the
+    // shadow week is supposed to keep reading.
+    for (let i = 0; i < 3; i++) {
+        rows.push(workerRow({
+            id: "new-" + i,
+            sourceRef: "drive:NEW" + i,
+            state: "RECEIVED",
+            dryRun: true,
+            createdAt: new Date(Date.parse("2026-08-30T00:00:00.000Z") + i * 60_000),
+        }));
+    }
+
+    const nextRetryAt = new Map<string, number>();
+    let clock = Date.parse("2026-09-01T12:00:00.000Z");
+
+    return {
+        rows,
+        advanceMinutes(mins: number) { clock += mins * 60_000; },
+        /** The route's claim, in memory: same predicate, same oldest-first order, same lease. */
+        claim: async (o: CutoverRequest) => {
+            const eligible = new Set(pickStates(o.dryRunGlobal));
+            const due = rows
+                .filter(r => eligible.has(r.state))
+                .filter(r => (nextRetryAt.get(r.id) ?? 0) <= clock)
+                .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+                .slice(0, BATCH_SIZE);
+            // The claim bumps every taken row's nextRetryAt by the lease.
+            for (const r of due) nextRetryAt.set(r.id, clock + 10 * 60_000);
+            return { rows: due, shadowRetired: 0, requeued: 0, shadowQuarantined: 0 };
+        },
+        /** What the worker's own release writes back. */
+        release: async (id: string, when: Date) => { nextRetryAt.set(id, when.getTime()); return true; },
+    };
+}
+
+test("ROLLBACK: newer receipts are read on the FIRST pass, not starved behind the old backlog", async () => {
+    const q = starvationQueue();
+    const readIds: string[] = [];
+    const h = harness(q.rows, {
+        isDryRunEnabled: () => true,
+        claim: q.claim,
+        releaseClaim: q.release,
+    });
+    // Record which rows actually reach the reader.
+    h.deps.applyRead = async (id, patch) => {
+        readIds.push(id);
+        h.applied.push(patch as ReadPatch);
+        return { owned: true, strongOwner: null };
+    };
+
+    const summary = await runIntakeWorker(h.deps);
+
+    assert.deepEqual(
+        readIds.slice().sort(),
+        ["new-0", "new-1", "new-2"],
+        "all three post-rollback receipts are read in the first invocation",
+    );
+    assert.equal(summary.processed, 3, "the old live rows never even occupy a batch slot");
+    assert.equal(h.books, 0, "and nothing books while the switch says dry-run");
+});
+
+test("ROLLBACK control: the OLD predicate really did starve them (two full batches deep)", async () => {
+    // Without this control the test above would pass against a queue that
+    // simply had no old rows in it. Here the ONLY difference is the predicate:
+    // the pre-fix one, which looked at the persisted flag and ignored the
+    // switch. Two invocations is already enough to prove the starvation.
+    const q = starvationQueue({ states: () => ["RECEIVED", "READ", "BOOKING"] });
+    const readIds: string[] = [];
+    const h = harness(q.rows, {
+        isDryRunEnabled: () => true,
+        claim: q.claim,
+        // The pre-fix loop skipped without releasing, so the rows kept the
+        // full ten-minute lease.
+        releaseClaim: async () => true,
+    });
+    h.deps.applyRead = async (id, patch) => {
+        readIds.push(id);
+        h.applied.push(patch as ReadPatch);
+        return { owned: true, strongOwner: null };
+    };
+
+    await runIntakeWorker(h.deps);
+    q.advanceMinutes(5);
+    await runIntakeWorker(h.deps);
+
+    assert.deepEqual(readIds, [], "twenty old rows fill both batches and no new receipt is reached");
+});
+
+test("ROLLBACK is not a black hole: going live again makes the old rows claimable", async () => {
+    // Excluding a row from the claim must not strand it. The predicate is
+    // evaluated per invocation from the current switch, so the same rows come
+    // straight back the moment the switch flips.
+    const q = starvationQueue();
+    const h = harness(q.rows, { isDryRunEnabled: () => false, claim: q.claim, releaseClaim: q.release });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.processed, BATCH_SIZE, "a live pass claims the old backlog oldest-first again");
+    assert.equal(h.books, BATCH_SIZE, "and books it");
+});
+
+test("a row the switch refuses RELEASES its claim instead of sitting on it", async () => {
+    // Belt-and-braces for the eligibility fix: if the switch is ever read as
+    // live at claim time and dry-run inside the loop, the skip must still hand
+    // the row back. A skip that kept the claim left the row owned by a pass
+    // that had finished — invisible to every fenced write until the lease
+    // lapsed, and back in the next batch to be skipped again.
+    for (const state of ["READ", "BOOKING"] as const) {
+        const h = harness([workerRow({ state, dryRun: false })], { isDryRunEnabled: () => true });
+        const summary = await runIntakeWorker(h.deps);
+        assert.equal(h.books, 0);
+        assert.deepEqual(summary.byState, { [state]: 1 }, state + " is unchanged — nothing is decided");
+        assert.equal(h.releasedClaims.length, 1, state + " hands the claim back");
+        assert.equal(
+            h.releasedClaims[0].nextRetryAt.getTime(),
+            NOW.getTime() + DRYRUN_PARK_RETRY_MS,
+            "deferred by an hour, so it stops competing for batch slots with new receipts",
+        );
+    }
+});
+
+test("a release that loses its fence reports STALE rather than claiming to have parked", async () => {
+    const h = harness([workerRow({ state: "READ", dryRun: false })], {
+        isDryRunEnabled: () => true,
+        releaseClaim: async () => false,
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { STALE: 1 });
+});
+
+// ── Whole-pass overlap lease (Codex a2998e8a, finding 4) ─────────────────────
+
+test("a second invocation that cannot take the lease does NOTHING", async () => {
+    const h = harness([workerRow()], { acquireLease: async () => null });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary, { processed: 0, byState: {}, skipped: "lease-held" });
+    assert.equal(h.claimOpts.length, 0, "no claim");
+    assert.equal(h.sweepCalls, 0, "no sweep");
+    assert.equal(h.reads, 0, "no Gemini call");
+    assert.equal(h.books, 0, "no QuickBooks call");
+});
+
+test("the lease is released on a normal pass", async () => {
+    const h = harness([workerRow()]);
+    await runIntakeWorker(h.deps);
+    assert.equal(h.leaseAcquires, 1);
+    assert.equal(h.leaseReleases, 1);
+});
+
+test("the lease is released even when the pass throws", async () => {
+    // Row errors are caught per row, but a claim/sweep failure propagates. A
+    // lease leaked there would wedge the queue for a whole TTL.
+    const h = harness([], { claim: async () => { throw new Error("prisma exploded"); } });
+    await assert.rejects(() => runIntakeWorker(h.deps), /prisma exploded/);
+    assert.equal(h.leaseReleases, 1);
 });

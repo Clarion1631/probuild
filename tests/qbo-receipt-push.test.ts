@@ -1363,3 +1363,92 @@ test("the route hands the SAME deadline to the token fetch and the create", asyn
     assert.deepEqual(seen[0], seen[1], "both legs share one budget");
     assert.equal(seen[0]!.budgetMs, 50_000);
 });
+// --- The route budget reaches the LATE calls of ensureQBVendor ---
+
+/**
+ * ensureQBVendor took a RouteDeadline but only its FIRST query carried it, so
+ * the candidate scan, the create, and the post-6240 re-query each opened a
+ * fresh 20s window. A vendor resolve could therefore run well past the route
+ * ceiling and be killed mid-write, which is the exact failure the shared budget
+ * exists to prevent.
+ *
+ * Each test spends the budget INSIDE the preceding call, then asserts the next
+ * one is never issued. The no-deadline control in the same test is what makes
+ * that meaningful: without it the assertion would also pass on code that made
+ * no call at all.
+ */
+function vendorFetchStub(options: { burnAtCall: number; duplicateFault?: boolean }) {
+    const urls: string[] = [];
+    const impl = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        urls.push(u);
+        if (urls.length === options.burnAtCall) {
+            await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        if (u.includes("/query?query=")) {
+            // Calls 1 and 2 (exact DisplayName, then the LIKE-prefix scan) miss;
+            // a fourth query is the post-6240 re-query, which finds the winner.
+            return new Response(JSON.stringify({ QueryResponse: urls.length > 3 ? { Vendor: [{ Id: "vendor-42" }] } : {} }), { status: 200 });
+        }
+        if (u.includes("/vendor?") && init?.method === "POST") {
+            return options.duplicateFault
+                ? new Response('{"Fault":{"Error":[{"code":"6240"}]}}', { status: 400 })
+                : new Response(JSON.stringify({ Vendor: { Id: "vendor-1" } }), { status: 200 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as unknown as typeof fetch;
+    return { impl, urls };
+}
+
+/** 1.4s of budget, spent by a 600ms call: the next call starts under the 1s floor. */
+const BUDGET_MS = 1_400;
+
+test("ensureQBVendor: the candidate scan is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 1 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 1, "the LIKE-prefix scan must not be issued");
+
+    // Control: the same stub with no budget reaches the scan.
+    const control = vendorFetchStub({ burnAtCall: 1 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(decodeURIComponent(control.urls[1]), /DisplayName LIKE 'Home%'/);
+});
+
+test("ensureQBVendor: the create is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 2 });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 2, "no Vendor may be created with no budget left");
+
+    const control = vendorFetchStub({ burnAtCall: 2 });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-1");
+    assert.equal(control.urls.length, 3);
+    assert.match(control.urls[2], /\/vendor\?/);
+});
+
+test("ensureQBVendor: the post-6240 re-query is refused once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+
+    const spent = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    const error = await withFetch(spent.impl, () =>
+        ensureQBVendor(TOKENS, "Home Depot", createRouteDeadline(BUDGET_MS)),
+    ).then(() => null, (e: unknown) => e as Error);
+    // The budget, not the duplicate, is the reason — a re-query that never ran
+    // must not be reported as "no match was found".
+    assert.ok(isQBBudgetExhaustedError(error), `got ${String(error)}`);
+    assert.equal(spent.urls.length, 3, "the re-query must not be issued");
+
+    const control = vendorFetchStub({ burnAtCall: 3, duplicateFault: true });
+    assert.equal(await withFetch(control.impl, () => ensureQBVendor(TOKENS, "Home Depot")), "vendor-42");
+    assert.equal(control.urls.length, 4);
+});

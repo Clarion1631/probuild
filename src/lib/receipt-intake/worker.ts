@@ -45,6 +45,73 @@ export const CLAIM_LOCK_KEY = "receipt-intake-worker";
 export const BATCH_SIZE = 10;
 /** How long a claimed row is hidden from the next run. */
 export const CLAIM_LEASE_MINUTES = 10;
+
+/**
+ * The states whose ONLY remaining step is a QuickBooks write.
+ *
+ * A row here has already been read, deduped and routed. Nothing else happens
+ * to it in a pass: READ waits to be promoted to BOOKING, and BOOKING waits to
+ * be booked. Both are exactly what the dry-run switch forbids.
+ */
+export const QBO_WRITING_STATES = ["READ", "BOOKING"] as const;
+
+/**
+ * ELIGIBILITY IS A FUNCTION OF THE CURRENT GLOBAL SWITCH, not of the row alone.
+ *
+ * `row.dryRun` is written once at intake and never re-read, so it cannot
+ * express a ROLLBACK: flip `RECEIPT_INTAKE_DRYRUN` back on and every row that
+ * was claimed while the switch was off keeps `dryRun:false`. The worker loop
+ * already refuses to book those (the switch outranks the flag), but refusing
+ * INSIDE the loop is not enough when the batch is ten rows and the order is
+ * oldest-first: a few hundred old live rows are claimed, skipped, claimed
+ * again five minutes later, and no NEW receipt is ever read. The queue looks
+ * busy and processes nothing — the same starvation the dry-run park exclusion
+ * was written to prevent, arriving through the other door.
+ *
+ * So while the global switch says dry-run, a QBO-writing state is not
+ * claimable at all, whatever the row's own flag says. RECEIVED rows still are:
+ * reading and routing is precisely what the shadow week is for.
+ */
+export function claimableStates(dryRunGlobal: boolean): ReceiptIntakeState[] {
+    return dryRunGlobal ? ["RECEIVED"] : ["RECEIVED", ...QBO_WRITING_STATES];
+}
+
+/**
+ * The claim's whole eligibility predicate, in ONE place.
+ *
+ * Exported (rather than living inline in the cron route) so both the pure
+ * worker tests and the real-Postgres claim test assert against the same
+ * object the route actually claims with. A second copy of this predicate is
+ * how the loop and the claim came to disagree in the first place.
+ *
+ * STAGING is absent on purpose: the row exists but its object does not, so
+ * claiming it would park a good receipt as "file-missing". sweepStaleStaging
+ * is what watches those.
+ */
+export function eligibleClaimWhere(now: Date, dryRunGlobal: boolean): Prisma.ReceiptIntakeWhereInput {
+    return {
+        state: { in: claimableStates(dryRunGlobal) },
+        OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+        /**
+         * A row parked by the shadow week (dryRun=true, sitting at READ or
+         * BOOKING) is DONE until the cutover, and must be excluded rather than
+         * merely skipped inside the loop — for the same batch-starvation
+         * reason as above. runIntakeWorker's cutover is what brings them back,
+         * once, on the first live pass. Redundant while `dryRunGlobal` is true
+         * (those states are already off the list) and load-bearing when it is
+         * false.
+         */
+        NOT: { AND: [{ dryRun: true }, { state: { in: [...QBO_WRITING_STATES] } }] },
+    };
+}
+
+/**
+ * How long a row skipped by the global dry-run switch waits before it is
+ * looked at again. Same hour as book.ts's "a switch is off" deferral: nothing
+ * is wrong with the document, and hammering it every five minutes only costs
+ * batch slots that new receipts need.
+ */
+export const DRYRUN_PARK_RETRY_MS = 60 * 60_000;
 /**
  * Stop taking on NEW rows once this much of the 60s function budget is gone.
  * One 25s read plus a QBO round trip can straddle the ceiling, and a row cut
@@ -181,6 +248,12 @@ export interface WorkerDependencies {
      * backlog and both un-park it, and the second one's UPDATE would race the
      * first one's claim.
      */
+    /**
+     * Take the whole-invocation lease, or null when another invocation holds a
+     * live one. Injected so the overlap rule is a unit test rather than a
+     * property only a production race could ever demonstrate.
+     */
+    acquireLease: () => Promise<{ release: () => Promise<void> } | null>;
     claim: (opts: CutoverRequest) => Promise<ClaimResult | null>;
     /** RECEIPT_INTAKE_DRYRUN is not "false". Injected so the cutover is testable. */
     isDryRunEnabled: () => boolean;
@@ -276,6 +349,18 @@ export interface WorkerDependencies {
     applyBookResult: (rowId: string, result: BookResult, claimToken: string | null) => Promise<void>;
     /** AI unavailable: park for a later pass WITHOUT spending an attempt. */
     deferRead: (rowId: string, busyPasses: number, reason: string, ownership: Ownership) => Promise<boolean>;
+    /**
+     * HAND THE ROW BACK, unchanged except for when to look at it again.
+     *
+     * A claim is what makes a row invisible to the next pass, so any path that
+     * finishes with a row WITHOUT completing, deferring or parking it still has
+     * to release ownership — otherwise the row is owned by a pass that has
+     * ended, every fenced write misses it, and it sits until its lease lapses.
+     * Used by the dry-run skip: nothing about the document is wrong, so it
+     * costs no `attempts` and changes no state; it just stops occupying a batch
+     * slot that a new receipt needs.
+     */
+    releaseClaim: (rowId: string, nextRetryAt: Date, ownership: Ownership) => Promise<boolean>;
     /** A transient fault anywhere else: spend an attempt and back off. */
     retryRow: (
         rowId: string,
@@ -345,7 +430,12 @@ export interface ReadPatch {
 export interface WorkerRunSummary {
     processed: number;
     byState: Record<string, number>;
-    skipped?: "already-running";
+    /**
+     * "lease-held": another invocation is mid-pass, so this one did nothing.
+     * "already-running": the claim's own advisory lock was taken — only
+     * reachable when a lease has expired under a still-running pass.
+     */
+    skipped?: "already-running" | "lease-held";
     /** Rows left unprocessed because the soft deadline hit. They keep their lease. */
     deferredToNextRun?: number;
     /** Rows v1 already booked, retired as SHADOW_DONE by the first live pass. */
@@ -444,13 +534,20 @@ export function toDateStr(date: Date): string {
 
 /** One pass. Never throws for a single bad row — one poison document must not stall the queue. */
 export interface CutoverRequest {
-    /** Run the cutover this pass (i.e. dry-run is off). */
-    run: boolean;
+    /**
+     * The CURRENT global switch, read ONCE per pass and handed down.
+     *
+     * ONE field, not a `run` flag beside it: the cutover runs exactly when the
+     * pass is live, and claim eligibility depends on the very same answer. Two
+     * fields that must always be each other's negation is how they drift, and
+     * a claim that disagreed with the loop about the switch is finding #1.
+     */
+    dryRunGlobal: boolean;
     /**
      * The instant v1 stopped booking. Only rows received before it are even
      * CANDIDATES for retirement — and each still needs its own evidence that v1
-     * booked it. Never null when `run` is true: the pass halts before claiming
-     * rather than proceed without it.
+     * booked it. Never null when `dryRunGlobal` is false: the pass halts before
+     * claiming rather than proceed without it.
      */
     boundary: Date | null;
 }
@@ -464,6 +561,30 @@ export interface ClaimResult {
 }
 
 export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerRunSummary> {
+    // MUTUAL EXCLUSION FOR THE WHOLE PASS, taken before anything is read,
+    // claimed or booked.
+    //
+    // The claim transaction's advisory lock is transaction scoped: it is gone
+    // the moment that transaction commits, which is BEFORE the first Gemini
+    // read and long before any QuickBooks write. So it never made the worker
+    // non-overlapping — it only made the claim itself atomic. A second
+    // invocation could (and, at five-minute cron spacing against 60-second
+    // passes, eventually would) claim a different batch and run alongside.
+    // This lease is what the "one worker at a time" property actually rests
+    // on; the per-row claim token is the layer under it that keeps an overlap
+    // harmless rather than merely unlikely.
+    const lease = await deps.acquireLease();
+    if (!lease) return { processed: 0, byState: {}, skipped: "lease-held" };
+    try {
+        return await runIntakePass(deps);
+    } finally {
+        // In a `finally`, so a throw out of the pass releases it too. Without
+        // that, one crash wedges the queue for a whole lease TTL.
+        await lease.release();
+    }
+}
+
+async function runIntakePass(deps: WorkerDependencies): Promise<WorkerRunSummary> {
     // THE DEADLINE STARTS HERE, at invocation entry — not after the claim and
     // the sweep. The sweep downloads objects, so timing it out of the budget
     // meant it could consume the whole platform timeout and the worker would
@@ -485,7 +606,14 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
     // those receipts are silently dropped. Nothing in the database can infer
     // that instant, so with no boundary recorded the pass refuses to touch
     // either side and says so.
-    const runCutover = !deps.isDryRunEnabled();
+    //
+    // READ ONCE, USE EVERYWHERE. The switch decides three things in this pass —
+    // whether the cutover runs, which states are even claimable, and whether a
+    // claimed row may book — and they have to be the same answer. Calling
+    // isDryRunEnabled() separately at each of those points is what let the
+    // claim hand out rows the loop then refused, forever.
+    const dryRunGlobal = deps.isDryRunEnabled();
+    const runCutover = !dryRunGlobal;
     const boundary = runCutover ? await deps.cutoverBoundary() : null;
 
     // HALT THE WHOLE PASS, before anything is claimed.
@@ -501,7 +629,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         return { processed: 0, byState: {}, cutoverBlocked: "cutover-boundary-missing" };
     }
 
-    const claimed = await deps.claim({ run: runCutover, boundary });
+    const claimed = await deps.claim({ dryRunGlobal, boundary });
     if (claimed === null) {
         return { processed: 0, byState: {}, skipped: "already-running" };
     }
@@ -540,8 +668,14 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 // never rechecked, so a row claimed while RECEIPT_INTAKE_DRYRUN
                 // was off keeps dryRun=false even after the switch is reverted
                 // to stop live QBO writes.
-                const live = !row.dryRun && !deps.isDryRunEnabled();
-                if (!live) { bump("READ"); continue; }
+                //
+                // `dryRunGlobal` is this pass's ONE reading of the switch, the
+                // same one the claim used, so a row can no longer be handed out
+                // as claimable and then refused here. Belt and braces all the
+                // same — and the release is what makes the belt safe: a skip
+                // that kept the claim left the row owned by a finished pass.
+                const live = !row.dryRun && !dryRunGlobal;
+                if (!live) { bump(await parkForDryRun(row, deps)); continue; }
                 const promotion = await deps.promoteToBooking(row.id, row.dedupWeakKey, row.claimToken);
                 if (promotion.stale) {
                     // Superseded between the claim and the promotion. The
@@ -563,7 +697,7 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
             } else if (row.state === "BOOKING") {
-                if (row.dryRun || deps.isDryRunEnabled()) { bump("BOOKING"); continue; }
+                if (row.dryRun || dryRunGlobal) { bump(await parkForDryRun(row, deps)); continue; }
                 const result = await deps.book(row);
                 await deps.applyBookResult(row.id, result, row.claimToken);
                 bump(stateForBookResult(result));
@@ -583,6 +717,28 @@ export async function runIntakeWorker(deps: WorkerDependencies): Promise<WorkerR
         ...(staged ? { staleStagingSwept: staged } : {}),
         ...(cleaned ? { orphansCleaned: cleaned } : {}),
     };
+}
+
+/**
+ * A row the dry-run switch will not let this pass advance.
+ *
+ * It keeps its state — nothing about it is decided, and the moment the switch
+ * goes live again it is claimable and bookable exactly as it was. What it does
+ * NOT keep is the claim: a skipped row that stayed owned by a finished pass is
+ * invisible to every fenced write until its lease lapses, and (before the
+ * eligibility fix above) came straight back into the next batch to be skipped
+ * again, crowding out the new receipts the shadow week exists to read.
+ *
+ * A release that FAILS means the row was already taken from us — report STALE
+ * rather than pretending the pass parked it.
+ */
+async function parkForDryRun(row: WorkerRow, deps: WorkerDependencies): Promise<string> {
+    const released = await deps.releaseClaim(
+        row.id,
+        new Date(deps.now().getTime() + DRYRUN_PARK_RETRY_MS),
+        ownershipOf(row),
+    ).catch(() => false);
+    return released ? row.state : "STALE";
 }
 
 /**

@@ -13,7 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PrismaClient, Prisma } from "@prisma/client";
-import { CLAIM_LOCK_KEY } from "../src/lib/receipt-intake/worker";
+import { CLAIM_LOCK_KEY, eligibleClaimWhere } from "../src/lib/receipt-intake/worker";
 
 const url = process.env.RECEIPT_INTAKE_DB_TEST_URL ?? process.env.MIGRATION_HISTORY_TEST_URL;
 const looksLikeProd = !!url && /supabase\.(co|com)/i.test(url);
@@ -73,11 +73,12 @@ test("two overlapping claims never hand out the same row", { skip }, async () =>
             );
             if (!lock?.locked) return null;
             const due = await tx.receiptIntake.findMany({
-                where: {
-                    sourceRef: { startsWith: PREFIX },
-                    state: { in: ["RECEIVED", "READ", "BOOKING"] },
-                    OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-                },
+                // The SHIPPED predicate, not a copy of it. A local re-statement
+                // is how the claim and the worker loop came to disagree about
+                // which rows are workable (finding 1); this suite is the only
+                // place the real SQL is ever executed, so it must execute the
+                // real thing.
+                where: { sourceRef: { startsWith: PREFIX }, ...eligibleClaimWhere(now, false) },
                 select: { id: true },
             });
             if (due.length === 0) return [];
@@ -113,11 +114,7 @@ test("a row whose nextRetryAt moved into the future between select and claim is 
     for (const id of ids) await seed(id);
 
     const now = new Date();
-    const ELIGIBLE = {
-        sourceRef: { startsWith: PREFIX },
-        state: { in: ["RECEIVED", "READ", "BOOKING"] },
-        OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-    };
+    const ELIGIBLE = { sourceRef: { startsWith: PREFIX }, ...eligibleClaimWhere(now, false) };
 
     const due = await db!.receiptIntake.findMany({ where: ELIGIBLE, select: { id: true } });
     assert.deepEqual(due.map(r => r.id).sort(), ids.slice().sort(), "both rows start eligible");
@@ -149,6 +146,40 @@ test("a row whose nextRetryAt moved into the future between select and claim is 
     const racedRow = await db!.receiptIntake.findUnique({ where: { id: "claimdb-race-a" } });
     assert.equal(racedRow?.nextRetryAt?.getTime(), future.getTime());
     assert.equal(racedRow?.claimToken, null);
+
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+});
+
+test("DRY-RUN ROLLBACK: the QBO-writing states are not claimable, whatever the row flag says", { skip }, async () => {
+    // Finding 1, against real SQL. A live window left rows at READ/BOOKING with
+    // dryRun=false; the switch is then rolled back. Those rows must drop out of
+    // the claim entirely, or they fill every ten-row batch (oldest-first) and
+    // the RECEIVED receipts behind them are never read.
+    await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
+    await seed("claimdb-old-read", { state: "READ", dryRun: false });
+    await seed("claimdb-old-booking", { state: "BOOKING", dryRun: false });
+    await seed("claimdb-parked", { state: "READ", dryRun: true });
+    await seed("claimdb-new", { state: "RECEIVED", dryRun: true });
+
+    const now = new Date();
+    const claimable = async (dryRunGlobal: boolean) =>
+        (await db!.receiptIntake.findMany({
+            where: { sourceRef: { startsWith: PREFIX }, ...eligibleClaimWhere(now, dryRunGlobal) },
+            select: { id: true },
+        })).map(r => r.id).sort();
+
+    assert.deepEqual(
+        await claimable(true),
+        ["claimdb-new"],
+        "under dry-run only the new receipt is claimable",
+    );
+    // And the exclusion is not a black hole: flip the switch and the same rows
+    // are claimable again. Only the shadow-week park (dryRun=true at READ) stays
+    // out, until the cutover requeues it.
+    assert.deepEqual(
+        await claimable(false),
+        ["claimdb-new", "claimdb-old-booking", "claimdb-old-read"],
+    );
 
     await db!.receiptIntake.deleteMany({ where: { sourceRef: { startsWith: PREFIX } } });
 });

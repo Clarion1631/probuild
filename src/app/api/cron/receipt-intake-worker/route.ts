@@ -4,6 +4,7 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
+import { acquireCronLease } from "@/lib/cron-lease";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { downloadVerified, inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
 import {
@@ -35,6 +36,7 @@ import {
     STAGING_SWEEP_MINUTES,
     type ClaimResult,
     type CutoverRequest,
+    eligibleClaimWhere,
     isUniqueViolation,
     readBudgetFor,
     runIntakeWorker,
@@ -52,15 +54,28 @@ export const maxDuration = 60;
  * Every 5 minutes: claim at most 10 due rows, read/dedup/route the new ones,
  * and book the ones that are cleared to book.
  *
- * OVERLAP SAFETY. pgbouncer forbids SESSION advisory locks (a pooled
- * connection is not the same connection twice — see review-alert-rollout.ts:8),
- * so the claim runs `pg_try_advisory_xact_lock` inside ONE SHORT transaction
- * and the work happens outside it. Two defences behind that, because a lock is
- * not a correctness argument on its own:
- *   - the claim bumps every taken row's `nextRetryAt`, so even interleaved runs
- *     never hand the same row to two workers, and
- *   - QBO's DocNumber/requestid idempotency means a double booking creates one
- *     Purchase, not two.
+ * OVERLAP SAFETY, in three layers — and it is worth being exact about what
+ * each one actually buys, because the first two were once described as though
+ * they did the third one's job:
+ *
+ *   1. A DURABLE INVOCATION LEASE (lib/cron-lease.ts), taken before anything is
+ *      read, claimed or booked and released in a `finally`. THIS is what makes
+ *      the worker non-overlapping. Its TTL outlives `maxDuration`, so the
+ *      platform kills a pass before its lease can lapse.
+ *   2. `pg_try_advisory_xact_lock` around the CLAIM TRANSACTION. It is
+ *      transaction scoped and is gone the moment that transaction commits — it
+ *      makes the cutover triage and the claim atomic with respect to each
+ *      other, and NOTHING about the Gemini read and QuickBooks write that
+ *      follow. It is retained because a lease that expires under a still-live
+ *      pass (or a stray manual invocation) must still not corrupt a claim.
+ *   3. Per-row ownership. The claim bumps every taken row's `nextRetryAt` and
+ *      stamps a `claimToken` that every completing write is fenced on, so even
+ *      two interleaved passes never hand the same row to two workers — and
+ *      QBO's DocNumber/requestid idempotency means a double booking creates
+ *      one Purchase, not two.
+ *
+ * pgbouncer is why (2) cannot simply be a SESSION advisory lock: a pooled
+ * connection is not the same connection twice (see review-alert-rollout.ts:8).
  *
  * Auth is isCronAuthorized() from lib/cron-auth: constant-time Bearer compare,
  * required EVERYWHERE except an explicit NODE_ENV === "development", and a
@@ -93,17 +108,18 @@ const WORKER_ROW_SELECT = {
 const RELEASE_CLAIM = { claimToken: null, claimedAt: null } as const;
 
 /**
- * A row parked by the shadow week (dryRun=true, sitting at READ or BOOKING) is
- * DONE until the cutover. It is excluded from the claim rather than merely
- * skipped inside the loop, because the batch is only ten rows: after a couple
- * of shadow days the oldest ten rows are all parked ones, they get re-claimed
- * every five minutes, and no NEW receipt is ever reached. The queue looks
- * healthy and processes nothing. runIntakeWorker's requeueDryRunParked is what
- * brings them back, once, on the first live pass.
+ * How long the invocation lease is held for.
+ *
+ * Longer than the route's own `maxDuration = 60`, deliberately: a lease that
+ * could expire while its pass was still running would let a second invocation
+ * in on exactly the run it exists to exclude, and the only alternative is
+ * heartbeating from inside a loop that spends its time blocked on Gemini and
+ * QuickBooks. The platform kills the pass first, and the next cron is five
+ * minutes out, so a crashed invocation's lease is always stale before anyone
+ * needs it.
  */
-const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
-    NOT: { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
-};
+const WORKER_LEASE_MS = 90_000;
+const WORKER_LEASE_KEY = "receiptIntakeWorkerLease";
 
 async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
     const now = new Date();
@@ -130,7 +146,7 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
         let shadowRetired = 0;
         let shadowQuarantined = 0;
         let requeued = 0;
-        if (opts.run) {
+        if (!opts.dryRunGlobal) {
             // runIntakeWorker halts before ever calling claim() without one, so
             // this is belt-and-braces rather than the real gate.
             if (!opts.boundary) {
@@ -262,14 +278,11 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
             }
         }
 
-        const ELIGIBLE: Prisma.ReceiptIntakeWhereInput = {
-            // STAGING is absent on purpose: the row exists but its object
-            // does not, so claiming it would park a good receipt as
-            // "file-missing". sweepStaleStaging is what watches those.
-            state: { in: ["RECEIVED", "READ", "BOOKING"] },
-            OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
-            ...NOT_DRY_RUN_PARKED,
-        };
+        // ONE predicate, shared with the worker lib and with the real-Postgres
+        // claim test, and a FUNCTION of the current global switch — see
+        // eligibleClaimWhere. A second copy of it here is how the claim and the
+        // processing loop came to disagree about which rows were workable.
+        const ELIGIBLE = eligibleClaimWhere(now, opts.dryRunGlobal);
 
         const due = await tx.receiptIntake.findMany({
             where: ELIGIBLE,
@@ -315,6 +328,8 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
 
 function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
     return {
+        acquireLease: () => acquireCronLease(WORKER_LEASE_KEY, WORKER_LEASE_MS),
+
         claim,
 
         isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
@@ -852,6 +867,18 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                     nextRetryAt: new Date(Date.now() + backoffMs(1)),
                     ...RELEASE_CLAIM,
                 },
+            });
+            return count > 0;
+        },
+
+        // Hand the row back untouched except for when to look at it again. No
+        // state change, no attempt spent, no lastError: the dry-run switch is
+        // not a verdict on the document. Fenced like every other write, so a
+        // superseded pass releases nothing.
+        releaseClaim: async (rowId, nextRetryAt, ownership) => {
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: { id: rowId, state: ownership.state, claimToken: ownership.claimToken },
+                data: { nextRetryAt, ...RELEASE_CLAIM },
             });
             return count > 0;
         },
